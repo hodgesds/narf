@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "e9eec650e484f39d69be916769bf6f9aa50e8e25c4d5a5f9c7d59de97330e6b1"
+prompt_hash = "4ce57483b1c6e42e087a1fd3d83122ac80aa4751ec6f92f5d676b01dfbd094dd"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -231,3 +231,27 @@ argument = "The frame edit only force-links the optional narf-bpf-leds seam and 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "narf_led_submit accepts scalars only and, in atomic BPF context, performs a bounded sequence of atomic operations into fixed FRAME-visible storage. Device lookup, allocation, trigger locking, and potentially sleepable hardware access occur later in one Stage::Late worker. Unknown actions fail with EINVAL, queue saturation fails with EAGAIN, full-width invalid indices remain drain-time no-ops, and the kfunc neither dereferences program pointers nor changes capability or domain rights."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Dynamic packet bounds change only the existing untrusted BPF verifier/runtime and Linux-compat attach path; no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model code is modified, and no subsystem is added to the documented TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "An XDP packet address is constructed only from the classifier's live immutable frame borrow after a BpfAttach-authorized type-correct attach. The verifier requires a same-provenance unsigned data/data_end comparison covering the complete access; raw-context execution is refused; the interpreter independently checks the exact slice; and native code is admitted only at the verifier-certified site. Execution remains inside the existing FRAME+BPF PKS mask, so the feature exposes RX bytes reachable there and grants no access to driver-private state or any additional domain."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "XDP test-run changes only the existing BPF runtime and Linux-compat syscall adapter. It modifies no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model code and adds no trusted subsystem."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The syscall range-validates and copies data_in into a size-bounded kernel-owned allocation before execution, then BpfProg::run_xdp alone constructs data/data_end from that exact immutable slice. Caller-supplied ctx pointers, CPU selection, flags, and batch mode are rejected; raw XDP execution remains unavailable; repeat is bounded; output copies only the owned frame prefix through the guarded user-copy path; and verifier, interpreter-region, and JIT admission checks remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Native arena-atomic lowering changes only the existing untrusted BPF JIT and runtime plus their specification and tests. It modifies no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model code and adds no trusted subsystem."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The verifier remains the sole admission path for native arena atomics. Both emitters derive the address from the page-aligned kernel arena slot base plus the verifier-tracked zero-extended handle and signed instruction displacement, reject misalignment before any atomic access, and register the actual faulting instruction for recovery before executable publication. Natural-alignment and page-fault paths return distinct terminal statuses with the offending handle; fetching bitwise arena atomics preserve the portable fail-closed boundary and interpret instead of using x86 scratch state that would destroy that handle."

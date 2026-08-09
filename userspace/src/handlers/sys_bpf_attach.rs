@@ -83,6 +83,7 @@ const ATTR_BUF: usize = 256;
 // program loader and attach handlers are sibling modules.
 const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
+const BPF_PROG_TYPE_XDP: u32 = 6;
 
 // `enum bpf_attach_type`, from include/uapi/linux/bpf.h. Only the two NARF has
 // a surface for are named; the rest are handled by range.
@@ -303,11 +304,18 @@ fn generic_attach_type_matches(prog: &BpfProg) -> bool {
         .is_none_or(|prog_type| prog_type == BPF_PROG_TYPE_TRACING)
 }
 
+fn hook_type_matches(target: &LinkTarget, prog: &BpfProg) -> bool {
+    match target {
+        LinkTarget::Probe(_) => generic_attach_type_matches(prog),
+        LinkTarget::Xdp(_) => prog.linux_prog_type() == Some(BPF_PROG_TYPE_XDP),
+    }
+}
+
 fn link_update_type_matches(link: &BpfLink, prog: &BpfProg) -> bool {
     if link.raw_tracepoint().is_some() {
         prog.linux_prog_type() == Some(BPF_PROG_TYPE_RAW_TRACEPOINT)
     } else {
-        generic_attach_type_matches(prog)
+        hook_type_matches(link.target(), prog)
     }
 }
 
@@ -354,7 +362,7 @@ pub(crate) fn bpf_prog_attach(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if !generic_attach_type_matches(&prog) {
+    if !hook_type_matches(&target, &prog) {
         return -EINVAL;
     }
     match link::prog_attach(link_caps(), &target, prog) {
@@ -416,7 +424,7 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if !generic_attach_type_matches(&prog) {
+    if !hook_type_matches(&target, &prog) {
         return -EINVAL;
     }
     let bpf_link = match BpfLink::create(link_caps(), target, prog) {

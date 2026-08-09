@@ -165,6 +165,14 @@ pub enum PtrKind {
     /// An untyped byte region whose length is the *following* argument.
     /// Rust spelling: `&[u8]` / `&mut [u8]`.
     Mem,
+    /// The exclusive end address of a dynamically-sized [`Self::Mem`] region.
+    ///
+    /// This is a hook-context descriptor, not a Rust kfunc argument. A
+    /// `Mem`/`MemEnd` pair with the same non-zero [`TypeKey`] models packet
+    /// `data`/`data_end`: the end pointer is comparable but never
+    /// dereferenceable, and a successful comparison refines the readable
+    /// extent of every live pointer to the paired region.
+    MemEnd,
     /// A pointer into a BPF arena.
     Arena,
     /// The program's context tuple.

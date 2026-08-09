@@ -12,19 +12,11 @@
 //! today. Deferred deliberately; `Pass`/`Drop` is what filtering and
 //! drop-based mitigation need, and it is reached without touching a driver.
 //!
-//! **A program cannot read frame bytes through a pointer.** The verifier
-//! rejects dereferencing anything but the frame pointer and the context
-//! (`fixpoint.rs`'s `PtrClass` rules, and `jit_glue`'s gate 5), and there is no
-//! packet-pointer class yet. So the frame is *summarised into the context
-//! tuple*: length, then the first 24 bytes as three little-endian words. That
-//! is enough to match on destination MAC prefix and EtherType — the bulk of
-//! real filtering — and nothing more. A `PtrClass::Packet` with verifier-proved
-//! bounds is what lifts it, and is the same work an arena or map-value pointer
-//! needs.
-//!
-//! Summarising rather than pretending is the point: a program that *looks* like
-//! it has a packet pointer but silently sees zeroes would be worse than one
-//! whose context says exactly what it gets.
+//! **Frame reads are dynamically bounded.** Context words 0 and 1 are the
+//! frame's `data` and exclusive `data_end` pointers. A program must compare a
+//! derived data pointer against that paired end before dereferencing it; the
+//! verifier turns only the safe edge into a native bare-access certificate,
+//! and the interpreter independently confines reads to this exact slice.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -33,13 +25,6 @@ use alloc::sync::Arc;
 use narf_net::bypass::classifier::{install_xdp, remove_xdp, XdpAction, XdpProgram};
 
 use crate::prog::BpfProg;
-
-/// How many leading frame bytes reach the program, as context words.
-///
-/// Three of the four context words; the first carries the length. 24 bytes
-/// covers both MAC addresses and the EtherType, which is where a filter
-/// decides.
-pub const FRAME_WORDS: usize = 3;
 
 /// A loaded program dispatching as an [`XdpProgram`].
 #[derive(Debug)]
@@ -69,30 +54,13 @@ impl XdpProgram for BpfXdp {
     }
 
     fn run(&self, _iface: &str, frame: &[u8]) -> XdpAction {
-        let mut ctx = [0u64; crate::interp::MAX_CTX_WORDS];
-        ctx[0] = frame.len() as u64;
-        for (i, w) in ctx[1..].iter_mut().enumerate().take(FRAME_WORDS) {
-            let off = i * 8;
-            if off + 8 <= frame.len() {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&frame[off..off + 8]);
-                *w = u64::from_le_bytes(b);
-            } else if off < frame.len() {
-                // A short frame: zero-pad the tail rather than skipping the
-                // word, so a program sees a consistent layout and `ctx[0]`
-                // remains the authority on how much of it is real.
-                let mut b = [0u8; 8];
-                b[..frame.len() - off].copy_from_slice(&frame[off..]);
-                *w = u64::from_le_bytes(b);
-            }
-        }
         // Only a program that *returned* decides. `Outcome::value()` is 0 for a
         // trap, so matching on it treated every trap as an unknown action and
         // therefore dropped the frame — the exact opposite of the policy stated
         // here, and severe: an unbounded loop verifies (fuel bounds it at
         // runtime), so a program that exhausts fuel would have silently dropped
         // *every frame on the interface*.
-        match self.prog.run_atomic(ctx, 1 + FRAME_WORDS) {
+        match self.prog.run_xdp(frame) {
             // Linux's XDP_PASS is 2 and XDP_DROP is 1; matching those keeps a
             // program written against Linux's constants behaving the same way.
             Some(crate::interp::Outcome::Returned(v)) => match v {
@@ -126,13 +94,15 @@ pub fn attach(
     // hook is `Atomic`. `attach_probe` has always checked this; this path did
     // not, and the consequence was worse than a missing diagnostic.
     //
-    // `BpfXdp::run` calls `run_atomic`, which returns `None` for a program
-    // verified for `Sleepable` — and `None` means "pass the frame" (declining
+    // `BpfXdp::run` calls the type-specific `run_xdp`, which returns `None` for
+    // a program verified for `Sleepable` — and `None` means "pass the frame" (declining
     // traffic because a filter could not run would turn a resource limit into a
     // network outage). So a sleepable program installed as an XDP filter
     // succeeded, then **failed open on every frame**: the interface looks
     // filtered and is not.
-    if prog.context() != narf_bpf_verifier::Context::Atomic {
+    if prog.context() != narf_bpf_verifier::Context::Atomic
+        || prog.linux_prog_type() != Some(crate::prog::BPF_PROG_TYPE_XDP)
+    {
         return Err(narf_net::bypass::classifier::ClassifyError::WrongContext);
     }
     let name = iface.clone();

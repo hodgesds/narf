@@ -395,6 +395,53 @@ provenance from a normal kernel-object address.
 BTF remains a Linux loader/introspection compatibility surface, not the source
 of NARF's kernel type authority.
 
+### 3.15 Dynamically bounded XDP packet reads
+
+`BPF_PROG_TYPE_XDP` programs are verified for an atomic two-word hook context:
+word 0 is a read-only `PtrKind::Mem` packet `data` pointer and word 1 is its
+exclusive `PtrKind::MemEnd` `data_end`. Both descriptors carry the same
+non-zero `TypeKey`, used here as a dynamic-region identity rather than a Rust
+object type. An end pointer may be compared but never dereferenced or adjusted.
+
+A packet pointer initially has no readable extent. On an unsigned 64-bit
+comparison between a constant-offset data pointer and its same-key end, only an
+edge proving `data + N <= data_end` (or the equivalent reversed comparison)
+publishes an `N`-byte readable prefix. `<` publishes `N + 1`; equality publishes
+`N`. The guarantee reaches live register aliases, intersects by minimum at
+control-flow joins, and every load must fit wholly inside it. A different key,
+a signed or 32-bit comparison, a non-constant offset, or an insufficient prefix
+proves nothing. Stack-spilled aliases are deliberately not recovered yet; that
+rejects some safe programs rather than guessing provenance.
+
+Live classification and `BPF_PROG_TEST_RUN` supply frame addresses only through
+`BpfProg::run_xdp`; the generic raw-context execution methods refuse XDP
+programs. Test-run copies Linux `data_in` into a kernel-owned frame, refuses
+caller `ctx_in`/`ctx_out`, CPU selection and batch mode, normalises zero repeat
+to one, and caps one synchronous call at a 64 KiB frame and 1024 iterations.
+Because XDP frames are currently immutable, `data_out` is the copied input;
+short output receives its prefix and the actual size with `ENOSPC`.
+
+The interpreter independently bounds each packet load against the exact
+borrowed slice. The JIT emits a direct read only for a verifier-published
+`bare_access_site`, so the program's dominating comparison is the native
+runtime guard. Frames remain immutable: stores are rejected by the context
+descriptor, and `XDP_TX`/`XDP_REDIRECT` remain unsupported.
+
+### 3.16 Native arena atomics
+
+The x86_64 and aarch64 JITs lower naturally aligned word and doubleword arena
+atomics after computing the same `slot_base + zero_extend(handle + off16)`
+address as ordinary arena accesses. Add, non-fetching bitwise operations,
+exchange, compare-and-exchange, load-acquire, and store-release are native;
+fetching bitwise arena operations remain interpreted on both architectures.
+
+Before the atomic memory instruction, emitted code tests the effective address
+for natural alignment. Failure returns JIT status `ARENA_UNALIGNED` with the
+offending handle and becomes `Trap::ArenaUnaligned`; it cannot partially execute
+the operation. A mapped but inaccessible address instead follows the registered
+arena exception-table entry and returns `ARENA_FAULT`. Both outcomes stop the
+program, and unsupported lowering fails closed to the interpreter.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches
@@ -476,6 +523,15 @@ relate an exact constant `(offset, width)` to the program's Rust-native object
 schema, and the synchronous live wrapper must repeat both the exact-field and
 whole-object bounds checks before copying. Typed programs cannot execute from
 a caller-supplied raw context, and direct `Object` loads stay opaque.
+
+**4.13 — Dynamic packet reads need both relational proof and a live runtime
+region.** A same-key `data`/`data_end` comparison may certify only the prefix
+its constant offset proves, and no other pointer comparison changes memory
+access rights. `run_xdp` is the sole constructor of the real-address context;
+its callers may supply only a Rust slice, and raw execution cannot forge the
+context. The interpreter checks the borrowed slice again, while native code is
+admitted only at a verifier-certified access site. The borrow ends synchronously
+before the RX caller may recycle the DMA buffer or the test-run syscall returns.
 
 ## 5. Architecture notes
 
@@ -833,12 +889,11 @@ and the perf event layer, all of which are closed.
     programs that do not, and "the budget is not the lever" was true of the cost
     and false of the bound.
 
-12. **A packet pointer needs *dynamic* region bounds, and the obvious
-    shortcut is an information leak.** XDP programs currently receive the frame
-    *summarised* into the context tuple (length, then 24 bytes as three words)
-    because a program cannot dereference the frame at all. Lifting that is the
-    next substantial verifier feature, and the shape of it is worth recording
-    before someone reaches for the easy version.
+12. ~~**A packet pointer needs *dynamic* region bounds, and the obvious
+    shortcut is an information leak.**~~ — **resolved with paired data/end
+    provenance and a runtime slice bound.** XDP programs formerly received the
+    frame summarised into the context tuple (length, then 24 bytes as three
+    words) because a program could not dereference the frame at all.
 
     `PtrClass::Mem` is already the right class — "an untyped bounded byte
     region", which is exactly what a packet is. What blocks it is that
@@ -857,10 +912,16 @@ and the perf event layer, all of which are closed.
     frame's real length would see the previous packet's bytes. An
     information leak, and exactly the fail-open shape §9 records two of.
 
-    So: dynamic bounds or nothing. Until then the context summary is honest
-    about what a program gets, which is the property that matters — a program
-    that appeared to hold a packet pointer while silently seeing zeroes would
-    be worse than one that never had one.
+    The implemented answer is dynamic bounds, not the shortcut. Context supplies
+    real `data` and `data_end` pointers carrying one region key. The verifier
+    recognises only a same-key unsigned 64-bit comparison, records the proved
+    prefix on the safe edge, and publishes a bare-access certificate only after
+    the complete load width fits. The interpreter independently resolves the
+    address inside the live frame slice; XDP raw-context execution is refused,
+    so a caller cannot forge the two kernel addresses. The classifier borrow is
+    synchronous and read-only. Tests pin the positive guard, missing and short
+    guards, mismatched provenance, an undereferenceable end marker, short live
+    frames, packet-content-dependent verdicts, and the syscall load/attach path.
 
 13. ~~**A userspace `mmap` of an arena keeps nothing alive, so arena frames are
     leaked rather than freed once exposed.**~~ — **resolved: the mapping owns

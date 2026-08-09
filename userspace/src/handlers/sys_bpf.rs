@@ -14,8 +14,8 @@
 //!   The Linux license string is copied, classified, and retained for program
 //!   introspection. Atomic fentry and raw-tracepoint types retain their distinct
 //!   Linux identities even though they share one verifier context.
-//! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
-//!   report the return value in `attr.test.retval`.
+//! * `BPF_PROG_TEST_RUN` (10) — run a generic program with a caller-supplied
+//!   context, or an XDP program over copied `data_in`, and report its result.
 //! * `BPF_MAP_CREATE` (0), the five keyed element commands, batch commands,
 //!   and `BPF_MAP_FREEZE` (22), over the keyed map kinds in `narf_bpf::map`.
 //! * `BPF_PROG_BIND_MAP` (35) — add a map lifetime reference to an already
@@ -131,8 +131,25 @@ const BPF_LOG_MASK: u32 = 15;
 // `struct { … } test` field offsets.
 const T_PROG_FD: usize = 0;
 const T_RETVAL: usize = 4;
+const T_DATA_SIZE_IN: usize = 8;
+const T_DATA_SIZE_OUT: usize = 12;
+const T_DATA_IN: usize = 16;
+const T_DATA_OUT: usize = 24;
+const T_REPEAT: usize = 32;
+const T_DURATION: usize = 36;
 const T_CTX_SIZE_IN: usize = 40;
+const T_CTX_SIZE_OUT: usize = 44;
 const T_CTX_IN: usize = 48;
+const T_CTX_OUT: usize = 56;
+const T_FLAGS: usize = 64;
+const T_CPU: usize = 68;
+const T_BATCH_SIZE: usize = 72;
+
+/// One synchronous syscall must not monopolise the kernel indefinitely.
+const MAX_XDP_TEST_REPEAT: u32 = 1024;
+/// XDP test frames are ordinary link-layer packets, not an allocation API.
+const MAX_XDP_TEST_DATA: usize = 64 * 1024;
+const ETH_HLEN: usize = 14;
 
 /// `enum bpf_prog_type` values NARF accepts. Program type remains object
 /// identity even when two types share an execution context: raw tracepoints
@@ -141,6 +158,7 @@ const T_CTX_IN: usize = 48;
 const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
+const BPF_PROG_TYPE_XDP: u32 = 6;
 
 /// The `Cap<BpfProgLoad, Grant>` this handler presents.
 ///
@@ -516,9 +534,11 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     // is verified *for*, and attaching to a hook that provides the other one
     // is rejected by type at attach (spec §4.5).
     let context = match prog_type {
-        BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => Context::Atomic,
+        BPF_PROG_TYPE_XDP | BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => {
+            Context::Atomic
+        }
         BPF_PROG_TYPE_SYSCALL => Context::Sleepable,
-        // LINUX-GAP: socket filters, XDP, cgroup hooks, LSM, struct_ops, and
+        // LINUX-GAP: socket filters, cgroup hooks, LSM, struct_ops, and
         // the rest arrive with their attach surfaces in Phase 5/6.
         _ => return -ENOTSUP,
     };
@@ -621,7 +641,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
 }
 
 fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
-    let mut attr = match read_attr(attr_uptr, size) {
+    let attr = match read_attr(attr_uptr, size) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -639,6 +659,9 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
         return -EINVAL;
     };
     let prog = file.prog();
+    if prog.linux_prog_type() == Some(BPF_PROG_TYPE_XDP) {
+        return prog_test_run_xdp(&prog, attr_uptr, size, &attr);
+    }
 
     // The context tuple. Linux's `ctx_in` is a program-type-specific struct;
     // for NARF's probe context it is the `[u64; 4]` the probe ABI already
@@ -685,7 +708,6 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
     // syscall itself succeeds; a trapped program is still a successful *run*
     // whose result happens to be zero.
     let retval = (outcome.value() & 0xFFFF_FFFF) as u32;
-    attr[T_RETVAL..T_RETVAL + 4].copy_from_slice(&retval.to_le_bytes());
     // SAFETY: `copy_to_user` range-validates and brackets SMAP; writing back
     // only the four bytes the caller asked about avoids clobbering fields a
     // newer userspace put beyond what this kernel understands.
@@ -693,6 +715,96 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
         return -(e as i64);
     }
     0
+}
+
+/// Linux-shaped XDP test execution without exposing native context pointers.
+///
+/// `data_in` is copied into an owned kernel allocation first. [`BpfProg::run_xdp`]
+/// then constructs `data`/`data_end` from that exact immutable slice, preserving
+/// the same pointer provenance as the live classifier path. NARF does not yet
+/// translate Linux's optional `xdp_md`, CPU selection, or batched test mode;
+/// accepting any of them partially would make the ABI look safer than it is.
+fn prog_test_run_xdp(
+    prog: &BpfProg,
+    attr_uptr: u64,
+    size: usize,
+    attr: &[u8; ATTR_BUF],
+) -> i64 {
+    if size < T_DURATION + 4 {
+        return -EINVAL;
+    }
+
+    let data_size_in = u32_at(attr, T_DATA_SIZE_IN) as usize;
+    let data_size_out = u32_at(attr, T_DATA_SIZE_OUT) as usize;
+    let data_in = u64_at(attr, T_DATA_IN);
+    let data_out = u64_at(attr, T_DATA_OUT);
+    let repeat = u32_at(attr, T_REPEAT).max(1);
+
+    if data_in == 0 || data_size_in < ETH_HLEN {
+        return -EINVAL;
+    }
+    if data_size_in > MAX_XDP_TEST_DATA || repeat > MAX_XDP_TEST_REPEAT {
+        return -E2BIG;
+    }
+    if (data_out == 0) != (data_size_out == 0)
+        || u32_at(attr, T_CTX_SIZE_IN) != 0
+        || u32_at(attr, T_CTX_SIZE_OUT) != 0
+        || u64_at(attr, T_CTX_IN) != 0
+        || u64_at(attr, T_CTX_OUT) != 0
+        || u32_at(attr, T_FLAGS) != 0
+        || u32_at(attr, T_CPU) != 0
+        || u32_at(attr, T_BATCH_SIZE) != 0
+    {
+        return -EINVAL;
+    }
+
+    // SAFETY: the helper validates the complete userspace range before
+    // allocation/copy and enforces the global syscall-copy limit. The tighter
+    // XDP limit above additionally bounds synchronous execution cost.
+    let frame = match unsafe { copy_from_user_vec(data_in, data_size_in) } {
+        Ok(frame) => frame,
+        Err(e) => return -(e as i64),
+    };
+
+    let start = narf_time::monotonic_ns();
+    let mut retval = 0u32;
+    for _ in 0..repeat {
+        let Some(outcome) = prog.run_xdp(&frame) else {
+            return -EAGAIN;
+        };
+        retval = (outcome.value() & 0xFFFF_FFFF) as u32;
+    }
+    let duration = narf_time::monotonic_ns()
+        .saturating_sub(start)
+        .checked_div(u64::from(repeat))
+        .unwrap_or(0)
+        .min(u64::from(u32::MAX)) as u32;
+
+    let copied = core::cmp::min(frame.len(), data_size_out);
+    if copied != 0 {
+        // SAFETY: `copy_to_user` validates the requested output prefix and
+        // brackets SMAP. The source remains the owned immutable frame.
+        if let Err(e) = unsafe { copy_to_user(data_out, &frame[..copied]) } {
+            return -(e as i64);
+        }
+    }
+    let actual_size = frame.len() as u32;
+    for (off, bytes) in [
+        (T_DATA_SIZE_OUT, actual_size.to_le_bytes()),
+        (T_RETVAL, retval.to_le_bytes()),
+        (T_DURATION, duration.to_le_bytes()),
+    ] {
+        // SAFETY: every field is within the attr prefix required above.
+        if let Err(e) = unsafe { copy_to_user(attr_uptr + off as u64, &bytes) } {
+            return -(e as i64);
+        }
+    }
+
+    if data_size_out < frame.len() && data_out != 0 {
+        -ENOSPC
+    } else {
+        0
+    }
 }
 // ── maps ────────────────────────────────────────────────────────────
 

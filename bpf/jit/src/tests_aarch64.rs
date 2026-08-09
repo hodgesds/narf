@@ -111,12 +111,25 @@ const A64_OOF_EPILOGUE: [u32; 6] = [
 /// The arena-fault epilogue: `mov x0, x9` (the offending handle), `mov x1, #2`
 /// (`status::ARENA_FAULT`), then the same restore.
 ///
-/// Last in the image, and reached only through the exception table — nothing
-/// branches here. Returning the handle is why the emitter folds `off16` into
-/// `x9` instead of leaving it in the `LDUR`.
+/// Reached only through the exception table — nothing branches here. Returning
+/// the handle is why the emitter folds `off16` into `x9` instead of leaving it
+/// in the `LDUR`.
 const A64_ARENA_EPILOGUE: [u32; 7] = [
     0xaa09_03e0,
     0xd280_0041,
+    A64_RESTORE[0],
+    A64_RESTORE[1],
+    A64_RESTORE[2],
+    A64_RESTORE[3],
+    A64_RESTORE[4],
+];
+
+/// The arena-unaligned epilogue: the same handle return, with status 3.
+/// This is last in the image because ordinary arena faults retain their older
+/// exception-table target while explicit alignment guards branch here.
+const A64_ARENA_UNALIGNED_EPILOGUE: [u32; 7] = [
+    0xaa09_03e0,
+    0xd280_0061,
     A64_RESTORE[0],
     A64_RESTORE[1],
     A64_RESTORE[2],
@@ -158,9 +171,9 @@ fn a64_image(items: &[Decoded]) -> (Vec<u32>, core::ops::Range<usize>) {
         &w[..A64_PROLOGUE.len()]
     );
     assert_eq!(
-        &w[w.len() - A64_ARENA_EPILOGUE.len()..],
-        &A64_ARENA_EPILOGUE,
-        "the image must end with the arena-fault epilogue"
+        &w[w.len() - A64_ARENA_UNALIGNED_EPILOGUE.len()..],
+        &A64_ARENA_UNALIGNED_EPILOGUE,
+        "the image must end with the arena-unaligned epilogue"
     );
     let start = A64_PROLOGUE.len() + 2; // the first block's `subs` + `b.lo`
     let end = w
@@ -200,6 +213,10 @@ fn a64_golden_prologue_and_epilogues() {
     assert_ne!(
         A64_EPILOGUE[0], A64_OOF_EPILOGUE[0],
         "the two epilogues must disagree about the exhaustion flag"
+    );
+    assert_ne!(
+        A64_ARENA_EPILOGUE[1], A64_ARENA_UNALIGNED_EPILOGUE[1],
+        "arena faults and unaligned atomics need distinct statuses"
     );
 }
 
@@ -1252,11 +1269,11 @@ fn a64_the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
         0,
         None,
     );
-    let arena_epi = w.len() - A64_ARENA_EPILOGUE.len();
+    let arena_epi = w.len() - A64_ARENA_UNALIGNED_EPILOGUE.len() - A64_ARENA_EPILOGUE.len();
     assert_eq!(
-        &w[arena_epi..],
+        &w[arena_epi..arena_epi + A64_ARENA_EPILOGUE.len()],
         &A64_ARENA_EPILOGUE,
-        "the image must end with the arena-fault epilogue"
+        "the exception-table target must remain the arena-fault epilogue"
     );
     assert_eq!(
         c.faults.0[0].fixup_off as usize,
@@ -1355,10 +1372,7 @@ fn a64_a_non_arena_access_keeps_the_plain_shape() {
 }
 
 #[test]
-fn a64_an_arena_atomic_the_emitter_cannot_shape_is_refused() {
-    // Fail-closed, and specifically not by falling through to the plain
-    // lowering — which would be a bare dereference of a handle. Narrower loads
-    // and stores are emitted now; an atomic still has no arena shape.
+fn a64_an_arena_atomic_uses_the_slot_relative_shape_and_records_its_fault() {
     let prog = crate::tests::verified_arena(
         &[
             Decoded::Atomic {
@@ -1374,9 +1388,38 @@ fn a64_an_arena_atomic_the_emitter_cannot_shape_is_refused() {
         0,
         None,
     );
+    let c = aarch64::compile(&prog).expect("the arena atomic compiles");
+    assert_eq!(c.faults.0.len(), 1);
+    let fault = c.faults.0[0];
+    assert!(fault.arena && fault.fixup_off > fault.fault_off);
+    let words = a64_words(&c.code);
+    assert_eq!(
+        words[fault.fault_off as usize / 4],
+        0xf8e0_023f,
+        "ldaddal x0, xzr, [x17]"
+    );
+}
+
+#[test]
+fn a64_a_fetching_bitwise_arena_atomic_still_falls_back() {
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: narf_bpf_isa::AtomicOp::Or { fetch: true },
+                dst: r(1),
+                src: r(0),
+                off: 8,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
     assert!(matches!(
         aarch64::compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
+        Err(crate::JitError::Unsupported { at: 0, .. })
     ));
 }
 

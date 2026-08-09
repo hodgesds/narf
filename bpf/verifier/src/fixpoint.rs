@@ -330,6 +330,23 @@ impl Pred {
         }
     }
 
+    fn swap_operands(self) -> Pred {
+        match self {
+            Pred::Eq => Pred::Eq,
+            Pred::Ne => Pred::Ne,
+            Pred::Gt => Pred::Lt,
+            Pred::Ge => Pred::Le,
+            Pred::Lt => Pred::Gt,
+            Pred::Le => Pred::Ge,
+            Pred::Sgt => Pred::Slt,
+            Pred::Sge => Pred::Sle,
+            Pred::Slt => Pred::Sgt,
+            Pred::Sle => Pred::Sge,
+            Pred::Set => Pred::Set,
+            Pred::NotSet => Pred::NotSet,
+        }
+    }
+
     /// Whether the comparison is unsigned, which decides how a 32-bit form may
     /// be reflected into a 64-bit abstract value.
     fn is_unsigned(self) -> bool {
@@ -812,22 +829,24 @@ impl Analysis<'_, '_> {
                 AbsValue::Ptr(PtrVal { off, ..p })
             }
 
-            (AbsValue::Ptr(p), AbsValue::Scalar(b)) if wide => match op {
-                AluOp::Add => AbsValue::Ptr(PtrVal {
-                    off: p.off.add(&b),
-                    ..p
-                }),
-                AluOp::Sub => AbsValue::Ptr(PtrVal {
-                    off: p.off.sub(&b),
-                    ..p
-                }),
-                _ => {
-                    return Err(VerifyError::PointerArithmetic {
-                        at,
-                        reg: dst.index(),
-                    })
+            (AbsValue::Ptr(p), AbsValue::Scalar(b)) if wide && p.class != PtrClass::MemEnd => {
+                match op {
+                    AluOp::Add => AbsValue::Ptr(PtrVal {
+                        off: p.off.add(&b),
+                        ..p
+                    }),
+                    AluOp::Sub => AbsValue::Ptr(PtrVal {
+                        off: p.off.sub(&b),
+                        ..p
+                    }),
+                    _ => {
+                        return Err(VerifyError::PointerArithmetic {
+                            at,
+                            reg: dst.index(),
+                        })
+                    }
                 }
-            },
+            }
 
             // The difference of two pointers into the same region is a scalar,
             // and is how a program measures how far it has walked.
@@ -1042,6 +1061,10 @@ impl Analysis<'_, '_> {
             self.bare_access_sites
                 .push(BareAccessSite { insn_index: at });
             return Ok(resolved);
+        }
+        if p.class == PtrClass::Mem {
+            self.bare_access_sites
+                .push(BareAccessSite { insn_index: at });
         }
         Ok(Resolved::Opaque)
     }
@@ -1532,6 +1555,7 @@ impl Analysis<'_, '_> {
                         PtrKind::Object => PtrClass::Object,
                         PtrKind::TraceObject => PtrClass::TraceObject,
                         PtrKind::Mem => PtrClass::Mem,
+                        PtrKind::MemEnd => PtrClass::MemEnd,
                         PtrKind::Arena => PtrClass::Arena,
                         PtrKind::Ctx => PtrClass::Ctx,
                         PtrKind::MapValue => PtrClass::MapValue,
@@ -1814,6 +1838,49 @@ impl Analysis<'_, '_> {
         let d = self.get(st, at, dst)?;
         let s = self.source(st, at, src, wide)?;
 
+        // A hook may expose a dynamically-sized byte region as a `Mem` /
+        // `MemEnd` pair carrying one non-zero key. The program must compare a
+        // derived data pointer with its paired exclusive end before a load.
+        // On the safe edge, the compared offset is a lower bound on the live
+        // extent, so publish that guarantee to every register alias of the
+        // region. Stack spills deliberately remain unrefined for now: failing
+        // to recover an alias rejects a safe program, while guessing one would
+        // admit an unchecked dereference.
+        if wide {
+            if let (AbsValue::Ptr(dp), AbsValue::Ptr(sp), Source::Reg(_)) = (d, s, src) {
+                let dynamic = match (dp.class, sp.class) {
+                    (PtrClass::Mem, PtrClass::MemEnd) => Some((dp, sp, pred)),
+                    (PtrClass::MemEnd, PtrClass::Mem) => Some((sp, dp, pred.swap_operands())),
+                    _ => None,
+                };
+                if let Some((mem, end, relation)) = dynamic {
+                    if mem.key.is_some() && mem.key == end.key {
+                        let limit = match (relation, mem.off.as_const()) {
+                            (Pred::Eq | Pred::Le, Some(off)) if off >= 0 => Some(off as u64),
+                            (Pred::Lt, Some(off)) if off >= 0 => (off as u64).checked_add(1),
+                            _ => None,
+                        };
+                        if let Some(limit) = limit {
+                            let mut out = st.clone();
+                            for value in &mut out.regs {
+                                if let AbsValue::Ptr(alias) = value {
+                                    if alias.class == PtrClass::Mem && alias.key == mem.key {
+                                        alias.size =
+                                            Some(alias.size.map_or(limit, |n| n.max(limit)));
+                                    }
+                                }
+                            }
+                            return Ok(Some(out));
+                        }
+                    }
+                    // A comparison of dynamic pointers that did not establish
+                    // a readable prefix still says nothing useful, but it is a
+                    // legal runtime comparison.
+                    return Ok(Some(st.clone()));
+                }
+            }
+        }
+
         // Null tests. This is the only pointer refinement there is, and it is
         // what makes `Option<T>` a verifier-enforced obligation rather than a
         // convention: a nullable result is unusable until a comparison against
@@ -1939,6 +2006,7 @@ fn value_of(d: &ArgDesc, ref_id: u32) -> AbsValue {
                 PtrKind::Object => PtrClass::Object,
                 PtrKind::TraceObject => PtrClass::TraceObject,
                 PtrKind::Mem => PtrClass::Mem,
+                PtrKind::MemEnd => PtrClass::MemEnd,
                 PtrKind::Arena => PtrClass::Arena,
                 PtrKind::Ctx => PtrClass::Ctx,
                 PtrKind::MapValue => PtrClass::MapValue,

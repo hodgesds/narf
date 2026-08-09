@@ -163,6 +163,15 @@ fn jne_imm(dst: u8, v: i32, off: i16) -> Decoded {
         off,
     }
 }
+fn jgt_reg(dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op: CondOp::Gt,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        off,
+    }
+}
 fn jeq_imm(dst: u8, v: i32, off: i16) -> Decoded {
     Decoded::JumpCond {
         wide: true,
@@ -216,6 +225,23 @@ fn load_typed<T: narf_tracing::TypedProbe>(
     insns: Vec<Insn>,
 ) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
     BpfProg::load_for_typed_probe::<T>(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from(name),
+            insns,
+            context: Context::Atomic,
+            maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
+        },
+    )
+}
+
+fn load_xdp(
+    name: &str,
+    insns: Vec<Insn>,
+) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
+    BpfProg::load_for_xdp(
         load_cap(),
         LoadRequest {
             name: alloc::string::String::from(name),
@@ -2360,43 +2386,54 @@ kernel_test_in!("bpf", smoke_bpf_jit_diff_stack_and_ctx_sweep);
 fn smoke_bpf_xdp_program_decides() -> TestResult {
     // The seam `net/src/bypass/classifier.rs` has named since it was written.
     //
-    // The frame is *summarised* into the context tuple — length, then the first
-    // 24 bytes as three words — because the verifier has no packet-pointer
-    // class, so a program cannot dereference the frame. This checks that the
-    // summary is real: the program returns DROP only when the EtherType word
-    // matches, so a zeroed or misaligned context would show up as the wrong
-    // verdict rather than passing quietly.
+    // Load data/data_end, prove that bytes 0..14 are live, then inspect the
+    // EtherType byte at offset 12. Without the guard, or if the runtime handed
+    // the interpreter a different region, this program is rejected or traps.
     use narf_net::bypass::classifier::{XdpAction, XdpProgram};
 
-    // ctx[2] holds frame bytes 8..16, which for an Ethernet frame spans the
-    // last 4 bytes of the source MAC and the EtherType. `if ctx[2] == K` then
-    // drop (1), else pass (2).
     let insns = asm(&[
-        ldx(1, 1, 16), // r1 = ctx[2]
+        ldx(2, 1, 0), // r2 = data
+        ldx(3, 1, 8), // r3 = data_end
+        mov_reg(4, 2),
+        alu_imm(AluOp::Add, 4, 14),
+        jgt_reg(4, 3, 5), // short frame -> XDP_PASS
+        ldx_size(Size::B, 1, 2, 12),
         mov_imm(0, 2), // default: XDP_PASS
         jne_imm(1, 0x11, 1),
         mov_imm(0, 1), // XDP_DROP
         EXIT,
+        mov_imm(0, 2),
+        EXIT,
     ]);
-    let Ok(prog) = load("xdp", insns, Context::Atomic) else {
+    let Ok(prog) = load_xdp("xdp", insns) else {
         return TestResult::Fail("load rejected the XDP program");
     };
-    let x = crate::attach_xdp::BpfXdp::for_test(prog, "test0");
+    if narf_bpf_jit::has_backend() && !prog.is_jited() {
+        return TestResult::Fail("bounded packet read unexpectedly fell back from the JIT");
+    }
+    if prog.run_atomic([u64::MAX; 4], 4).is_some()
+        || prog.run_atomic_interpreted([u64::MAX; 4], 4).is_some()
+    {
+        return TestResult::Fail("XDP accepted a caller-forged raw pointer context");
+    }
+    let x = crate::attach_xdp::BpfXdp::for_test(alloc::sync::Arc::clone(&prog), "test0");
 
-    // A frame whose bytes 8..16 are 0x11 followed by zeroes → matches → DROP.
+    // A frame whose EtherType's first byte is 0x11 → matches → DROP.
     let mut frame = [0u8; 64];
-    frame[8] = 0x11;
+    frame[12] = 0x11;
+    if prog.run_xdp_interpreted(&frame) != Some(Outcome::Returned(1)) {
+        return TestResult::Fail("interpreter did not read the bounded frame byte");
+    }
     if x.run("test0", &frame) != XdpAction::Drop {
-        return TestResult::Fail("program did not see the frame summary");
+        return TestResult::Fail("program did not read the matching frame byte");
     }
     // Change the matched byte → PASS. If the context were zeroed, both frames
     // would take the same branch and this would be the failure.
-    frame[8] = 0x22;
+    frame[12] = 0x22;
     if x.run("test0", &frame) != XdpAction::Pass {
         return TestResult::Fail("verdict did not follow the frame contents");
     }
-    // A short frame must not panic and must still be summarised — the tail is
-    // zero-padded, and ctx[0] stays the authority on how much is real.
+    // A short frame takes the explicit bounds-failure branch.
     if x.run("test0", &[0u8; 3]) != XdpAction::Pass {
         return TestResult::Fail("a short frame was mishandled");
     }
@@ -2411,7 +2448,7 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
     // the worst outcome available.
     use narf_net::bypass::classifier::{XdpAction, XdpProgram};
     let insns = asm(&[mov_imm(0, 99), EXIT]);
-    let Ok(prog) = load("xdp-bad", insns, Context::Atomic) else {
+    let Ok(prog) = load_xdp("xdp-bad", insns) else {
         return TestResult::Fail("load rejected");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "test1");

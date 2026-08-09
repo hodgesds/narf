@@ -26,9 +26,9 @@ is the hardware isolation that backs it up.** They are peers, not alternatives.
 
 ### 2.1 BPF barely uses address-space visibility
 
-Unlike Linux BPF, NARF BPF has no `bpf_probe_read` and no way to dereference an
-arbitrary kernel pointer. A program reaches memory by exactly four paths, and
-only two are real dereferences — of the program's *own* memory:
+Unlike Linux BPF, NARF BPF has no arbitrary-address `bpf_probe_read`. A program
+reaches memory by exactly five paths; the added XDP path is a synchronous,
+read-only borrow whose exact extent is supplied by the classifier:
 
 | Path | Mechanism | Real cross-domain deref? |
 |---|---|---|
@@ -36,6 +36,7 @@ only two are real dereferences — of the program's *own* memory:
 | kfunc call | typed scalars/handles; the shim runs in kernel context | no |
 | map value | pointer into that map's own value bytes | its own bytes only |
 | arena | bounds-checked deref of the program's own frames (`interp.rs:649`) | its own frames only |
+| XDP packet | same-key `data`/`data_end` proof plus live slice bound | read-only RX bytes only |
 
 The verifier rejects raw object deref outright (`OpaqueDeref`,
 `verifier/src/fixpoint.rs:931` — no BTF, so no offset is provably in-bounds),
@@ -44,11 +45,16 @@ and a wild pointer in the interpreter **traps, never faults**
 functions, deliberately: *"the closed, audited list is the safety property"*
 (`kfuncs.rs:3`).
 
-**Consequence.** The "visibility into an address space" that confinement would
-remove is the Linux *tracing* model (kprobe + `probe_read` reading arbitrary
-kernel memory) — which NARF has already declined (`spec.md` §1, "out of scope,
-permanently: … unprivileged BPF"; there is no probe_read helper). For the BPF we
-actually run, confinement removes almost nothing.
+The XDP borrow is entered only for RX storage reachable from FRAME/BPF under the
+active PKS mask; it does not make driver state reachable. A future driver that
+tags its DMA buffers into a private driver domain must stage the received bytes
+into FRAME/BPF memory or add a Frame-mediated read before calling `run_xdp` — it
+must not widen the BPF domain mask. On current paths, an accidental private tag
+fails closed as a PK fault rather than bypassing confinement.
+
+**Consequence.** The broad "visibility into an address space" that confinement
+removes is still Linux's tracing model (kprobe + arbitrary-address
+`probe_read`). XDP adds one exact, read-only region, not ambient kernel memory.
 
 ### 2.2 The domain fence is already live (on Intel)
 

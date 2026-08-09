@@ -38,9 +38,9 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (an arena atomic) would make every
-//! program containing it fall back, and a fuzzer whose subjects fall back is a
-//! fuzzer comparing the interpreter with itself.
+//! lower: a shape neither backend emits (a fetching bitwise arena atomic) would
+//! make every program containing it fall back, and a fuzzer whose subjects fall
+//! back is a fuzzer comparing the interpreter with itself.
 //!
 //! Three lowered shapes are deliberately *not* generated here and are covered by
 //! goldens plus targeted `smoke_bpf_jit_*_matches_the_interpreter` tests instead:
@@ -1487,12 +1487,11 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    // An arena atomic is the durable probe: it verifies through the real loader
-    // (given an arena to point at) yet has no lowering — the arena addressing
-    // shape and the atomic/cmpxchg-loop scratch registers collide, so both
-    // backends leave it interpreted. (The multiply, atomic, LD_IMM64,
-    // BPF-to-BPF-call, fetching-bitwise-atomic, `may_goto` and map-pseudo
-    // LD_IMM64 probes that once lived here are all lowered now.)
+    // A fetching bitwise arena atomic is the durable probe: it verifies through
+    // the real loader (given an arena to point at), but the x86 cmpxchg loop's
+    // scratch state collides with the fault-recovery handle contract. aarch64
+    // deliberately keeps the same portable arena repertoire, so both backends
+    // leave it interpreted. Other arena atomics are lowered now.
     let cap = crate::arena::kernel_arena_cap();
     let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
         Ok(g) => alloc::sync::Arc::new(g),
@@ -1505,7 +1504,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
         super::mov_imm(1, 7), // the addend
         Decoded::Atomic {
             size: Size::Dw,
-            op: AtomicOp::Add { fetch: false },
+            op: AtomicOp::Or { fetch: true },
             dst: r(6),
             src: r(1),
             off: 0,
@@ -1519,7 +1518,9 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
         return TestResult::Fail("the unlowered-shape probe no longer verifies");
     };
     if p.is_jited() {
-        note!("bpf-fuzz: a backend now lowers an arena atomic — extend the repertoire");
+        note!(
+            "bpf-fuzz: a backend now lowers a fetching bitwise arena atomic — extend the repertoire"
+        );
         return TestResult::Fail(
             "a backend gained a shape the fuzzer does not generate — extend the repertoire",
         );

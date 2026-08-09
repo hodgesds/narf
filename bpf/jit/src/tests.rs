@@ -297,9 +297,10 @@ fn the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
     let c = compile(&prog).expect("the arena store is emitted now");
     assert_eq!(c.faults.0.len(), 1);
     let f = c.faults.0[0];
-    // The last instruction of the image is the arena epilogue's `ret`, and the
-    // epilogue is `mov rax, rcx; mov rdx, 2; RESTORE`.
-    let arena_epi = c.code.len() - (3 + 10 + RESTORE.len());
+    // The arena-fault epilogue precedes the equal-sized unaligned epilogue;
+    // both are `mov rax, rcx; mov rdx, status; RESTORE`.
+    let arena_epilogue_len = 3 + 10 + RESTORE.len();
+    let arena_epi = c.code.len() - 2 * arena_epilogue_len;
     assert_eq!(
         f.fixup_off as usize, arena_epi,
         "the fixup must name the arena epilogue"
@@ -889,15 +890,36 @@ fn a_fetching_bitwise_atomic_is_a_cmpxchg_loop() {
 }
 
 #[test]
-fn an_arena_atomic_the_emitter_cannot_shape_is_refused() {
-    // Fail-closed, and specifically *not* by falling through to the plain
-    // lowering. Atomics have no arena encoding here, and the wrong answer would
-    // be a bare dereference of the handle, which is the whole hazard.
+fn an_arena_atomic_uses_the_slot_relative_shape_and_records_its_fault() {
     let prog = verified_arena(
         &[
             Decoded::Atomic {
                 size: Size::Dw,
                 op: AtomicOp::Add { fetch: false },
+                dst: r(2),
+                src: r(3),
+                off: 8,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("the arena atomic compiles");
+    assert_eq!(c.faults.0.len(), 1);
+    let fault = c.faults.0[0];
+    assert!(fault.arena && fault.fixup_off > fault.fault_off);
+    assert_eq!(c.code[fault.fault_off as usize], 0xF0, "lock prefix");
+}
+
+#[test]
+fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
+    let prog = verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Or { fetch: true },
                 dst: r(2),
                 src: r(3),
                 off: 8,

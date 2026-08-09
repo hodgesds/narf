@@ -105,6 +105,16 @@ fn jmp(op: CondOp, dst: u8, imm: i32, off: i16) -> Decoded {
     }
 }
 
+fn jmpr(op: CondOp, dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        off,
+    }
+}
+
 fn call(id: i32) -> Decoded {
     Decoded::Call(CallTarget::Kfunc(id))
 }
@@ -271,6 +281,108 @@ static CONST_ARG: &[ArgDesc] = &[ArgDesc {
     domain: ValidityDomain::Static,
     flags: ArgFlags::CONST,
 }];
+
+const PACKET_KEY: TypeKey = TypeKey(0x504b_5401);
+static PACKET_CTX: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: PACKET_KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    },
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::MemEnd,
+            key: PACKET_KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    },
+];
+
+fn packet_read_program(checked: i32, read_off: i16, read_size: Size) -> Vec<Decoded> {
+    vec![
+        ldx(Size::Dw, 2, 1, 0),
+        ldx(Size::Dw, 3, 1, 8),
+        movr(4, 2),
+        alu(AluOp::Add, 4, checked),
+        jmpr(CondOp::Gt, 4, 3, 2),
+        ldx(read_size, 0, 2, read_off),
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ]
+}
+
+#[test]
+fn dynamic_region_check_certifies_packet_read() {
+    let verified = check_ctx(&packet_read_program(14, 12, Size::H), PACKET_CTX)
+        .expect("data + 14 <= data_end proves a two-byte read at offset 12");
+    assert_eq!(
+        verified
+            .bare_access_sites
+            .iter()
+            .map(|site| site.insn_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 5],
+        "both context loads and the dynamically bounded packet load are native-safe"
+    );
+}
+
+#[test]
+fn dynamic_region_read_without_dominating_check_is_rejected() {
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 2, 1, 0), ldx(Size::H, 0, 2, 12), EXIT,],
+            PACKET_CTX,
+        )
+        .expect_err("unchecked packet read must fail"),
+        VerifyError::OutOfBounds { at: 1 }
+    );
+}
+
+#[test]
+fn dynamic_region_check_must_cover_the_whole_access() {
+    assert_eq!(
+        check_ctx(&packet_read_program(13, 12, Size::H), PACKET_CTX)
+            .expect_err("a one-byte-short packet check must fail"),
+        VerifyError::OutOfBounds { at: 5 }
+    );
+}
+
+#[test]
+fn dynamic_region_end_is_not_dereferenceable() {
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 2, 1, 8), ldx(Size::B, 0, 2, 0), EXIT,],
+            PACKET_CTX,
+        )
+        .expect_err("the exclusive end marker must not be readable"),
+        VerifyError::OutOfBounds { at: 1 }
+    );
+}
+
+#[test]
+fn dynamic_region_identity_must_match() {
+    static WRONG_END_CTX: &[ArgDesc] = &[
+        PACKET_CTX[0],
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::MemEnd,
+                key: TypeKey(0x504b_5402),
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::READONLY,
+        },
+    ];
+    assert_eq!(
+        check_ctx(&packet_read_program(14, 12, Size::H), WRONG_END_CTX)
+            .expect_err("an unrelated end pointer must not refine the packet"),
+        VerifyError::OutOfBounds { at: 5 }
+    );
+}
 
 /// An acquiring kfunc: `fn acquire() -> Option<Owned<T>>`.
 fn acquire_kfunc() -> KfuncDesc {

@@ -698,6 +698,33 @@ mod smokes {
         .ok()
     }
 
+    fn ret_xdp_prog(name: &str, v: i32) -> Option<Arc<BpfProg>> {
+        let mut insns: Vec<Insn> = Vec::new();
+        for d in [
+            Decoded::Mov {
+                wide: true,
+                dst: Reg::new(0).expect("r0"),
+                src: Source::Imm(v),
+                sign_extend: None,
+            },
+            Decoded::Exit,
+        ] {
+            insns.extend_from_slice(encode(d).slots());
+        }
+        BpfProg::load_for_xdp(
+            load_cap(),
+            LoadRequest {
+                name: String::from(name),
+                insns,
+                context: Context::Atomic,
+                maps: Vec::new(),
+                map_indices: Vec::new(),
+                load_references: Vec::new(),
+            },
+        )
+        .ok()
+    }
+
     /// `classify()`'s verdict, as a pair of predicates — `Verdict` carries a
     /// payload on `Consumed` and so is not `PartialEq`.
     fn dropped(v: Verdict) -> bool {
@@ -940,7 +967,7 @@ mod smokes {
     fn smoke_bpf_link_drop_detaches_xdp() -> TestResult {
         const IFACE: &str = "bpf-link-xdp0";
         // 1 is Linux's `XDP_DROP`, which `BpfXdp::run` matches on.
-        let Some(prog) = ret_prog("linkxdp", 1, Context::Atomic) else {
+        let Some(prog) = ret_xdp_prog("linkxdp", 1) else {
             return TestResult::Fail("load rejected a trivial atomic program");
         };
         let link = match BpfLink::create(
@@ -979,8 +1006,8 @@ mod smokes {
     fn smoke_bpf_link_second_link_on_an_xdp_target_is_busy() -> TestResult {
         const IFACE: &str = "bpf-link-xdp3";
         let (Some(dropper), Some(passer)) = (
-            ret_prog("linkxdpbusy_d", 1, Context::Atomic),
-            ret_prog("linkxdpbusy_p", 2, Context::Atomic),
+            ret_xdp_prog("linkxdpbusy_d", 1),
+            ret_xdp_prog("linkxdpbusy_p", 2),
         ) else {
             return TestResult::Fail("load rejected a trivial atomic program");
         };
@@ -1016,7 +1043,7 @@ mod smokes {
     /// The XDP hook is `Atomic` too, and this is the check whose absence was
     /// worst.
     ///
-    /// `BpfXdp::run` calls `run_atomic`, which returns `None` for a program
+    /// `BpfXdp::run` calls `run_xdp`, which returns `None` for a program
     /// verified for `Sleepable` — and `None` means "pass the frame", because
     /// dropping traffic when a filter cannot run would turn a resource limit
     /// into a network outage. So without the check the attach *succeeded* and
@@ -1039,12 +1066,12 @@ mod smokes {
         if is_claimed(&LinkTarget::Xdp(String::from(IFACE))) {
             return TestResult::Fail("a refused XDP link left its claim behind");
         }
-        // Nothing may be installed on the interface. A `run_atomic` that
+        // Nothing may be installed on the interface. A `run_xdp` that
         // declines yields `XdpAction::Pass`, which is indistinguishable from
         // "no program" by verdict alone — so this checks the classifier slot
         // through the one thing that *does* differ: a program that would have
         // dropped, attached afterwards, must be the one that runs.
-        let Some(dropper) = ret_prog("linkxdpdrop", 1, Context::Atomic) else {
+        let Some(dropper) = ret_xdp_prog("linkxdpdrop", 1) else {
             return TestResult::Fail("load rejected a trivial atomic program");
         };
         let link = match BpfLink::create(
@@ -1067,10 +1094,9 @@ mod smokes {
     /// An XDP link *does* have an atomic replace, and `BPF_F_REPLACE` guards it.
     fn smoke_bpf_link_update_swaps_the_xdp_program() -> TestResult {
         const IFACE: &str = "bpf-link-xdp1";
-        let (Some(dropper), Some(passer)) = (
-            ret_prog("linkxdp_d", 1, Context::Atomic),
-            ret_prog("linkxdp_p", 2, Context::Atomic),
-        ) else {
+        let (Some(dropper), Some(passer)) =
+            (ret_xdp_prog("linkxdp_d", 1), ret_xdp_prog("linkxdp_p", 2))
+        else {
             return TestResult::Fail("load rejected a trivial atomic program");
         };
         let link = match BpfLink::create(

@@ -39,6 +39,9 @@ Landed:
 - **Extension contracts** — the `kfunc!` and `struct_ops!` macros (Rust-native
   type descriptors, no BTF, no trampoline).
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
+  XDP exposes read-only `data`/`data_end` pointers: packet loads require a
+  verifier-proved dynamic bound and are independently slice-bounded by the
+  interpreter.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with
@@ -48,11 +51,13 @@ Landed:
   load-provenance metadata, bounded verifier logs, native raw-tracepoint program
   loads and named opens, fd-gated runtime statistics, recursion-miss accounting,
   prog-query, task-fd-query, and iterators.
+  XDP test-run translates `data_in` into a kernel-owned immutable frame rather
+  than accepting caller-authored native context pointers.
 
-Residual: JIT lowering of arena atomics and arena access under a subprogram call
-(register-allocation blockers — these fall back to the interpreter); optional
-direct typed-field loads (mediated typed tracing has landed); and the non-PKS
-hardware domain-confinement backends (below).
+Residual: JIT lowering of fetching bitwise arena atomics and arena access under
+a subprogram call (register-allocation blockers — these fall back to the
+interpreter); optional direct typed-field loads (mediated typed tracing has
+landed); and the non-PKS hardware domain-confinement backends (below).
 
 The JIT is enabled **behind the verifier**: the interpreter's safety came from
 never dereferencing a program-supplied address, and native code trades that for
