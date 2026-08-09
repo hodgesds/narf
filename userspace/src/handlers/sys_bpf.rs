@@ -40,7 +40,7 @@ use super::*;
 use narf_bpf::map::{
     BpfMap, BpfMapCap, MapAccess, MapAttr, MapError, MapFile, MapKind,
 };
-use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest, ProgFile};
+use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadMetadata, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 
@@ -473,7 +473,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         Err(e) => return e,
     };
 
-    let prog = match BpfProg::load_with_license(
+    let prog = match BpfProg::load_with_metadata(
         load_cap(),
         LoadRequest {
             name,
@@ -483,7 +483,10 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
             map_indices: resolved.map_indices,
             load_references: resolved.load_references,
         },
-        gpl_compatible,
+        LoadMetadata {
+            gpl_compatible,
+            created_by_uid: read_uidgid(current_task_id()).euid,
+        },
     ) {
         Ok(p) => p,
         // Linux returns -EINVAL for a rejected program and puts the reason in

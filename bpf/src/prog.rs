@@ -113,6 +113,10 @@ pub struct BpfProg {
     tag: [u8; PROG_TAG_SIZE],
     /// Whether the load-time license matched Linux's GPL-compatible set.
     gpl_compatible: bool,
+    /// Monotonic nanoseconds since boot when the program finished loading.
+    load_time_ns: u64,
+    /// Effective uid of the task that loaded the program.
+    created_by_uid: u32,
     /// The validated instruction image. Verification does not rewrite
     /// instructions — lowering happens once, in the JIT (spec §1.7).
     insns: Vec<Insn>,
@@ -176,6 +180,15 @@ pub struct BpfProg {
     /// concurrent syscalls. Object identity, not the fd used for the binding,
     /// makes repeated binds idempotent.
     bound_maps: IrqSafeSpinLock<Vec<Arc<crate::map::BpfMap>>>,
+}
+
+/// Linux-visible metadata supplied by a userspace program loader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LoadMetadata {
+    /// Whether the copied license matched Linux's GPL-compatible set.
+    pub gpl_compatible: bool,
+    /// Effective uid of the task issuing `BPF_PROG_LOAD`.
+    pub created_by_uid: u32,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -252,7 +265,7 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, false)
+        Self::load_with_options(cap, req, None, LoadMetadata::default())
     }
 
     /// Verify and load with the compatibility classification of the license
@@ -269,7 +282,31 @@ impl BpfProg {
         req: LoadRequest,
         gpl_compatible: bool,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, gpl_compatible)
+        Self::load_with_metadata(
+            cap,
+            req,
+            LoadMetadata {
+                gpl_compatible,
+                created_by_uid: 0,
+            },
+        )
+    }
+
+    /// Verify and load with metadata captured by a userspace loader.
+    ///
+    /// In-kernel loaders use [`Self::load`]; syscall-shaped loaders use this
+    /// entry point so credential metadata is copied once and remains stable if
+    /// either the loader or a later querying task changes credentials.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`].
+    pub fn load_with_metadata(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        metadata: LoadMetadata,
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_options(cap, req, None, metadata)
     }
 
     /// Verify and load, binding an arena group the program may address.
@@ -304,14 +341,14 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, arenas, false)
+        Self::load_with_options(cap, req, arenas, LoadMetadata::default())
     }
 
     fn load_with_options(
         cap: &Cap<BpfProgLoad, Grant>,
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
-        gpl_compatible: bool,
+        metadata: LoadMetadata,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
@@ -420,7 +457,9 @@ impl BpfProg {
             name: req.name,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             tag,
-            gpl_compatible,
+            gpl_compatible: metadata.gpl_compatible,
+            load_time_ns: narf_time::monotonic_ns(),
+            created_by_uid: metadata.created_by_uid,
             insns: req.insns,
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
@@ -501,6 +540,20 @@ impl BpfProg {
     #[must_use]
     pub const fn gpl_compatible(&self) -> bool {
         self.gpl_compatible
+    }
+
+    /// Monotonic nanoseconds since boot when this program finished loading.
+    #[inline]
+    #[must_use]
+    pub const fn load_time_ns(&self) -> u64 {
+        self.load_time_ns
+    }
+
+    /// Effective uid captured from the task that loaded this program.
+    #[inline]
+    #[must_use]
+    pub const fn created_by_uid(&self) -> u32 {
+        self.created_by_uid
     }
 
     /// The map named by this file descriptor, or `None`.

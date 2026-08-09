@@ -2856,6 +2856,8 @@ const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
 const PI_JITED_PROG_INSNS: usize = 24;
 const PI_XLATED_PROG_INSNS: usize = 32;
+const PI_LOAD_TIME: usize = 40;
+const PI_CREATED_BY_UID: usize = 48;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
@@ -2998,6 +3000,13 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         if &info[PI_NAME..PI_NAME + 4] != b"abit" || info[PI_NAME + 4] != 0 {
             return Err("bpf_prog_info.name is not the NUL-padded load-time name");
         }
+        let load_time = info_u64(&info, PI_LOAD_TIME);
+        if load_time == 0 {
+            return Err("bpf_prog_info.load_time is zero");
+        }
+        if info_u32(&info, PI_CREATED_BY_UID) != 0 {
+            return Err("bpf_prog_info.created_by_uid did not capture the root loader");
+        }
         if info_u64(&info, PI_RUN_CNT) != 0 {
             return Err("bpf_prog_info.run_cnt is non-zero for a program never run");
         }
@@ -3017,6 +3026,9 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
         if r != Some(0) {
             return Err("second BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u64(&info, PI_LOAD_TIME) != load_time {
+            return Err("bpf_prog_info.load_time changed between queries");
         }
         // A program the JIT declined reports 0; one it compiled reports the
         // emitted byte count. Either is correct — what is not is a non-zero

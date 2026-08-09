@@ -313,6 +313,16 @@ metadata rather than a second helper allowlist. If a future kfunc gains such a
 policy, it must consume this stored classification during verification rather
 than re-reading mutable userspace memory.
 
+### 3.10 Program provenance metadata
+
+Every successful load records its completion time in monotonic nanoseconds
+since boot. A Linux-shaped `BPF_PROG_LOAD` additionally snapshots the loader's
+effective uid in `LoadMetadata`; later credential changes cannot rewrite the
+program's provenance. `BpfProg::load_time_ns()` and
+`BpfProg::created_by_uid()` expose the immutable values through
+`bpf_prog_info.load_time` and `created_by_uid`. Direct in-kernel loaders have
+no userspace credential and therefore use uid 0.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches
