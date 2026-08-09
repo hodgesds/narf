@@ -47,6 +47,32 @@ pub const MAX_INSNS: usize = 1 << 16;
 /// Bytes Linux exposes as a program tag.
 pub const PROG_TAG_SIZE: usize = 8;
 
+/// Linux `BPF_PROG_TYPE_XDP`.
+pub const BPF_PROG_TYPE_XDP: u32 = 6;
+
+const XDP_PACKET_KEY: narf_bpf_verifier::TypeKey = narf_bpf_verifier::TypeKey(
+    narf_bpf_verifier::kfunc::fnv1a32_nonzero("narf_bpf::xdp_packet"),
+);
+
+const XDP_CTX: [narf_bpf_verifier::ArgDesc; 2] = [
+    narf_bpf_verifier::ArgDesc {
+        kind: narf_bpf_verifier::TypeKind::Ptr {
+            kind: narf_bpf_verifier::PtrKind::Mem,
+            key: XDP_PACKET_KEY,
+        },
+        domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
+        flags: narf_bpf_verifier::ArgFlags::READONLY,
+    },
+    narf_bpf_verifier::ArgDesc {
+        kind: narf_bpf_verifier::TypeKind::Ptr {
+            kind: narf_bpf_verifier::PtrKind::MemEnd,
+            key: XDP_PACKET_KEY,
+        },
+        domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
+        flags: narf_bpf_verifier::ArgFlags::READONLY,
+    },
+];
+
 /// Why loading failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -65,6 +91,8 @@ pub enum LoadError {
     TypedProbeRequiresAtomic,
     /// The Rust probe object cannot be represented by the verifier schema.
     TypedProbeTooLarge,
+    /// XDP frames are borrowed only for an atomic classifier callback.
+    XdpRequiresAtomic,
 }
 
 impl From<CapError> for LoadError {
@@ -335,6 +363,29 @@ impl BpfProg {
         Self::load_with_options(cap, req, None, metadata, None)
     }
 
+    /// Verify and load against the XDP `data` / `data_end` context.
+    ///
+    /// The program may read frame bytes only after the verifier proves a
+    /// dominating comparison against the paired exclusive end pointer.
+    pub fn load_for_xdp(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+    ) -> Result<Arc<Self>, LoadError> {
+        if req.context != Context::Atomic {
+            return Err(LoadError::XdpRequiresAtomic);
+        }
+        Self::load_with_options(
+            cap,
+            req,
+            None,
+            LoadMetadata {
+                linux_prog_type: Some(BPF_PROG_TYPE_XDP),
+                ..LoadMetadata::default()
+            },
+            None,
+        )
+    }
+
     /// Verify and load, binding an arena group the program may address.
     ///
     /// A separate entry point rather than a field on [`LoadRequest`]: that struct
@@ -413,6 +464,10 @@ impl BpfProg {
         typed_probe: Option<TypedProbeLayout>,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
+        let xdp = metadata.linux_prog_type == Some(BPF_PROG_TYPE_XDP);
+        if xdp && req.context != Context::Atomic {
+            return Err(LoadError::XdpRequiresAtomic);
+        }
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
             return Err(LoadError::BadSize(req.insns.len()));
         }
@@ -478,6 +533,8 @@ impl BpfProg {
             // scalars.
             ctx_fields: if typed_probe.is_some() {
                 &typed_ctx_storage
+            } else if xdp {
+                &XDP_CTX
             } else {
                 &CTX_SCALARS
             },
@@ -887,10 +944,38 @@ impl BpfProg {
         // Only `run_typed_probe` may construct that context; admitting a raw
         // caller here would let it forge the wrapper pointer before the
         // runtime mediator had a chance to validate anything.
-        if self.typed_probe.is_some() {
+        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
             return None;
         }
         self.run_atomic_inner(ctx, ctx_len)
+    }
+
+    /// Run an XDP program against one live, read-only receive frame.
+    pub(crate) fn run_xdp(&self, frame: &[u8]) -> Option<Outcome> {
+        if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
+            return None;
+        }
+        let range = frame.as_ptr_range();
+        self.run_atomic_inner_with_region(
+            [range.start as u64, range.end as u64, 0, 0],
+            2,
+            Some(frame),
+        )
+    }
+
+    /// Run the XDP path through the interpreter for kernel differential tests.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn run_xdp_interpreted(&self, frame: &[u8]) -> Option<Outcome> {
+        if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
+            return None;
+        }
+        let range = frame.as_ptr_range();
+        let _confined = crate::domain::enter();
+        self.run_atomic_interpreted_inner(
+            [range.start as u64, range.end as u64, 0, 0],
+            2,
+            Some(frame),
+        )
     }
 
     /// Run against the live wrapper supplied by synchronous typed dispatch.
@@ -902,6 +987,15 @@ impl BpfProg {
     }
 
     fn run_atomic_inner(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+        self.run_atomic_inner_with_region(ctx, ctx_len, None)
+    }
+
+    fn run_atomic_inner_with_region(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+        readonly_region: Option<&[u8]>,
+    ) -> Option<Outcome> {
         // Confine the whole run to the BPF hardware domain: a verifier or JIT
         // escape that stores into another subsystem's domain (the cap table, the
         // scheduler, a driver) takes a protection-key fault rather than
@@ -926,7 +1020,7 @@ impl BpfProg {
                 return self.run_atomic_native(ctx, ctx_len, slot_base);
             }
         }
-        self.run_atomic_interpreted_inner(ctx, ctx_len)
+        self.run_atomic_interpreted_inner(ctx, ctx_len, readonly_region)
     }
 
     /// Run interpreted, whatever `self.jit` holds.
@@ -941,16 +1035,17 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
-        if self.typed_probe.is_some() {
+        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
             return None;
         }
-        self.run_atomic_interpreted_inner(ctx, ctx_len)
+        self.run_atomic_interpreted_inner(ctx, ctx_len, None)
     }
 
     fn run_atomic_interpreted_inner(
         &self,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
+        readonly_region: Option<&[u8]>,
     ) -> Option<Outcome> {
         if self.context != Context::Atomic {
             return None;
@@ -985,6 +1080,9 @@ impl BpfProg {
         )
         .with_arenas(self.arenas())
         .with_map_indices(&self.map_indices);
+        if let Some(region) = readonly_region {
+            vm = vm.with_readonly_region(region);
+        }
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
         let stats_start = crate::stats::run_start();

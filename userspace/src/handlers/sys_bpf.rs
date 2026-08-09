@@ -141,6 +141,7 @@ const T_CTX_IN: usize = 48;
 const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
+const BPF_PROG_TYPE_XDP: u32 = 6;
 
 /// The `Cap<BpfProgLoad, Grant>` this handler presents.
 ///
@@ -516,9 +517,11 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     // is verified *for*, and attaching to a hook that provides the other one
     // is rejected by type at attach (spec §4.5).
     let context = match prog_type {
-        BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => Context::Atomic,
+        BPF_PROG_TYPE_XDP | BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => {
+            Context::Atomic
+        }
         BPF_PROG_TYPE_SYSCALL => Context::Sleepable,
-        // LINUX-GAP: socket filters, XDP, cgroup hooks, LSM, struct_ops, and
+        // LINUX-GAP: socket filters, cgroup hooks, LSM, struct_ops, and
         // the rest arrive with their attach surfaces in Phase 5/6.
         _ => return -ENOTSUP,
     };
@@ -639,6 +642,14 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
         return -EINVAL;
     };
     let prog = file.prog();
+    // XDP context pointers are kernel addresses borrowed from the classifier,
+    // never caller-provided words. A generic ctx_in test run could otherwise
+    // forge both ends of a native bare dereference. XDP test-run support needs
+    // the data_in ABI to build a real frame and is deliberately refused until
+    // that translation exists.
+    if prog.linux_prog_type() == Some(BPF_PROG_TYPE_XDP) {
+        return -ENOTSUP;
+    }
 
     // The context tuple. Linux's `ctx_in` is a program-type-specific struct;
     // for NARF's probe context it is the `[u64; 4]` the probe ABI already

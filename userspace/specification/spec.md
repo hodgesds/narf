@@ -459,6 +459,19 @@ reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
 
+### 3.3 BPF XDP program compatibility
+
+`BPF_PROG_LOAD` accepts Linux program type 6 (`BPF_PROG_TYPE_XDP`) and records
+that type as object identity distinct from tracing programs even though both
+execute atomically. Only an XDP program may attach to `BPF_XDP`; tracing,
+raw-tracepoint, and sleepable programs receive `EINVAL` on a valid XDP target.
+The runtime context is kernel-constructed packet `data` / `data_end`, not a
+caller-supplied `ctx_in`. Consequently `BPF_PROG_TEST_RUN` on an XDP program
+returns `EOPNOTSUPP` until the Linux `data_in` packet translation is implemented;
+accepting arbitrary context words would let a caller forge native pointer
+bounds. Packet reads and their verifier/runtime contract are owned by
+`bpf/specification/spec.md` §3.15.
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

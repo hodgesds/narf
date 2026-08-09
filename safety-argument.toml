@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "e9eec650e484f39d69be916769bf6f9aa50e8e25c4d5a5f9c7d59de97330e6b1"
+prompt_hash = "6e7ecf10083ec035057bdce834a72bbe2bffae8df9383ed10eb06c78dd70944b"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -231,3 +231,11 @@ argument = "The frame edit only force-links the optional narf-bpf-leds seam and 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "narf_led_submit accepts scalars only and, in atomic BPF context, performs a bounded sequence of atomic operations into fixed FRAME-visible storage. Device lookup, allocation, trigger locking, and potentially sleepable hardware access occur later in one Stage::Late worker. Unknown actions fail with EINVAL, queue saturation fails with EAGAIN, full-width invalid indices remain drain-time no-ops, and the kfunc neither dereferences program pointers nor changes capability or domain rights."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Dynamic packet bounds change only the existing untrusted BPF verifier/runtime and Linux-compat attach path; no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model code is modified, and no subsystem is added to the documented TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "An XDP packet address is constructed only from the classifier's live immutable frame borrow after a BpfAttach-authorized type-correct attach. The verifier requires a same-provenance unsigned data/data_end comparison covering the complete access; raw-context execution is refused; the interpreter independently checks the exact slice; and native code is admitted only at the verifier-certified site. Execution remains inside the existing FRAME+BPF PKS mask, so the feature exposes RX bytes reachable there and grants no access to driver-private state or any additional domain."

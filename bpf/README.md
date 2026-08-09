@@ -39,6 +39,9 @@ Landed:
 - **Extension contracts** — the `kfunc!` and `struct_ops!` macros (Rust-native
   type descriptors, no BTF, no trampoline).
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
+  XDP exposes read-only `data`/`data_end` pointers: packet loads require a
+  verifier-proved dynamic bound and are independently slice-bounded by the
+  interpreter.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with

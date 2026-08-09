@@ -60,6 +60,10 @@ pub enum PtrClass {
     /// An untyped bounded byte region — what `&[u8]` lowers to, and what a
     /// caller's stack region looks like from inside a subprogram.
     Mem,
+    /// Exclusive end marker for a dynamically-sized [`Self::Mem`] region.
+    /// Comparable to a `Mem` pointer carrying the same key, never
+    /// dereferenceable.
+    MemEnd,
     /// A typed kernel object. Opaque: its fields are reachable only through a
     /// fault-recoverable probe load, because NARF has no in-kernel BTF and
     /// therefore no field layout to check against.
@@ -107,7 +111,8 @@ impl PtrClass {
 pub struct PtrVal {
     /// What kind of region.
     pub class: PtrClass,
-    /// Which type/schema, for [`PtrClass::Object`] and [`PtrClass::TraceObject`].
+    /// Which type/schema, or dynamic-region identity for a paired
+    /// [`PtrClass::Mem`] / [`PtrClass::MemEnd`].
     pub key: TypeKey,
     /// How long it stays valid.
     pub domain: ValidityDomain,

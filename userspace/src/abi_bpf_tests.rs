@@ -34,6 +34,7 @@ const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+const BPF_PROG_TYPE_XDP: u32 = 6;
 
 /// A `union bpf_attr` big enough for `prog_load` and `test`.
 const ATTR_LEN: usize = 160;
@@ -57,6 +58,32 @@ fn ret_imm(v: i32) -> [u8; 16] {
     p[4..8].copy_from_slice(&v.to_le_bytes());
     // BPF_JMP | BPF_EXIT = 0x95.
     p[8] = 0x95;
+    p
+}
+
+/// XDP: prove bytes 0..14 against `data_end`, then drop only when byte 12 is
+/// `0x11`. Hand-encoded to keep this an ABI test independent of the assembler.
+fn xdp_bounded_byte_program() -> [u8; 96] {
+    let mut p = [0u8; 96];
+    let mut put = |i: usize, code: u8, dst: u8, src: u8, off: i16, imm: i32| {
+        let at = i * 8;
+        p[at] = code;
+        p[at + 1] = (src << 4) | dst;
+        p[at + 2..at + 4].copy_from_slice(&off.to_le_bytes());
+        p[at + 4..at + 8].copy_from_slice(&imm.to_le_bytes());
+    };
+    put(0, 0x79, 2, 1, 0, 0); // r2 = ctx[0] (data)
+    put(1, 0x79, 3, 1, 8, 0); // r3 = ctx[1] (data_end)
+    put(2, 0xbf, 4, 2, 0, 0); // r4 = r2
+    put(3, 0x07, 4, 0, 0, 14); // r4 += 14
+    put(4, 0x2d, 4, 3, 5, 0); // if r4 > r3 -> pass
+    put(5, 0x71, 1, 2, 12, 0); // r1 = *(u8 *)(r2 + 12)
+    put(6, 0xb7, 0, 0, 0, 2); // XDP_PASS
+    put(7, 0x55, 1, 0, 1, 0x11); // if r1 != 0x11 -> exit
+    put(8, 0xb7, 0, 0, 0, 1); // XDP_DROP
+    put(9, 0x95, 0, 0, 0, 0);
+    put(10, 0xb7, 0, 0, 0, 2); // short frame: XDP_PASS
+    put(11, 0x95, 0, 0, 0, 0);
     p
 }
 
@@ -5191,24 +5218,55 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
             .map(|i| i as u32 + 2)
             .ok_or("the registered interface is not in the snapshot")?;
 
-        // 1 is Linux's `XDP_DROP`.
-        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let fd = load_prog(BPF_PROG_TYPE_XDP, &xdp_bounded_byte_program()).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("BPF_PROG_LOAD rejected a trivial program");
         }
+        let mut test = [0u8; ATTR_LEN];
+        put_u32(&mut test, 0, fd as u32);
+        if bpf(BPF_PROG_TEST_RUN, &test) != Some(EOPNOTSUPP) {
+            return Err("XDP test-run accepted a caller-forged pointer context");
+        }
+        let tracing_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1))
+            .ok_or("tracing BPF_PROG_LOAD was not Ok")?;
+        if tracing_fd < 0
+            || bpf(
+                BPF_LINK_CREATE,
+                &link_attr(tracing_fd as u32, ifindex, BPF_XDP),
+            ) != Some(EINVAL)
+        {
+            return Err("a tracing program attached to the XDP hook");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(fd as u32, fresh_probe(), BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("an XDP program attached to a tracing hook");
+        }
+        let _ = call(Syscall::Close.raw(), a0(tracing_fd as u64));
         let link_fd =
             bpf(BPF_LINK_CREATE, &link_attr(fd as u32, ifindex, BPF_XDP)).ok_or("bpf() not Ok")?;
         if link_fd < 0 {
             return Err("BPF_LINK_CREATE on a registered interface's ifindex failed");
         }
 
-        let frame = [0u8; 64];
+        let mut frame = [0u8; 64];
+        frame[12] = 0x11;
         if !matches!(classify(IFACE, &frame), Verdict::Dropped) {
-            return Err("the linked XDP program did not drop the frame");
+            return Err("the linked XDP program did not read and drop the matching frame");
+        }
+        frame[12] = 0x22;
+        if !matches!(classify(IFACE, &frame), Verdict::PassThrough) {
+            return Err("the bounded XDP read did not distinguish packet bytes");
+        }
+        if !matches!(classify(IFACE, &[0u8; 3]), Verdict::PassThrough) {
+            return Err("the XDP data_end guard did not pass a short frame");
         }
         if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
             return Err("closing the link fd failed");
         }
+        frame[12] = 0x11;
         if !matches!(classify(IFACE, &frame), Verdict::PassThrough) {
             return Err("frames were still dropped after the link fd was closed");
         }
@@ -6053,7 +6111,7 @@ fn smoke_bpf_syscall_link_info_xdp() -> TestResult {
             .map(|i| i as u32 + 2)
             .ok_or("the registered interface is not in the snapshot")?;
 
-        let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let fd = load_prog(BPF_PROG_TYPE_XDP, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("BPF_PROG_LOAD rejected a trivial program");
         }

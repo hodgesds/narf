@@ -364,6 +364,11 @@ pub struct Vm<'a> {
     maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
     /// Sparse `bpf_attr.prog_load.fd_array` positions for map-index loads.
     map_indices: &'a [crate::prog::IndexedMap],
+    /// One hook-owned, read-only byte region whose real address is exposed in
+    /// the context (currently an XDP frame). The verifier admits reads only
+    /// after a `data`/`data_end` comparison; this runtime bound independently
+    /// keeps the interpreter from dereferencing any other kernel address.
+    readonly_region: Option<&'a [u8]>,
     /// The ring buffer a live `bpf_ringbuf_reserve` targets, or `None` when no
     /// reservation is outstanding. Holding the `Arc` keeps the ring alive for
     /// the reservation even if the program's own reference were somehow
@@ -430,6 +435,7 @@ impl<'a> Vm<'a> {
             arenas: &[],
             maps,
             map_indices: &[],
+            readonly_region: None,
             reserve_map: None,
             reserve_len: 0,
             reserve_buf: [0u8; MAX_RESERVE],
@@ -453,6 +459,13 @@ impl<'a> Vm<'a> {
     #[must_use]
     pub fn with_map_indices(mut self, indices: &'a [crate::prog::IndexedMap]) -> Self {
         self.map_indices = indices;
+        self
+    }
+
+    /// Bind the hook-owned byte region named by a dynamic context pair.
+    #[must_use]
+    pub fn with_readonly_region(mut self, bytes: &'a [u8]) -> Self {
+        self.readonly_region = Some(bytes);
         self
     }
 
@@ -651,6 +664,19 @@ impl<'a> Vm<'a> {
                 let shift = (off % 8) * 8;
                 let raw = word >> shift;
                 return Ok(widen(raw, size, signed));
+            }
+        }
+        if let Some(bytes) = self.readonly_region {
+            let base = bytes.as_ptr() as u64;
+            let limit = base.checked_add(bytes.len() as u64);
+            let end = addr.checked_add(len as u64);
+            if let (Some(limit), Some(end)) = (limit, end) {
+                if addr >= base && end <= limit {
+                    let off = (addr - base) as usize;
+                    let mut buf = [0u8; 8];
+                    buf[..len].copy_from_slice(&bytes[off..off + len]);
+                    return Ok(widen(u64::from_le_bytes(buf), size, signed));
+                }
             }
         }
         // Neither region matched, so the only remaining meaning of the value is
