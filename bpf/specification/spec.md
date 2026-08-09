@@ -182,10 +182,29 @@ stays the cap-free fast path.
 
 ### 3.4 Maps
 
-Five native kinds behind an ~8-method trait: `Array`, `Hash`, `PerCpuArray`,
+Five native kinds behind a 9-method trait: `Array`, `Hash`, `PerCpuArray`,
 `PerCpuHash`, `RingBuf`. Everything else Linux makes a map type — LRU, LPM
 tries, bloom filters, queues/stacks, map-in-map, and the graph data-structure
 API — is an arena + kfunc library here, not kernel code.
+
+`BPF_MAP_LOOKUP_AND_DELETE_ELEM` is one map operation, not a userspace-visible
+lookup followed by delete: Hash and PerCpuHash copy the full syscall-width
+value and unlink the node under the same map lock. Arrays and RingBuf return
+`EOPNOTSUPP`, matching Linux's map-type restriction. NARF has no
+BTF-described `bpf_spin_lock` values, so `BPF_F_LOCK` is `EINVAL`. The syscall
+removes the entry before copying the result to userspace; an output `EFAULT`
+therefore may consume the key without returning its value, as on Linux.
+
+Each `MapFile` carries descriptor-local `ReadWrite`, `ReadOnly`, or `WriteOnly`
+syscall access. `BPF_MAP_CREATE`, `BPF_OBJ_GET`, and
+`BPF_MAP_GET_FD_BY_ID` accept Linux's mutually-exclusive `BPF_F_RDONLY` /
+`BPF_F_WRONLY` flags and expose the matching `F_GETFL` mode. Lookup and key
+iteration require read access; update, delete, and freeze require write access;
+lookup-and-delete requires both. Batch commands apply the same matrix. A denied
+operation returns `EPERM` after fd/type resolution and before touching key or
+value pointers. The mode belongs to the file description, not `BpfMap`: pinning,
+info, program load, and `BPF_PROG_BIND_MAP` still address the object itself, and
+reopening a pin creates a fresh descriptor with the requested mode.
 
 `BPF_MAP_FREEZE` is object-wide and one-way for the four keyed kinds. A
 successful call prevents every later syscall update/delete, including the

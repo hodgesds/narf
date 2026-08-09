@@ -13,7 +13,7 @@
 //! * `BPF_PROG_LOAD` (5) — verify and load, returning a program fd.
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
-//! * `BPF_MAP_CREATE` (0), the four element commands (1..=4), batch commands,
+//! * `BPF_MAP_CREATE` (0), the five keyed element commands, batch commands,
 //!   and `BPF_MAP_FREEZE` (22), over the keyed map kinds in `narf_bpf::map`.
 //! * `BPF_PROG_BIND_MAP` (35) — add a map lifetime reference to an already
 //!   loaded program without making the map addressable by its instructions.
@@ -35,7 +35,9 @@
 #[allow(unused_imports)]
 use super::*;
 
-use narf_bpf::map::{BpfMap, BpfMapCap, MapAttr, MapError, MapFile, MapKind};
+use narf_bpf::map::{
+    BpfMap, BpfMapCap, MapAccess, MapAttr, MapError, MapFile, MapKind,
+};
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
@@ -79,6 +81,7 @@ const BPF_MAP_FREEZE: u32 = 22;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
 const BPF_PROG_QUERY: u32 = 16;
 const BPF_TASK_FD_QUERY: u32 = 20;
+const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
 const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
@@ -201,6 +204,7 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_MAP_UPDATE_ELEM => map_update_elem(attr_uptr, size),
         BPF_MAP_DELETE_ELEM => map_delete_elem(attr_uptr, size),
         BPF_MAP_GET_NEXT_KEY => map_get_next_key(attr_uptr, size),
+        BPF_MAP_LOOKUP_AND_DELETE_ELEM => map_lookup_and_delete_elem(attr_uptr, size),
 
         // Batch element commands — `sys_bpf.rs`, built on the same element ops.
         BPF_MAP_LOOKUP_BATCH => map_batch_read(attr_uptr, size, false),
@@ -583,11 +587,49 @@ const ME_FLAGS: usize = 24;
 /// than `EINVAL`.
 const BPF_F_NO_PREALLOC: u32 = 1;
 
+/// Descriptor-local map access flags shared by `BPF_MAP_CREATE`,
+/// `BPF_OBJ_GET`, and `BPF_MAP_GET_FD_BY_ID`.
+pub(crate) const BPF_F_RDONLY: u32 = 1 << 3;
+pub(crate) const BPF_F_WRONLY: u32 = 1 << 4;
+
 /// `BPF_F_ZERO_SEED`.
 ///
 /// Accepted because it is already true: `crate::map`'s hash is unseeded, since
 /// there is no unprivileged BPF for a seed to defend against (spec §4.10).
 const BPF_F_ZERO_SEED: u32 = 64;
+
+pub(crate) fn map_access_from_flags(flags: u32) -> Result<MapAccess, i64> {
+    match flags & (BPF_F_RDONLY | BPF_F_WRONLY) {
+        0 => Ok(MapAccess::ReadWrite),
+        BPF_F_RDONLY => Ok(MapAccess::ReadOnly),
+        BPF_F_WRONLY => Ok(MapAccess::WriteOnly),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// Install one map fd with matching `F_GETFL` and `bpf(2)` access modes.
+pub(crate) fn install_map_fd(map: alloc::sync::Arc<BpfMap>, access: MapAccess) -> i64 {
+    let status_flags = match access {
+        MapAccess::ReadWrite => crate::fd::O_RDWR,
+        MapAccess::ReadOnly => crate::fd::O_RDONLY,
+        MapAccess::WriteOnly => crate::fd::O_WRONLY,
+    };
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+        alloc::sync::Arc::new(MapFile::with_access(map, access));
+    match fd::with_table(current_task_id(), |t| {
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            // Linux's `bpf_map_new_fd` always adds `O_CLOEXEC`: a leaked map
+            // fd is a leaked authority, regardless of its access mode.
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags,
+        })
+    }) {
+        Some(n) => n as i64,
+        None => -EMFILE,
+    }
+}
 
 fn map_create(attr_uptr: u64, size: usize) -> i64 {
     let attr = match read_attr(attr_uptr, size) {
@@ -612,13 +654,20 @@ fn map_create(attr_uptr: u64, size: usize) -> i64 {
     } else {
         0
     };
-    if map_flags & !(BPF_F_NO_PREALLOC | BPF_F_ZERO_SEED) != 0 {
-        // Every remaining flag changes observable behaviour — read-only maps,
-        // mmapability, NUMA placement, LRU tuning — so accepting one silently
+    if map_flags
+        & !(BPF_F_NO_PREALLOC | BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_ZERO_SEED)
+        != 0
+    {
+        // Every remaining flag changes observable behaviour — mmapability,
+        // NUMA placement, LRU tuning — so accepting one silently
         // would be a lie about what the map does. `EINVAL` is what Linux
         // returns for a flag a map type does not support.
         return -EINVAL;
     }
+    let access = match map_access_from_flags(map_flags) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
 
     let map_attr = MapAttr {
         kind,
@@ -642,33 +691,37 @@ fn map_create(attr_uptr: u64, size: usize) -> i64 {
         Err(e) => return -(i64::from(e.errno())),
     };
 
-    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
-        alloc::sync::Arc::new(MapFile::new(map));
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
-            ops,
-            offset: 0,
-            // As for a program fd: Linux's `bpf_map_new_fd` passes `O_CLOEXEC`,
-            // because a leaked map fd is a leaked capability.
-            flags: crate::fd::FD_CLOEXEC,
-            status_flags: 0,
-        })
-    }) {
-        Some(n) => n as i64,
-        None => -EMFILE,
-    }
+    install_map_fd(map, access)
 }
 
-/// Recover the map behind a file descriptor.
-fn map_from_fd(fd: u32) -> Result<alloc::sync::Arc<narf_bpf::map::BpfMap>, i64> {
+/// Recover the map and descriptor-local access behind a file descriptor.
+fn map_file_from_fd(
+    fd: u32,
+) -> Result<(alloc::sync::Arc<narf_bpf::map::BpfMap>, MapAccess), i64> {
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
         _ => return Err(-EBADF_),
     };
-    ops.as_any()
+    let file = ops
+        .as_any()
         .and_then(|a| a.downcast_ref::<MapFile>())
-        .map(MapFile::map)
-        .ok_or(-EINVAL)
+        .ok_or(-EINVAL)?;
+    Ok((file.map(), file.access()))
+}
+
+/// Recover the object without applying descriptor-local syscall permissions.
+/// Program load, program-map binding, pinning, and info queries name the map
+/// object itself; `BPF_F_RDONLY`/`WRONLY` constrain only map syscalls.
+fn map_from_fd(fd: u32) -> Result<alloc::sync::Arc<narf_bpf::map::BpfMap>, i64> {
+    map_file_from_fd(fd).map(|(map, _)| map)
+}
+
+fn require_map_access(access: MapAccess, read: bool, write: bool) -> Result<(), i64> {
+    if (read && !access.can_read()) || (write && !access.can_write()) {
+        Err(-EPERM)
+    } else {
+        Ok(())
+    }
 }
 
 /// Recover the program behind a file descriptor.
@@ -756,9 +809,9 @@ fn enable_stats(attr_uptr: u64, size: usize) -> i64 {
 /// The three fields every element command reads: the map, the key, and the
 /// user pointer for the value or next key.
 ///
-/// Factored out because the four element commands agree on the layout and on
+/// Factored out because the five keyed element commands agree on the layout and on
 /// the order the errnos come in — `EBADF` for the fd before `EFAULT` for the
-/// key — and four copies of that order is how one of them ends up different.
+/// key — and copies of that order are how one of them ends up different.
 struct ElemArgs {
     map: alloc::sync::Arc<narf_bpf::map::BpfMap>,
     key: alloc::vec::Vec<u8>,
@@ -766,14 +819,20 @@ struct ElemArgs {
     flags: u64,
 }
 
-fn elem_args(attr_uptr: u64, size: usize, need_value: bool) -> Result<ElemArgs, i64> {
-    let attr = read_attr(attr_uptr, size)?;
+fn elem_args_from(
+    attr: &[u8; ATTR_BUF],
+    size: usize,
+    need_value: bool,
+    read: bool,
+    write: bool,
+) -> Result<ElemArgs, i64> {
     if size < ME_VALUE + 8 {
         return Err(-EINVAL);
     }
-    let map = map_from_fd(u32_at(&attr, ME_MAP_FD))?;
-    let key_uptr = u64_at(&attr, ME_KEY);
-    let value_uptr = u64_at(&attr, ME_VALUE);
+    let (map, access) = map_file_from_fd(u32_at(attr, ME_MAP_FD))?;
+    require_map_access(access, read, write)?;
+    let key_uptr = u64_at(attr, ME_KEY);
+    let value_uptr = u64_at(attr, ME_VALUE);
     if key_uptr == 0 || (need_value && value_uptr == 0) {
         // Linux takes a NULL key as `EFAULT` from `copy_from_user`, not as
         // `EINVAL` — the exception is `GET_NEXT_KEY`, where NULL means "start
@@ -789,15 +848,26 @@ fn elem_args(attr_uptr: u64, size: usize, need_value: bool) -> Result<ElemArgs, 
         key,
         value_uptr,
         flags: if size >= ME_FLAGS + 8 {
-            u64_at(&attr, ME_FLAGS)
+            u64_at(attr, ME_FLAGS)
         } else {
             0
         },
     })
 }
 
+fn elem_args(
+    attr_uptr: u64,
+    size: usize,
+    need_value: bool,
+    read: bool,
+    write: bool,
+) -> Result<ElemArgs, i64> {
+    let attr = read_attr(attr_uptr, size)?;
+    elem_args_from(&attr, size, need_value, read, write)
+}
+
 fn map_lookup_elem(attr_uptr: u64, size: usize) -> i64 {
-    let a = match elem_args(attr_uptr, size, true) {
+    let a = match elem_args(attr_uptr, size, true, true, false) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -817,7 +887,7 @@ fn map_lookup_elem(attr_uptr: u64, size: usize) -> i64 {
 }
 
 fn map_update_elem(attr_uptr: u64, size: usize) -> i64 {
-    let a = match elem_args(attr_uptr, size, true) {
+    let a = match elem_args(attr_uptr, size, true, false, true) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -837,7 +907,7 @@ fn map_update_elem(attr_uptr: u64, size: usize) -> i64 {
 }
 
 fn map_delete_elem(attr_uptr: u64, size: usize) -> i64 {
-    let a = match elem_args(attr_uptr, size, false) {
+    let a = match elem_args(attr_uptr, size, false, false, true) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -851,6 +921,49 @@ fn map_delete_elem(attr_uptr: u64, size: usize) -> i64 {
     }
 }
 
+/// `BPF_MAP_LOOKUP_AND_DELETE_ELEM` — atomically return and remove one entry.
+///
+/// Linux defines this only for hash-family and queue/stack maps. NARF's native
+/// subset therefore accepts Hash and PerCpuHash and reports `EOPNOTSUPP` for
+/// arrays and ring buffers. The value copy occurs after the map operation, so
+/// an `EFAULT` writing userspace can still leave the entry consumed, matching
+/// Linux's syscall ordering.
+fn map_lookup_and_delete_elem(attr_uptr: u64, size: usize) -> i64 {
+    const END: usize = ME_FLAGS + 8;
+
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < ME_VALUE + 8 || (size > END && attr[END..size].iter().any(|b| *b != 0)) {
+        return -EINVAL;
+    }
+    // `BPF_F_LOCK` is the only Linux-defined bit. NARF has no BTF-described
+    // spin-locked values, so it is invalid here, as are all unknown bits.
+    if u64_at(&attr, ME_FLAGS) != 0 {
+        return -EINVAL;
+    }
+    // The value is output-only. Linux resolves and removes the entry before
+    // touching it, so even a NULL output pointer must not fail early.
+    let a = match elem_args_from(&attr, size, false, true, true) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let mut out = alloc::vec![0u8; a.map.syscall_value_bytes()];
+    let write = match a.map.begin_sys_write() {
+        Ok(w) => w,
+        Err(e) => return -(i64::from(e.errno())),
+    };
+    if let Err(e) = write.lookup_and_delete(&a.key, &mut out) {
+        return -(i64::from(e.errno()));
+    }
+    // SAFETY: range-validated inside `copy_to_user`, which also brackets SMAP.
+    match unsafe { copy_to_user(a.value_uptr, &out) } {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
 fn map_get_next_key(attr_uptr: u64, size: usize) -> i64 {
     let attr = match read_attr(attr_uptr, size) {
         Ok(a) => a,
@@ -859,10 +972,13 @@ fn map_get_next_key(attr_uptr: u64, size: usize) -> i64 {
     if size < ME_VALUE + 8 {
         return -EINVAL;
     }
-    let map = match map_from_fd(u32_at(&attr, ME_MAP_FD)) {
+    let (map, access) = match map_file_from_fd(u32_at(&attr, ME_MAP_FD)) {
         Ok(m) => m,
         Err(e) => return e,
     };
+    if let Err(e) = require_map_access(access, true, false) {
+        return e;
+    }
     let key_uptr = u64_at(&attr, ME_KEY);
     let next_uptr = u64_at(&attr, ME_VALUE);
     if next_uptr == 0 {
@@ -907,10 +1023,13 @@ fn map_freeze(attr_uptr: u64, size: usize) -> i64 {
     if size < 4 || attr[4..size].iter().any(|b| *b != 0) {
         return -EINVAL;
     }
-    let map = match map_from_fd(u32_at(&attr, 0)) {
+    let (map, access) = match map_file_from_fd(u32_at(&attr, 0)) {
         Ok(m) => m,
         Err(e) => return e,
     };
+    if let Err(e) = require_map_access(access, false, true) {
+        return e;
+    }
     match map.freeze() {
         Ok(()) => 0,
         Err(e) => -(i64::from(e.errno())),
@@ -948,10 +1067,13 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
     if size < BA_MAP_FD + 4 {
         return -EINVAL;
     }
-    let map = match map_from_fd(u32_at(&attr, BA_MAP_FD)) {
+    let (map, access) = match map_file_from_fd(u32_at(&attr, BA_MAP_FD)) {
         Ok(m) => m,
         Err(e) => return e,
     };
+    if let Err(e) = require_map_access(access, true, and_delete) {
+        return e;
+    }
     // No batch-level flags, and no per-element `BPF_F_LOCK`: NARF has no
     // spin-locked maps, so any set bit names behaviour that would not happen.
     if u64_at(&attr, BA_FLAGS) != 0 || u64_at(&attr, BA_ELEM_FLAGS) != 0 {
@@ -1076,10 +1198,13 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
     if size < BA_MAP_FD + 4 {
         return -EINVAL;
     }
-    let map = match map_from_fd(u32_at(&attr, BA_MAP_FD)) {
+    let (map, access) = match map_file_from_fd(u32_at(&attr, BA_MAP_FD)) {
         Ok(m) => m,
         Err(e) => return e,
     };
+    if let Err(e) = require_map_access(access, false, true) {
+        return e;
+    }
     if u64_at(&attr, BA_FLAGS) != 0 {
         return -EINVAL;
     }

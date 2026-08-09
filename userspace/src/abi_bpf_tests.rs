@@ -17,6 +17,7 @@ const BPF_PROG_LOAD: u64 = 5;
 const BPF_OBJ_PIN: u64 = 6;
 const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
+const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u64 = 21;
 const BPF_MAP_FREEZE: u64 = 22;
 const BPF_ENABLE_STATS: u64 = 32;
 const BPF_PROG_BIND_MAP: u64 = 35;
@@ -651,6 +652,8 @@ const BPF_EXIST: u64 = 2;
 const BPF_F_LOCK: u64 = 4;
 
 const BPF_F_NO_PREALLOC: u32 = 1;
+const BPF_F_RDONLY: u32 = 1 << 3;
+const BPF_F_WRONLY: u32 = 1 << 4;
 /// `BPF_F_MMAPABLE` — a flag NARF has no implementation of, so it must be
 /// refused rather than silently ignored.
 const BPF_F_MMAPABLE: u32 = 1024;
@@ -829,6 +832,166 @@ fn smoke_abi_bpf_map_create_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_create_neg);
 
+fn smoke_abi_bpf_map_fd_access_modes() -> TestResult {
+    with_setup(|| {
+        let ro = create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_RDONLY)
+            .ok_or("read-only BPF_MAP_CREATE was not Ok")?;
+        let wo = create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_WRONLY)
+            .ok_or("write-only BPF_MAP_CREATE was not Ok")?;
+        if ro < 0 || wo < 0 {
+            return Err("BPF_MAP_CREATE refused an fd access mode");
+        }
+        if create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_RDONLY | BPF_F_WRONLY)
+            != Some(EINVAL)
+        {
+            return Err("BPF_MAP_CREATE accepted both access modes");
+        }
+
+        // The mode is part of the file description as well as the bpf(2)
+        // permission check, so ordinary F_GETFL must report it.
+        const F_GETFL: u64 = 3;
+        const O_ACCMODE: i64 = 3;
+        if call(Syscall::Fcntl.raw(), a2(ro as u64, F_GETFL, 0)) != Some(0) {
+            return Err("F_GETFL did not report O_RDONLY on a read-only map fd");
+        }
+        if call(Syscall::Fcntl.raw(), a2(wo as u64, F_GETFL, 0)).map(|flags| flags & O_ACCMODE)
+            != Some(1)
+        {
+            return Err("F_GETFL did not report O_WRONLY on a write-only map fd");
+        }
+
+        let key = 0u32;
+        let value = 0xAABB_CCDD_EEFF_0011u64;
+        let kptr = (&key) as *const u32 as u64;
+        let vptr = (&value) as *const u64 as u64;
+        let mut out = 0u64;
+        let out_ptr = (&mut out) as *mut u64 as u64;
+        let mut next = u32::MAX;
+
+        if elem(BPF_MAP_LOOKUP_ELEM, ro, kptr, out_ptr, 0) != Some(0)
+            || elem(
+                BPF_MAP_GET_NEXT_KEY,
+                ro,
+                0,
+                (&mut next) as *mut u32 as u64,
+                0,
+            ) != Some(0)
+        {
+            return Err("a read-only map fd refused a read operation");
+        }
+        if elem(BPF_MAP_UPDATE_ELEM, ro, kptr, vptr, BPF_ANY) != Some(-1)
+            || elem(BPF_MAP_DELETE_ELEM, ro, kptr, 0, 0) != Some(-1)
+            || freeze_map(ro) != Some(-1)
+        {
+            return Err("a read-only map fd admitted a write operation");
+        }
+        // Permission is checked after fd resolution but before user pointers.
+        if elem(BPF_MAP_UPDATE_ELEM, ro, 0, 0, BPF_ANY) != Some(-1) {
+            return Err("read-only permission did not precede pointer validation");
+        }
+
+        if elem(BPF_MAP_UPDATE_ELEM, wo, kptr, vptr, BPF_ANY) != Some(0) {
+            return Err("a write-only map fd refused an update");
+        }
+        if elem(BPF_MAP_LOOKUP_ELEM, wo, kptr, out_ptr, 0) != Some(-1)
+            || elem(
+                BPF_MAP_GET_NEXT_KEY,
+                wo,
+                0,
+                (&mut next) as *mut u32 as u64,
+                0,
+            ) != Some(-1)
+        {
+            return Err("a write-only map fd admitted a read operation");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, ro, kptr, out_ptr, 0) != Some(-1)
+            || elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, wo, kptr, out_ptr, 0) != Some(-1)
+        {
+            return Err("lookup-and-delete did not require both permissions");
+        }
+
+        let keys = [key];
+        let mut values = [value];
+        if batch(
+            BPF_MAP_LOOKUP_BATCH,
+            ro,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            values.as_mut_ptr() as u64,
+            1,
+            0,
+        )
+        .0 != Some(0)
+            || batch(
+                BPF_MAP_UPDATE_BATCH,
+                ro,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_ptr() as u64,
+                1,
+                BPF_ANY,
+            )
+            .0 != Some(-1)
+            || batch(
+                BPF_MAP_LOOKUP_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_mut_ptr() as u64,
+                1,
+                0,
+            )
+            .0 != Some(-1)
+            || batch(
+                BPF_MAP_UPDATE_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_ptr() as u64,
+                1,
+                BPF_ANY,
+            )
+            .0 != Some(0)
+        {
+            return Err("batch operations did not enforce their read/write direction");
+        }
+        if batch(
+            BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+            ro,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            values.as_mut_ptr() as u64,
+            1,
+            0,
+        )
+        .0 != Some(-1)
+            || batch(
+                BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_mut_ptr() as u64,
+                1,
+                0,
+            )
+            .0 != Some(-1)
+        {
+            return Err("lookup-and-delete batch did not require both permissions");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(ro as u64));
+        let _ = call(Syscall::Close.raw(), a0(wo as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_fd_access_modes);
+
 // ── array element commands ──────────────────────────────────────────
 
 fn smoke_abi_bpf_map_array_elem_pos() -> TestResult {
@@ -980,6 +1143,7 @@ fn smoke_abi_bpf_map_elem_on_a_non_map_fd() -> TestResult {
             BPF_MAP_UPDATE_ELEM,
             BPF_MAP_DELETE_ELEM,
             BPF_MAP_GET_NEXT_KEY,
+            BPF_MAP_LOOKUP_AND_DELETE_ELEM,
         ] {
             if elem(
                 cmd,
@@ -1123,6 +1287,176 @@ fn smoke_abi_bpf_map_hash_elem_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_hash_elem_neg);
 
+// ── BPF_MAP_LOOKUP_AND_DELETE_ELEM ─────────────────────────────────
+
+fn smoke_abi_bpf_map_lookup_and_delete_elem_pos() -> TestResult {
+    with_setup(|| {
+        for kind in [BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH] {
+            let fd = create_map(kind, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let key: u32 = kind;
+            let cpus = if kind == BPF_MAP_TYPE_PERCPU_HASH {
+                narf_lib::smp::cpu_count().max(1) as usize
+            } else {
+                1
+            };
+            let values: alloc::vec::Vec<u64> = (0..cpus)
+                .map(|cpu| 0x1122_0000_0000_0000 | cpu as u64)
+                .collect();
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                values.as_ptr() as u64,
+                BPF_ANY,
+            ) != Some(0)
+            {
+                return Err("seed update failed");
+            }
+            let mut out = alloc::vec![0u64; cpus];
+            if elem(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(0)
+            {
+                return Err("BPF_MAP_LOOKUP_AND_DELETE_ELEM failed");
+            }
+            if out != values {
+                return Err("lookup-and-delete returned the wrong syscall-width value");
+            }
+            if elem(
+                BPF_MAP_LOOKUP_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("lookup-and-delete left the key live");
+            }
+            if elem(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("lookup-and-delete of an absent key was not ENOENT");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_lookup_and_delete_elem_pos);
+
+fn smoke_abi_bpf_map_lookup_and_delete_elem_neg() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+        let array_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if fd < 0 || array_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let key = 9u32;
+        let value = 0x8877_6655_4433_2211u64;
+        let kptr = (&key) as *const u32 as u64;
+        let vptr = (&value) as *const u64 as u64;
+
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, array_fd, kptr, vptr, 0) != Some(EOPNOTSUPP) {
+            return Err("lookup-and-delete on an Array was not EOPNOTSUPP");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, vptr, BPF_F_LOCK) != Some(EINVAL)
+            || elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, vptr, 8) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted unsupported flags");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, -1, kptr, vptr, 8) != Some(EINVAL) {
+            return Err("lookup-and-delete resolved the fd before validating flags");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, 0, vptr, 0) != Some(EFAULT) {
+            return Err("lookup-and-delete accepted a null key");
+        }
+        // The output pointer is not touched until a key has been found and
+        // consumed, so an absent key wins over the pointer fault.
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, 0, 0) != Some(ENOENT) {
+            return Err("absent lookup-and-delete touched its output pointer");
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, ME_MAP_FD, fd as u32);
+        put_u64(&mut attr, ME_KEY, kptr);
+        put_u64(&mut attr, ME_VALUE, vptr);
+        // Linux zero-extends short attrs. Omitting the flags field is valid;
+        // this key is absent, so the operation reaches the map and says so.
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                (ME_VALUE + 8) as u64,
+            ),
+        ) != Some(ENOENT)
+        {
+            return Err("lookup-and-delete did not zero-extend an omitted flags field");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                (ME_VALUE + 7) as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted a truncated attr");
+        }
+        attr[ME_FLAGS + 8] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted a non-zero attr tail");
+        }
+
+        // Linux removes the element before copying it to userspace. Preserve
+        // that ordering: an output EFAULT consumes the key without returning
+        // its value.
+        if elem(BPF_MAP_UPDATE_ELEM, fd, kptr, vptr, BPF_ANY) != Some(0) {
+            return Err("seed update before output fault failed");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, 0, 0) != Some(EFAULT) {
+            return Err("bad lookup-and-delete output pointer was not EFAULT");
+        }
+        let mut out = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            fd,
+            kptr,
+            (&mut out) as *mut u64 as u64,
+            0,
+        ) != Some(ENOENT)
+        {
+            return Err("output EFAULT did not consume the hash entry");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(array_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_lookup_and_delete_elem_neg);
+
 // ── BPF_MAP_FREEZE ─────────────────────────────────────────────────
 
 fn smoke_abi_bpf_map_freeze_pos() -> TestResult {
@@ -1180,6 +1514,17 @@ fn smoke_abi_bpf_map_freeze_pos() -> TestResult {
             != Some(-1 /* EPERM */)
         {
             return Err("single delete mutated a frozen map");
+        }
+        let mut deleted = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+            fd,
+            (&key) as *const u32 as u64,
+            (&mut deleted) as *mut u64 as u64,
+            0,
+        ) != Some(-1 /* EPERM */)
+        {
+            return Err("lookup-and-delete mutated a frozen map");
         }
         let keys = [key];
         let values = [replacement];
@@ -2220,8 +2565,13 @@ fn next_id(cmd: u64, start: u32) -> (Option<i64>, u32) {
 
 /// `BPF_*_GET_FD_BY_ID`.
 fn fd_by_id(cmd: u64, id: u32) -> Option<i64> {
+    fd_by_id_flags(cmd, id, 0)
+}
+
+fn fd_by_id_flags(cmd: u64, id: u32, flags: u32) -> Option<i64> {
     let mut attr = [0u8; ATTR_LEN];
     put_u32(&mut attr, 0, id);
+    put_u32(&mut attr, 8, flags);
     call(
         Syscall::Bpf.raw(),
         a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
@@ -2776,6 +3126,56 @@ fn smoke_abi_bpf_get_fd_by_id_pos() -> TestResult {
         if map_id_of(map_fd2)? != map_id {
             return Err("the fd obtained by id names a different map");
         }
+        let ro = fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_RDONLY)
+            .ok_or("read-only BPF_MAP_GET_FD_BY_ID was not Ok")?;
+        let wo = fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_WRONLY)
+            .ok_or("write-only BPF_MAP_GET_FD_BY_ID was not Ok")?;
+        if ro < 0 || wo < 0 {
+            return Err("BPF_MAP_GET_FD_BY_ID refused an access mode");
+        }
+        let key = 0u32;
+        let value = 0x1234_5678_9ABC_DEF0u64;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            wo,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("write-only by-id fd could not update its map");
+        }
+        let mut out = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            ro,
+            (&key) as *const u32 as u64,
+            (&mut out) as *mut u64 as u64,
+            0,
+        ) != Some(0)
+            || out != value
+        {
+            return Err("read-only by-id fd did not address the same map");
+        }
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            ro,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(-1)
+            || elem(
+                BPF_MAP_LOOKUP_ELEM,
+                wo,
+                (&key) as *const u32 as u64,
+                (&mut out) as *mut u64 as u64,
+                0,
+            ) != Some(-1)
+        {
+            return Err("by-id access mode was not enforced");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ro as u64));
+        let _ = call(Syscall::Close.raw(), a0(wo as u64));
         let _ = call(Syscall::Close.raw(), a0(map_fd2 as u64));
         let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
@@ -2835,27 +3235,18 @@ fn smoke_abi_bpf_get_fd_by_id_neg() -> TestResult {
         {
             return Err("BPF_PROG_GET_FD_BY_ID ignored a non-zero open_flags");
         }
-        // LINUX-GAP: a map fd *does* take `open_flags` on Linux
-        // (`BPF_F_RDONLY`/`BPF_F_WRONLY`), and NARF has no read-only map fd —
-        // so it must refuse rather than hand back a fully writable one.
+        // Map open flags are a two-value access mode. Unknown bits and asking
+        // for both directions at once are malformed.
         let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
         if map_fd < 0 {
             return Err("BPF_MAP_CREATE failed");
         }
         let map_id = map_id_of(map_fd)?;
-        let mut attr = [0u8; ATTR_LEN];
-        put_u32(&mut attr, 0, map_id);
-        put_u32(&mut attr, 8, 0x0000_0008 /* BPF_F_RDONLY */);
-        if call(
-            Syscall::Bpf.raw(),
-            a2(
-                BPF_MAP_GET_FD_BY_ID,
-                attr.as_mut_ptr() as u64,
-                ATTR_LEN as u64,
-            ),
-        ) != Some(EOPNOTSUPP)
+        if fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, 1) != Some(EINVAL)
+            || fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_RDONLY | BPF_F_WRONLY)
+                != Some(EINVAL)
         {
-            return Err("BPF_MAP_GET_FD_BY_ID with BPF_F_RDONLY did not return ENOTSUP");
+            return Err("BPF_MAP_GET_FD_BY_ID accepted invalid open_flags");
         }
         let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(fd as u64));
@@ -4046,6 +4437,7 @@ const OB_PATH_FD: usize = 16;
 const OB_END: usize = 20;
 
 const BPF_F_RDONLY_FLAG: u32 = 1 << 3;
+const BPF_F_WRONLY_FLAG: u32 = 1 << 4;
 const BPF_F_PATH_FD: u32 = 1 << 14;
 
 /// `F_GETFD`.
@@ -4080,7 +4472,11 @@ fn obj_pin(fd: i64, path: &CPath) -> Option<i64> {
 }
 
 fn obj_get(path: &CPath) -> Option<i64> {
-    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 0))
+    obj_get_flags(path, 0)
+}
+
+fn obj_get_flags(path: &CPath, flags: u32) -> Option<i64> {
+    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, flags, 0))
 }
 
 /// The smallest well-formed BTF blob: a header, one `BTF_KIND_INT` named
@@ -4906,12 +5302,40 @@ fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
             if back != value {
                 return Err("the reopened fd addressed a different map");
             }
+            let ro = obj_get_flags(&path, BPF_F_RDONLY_FLAG)
+                .ok_or("read-only BPF_OBJ_GET was not Ok")?;
+            let wo = obj_get_flags(&path, BPF_F_WRONLY_FLAG)
+                .ok_or("write-only BPF_OBJ_GET was not Ok")?;
+            if ro < 0 || wo < 0 {
+                return Err("BPF_OBJ_GET refused a map access mode");
+            }
+            if elem(BPF_MAP_LOOKUP_ELEM, ro, kptr, bptr, 0) != Some(0)
+                || elem(BPF_MAP_UPDATE_ELEM, ro, kptr, vptr, BPF_ANY) != Some(-1)
+                || elem(BPF_MAP_LOOKUP_ELEM, wo, kptr, bptr, 0) != Some(-1)
+            {
+                return Err("BPF_OBJ_GET did not enforce its requested access mode");
+            }
+            let replacement = 0x1020_3040_5060_7080u64;
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                wo,
+                kptr,
+                (&replacement) as *const u64 as u64,
+                BPF_ANY,
+            ) != Some(0)
+                || elem(BPF_MAP_LOOKUP_ELEM, reopened, kptr, bptr, 0) != Some(0)
+                || back != replacement
+            {
+                return Err("restricted BPF_OBJ_GET fds did not share the pinned map");
+            }
             // The ids agree too — the strongest single statement that one
             // object wears both fds.
             if map_id_of(fd)? != map_id_of(reopened)? {
                 return Err("the reopened fd reports a different map id");
             }
 
+            let _ = call(Syscall::Close.raw(), a0(ro as u64));
+            let _ = call(Syscall::Close.raw(), a0(wo as u64));
             let _ = call(Syscall::Close.raw(), a0(reopened as u64));
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
             Ok(())
@@ -4939,7 +5363,9 @@ fn smoke_abi_bpf_obj_pin_prog_pos() -> TestResult {
             if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
                 return Err("closing the program fd failed");
             }
-            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            // Linux accepts an access flag here but program fds do not carry
+            // map element permissions; the reopened program remains runnable.
+            let reopened = obj_get_flags(&path, BPF_F_RDONLY_FLAG).ok_or("bpf() not Ok")?;
             if reopened < 0 {
                 return Err("BPF_OBJ_GET failed after the creating fd was closed");
             }
@@ -5102,14 +5528,16 @@ fn smoke_abi_bpf_obj_get_neg() -> TestResult {
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 3, 0, 0)) != Some(EINVAL) {
                 return Err("BPF_OBJ_GET with a non-zero bpf_fd did not return EINVAL");
             }
-            // Flags: outside the mask is EINVAL, inside-but-unimplemented is
-            // EOPNOTSUPP. Collapsing the two makes feature detection guesswork.
+            // Flags outside the mask and contradictory access modes are
+            // malformed. One valid access mode proceeds to path resolution.
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 1, 0)) != Some(EINVAL) {
                 return Err("BPF_OBJ_GET accepted a flag outside its mask");
             }
-            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_RDONLY_FLAG, 0)) != Some(EOPNOTSUPP)
-            {
-                return Err("BPF_OBJ_GET with BPF_F_RDONLY did not return EOPNOTSUPP");
+            if obj_get_flags(&path, BPF_F_RDONLY_FLAG | BPF_F_WRONLY_FLAG) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET accepted both access modes");
+            }
+            if obj_get_flags(&path, BPF_F_RDONLY_FLAG) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET did not resolve a path after accepting BPF_F_RDONLY");
             }
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_PATH_FD, 0)) != Some(EOPNOTSUPP) {
                 return Err("BPF_OBJ_GET with BPF_F_PATH_FD did not return EOPNOTSUPP");

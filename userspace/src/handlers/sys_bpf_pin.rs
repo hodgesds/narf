@@ -45,7 +45,7 @@
 //! | the path is not a pin (`GET`)             | EACCES  | `bpf_inode_type` |
 //! | the path does not exist (`GET`)           | ENOENT  | `user_path_at` |
 //! | reserved `file_flags` / stray `path_fd`   | EINVAL  | `CHECK_ATTR` |
-//! | `BPF_F_PATH_FD` / `BPF_F_RDONLY|WRONLY`   | ENOTSUP | — see LINUX-GAPs |
+//! | `BPF_F_PATH_FD`                            | ENOTSUP | — see LINUX-GAP |
 //!
 //! One deliberate ordering divergence: Linux's `user_path_create` reports
 //! `EEXIST` *before* the "is this bpffs?" check, so pinning onto an existing
@@ -269,6 +269,11 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         return -EINVAL;
     }
 
+    let file_flags = u32_at(&attr, OB_FILE_FLAGS);
+    let access = match super::map_access_from_flags(file_flags) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let path = match common_path(
         &attr,
         size,
@@ -277,16 +282,6 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // LINUX-GAP: `BPF_F_RDONLY` / `BPF_F_WRONLY` on the returned fd. Linux
-    // honours them and the fd then refuses the other direction. NARF's
-    // `MapFile` has one mode, so accepting the flag would hand back a fully
-    // writable fd to a caller that asked for a read-only one — a lie about
-    // privilege, which is the one class of lie worth an errno. Same answer
-    // `BPF_MAP_GET_FD_BY_ID` gives for `open_flags`.
-    if u32_at(&attr, OB_FILE_FLAGS) & (BPF_F_RDONLY | BPF_F_WRONLY) != 0 {
-        return -ENOTSUP;
-    }
-
     // Two failure shapes, and Linux distinguishes them: a path that does not
     // resolve is `ENOENT` (`user_path_at`), a path that resolves to something
     // which is not a BPF object is `EACCES` (`bpf_inode_type`). Collapsing them
@@ -307,6 +302,24 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         }
         Err(e) => return e,
     };
+
+    // A pin holds the object, not the access mode of the fd that created it.
+    // Reopening a map therefore gets a fresh `MapFile` with this call's mode.
+    // Linux ignores these mode flags for programs and refuses them for links.
+    if let Some(map_file) = obj
+        .as_any()
+        .and_then(|any| any.downcast_ref::<MapFile>())
+    {
+        return super::install_map_fd(map_file.map(), access);
+    }
+    if obj
+        .as_any()
+        .and_then(|any| any.downcast_ref::<LinkFile>())
+        .is_some()
+        && file_flags & (BPF_F_RDONLY | BPF_F_WRONLY) != 0
+    {
+        return -EINVAL;
+    }
 
     // A *new fd holding its own reference*: the object now survives this fd's
     // close only if the pin (or another fd) still holds it.

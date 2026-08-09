@@ -2940,6 +2940,43 @@ fn smoke_bpf_map_hash_roundtrip() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_map_hash_roundtrip);
 
+fn smoke_bpf_map_hash_lookup_and_delete_is_one_operation() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let key = k32(7);
+        let value = 0xAABB_CCDD_EEFF_0011u64.to_le_bytes();
+        m.ops()
+            .update(&key, &value, BPF_ANY)
+            .map_err(|_| "Hash seed update failed")?;
+        let write = m
+            .begin_sys_write()
+            .map_err(|_| "syscall write was refused")?;
+        let mut out = [0u8; 8];
+        write
+            .lookup_and_delete(&key, &mut out)
+            .map_err(|_| "lookup-and-delete failed")?;
+        if out != value {
+            return Err("lookup-and-delete returned the wrong value");
+        }
+        if m.ops().lookup(&key, &mut out) != Err(MapError::NotFound) {
+            return Err("lookup-and-delete left the key live");
+        }
+        if write.lookup_and_delete(&key, &mut out) != Err(MapError::NotFound) {
+            return Err("lookup-and-delete of an absent key was not NotFound");
+        }
+
+        let array = mk(MapKind::Array, 4, 8, 1).map_err(|_| "Array create failed")?;
+        let array_write = array
+            .begin_sys_write()
+            .map_err(|_| "Array syscall write was refused")?;
+        if array_write.lookup_and_delete(&k32(0), &mut out) != Err(MapError::Unsupported) {
+            return Err("lookup-and-delete on an Array was not Unsupported");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_map_hash_lookup_and_delete_is_one_operation);
+
 fn smoke_bpf_map_hash_flag_policy() -> TestResult {
     checked(|| {
         let m = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;

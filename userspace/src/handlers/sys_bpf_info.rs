@@ -502,11 +502,11 @@ fn map_info(
     put_name(&mut out, MI_NAME, &map.name);
     // Deliberately zero:
     //
-    // LINUX-GAP: `map_flags`. `BpfMap` does not retain the creation flags,
-    // because the only two `BPF_MAP_CREATE` accepts (`BPF_F_NO_PREALLOC`,
-    // `BPF_F_ZERO_SEED`) change nothing about the map that exists — see
-    // `sys_bpf.rs`. Echoing them back would describe a map that differs from
-    // the one NARF built; zero describes the map that was actually made.
+    // LINUX-GAP: persistent `map_flags`. `BPF_F_RDONLY` / `BPF_F_WRONLY` are
+    // descriptor-local and Linux strips them from map info too. The two
+    // object flags NARF accepts (`BPF_F_NO_PREALLOC`, `BPF_F_ZERO_SEED`) change
+    // nothing about the map that exists — see `sys_bpf.rs` — so echoing them
+    // would describe behaviour NARF did not build. Zero describes the object.
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no map offload.
     // LINUX-GAP: `btf_id`, `btf_key_type_id`, `btf_value_type_id`,
     // `btf_vmlinux_value_type_id` — no BTF.
@@ -730,19 +730,19 @@ pub(crate) fn bpf_map_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
     if let Err(e) = check_attr_tail(&attr, GI_MAP_FD_END, size) {
         return e;
     }
-    if size >= GI_OPEN_FLAGS + 4 && u32_at(&attr, GI_OPEN_FLAGS) != 0 {
-        // LINUX-GAP: `BPF_F_RDONLY` / `BPF_F_WRONLY` on a map fd. Linux honours
-        // them and the resulting fd refuses the other direction. NARF's
-        // `MapFile` has one mode, so accepting the flag would hand back a
-        // fully-writable fd to a caller that asked for a read-only one — a lie
-        // about privilege, which is the one class of lie worth an errno.
-        return -ENOTSUP;
+    let flags = u32_at(&attr, GI_OPEN_FLAGS);
+    if flags & !(super::BPF_F_RDONLY | super::BPF_F_WRONLY) != 0 {
+        return -EINVAL;
     }
+    let access = match super::map_access_from_flags(flags) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let id = u32_at(&attr, GI_START_ID);
     let Some(map) = narf_bpf::idreg::maps().get(id) else {
         return -ENOENT;
     };
-    install_fd(alloc::sync::Arc::new(MapFile::new(map)))
+    super::install_map_fd(map, access)
 }
 
 pub(crate) fn bpf_link_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
