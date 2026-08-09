@@ -17,6 +17,47 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::interp::{Outcome, Trap};
 use crate::prog::{BpfProg, BpfProgLoad, LoadRequest};
 
+#[repr(C)]
+struct TypedTraceSample {
+    pid: u32,
+    flags: u32,
+    value: u64,
+}
+
+// SAFETY: both descriptors use `offset_of!`, their widths are the concrete
+// field widths, and the type name is private and unique to this kernel test.
+unsafe impl narf_tracing::TypedProbe for TypedTraceSample {
+    const TYPE_NAME: &'static str = "narf_bpf_test::TypedTraceSample";
+    const FIELDS: &'static [narf_tracing::ProbeField] = &[
+        narf_tracing::ProbeField {
+            name: "pid",
+            offset: core::mem::offset_of!(TypedTraceSample, pid) as u32,
+            size: core::mem::size_of::<u32>() as u32,
+        },
+        narf_tracing::ProbeField {
+            name: "value",
+            offset: core::mem::offset_of!(TypedTraceSample, value) as u32,
+            size: core::mem::size_of::<u64>() as u32,
+        },
+    ];
+}
+
+#[repr(C)]
+struct OtherTypedTraceSample {
+    value: u64,
+}
+
+// SAFETY: as above; this distinct name deliberately produces a different
+// type key for the attach-mismatch check.
+unsafe impl narf_tracing::TypedProbe for OtherTypedTraceSample {
+    const TYPE_NAME: &'static str = "narf_bpf_test::OtherTypedTraceSample";
+    const FIELDS: &'static [narf_tracing::ProbeField] = &[narf_tracing::ProbeField {
+        name: "value",
+        offset: core::mem::offset_of!(OtherTypedTraceSample, value) as u32,
+        size: core::mem::size_of::<u64>() as u32,
+    }];
+}
+
 /// Generated differential fuzzing of the JIT, built on the `diff_run` below.
 ///
 /// A child module rather than a sibling of `tests`, so it reaches the same
@@ -168,6 +209,23 @@ fn load_with_maps(
         },
     )
     .map_err(|_| "load rejected")
+}
+
+fn load_typed<T: narf_tracing::TypedProbe>(
+    name: &str,
+    insns: Vec<Insn>,
+) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
+    BpfProg::load_for_typed_probe::<T>(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from(name),
+            insns,
+            context: Context::Atomic,
+            maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
+        },
+    )
 }
 
 // ── registry ────────────────────────────────────────────────────────
@@ -785,6 +843,100 @@ fn smoke_bpf_probe_attach_fires() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_probe_attach_fires);
+
+fn typed_value_read_program(offset: i32, width: i32) -> Vec<Insn> {
+    // r6 = typed object from ctx[0]
+    // r1/r2 = writable stack destination + width
+    // r3/r4 = object + exact field offset
+    // narf_probe_read(...); return the copied u64
+    asm(&[
+        ldx(6, 1, 0),
+        mov_reg(1, 10),
+        alu_imm(AluOp::Sub, 1, 8),
+        mov_imm(2, width),
+        mov_reg(3, 6),
+        mov_imm(4, offset),
+        call("narf_probe_read"),
+        ldx(0, 10, -8),
+        EXIT,
+    ])
+}
+
+fn smoke_bpf_typed_probe_reads_declared_field() -> TestResult {
+    use narf_tracing::dispatch::{self, ProbeArgs, ProbeHandlerInstall};
+
+    let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
+    let Ok(prog) =
+        load_typed::<TypedTraceSample>("typed-read", typed_value_read_program(value_offset, 8))
+    else {
+        return TestResult::Fail("load rejected an exact typed field read");
+    };
+    if narf_bpf_jit::has_backend() && !prog.is_jited() {
+        return TestResult::Fail("typed field mediator did not reach the native backend");
+    }
+    // The raw execution API must not accept a caller-forged wrapper pointer.
+    if prog.run_atomic([0; 4], 4).is_some() || prog.run_atomic_interpreted([0; 4], 4).is_some() {
+        return TestResult::Fail("typed program accepted a raw context execution");
+    }
+
+    let attach_cap = Cap::<crate::prog::BpfAttach, Grant>::bootstrap();
+    let install_cap = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let probe_id = dispatch::reserve_probe_id();
+    if crate::attach::attach_probe(&attach_cap, &install_cap, probe_id, prog.clone()).is_err() {
+        return TestResult::Fail("typed attach failed");
+    }
+
+    // Neither an ordinary scalar fire nor the wrong Rust schema may run it.
+    dispatch::fire(probe_id, ProbeArgs::one(u64::MAX));
+    dispatch::fire_typed(probe_id, &OtherTypedTraceSample { value: 9 });
+    let sample = TypedTraceSample {
+        pid: 41,
+        flags: 7,
+        value: 0x1122_3344_5566_7788,
+    };
+    dispatch::fire_typed(probe_id, &sample);
+    let _ = crate::attach::detach_probe(&install_cap, probe_id);
+
+    if prog.runs() != 1 || prog.traps() != 0 {
+        return TestResult::Fail("typed dispatch ran the wrong number of times or trapped");
+    }
+    if prog.accumulated() != sample.value {
+        return TestResult::Fail("typed mediator copied the wrong field bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_typed_probe_reads_declared_field);
+
+fn smoke_bpf_typed_probe_rejects_non_field_reads() -> TestResult {
+    let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
+    // A shifted offset and a truncated width are both inside the object, but
+    // neither is one exact declared field. In-object is intentionally not
+    // enough: the schema is the authority boundary.
+    for (offset, width) in [(value_offset + 1, 8), (value_offset, 4)] {
+        match load_typed::<TypedTraceSample>(
+            "typed-bad-field",
+            typed_value_read_program(offset, width),
+        ) {
+            Err(crate::prog::LoadError::Rejected(
+                narf_bpf_verifier::VerifyError::KfuncSignature { .. },
+            )) => {}
+            Err(_) => return TestResult::Fail("bad typed read failed for the wrong reason"),
+            Ok(_) => return TestResult::Fail("non-field typed read passed verification"),
+        }
+    }
+
+    // Direct dereference remains forbidden even for a declared field. The
+    // mediated path is what supplies the independent runtime recheck.
+    let direct = asm(&[ldx(6, 1, 0), ldx(0, 6, value_offset as i16), EXIT]);
+    match load_typed::<TypedTraceSample>("typed-direct", direct) {
+        Err(crate::prog::LoadError::Rejected(narf_bpf_verifier::VerifyError::OpaqueDeref {
+            ..
+        })) => TestResult::Pass,
+        Err(_) => TestResult::Fail("direct typed load failed for the wrong reason"),
+        Ok(_) => TestResult::Fail("direct typed object dereference was accepted"),
+    }
+}
+kernel_test_in!("bpf", smoke_bpf_typed_probe_rejects_non_field_reads);
 
 fn smoke_bpf_probe_attach_rejects_sleepable_program() -> TestResult {
     use narf_tracing::dispatch::{self, ProbeHandlerInstall};
@@ -1876,8 +2028,8 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // under `p.class.is_faulting()`, and the other faulting class,
     // `PtrClass::Object`, returns `OpaqueDeref` before reaching the push. So the
     // `!f.arena` clause is dead through the verifier and stays correct only if
-    // something checks it. Probe reads are what will make it live, and they have
-    // no lowering on either backend — a fault site the emitter did not produce
+    // something checks it. A future non-arena faulting class may make it live;
+    // a fault site the emitter did not produce
     // would be sealed as executable text with no extable entry covering it,
     // which `bpf_extable`'s contract makes fatal by design.
     //
@@ -1885,9 +2037,8 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // the `arena_count != 1` test and the last two do.
     use narf_bpf_verifier::{FaultSite, VerifiedProgram};
     let base = |arena: bool| VerifiedProgram {
-        // A doubleword store through R1, which is an admissible base in a
-        // program with no `call` — so gate 5 is not what refuses any of the
-        // cases below, and each one isolates the gate it names.
+        // A doubleword store whose synthetic verifier certificate makes gate 5
+        // irrelevant, so each case isolates the gate it names.
         insns: asm(&[st_imm(1, 0, 5), mov_imm(0, 1), EXIT]),
         context: Context::Atomic,
         max_stack_bytes: 8,
@@ -1897,6 +2048,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
             dst_reg: Some(0),
             arena,
         }],
+        bare_access_sites: alloc::vec![narf_bpf_verifier::BareAccessSite { insn_index: 0 }],
         subprogs: alloc::vec::Vec::new(),
         uses_arena: arena,
         kfunc_calls: alloc::vec::Vec::new(),
@@ -2642,15 +2794,10 @@ fn smoke_bpf_jit_refuses_a_sleepable_kfunc_call() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_sleepable_kfunc_call);
 
-fn smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program() -> TestResult {
-    // `jit_glue` gate 5. R1 is the context on entry and stays so as long as
-    // nothing can produce another pointer class — but a kfunc return can, and
-    // `r1 = r0` is an ordinary move the verifier will type-check happily
-    // against whatever class R0 holds. Native code would dereference R1
-    // verbatim, so a program containing *any* call loses R1 as a base.
-    //
-    // Both halves, because a gate that refuses everything is not a gate: the
-    // same load must still compile when there is no call to worry about.
+fn smoke_bpf_jit_certifies_context_dereferences_across_calls() -> TestResult {
+    // Gate 5 is flow-sensitive now: the verifier publishes this load as a
+    // concrete context access, so a later kfunc return cannot make its physical
+    // base register ambiguous. Both the no-call and calling forms compile.
     let with_ctx_load = [ldx(0, 1, 0), EXIT];
     let Ok(a) = load("ctx_nocall", asm(&with_ctx_load), Context::Atomic) else {
         return TestResult::Fail("load rejected");
@@ -2664,14 +2811,14 @@ fn smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program() -> TestRes
     let Ok(b) = load("ctx_call", asm(&b_prog), Context::Atomic) else {
         return TestResult::Fail("load rejected");
     };
-    if b.is_jited() {
-        return TestResult::Fail("a context dereference survived into a calling program");
+    if !b.is_jited() && narf_bpf_jit::has_backend() {
+        return TestResult::Fail("a verifier-certified context load did not compile across a call");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "bpf",
-    smoke_bpf_jit_refuses_a_context_dereference_in_a_calling_program
+    smoke_bpf_jit_certifies_context_dereferences_across_calls
 );
 
 fn smoke_bpf_jit_subprog_calls_match_the_interpreter() -> TestResult {

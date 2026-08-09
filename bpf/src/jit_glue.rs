@@ -26,8 +26,8 @@
 //!    [`JitSkip::UsesArena`], which now means "more than one arena".
 //! 3. **No non-arena fault sites.** Relaxed rather than lifted: the verifier
 //!    records an arena access *as* a fault site, so the original gate refused
-//!    every arena program by itself. Probe reads still have no lowering, so a
-//!    fault site that is not an arena access is still a refusal — checked
+//!    every arena program by itself. A non-arena fault site still has no
+//!    lowering, so it remains a refusal — checked
 //!    explicitly so the reason is visible rather than inferred from an error.
 //! 4. ~~No back-edge.~~ **Lifted.** This gate stood in for missing fuel
 //!    emission: the verifier deliberately does not prove termination
@@ -42,17 +42,14 @@
 //!    being academic the day the emitter learned `Call`, which is exactly the
 //!    day this gate's own doc-comment predicted:
 //!
-//!    * In a program with **no call**, R10 and R1 are both safe bases. R10 is
-//!      the frame and cannot be written at all (the verifier rejects it), and
-//!      with no call there is no producer of any pointer class other than the
-//!      entry ones — so R1 is the context, or an offset from the frame copied
-//!      into it, and either lowers correctly to a bare `[base + disp]`.
-//!    * In a program **with** a call, only R10 is. A kfunc return can put an
-//!      arena handle or a map-value pointer in R0, `r1 = r0` is an ordinary
-//!      move, and the verifier will happily prove the resulting access
-//!      in-bounds *for that class* — while native code would dereference the
-//!      register verbatim. Nothing catches that, so R1 stops being admissible
-//!      wholesale.
+//!    * For an ordinary bare load/store/atomic, the verifier publishes the
+//!      instruction in `bare_access_sites` only when its pointer class is the
+//!      bounded BPF stack or the immutable invocation context. The gate checks
+//!      that certificate, not a physical register name. A context pointer may
+//!      therefore be copied to a callee-saved register and survive kfunc calls
+//!      without becoming confused with a kfunc-returned arena/map handle.
+//!      R10 remains a structural exception: the ISA makes it read-only, so it
+//!      is the frame base even in unreachable code the verifier never visits.
 //!    * **An arena access is exempt**, whatever its base, because it does not
 //!      lower to a bare dereference at all — it lowers to the slot-relative
 //!      shape, whose reachable set is the slot's guards. "Which accesses are
@@ -72,11 +69,10 @@
 //!    has only a kfunc return as a producer, so an arena program always contains
 //!    a call, and a call is what withdraws R1.)
 //!
-//!    This is otherwise deliberately conservative: it also refuses programs that
-//!    read their context before calling anything, which is sound but slower than
-//!    it needs to be. Making it precise means the verifier publishing the
-//!    pointer *class* at each access, which it does not today — and until it
-//!    does, "refuse and interpret" is the only answer that cannot be wrong.
+//!    Other pointer classes remain refused unless they have a dedicated lowering
+//!    (the arena case). The certificate is intentionally narrower than “the
+//!    verifier accepted the access”: map-value and generic memory classes may
+//!    need address translation the native backend does not yet provide.
 //!
 //! Anything gated out runs interpreted, which is a complete implementation.
 //!
@@ -156,8 +152,7 @@
 //! are all inside a verified access's reach and all unmapped. A JITed arena
 //! access can therefore fault no matter how the arena is populated, so it
 //! needs an `ExEntry` — which also means gate 3 must relax to "no *non-arena*
-//! fault sites" rather than lift outright, since probe reads have no lowering
-//! either.
+//! fault sites" rather than lift outright.
 //!
 //! Discharged by [`try_compile`]'s `fault_sites.iter().any(|f| !f.arena)` test,
 //! and by the `ExEntry` vector it now builds from `compiled.faults` — where it
@@ -359,35 +354,16 @@ pub enum JitSkip {
     /// arenas is refused for the mirror-image reason: there would be no slot base
     /// to enter the image with.
     UsesArena,
-    /// Has faulting accesses that are not arena accesses — a probe read, which
-    /// has no lowering on either backend.
+    /// Has faulting accesses that are not arena accesses and have no lowering
+    /// on either backend.
     HasFaultSites,
     /// The emitter declined an instruction.
     Unsupported,
     /// Text allocation, writing, registration, or sealing failed.
     TextUnavailable,
-    /// Dereferences a register whose pointer class the emitter cannot certify:
-    /// anything but the frame, or — in a program with no `call` — the context.
+    /// Dereferences an instruction the verifier did not certify as a raw stack
+    /// or context access and the emitter has no dedicated lowering for.
     UncheckedPointerBase,
-}
-
-/// Whether the program contains any `call`.
-///
-/// Load and store bases are admitted differently either side of this, because
-/// a kfunc return is the only way a *new* pointer class enters a register —
-/// see gate 5 in the module docs.
-fn contains_a_call(insns: &[narf_bpf_isa::Insn]) -> Result<bool, JitSkip> {
-    let mut i = 0usize;
-    while i < insns.len() {
-        let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
-            return Err(JitSkip::Unsupported);
-        };
-        if matches!(d, narf_bpf_isa::Decoded::Call(_)) {
-            return Ok(true);
-        }
-        i += width;
-    }
-    Ok(false)
 }
 
 /// Gates 4 and 5, as a single walk.
@@ -399,14 +375,13 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
     use narf_bpf_isa::{Decoded, Reg};
 
     let insns = &v.insns;
-    // Whether R1 is still admissible as a dereference base. It is the context
-    // pointer on entry and stays so as long as nothing can produce another
-    // pointer class — and a kfunc return is exactly that. Whole-program rather
-    // than flow-sensitive: a back-edge can route a call around to an
-    // earlier-indexed access, so "no call *before* this instruction" is not a
-    // property the instruction order can establish.
-    let ctx_base_ok = !contains_a_call(insns)?;
-    let base_ok = |r: Reg| r == Reg::R10 || (r == Reg::R1 && ctx_base_ok);
+    let bare_ok = |at: usize| {
+        u32::try_from(at).ok().is_some_and(|at| {
+            v.bare_access_sites
+                .binary_search_by_key(&at, |site| site.insn_index)
+                .is_ok()
+        })
+    };
     // Which accesses the emitter will give the slot-relative shape. The *same*
     // function the emitter calls, so an instruction cannot be exempt here and
     // lowered as a bare dereference there.
@@ -428,10 +403,10 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
             // A load or store base must be one the emitter can certify. Any
             // other register could hold a class it would lower to a bare
             // dereference.
-            Decoded::Load { src, .. } if !arena_here && !base_ok(src) => {
+            Decoded::Load { src, .. } if !arena_here && src != Reg::R10 && !bare_ok(i) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
-            Decoded::Store { dst, .. } if !arena_here && !base_ok(dst) => {
+            Decoded::Store { dst, .. } if !arena_here && dst != Reg::R10 && !bare_ok(i) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
             // An atomic dereferences its destination exactly as a store does, so
@@ -439,7 +414,7 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
             // cmpxchg the emitter cannot shape simply returns `Unsupported` at
             // emit time and the whole program falls back — this gate only guards
             // the pointer base.
-            Decoded::Atomic { dst, .. } if !arena_here && !base_ok(dst) => {
+            Decoded::Atomic { dst, .. } if !arena_here && dst != Reg::R10 && !bare_ok(i) => {
                 return Err(JitSkip::UncheckedPointerBase)
             }
             _ => {}
@@ -526,7 +501,8 @@ pub fn try_compile(
         return Err(JitSkip::UsesArena);
     }
     // Gate 3, relaxed: an arena access *is* a fault site, so refusing all of
-    // them refuses every arena program. A probe read still has no lowering.
+    // them refuses every arena program. Other fault sites still have no
+    // native lowering.
     if v.fault_sites.iter().any(|f| !f.arena) {
         return Err(JitSkip::HasFaultSites);
     }

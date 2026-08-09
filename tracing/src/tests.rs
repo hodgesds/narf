@@ -159,7 +159,7 @@ fn smoke_tracing_dispatch_fire_routes_handler() -> TestResult {
     impl ProbeHandler for Counter {
         fn fire(&self, args: ProbeArgs) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            SUM.fetch_add(args.0[0], Ordering::Relaxed);
+            SUM.fetch_add(args.words()[0], Ordering::Relaxed);
         }
     }
 

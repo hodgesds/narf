@@ -373,6 +373,7 @@ fn check(insns: &[Insn]) -> Result<crate::VerifiedProgram, VerifyError> {
         ctx_fields: &[],
         kfuncs: &[],
         maps: &[],
+        objects: &[],
     })
 }
 
@@ -458,6 +459,7 @@ fn propagates_malformed_kfunc_descriptors() {
         ctx_fields: &[],
         kfuncs: &kfuncs,
         maps: &[],
+        objects: &[],
     })
     .unwrap_err();
     assert_eq!(err, VerifyError::Kfunc(KfuncError::VoidArgument(0)));
@@ -497,6 +499,53 @@ fn accepts_const_on_a_scalar_argument() {
     assert_eq!(
         desc(ARGS, ArgDesc::VOID, Context::Atomic).validate(),
         Ok(())
+    );
+}
+
+#[test]
+fn kfuncs_cannot_manufacture_trace_object_provenance() {
+    const RET: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::TraceObject,
+            key: TypeKey(1),
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    };
+    assert_eq!(
+        desc(&[], RET, Context::Atomic).validate(),
+        Err(KfuncError::TraceObjectReturn)
+    );
+}
+
+#[test]
+fn generic_trace_objects_require_the_complete_typed_mediator_shape() {
+    static ANY_TRACE_OBJECT: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::TraceObject,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::ANY_TRACE_OBJECT,
+    };
+    static FIELD: ArgDesc = ArgDesc {
+        kind: TypeKind::Scalar {
+            bits: 64,
+            signed: false,
+        },
+        domain: ValidityDomain::Static,
+        flags: ArgFlags::CONST.with(ArgFlags::OBJECT_FIELD_OFFSET),
+    };
+    static OBJECT_ONLY: &[ArgDesc] = &[ANY_TRACE_OBJECT];
+    static FIELD_ONLY: &[ArgDesc] = &[FIELD];
+
+    assert_eq!(
+        desc(OBJECT_ONLY, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::UnpairedTraceObject(0))
+    );
+    assert_eq!(
+        desc(FIELD_ONLY, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::UnpairedFieldOffset(0))
     );
 }
 

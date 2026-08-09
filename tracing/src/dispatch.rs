@@ -118,22 +118,193 @@ pub trait ProbeHandler: Send + Sync + 'static {
     fn fire(&self, args: ProbeArgs);
 }
 
-/// Four-u64 argument bundle. Unused slots are `0`.
+/// One field a [`TypedProbe`] deliberately exposes to tracing programs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProbeField {
+    /// Stable source-level field name, for diagnostics and tooling.
+    pub name: &'static str,
+    /// Byte offset from the start of the object.
+    pub offset: u32,
+    /// Field width in bytes. Typed BPF reads require an exact match.
+    pub size: u32,
+}
+
+/// A Rust type whose selected fields may be read by a typed tracing program.
+///
+/// # Safety
+///
+/// Every field must lie wholly inside `Self`, and its offset/size must describe
+/// the bytes named by `name`. Every exposed byte must be initialized and must
+/// not be mutated, including through interior mutability, for the synchronous
+/// duration of [`fire_typed`]. `TYPE_NAME` must be unique kernel-wide. The
+/// mediated copy path checks the descriptor again at runtime, but it cannot
+/// prove that an unsafe implementation described the intended Rust field.
+pub unsafe trait TypedProbe: 'static {
+    /// Stable kernel-wide type name.
+    const TYPE_NAME: &'static str;
+    /// Stable identity used by the BPF verifier and attach adapter.
+    const TYPE_KEY: u32 = type_key(Self::TYPE_NAME);
+    /// The only fields tracing programs may read.
+    const FIELDS: &'static [ProbeField];
+}
+
+/// FNV-1a identity shared with BPF's Rust-native type descriptors.
+#[must_use]
+pub const fn type_key(name: &str) -> u32 {
+    let bytes = name.as_bytes();
+    let mut hash = 0x811C_9DC5u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+/// Borrowed typed object passed only for the synchronous duration of
+/// [`fire_typed`].
+#[derive(Debug)]
+pub struct TypedProbeRef {
+    type_key: u32,
+    data: *const u8,
+    len: usize,
+    fields: &'static [ProbeField],
+}
+
+impl TypedProbeRef {
+    /// Stable schema identity.
+    #[must_use]
+    pub const fn type_key(&self) -> u32 {
+        self.type_key
+    }
+
+    /// Size of the borrowed Rust object.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the object has no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Declared readable fields.
+    #[must_use]
+    pub const fn fields(&self) -> &'static [ProbeField] {
+        self.fields
+    }
+
+    /// Opaque context word consumed by the BPF typed-probe adapter.
+    #[must_use]
+    pub fn as_context_word(&self) -> u64 {
+        self as *const Self as u64
+    }
+
+    /// Copy one exactly-declared field into `dst`.
+    ///
+    /// Both the field boundary and the whole-object boundary are checked here,
+    /// after verification, so a verifier bug cannot turn a tracing read into
+    /// an out-of-object kernel read.
+    pub fn copy_field(&self, offset: u64, dst: &mut [u8]) -> bool {
+        let Ok(offset32) = u32::try_from(offset) else {
+            return false;
+        };
+        let Ok(size32) = u32::try_from(dst.len()) else {
+            return false;
+        };
+        if !self
+            .fields
+            .iter()
+            .any(|f| f.offset == offset32 && f.size == size32)
+        {
+            return false;
+        }
+        let Some(end) = (offset as usize).checked_add(dst.len()) else {
+            return false;
+        };
+        if end > self.len {
+            return false;
+        }
+        // SAFETY: `fire_typed` constructed this wrapper from a live `&T` and
+        // invokes handlers synchronously before returning. The unsafe
+        // `TypedProbe` contract plus the checks above prove this exact range is
+        // inside `T`; `dst` is independently verifier-bounded by the kfunc ABI.
+        unsafe {
+            core::ptr::copy(self.data.add(offset as usize), dst.as_mut_ptr(), dst.len());
+        }
+        true
+    }
+}
+
+/// Four-u64 scalar arguments or one borrowed typed object.
+///
+/// The representation is private so an ordinary probe cannot forge the typed
+/// marker around an arbitrary kernel pointer. Scalar observers see zero words
+/// for a typed fire; the object address is available only through
+/// [`Self::typed`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProbeArgs(pub [u64; 4]);
+pub struct ProbeArgs {
+    words: [u64; 4],
+    typed: usize,
+}
 
 impl ProbeArgs {
     #[inline]
     pub const fn none() -> Self {
-        Self([0; 4])
+        Self {
+            words: [0; 4],
+            typed: 0,
+        }
     }
     #[inline]
     pub const fn one(a: u64) -> Self {
-        Self([a, 0, 0, 0])
+        Self {
+            words: [a, 0, 0, 0],
+            typed: 0,
+        }
     }
     #[inline]
     pub const fn two(a: u64, b: u64) -> Self {
-        Self([a, b, 0, 0])
+        Self {
+            words: [a, b, 0, 0],
+            typed: 0,
+        }
+    }
+
+    /// Scalar tuple. Typed fires deliberately return zeros here.
+    #[inline]
+    #[must_use]
+    pub const fn words(self) -> [u64; 4] {
+        self.words
+    }
+
+    /// Borrowed typed object, if this came from [`fire_typed`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must be executing synchronously inside the observer or
+    /// handler invocation that received this `ProbeArgs`. The reference must
+    /// not escape that callback; `fire_typed`'s stack wrapper is gone when
+    /// dispatch returns.
+    #[inline]
+    #[must_use]
+    pub unsafe fn typed(self) -> Option<&'static TypedProbeRef> {
+        if self.typed == 0 {
+            None
+        } else {
+            // SAFETY: only `fire_typed` creates a non-zero marker, and it calls
+            // every observer/handler synchronously while the wrapper is live.
+            // The returned lifetime is intentionally consumed within that
+            // callback; retaining it would violate `ProbeHandler`'s contract.
+            Some(unsafe { &*(self.typed as *const TypedProbeRef) })
+        }
     }
 }
 
@@ -262,4 +433,26 @@ pub fn fire(probe_id: u32, args: ProbeArgs) {
     if let Some(h) = handler {
         h.fire(args);
     }
+}
+
+/// Fire a probe with one Rust-described typed object.
+///
+/// The wrapper lives across the complete synchronous dispatch. Ordinary scalar
+/// handlers and the global scalar observer receive zero words, preventing the
+/// borrowed kernel address from becoming an accidental pointer disclosure.
+#[inline]
+pub fn fire_typed<T: TypedProbe>(probe_id: u32, value: &T) {
+    let borrowed = TypedProbeRef {
+        type_key: T::TYPE_KEY,
+        data: (value as *const T).cast::<u8>(),
+        len: core::mem::size_of::<T>(),
+        fields: T::FIELDS,
+    };
+    fire(
+        probe_id,
+        ProbeArgs {
+            words: [0; 4],
+            typed: (&borrowed as *const TypedProbeRef) as usize,
+        },
+    );
 }

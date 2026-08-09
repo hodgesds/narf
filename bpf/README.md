@@ -28,7 +28,8 @@ Landed:
 - **Verifier** — the abstract interpreter is real: `verify()` runs
   `fixpoint::run` over the type graph, enforcing pointer classes, bounds, and
   the single validity-domain rule (sleep safety + lock discipline + reference
-  tracking). Raw pointer deref is rejected; there is no `bpf_probe_read`.
+  tracking). Raw pointer deref is rejected; typed tracing reads use the
+  independently rechecked `narf_probe_read` mediator.
 - **Runtime** — the fuel-metered interpreter, and the x86_64/aarch64 **JIT**
   behind it. `run_atomic` enters native code once the verifier has proved the
   program and falls back to the interpreter otherwise. The JIT lowers the full
@@ -49,8 +50,9 @@ Landed:
   prog-query, task-fd-query, and iterators.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call
-(register-allocation blockers — these fall back to the interpreter); typed
-object access for tracing; and hardware domain confinement (below).
+(register-allocation blockers — these fall back to the interpreter); optional
+direct typed-field loads (mediated typed tracing has landed); and the non-PKS
+hardware domain-confinement backends (below).
 
 The JIT is enabled **behind the verifier**: the interpreter's safety came from
 never dereferencing a program-supplied address, and native code trades that for
@@ -68,9 +70,10 @@ hardware defense-in-depth *under* the verifier. FRAME stays reachable, so the
 interpreter, the kfunc shims, and the fault handler keep working; the fence is a
 no-op on AMD PCID / aarch64 MTE (deferred). Because NARF BPF already reaches
 memory only through its own stack/ctx/maps/arena (no raw kernel deref, no
-`bpf_probe_read`), it cost the runtime nothing. Observability, if it ever lands,
+arbitrary `bpf_probe_read`), it cost the runtime nothing. Typed observability now
 reads through a Frame-mediated `narf_probe_read` kfunc that accepts only
-verifier-tracked pointers — never a raw address — so the fence holds for tracing.
+schema-tracked pointers — never a raw address — and rechecks the exact field at
+runtime, so the fence holds for tracing.
 
 Full design, threat model, the FRAME-stays-writable rationale, the tracing read
 model, why BTF is not the path there, and what remains (subsystem memory-tagging,

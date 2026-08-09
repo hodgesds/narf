@@ -364,6 +364,37 @@ The counter is independent of `BPF_ENABLE_STATS`, matching Linux: timing and
 successful-run counts pay the opt-in timestamp cost, while recursion refusals
 are counted whenever they occur.
 
+### 3.14 Rust-native typed tracing reads
+
+In-tree trace sites describe readable object fields with
+`narf_tracing::TypedProbe`: a kernel-wide type name/key, the concrete object
+size, and an exact list of `(offset, size)` fields. `BpfProg::load_for_typed_probe`
+verifies an atomic program against that schema. The context's first field is an
+opaque, read-only `TraceObject` pointer with provenance distinct from ordinary
+kernel `Object` pointers; ordinary loads through it remain
+`VerifyError::OpaqueDeref`.
+
+Programs read a declared field through
+`narf_probe_read(dst, dst_len, source, field_offset)`. Its Rust-derived kfunc
+descriptor requires one verifier-bounded writable destination, one wildcard
+trace object whose concrete key comes from the program schema, and one constant
+offset. Verification accepts the call only when `dst_len` and `field_offset`
+exactly match one declared field; being merely in bounds is insufficient. The
+live tracing wrapper independently repeats the exact-field and whole-object
+bounds checks before copying. The implementation is shared by the interpreter
+and both native backends through their existing kfunc-call ABI.
+
+Typed objects are borrowed only during synchronous `fire_typed` dispatch.
+Accordingly typed loads require `Context::Atomic`, scalar fires and different
+schemas do not invoke them, and the public raw-context `run_atomic` and
+`run_atomic_interpreted` entry points decline them. Only the crate-private
+typed attach adapter may construct the wrapper context. This prevents an
+in-kernel caller from forging the pointer consumed by the runtime mediator.
+Kfunc descriptors cannot return `TraceObject`, so they cannot manufacture that
+provenance from a normal kernel-object address.
+BTF remains a Linux loader/introspection compatibility surface, not the source
+of NARF's kernel type authority.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches
@@ -439,6 +470,12 @@ unprivileged mode and no second set of limits.
 
 **4.11 — The verifier fails closed.** Any construct it cannot prove safe is
 rejected. `VerifyError` carries an instruction index wherever one exists.
+
+**4.12 — Typed tracing reads are mediated twice.** Load-time verification must
+relate an exact constant `(offset, width)` to the program's Rust-native object
+schema, and the synchronous live wrapper must repeat both the exact-field and
+whole-object bounds checks before copying. Typed programs cannot execute from
+a caller-supplied raw context, and direct `Object` loads stay opaque.
 
 ## 5. Architecture notes
 

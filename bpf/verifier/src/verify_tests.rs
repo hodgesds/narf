@@ -21,7 +21,9 @@ use narf_bpf_isa::{AluOp, AtomicOp, CallTarget, CondOp, Decoded, Imm64, Insn, Re
 use crate::kfunc::{
     ArgDesc, ArgFlags, Context, KfuncDesc, PtrKind, TypeKey, TypeKind, ValidityDomain,
 };
-use crate::{interp, verify, MapDesc, Program, VerifiedProgram, VerifyError};
+use crate::{
+    interp, verify, MapDesc, ObjectDesc, ObjectField, Program, VerifiedProgram, VerifyError,
+};
 
 // ── Program construction ────────────────────────────────────────────
 
@@ -142,6 +144,7 @@ fn check_all(
         ctx_fields,
         kfuncs: &kfuncs,
         maps,
+        objects: &[],
     })
 }
 
@@ -2621,6 +2624,7 @@ fn every_program_the_verifier_accepts_runs_without_an_out_of_bounds_access() {
             ctx_fields: &[],
             kfuncs: &[],
             maps: &[],
+            objects: &[],
         }) else {
             continue;
         };
@@ -2754,6 +2758,7 @@ fn a_verified_variable_frame_access_is_safe_for_every_index_it_admits() {
             ctx_fields: CTX1,
             kfuncs: &[],
             maps: &[],
+            objects: &[],
         }) else {
             continue;
         };
@@ -2899,6 +2904,124 @@ fn even_a_constant_offset_into_an_opaque_object_is_rejected() {
     assert!(
         matches!(err, VerifyError::OpaqueDeref { .. }),
         "expected OpaqueDeref, got {err:?}"
+    );
+}
+
+fn verify_typed_field_with_context(
+    offset: i32,
+    width: i32,
+    ctx_kind: PtrKind,
+) -> Result<VerifiedProgram, VerifyError> {
+    const KEY: TypeKey = TypeKey(77);
+    let ctx = [ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: ctx_kind,
+            key: KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    }];
+    let args: &'static [ArgDesc] = Vec::leak(vec![
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::Mem,
+                key: TypeKey::NONE,
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::SIZED_BY_NEXT.with(ArgFlags::UNINIT),
+        },
+        ArgDesc::SCALAR64,
+        ArgDesc {
+            kind: TypeKind::Ptr {
+                kind: PtrKind::TraceObject,
+                key: TypeKey::NONE,
+            },
+            domain: ValidityDomain::NonPreemptible,
+            flags: ArgFlags::ANY_TRACE_OBJECT,
+        },
+        ArgDesc {
+            kind: TypeKind::Scalar {
+                bits: 64,
+                signed: false,
+            },
+            domain: ValidityDomain::Static,
+            flags: ArgFlags::CONST.with(ArgFlags::OBJECT_FIELD_OFFSET),
+        },
+    ]);
+    let kfuncs = [KfuncDesc {
+        id: 9,
+        name: "probe_read",
+        addr: 0x1000,
+        args,
+        ret: ArgDesc::SCALAR64,
+        context: Context::Atomic,
+    }];
+    let fields = [ObjectField { offset: 8, size: 8 }];
+    let objects = [ObjectDesc {
+        key: KEY,
+        size: 16,
+        fields: &fields,
+    }];
+    let image = encode_all(&[
+        ldx(Size::Dw, 6, 1, 0),
+        movr(1, 10),
+        alu(AluOp::Sub, 1, 8),
+        mov(2, width),
+        movr(3, 6),
+        mov(4, offset),
+        call(9),
+        ldx(Size::Dw, 0, 10, -8),
+        EXIT,
+    ]);
+    verify(&Program {
+        insns: &image,
+        context: Context::Atomic,
+        ctx_fields: &ctx,
+        kfuncs: &kfuncs,
+        maps: &[],
+        objects: &objects,
+    })
+}
+
+fn verify_typed_field(offset: i32, width: i32) -> Result<VerifiedProgram, VerifyError> {
+    verify_typed_field_with_context(offset, width, PtrKind::TraceObject)
+}
+
+#[test]
+fn typed_mediator_accepts_one_exact_declared_field() {
+    let verified = verify_typed_field(8, 8).expect("exact schema field should verify");
+    assert_eq!(
+        verified
+            .bare_access_sites
+            .iter()
+            .map(|site| site.insn_index)
+            .collect::<Vec<_>>(),
+        vec![0, 7],
+        "only the context and stack loads are safe bare dereferences"
+    );
+}
+
+#[test]
+fn typed_mediator_rejects_in_object_non_fields() {
+    for (offset, width) in [(9, 8), (8, 4)] {
+        assert!(
+            matches!(
+                verify_typed_field(offset, width),
+                Err(VerifyError::KfuncSignature { at: 6, arg: 3, .. })
+            ),
+            "offset={offset} width={width}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_kernel_objects_cannot_satisfy_the_typed_mediator() {
+    assert!(
+        matches!(
+            verify_typed_field_with_context(8, 8, PtrKind::Object),
+            Err(VerifyError::KfuncSignature { at: 6, arg: 2, .. })
+        ),
+        "an ordinary object pointer must not acquire trace-object provenance"
     );
 }
 

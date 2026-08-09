@@ -350,6 +350,7 @@ fn verifier_program<'a>(
         ctx_fields: &CTX_SCALARS,
         kfuncs: descs,
         maps: &[],
+        objects: &[],
     }
 }
 

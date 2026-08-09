@@ -61,6 +61,10 @@ pub enum LoadError {
     Rejected(VerifyError),
     /// The program needs more stack than the current provider offers.
     StackTooDeep { needed: u32, limit: u32 },
+    /// Typed probe objects are borrowed only for an atomic fire callback.
+    TypedProbeRequiresAtomic,
+    /// The Rust probe object cannot be represented by the verifier schema.
+    TypedProbeTooLarge,
 }
 
 impl From<CapError> for LoadError {
@@ -129,6 +133,8 @@ pub struct BpfProg {
     insns: Vec<Insn>,
     /// The execution context this program was verified for.
     context: Context,
+    /// Rust-native typed-probe schema, for runtime attach validation.
+    typed_probe: Option<TypedProbeLayout>,
     /// Starting fuel for each invocation.
     initial_fuel: u64,
     /// Bytes of BPF stack the program may use.
@@ -189,6 +195,14 @@ pub struct BpfProg {
     /// concurrent syscalls. Object identity, not the fd used for the binding,
     /// makes repeated binds idempotent.
     bound_maps: IrqSafeSpinLock<Vec<Arc<crate::map::BpfMap>>>,
+}
+
+/// Owned copy of one typed-probe schema used during verification and dispatch.
+#[derive(Clone, Debug)]
+struct TypedProbeLayout {
+    type_key: u32,
+    size: u32,
+    fields: Vec<narf_bpf_verifier::ObjectField>,
 }
 
 /// Linux-visible metadata supplied by a userspace program loader.
@@ -276,7 +290,7 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, LoadMetadata::default())
+        Self::load_with_options(cap, req, None, LoadMetadata::default(), None)
     }
 
     /// Verify and load with the compatibility classification of the license
@@ -318,7 +332,7 @@ impl BpfProg {
         req: LoadRequest,
         metadata: LoadMetadata,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, metadata)
+        Self::load_with_options(cap, req, None, metadata, None)
     }
 
     /// Verify and load, binding an arena group the program may address.
@@ -353,7 +367,42 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, arenas, LoadMetadata::default())
+        Self::load_with_options(cap, req, arenas, LoadMetadata::default(), None)
+    }
+
+    /// Verify and load for one Rust-described typed tracing object.
+    ///
+    /// The object is borrowed by `tracing::fire_typed` only for the synchronous
+    /// atomic callback. Its fields remain opaque to ordinary loads; programs
+    /// reach them through `narf_probe_read`, whose verifier descriptor and
+    /// runtime wrapper both require an exact declared field.
+    pub fn load_for_typed_probe<T: narf_tracing::TypedProbe>(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+    ) -> Result<Arc<Self>, LoadError> {
+        if req.context != Context::Atomic {
+            return Err(LoadError::TypedProbeRequiresAtomic);
+        }
+        let size =
+            u32::try_from(core::mem::size_of::<T>()).map_err(|_| LoadError::TypedProbeTooLarge)?;
+        let fields = T::FIELDS
+            .iter()
+            .map(|field| narf_bpf_verifier::ObjectField {
+                offset: field.offset,
+                size: field.size,
+            })
+            .collect();
+        Self::load_with_options(
+            cap,
+            req,
+            None,
+            LoadMetadata::default(),
+            Some(TypedProbeLayout {
+                type_key: T::TYPE_KEY,
+                size,
+                fields,
+            }),
+        )
     }
 
     fn load_with_options(
@@ -361,6 +410,7 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
         metadata: LoadMetadata,
+        typed_probe: Option<TypedProbeLayout>,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
@@ -401,15 +451,39 @@ impl BpfProg {
                 }
             }))
             .collect();
+        let typed_ctx = typed_probe
+            .as_ref()
+            .map(|typed| narf_bpf_verifier::ArgDesc {
+                kind: narf_bpf_verifier::TypeKind::Ptr {
+                    kind: narf_bpf_verifier::PtrKind::TraceObject,
+                    key: narf_bpf_verifier::TypeKey(typed.type_key),
+                },
+                domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
+                flags: narf_bpf_verifier::ArgFlags::READONLY,
+            });
+        let typed_objects = typed_probe
+            .as_ref()
+            .map(|typed| narf_bpf_verifier::ObjectDesc {
+                key: narf_bpf_verifier::TypeKey(typed.type_key),
+                size: typed.size,
+                fields: typed.fields.as_slice(),
+            });
+        let typed_ctx_storage = typed_ctx.into_iter().collect::<Vec<_>>();
+        let typed_object_storage = typed_objects.into_iter().collect::<Vec<_>>();
         let prog = narf_bpf_verifier::Program {
             insns: &req.insns,
             context: req.context,
             // The probe ABI's `[u64; 4]` is already the ctx tuple, so there is
             // no ctx-rewriting layer and nothing to describe beyond four
             // scalars.
-            ctx_fields: &CTX_SCALARS,
+            ctx_fields: if typed_probe.is_some() {
+                &typed_ctx_storage
+            } else {
+                &CTX_SCALARS
+            },
             kfuncs: &descs,
             maps: &map_descs,
+            objects: &typed_object_storage,
         };
 
         let mut subprogs: Vec<SubprogInfo> = Vec::new();
@@ -475,6 +549,7 @@ impl BpfProg {
             linux_prog_type: metadata.linux_prog_type,
             insns: req.insns,
             context: req.context,
+            typed_probe,
             initial_fuel: DEFAULT_FUEL,
             stack_bytes,
             subprogs,
@@ -512,6 +587,28 @@ impl BpfProg {
     #[must_use]
     pub const fn context(&self) -> Context {
         self.context
+    }
+
+    /// Stable type key of this program's typed tracing context, if any.
+    #[inline]
+    #[must_use]
+    pub fn typed_probe_type(&self) -> Option<u32> {
+        self.typed_probe.as_ref().map(|typed| typed.type_key)
+    }
+
+    /// Whether a live typed probe wrapper satisfies this program's schema.
+    #[must_use]
+    pub fn accepts_typed_probe(&self, typed: &narf_tracing::TypedProbeRef) -> bool {
+        self.typed_probe.as_ref().is_some_and(|expected| {
+            expected.type_key == typed.type_key()
+                && usize::try_from(expected.size).ok() == Some(typed.len())
+                && expected.fields.len() == typed.fields().len()
+                && expected
+                    .fields
+                    .iter()
+                    .zip(typed.fields())
+                    .all(|(want, got)| want.offset == got.offset && want.size == got.size)
+        })
     }
 
     /// Instruction count.
@@ -786,6 +883,25 @@ impl BpfProg {
     /// counter, so depth N+1 loses its invocation rather than corrupting the
     /// frame below it.
     pub fn run_atomic(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
+        // Typed contexts contain a pointer to a short-lived kernel wrapper.
+        // Only `run_typed_probe` may construct that context; admitting a raw
+        // caller here would let it forge the wrapper pointer before the
+        // runtime mediator had a chance to validate anything.
+        if self.typed_probe.is_some() {
+            return None;
+        }
+        self.run_atomic_inner(ctx, ctx_len)
+    }
+
+    /// Run against the live wrapper supplied by synchronous typed dispatch.
+    pub(crate) fn run_typed_probe(&self, typed: &narf_tracing::TypedProbeRef) -> Option<Outcome> {
+        if !self.accepts_typed_probe(typed) {
+            return None;
+        }
+        self.run_atomic_inner([typed.as_context_word(), 0, 0, 0], 1)
+    }
+
+    fn run_atomic_inner(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
         // Confine the whole run to the BPF hardware domain: a verifier or JIT
         // escape that stores into another subsystem's domain (the cap table, the
         // scheduler, a driver) takes a protection-key fault rather than
@@ -810,7 +926,7 @@ impl BpfProg {
                 return self.run_atomic_native(ctx, ctx_len, slot_base);
             }
         }
-        self.run_atomic_interpreted(ctx, ctx_len)
+        self.run_atomic_interpreted_inner(ctx, ctx_len)
     }
 
     /// Run interpreted, whatever `self.jit` holds.
@@ -821,6 +937,17 @@ impl BpfProg {
     /// produced what was intended, and the interpreter is the oracle for
     /// whether the intent was right.
     pub fn run_atomic_interpreted(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
+        if self.typed_probe.is_some() {
+            return None;
+        }
+        self.run_atomic_interpreted_inner(ctx, ctx_len)
+    }
+
+    fn run_atomic_interpreted_inner(
         &self,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
@@ -871,10 +998,10 @@ impl BpfProg {
     /// Only reachable when [`crate::jit_glue::try_compile`] accepted the
     /// program, which means: the verifier proved it (not the `provisional`
     /// path), it touches at most one arena, it has no *non-arena* faulting
-    /// accesses, and every non-arena dereference is through the frame — or the
-    /// frame and the context, if it contains no `call`. Those gates are why this
-    /// can hand control to generated code without the interpreter's per-access
-    /// bounds checks. ("No back-edge" was lifted when the emitter learned to
+    /// accesses, and every non-arena dereference has a verifier-published stack
+    /// or context certificate. Those gates are why this can hand control to
+    /// generated code without the interpreter's per-access bounds checks.
+    /// ("No back-edge" was lifted when the emitter learned to
     /// burn fuel per block; "no arena" when it learned the slot-relative access
     /// shape and the exception table behind it.)
     ///

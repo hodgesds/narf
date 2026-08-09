@@ -122,6 +122,29 @@ pub struct Program<'a> {
     /// Every map this program may reference. Descriptor-local fd-array indices
     /// are explicit on [`MapDesc`] rather than implied by slice position.
     pub maps: &'a [MapDesc],
+    /// Rust-native layouts of typed objects this program may inspect through
+    /// mediated tracing kfuncs.
+    pub objects: &'a [ObjectDesc<'a>],
+}
+
+/// One readable field in a Rust-native typed object descriptor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ObjectField {
+    /// Byte offset from the object base.
+    pub offset: u32,
+    /// Exact readable width in bytes.
+    pub size: u32,
+}
+
+/// The verifier-facing shape of one typed tracing object.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ObjectDesc<'a> {
+    /// Stable Rust-native type identity.
+    pub key: TypeKey,
+    /// Whole object size, used to validate field declarations.
+    pub size: u32,
+    /// Exact fields a program may request from the mediated read kfunc.
+    pub fields: &'a [ObjectField],
 }
 
 /// What the verifier knows about one map a program references.
@@ -177,6 +200,17 @@ pub struct FaultSite {
     pub dst_reg: Option<u8>,
     /// Whether this is an arena access, which reports differently.
     pub arena: bool,
+}
+
+/// A non-arena memory instruction whose raw native dereference is safe.
+///
+/// The verifier publishes this only for accesses through its bounded stack or
+/// immutable context classes. The JIT admission gate checks the instruction
+/// index rather than guessing safety from the physical register number.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BareAccessSite {
+    /// Index of the load, store, or atomic instruction.
+    pub insn_index: u32,
 }
 
 /// A `call` to a kfunc, as resolved during verification.
@@ -239,6 +273,8 @@ pub struct VerifiedProgram {
     pub initial_fuel: u64,
     /// Instructions needing exception-table coverage.
     pub fault_sites: Vec<FaultSite>,
+    /// Instructions proved safe to lower as bare host-pointer dereferences.
+    pub bare_access_sites: Vec<BareAccessSite>,
     /// Subprogram boundaries and stack usage.
     pub subprogs: Vec<SubprogInfo>,
     /// Whether the program touches an arena, and so needs the arena base
@@ -273,6 +309,8 @@ pub enum VerifyError {
         field: usize,
         err: kfunc::KfuncError,
     },
+    /// A Rust-native typed-object descriptor was malformed.
+    BadObjectDescriptor { object: usize },
     /// A control-flow edge leaves the subprogram it starts in.
     ///
     /// Every analysis downstream assumes subprograms are CFG-disjoint: each is
@@ -485,6 +523,20 @@ pub fn verify(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     // "reasoning from a broken contract", one descriptor over.
     for (i, f) in prog.ctx_fields.iter().enumerate() {
         kfunc::validate_type(*f, i).map_err(|err| VerifyError::BadCtxField { field: i, err })?;
+    }
+    for (i, object) in prog.objects.iter().enumerate() {
+        if !object.key.is_some()
+            || object.size == 0
+            || object.fields.iter().any(|field| {
+                field.size == 0
+                    || u64::from(field.offset) + u64::from(field.size) > u64::from(object.size)
+            })
+            || prog.objects[..i]
+                .iter()
+                .any(|earlier| earlier.key == object.key)
+        {
+            return Err(VerifyError::BadObjectDescriptor { object: i });
+        }
     }
     fixpoint::run(prog)
 }

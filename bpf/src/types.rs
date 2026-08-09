@@ -224,6 +224,96 @@ impl<T: BpfObject> Trusted<T> {
     }
 }
 
+/// Opaque source object accepted by the typed tracing copy mediator.
+///
+/// Unlike [`Trusted<T>`], this deliberately accepts any verifier object key.
+/// The program-specific schema relates that key to a constant field offset at
+/// load time, and [`narf_tracing::TypedProbeRef`] repeats the exact-field and
+/// whole-object checks when the kfunc runs.
+#[derive(Debug)]
+pub struct TraceSource {
+    ptr: NonNull<narf_tracing::TypedProbeRef>,
+}
+
+impl TraceSource {
+    /// Copy one declared field from the live typed-probe wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been constructed during `BpfProg::run_typed_probe` and
+    /// used before that synchronous dispatch returns.
+    pub unsafe fn copy_field(&self, offset: u64, dst: &mut [u8]) -> bool {
+        // SAFETY: the typed execution gate establishes that this pointer names
+        // the stack wrapper currently owned by `tracing::fire_typed`.
+        unsafe { self.ptr.as_ref() }.copy_field(offset, dst)
+    }
+}
+
+// SAFETY: conversion only stores the raw word. Dereferencing is confined to
+// `copy_field`, whose caller must establish the synchronous typed-run gate.
+unsafe impl BpfType for TraceSource {
+    const DESC: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::TraceObject,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::ANY_TRACE_OBJECT,
+    };
+    const LEGAL_IN_RET: bool = false;
+
+    #[inline]
+    unsafe fn from_raw(raw: u64, _next: u64) -> Self {
+        Self {
+            // SAFETY: an ordinary program cannot reach the typed execution
+            // gate, and the verifier rejects nullable object arguments.
+            ptr: unsafe { NonNull::new_unchecked(raw as *mut narf_tracing::TypedProbeRef) },
+        }
+    }
+
+    #[inline]
+    fn into_raw(self) -> u64 {
+        self.ptr.as_ptr() as u64
+    }
+}
+
+/// Verifier-constant byte offset naming an exact typed-probe field.
+#[derive(Copy, Clone, Debug)]
+pub struct TraceFieldOffset(u64);
+
+impl TraceFieldOffset {
+    /// Raw byte offset selected by the verified program.
+    #[inline]
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+// SAFETY: every integer is a valid wrapper value. The descriptor adds the
+// load-time constant and schema-relation obligations.
+unsafe impl BpfType for TraceFieldOffset {
+    const DESC: ArgDesc = ArgDesc {
+        kind: TypeKind::Scalar {
+            bits: 64,
+            signed: false,
+        },
+        domain: ValidityDomain::Static,
+        flags: ArgFlags::CONST.with(ArgFlags::OBJECT_FIELD_OFFSET),
+    };
+    const LEGAL_IN_RET: bool = false;
+
+    #[inline]
+    unsafe fn from_raw(raw: u64, _next: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
 // SAFETY: `from_raw` stores the integer without dereferencing it. The
 // verifier's obligation (non-null, live, trusted domain) is discharged
 // before the call; this type never itself creates a Rust reference.
