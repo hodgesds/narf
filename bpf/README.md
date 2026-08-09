@@ -42,8 +42,8 @@ Landed:
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with
   directory-fd-relative paths, attach/detach, link create/update/detach,
-  keyed-map freeze, program-map lifetime binding, fd-gated runtime statistics,
-  prog-query, task-fd-query, and iterators.
+  keyed-map freeze, load-time map/BTF fd arrays, program-map lifetime binding,
+  fd-gated runtime statistics, prog-query, task-fd-query, and iterators.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call
 (register-allocation blockers — these fall back to the interpreter); typed

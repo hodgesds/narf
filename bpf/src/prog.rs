@@ -70,6 +70,30 @@ pub enum BindError {
     NoMemory,
 }
 
+/// A type-erased object whose lifetime is bound to a loaded program.
+///
+/// Linux permits BTF descriptors in `bpf_attr.prog_load.fd_array` alongside
+/// maps. `narf-bpf` deliberately does not depend on the BTF parser crate, so
+/// the syscall layer hands the program an opaque strong reference instead of
+/// teaching the runtime about a compatibility-only type graph.
+pub trait LoadReference: core::fmt::Debug + Send + Sync {}
+
+impl<T: core::fmt::Debug + Send + Sync> LoadReference for T {}
+
+/// One sparse `fd_array` position resolved to a map.
+///
+/// Positions are explicit rather than implied by vector order because Linux's
+/// array may contain duplicate maps, BTF descriptors, and unused slots.
+#[derive(Clone, Debug)]
+pub struct IndexedMap {
+    /// The index carried by `BPF_PSEUDO_MAP_IDX`.
+    pub index: i32,
+    /// The descriptor read from the caller's fd array.
+    pub fd: i32,
+    /// The map held alive for verification and execution.
+    pub map: Arc<crate::map::BpfMap>,
+}
+
 /// A loaded, verified program.
 ///
 /// Reference-counted (`Arc`) rather than owned by its fd, because a program
@@ -131,6 +155,11 @@ pub struct BpfProg {
     /// a map alive after the fd that created it is closed. Linux does the same
     /// through `prog->aux->used_maps`.
     maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
+    /// Sparse positions used by `BPF_PSEUDO_MAP_IDX` instructions.
+    map_indices: Vec<IndexedMap>,
+    /// Non-map objects from the program-load fd array, currently BTF blobs.
+    /// Their only NARF semantic is the Linux-compatible lifetime reference.
+    _load_references: Vec<Arc<dyn LoadReference>>,
     /// Maps attached after load solely to share the program's lifetime.
     ///
     /// `BPF_PROG_BIND_MAP` does not make these maps addressable by program
@@ -165,6 +194,10 @@ pub struct LoadRequest {
     /// for its whole life — a map cannot be freed out from under a program that
     /// names it.
     pub maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
+    /// Map positions resolved from `bpf_attr.prog_load.fd_array`.
+    pub map_indices: Vec<IndexedMap>,
+    /// Compatibility objects whose lifetime is bound to this program.
+    pub load_references: Vec<Arc<dyn LoadReference>>,
 }
 
 impl BpfProg {
@@ -230,11 +263,22 @@ impl BpfProg {
                 let a = m.attr();
                 narf_bpf_verifier::MapDesc {
                     fd: *fd,
+                    fd_array_idx: None,
                     key_size: a.key_size,
                     value_size: a.value_size,
                     max_entries: a.max_entries,
                 }
             })
+            .chain(req.map_indices.iter().map(|indexed| {
+                let a = indexed.map.attr();
+                narf_bpf_verifier::MapDesc {
+                    fd: indexed.fd,
+                    fd_array_idx: Some(indexed.index),
+                    key_size: a.key_size,
+                    value_size: a.value_size,
+                    max_entries: a.max_entries,
+                }
+            }))
             .collect();
         let prog = narf_bpf_verifier::Program {
             insns: &req.insns,
@@ -267,7 +311,14 @@ impl BpfProg {
                 // group the program will run against, so the number cannot
                 // describe a different one.
                 let arena_count = arenas.as_ref().map_or(0, |g| g.arenas().len());
-                jit = crate::jit_glue::try_compile(&v, true, arena_count, &req.maps).ok();
+                jit = crate::jit_glue::try_compile(
+                    &v,
+                    true,
+                    arena_count,
+                    &req.maps,
+                    &req.map_indices,
+                )
+                .ok();
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
@@ -304,6 +355,8 @@ impl BpfProg {
             jit,
             arenas,
             maps: req.maps,
+            map_indices: req.map_indices,
+            _load_references: req.load_references,
             bound_maps: IrqSafeSpinLock::new(Vec::new()),
             runs: AtomicU64::new(0),
             stats_runs: AtomicU64::new(0),
@@ -363,13 +416,41 @@ impl BpfProg {
     /// `MapIdx` form.
     #[must_use]
     pub fn map_by_idx(&self, idx: usize) -> Option<&Arc<crate::map::BpfMap>> {
-        self.maps.get(idx).map(|(_, m)| m)
+        let idx = i32::try_from(idx).ok()?;
+        self.map_indices
+            .iter()
+            .find(|indexed| indexed.index == idx)
+            .map(|indexed| &indexed.map)
     }
 
     /// How many maps the loaded instruction image may address.
     #[must_use]
     pub fn map_count(&self) -> usize {
-        self.maps.len()
+        let direct = self
+            .maps
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, map))| {
+                !self.maps[..*i]
+                    .iter()
+                    .any(|(_, earlier)| Arc::ptr_eq(earlier, map))
+            })
+            .count();
+        let indexed_only = self
+            .map_indices
+            .iter()
+            .enumerate()
+            .filter(|(i, indexed)| {
+                !self
+                    .maps
+                    .iter()
+                    .any(|(_, direct)| Arc::ptr_eq(direct, &indexed.map))
+                    && !self.map_indices[..*i]
+                        .iter()
+                        .any(|earlier| Arc::ptr_eq(&earlier.map, &indexed.map))
+            })
+            .count();
+        direct + indexed_only
     }
 
     /// Bind `map` to this program's lifetime without granting program access.
@@ -387,6 +468,10 @@ impl BpfProg {
             .maps
             .iter()
             .any(|(_, existing)| Arc::ptr_eq(existing, &map))
+            || self
+                .map_indices
+                .iter()
+                .any(|indexed| Arc::ptr_eq(&indexed.map, &map))
         {
             return Ok(());
         }
@@ -432,19 +517,32 @@ impl BpfProg {
     pub fn used_map_ids(&self) -> Result<Vec<u32>, BindError> {
         let mut ids = Vec::new();
         loop {
-            let needed = self.maps.len() + self.bound_maps.lock().len();
+            let needed = self.maps.len() + self.map_indices.len() + self.bound_maps.lock().len();
             if ids.capacity() < needed {
                 ids.try_reserve_exact(needed)
                     .map_err(|_| BindError::NoMemory)?;
             }
 
             let bound = self.bound_maps.lock();
-            if ids.capacity() < self.maps.len() + bound.len() {
+            if ids.capacity() < self.maps.len() + self.map_indices.len() + bound.len() {
                 drop(bound);
                 continue;
             }
-            ids.extend(self.maps.iter().map(|(_, map)| map.id));
-            ids.extend(bound.iter().map(|map| map.id));
+            for (_, map) in &self.maps {
+                if !ids.contains(&map.id) {
+                    ids.push(map.id);
+                }
+            }
+            for indexed in &self.map_indices {
+                if !ids.contains(&indexed.map.id) {
+                    ids.push(indexed.map.id);
+                }
+            }
+            for map in bound.iter() {
+                if !ids.contains(&map.id) {
+                    ids.push(map.id);
+                }
+            }
             return Ok(ids);
         }
     }
@@ -572,7 +670,8 @@ impl BpfProg {
             frame,
             registry,
         )
-        .with_arenas(self.arenas());
+        .with_arenas(self.arenas())
+        .with_map_indices(&self.map_indices);
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
         let stats_start = crate::stats::run_start();
@@ -763,7 +862,8 @@ impl BpfProg {
             frame,
             registry,
         )
-        .with_arenas(self.arenas());
+        .with_arenas(self.arenas())
+        .with_map_indices(&self.map_indices);
         let stats_start = crate::stats::run_start();
         let outcome = vm.run().await;
         self.record(outcome, stats_start);

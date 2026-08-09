@@ -226,6 +226,20 @@ the load-time maps in `bpf_prog_info.map_ids`. The mutable lifetime-only set is
 lock-protected separately from the immutable runtime lookup table, so binding
 cannot race program execution into seeing an unverified map.
 
+`BPF_PROG_LOAD` accepts Linux's `fd_array` / `fd_array_cnt` contract. A
+non-zero count eagerly validates and binds every map or BTF fd; maps appear
+once in `bpf_prog_info.map_ids`, while type-erased strong references keep BTF
+objects alive without making the Rust-derived verifier depend on BTF. The
+64-distinct-map and 64-distinct-BTF limits match Linux. Count zero preserves
+the legacy lazy form used by `BPF_PSEUDO_MAP_IDX`: each instruction resolves
+its signed index directly from userspace's array. Sparse indices are recorded
+explicitly beside the immutable image, not inferred from the used-map vector,
+so duplicate maps, BTF entries, and unused slots cannot renumber a reference.
+The verifier, interpreter, and JIT consume that same index table; none rewrites
+the submitted instructions. A missing array is `EPROTO`, an unreadable entry
+is `EFAULT`, an unopened fd is `EBADF`, and a live non-map/non-BTF fd is
+`EINVAL`.
+
 ### 3.5 Object pinning
 
 `BPF_OBJ_PIN` stores a strong reference to a map, program, or link in bpffs;

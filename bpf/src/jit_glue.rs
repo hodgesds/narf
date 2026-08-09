@@ -441,6 +441,7 @@ fn scan_program(v: &VerifiedProgram) -> Result<(), JitSkip> {
 fn resolve_map_imm64(
     v: &VerifiedProgram,
     maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+    map_indices: &[crate::prog::IndexedMap],
 ) -> alloc::vec::Vec<(u32, u64)> {
     use narf_bpf_isa::{decode, Decoded, Imm64};
     let mut out = alloc::vec::Vec::new();
@@ -452,10 +453,10 @@ fn resolve_map_imm64(
         if let Decoded::LoadImm64 { value, .. } = d {
             let addr = match value {
                 Imm64::MapFd(fd) => maps.iter().find(|(f, _)| *f == fd).map(|(_, m)| m),
-                Imm64::MapIdx(idx) => usize::try_from(idx)
-                    .ok()
-                    .and_then(|k| maps.get(k))
-                    .map(|(_, m)| m),
+                Imm64::MapIdx(idx) => map_indices
+                    .iter()
+                    .find(|indexed| indexed.index == idx)
+                    .map(|indexed| &indexed.map),
                 _ => None,
             };
             if let Some(m) = addr {
@@ -486,6 +487,7 @@ pub fn try_compile(
     fully_verified: bool,
     arena_count: usize,
     maps: &[(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+    map_indices: &[crate::prog::IndexedMap],
 ) -> Result<JitImage, JitSkip> {
     if !fully_verified {
         return Err(JitSkip::NotFullyVerified);
@@ -522,7 +524,7 @@ pub fn try_compile(
     }
     scan_program(v)?;
 
-    let map_imm64 = resolve_map_imm64(v, maps);
+    let map_imm64 = resolve_map_imm64(v, maps, map_indices);
     let compiled =
         narf_bpf_jit::compile_resolved(v, &map_imm64).map_err(|_| JitSkip::Unsupported)?;
     let cap = jit_cap();

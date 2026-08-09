@@ -177,6 +177,14 @@ impl BtfFile {
         Arc::clone(self.blob.btf())
     }
 
+    /// A strong reference suitable for `BPF_PROG_LOAD`'s fd-array lifetime
+    /// binding. The BPF runtime keeps it type-erased because parsed BTF is a
+    /// userspace-compatibility object, not part of NARF's verifier ABI.
+    #[must_use]
+    pub(crate) fn blob(&self) -> Arc<BtfBlob> {
+        Arc::clone(&self.blob)
+    }
+
     /// The blob's id.
     #[must_use]
     pub(crate) fn id(&self) -> u32 {

@@ -1310,6 +1310,8 @@ fn load_against(
             insns: asm(items),
             context: Context::Atomic,
             maps: Vec::new(),
+            map_indices: Vec::new(),
+            load_references: Vec::new(),
         },
         Some(alloc::sync::Arc::clone(group)),
     )

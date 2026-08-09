@@ -611,6 +611,8 @@ fn sample_load_total(idx: usize, iters: u32) -> Option<Sample> {
             insns: insns.clone(),
             context: Context::Atomic,
             maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         })
         .collect();
 

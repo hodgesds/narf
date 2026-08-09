@@ -119,8 +119,8 @@ pub struct Program<'a> {
     pub ctx_fields: &'a [ArgDesc],
     /// Every kfunc this program may call.
     pub kfuncs: &'a [KfuncDesc],
-    /// Every map this program may reference, in the order the loader supplied
-    /// them. See [`MapDesc`].
+    /// Every map this program may reference. Descriptor-local fd-array indices
+    /// are explicit on [`MapDesc`] rather than implied by slice position.
     pub maps: &'a [MapDesc],
 }
 
@@ -142,10 +142,17 @@ pub struct MapDesc {
     /// `MapFd` / `MapValue` forms.
     ///
     /// Resolution is by fd value, not by position, because that is what the
-    /// instruction encoding carries. The `MapIdx` forms index this slice
-    /// instead, which is why both a descriptor's fd *and* its position are
-    /// meaningful.
+    /// instruction encoding carries. The `MapIdx` forms use
+    /// [`Self::fd_array_idx`] instead, which is why both values are meaningful.
     pub fd: i32,
+    /// Position in `bpf_attr.prog_load.fd_array` for a
+    /// `BPF_PSEUDO_MAP_IDX` reference, or `None` when this descriptor is only
+    /// addressable by fd.
+    ///
+    /// Kept separate from slice position: the array may contain BTF fds,
+    /// duplicate maps, or unreferenced holes, none of which may renumber an
+    /// instruction's index.
+    pub fd_array_idx: Option<i32>,
     /// Key width in bytes.
     pub key_size: u32,
     /// Value width in bytes, as one program-visible value.

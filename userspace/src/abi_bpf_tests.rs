@@ -2408,6 +2408,256 @@ fn ld_map_fd_prog(fd: i64) -> [u8; 32] {
     p
 }
 
+/// `ld_imm64 r1 = map_by_idx(<index>); r0 = 0; exit`.
+fn ld_map_idx_prog(index: i32) -> [u8; 32] {
+    let mut p = [0u8; 32];
+    p[0] = 0x18;
+    // dst = r1, src = BPF_PSEUDO_MAP_IDX (5).
+    p[1] = 0x51;
+    p[4..8].copy_from_slice(&index.to_le_bytes());
+    p[16] = 0xB7;
+    p[24] = 0x95;
+    p
+}
+
+/// Load an indexed map into r1, put `key` in r2, and call
+/// `narf_map_delete(map, key)`. The returned errno becomes the program result.
+fn ld_map_idx_delete_prog(index: i32, key: i32) -> [u8; 40] {
+    let mut p = [0u8; 40];
+    p[0] = 0x18;
+    p[1] = 0x51;
+    p[4..8].copy_from_slice(&index.to_le_bytes());
+    p[16] = 0xB7; // r2 = key
+    p[17] = 0x02;
+    p[20..24].copy_from_slice(&key.to_le_bytes());
+    p[24] = 0x85; // call narf_map_delete
+    p[25] = 0x20; // src = BPF_PSEUDO_KFUNC_CALL (2)
+    p[28..32].copy_from_slice(&narf_bpf::kfunc::id_for("narf_map_delete").to_le_bytes());
+    p[32] = 0x95;
+    p
+}
+
+const PROG_LOAD_EXT_LEN: usize = 152;
+const PL_FD_ARRAY: usize = 120;
+const PL_FD_ARRAY_CNT: usize = 148;
+const EPROTO: i64 = -71;
+
+/// Load using the extended `prog_load` shape that reaches `fd_array_cnt`.
+fn load_prog_fd_array_raw(insns: &[u8], fd_array: u64, fd_array_cnt: u32) -> Option<i64> {
+    let mut attr = [0u8; PROG_LOAD_EXT_LEN];
+    attr[0..4].copy_from_slice(&BPF_PROG_TYPE_TRACING.to_le_bytes());
+    attr[4..8].copy_from_slice(&((insns.len() / 8) as u32).to_le_bytes());
+    attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+    attr[48..52].copy_from_slice(b"fdar");
+    attr[PL_FD_ARRAY..PL_FD_ARRAY + 8].copy_from_slice(&fd_array.to_le_bytes());
+    attr[PL_FD_ARRAY_CNT..PL_FD_ARRAY_CNT + 4].copy_from_slice(&fd_array_cnt.to_le_bytes());
+    call(
+        Syscall::Bpf.raw(),
+        a2(
+            BPF_PROG_LOAD,
+            attr.as_ptr() as u64,
+            PROG_LOAD_EXT_LEN as u64,
+        ),
+    )
+}
+
+fn load_prog_fd_array(insns: &[u8], fds: &[i32]) -> Option<i64> {
+    load_prog_fd_array_raw(insns, fds.as_ptr() as u64, fds.len() as u32)
+}
+
+fn smoke_bpf_prog_load_fd_array_maps() -> TestResult {
+    with_setup(|| {
+        let first = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        let second = create_map(BPF_MAP_TYPE_HASH, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if first < 0 || second < 0 {
+            return Err("map creation for fd_array failed");
+        }
+        let first_id = map_id_of(first)?;
+        let second_id = map_id_of(second)?;
+        let fds = [first as i32, second as i32, first as i32];
+
+        let key = 1u32;
+        let value = 0x55AAu64;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            second,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("seeding the indexed hash map failed");
+        }
+
+        let prog_fd = load_prog_fd_array(&ld_map_idx_delete_prog(1, key as i32), &fds)
+            .ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a valid map fd_array");
+        }
+        {
+            let prog = prog_behind_fd(prog_fd).ok_or("program fd did not hold BpfProg")?;
+            if prog.map_by_idx(1).map(|map| map.id) != Some(second_id) {
+                return Err("BPF_PSEUDO_MAP_IDX resolved the wrong fd_array position");
+            }
+            if prog.jited_len() == 0 {
+                return Err("the map-index program did not exercise the JIT fixup path");
+            }
+        }
+        let mut test_attr = [0u8; ATTR_LEN];
+        let mut missing = 0u64;
+        put_u32(&mut test_attr, 0, prog_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_PROG_TEST_RUN,
+                test_attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(0)
+            || get_u32(&test_attr, 4) != 0
+            || elem(
+                BPF_MAP_LOOKUP_ELEM,
+                second,
+                (&key) as *const u32 as u64,
+                (&mut missing) as *mut u64 as u64,
+                0,
+            ) != Some(ENOENT)
+        {
+            return Err("the JIT did not execute against fd_array index 1");
+        }
+
+        // Eager binding reports duplicate objects once, in first-seen order.
+        let mut ids = [0u32; 4];
+        let mut info = [0u8; INFO_BUF];
+        put_info_u32(&mut info, PI_NR_MAP_IDS, ids.len() as u32);
+        put_info_u64(&mut info, PI_MAP_IDS, ids.as_mut_ptr() as u64);
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&info, PI_NR_MAP_IDS) != 2
+            || ids[..2] != [first_id, second_id]
+        {
+            return Err("fd_array maps were not deduplicated in program info");
+        }
+
+        // The legacy count-zero form still supplies indices lazily.
+        let legacy = load_prog_fd_array_raw(&ld_map_idx_prog(2), fds.as_ptr() as u64, 0)
+            .ok_or("legacy fd_array load not Ok")?;
+        if legacy < 0 {
+            return Err("legacy count-zero fd_array was rejected");
+        }
+        {
+            let prog = prog_behind_fd(legacy).ok_or("legacy program fd did not hold BpfProg")?;
+            if prog.map_by_idx(2).map(|map| map.id) != Some(first_id) {
+                return Err("legacy fd_array index resolved the wrong map");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(legacy as u64));
+
+        // Closing the creating map fds leaves both eager bindings alive.
+        let _ = call(Syscall::Close.raw(), a0(first as u64));
+        let _ = call(Syscall::Close.raw(), a0(second as u64));
+        for id in [first_id, second_id] {
+            let held = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("map id lookup not Ok")?;
+            if held < 0 {
+                return Err("fd_array map died when its creating fd closed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(held as u64));
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, first_id) != Some(ENOENT)
+            || fd_by_id(BPF_MAP_GET_FD_BY_ID, second_id) != Some(ENOENT)
+        {
+            return Err("fd_array maps survived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_maps);
+
+fn smoke_bpf_prog_load_fd_array_btf_lifetime() -> TestResult {
+    with_setup(|| {
+        let blob = minimal_btf();
+        let btf_fd = btf_load(&blob).ok_or("BPF_BTF_LOAD not Ok")?;
+        if btf_fd < 0 {
+            return Err("BPF_BTF_LOAD failed");
+        }
+        let btf_id = info_u32(&btf_info_of(btf_fd)?, BI_ID);
+        let fds = [btf_fd as i32];
+        let prog_fd = load_prog_fd_array(&ret_imm(0), &fds).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a BTF fd_array entry");
+        }
+        let _ = call(Syscall::Close.raw(), a0(btf_fd as u64));
+        let held = fd_by_id(BPF_BTF_GET_FD_BY_ID, btf_id).ok_or("BTF id lookup not Ok")?;
+        if held < 0 {
+            return Err("fd_array BTF died when its creating fd closed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(held as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, btf_id) != Some(ENOENT) {
+            return Err("fd_array BTF survived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_btf_lifetime);
+
+fn smoke_bpf_prog_load_fd_array_neg() -> TestResult {
+    with_setup(|| {
+        if load_prog_fd_array_raw(&ret_imm(0), 0, 1) != Some(EFAULT) {
+            return Err("a non-zero fd_array_cnt with null fd_array was not EFAULT");
+        }
+        if load_prog_fd_array_raw(&ld_map_idx_prog(0), 0, 0) != Some(EPROTO) {
+            return Err("BPF_PSEUDO_MAP_IDX without fd_array was not EPROTO");
+        }
+        let invalid = [4095i32];
+        if load_prog_fd_array(&ret_imm(0), &invalid) != Some(EBADF) {
+            return Err("an unopened fd_array entry was not EBADF");
+        }
+        let mut pipefds = [0u8; 8];
+        if call(Syscall::Pipe.raw(), a0(pipefds.as_mut_ptr() as u64)) != Some(0) {
+            return Err("pipe setup failed");
+        }
+        let pipe_fd = i32::from_le_bytes([pipefds[0], pipefds[1], pipefds[2], pipefds[3]]);
+        if load_prog_fd_array(&ret_imm(0), &[pipe_fd]) != Some(EINVAL) {
+            return Err("a non-map/non-BTF fd_array entry was not EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(pipe_fd as u64));
+        let write_fd = i32::from_le_bytes([pipefds[4], pipefds[5], pipefds[6], pipefds[7]]);
+        let _ = call(Syscall::Close.raw(), a0(write_fd as u64));
+
+        if load_prog_fd_array_raw(&ret_imm(0), 0, u32::MAX) != Some(EINVAL) {
+            return Err("an overflowing fd_array_cnt was not EINVAL");
+        }
+
+        // Linux's verifier admits at most 64 distinct used maps. Duplicate
+        // descriptors do not consume another slot, but a 65th object does.
+        let mut map_fds = alloc::vec::Vec::new();
+        for _ in 0..65 {
+            let map = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+            if map < 0 {
+                for fd in map_fds {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                return Err("map creation for the fd_array limit failed");
+            }
+            map_fds.push(map);
+        }
+        let raw_fds: alloc::vec::Vec<i32> = map_fds.iter().map(|fd| *fd as i32).collect();
+        let too_many = load_prog_fd_array(&ret_imm(0), &raw_fds);
+        for fd in map_fds {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        if too_many != Some(E2BIG) {
+            if let Some(fd) = too_many.filter(|fd| *fd >= 0) {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            return Err("a 65th distinct fd_array map was not E2BIG");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_neg);
+
 fn smoke_abi_bpf_prog_load_with_a_map_pos() -> TestResult {
     with_setup(|| {
         let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;

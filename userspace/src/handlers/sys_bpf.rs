@@ -45,6 +45,7 @@ use narf_capabilities::{Cap, Grant};
 // Errno values this handler returns. `handlers/mod.rs` names only the few it
 // needs; the rest are spelled out here rather than widening that set.
 const EPERM: i64 = 1;
+const E2BIG: i64 = 7;
 const EBADF_: i64 = 9;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -53,6 +54,7 @@ const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 const EBUSY: i64 = 16;
+const EPROTO: i64 = 71;
 /// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
 /// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
 const ENOTSUP: i64 = 95;
@@ -109,6 +111,8 @@ const PL_PROG_TYPE: usize = 0;
 const PL_INSN_CNT: usize = 4;
 const PL_INSNS: usize = 8;
 const PL_PROG_NAME: usize = 48;
+const PL_FD_ARRAY: usize = 120;
+const PL_FD_ARRAY_CNT: usize = 148;
 const PROG_NAME_LEN: usize = 16;
 
 // `struct { … } test` field offsets.
@@ -419,7 +423,9 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     // Every map the program's `LD_IMM64` immediates name, resolved through the
     // caller's fd table. The `Arc`s travel into the program and keep the maps
     // alive after the creating fds are closed.
-    let maps = match resolve_prog_maps(&insns) {
+    let fd_array = u64_at(&attr, PL_FD_ARRAY);
+    let fd_array_cnt = u32_at(&attr, PL_FD_ARRAY_CNT);
+    let resolved = match resolve_prog_maps(&insns, fd_array, fd_array_cnt) {
         Ok(m) => m,
         Err(e) => return e,
     };
@@ -430,7 +436,9 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
             name,
             insns,
             context,
-            maps,
+            maps: resolved.maps,
+            map_indices: resolved.map_indices,
+            load_references: resolved.load_references,
         },
     ) {
         Ok(p) => p,
@@ -1260,7 +1268,67 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
     result
 }
 
-/// Resolve every map a program's `LD_IMM64` immediates name.
+/// Objects resolved from `BPF_PROG_LOAD`'s instruction image and fd array.
+struct ResolvedProgMaps {
+    maps: alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)>,
+    map_indices: alloc::vec::Vec<narf_bpf::prog::IndexedMap>,
+    load_references:
+        alloc::vec::Vec<alloc::sync::Arc<dyn narf_bpf::prog::LoadReference>>,
+}
+
+/// Read one signed descriptor from the caller's fd array.
+fn fd_array_entry(uptr: u64, index: u64) -> Result<i32, i64> {
+    let offset = index.checked_mul(4).ok_or(-EFAULT)?;
+    let at = uptr.checked_add(offset).ok_or(-EFAULT)?;
+    let mut raw = [0u8; 4];
+    // SAFETY: `copy_from_user` validates the four-byte range and SMAP-brackets
+    // it. Linux performs the same per-entry copy rather than trusting `count`
+    // as an allocation size.
+    unsafe { copy_from_user(&mut raw, at) }.map_err(|e| -(e as i64))?;
+    Ok(i32::from_le_bytes(raw))
+}
+
+/// Add one map lifetime/reference entry, enforcing Linux's 64-object limit.
+///
+/// Array scanning only needs one reference per object. Direct `MapFd`
+/// instructions additionally need their exact fd alias retained because NARF
+/// resolves immutable instructions at run time rather than rewriting them.
+fn add_prog_map(
+    maps: &mut alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)>,
+    fd: i32,
+    map: alloc::sync::Arc<narf_bpf::map::BpfMap>,
+    retain_fd_alias: bool,
+) -> Result<(), i64> {
+    if maps.iter().any(|(known_fd, known)| {
+        alloc::sync::Arc::ptr_eq(known, &map) && (!retain_fd_alias || *known_fd == fd)
+    }) {
+        return Ok(());
+    }
+    let is_new_object = !maps
+        .iter()
+        .any(|(_, known)| alloc::sync::Arc::ptr_eq(known, &map));
+    if is_new_object && distinct_prog_maps(maps) >= 64 {
+        return Err(-E2BIG);
+    }
+    maps.push((fd, map));
+    Ok(())
+}
+
+fn distinct_prog_maps(
+    maps: &[(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)],
+) -> usize {
+    maps.iter()
+        .enumerate()
+        .filter(|(i, (_, map))| {
+            !maps[..*i]
+                .iter()
+                .any(|(_, earlier)| alloc::sync::Arc::ptr_eq(earlier, map))
+        })
+        .count()
+}
+
+/// Resolve every map a program's `LD_IMM64` immediates name and every object
+/// eagerly bound through `fd_array_cnt`.
 ///
 /// Linux does this in `resolve_pseudo_ldimm64` and *rewrites the instruction*
 /// to hold the map's kernel address. NARF does not rewrite: verification does
@@ -1269,46 +1337,102 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
 /// same list. The cost is one lookup per `LD_IMM64`; the gain is that there is
 /// no second, patched copy of the program to keep consistent.
 ///
-/// Duplicate fds collapse to one entry, so a program that names the same map
-/// twenty times holds one reference and the verifier sees one descriptor.
+/// Duplicate objects collapse for lifetime and info reporting. Exact fd aliases
+/// used by immutable `MapFd` instructions remain as lookup descriptors, while
+/// sparse array indices travel in their own table and cannot be renumbered by
+/// a BTF entry or duplicate map.
 fn resolve_prog_maps(
     insns: &[narf_bpf_isa::Insn],
-) -> Result<alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)>, i64> {
+    fd_array: u64,
+    fd_array_cnt: u32,
+) -> Result<ResolvedProgMaps, i64> {
     use narf_bpf_isa::{Decoded, Imm64};
 
-    let mut out: alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)> =
-        alloc::vec::Vec::new();
+    if fd_array_cnt >= u32::MAX / 4 {
+        return Err(-EINVAL);
+    }
+
+    let mut maps = alloc::vec::Vec::new();
+    let mut map_indices = alloc::vec::Vec::new();
+    let mut load_references = alloc::vec::Vec::new();
+    let mut btf_ids = alloc::vec::Vec::new();
+
+    // A non-zero count selects Linux's continuous-array API: every entry must
+    // be a map or BTF fd and is bound even when no instruction names it.
+    for index in 0..fd_array_cnt {
+        let fd = fd_array_entry(fd_array, u64::from(index))?;
+        let ops = match fd::with_table(current_task_id(), |t| {
+            u32::try_from(fd)
+                .ok()
+                .and_then(|n| t.get(n).map(|entry| entry.ops.clone()))
+        }) {
+            Some(Some(ops)) => ops,
+            _ => return Err(-EBADF_),
+        };
+        let Some(any) = ops.as_any() else {
+            return Err(-EINVAL);
+        };
+        if let Some(file) = any.downcast_ref::<MapFile>() {
+            let map = file.map();
+            add_prog_map(&mut maps, fd, map, false)?;
+            continue;
+        }
+        if let Some(file) = any.downcast_ref::<BtfFile>() {
+            let id = file.id();
+            if !btf_ids.contains(&id) {
+                if btf_ids.len() >= 64 {
+                    return Err(-E2BIG);
+                }
+                btf_ids.push(id);
+                let reference: alloc::sync::Arc<dyn narf_bpf::prog::LoadReference> = file.blob();
+                load_references.push(reference);
+            }
+            continue;
+        }
+        return Err(-EINVAL);
+    }
+
     let mut i = 0usize;
     while i < insns.len() {
         // An undecodable instruction is not this function's error to report:
         // `BpfProg::load` decodes the whole image and names the offending slot.
         let Ok((d, width)) = narf_bpf_isa::decode(insns, i) else {
-            return Ok(out);
+            return Ok(ResolvedProgMaps {
+                maps,
+                map_indices,
+                load_references,
+            });
         };
         if let Decoded::LoadImm64 { value, .. } = d {
-            let fd = match value {
-                Imm64::MapFd(fd) | Imm64::MapValue { fd, .. } => Some(fd),
-                // The `MapIdx` forms index this very list, so there is no fd to
-                // resolve — the loader must have named its maps by fd at least
-                // once for the array to exist. A program using only the index
-                // forms therefore resolves to an empty set and the verifier
-                // reports `UnknownMap`, which is the honest answer: NARF has no
-                // separate `fd_array` attribute to populate it from.
-                //
-                // LINUX-GAP: `bpf_attr.prog_load.fd_array` is not implemented,
-                // so `BPF_PSEUDO_MAP_IDX{,_VALUE}` cannot resolve. The verifier
-                // supports the forms; the syscall has nowhere to get the array.
-                Imm64::MapIdx(_) | Imm64::MapIdxValue { .. } => None,
-                _ => None,
-            };
-            if let Some(fd) = fd {
-                if !out.iter().any(|(f, _)| *f == fd) {
-                    let m = map_from_fd(fd as u32)?;
-                    out.push((fd, m));
+            match value {
+                Imm64::MapFd(fd) | Imm64::MapValue { fd, .. } => {
+                    let map = map_from_fd(fd as u32)?;
+                    add_prog_map(&mut maps, fd, map, true)?;
                 }
+                Imm64::MapIdx(index) | Imm64::MapIdxValue { idx: index, .. } => {
+                    if fd_array == 0 {
+                        return Err(-EPROTO);
+                    }
+                    let fd = fd_array_entry(
+                        fd_array,
+                        u64::try_from(index).map_err(|_| -EFAULT)?,
+                    )?;
+                    let map = map_from_fd(fd as u32)?;
+                    add_prog_map(&mut maps, fd, alloc::sync::Arc::clone(&map), false)?;
+                    if !map_indices.iter().any(
+                        |known: &narf_bpf::prog::IndexedMap| known.index == index,
+                    ) {
+                        map_indices.push(narf_bpf::prog::IndexedMap { index, fd, map });
+                    }
+                }
+                _ => {}
             }
         }
         i += width;
     }
-    Ok(out)
+    Ok(ResolvedProgMaps {
+        maps,
+        map_indices,
+        load_references,
+    })
 }

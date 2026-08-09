@@ -634,6 +634,8 @@ mod smokes {
                 insns,
                 context,
                 maps: Vec::new(),
+                map_indices: Vec::new(),
+                load_references: Vec::new(),
             },
         )
         .ok()

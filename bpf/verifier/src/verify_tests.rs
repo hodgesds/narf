@@ -1953,6 +1953,7 @@ fn callback_subprogram_addresses_are_not_implemented_yet() {
 
 const MAP8: MapDesc = MapDesc {
     fd: 3,
+    fd_array_idx: None,
     key_size: 4,
     value_size: 8,
     max_entries: 16,
@@ -2136,9 +2137,14 @@ fn a_map_index_immediate_resolves_by_position() {
     // maps. Descriptor 1 is deliberately given a *different* fd from its index,
     // so a resolver that confused the two would fail this.
     let maps = [
-        MapDesc { fd: 40, ..MAP8 },
+        MapDesc {
+            fd: 40,
+            fd_array_idx: Some(0),
+            ..MAP8
+        },
         MapDesc {
             fd: 41,
+            fd_array_idx: Some(1),
             value_size: 32,
             ..MAP8
         },

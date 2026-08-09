@@ -163,6 +163,8 @@ fn load_with_maps(
             insns,
             context: ctx,
             maps,
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         },
     )
     .map_err(|_| "load rejected")
@@ -1493,6 +1495,8 @@ fn arena_prog(
             insns: asm(items),
             context: Context::Atomic,
             maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         },
         Some(alloc::sync::Arc::new(g)),
     )
@@ -1690,6 +1694,8 @@ fn smoke_bpf_jit_arena_unpopulated_pages_trap_natively() -> TestResult {
             ]),
             context: Context::Atomic,
             maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         },
         Some(alloc::sync::Arc::new(g)),
     ) {
@@ -1862,7 +1868,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
 
     // Gate 3: a probe read — a fault site that is not an arena access — is
     // refused, and named as such.
-    if crate::jit_glue::try_compile(&base(false), true, 0, &[]).err()
+    if crate::jit_glue::try_compile(&base(false), true, 0, &[], &[]).err()
         != Some(crate::jit_glue::JitSkip::HasFaultSites)
     {
         return TestResult::Fail("a non-arena fault site must still be refused by gate 3");
@@ -1870,7 +1876,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // Gate 2: an arena program with no arena has no slot base to be entered
     // with, and one with two has the straddling divergence.
     for n in [0usize, 2, 3] {
-        if crate::jit_glue::try_compile(&base(true), true, n, &[]).err()
+        if crate::jit_glue::try_compile(&base(true), true, n, &[], &[]).err()
             != Some(crate::jit_glue::JitSkip::UsesArena)
         {
             return TestResult::Fail("gate 2 must refuse any arena count other than one");
@@ -1879,7 +1885,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
     // And a gate that refuses everything is not a gate: the same program with
     // exactly one arena is accepted, so the two refusals above are about the
     // count and the flag rather than about arena programs in general.
-    match crate::jit_glue::try_compile(&base(true), true, 1, &[]) {
+    match crate::jit_glue::try_compile(&base(true), true, 1, &[], &[]) {
         Ok(image) => {
             // …and the emitted image really does contain the arena shape, so
             // `run_atomic`'s belt will demand a slot base for it. An `Ok` whose
@@ -3479,6 +3485,67 @@ fn smoke_bpf_prog_bind_map_holds_lifetime_without_access() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_prog_bind_map_holds_lifetime_without_access);
 
+fn smoke_bpf_indexed_only_map_is_accounted() -> TestResult {
+    checked(|| {
+        let map = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let id = map.id;
+        let weak = Arc::downgrade(&map);
+        let prog = BpfProg::load(
+            load_cap(),
+            LoadRequest {
+                name: String::from("idxonly"),
+                insns: asm(&[
+                    Decoded::LoadImm64 {
+                        dst: r(1),
+                        value: Imm64::MapIdx(9),
+                    },
+                    mov_imm(0, 0),
+                    EXIT,
+                ]),
+                context: Context::Atomic,
+                maps: alloc::vec::Vec::new(),
+                map_indices: alloc::vec![crate::prog::IndexedMap {
+                    index: 9,
+                    fd: 77,
+                    map: Arc::clone(&map),
+                }],
+                load_references: alloc::vec::Vec::new(),
+            },
+        )
+        .map_err(|_| "indexed-only load failed")?;
+
+        if prog.map_count() != 1
+            || prog.map_by_idx(9).map(|indexed| indexed.id) != Some(id)
+            || prog
+                .used_map_ids()
+                .map_err(|_| "used-map snapshot allocation failed")?
+                != alloc::vec![id]
+        {
+            return Err("indexed-only map was missing from program accounting");
+        }
+        prog.bind_map(Arc::clone(&map))
+            .map_err(|_| "binding an indexed map failed")?;
+        if prog
+            .used_map_ids()
+            .map_err(|_| "used-map snapshot allocation failed")?
+            != alloc::vec![id]
+        {
+            return Err("binding an indexed map duplicated its program-info id");
+        }
+
+        drop(map);
+        if weak.upgrade().is_none() {
+            return Err("indexed map died while the program was still live");
+        }
+        drop(prog);
+        if weak.upgrade().is_some() {
+            return Err("indexed map outlived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_indexed_only_map_is_accounted);
+
 // ── map access from a program ───────────────────────────────────────
 
 /// The fd a smoke's `LD_IMM64` immediates name.
@@ -3508,6 +3575,8 @@ fn load_with_map(
             insns,
             context: Context::Atomic,
             maps: alloc::vec![(SMOKE_MAP_FD, Arc::clone(map))],
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         },
     )
 }
