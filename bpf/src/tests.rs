@@ -989,6 +989,42 @@ fn smoke_bpf_verified_ceiling_fits_the_real_region() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_verified_ceiling_fits_the_real_region);
 
+fn smoke_bpf_counts_only_recursion_refusals() -> TestResult {
+    use crate::mem::BpfStack;
+
+    if !crate::mem::region_ready() {
+        return TestResult::Fail("bpf-percpu-stack initcall did not run");
+    }
+    let Ok(prog) = load("recurmiss", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic) else {
+        return TestResult::Fail("load rejected a trivial program");
+    };
+    let provider = crate::mem::PerCpuRegion;
+    let mut occupied = Vec::new();
+    for _ in 0..narf_memory::bpf_stack::MAX_NEST {
+        let Some(frame) = provider.acquire(64) else {
+            return TestResult::Fail("could not occupy every per-CPU nesting level");
+        };
+        occupied.push(frame);
+    }
+
+    if prog.run_atomic([0; 4], 4).is_some() {
+        return TestResult::Fail("an invocation ran past the nesting limit");
+    }
+    if prog.recursion_misses() != 1 {
+        return TestResult::Fail("nesting refusal did not increment recursion_misses once");
+    }
+
+    drop(occupied);
+    if !matches!(prog.run_atomic([0; 4], 4), Some(Outcome::Returned(1))) {
+        return TestResult::Fail("program did not run after nesting levels were released");
+    }
+    if prog.recursion_misses() != 1 {
+        return TestResult::Fail("successful invocation changed recursion_misses");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_counts_only_recursion_refusals);
+
 fn smoke_bpf_fresh_frame_is_zeroed() -> TestResult {
     // Pins a cross-crate obligation. The verifier deliberately loses per-byte
     // initialisation tracking for a caller frame passed to a callee, which is

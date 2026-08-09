@@ -14,7 +14,9 @@ use narf_crypto::sha256::Sha256;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
-use crate::mem::{BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, STUB_STACK_BYTES};
+use crate::mem::{
+    BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, STUB_STACK_BYTES,
+};
 
 /// Authority to load and verify a BPF program.
 ///
@@ -145,6 +147,8 @@ pub struct BpfProg {
     stats_runs: AtomicU64,
     /// Nanoseconds spent executing invocations admitted to runtime stats.
     run_time_ns: AtomicU64,
+    /// Atomic invocations refused because this CPU's nesting budget was full.
+    recursion_misses: AtomicU64,
     /// Sum of return values. One of three ways an attached program's effect is
     /// observed, alongside the scratch counters in `crate::kfuncs` and — now
     /// that they exist — the maps in `crate::map`.
@@ -483,6 +487,7 @@ impl BpfProg {
             runs: AtomicU64::new(0),
             stats_runs: AtomicU64::new(0),
             run_time_ns: AtomicU64::new(0),
+            recursion_misses: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
         });
@@ -742,6 +747,17 @@ impl BpfProg {
         self.run_time_ns.load(Ordering::Relaxed)
     }
 
+    /// Atomic invocations declined because the per-CPU nesting limit was full.
+    ///
+    /// Unlike [`Self::stats_runs`] and [`Self::run_time_ns`], Linux accounts
+    /// recursion misses even when `BPF_ENABLE_STATS` is disabled. Oversized
+    /// stack requests and an unavailable provider are not recursion misses.
+    #[inline]
+    #[must_use]
+    pub fn recursion_misses(&self) -> u64 {
+        self.recursion_misses.load(Ordering::Relaxed)
+    }
+
     /// Sum of return values across every invocation.
     #[inline]
     #[must_use]
@@ -818,11 +834,7 @@ impl BpfProg {
         // rather than silently run on a frame smaller than it was proved to
         // need — the two sizes disagreeing silently is what the stub-only path
         // used to do (4 KiB stub against a 16 KiB verified ceiling).
-        let frame = if crate::mem::region_ready() {
-            PerCpuRegion.acquire(self.stack_bytes as usize)?
-        } else {
-            PerCpuStackStub.acquire(self.stack_bytes as usize)?
-        };
+        let frame = self.acquire_atomic_frame()?;
         let registry = crate::kfunc::registry()?;
         // Four readable words, tail zero-filled — the same contract
         // `run_atomic_native` provides, because the verifier proved all four
@@ -879,11 +891,7 @@ impl BpfProg {
             return None;
         }
         let image = self.jit.as_ref()?;
-        let mut frame = if crate::mem::region_ready() {
-            PerCpuRegion.acquire(self.stack_bytes as usize)?
-        } else {
-            PerCpuStackStub.acquire(self.stack_bytes as usize)?
-        };
+        let mut frame = self.acquire_atomic_frame()?;
         // The frame is already zeroed by the provider, which native code relies
         // on exactly as the interpreter does: the verifier permits reading a
         // widened stack slot before any concrete write, so the bytes must not be
@@ -961,6 +969,30 @@ impl BpfProg {
         };
         self.record(outcome, stats_start);
         Some(outcome)
+    }
+
+    /// Claim the stack for one atomic invocation and classify a refusal.
+    ///
+    /// A loaded program is verifier-bounded to the real region's per-level
+    /// size. Therefore a real-provider refusal after boot means the nesting
+    /// budget is full. Before boot reaches that provider, the smaller stub can
+    /// also reject an otherwise valid program for size; that case must not be
+    /// reported as Linux's `recursion_misses`.
+    fn acquire_atomic_frame(&self) -> Option<StackFrame<'_>> {
+        let bytes = self.stack_bytes as usize;
+        if crate::mem::region_ready() {
+            let frame = PerCpuRegion.acquire(bytes);
+            if frame.is_none() && (bytes as u64) <= narf_memory::bpf_stack::bytes_per_level() {
+                self.recursion_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            frame
+        } else {
+            let frame = PerCpuStackStub.acquire(bytes);
+            if frame.is_none() && bytes <= STUB_STACK_BYTES {
+                self.recursion_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            frame
+        }
     }
 
     /// Whether this program runs as native code.

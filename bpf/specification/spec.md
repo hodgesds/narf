@@ -353,6 +353,17 @@ buffer, true-length, truncation, and `EFAULT` behavior. Raw and id-selected
 attaches both claim the resolved dispatch id in the single-owner table, so the
 two ABIs cannot attach independently to one physical hook.
 
+### 3.13 Program recursion misses
+
+Every `BpfProg` owns an always-on `recursion_misses` counter. `run_atomic`
+increments it exactly when the current CPU's per-CPU stack nesting budget
+refuses an invocation; an oversized request or unavailable provider remains a
+plain refusal and is not misclassified. `BpfProg::recursion_misses()` exposes
+the cumulative value through Linux's `bpf_prog_info.recursion_misses` field.
+The counter is independent of `BPF_ENABLE_STATS`, matching Linux: timing and
+successful-run counts pay the opt-in timestamp cost, while recursion refusals
+are counted whenever they occur.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

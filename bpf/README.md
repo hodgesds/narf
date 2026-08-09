@@ -45,8 +45,8 @@ Landed:
   keyed-map freeze, load-time map/BTF fd arrays, program-map lifetime binding,
   translated/native instruction dumps, stable Linux program tags, license and
   load-provenance metadata, bounded verifier logs, native raw-tracepoint program
-  loads and named opens, fd-gated runtime statistics, prog-query, task-fd-query,
-  and iterators.
+  loads and named opens, fd-gated runtime statistics, recursion-miss accounting,
+  prog-query, task-fd-query, and iterators.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call
 (register-allocation blockers — these fall back to the interpreter); typed

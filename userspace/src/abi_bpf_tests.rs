@@ -2019,6 +2019,64 @@ fn smoke_abi_bpf_enable_stats_pos() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_abi_bpf_enable_stats_pos);
 
+fn smoke_abi_bpf_prog_info_recursion_misses_pos() -> TestResult {
+    with_setup(|| {
+        use narf_bpf::mem::BpfStack;
+
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+
+        let provider = narf_bpf::mem::PerCpuRegion;
+        let mut occupied = alloc::vec::Vec::new();
+        for _ in 0..narf_memory::bpf_stack::MAX_NEST {
+            occupied.push(
+                provider
+                    .acquire(64)
+                    .ok_or("could not occupy every per-CPU nesting level")?,
+            );
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, prog_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EAGAIN)
+        {
+            return Err("BPF_PROG_TEST_RUN did not report a nesting refusal");
+        }
+
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed after a nesting refusal");
+        }
+        if info_u64(&info, PI_RECURSION_MISSES) != 1 {
+            return Err("bpf_prog_info.recursion_misses did not report the refusal");
+        }
+
+        drop(occupied);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(0)
+        {
+            return Err("BPF_PROG_TEST_RUN did not recover after releasing stack levels");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&info, PI_RECURSION_MISSES) != 1
+        {
+            return Err("a successful run changed bpf_prog_info.recursion_misses");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_prog_info_recursion_misses_pos);
+
 fn smoke_abi_bpf_enable_stats_neg() -> TestResult {
     with_setup(|| {
         if enable_stats(1) != Some(EINVAL) {
@@ -2977,6 +3035,7 @@ const PI_NAME: usize = 64;
 const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
+const PI_RECURSION_MISSES: usize = 208;
 
 // `struct bpf_map_info` field offsets.
 const MI_TYPE: usize = 0;
