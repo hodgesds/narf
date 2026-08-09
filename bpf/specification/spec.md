@@ -187,6 +187,17 @@ Five native kinds behind an ~8-method trait: `Array`, `Hash`, `PerCpuArray`,
 tries, bloom filters, queues/stacks, map-in-map, and the graph data-structure
 API — is an arena + kfunc library here, not kernel code.
 
+`BPF_MAP_FREEZE` is object-wide and one-way for the four keyed kinds. A
+successful call prevents every later syscall update/delete, including the
+batch and lookup-and-delete forms, with `EPERM`; lookup and iteration remain
+available, and program-side kfunc updates remain legal. A repeated freeze or a
+freeze racing an already admitted syscall writer returns `EBUSY`. The runtime
+linearises these through `BpfMap::begin_sys_write` / `SysWrite`, so freeze
+cannot return while an earlier userspace write can still commit. Ring buffers
+return `EOPNOTSUPP`: their writable consumer-page `mmap` is not yet represented
+in that writer accounting, so reporting success would leave a userspace alias
+that can still mutate the ring.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches
