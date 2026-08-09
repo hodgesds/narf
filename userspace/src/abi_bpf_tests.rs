@@ -17,12 +17,14 @@ const BPF_PROG_LOAD: u64 = 5;
 const BPF_OBJ_PIN: u64 = 6;
 const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
+const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u64 = 21;
 const BPF_MAP_FREEZE: u64 = 22;
 const BPF_ENABLE_STATS: u64 = 32;
 const BPF_PROG_BIND_MAP: u64 = 35;
 /// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
 /// in the "deliberately absent" list now that pinning has landed.
 const BPF_PROG_QUERY: u64 = 16;
+const BPF_RAW_TRACEPOINT_OPEN: u64 = 17;
 const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
@@ -33,7 +35,7 @@ const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 
 /// A `union bpf_attr` big enough for `prog_load` and `test`.
-const ATTR_LEN: usize = 128;
+const ATTR_LEN: usize = 160;
 
 fn put_u32(buf: &mut [u8; ATTR_LEN], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -58,10 +60,15 @@ fn ret_imm(v: i32) -> [u8; 16] {
 }
 
 fn load_prog(prog_type: u32, insns: &[u8]) -> Option<i64> {
+    load_prog_license(prog_type, insns, b"GPL\0")
+}
+
+fn load_prog_license(prog_type: u32, insns: &[u8], license: &[u8]) -> Option<i64> {
     let mut attr = [0u8; ATTR_LEN];
     put_u32(&mut attr, 0, prog_type);
     put_u32(&mut attr, 4, (insns.len() / 8) as u32);
     put_u64(&mut attr, 8, insns.as_ptr() as u64);
+    put_u64(&mut attr, 16, license.as_ptr() as u64);
     // prog_name, a fixed 16-byte NUL-padded field at offset 48.
     attr[48..52].copy_from_slice(b"abit");
     call(
@@ -91,6 +98,107 @@ fn smoke_abi_bpf_prog_load_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_pos);
+
+fn smoke_abi_bpf_prog_load_license_pos() -> TestResult {
+    with_setup(|| {
+        const GPL_LICENSES: [&[u8]; 6] = [
+            b"GPL\0",
+            b"GPL v2\0",
+            b"GPL and additional rights\0",
+            b"Dual BSD/GPL\0",
+            b"Dual MIT/GPL\0",
+            b"Dual MPL/GPL\0",
+        ];
+        let insns = ret_imm(1);
+        for license in GPL_LICENSES {
+            let fd =
+                load_prog_license(BPF_PROG_TYPE_TRACING, &insns, license).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD rejected a GPL-compatible license");
+            }
+            let mut info = [0u8; INFO_BUF];
+            if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+                return Err("BPF_OBJ_GET_INFO_BY_FD failed for a licensed program");
+            }
+            if info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 1 {
+                return Err("bpf_prog_info did not classify a GPL-compatible license");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        for license in [b"MIT\0".as_slice(), b"GPL v3\0", b"gpl\0", b"GPL \0"] {
+            let fd =
+                load_prog_license(BPF_PROG_TYPE_TRACING, &insns, license).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD rejected a non-GPL license");
+            }
+            let mut info = [0u8; INFO_BUF];
+            if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+                return Err("BPF_OBJ_GET_INFO_BY_FD failed for a licensed program");
+            }
+            if info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 0 {
+                return Err("bpf_prog_info accepted a near-miss GPL license");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // Linux forcibly terminates its 128-byte stack buffer after copying
+        // at most 127 bytes, so lack of an earlier NUL is not itself an error.
+        let unterminated = [b'X'; 127];
+        let fd = load_prog_license(BPF_PROG_TYPE_TRACING, &insns, &unterminated)
+            .ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a 127-byte unterminated license");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 0
+        {
+            return Err("unterminated license was not accepted as non-GPL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_license_pos);
+
+fn smoke_abi_bpf_prog_load_license_neg() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(1);
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, (insns.len() / 8) as u32);
+        put_u64(&mut attr, 8, insns.as_ptr() as u64);
+
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EFAULT)
+        {
+            return Err("BPF_PROG_LOAD with a NULL license did not return EFAULT");
+        }
+        put_u64(&mut attr, 16, u64::MAX);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EFAULT)
+        {
+            return Err("BPF_PROG_LOAD with an invalid license did not return EFAULT");
+        }
+
+        let license = b"GPL\0";
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, 16),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_LOAD accepted an attr truncated before license");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_license_neg);
 
 fn smoke_abi_bpf_prog_load_neg() -> TestResult {
     with_setup(|| {
@@ -127,6 +235,114 @@ fn smoke_abi_bpf_prog_load_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_neg);
+
+fn smoke_abi_bpf_prog_load_log_pos() -> TestResult {
+    with_setup(|| {
+        let license = b"GPL\0";
+        // `exit` reads R0 before it has been initialized. This pins that a
+        // verifier rejection includes both the variant and instruction index.
+        let invalid = [0x95u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut log = [0xAAu8; 192];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, 1);
+        put_u64(&mut attr, 8, invalid.as_ptr() as u64);
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        put_u32(&mut attr, 24, 1); // BPF_LOG_LEVEL1
+        put_u32(&mut attr, 28, log.len() as u32);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_LOAD did not preserve a verifier rejection");
+        }
+        let true_size = get_u32(&attr, 140) as usize;
+        if true_size == 0 || true_size > log.len() {
+            return Err("BPF_PROG_LOAD did not report the verifier log's true size");
+        }
+        if log[true_size - 1] != 0 {
+            return Err("BPF_PROG_LOAD verifier log is not NUL terminated");
+        }
+        let text = core::str::from_utf8(&log[..true_size - 1])
+            .map_err(|_| "BPF_PROG_LOAD verifier log was not UTF-8")?;
+        if !text.contains("UninitRegister") || !text.contains("at: 0") {
+            return Err("BPF_PROG_LOAD verifier log omitted the rejection location");
+        }
+
+        // Successful verification also produces a bounded diagnostic when
+        // requested, and still returns the program fd.
+        let valid = ret_imm(1);
+        let mut success_log = [0u8; 96];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, 2);
+        put_u64(&mut attr, 8, valid.as_ptr() as u64);
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, success_log.len() as u32);
+        put_u64(&mut attr, 32, success_log.as_mut_ptr() as u64);
+        let fd = call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        )
+        .ok_or("bpf() not Ok")?;
+        if fd < 0 || !success_log.starts_with(b"verification accepted: 2 instructions\n\0") {
+            return Err("successful BPF_PROG_LOAD did not return its verifier log");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_log_pos);
+
+fn smoke_abi_bpf_prog_load_log_neg() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(1);
+        let license = b"GPL\0";
+        let base = || {
+            let mut attr = [0u8; ATTR_LEN];
+            put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+            put_u32(&mut attr, 4, 2);
+            put_u64(&mut attr, 8, insns.as_ptr() as u64);
+            put_u64(&mut attr, 16, license.as_ptr() as u64);
+            attr
+        };
+
+        let mut log = [0xAAu8; 64];
+        let mut attr = base();
+        put_u32(&mut attr, 28, log.len() as u32);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EINVAL) {
+            return Err("BPF_PROG_LOAD accepted a log buffer without log_level");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 16); // outside BPF_LOG_MASK
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EINVAL) {
+            return Err("BPF_PROG_LOAD accepted an unknown log_level bit");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, 1);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(-28 /* ENOSPC */) {
+            return Err("BPF_PROG_LOAD did not report a truncated verifier log");
+        }
+        if log[0] != 0 || get_u32(&attr, 140) <= 1 {
+            return Err("truncated verifier log did not publish NUL and true size");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, 64);
+        put_u64(&mut attr, 32, u64::MAX);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EFAULT) {
+            return Err("BPF_PROG_LOAD with a bad verifier log pointer was not EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_log_neg);
 
 // ── BPF_PROG_TEST_RUN ───────────────────────────────────────────────
 
@@ -651,6 +867,8 @@ const BPF_EXIST: u64 = 2;
 const BPF_F_LOCK: u64 = 4;
 
 const BPF_F_NO_PREALLOC: u32 = 1;
+const BPF_F_RDONLY: u32 = 1 << 3;
+const BPF_F_WRONLY: u32 = 1 << 4;
 /// `BPF_F_MMAPABLE` — a flag NARF has no implementation of, so it must be
 /// refused rather than silently ignored.
 const BPF_F_MMAPABLE: u32 = 1024;
@@ -829,6 +1047,166 @@ fn smoke_abi_bpf_map_create_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_create_neg);
 
+fn smoke_abi_bpf_map_fd_access_modes() -> TestResult {
+    with_setup(|| {
+        let ro = create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_RDONLY)
+            .ok_or("read-only BPF_MAP_CREATE was not Ok")?;
+        let wo = create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_WRONLY)
+            .ok_or("write-only BPF_MAP_CREATE was not Ok")?;
+        if ro < 0 || wo < 0 {
+            return Err("BPF_MAP_CREATE refused an fd access mode");
+        }
+        if create_map_flags(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_RDONLY | BPF_F_WRONLY)
+            != Some(EINVAL)
+        {
+            return Err("BPF_MAP_CREATE accepted both access modes");
+        }
+
+        // The mode is part of the file description as well as the bpf(2)
+        // permission check, so ordinary F_GETFL must report it.
+        const F_GETFL: u64 = 3;
+        const O_ACCMODE: i64 = 3;
+        if call(Syscall::Fcntl.raw(), a2(ro as u64, F_GETFL, 0)) != Some(0) {
+            return Err("F_GETFL did not report O_RDONLY on a read-only map fd");
+        }
+        if call(Syscall::Fcntl.raw(), a2(wo as u64, F_GETFL, 0)).map(|flags| flags & O_ACCMODE)
+            != Some(1)
+        {
+            return Err("F_GETFL did not report O_WRONLY on a write-only map fd");
+        }
+
+        let key = 0u32;
+        let value = 0xAABB_CCDD_EEFF_0011u64;
+        let kptr = (&key) as *const u32 as u64;
+        let vptr = (&value) as *const u64 as u64;
+        let mut out = 0u64;
+        let out_ptr = (&mut out) as *mut u64 as u64;
+        let mut next = u32::MAX;
+
+        if elem(BPF_MAP_LOOKUP_ELEM, ro, kptr, out_ptr, 0) != Some(0)
+            || elem(
+                BPF_MAP_GET_NEXT_KEY,
+                ro,
+                0,
+                (&mut next) as *mut u32 as u64,
+                0,
+            ) != Some(0)
+        {
+            return Err("a read-only map fd refused a read operation");
+        }
+        if elem(BPF_MAP_UPDATE_ELEM, ro, kptr, vptr, BPF_ANY) != Some(-1)
+            || elem(BPF_MAP_DELETE_ELEM, ro, kptr, 0, 0) != Some(-1)
+            || freeze_map(ro) != Some(-1)
+        {
+            return Err("a read-only map fd admitted a write operation");
+        }
+        // Permission is checked after fd resolution but before user pointers.
+        if elem(BPF_MAP_UPDATE_ELEM, ro, 0, 0, BPF_ANY) != Some(-1) {
+            return Err("read-only permission did not precede pointer validation");
+        }
+
+        if elem(BPF_MAP_UPDATE_ELEM, wo, kptr, vptr, BPF_ANY) != Some(0) {
+            return Err("a write-only map fd refused an update");
+        }
+        if elem(BPF_MAP_LOOKUP_ELEM, wo, kptr, out_ptr, 0) != Some(-1)
+            || elem(
+                BPF_MAP_GET_NEXT_KEY,
+                wo,
+                0,
+                (&mut next) as *mut u32 as u64,
+                0,
+            ) != Some(-1)
+        {
+            return Err("a write-only map fd admitted a read operation");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, ro, kptr, out_ptr, 0) != Some(-1)
+            || elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, wo, kptr, out_ptr, 0) != Some(-1)
+        {
+            return Err("lookup-and-delete did not require both permissions");
+        }
+
+        let keys = [key];
+        let mut values = [value];
+        if batch(
+            BPF_MAP_LOOKUP_BATCH,
+            ro,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            values.as_mut_ptr() as u64,
+            1,
+            0,
+        )
+        .0 != Some(0)
+            || batch(
+                BPF_MAP_UPDATE_BATCH,
+                ro,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_ptr() as u64,
+                1,
+                BPF_ANY,
+            )
+            .0 != Some(-1)
+            || batch(
+                BPF_MAP_LOOKUP_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_mut_ptr() as u64,
+                1,
+                0,
+            )
+            .0 != Some(-1)
+            || batch(
+                BPF_MAP_UPDATE_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_ptr() as u64,
+                1,
+                BPF_ANY,
+            )
+            .0 != Some(0)
+        {
+            return Err("batch operations did not enforce their read/write direction");
+        }
+        if batch(
+            BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+            ro,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            values.as_mut_ptr() as u64,
+            1,
+            0,
+        )
+        .0 != Some(-1)
+            || batch(
+                BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+                wo,
+                0,
+                0,
+                keys.as_ptr() as u64,
+                values.as_mut_ptr() as u64,
+                1,
+                0,
+            )
+            .0 != Some(-1)
+        {
+            return Err("lookup-and-delete batch did not require both permissions");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(ro as u64));
+        let _ = call(Syscall::Close.raw(), a0(wo as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_fd_access_modes);
+
 // ── array element commands ──────────────────────────────────────────
 
 fn smoke_abi_bpf_map_array_elem_pos() -> TestResult {
@@ -980,6 +1358,7 @@ fn smoke_abi_bpf_map_elem_on_a_non_map_fd() -> TestResult {
             BPF_MAP_UPDATE_ELEM,
             BPF_MAP_DELETE_ELEM,
             BPF_MAP_GET_NEXT_KEY,
+            BPF_MAP_LOOKUP_AND_DELETE_ELEM,
         ] {
             if elem(
                 cmd,
@@ -1123,6 +1502,176 @@ fn smoke_abi_bpf_map_hash_elem_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_hash_elem_neg);
 
+// ── BPF_MAP_LOOKUP_AND_DELETE_ELEM ─────────────────────────────────
+
+fn smoke_abi_bpf_map_lookup_and_delete_elem_pos() -> TestResult {
+    with_setup(|| {
+        for kind in [BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_HASH] {
+            let fd = create_map(kind, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+            let key: u32 = kind;
+            let cpus = if kind == BPF_MAP_TYPE_PERCPU_HASH {
+                narf_lib::smp::cpu_count().max(1) as usize
+            } else {
+                1
+            };
+            let values: alloc::vec::Vec<u64> = (0..cpus)
+                .map(|cpu| 0x1122_0000_0000_0000 | cpu as u64)
+                .collect();
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                values.as_ptr() as u64,
+                BPF_ANY,
+            ) != Some(0)
+            {
+                return Err("seed update failed");
+            }
+            let mut out = alloc::vec![0u64; cpus];
+            if elem(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(0)
+            {
+                return Err("BPF_MAP_LOOKUP_AND_DELETE_ELEM failed");
+            }
+            if out != values {
+                return Err("lookup-and-delete returned the wrong syscall-width value");
+            }
+            if elem(
+                BPF_MAP_LOOKUP_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("lookup-and-delete left the key live");
+            }
+            if elem(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                fd,
+                (&key) as *const u32 as u64,
+                out.as_mut_ptr() as u64,
+                0,
+            ) != Some(ENOENT)
+            {
+                return Err("lookup-and-delete of an absent key was not ENOENT");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_lookup_and_delete_elem_pos);
+
+fn smoke_abi_bpf_map_lookup_and_delete_elem_neg() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+        let array_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if fd < 0 || array_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let key = 9u32;
+        let value = 0x8877_6655_4433_2211u64;
+        let kptr = (&key) as *const u32 as u64;
+        let vptr = (&value) as *const u64 as u64;
+
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, array_fd, kptr, vptr, 0) != Some(EOPNOTSUPP) {
+            return Err("lookup-and-delete on an Array was not EOPNOTSUPP");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, vptr, BPF_F_LOCK) != Some(EINVAL)
+            || elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, vptr, 8) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted unsupported flags");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, -1, kptr, vptr, 8) != Some(EINVAL) {
+            return Err("lookup-and-delete resolved the fd before validating flags");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, 0, vptr, 0) != Some(EFAULT) {
+            return Err("lookup-and-delete accepted a null key");
+        }
+        // The output pointer is not touched until a key has been found and
+        // consumed, so an absent key wins over the pointer fault.
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, 0, 0) != Some(ENOENT) {
+            return Err("absent lookup-and-delete touched its output pointer");
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, ME_MAP_FD, fd as u32);
+        put_u64(&mut attr, ME_KEY, kptr);
+        put_u64(&mut attr, ME_VALUE, vptr);
+        // Linux zero-extends short attrs. Omitting the flags field is valid;
+        // this key is absent, so the operation reaches the map and says so.
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                (ME_VALUE + 8) as u64,
+            ),
+        ) != Some(ENOENT)
+        {
+            return Err("lookup-and-delete did not zero-extend an omitted flags field");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                (ME_VALUE + 7) as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted a truncated attr");
+        }
+        attr[ME_FLAGS + 8] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                attr.as_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("lookup-and-delete accepted a non-zero attr tail");
+        }
+
+        // Linux removes the element before copying it to userspace. Preserve
+        // that ordering: an output EFAULT consumes the key without returning
+        // its value.
+        if elem(BPF_MAP_UPDATE_ELEM, fd, kptr, vptr, BPF_ANY) != Some(0) {
+            return Err("seed update before output fault failed");
+        }
+        if elem(BPF_MAP_LOOKUP_AND_DELETE_ELEM, fd, kptr, 0, 0) != Some(EFAULT) {
+            return Err("bad lookup-and-delete output pointer was not EFAULT");
+        }
+        let mut out = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            fd,
+            kptr,
+            (&mut out) as *mut u64 as u64,
+            0,
+        ) != Some(ENOENT)
+        {
+            return Err("output EFAULT did not consume the hash entry");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(array_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_lookup_and_delete_elem_neg);
+
 // ── BPF_MAP_FREEZE ─────────────────────────────────────────────────
 
 fn smoke_abi_bpf_map_freeze_pos() -> TestResult {
@@ -1180,6 +1729,17 @@ fn smoke_abi_bpf_map_freeze_pos() -> TestResult {
             != Some(-1 /* EPERM */)
         {
             return Err("single delete mutated a frozen map");
+        }
+        let mut deleted = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+            fd,
+            (&key) as *const u32 as u64,
+            (&mut deleted) as *mut u64 as u64,
+            0,
+        ) != Some(-1 /* EPERM */)
+        {
+            return Err("lookup-and-delete mutated a frozen map");
         }
         let keys = [key];
         let values = [replacement];
@@ -2063,6 +2623,256 @@ fn ld_map_fd_prog(fd: i64) -> [u8; 32] {
     p
 }
 
+/// `ld_imm64 r1 = map_by_idx(<index>); r0 = 0; exit`.
+fn ld_map_idx_prog(index: i32) -> [u8; 32] {
+    let mut p = [0u8; 32];
+    p[0] = 0x18;
+    // dst = r1, src = BPF_PSEUDO_MAP_IDX (5).
+    p[1] = 0x51;
+    p[4..8].copy_from_slice(&index.to_le_bytes());
+    p[16] = 0xB7;
+    p[24] = 0x95;
+    p
+}
+
+/// Load an indexed map into r1, put `key` in r2, and call
+/// `narf_map_delete(map, key)`. The returned errno becomes the program result.
+fn ld_map_idx_delete_prog(index: i32, key: i32) -> [u8; 40] {
+    let mut p = [0u8; 40];
+    p[0] = 0x18;
+    p[1] = 0x51;
+    p[4..8].copy_from_slice(&index.to_le_bytes());
+    p[16] = 0xB7; // r2 = key
+    p[17] = 0x02;
+    p[20..24].copy_from_slice(&key.to_le_bytes());
+    p[24] = 0x85; // call narf_map_delete
+    p[25] = 0x20; // src = BPF_PSEUDO_KFUNC_CALL (2)
+    p[28..32].copy_from_slice(&narf_bpf::kfunc::id_for("narf_map_delete").to_le_bytes());
+    p[32] = 0x95;
+    p
+}
+
+const PROG_LOAD_EXT_LEN: usize = 152;
+const PL_FD_ARRAY: usize = 120;
+const PL_FD_ARRAY_CNT: usize = 148;
+const EPROTO: i64 = -71;
+
+/// Load using the extended `prog_load` shape that reaches `fd_array_cnt`.
+fn load_prog_fd_array_raw(insns: &[u8], fd_array: u64, fd_array_cnt: u32) -> Option<i64> {
+    let mut attr = [0u8; PROG_LOAD_EXT_LEN];
+    attr[0..4].copy_from_slice(&BPF_PROG_TYPE_TRACING.to_le_bytes());
+    attr[4..8].copy_from_slice(&((insns.len() / 8) as u32).to_le_bytes());
+    attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+    attr[48..52].copy_from_slice(b"fdar");
+    attr[PL_FD_ARRAY..PL_FD_ARRAY + 8].copy_from_slice(&fd_array.to_le_bytes());
+    attr[PL_FD_ARRAY_CNT..PL_FD_ARRAY_CNT + 4].copy_from_slice(&fd_array_cnt.to_le_bytes());
+    call(
+        Syscall::Bpf.raw(),
+        a2(
+            BPF_PROG_LOAD,
+            attr.as_ptr() as u64,
+            PROG_LOAD_EXT_LEN as u64,
+        ),
+    )
+}
+
+fn load_prog_fd_array(insns: &[u8], fds: &[i32]) -> Option<i64> {
+    load_prog_fd_array_raw(insns, fds.as_ptr() as u64, fds.len() as u32)
+}
+
+fn smoke_bpf_prog_load_fd_array_maps() -> TestResult {
+    with_setup(|| {
+        let first = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
+        let second = create_map(BPF_MAP_TYPE_HASH, 4, 8, 2).ok_or("bpf() not Ok")?;
+        if first < 0 || second < 0 {
+            return Err("map creation for fd_array failed");
+        }
+        let first_id = map_id_of(first)?;
+        let second_id = map_id_of(second)?;
+        let fds = [first as i32, second as i32, first as i32];
+
+        let key = 1u32;
+        let value = 0x55AAu64;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            second,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("seeding the indexed hash map failed");
+        }
+
+        let prog_fd = load_prog_fd_array(&ld_map_idx_delete_prog(1, key as i32), &fds)
+            .ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a valid map fd_array");
+        }
+        {
+            let prog = prog_behind_fd(prog_fd).ok_or("program fd did not hold BpfProg")?;
+            if prog.map_by_idx(1).map(|map| map.id) != Some(second_id) {
+                return Err("BPF_PSEUDO_MAP_IDX resolved the wrong fd_array position");
+            }
+            if prog.jited_len() == 0 {
+                return Err("the map-index program did not exercise the JIT fixup path");
+            }
+        }
+        let mut test_attr = [0u8; ATTR_LEN];
+        let mut missing = 0u64;
+        put_u32(&mut test_attr, 0, prog_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_PROG_TEST_RUN,
+                test_attr.as_mut_ptr() as u64,
+                ATTR_LEN as u64,
+            ),
+        ) != Some(0)
+            || get_u32(&test_attr, 4) != 0
+            || elem(
+                BPF_MAP_LOOKUP_ELEM,
+                second,
+                (&key) as *const u32 as u64,
+                (&mut missing) as *mut u64 as u64,
+                0,
+            ) != Some(ENOENT)
+        {
+            return Err("the JIT did not execute against fd_array index 1");
+        }
+
+        // Eager binding reports duplicate objects once, in first-seen order.
+        let mut ids = [0u32; 4];
+        let mut info = [0u8; INFO_BUF];
+        put_info_u32(&mut info, PI_NR_MAP_IDS, ids.len() as u32);
+        put_info_u64(&mut info, PI_MAP_IDS, ids.as_mut_ptr() as u64);
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&info, PI_NR_MAP_IDS) != 2
+            || ids[..2] != [first_id, second_id]
+        {
+            return Err("fd_array maps were not deduplicated in program info");
+        }
+
+        // The legacy count-zero form still supplies indices lazily.
+        let legacy = load_prog_fd_array_raw(&ld_map_idx_prog(2), fds.as_ptr() as u64, 0)
+            .ok_or("legacy fd_array load not Ok")?;
+        if legacy < 0 {
+            return Err("legacy count-zero fd_array was rejected");
+        }
+        {
+            let prog = prog_behind_fd(legacy).ok_or("legacy program fd did not hold BpfProg")?;
+            if prog.map_by_idx(2).map(|map| map.id) != Some(first_id) {
+                return Err("legacy fd_array index resolved the wrong map");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(legacy as u64));
+
+        // Closing the creating map fds leaves both eager bindings alive.
+        let _ = call(Syscall::Close.raw(), a0(first as u64));
+        let _ = call(Syscall::Close.raw(), a0(second as u64));
+        for id in [first_id, second_id] {
+            let held = fd_by_id(BPF_MAP_GET_FD_BY_ID, id).ok_or("map id lookup not Ok")?;
+            if held < 0 {
+                return Err("fd_array map died when its creating fd closed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(held as u64));
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, first_id) != Some(ENOENT)
+            || fd_by_id(BPF_MAP_GET_FD_BY_ID, second_id) != Some(ENOENT)
+        {
+            return Err("fd_array maps survived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_maps);
+
+fn smoke_bpf_prog_load_fd_array_btf_lifetime() -> TestResult {
+    with_setup(|| {
+        let blob = minimal_btf();
+        let btf_fd = btf_load(&blob).ok_or("BPF_BTF_LOAD not Ok")?;
+        if btf_fd < 0 {
+            return Err("BPF_BTF_LOAD failed");
+        }
+        let btf_id = info_u32(&btf_info_of(btf_fd)?, BI_ID);
+        let fds = [btf_fd as i32];
+        let prog_fd = load_prog_fd_array(&ret_imm(0), &fds).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a BTF fd_array entry");
+        }
+        let _ = call(Syscall::Close.raw(), a0(btf_fd as u64));
+        let held = fd_by_id(BPF_BTF_GET_FD_BY_ID, btf_id).ok_or("BTF id lookup not Ok")?;
+        if held < 0 {
+            return Err("fd_array BTF died when its creating fd closed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(held as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_BTF_GET_FD_BY_ID, btf_id) != Some(ENOENT) {
+            return Err("fd_array BTF survived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_btf_lifetime);
+
+fn smoke_bpf_prog_load_fd_array_neg() -> TestResult {
+    with_setup(|| {
+        if load_prog_fd_array_raw(&ret_imm(0), 0, 1) != Some(EFAULT) {
+            return Err("a non-zero fd_array_cnt with null fd_array was not EFAULT");
+        }
+        if load_prog_fd_array_raw(&ld_map_idx_prog(0), 0, 0) != Some(EPROTO) {
+            return Err("BPF_PSEUDO_MAP_IDX without fd_array was not EPROTO");
+        }
+        let invalid = [4095i32];
+        if load_prog_fd_array(&ret_imm(0), &invalid) != Some(EBADF) {
+            return Err("an unopened fd_array entry was not EBADF");
+        }
+        let mut pipefds = [0u8; 8];
+        if call(Syscall::Pipe.raw(), a0(pipefds.as_mut_ptr() as u64)) != Some(0) {
+            return Err("pipe setup failed");
+        }
+        let pipe_fd = i32::from_le_bytes([pipefds[0], pipefds[1], pipefds[2], pipefds[3]]);
+        if load_prog_fd_array(&ret_imm(0), &[pipe_fd]) != Some(EINVAL) {
+            return Err("a non-map/non-BTF fd_array entry was not EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(pipe_fd as u64));
+        let write_fd = i32::from_le_bytes([pipefds[4], pipefds[5], pipefds[6], pipefds[7]]);
+        let _ = call(Syscall::Close.raw(), a0(write_fd as u64));
+
+        if load_prog_fd_array_raw(&ret_imm(0), 0, u32::MAX) != Some(EINVAL) {
+            return Err("an overflowing fd_array_cnt was not EINVAL");
+        }
+
+        // Linux's verifier admits at most 64 distinct used maps. Duplicate
+        // descriptors do not consume another slot, but a 65th object does.
+        let mut map_fds = alloc::vec::Vec::new();
+        for _ in 0..65 {
+            let map = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+            if map < 0 {
+                for fd in map_fds {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                return Err("map creation for the fd_array limit failed");
+            }
+            map_fds.push(map);
+        }
+        let raw_fds: alloc::vec::Vec<i32> = map_fds.iter().map(|fd| *fd as i32).collect();
+        let too_many = load_prog_fd_array(&ret_imm(0), &raw_fds);
+        for fd in map_fds {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        if too_many != Some(E2BIG) {
+            if let Some(fd) = too_many.filter(|fd| *fd >= 0) {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            return Err("a 65th distinct fd_array map was not E2BIG");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_load_fd_array_neg);
+
 fn smoke_abi_bpf_prog_load_with_a_map_pos() -> TestResult {
     with_setup(|| {
         let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
@@ -2150,12 +2960,17 @@ const INFO_BUF: usize = 320;
 // `struct bpf_prog_info` field offsets.
 const PI_TYPE: usize = 0;
 const PI_ID: usize = 4;
+const PI_TAG: usize = 8;
 const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
+const PI_JITED_PROG_INSNS: usize = 24;
 const PI_XLATED_PROG_INSNS: usize = 32;
+const PI_LOAD_TIME: usize = 40;
+const PI_CREATED_BY_UID: usize = 48;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 
@@ -2220,8 +3035,13 @@ fn next_id(cmd: u64, start: u32) -> (Option<i64>, u32) {
 
 /// `BPF_*_GET_FD_BY_ID`.
 fn fd_by_id(cmd: u64, id: u32) -> Option<i64> {
+    fd_by_id_flags(cmd, id, 0)
+}
+
+fn fd_by_id_flags(cmd: u64, id: u32, flags: u32) -> Option<i64> {
     let mut attr = [0u8; ATTR_LEN];
     put_u32(&mut attr, 0, id);
+    put_u32(&mut attr, 8, flags);
     call(
         Syscall::Bpf.raw(),
         a2(cmd, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
@@ -2275,6 +3095,12 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         if info_u32(&info, PI_ID) == 0 {
             return Err("bpf_prog_info.id is 0 — ids start at 1");
         }
+        // First eight bytes of SHA-256 over `ret_imm(7)`, independently
+        // generated with Linux's program-tag algorithm. This pins byte order,
+        // digest choice, and truncation rather than merely checking non-zero.
+        if info[PI_TAG..PI_TAG + 8] != [0x9e, 0xfe, 0x88, 0x73, 0x12, 0x07, 0x41, 0xb3] {
+            return Err("bpf_prog_info.tag is not Linux's SHA-256 program tag");
+        }
         // NARF does not rewrite instructions, so the xlated length is exactly
         // the loaded image.
         if info_u32(&info, PI_XLATED_PROG_LEN) != insns.len() as u32 {
@@ -2282,6 +3108,13 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         }
         if &info[PI_NAME..PI_NAME + 4] != b"abit" || info[PI_NAME + 4] != 0 {
             return Err("bpf_prog_info.name is not the NUL-padded load-time name");
+        }
+        let load_time = info_u64(&info, PI_LOAD_TIME);
+        if load_time == 0 {
+            return Err("bpf_prog_info.load_time is zero");
+        }
+        if info_u32(&info, PI_CREATED_BY_UID) != 0 {
+            return Err("bpf_prog_info.created_by_uid did not capture the root loader");
         }
         if info_u64(&info, PI_RUN_CNT) != 0 {
             return Err("bpf_prog_info.run_cnt is non-zero for a program never run");
@@ -2295,9 +3128,16 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         {
             return Err("BPF_PROG_TEST_RUN failed");
         }
+        // Length fields are input capacities as well as outputs. Start a fresh
+        // sizing query rather than accidentally requesting copies to the null
+        // pointers from the first query.
+        let mut info = [0u8; INFO_BUF];
         let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
         if r != Some(0) {
             return Err("second BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u64(&info, PI_LOAD_TIME) != load_time {
+            return Err("bpf_prog_info.load_time changed between queries");
         }
         // A program the JIT declined reports 0; one it compiled reports the
         // emitted byte count. Either is correct — what is not is a non-zero
@@ -2312,6 +3152,48 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_prog_pos);
+
+/// Linux removes map fds from the tag input because descriptor numbers are
+/// allocation-local. Two otherwise-identical programs must therefore retain
+/// one identity even when their maps arrived through different fds.
+fn smoke_abi_bpf_obj_get_info_prog_tag_map_fd_pos() -> TestResult {
+    with_setup(|| {
+        let map_a = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        let map_b = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if map_a < 0 || map_b < 0 || map_a == map_b {
+            return Err("BPF_MAP_CREATE did not return two distinct descriptors");
+        }
+        let prog_a =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_a)).ok_or("bpf() not Ok")?;
+        let prog_b =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_b)).ok_or("bpf() not Ok")?;
+        if prog_a < 0 || prog_b < 0 {
+            return Err("BPF_PROG_LOAD rejected a map-fd program");
+        }
+
+        let mut info_a = [0u8; INFO_BUF];
+        let mut info_b = [0u8; INFO_BUF];
+        if obj_info(prog_a, &mut info_a, PROG_INFO_LEN as u32).0 != Some(0)
+            || obj_info(prog_b, &mut info_b, PROG_INFO_LEN as u32).0 != Some(0)
+        {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed for a map-fd program");
+        }
+        let expected = [0x0b, 0xd0, 0x16, 0x86, 0x76, 0xc7, 0xc7, 0x79];
+        if info_a[PI_TAG..PI_TAG + 8] != expected || info_b[PI_TAG..PI_TAG + 8] != expected {
+            return Err("program tag retained an unstable map descriptor");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(prog_a as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_b as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_a as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_b as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_obj_get_info_prog_tag_map_fd_pos
+);
 
 fn smoke_abi_bpf_obj_get_info_neg() -> TestResult {
     with_setup(|| {
@@ -2385,32 +3267,113 @@ fn smoke_abi_bpf_obj_get_info_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_neg);
 
-/// The instruction-dump fields. NARF has no dump path, and a caller that asked
-/// for the image must not get a success with its buffer untouched — it would
-/// disassemble whatever was already there.
+/// The instruction-dump fields use their length words as input capacities and
+/// output true lengths. Exercise prefixes deliberately: accepting only a full
+/// buffer would break the two-call sizing pattern used by bpftool.
+fn smoke_abi_bpf_obj_get_info_dump_pos() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        // A map pseudo-load makes the exact-byte assertion load-bearing: Linux
+        // normally rewrites this immediate to a kernel pointer, while NARF's
+        // contract keeps the submitted fd in the immutable translated image.
+        let xlated = ld_map_fd_prog(map_fd);
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &xlated).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let jited = prog_behind_fd(fd)
+            .ok_or("program fd did not hold BpfProg")?
+            .jited_bytes()
+            .to_vec();
+        if jited.len() < 2 {
+            return Err("trivial program did not produce a dumpable JIT image");
+        }
+
+        let xlated_cap = xlated.len() - 3;
+        let jited_cap = jited.len() - 1;
+        let mut xlated_out = alloc::vec![0xA5; xlated_cap + 1];
+        let mut jited_out = alloc::vec![0xA5; jited_cap + 1];
+        let mut info = [0u8; INFO_BUF];
+        info[PI_XLATED_PROG_LEN..PI_XLATED_PROG_LEN + 4]
+            .copy_from_slice(&(xlated_cap as u32).to_le_bytes());
+        info[PI_JITED_PROG_LEN..PI_JITED_PROG_LEN + 4]
+            .copy_from_slice(&(jited_cap as u32).to_le_bytes());
+        put_info_u64(
+            &mut info,
+            PI_XLATED_PROG_INSNS,
+            xlated_out.as_mut_ptr() as u64,
+        );
+        put_info_u64(
+            &mut info,
+            PI_JITED_PROG_INSNS,
+            jited_out.as_mut_ptr() as u64,
+        );
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD instruction dump failed");
+        }
+        if xlated_out[..xlated_cap] != xlated[..xlated_cap] || xlated_out[xlated_cap] != 0xA5 {
+            return Err("translated dump did not copy exactly its declared prefix");
+        }
+        if jited_out[..jited_cap] != jited[..jited_cap] || jited_out[jited_cap] != 0xA5 {
+            return Err("JIT dump did not copy exactly its declared prefix");
+        }
+        if info_u32(&info, PI_XLATED_PROG_LEN) != xlated.len() as u32
+            || info_u32(&info, PI_JITED_PROG_LEN) != jited.len() as u32
+        {
+            return Err("instruction dump did not report full output lengths");
+        }
+        if info_u64(&info, PI_XLATED_PROG_INSNS) != xlated_out.as_ptr() as u64
+            || info_u64(&info, PI_JITED_PROG_INSNS) != jited_out.as_ptr() as u64
+        {
+            return Err("instruction dump did not preserve its in/out pointers");
+        }
+
+        // Capacity zero is a sizing query even when the pointer is nonsense.
+        let mut info = [0u8; INFO_BUF];
+        put_info_u64(&mut info, PI_XLATED_PROG_INSNS, u64::MAX);
+        put_info_u64(&mut info, PI_JITED_PROG_INSNS, u64::MAX);
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("zero-capacity instruction sizing query touched its pointer");
+        }
+        if info_u32(&info, PI_XLATED_PROG_LEN) != xlated.len() as u32
+            || info_u32(&info, PI_JITED_PROG_LEN) != jited.len() as u32
+        {
+            return Err("instruction sizing query returned the wrong lengths");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_obj_get_info_dump_pos);
+
 fn smoke_abi_bpf_obj_get_info_dump_neg() -> TestResult {
     with_setup(|| {
         let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("BPF_PROG_LOAD failed");
         }
-        let mut sink = [0u8; INFO_BUF];
+
         let mut info = [0u8; INFO_BUF];
-        put_info_u64(&mut info, PI_XLATED_PROG_INSNS, sink.as_mut_ptr() as u64);
-        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EOPNOTSUPP) {
-            return Err("a request to dump xlated instructions did not return ENOTSUP");
+        info[PI_XLATED_PROG_LEN..PI_XLATED_PROG_LEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("translated dump with a null output pointer was not EFAULT");
         }
-        // …and the same call without the dump pointer still works, so the
-        // refusal is scoped to the feature and not to the command.
+
         let mut info = [0u8; INFO_BUF];
-        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
-            return Err("BPF_OBJ_GET_INFO_BY_FD failed without a dump request");
+        info[PI_JITED_PROG_LEN..PI_JITED_PROG_LEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("JIT dump with a null output pointer was not EFAULT");
         }
+
         let _ = call(Syscall::Close.raw(), a0(fd as u64));
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_dump_neg);
+kernel_test_in!("bpf", smoke_abi_bpf_obj_get_info_dump_neg);
 
 /// `nr_map_ids` / `map_ids` — the in/out pair a loader uses to rediscover the
 /// maps a program holds.
@@ -2776,6 +3739,56 @@ fn smoke_abi_bpf_get_fd_by_id_pos() -> TestResult {
         if map_id_of(map_fd2)? != map_id {
             return Err("the fd obtained by id names a different map");
         }
+        let ro = fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_RDONLY)
+            .ok_or("read-only BPF_MAP_GET_FD_BY_ID was not Ok")?;
+        let wo = fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_WRONLY)
+            .ok_or("write-only BPF_MAP_GET_FD_BY_ID was not Ok")?;
+        if ro < 0 || wo < 0 {
+            return Err("BPF_MAP_GET_FD_BY_ID refused an access mode");
+        }
+        let key = 0u32;
+        let value = 0x1234_5678_9ABC_DEF0u64;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            wo,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("write-only by-id fd could not update its map");
+        }
+        let mut out = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            ro,
+            (&key) as *const u32 as u64,
+            (&mut out) as *mut u64 as u64,
+            0,
+        ) != Some(0)
+            || out != value
+        {
+            return Err("read-only by-id fd did not address the same map");
+        }
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            ro,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(-1)
+            || elem(
+                BPF_MAP_LOOKUP_ELEM,
+                wo,
+                (&key) as *const u32 as u64,
+                (&mut out) as *mut u64 as u64,
+                0,
+            ) != Some(-1)
+        {
+            return Err("by-id access mode was not enforced");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ro as u64));
+        let _ = call(Syscall::Close.raw(), a0(wo as u64));
         let _ = call(Syscall::Close.raw(), a0(map_fd2 as u64));
         let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(fd2 as u64));
@@ -2835,27 +3848,18 @@ fn smoke_abi_bpf_get_fd_by_id_neg() -> TestResult {
         {
             return Err("BPF_PROG_GET_FD_BY_ID ignored a non-zero open_flags");
         }
-        // LINUX-GAP: a map fd *does* take `open_flags` on Linux
-        // (`BPF_F_RDONLY`/`BPF_F_WRONLY`), and NARF has no read-only map fd —
-        // so it must refuse rather than hand back a fully writable one.
+        // Map open flags are a two-value access mode. Unknown bits and asking
+        // for both directions at once are malformed.
         let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 2).ok_or("bpf() not Ok")?;
         if map_fd < 0 {
             return Err("BPF_MAP_CREATE failed");
         }
         let map_id = map_id_of(map_fd)?;
-        let mut attr = [0u8; ATTR_LEN];
-        put_u32(&mut attr, 0, map_id);
-        put_u32(&mut attr, 8, 0x0000_0008 /* BPF_F_RDONLY */);
-        if call(
-            Syscall::Bpf.raw(),
-            a2(
-                BPF_MAP_GET_FD_BY_ID,
-                attr.as_mut_ptr() as u64,
-                ATTR_LEN as u64,
-            ),
-        ) != Some(EOPNOTSUPP)
+        if fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, 1) != Some(EINVAL)
+            || fd_by_id_flags(BPF_MAP_GET_FD_BY_ID, map_id, BPF_F_RDONLY | BPF_F_WRONLY)
+                != Some(EINVAL)
         {
-            return Err("BPF_MAP_GET_FD_BY_ID with BPF_F_RDONLY did not return ENOTSUP");
+            return Err("BPF_MAP_GET_FD_BY_ID accepted invalid open_flags");
         }
         let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
         let _ = call(Syscall::Close.raw(), a0(fd as u64));
@@ -3173,6 +4177,185 @@ fn link_attr(prog_fd: u32, target: u32, attach_type: u32) -> [u8; ATTR_LEN] {
 fn fresh_probe() -> u32 {
     narf_tracing::dispatch::reserve_probe_id()
 }
+
+fn raw_tracepoint_attr(name: u64, prog_fd: u32, cookie: u64) -> [u8; ATTR_LEN] {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u64(&mut attr, 0, name);
+    put_u32(&mut attr, 8, prog_fd);
+    put_u64(&mut attr, 16, cookie);
+    attr
+}
+
+fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
+    with_setup(|| {
+        const NAME: &[u8] = b"abi_raw_tp\0";
+        const COOKIE: u64 = 0x1122_3344_5566_7788;
+        let probe_id = narf_tracing::register_named_probe("abi_raw_tp")
+            .map_err(|_| "could not register the named tracepoint")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected the raw-tracepoint program");
+        }
+        let stats_fd = enable_stats(0).ok_or("BPF_ENABLE_STATS not Ok")?;
+        if stats_fd < 0 {
+            return Err("BPF_ENABLE_STATS failed");
+        }
+        let attr = raw_tracepoint_attr(NAME.as_ptr() as u64, prog_fd as u32, COOKIE);
+        let link_fd = bpf(BPF_RAW_TRACEPOINT_OPEN, &attr).ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_RAW_TRACEPOINT_OPEN rejected a registered name");
+        }
+        let flags = call(Syscall::Fcntl.raw(), a2(link_fd as u64, 1, 0)).ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("raw-tracepoint link fd is not close-on-exec");
+        }
+        if bpf(BPF_RAW_TRACEPOINT_OPEN, &attr) != Some(-16 /* EBUSY */) {
+            return Err("a second raw-tracepoint link did not report EBUSY");
+        }
+
+        let mut name_out = [0xAAu8; 32];
+        let mut link_info = [0u8; INFO_BUF];
+        put_info_u64(&mut link_info, LI_RAW_NAME, name_out.as_mut_ptr() as u64);
+        put_info_u32(&mut link_info, LI_RAW_NAME_LEN, name_out.len() as u32);
+        let (r, back) = obj_info(link_fd, &mut link_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(0) || back != RAW_LINK_INFO_LEN as u32 {
+            return Err("raw-tracepoint BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u32(&link_info, LI_TYPE) != BPF_LINK_TYPE_RAW_TRACEPOINT
+            || info_u32(&link_info, LI_PROG_ID) != id_of(prog_fd)?
+        {
+            return Err("raw-tracepoint link info reported the wrong type or program");
+        }
+        if info_u64(&link_info, LI_RAW_NAME) != name_out.as_mut_ptr() as u64
+            || info_u32(&link_info, LI_RAW_NAME_LEN) != NAME.len() as u32
+            || info_u64(&link_info, LI_RAW_COOKIE) != COOKIE
+            || name_out[..NAME.len()] != NAME[..]
+        {
+            return Err("raw-tracepoint link info lost its name or cookie");
+        }
+
+        let mut size_info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(link_fd, &mut size_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(0)
+            || back != RAW_LINK_INFO_LEN as u32
+            || info_u32(&size_info, LI_RAW_NAME_LEN) != NAME.len() as u32
+            || info_u64(&size_info, LI_RAW_COOKIE) != COOKIE
+        {
+            return Err("raw-tracepoint link info sizing lost the true length");
+        }
+
+        let mut short_name = [0xAAu8; 4];
+        let mut short_info = [0u8; INFO_BUF];
+        put_info_u64(&mut short_info, LI_RAW_NAME, short_name.as_mut_ptr() as u64);
+        put_info_u32(&mut short_info, LI_RAW_NAME_LEN, short_name.len() as u32);
+        let (r, back) = obj_info(link_fd, &mut short_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(ENOSPC)
+            || back != RAW_LINK_INFO_LEN as u32
+            || short_name != *b"abi\0"
+            || info_u32(&short_info, LI_RAW_NAME_LEN) != short_name.len() as u32
+        {
+            return Err("raw-tracepoint link info truncation diverged from Linux");
+        }
+
+        let mut bad_info = [0u8; INFO_BUF];
+        put_info_u64(&mut bad_info, LI_RAW_NAME, u64::MAX);
+        put_info_u32(&mut bad_info, LI_RAW_NAME_LEN, 4);
+        if obj_info(link_fd, &mut bad_info, RAW_LINK_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("raw-tracepoint link info did not reject an invalid name pointer");
+        }
+
+        let mut mismatched_info = [0u8; INFO_BUF];
+        put_info_u32(&mut mismatched_info, LI_RAW_NAME_LEN, 1);
+        if obj_info(link_fd, &mut mismatched_info, RAW_LINK_INFO_LEN as u32).0 != Some(EINVAL) {
+            return Err("raw-tracepoint link info accepted a mismatched name pointer/capacity");
+        }
+
+        narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
+        let mut prog_info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut prog_info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&prog_info, PI_RUN_CNT) != 1
+        {
+            return Err("the named raw tracepoint did not run its program");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
+        let mut after = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut after, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&after, PI_RUN_CNT) != 1
+        {
+            return Err("closing the raw-tracepoint link did not detach it");
+        }
+        let _ = call(Syscall::Close.raw(), a0(stats_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_raw_tracepoint_open_pos);
+
+fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
+    with_setup(|| {
+        const KNOWN: &[u8] = b"abi_raw_tp_neg\0";
+        const UNKNOWN: &[u8] = b"abi_raw_tp_missing\0";
+        let _probe_id = narf_tracing::register_named_probe("abi_raw_tp_neg")
+            .map_err(|_| "could not register the negative-test tracepoint")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(UNKNOWN.as_ptr() as u64, prog_fd as u32, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("an unknown raw tracepoint name was not ENOENT");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(u64::MAX, prog_fd as u32, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("an invalid raw tracepoint name pointer was not EFAULT");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, 4095, 0),
+        ) != Some(EBADF)
+        {
+            return Err("an unopened raw tracepoint program fd was not EBADF");
+        }
+        let sleepable = load_prog(BPF_PROG_TYPE_SYSCALL, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if sleepable < 0 {
+            return Err("BPF_PROG_LOAD rejected the sleepable negative fixture");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, sleepable as u32, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("a sleepable program attached to an atomic raw tracepoint");
+        }
+        let mut attr = raw_tracepoint_attr(KNOWN.as_ptr() as u64, prog_fd as u32, 0);
+        put_u32(&mut attr, 12, 1);
+        if bpf(BPF_RAW_TRACEPOINT_OPEN, &attr) != Some(EINVAL) {
+            return Err("BPF_RAW_TRACEPOINT_OPEN accepted its reserved word");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_RAW_TRACEPOINT_OPEN,
+                attr.as_ptr() as u64,
+                8, // truncated before prog_fd
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_RAW_TRACEPOINT_OPEN accepted a truncated attr");
+        }
+        let _ = call(Syscall::Close.raw(), a0(sleepable as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_raw_tracepoint_open_neg);
 
 // ── BPF iterators: BPF_LINK_CREATE(BPF_TRACE_ITER) + BPF_ITER_CREATE ──
 
@@ -3983,7 +5166,8 @@ kernel_test_in!("bpf", smoke_bpf_syscall_link_close_detaches_xdp);
 const BPF_BTF_GET_FD_BY_ID: u64 = 19;
 const BPF_BTF_GET_NEXT_ID: u64 = 23;
 
-/// `enum bpf_link_type`. The two NARF can produce.
+/// `enum bpf_link_type` values NARF can produce.
+const BPF_LINK_TYPE_RAW_TRACEPOINT: u32 = 1;
 const BPF_LINK_TYPE_TRACING: u32 = 2;
 const BPF_LINK_TYPE_XDP: u32 = 6;
 
@@ -3998,6 +5182,10 @@ const LI_UNION: usize = 16;
 /// reports this number back, so a caller compiled against the full struct knows
 /// the tail is untouched.
 const LINK_INFO_LEN: usize = 32;
+const RAW_LINK_INFO_LEN: usize = 40;
+const LI_RAW_NAME: usize = 16;
+const LI_RAW_NAME_LEN: usize = 24;
+const LI_RAW_COOKIE: usize = 32;
 
 // `struct bpf_btf_info` field offsets.
 const BI_BTF: usize = 0;
@@ -4046,6 +5234,7 @@ const OB_PATH_FD: usize = 16;
 const OB_END: usize = 20;
 
 const BPF_F_RDONLY_FLAG: u32 = 1 << 3;
+const BPF_F_WRONLY_FLAG: u32 = 1 << 4;
 const BPF_F_PATH_FD: u32 = 1 << 14;
 
 /// `F_GETFD`.
@@ -4080,7 +5269,25 @@ fn obj_pin(fd: i64, path: &CPath) -> Option<i64> {
 }
 
 fn obj_get(path: &CPath) -> Option<i64> {
-    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 0))
+    obj_get_flags(path, 0)
+}
+
+fn obj_get_flags(path: &CPath, flags: u32) -> Option<i64> {
+    bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, flags, 0))
+}
+
+fn obj_pin_at(fd: i64, path: &CPath, path_fd: i64) -> Option<i64> {
+    bpf(
+        BPF_OBJ_PIN,
+        &obj_attr(path.ptr(), fd as u32, BPF_F_PATH_FD, path_fd as u32),
+    )
+}
+
+fn obj_get_at_flags(path: &CPath, path_fd: i64, flags: u32) -> Option<i64> {
+    bpf(
+        BPF_OBJ_GET,
+        &obj_attr(path.ptr(), 0, flags | BPF_F_PATH_FD, path_fd as u32),
+    )
 }
 
 /// The smallest well-formed BTF blob: a header, one `BTF_KIND_INT` named
@@ -4906,12 +6113,40 @@ fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
             if back != value {
                 return Err("the reopened fd addressed a different map");
             }
+            let ro = obj_get_flags(&path, BPF_F_RDONLY_FLAG)
+                .ok_or("read-only BPF_OBJ_GET was not Ok")?;
+            let wo = obj_get_flags(&path, BPF_F_WRONLY_FLAG)
+                .ok_or("write-only BPF_OBJ_GET was not Ok")?;
+            if ro < 0 || wo < 0 {
+                return Err("BPF_OBJ_GET refused a map access mode");
+            }
+            if elem(BPF_MAP_LOOKUP_ELEM, ro, kptr, bptr, 0) != Some(0)
+                || elem(BPF_MAP_UPDATE_ELEM, ro, kptr, vptr, BPF_ANY) != Some(-1)
+                || elem(BPF_MAP_LOOKUP_ELEM, wo, kptr, bptr, 0) != Some(-1)
+            {
+                return Err("BPF_OBJ_GET did not enforce its requested access mode");
+            }
+            let replacement = 0x1020_3040_5060_7080u64;
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                wo,
+                kptr,
+                (&replacement) as *const u64 as u64,
+                BPF_ANY,
+            ) != Some(0)
+                || elem(BPF_MAP_LOOKUP_ELEM, reopened, kptr, bptr, 0) != Some(0)
+                || back != replacement
+            {
+                return Err("restricted BPF_OBJ_GET fds did not share the pinned map");
+            }
             // The ids agree too — the strongest single statement that one
             // object wears both fds.
             if map_id_of(fd)? != map_id_of(reopened)? {
                 return Err("the reopened fd reports a different map id");
             }
 
+            let _ = call(Syscall::Close.raw(), a0(ro as u64));
+            let _ = call(Syscall::Close.raw(), a0(wo as u64));
             let _ = call(Syscall::Close.raw(), a0(reopened as u64));
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
             Ok(())
@@ -4919,6 +6154,97 @@ fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_pos);
+
+/// `BPF_F_PATH_FD` gives both object commands openat(2)-style anchoring.
+///
+/// The absolute-path case is load-bearing too: Linux ignores the selected fd
+/// for an absolute pathname, so eagerly validating `path_fd` would reject a
+/// request that `user_path_at` accepts.
+fn smoke_abi_bpf_obj_path_fd_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-path-fd";
+        const O_DIRECTORY: u64 = 0o200000;
+        with_bpffs(AT, || {
+            let root = CPath::new(AT);
+            let dir_fd = call_open(root.ptr(), O_DIRECTORY).ok_or("open directory not Ok")?;
+            if dir_fd < 0 {
+                return Err("opening bpffs as a directory fd failed");
+            }
+            let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if map_fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+
+            let relative = CPath::new("m");
+            if obj_get_at_flags(&relative, map_fd, 0) != Some(ENOTDIR) {
+                return Err("BPF_OBJ_GET with a non-directory path_fd was not ENOTDIR");
+            }
+            if obj_pin_at(map_fd, &relative, dir_fd) != Some(0) {
+                return Err("BPF_OBJ_PIN did not resolve a relative path under path_fd");
+            }
+
+            let absolute = CPath::new("/bpf-path-fd/m");
+            let by_absolute = obj_get(&absolute).ok_or("absolute BPF_OBJ_GET not Ok")?;
+            let by_relative = obj_get_at_flags(&relative, dir_fd, BPF_F_RDONLY_FLAG)
+                .ok_or("relative BPF_OBJ_GET not Ok")?;
+            if by_absolute < 0 || by_relative < 0 {
+                return Err("a path-fd pin could not be reopened");
+            }
+            if map_id_of(map_fd)? != map_id_of(by_absolute)?
+                || map_id_of(map_fd)? != map_id_of(by_relative)?
+            {
+                return Err("path-fd operations did not address the pinned map");
+            }
+
+            // Access-mode flags compose with PATH_FD rather than changing its
+            // resolution. The relative descriptor above is read-only.
+            let key = 0u32;
+            let value = 7u64;
+            let mut out = 0u64;
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                map_fd,
+                (&key) as *const u32 as u64,
+                (&value) as *const u64 as u64,
+                BPF_ANY,
+            ) != Some(0)
+                || elem(
+                    BPF_MAP_LOOKUP_ELEM,
+                    by_relative,
+                    (&key) as *const u32 as u64,
+                    (&mut out) as *mut u64 as u64,
+                    0,
+                ) != Some(0)
+                || out != value
+                || elem(
+                    BPF_MAP_UPDATE_ELEM,
+                    by_relative,
+                    (&key) as *const u32 as u64,
+                    (&value) as *const u64 as u64,
+                    BPF_ANY,
+                ) != Some(EPERM)
+            {
+                return Err("PATH_FD did not compose with a read-only map reopen");
+            }
+
+            // openat(2) semantics: an absolute pathname does not consult its
+            // dirfd, even when the caller supplied BPF_F_PATH_FD.
+            let ignored_bad_fd = obj_get_at_flags(&absolute, 4095, 0)
+                .ok_or("absolute path-fd BPF_OBJ_GET not Ok")?;
+            if ignored_bad_fd < 0 || map_id_of(ignored_bad_fd)? != map_id_of(map_fd)? {
+                return Err("an absolute BPF_OBJ_GET incorrectly consulted path_fd");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(ignored_bad_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(by_relative as u64));
+            let _ = call(Syscall::Close.raw(), a0(by_absolute as u64));
+            let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(dir_fd as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_path_fd_pos);
 
 /// A program is pinnable too, and one reopened by path still *runs* — an fd
 /// that resolved to the right object but a broken image would pass every check
@@ -4939,7 +6265,9 @@ fn smoke_abi_bpf_obj_pin_prog_pos() -> TestResult {
             if call(Syscall::Close.raw(), a0(fd as u64)) != Some(0) {
                 return Err("closing the program fd failed");
             }
-            let reopened = obj_get(&path).ok_or("bpf() not Ok")?;
+            // Linux accepts an access flag here but program fds do not carry
+            // map element permissions; the reopened program remains runnable.
+            let reopened = obj_get_flags(&path, BPF_F_RDONLY_FLAG).ok_or("bpf() not Ok")?;
             if reopened < 0 {
                 return Err("BPF_OBJ_GET failed after the creating fd was closed");
             }
@@ -5032,12 +6360,15 @@ fn smoke_abi_bpf_obj_pin_neg() -> TestResult {
             {
                 return Err("BPF_OBJ_PIN accepted a flag outside its mask");
             }
-            if bpf(
-                BPF_OBJ_PIN,
-                &obj_attr(good.ptr(), fd as u32, BPF_F_PATH_FD, 0),
-            ) != Some(EOPNOTSUPP)
-            {
-                return Err("BPF_OBJ_PIN with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            let relative = CPath::new("m");
+            if obj_pin_at(fd, &relative, 4095) != Some(EBADF) {
+                return Err("BPF_OBJ_PIN with an unopened path_fd was not EBADF");
+            }
+            if obj_pin_at(fd, &relative, fd) != Some(ENOTDIR) {
+                return Err("BPF_OBJ_PIN with a non-directory path_fd was not ENOTDIR");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(0, fd as u32, BPF_F_PATH_FD, 4095)) != Some(EFAULT) {
+                return Err("BPF_OBJ_PIN checked path_fd before a bad pathname");
             }
             if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), fd as u32, 0, 3)) != Some(EINVAL) {
                 return Err("a path_fd without BPF_F_PATH_FD was not rejected");
@@ -5102,17 +6433,23 @@ fn smoke_abi_bpf_obj_get_neg() -> TestResult {
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 3, 0, 0)) != Some(EINVAL) {
                 return Err("BPF_OBJ_GET with a non-zero bpf_fd did not return EINVAL");
             }
-            // Flags: outside the mask is EINVAL, inside-but-unimplemented is
-            // EOPNOTSUPP. Collapsing the two makes feature detection guesswork.
+            // Flags outside the mask and contradictory access modes are
+            // malformed. One valid access mode proceeds to path resolution.
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 1, 0)) != Some(EINVAL) {
                 return Err("BPF_OBJ_GET accepted a flag outside its mask");
             }
-            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_RDONLY_FLAG, 0)) != Some(EOPNOTSUPP)
-            {
-                return Err("BPF_OBJ_GET with BPF_F_RDONLY did not return EOPNOTSUPP");
+            if obj_get_flags(&path, BPF_F_RDONLY_FLAG | BPF_F_WRONLY_FLAG) != Some(EINVAL) {
+                return Err("BPF_OBJ_GET accepted both access modes");
             }
-            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_PATH_FD, 0)) != Some(EOPNOTSUPP) {
-                return Err("BPF_OBJ_GET with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            if obj_get_flags(&path, BPF_F_RDONLY_FLAG) != Some(ENOENT) {
+                return Err("BPF_OBJ_GET did not resolve a path after accepting BPF_F_RDONLY");
+            }
+            let relative = CPath::new("nothing");
+            if obj_get_at_flags(&relative, 4095, 0) != Some(EBADF) {
+                return Err("BPF_OBJ_GET with an unopened path_fd was not EBADF");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(0, 0, BPF_F_PATH_FD, 4095)) != Some(EFAULT) {
+                return Err("BPF_OBJ_GET checked path_fd before a bad pathname");
             }
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 3)) != Some(EINVAL) {
                 return Err("a path_fd without BPF_F_PATH_FD was not rejected");

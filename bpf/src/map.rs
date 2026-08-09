@@ -231,7 +231,7 @@ pub const BPF_F_LOCK: u64 = 4;
 
 /// The one map interface.
 ///
-/// Eight methods. Linux's `bpf_map_ops` has 45 slots; the difference is that
+/// Nine methods. Linux's `bpf_map_ops` has 45 slots; the difference is that
 /// nothing here is a hook for a map type that does not exist, and the four
 /// kinds share one implementation of the syscall/program split rather than each
 /// carrying its own `_percpu` variants.
@@ -281,6 +281,15 @@ pub trait BpfMapOps: Send + Sync + core::fmt::Debug {
     /// [`MapError::NotFound`] if absent; [`MapError::Invalid`] for the array
     /// kinds, which have no removable slots.
     fn delete(&self, key: &[u8]) -> Result<(), MapError>;
+
+    /// Atomically copy the syscall-width value for `key` into `out` and
+    /// remove the entry.
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::NotFound`] if absent; [`MapError::Unsupported`] for map
+    /// kinds on which Linux does not define `BPF_MAP_LOOKUP_AND_DELETE_ELEM`.
+    fn lookup_and_delete(&self, key: &[u8], out: &mut [u8]) -> Result<(), MapError>;
 
     /// Write the key after `key` — or the first key, when `key` is `None` — to
     /// `out`.
@@ -590,6 +599,10 @@ impl BpfMapOps for ArrayMap {
         // `array_map_delete_elem` is `-EINVAL`: an array slot cannot stop
         // existing.
         Err(MapError::Invalid)
+    }
+
+    fn lookup_and_delete(&self, _key: &[u8], _out: &mut [u8]) -> Result<(), MapError> {
+        Err(MapError::Unsupported)
     }
 
     fn next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> Result<(), MapError> {
@@ -936,6 +949,26 @@ impl BpfMapOps for HashMap {
         Ok(())
     }
 
+    fn lookup_and_delete(&self, key: &[u8], out: &mut [u8]) -> Result<(), MapError> {
+        self.check_key(key)?;
+        if out.len() != self.syscall_value_bytes() {
+            return Err(MapError::Invalid);
+        }
+        let mut st = self.store.lock();
+        let node = self.find(&st, key).ok_or(MapError::NotFound)?;
+        if self.attr.kind.is_per_cpu() {
+            for cpu in 0..self.cpus {
+                let r = self.value_range(node, cpu);
+                let d = cpu * self.stride;
+                out[d..d + self.attr.value_size as usize].copy_from_slice(&st.values[r]);
+            }
+        } else {
+            out.copy_from_slice(&st.values[self.value_range(node, 0)]);
+        }
+        self.unlink_node(&mut st, key, node);
+        Ok(())
+    }
+
     fn next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> Result<(), MapError> {
         if out.len() != self.attr.key_size as usize {
             return Err(MapError::Invalid);
@@ -1051,6 +1084,11 @@ impl SysWrite<'_> {
     /// Delete one key through the syscall view.
     pub fn delete(&self, key: &[u8]) -> Result<(), MapError> {
         self.map.ops().delete(key)
+    }
+
+    /// Atomically copy and remove one key through the syscall view.
+    pub fn lookup_and_delete(&self, key: &[u8], out: &mut [u8]) -> Result<(), MapError> {
+        self.map.ops().lookup_and_delete(key, out)
     }
 }
 
@@ -1393,22 +1431,64 @@ fn footprint_bytes(attr: MapAttr) -> u64 {
 /// caller has to recover a map from a descriptor (element ops, and program load
 /// resolving `LD_IMM64` map references), and a downcast only works where every
 /// caller can name the concrete type.
+/// Syscall-side access carried by one map file description.
+///
+/// This is deliberately not stored on [`BpfMap`]: the same object may be open
+/// through descriptors with different permissions, and BPF program access is
+/// controlled independently by the map's program-side flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapAccess {
+    /// Lookup, iteration, update, and delete are all permitted.
+    ReadWrite,
+    /// Lookup and iteration are permitted; mutations are refused.
+    ReadOnly,
+    /// Mutations are permitted; lookup and iteration are refused.
+    WriteOnly,
+}
+
+impl MapAccess {
+    /// Whether this descriptor admits syscall-side reads.
+    #[must_use]
+    pub const fn can_read(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::ReadOnly)
+    }
+
+    /// Whether this descriptor admits syscall-side writes.
+    #[must_use]
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::WriteOnly)
+    }
+}
+
 #[derive(Debug)]
 pub struct MapFile {
     map: Arc<BpfMap>,
+    access: MapAccess,
 }
 
 impl MapFile {
-    /// Wrap a created map for installation in an fd table.
+    /// Wrap a map in a read-write file description.
     #[must_use]
     pub fn new(map: Arc<BpfMap>) -> Self {
-        Self { map }
+        Self::with_access(map, MapAccess::ReadWrite)
+    }
+
+    /// Wrap a map with descriptor-local syscall access.
+    #[must_use]
+    pub fn with_access(map: Arc<BpfMap>, access: MapAccess) -> Self {
+        Self { map, access }
     }
 
     /// The map behind this fd.
     #[must_use]
     pub fn map(&self) -> Arc<BpfMap> {
         Arc::clone(&self.map)
+    }
+
+    /// This descriptor's syscall-side access.
+    #[must_use]
+    pub const fn access(&self) -> MapAccess {
+        self.access
     }
 }
 

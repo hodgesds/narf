@@ -362,6 +362,8 @@ pub struct Vm<'a> {
     arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>],
     /// See [`VmProgram::maps`].
     maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
+    /// Sparse `bpf_attr.prog_load.fd_array` positions for map-index loads.
+    map_indices: &'a [crate::prog::IndexedMap],
     /// The ring buffer a live `bpf_ringbuf_reserve` targets, or `None` when no
     /// reservation is outstanding. Holding the `Arc` keeps the ring alive for
     /// the reservation even if the program's own reference were somehow
@@ -427,6 +429,7 @@ impl<'a> Vm<'a> {
             context,
             arenas: &[],
             maps,
+            map_indices: &[],
             reserve_map: None,
             reserve_len: 0,
             reserve_buf: [0u8; MAX_RESERVE],
@@ -443,6 +446,13 @@ impl<'a> Vm<'a> {
     #[must_use]
     pub fn with_arenas(mut self, arenas: &'a [alloc::sync::Arc<crate::arena::ProgArena>]) -> Self {
         self.arenas = arenas;
+        self
+    }
+
+    /// Bind the sparse map fd-array positions resolved at program load.
+    #[must_use]
+    pub fn with_map_indices(mut self, indices: &'a [crate::prog::IndexedMap]) -> Self {
+        self.map_indices = indices;
         self
     }
 
@@ -923,10 +933,11 @@ impl<'a> Vm<'a> {
                         // verified program.
                         Imm64::MapFd(fd) => self.map_addr(at, self.map_by_fd(fd))?,
                         Imm64::MapIdx(idx) => {
-                            let m = usize::try_from(idx)
-                                .ok()
-                                .and_then(|i| self.maps.get(i))
-                                .map(|(_, m)| m);
+                            let m = self
+                                .map_indices
+                                .iter()
+                                .find(|indexed| indexed.index == idx)
+                                .map(|indexed| &indexed.map);
                             self.map_addr(at, m)?
                         }
                         // LINUX-GAP: `BPF_PSEUDO_MAP_VALUE` — a pointer into

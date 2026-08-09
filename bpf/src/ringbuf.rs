@@ -450,6 +450,10 @@ impl BpfMapOps for RingBuf {
         Err(MapError::Invalid)
     }
 
+    fn lookup_and_delete(&self, _key: &[u8], _out: &mut [u8]) -> Result<(), MapError> {
+        Err(MapError::Unsupported)
+    }
+
     fn next_key(&self, _key: Option<&[u8]>, _out: &mut [u8]) -> Result<(), MapError> {
         Err(MapError::Invalid)
     }

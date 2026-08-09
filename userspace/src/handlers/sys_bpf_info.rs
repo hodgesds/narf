@@ -63,8 +63,7 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-/// Linux's userspace-visible `EOPNOTSUPP`, which equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
+const ENOSPC: i64 = 28;
 
 /// As `sys_bpf.rs`: `union bpf_attr` grows every release and Linux accepts any
 /// size, zero-extending. Copy what the caller supplied into a zeroed buffer.
@@ -163,13 +162,17 @@ fn check_attr_tail(attr: &[u8; ATTR_BUF], last_field_end: usize, size: usize) ->
 // tail) come from.
 const PI_TYPE: usize = 0;
 const PI_ID: usize = 4;
+const PI_TAG: usize = 8;
 const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
 const PI_JITED_PROG_INSNS: usize = 24;
 const PI_XLATED_PROG_INSNS: usize = 32;
+const PI_LOAD_TIME: usize = 40;
+const PI_CREATED_BY_UID: usize = 48;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 /// `sizeof(struct bpf_prog_info)`.
@@ -202,7 +205,7 @@ const LI_UNION: usize = 16;
 const LI_TRACING_TARGET_OBJ_ID: usize = 20;
 /// `tracing.target_btf_id`.
 const LI_TRACING_TARGET_BTF_ID: usize = 24;
-/// How much of `struct bpf_link_info` NARF fills.
+/// How much of `struct bpf_link_info` NARF fills for tracing and XDP links.
 ///
 /// Short of Linux's 64, and deliberately so — the same call the `MAP_INFO_LEN`
 /// note above makes. Every union member NARF can produce (`tracing`'s three
@@ -211,8 +214,15 @@ const LI_TRACING_TARGET_BTF_ID: usize = 24;
 /// would read a `cookie` or a `kprobe_multi.count` that was never written.
 /// Reporting 32 says exactly which prefix is real.
 const LINK_INFO_LEN: usize = 32;
+/// Raw-tracepoint info additionally includes its 64-bit cookie.
+const RAW_LINK_INFO_LEN: usize = 40;
 
-/// `enum bpf_link_type`. Only the two NARF has surfaces for.
+const LI_RAW_NAME: usize = 16;
+const LI_RAW_NAME_LEN: usize = 24;
+const LI_RAW_COOKIE: usize = 32;
+
+/// `enum bpf_link_type` values NARF can produce.
+const BPF_LINK_TYPE_RAW_TRACEPOINT: u32 = 1;
 const BPF_LINK_TYPE_TRACING: u32 = 2;
 const BPF_LINK_TYPE_XDP: u32 = 6;
 /// `enum bpf_attach_type`'s `BPF_TRACE_FENTRY`, echoed into
@@ -382,24 +392,14 @@ fn prog_info(
         return e;
     }
 
-    // LINUX-GAP: the instruction-dump fields. Linux lets a privileged caller
-    // pass a buffer in `xlated_prog_insns` / `jited_prog_insns` and copies the
-    // program image into it; NARF has no dump path. Refusing loudly rather than
-    // reporting a length and writing nothing — a caller that asked for the
-    // image and got a silently untouched buffer would disassemble whatever was
-    // already there. `bpftool prog list` (which never sets these) is
-    // unaffected; `bpftool prog dump` gets a clean "this kernel does not do
-    // that".
-    // `>=`, not `>`: a field spanning bytes `[off, off+8)` is fully supplied
-    // once `user_len` reaches `off + 8`. Off by one here silently ignores a
-    // dump request from a caller whose struct ends exactly at the field.
-    let wants_xlated =
-        user_len >= PI_XLATED_PROG_INSNS + 8 && u64_at(&uin, PI_XLATED_PROG_INSNS) != 0;
-    let wants_jited =
-        user_len >= PI_JITED_PROG_INSNS + 8 && u64_at(&uin, PI_JITED_PROG_INSNS) != 0;
-    if wants_xlated || wants_jited {
-        return -ENOTSUP;
-    }
+    // Both lengths are in/out: the caller supplies buffer capacities and the
+    // kernel reports the full image lengths even when it copied only prefixes.
+    // A non-zero pointer with zero capacity is only a sizing query; a non-zero
+    // capacity with a null pointer faults when the corresponding image exists.
+    let xlated_cap = u32_at(&uin, PI_XLATED_PROG_LEN) as usize;
+    let jited_cap = u32_at(&uin, PI_JITED_PROG_LEN) as usize;
+    let xlated_uptr = u64_at(&uin, PI_XLATED_PROG_INSNS);
+    let jited_uptr = u64_at(&uin, PI_JITED_PROG_INSNS);
 
     // The in-value of `nr_map_ids` is the caller's array capacity; the
     // out-value is the true count. Both halves matter: a caller sizing its
@@ -432,6 +432,37 @@ fn prog_info(
         }
     }
 
+    let xlated_len = prog.len() * core::mem::size_of::<narf_bpf_isa::Insn>();
+    let mut copied = 0usize;
+    let want_xlated = xlated_cap.min(xlated_len);
+    for insn in prog.instructions() {
+        if copied == want_xlated {
+            break;
+        }
+        let bytes = insn.to_bytes();
+        let n = (want_xlated - copied).min(bytes.len());
+        let dst = match xlated_uptr.checked_add(copied as u64) {
+            Some(dst) => dst,
+            None => return -EFAULT,
+        };
+        // SAFETY: `copy_to_user` validates each destination range and
+        // SMAP-brackets the copy. `n` is bounded by one encoded instruction.
+        if let Err(e) = unsafe { copy_to_user(dst, &bytes[..n]) } {
+            return -(e as i64);
+        }
+        copied += n;
+    }
+
+    let jited = prog.jited_bytes();
+    let want_jited = jited_cap.min(jited.len());
+    if want_jited > 0 {
+        // SAFETY: `copy_to_user` validates the caller-provided buffer. The
+        // source is the sealed text mapping held live by `prog`'s `Arc`.
+        if let Err(e) = unsafe { copy_to_user(jited_uptr, &jited[..want_jited]) } {
+            return -(e as i64);
+        }
+    }
+
     let mut out = [0u8; PROG_INFO_LEN];
     put_u32(
         &mut out,
@@ -442,29 +473,27 @@ fn prog_info(
         },
     );
     put_u32(&mut out, PI_ID, prog.id);
-    put_u32(&mut out, PI_JITED_PROG_LEN, prog.jited_len() as u32);
+    out[PI_TAG..PI_TAG + narf_bpf::prog::PROG_TAG_SIZE].copy_from_slice(&prog.tag());
+    put_u32(&mut out, PI_JITED_PROG_LEN, jited.len() as u32);
     // NARF does not rewrite instructions (spec §1.7), so the "translated"
     // program *is* the loaded one and its length is exact rather than an
     // approximation of a rewritten image.
-    put_u32(
-        &mut out,
-        PI_XLATED_PROG_LEN,
-        (prog.len() * core::mem::size_of::<narf_bpf_isa::Insn>()) as u32,
-    );
+    put_u32(&mut out, PI_XLATED_PROG_LEN, xlated_len as u32);
+    // Linux copies the in/out buffer addresses back unchanged. Keeping them
+    // makes a single returned `bpf_prog_info` self-describing to callers that
+    // reuse it for another partial dump.
+    put_u64(&mut out, PI_JITED_PROG_INSNS, jited_uptr);
+    put_u64(&mut out, PI_XLATED_PROG_INSNS, xlated_uptr);
+    put_u64(&mut out, PI_LOAD_TIME, prog.load_time_ns());
+    put_u32(&mut out, PI_CREATED_BY_UID, prog.created_by_uid());
     put_u32(&mut out, PI_NR_MAP_IDS, nr_maps as u32);
+    put_u64(&mut out, PI_MAP_IDS, map_ids_uptr);
     put_name(&mut out, PI_NAME, &prog.name);
+    put_u32(&mut out, PI_GPL_COMPATIBLE, u32::from(prog.gpl_compatible()));
     put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
     // Everything else stays zero, and each is a deliberate absence:
     //
-    // LINUX-GAP: `tag` — Linux's SHA-1 over the instruction image. NARF
-    // computes no program tag, and a fabricated one would collide across
-    // distinct programs, which is exactly what a tag exists to rule out.
-    // LINUX-GAP: `load_time`, `created_by_uid` — not recorded on `BpfProg`, and
-    // recording them is new bookkeeping on the load path rather than reporting
-    // of something already known.
-    // LINUX-GAP: `gpl_compatible` — NARF's load ABI carries no license field,
-    // so there is nothing to be compatible with; 0 is "unknown", not "no".
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no offload, no netns
     // binding for programs.
     // LINUX-GAP: `nr_jited_ksyms`, `nr_jited_func_lens`, `jited_ksyms`,
@@ -502,11 +531,11 @@ fn map_info(
     put_name(&mut out, MI_NAME, &map.name);
     // Deliberately zero:
     //
-    // LINUX-GAP: `map_flags`. `BpfMap` does not retain the creation flags,
-    // because the only two `BPF_MAP_CREATE` accepts (`BPF_F_NO_PREALLOC`,
-    // `BPF_F_ZERO_SEED`) change nothing about the map that exists — see
-    // `sys_bpf.rs`. Echoing them back would describe a map that differs from
-    // the one NARF built; zero describes the map that was actually made.
+    // LINUX-GAP: persistent `map_flags`. `BPF_F_RDONLY` / `BPF_F_WRONLY` are
+    // descriptor-local and Linux strips them from map info too. The two
+    // object flags NARF accepts (`BPF_F_NO_PREALLOC`, `BPF_F_ZERO_SEED`) change
+    // nothing about the map that exists — see `sys_bpf.rs` — so echoing them
+    // would describe behaviour NARF did not build. Zero describes the object.
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no map offload.
     // LINUX-GAP: `btf_id`, `btf_key_type_id`, `btf_value_type_id`,
     // `btf_vmlinux_value_type_id` — no BTF.
@@ -521,7 +550,11 @@ fn link_info(
     user_len: usize,
     link: &alloc::sync::Arc<narf_bpf::link::BpfLink>,
 ) -> i64 {
-    let mut out = [0u8; LINK_INFO_LEN];
+    let mut uin = [0u8; RAW_LINK_INFO_LEN];
+    if let Err(e) = read_user_info(uinfo, user_len, &mut uin) {
+        return e;
+    }
+    let mut out = [0u8; RAW_LINK_INFO_LEN];
     put_u32(&mut out, LI_ID, link.id());
     // `prog_id` is 0 once the link has been detached — `BPF_LINK_DETACH` leaves
     // the fd valid and the link dead, and reporting the last program it held
@@ -530,33 +563,65 @@ fn link_info(
     if let Some(p) = link.prog() {
         put_u32(&mut out, LI_PROG_ID, p.id);
     }
-    match link.target() {
-        LinkTarget::Probe(_) => {
-            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_TRACING);
-            put_u32(&mut out, LI_UNION, BPF_TRACE_FENTRY);
-            // LINUX-GAP: `tracing.target_obj_id` / `tracing.target_btf_id`.
-            // Linux names an fentry target by BTF id; NARF names it by
-            // `narf_tracing::dispatch` probe id, and nothing joins the two
-            // (see `sys_bpf_attach.rs`'s header). Writing the probe id into a
-            // field documented as a BTF type id would be a value that looks
-            // resolvable and is not, so both stay 0 — which for
-            // `target_btf_id` already means "none".
-            put_u32(&mut out, LI_TRACING_TARGET_OBJ_ID, 0);
-            put_u32(&mut out, LI_TRACING_TARGET_BTF_ID, 0);
+    let mut object_len = LINK_INFO_LEN;
+    if let Some((name, cookie)) = link.raw_tracepoint() {
+        object_len = RAW_LINK_INFO_LEN;
+        put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_RAW_TRACEPOINT);
+        let name_uptr = u64_at(&uin, LI_RAW_NAME);
+        let capacity = u32_at(&uin, LI_RAW_NAME_LEN) as usize;
+        if (name_uptr != 0) != (capacity != 0) {
+            return -EINVAL;
         }
-        LinkTarget::Xdp(iface) => {
-            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_XDP);
-            // 0 for an interface that has since been unregistered: `ifindex`
-            // has no "unknown" encoding other than 0, and a stale index would
-            // name whichever interface now sits at that position.
-            put_u32(
-                &mut out,
-                LI_UNION,
-                super::ifindex_for_iface(iface).unwrap_or(0),
-            );
+        put_u64(&mut out, LI_RAW_NAME, name_uptr);
+        put_u32(&mut out, LI_RAW_NAME_LEN, name.len().saturating_add(1) as u32);
+        put_u64(&mut out, LI_RAW_COOKIE, cookie);
+        if name_uptr != 0 {
+            let keep = name.len().min(capacity - 1);
+            let mut bytes = alloc::vec::Vec::with_capacity(keep + 1);
+            bytes.extend_from_slice(&name.as_bytes()[..keep]);
+            bytes.push(0);
+            // SAFETY: the caller supplied this name buffer and capacity;
+            // `copy_to_user` validates the bounded destination range.
+            if let Err(e) = unsafe { copy_to_user(name_uptr, &bytes) } {
+                return -(e as i64);
+            }
+            if capacity <= name.len() {
+                // Linux returns before copying the local `bpf_link_info` back
+                // on truncation. The name buffer still receives its bounded,
+                // NUL-terminated prefix, while the caller's in/out length and
+                // `attr.info_len` remain unchanged.
+                return -ENOSPC;
+            }
+        }
+    } else {
+        match link.target() {
+            LinkTarget::Probe(_) => {
+                put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_TRACING);
+                put_u32(&mut out, LI_UNION, BPF_TRACE_FENTRY);
+                // LINUX-GAP: `tracing.target_obj_id` / `tracing.target_btf_id`.
+                // Linux names an fentry target by BTF id; NARF names it by
+                // `narf_tracing::dispatch` probe id, and nothing joins the two
+                // (see `sys_bpf_attach.rs`'s header). Writing the probe id into a
+                // field documented as a BTF type id would be a value that looks
+                // resolvable and is not, so both stay 0 — which for
+                // `target_btf_id` already means "none".
+                put_u32(&mut out, LI_TRACING_TARGET_OBJ_ID, 0);
+                put_u32(&mut out, LI_TRACING_TARGET_BTF_ID, 0);
+            }
+            LinkTarget::Xdp(iface) => {
+                put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_XDP);
+                // 0 for an interface that has since been unregistered: `ifindex`
+                // has no "unknown" encoding other than 0, and a stale index would
+                // name whichever interface now sits at that position.
+                put_u32(
+                    &mut out,
+                    LI_UNION,
+                    super::ifindex_for_iface(iface).unwrap_or(0),
+                );
+            }
         }
     }
-    write_info(attr_uptr, uinfo, user_len, &out, LINK_INFO_LEN)
+    write_info(attr_uptr, uinfo, user_len, &out, object_len)
 }
 
 fn btf_info(attr_uptr: u64, uinfo: u64, user_len: usize, file: &super::BtfFile) -> i64 {
@@ -730,19 +795,19 @@ pub(crate) fn bpf_map_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {
     if let Err(e) = check_attr_tail(&attr, GI_MAP_FD_END, size) {
         return e;
     }
-    if size >= GI_OPEN_FLAGS + 4 && u32_at(&attr, GI_OPEN_FLAGS) != 0 {
-        // LINUX-GAP: `BPF_F_RDONLY` / `BPF_F_WRONLY` on a map fd. Linux honours
-        // them and the resulting fd refuses the other direction. NARF's
-        // `MapFile` has one mode, so accepting the flag would hand back a
-        // fully-writable fd to a caller that asked for a read-only one — a lie
-        // about privilege, which is the one class of lie worth an errno.
-        return -ENOTSUP;
+    let flags = u32_at(&attr, GI_OPEN_FLAGS);
+    if flags & !(super::BPF_F_RDONLY | super::BPF_F_WRONLY) != 0 {
+        return -EINVAL;
     }
+    let access = match super::map_access_from_flags(flags) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let id = u32_at(&attr, GI_START_ID);
     let Some(map) = narf_bpf::idreg::maps().get(id) else {
         return -ENOENT;
     };
-    install_fd(alloc::sync::Arc::new(MapFile::new(map)))
+    super::install_map_fd(map, access)
 }
 
 pub(crate) fn bpf_link_get_fd_by_id(attr_uptr: u64, size: usize) -> i64 {

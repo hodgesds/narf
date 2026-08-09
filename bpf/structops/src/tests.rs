@@ -86,6 +86,8 @@ fn load(name: &str, insns: Vec<Insn>, ctx: Context) -> Result<Arc<BpfProg>, &'st
             insns,
             context: ctx,
             maps: Vec::new(),
+            map_indices: Vec::new(),
+            load_references: Vec::new(),
         },
     )
     .map_err(|_| "load rejected")

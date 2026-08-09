@@ -10,6 +10,7 @@ use narf_bpf_verifier::kfunc::Context;
 use narf_bpf_verifier::SubprogInfo;
 use narf_bpf_verifier::{VerifyError, DEFAULT_FUEL, MAX_STACK_BYTES};
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+use narf_crypto::sha256::Sha256;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
@@ -41,6 +42,9 @@ impl CapType for BpfAttach {
 /// userspace, nothing more.
 pub const MAX_INSNS: usize = 1 << 16;
 
+/// Bytes Linux exposes as a program tag.
+pub const PROG_TAG_SIZE: usize = 8;
+
 /// Why loading failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -70,6 +74,30 @@ pub enum BindError {
     NoMemory,
 }
 
+/// A type-erased object whose lifetime is bound to a loaded program.
+///
+/// Linux permits BTF descriptors in `bpf_attr.prog_load.fd_array` alongside
+/// maps. `narf-bpf` deliberately does not depend on the BTF parser crate, so
+/// the syscall layer hands the program an opaque strong reference instead of
+/// teaching the runtime about a compatibility-only type graph.
+pub trait LoadReference: core::fmt::Debug + Send + Sync {}
+
+impl<T: core::fmt::Debug + Send + Sync> LoadReference for T {}
+
+/// One sparse `fd_array` position resolved to a map.
+///
+/// Positions are explicit rather than implied by vector order because Linux's
+/// array may contain duplicate maps, BTF descriptors, and unused slots.
+#[derive(Clone, Debug)]
+pub struct IndexedMap {
+    /// The index carried by `BPF_PSEUDO_MAP_IDX`.
+    pub index: i32,
+    /// The descriptor read from the caller's fd array.
+    pub fd: i32,
+    /// The map held alive for verification and execution.
+    pub map: Arc<crate::map::BpfMap>,
+}
+
 /// A loaded, verified program.
 ///
 /// Reference-counted (`Arc`) rather than owned by its fd, because a program
@@ -81,6 +109,14 @@ pub struct BpfProg {
     pub name: String,
     /// Kernel-wide id.
     pub id: u32,
+    /// Stable Linux-compatible identity of the submitted instruction image.
+    tag: [u8; PROG_TAG_SIZE],
+    /// Whether the load-time license matched Linux's GPL-compatible set.
+    gpl_compatible: bool,
+    /// Monotonic nanoseconds since boot when the program finished loading.
+    load_time_ns: u64,
+    /// Effective uid of the task that loaded the program.
+    created_by_uid: u32,
     /// The validated instruction image. Verification does not rewrite
     /// instructions — lowering happens once, in the JIT (spec §1.7).
     insns: Vec<Insn>,
@@ -131,6 +167,11 @@ pub struct BpfProg {
     /// a map alive after the fd that created it is closed. Linux does the same
     /// through `prog->aux->used_maps`.
     maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
+    /// Sparse positions used by `BPF_PSEUDO_MAP_IDX` instructions.
+    map_indices: Vec<IndexedMap>,
+    /// Non-map objects from the program-load fd array, currently BTF blobs.
+    /// Their only NARF semantic is the Linux-compatible lifetime reference.
+    _load_references: Vec<Arc<dyn LoadReference>>,
     /// Maps attached after load solely to share the program's lifetime.
     ///
     /// `BPF_PROG_BIND_MAP` does not make these maps addressable by program
@@ -141,7 +182,53 @@ pub struct BpfProg {
     bound_maps: IrqSafeSpinLock<Vec<Arc<crate::map::BpfMap>>>,
 }
 
+/// Linux-visible metadata supplied by a userspace program loader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LoadMetadata {
+    /// Whether the copied license matched Linux's GPL-compatible set.
+    pub gpl_compatible: bool,
+    /// Effective uid of the task issuing `BPF_PROG_LOAD`.
+    pub created_by_uid: u32,
+}
+
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Match Linux's `bpf_prog_calc_tag`: hash the submitted slots, except that
+/// the two immediate halves of map-fd and map-value pseudo loads are zero.
+/// File descriptors are process-local allocation results and therefore cannot
+/// be part of a stable program identity. Map-index pseudo loads remain intact
+/// because their indices are stable inputs from the loader's fd array.
+fn calculate_tag(insns: &[Insn]) -> [u8; PROG_TAG_SIZE] {
+    use narf_bpf_isa::opcode::{PSEUDO_MAP_FD, PSEUDO_MAP_VALUE};
+
+    let mut sha = Sha256::new();
+    let mut map_imm_tail = false;
+    for &original in insns {
+        let mut insn = original;
+        if !map_imm_tail
+            && insn.is_wide_imm()
+            && matches!(insn.src_raw(), PSEUDO_MAP_FD | PSEUDO_MAP_VALUE)
+        {
+            insn.imm = 0;
+            map_imm_tail = true;
+        } else if map_imm_tail
+            && insn.code == 0
+            && insn.dst_raw() == 0
+            && insn.src_raw() == 0
+            && insn.off == 0
+        {
+            insn.imm = 0;
+            map_imm_tail = false;
+        } else {
+            map_imm_tail = false;
+        }
+        sha.update(&insn.to_bytes());
+    }
+    let digest = sha.finalize();
+    let mut tag = [0u8; PROG_TAG_SIZE];
+    tag.copy_from_slice(&digest[..PROG_TAG_SIZE]);
+    tag
+}
 
 /// A load request.
 #[derive(Debug)]
@@ -165,6 +252,10 @@ pub struct LoadRequest {
     /// for its whole life — a map cannot be freed out from under a program that
     /// names it.
     pub maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
+    /// Map positions resolved from `bpf_attr.prog_load.fd_array`.
+    pub map_indices: Vec<IndexedMap>,
+    /// Compatibility objects whose lifetime is bound to this program.
+    pub load_references: Vec<Arc<dyn LoadReference>>,
 }
 
 impl BpfProg {
@@ -174,7 +265,48 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_arena(cap, req, None)
+        Self::load_with_options(cap, req, None, LoadMetadata::default())
+    }
+
+    /// Verify and load with the compatibility classification of the license
+    /// supplied through Linux's `BPF_PROG_LOAD` ABI.
+    ///
+    /// Direct in-kernel loaders use [`Self::load`] and are conservatively
+    /// non-GPL unless they opt into this metadata explicitly.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`].
+    pub fn load_with_license(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        gpl_compatible: bool,
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_metadata(
+            cap,
+            req,
+            LoadMetadata {
+                gpl_compatible,
+                created_by_uid: 0,
+            },
+        )
+    }
+
+    /// Verify and load with metadata captured by a userspace loader.
+    ///
+    /// In-kernel loaders use [`Self::load`]; syscall-shaped loaders use this
+    /// entry point so credential metadata is copied once and remains stable if
+    /// either the loader or a later querying task changes credentials.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`].
+    pub fn load_with_metadata(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        metadata: LoadMetadata,
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_options(cap, req, None, metadata)
     }
 
     /// Verify and load, binding an arena group the program may address.
@@ -209,12 +341,22 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
     ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_options(cap, req, arenas, LoadMetadata::default())
+    }
+
+    fn load_with_options(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        arenas: Option<Arc<crate::arena::ArenaGroup>>,
+        metadata: LoadMetadata,
+    ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
             return Err(LoadError::BadSize(req.insns.len()));
         }
         let registry = crate::kfunc::registry().ok_or(LoadError::NoRegistry)?;
         reject_unrunnable(&req.insns)?;
+        let tag = calculate_tag(&req.insns);
 
         // Descriptors for every kfunc the program may call. The whole
         // registry, because NARF has one call ABI and one closed kfunc set —
@@ -230,11 +372,22 @@ impl BpfProg {
                 let a = m.attr();
                 narf_bpf_verifier::MapDesc {
                     fd: *fd,
+                    fd_array_idx: None,
                     key_size: a.key_size,
                     value_size: a.value_size,
                     max_entries: a.max_entries,
                 }
             })
+            .chain(req.map_indices.iter().map(|indexed| {
+                let a = indexed.map.attr();
+                narf_bpf_verifier::MapDesc {
+                    fd: indexed.fd,
+                    fd_array_idx: Some(indexed.index),
+                    key_size: a.key_size,
+                    value_size: a.value_size,
+                    max_entries: a.max_entries,
+                }
+            }))
             .collect();
         let prog = narf_bpf_verifier::Program {
             insns: &req.insns,
@@ -267,7 +420,14 @@ impl BpfProg {
                 // group the program will run against, so the number cannot
                 // describe a different one.
                 let arena_count = arenas.as_ref().map_or(0, |g| g.arenas().len());
-                jit = crate::jit_glue::try_compile(&v, true, arena_count, &req.maps).ok();
+                jit = crate::jit_glue::try_compile(
+                    &v,
+                    true,
+                    arena_count,
+                    &req.maps,
+                    &req.map_indices,
+                )
+                .ok();
                 subprogs = v.subprogs;
                 v.max_stack_bytes.max(1)
             }
@@ -296,6 +456,10 @@ impl BpfProg {
         let prog = Arc::new(Self {
             name: req.name,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            tag,
+            gpl_compatible: metadata.gpl_compatible,
+            load_time_ns: narf_time::monotonic_ns(),
+            created_by_uid: metadata.created_by_uid,
             insns: req.insns,
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
@@ -304,6 +468,8 @@ impl BpfProg {
             jit,
             arenas,
             maps: req.maps,
+            map_indices: req.map_indices,
+            _load_references: req.load_references,
             bound_maps: IrqSafeSpinLock::new(Vec::new()),
             runs: AtomicU64::new(0),
             stats_runs: AtomicU64::new(0),
@@ -348,6 +514,48 @@ impl BpfProg {
         self.insns.is_empty()
     }
 
+    /// Immutable Linux instruction image accepted at load time.
+    ///
+    /// NARF keeps map resolution beside this image rather than rewriting its
+    /// immediates, so these are also the bytes reported as translated
+    /// instructions by `BPF_OBJ_GET_INFO_BY_FD`.
+    #[inline]
+    #[must_use]
+    pub fn instructions(&self) -> &[Insn] {
+        &self.insns
+    }
+
+    /// Linux-compatible program tag: the first eight bytes of SHA-256 over
+    /// the submitted instruction image after normalizing unstable map file
+    /// descriptors.
+    #[inline]
+    #[must_use]
+    pub const fn tag(&self) -> [u8; PROG_TAG_SIZE] {
+        self.tag
+    }
+
+    /// Whether the program's load-time license is GPL compatible under
+    /// Linux's exact license-string classification.
+    #[inline]
+    #[must_use]
+    pub const fn gpl_compatible(&self) -> bool {
+        self.gpl_compatible
+    }
+
+    /// Monotonic nanoseconds since boot when this program finished loading.
+    #[inline]
+    #[must_use]
+    pub const fn load_time_ns(&self) -> u64 {
+        self.load_time_ns
+    }
+
+    /// Effective uid captured from the task that loaded this program.
+    #[inline]
+    #[must_use]
+    pub const fn created_by_uid(&self) -> u32 {
+        self.created_by_uid
+    }
+
     /// The map named by this file descriptor, or `None`.
     ///
     /// What the interpreter resolves `LD_IMM64`'s `MapFd` form against. The
@@ -363,13 +571,41 @@ impl BpfProg {
     /// `MapIdx` form.
     #[must_use]
     pub fn map_by_idx(&self, idx: usize) -> Option<&Arc<crate::map::BpfMap>> {
-        self.maps.get(idx).map(|(_, m)| m)
+        let idx = i32::try_from(idx).ok()?;
+        self.map_indices
+            .iter()
+            .find(|indexed| indexed.index == idx)
+            .map(|indexed| &indexed.map)
     }
 
     /// How many maps the loaded instruction image may address.
     #[must_use]
     pub fn map_count(&self) -> usize {
-        self.maps.len()
+        let direct = self
+            .maps
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, map))| {
+                !self.maps[..*i]
+                    .iter()
+                    .any(|(_, earlier)| Arc::ptr_eq(earlier, map))
+            })
+            .count();
+        let indexed_only = self
+            .map_indices
+            .iter()
+            .enumerate()
+            .filter(|(i, indexed)| {
+                !self
+                    .maps
+                    .iter()
+                    .any(|(_, direct)| Arc::ptr_eq(direct, &indexed.map))
+                    && !self.map_indices[..*i]
+                        .iter()
+                        .any(|earlier| Arc::ptr_eq(&earlier.map, &indexed.map))
+            })
+            .count();
+        direct + indexed_only
     }
 
     /// Bind `map` to this program's lifetime without granting program access.
@@ -387,6 +623,10 @@ impl BpfProg {
             .maps
             .iter()
             .any(|(_, existing)| Arc::ptr_eq(existing, &map))
+            || self
+                .map_indices
+                .iter()
+                .any(|indexed| Arc::ptr_eq(&indexed.map, &map))
         {
             return Ok(());
         }
@@ -432,19 +672,32 @@ impl BpfProg {
     pub fn used_map_ids(&self) -> Result<Vec<u32>, BindError> {
         let mut ids = Vec::new();
         loop {
-            let needed = self.maps.len() + self.bound_maps.lock().len();
+            let needed = self.maps.len() + self.map_indices.len() + self.bound_maps.lock().len();
             if ids.capacity() < needed {
                 ids.try_reserve_exact(needed)
                     .map_err(|_| BindError::NoMemory)?;
             }
 
             let bound = self.bound_maps.lock();
-            if ids.capacity() < self.maps.len() + bound.len() {
+            if ids.capacity() < self.maps.len() + self.map_indices.len() + bound.len() {
                 drop(bound);
                 continue;
             }
-            ids.extend(self.maps.iter().map(|(_, map)| map.id));
-            ids.extend(bound.iter().map(|map| map.id));
+            for (_, map) in &self.maps {
+                if !ids.contains(&map.id) {
+                    ids.push(map.id);
+                }
+            }
+            for indexed in &self.map_indices {
+                if !ids.contains(&indexed.map.id) {
+                    ids.push(indexed.map.id);
+                }
+            }
+            for map in bound.iter() {
+                if !ids.contains(&map.id) {
+                    ids.push(map.id);
+                }
+            }
             return Ok(ids);
         }
     }
@@ -572,7 +825,8 @@ impl BpfProg {
             frame,
             registry,
         )
-        .with_arenas(self.arenas());
+        .with_arenas(self.arenas())
+        .with_map_indices(&self.map_indices);
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
         let stats_start = crate::stats::run_start();
@@ -738,6 +992,19 @@ impl BpfProg {
             .map_or(0, crate::jit_glue::JitImage::text_len)
     }
 
+    /// Emitted native instruction bytes, empty when this program is interpreted.
+    ///
+    /// This is the privileged introspection view behind
+    /// `bpf_prog_info.jited_prog_insns`; execution continues to enter through
+    /// the sealed image owned by the program.
+    #[inline]
+    #[must_use]
+    pub fn jited_bytes(&self) -> &[u8] {
+        self.jit
+            .as_ref()
+            .map_or(&[], crate::jit_glue::JitImage::text)
+    }
+
     /// Run the program on a heap stack owned by the caller's future.
     ///
     /// The sleepable path (spec §4.8): a sleeping program cannot hold a
@@ -763,7 +1030,8 @@ impl BpfProg {
             frame,
             registry,
         )
-        .with_arenas(self.arenas());
+        .with_arenas(self.arenas())
+        .with_map_indices(&self.map_indices);
         let stats_start = crate::stats::run_start();
         let outcome = vm.run().await;
         self.record(outcome, stats_start);

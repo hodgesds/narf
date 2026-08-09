@@ -87,6 +87,8 @@ pub fn remove_probe(p: Probe);
 
 pub fn install_probe_observer(observer: fn(u32, ProbeArgs));
 pub fn install_event_observer(observer: fn(u64, &[u8]));
+pub fn register_named_probe(name: &'static str) -> Result<u32, NamedProbeError>;
+pub fn named_probe_id(name: &str) -> Option<u32>;
 
 pub enum ProbeAction {
     Capture { fields: &'static [Field] },
@@ -102,6 +104,13 @@ The two observer slots are kernel-internal, allocation-free bridges. A dynamic
 installed observer before normal handler/sink dispatch. The perf compatibility
 adapter uses these slots to defer exact IDs and payload bytes into its own
 bounded per-CPU record queue; observer callbacks must not block or allocate.
+
+`register_named_probe` is the cold-path bridge from Linux's flat raw-tracepoint
+name namespace to NARF's dispatch IDs. A site registers once, retains the
+returned ID, and fires by ID, so lookup adds no hot-path work. Names are
+non-empty, NUL-free, at most 127 bytes, and kernel-wide unique; the registry is
+bounded to 256 sites. Static `probe!` metadata is not automatically registered:
+only a site wired to call `dispatch::fire` may resolve successfully.
 
 Declarative only. NARF explicitly rejects an eBPF-style VM at probe
 sites — probe actions are a fixed enum and compose via chaining

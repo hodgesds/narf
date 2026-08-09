@@ -72,7 +72,7 @@ pub use interp::{Outcome, Trap, Vm};
 pub use kfunc::{KfuncEntry, KfuncShim, Registry, RegistryError};
 pub use link::{BpfLink, LinkCaps, LinkError, LinkFile, LinkTarget};
 pub use map::{ArrayMap, BpfMap, BpfMapCap, BpfMapOps, HashMap, MapAttr, MapError, MapKind};
-pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadRequest};
+pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadMetadata, LoadRequest};
 pub use types::{ArenaPtr, BpfObject, BpfType, Const, Guard, Owned, Rcu, SleepableRcu, Trusted};
 
 /// Boot-time bring-up.

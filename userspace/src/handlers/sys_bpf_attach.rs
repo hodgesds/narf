@@ -24,15 +24,14 @@
 //!
 //! ## Naming the target: two deliberate ABI divergences
 //!
-//! **Tracing takes a probe id, not a name.** Linux names an fentry target by
-//! BTF id (`link_create.target_btf_id`) or, for raw tracepoints, by a
-//! `tp_name` string. NARF has neither: `probe!` records a provider/name pair
-//! into `.note.narf.probes` as *metadata*, while `dispatch::reserve_probe_id()`
-//! hands out ids lazily and independently, and nothing joins the two. Accepting
-//! a name would therefore mean inventing a lookup that nothing populates — a
-//! name that silently resolved to the wrong site, or to none, is worse than a
-//! documented divergence. So `target_fd` carries the `u32` probe id.
-//! // LINUX-GAP: no name- or BTF-based tracing target resolution.
+//! **Fentry takes a probe id; raw tracepoints take a registered name.** Linux
+//! names an fentry target by BTF id (`link_create.target_btf_id`), which NARF
+//! still does not have, so `target_fd` carries the `u32` dispatch id there.
+//! `BPF_RAW_TRACEPOINT_OPEN`, however, resolves its string through tracing's
+//! explicit named-probe registry. Static `probe!` metadata alone is not enough:
+//! a site must register and retain the returned dispatch id, ensuring every
+//! successfully resolved name reaches a site that can actually call `fire`.
+//! // LINUX-GAP: no BTF-based fentry target resolution.
 //!
 //! **XDP takes an ifindex, resolved the way NARF's rtnetlink assigns them.**
 //! `net/src/bypass/classifier.rs` keys its XDP slot by interface *name*, and
@@ -64,6 +63,7 @@ use narf_tracing::dispatch::ProbeHandlerInstall;
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
+const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
 const EBUSY: i64 = 16;
@@ -110,6 +110,13 @@ const LU_OLD_PROG_FD: usize = 12;
 
 // `struct { … } link_detach` field offsets.
 const LD_LINK_FD: usize = 0;
+
+// `struct { … } raw_tracepoint` field offsets.
+const RT_NAME: usize = 0;
+const RT_PROG_FD: usize = 8;
+const RT_RESERVED: usize = 12;
+const RT_COOKIE: usize = 16;
+const RT_END: usize = 24;
 
 /// `BPF_F_REPLACE` — `link_update.old_prog_fd` names the program the caller
 /// believes is attached, and the update applies only if it is.
@@ -427,6 +434,69 @@ fn open_cloexec_fd(ops: Arc<dyn narf_filesystem::FileOps>) -> i64 {
         Some(n) => n as i64,
         None => -EMFILE,
     }
+}
+
+/// Copy Linux's bounded raw-tracepoint name.
+///
+/// Linux reads at most 127 bytes and forcibly terminates its local 128-byte
+/// buffer. An unterminated prefix is therefore a valid lookup key, though it
+/// will normally miss the registry.
+fn raw_tracepoint_name(uptr: u64) -> Result<String, i64> {
+    if uptr == 0 {
+        return Err(-EFAULT);
+    }
+    let mut bytes = alloc::vec::Vec::with_capacity(127);
+    for i in 0..127u64 {
+        let mut byte = 0u8;
+        let src = uptr.checked_add(i).ok_or(-EFAULT)?;
+        // SAFETY: one caller-provided byte; `copy_from_user` validates the
+        // address and SMAP-brackets the access.
+        unsafe { copy_from_user(core::slice::from_mut(&mut byte), src) }
+            .map_err(|_| -EFAULT)?;
+        if byte == 0 {
+            return String::from_utf8(bytes).map_err(|_| -ENOENT);
+        }
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).map_err(|_| -ENOENT)
+}
+
+/// `BPF_RAW_TRACEPOINT_OPEN` — resolve a registered name and return an owning
+/// close-on-exec link fd whose final close detaches the program.
+pub(crate) fn bpf_raw_tracepoint_open(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < RT_PROG_FD + 4 || u32_at(&attr, RT_RESERVED) != 0 {
+        return -EINVAL;
+    }
+    if size > RT_END && attr[RT_END..size].iter().any(|byte| *byte != 0) {
+        return -EINVAL;
+    }
+    let prog = match prog_from_fd(u32_at(&attr, RT_PROG_FD)) {
+        Ok(prog) => prog,
+        Err(e) => return e,
+    };
+    let name = match raw_tracepoint_name(u64_at(&attr, RT_NAME)) {
+        Ok(name) => name,
+        Err(e) => return e,
+    };
+    let probe_id = match narf_tracing::dispatch::named_probe_id(&name) {
+        Some(id) => id,
+        None => return -ENOENT,
+    };
+    let link = match BpfLink::create_raw_tracepoint(
+        link_caps(),
+        probe_id,
+        name,
+        u64_at(&attr, RT_COOKIE),
+        prog,
+    ) {
+        Ok(link) => link,
+        Err(e) => return errno(e),
+    };
+    open_cloexec_fd(Arc::new(LinkFile::new(link)))
 }
 
 // `struct { … } iter_create` field offsets.

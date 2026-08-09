@@ -24,9 +24,9 @@ net classifier, perf).
 `LD_IND`, unprivileged BPF, and Linux's map-type zoo beyond the five native
 kinds in §3.4.
 
-**Out of scope, for now:** offloaded programs, `bpffs` pinning, CO-RE
-relocation in-kernel (it is a userspace concern), and continuation-style JIT
-lowering of sleepable programs (§8.5).
+**Out of scope, for now:** offloaded programs, CO-RE relocation in-kernel (it
+is a userspace concern), and continuation-style JIT lowering of sleepable
+programs (§8.5).
 
 ## 2. Assumptions
 
@@ -182,10 +182,29 @@ stays the cap-free fast path.
 
 ### 3.4 Maps
 
-Five native kinds behind an ~8-method trait: `Array`, `Hash`, `PerCpuArray`,
+Five native kinds behind a 9-method trait: `Array`, `Hash`, `PerCpuArray`,
 `PerCpuHash`, `RingBuf`. Everything else Linux makes a map type — LRU, LPM
 tries, bloom filters, queues/stacks, map-in-map, and the graph data-structure
 API — is an arena + kfunc library here, not kernel code.
+
+`BPF_MAP_LOOKUP_AND_DELETE_ELEM` is one map operation, not a userspace-visible
+lookup followed by delete: Hash and PerCpuHash copy the full syscall-width
+value and unlink the node under the same map lock. Arrays and RingBuf return
+`EOPNOTSUPP`, matching Linux's map-type restriction. NARF has no
+BTF-described `bpf_spin_lock` values, so `BPF_F_LOCK` is `EINVAL`. The syscall
+removes the entry before copying the result to userspace; an output `EFAULT`
+therefore may consume the key without returning its value, as on Linux.
+
+Each `MapFile` carries descriptor-local `ReadWrite`, `ReadOnly`, or `WriteOnly`
+syscall access. `BPF_MAP_CREATE`, `BPF_OBJ_GET`, and
+`BPF_MAP_GET_FD_BY_ID` accept Linux's mutually-exclusive `BPF_F_RDONLY` /
+`BPF_F_WRONLY` flags and expose the matching `F_GETFL` mode. Lookup and key
+iteration require read access; update, delete, and freeze require write access;
+lookup-and-delete requires both. Batch commands apply the same matrix. A denied
+operation returns `EPERM` after fd/type resolution and before touching key or
+value pointers. The mode belongs to the file description, not `BpfMap`: pinning,
+info, program load, and `BPF_PROG_BIND_MAP` still address the object itself, and
+reopening a pin creates a fresh descriptor with the requested mode.
 
 `BPF_MAP_FREEZE` is object-wide and one-way for the four keyed kinds. A
 successful call prevents every later syscall update/delete, including the
@@ -207,7 +226,34 @@ the load-time maps in `bpf_prog_info.map_ids`. The mutable lifetime-only set is
 lock-protected separately from the immutable runtime lookup table, so binding
 cannot race program execution into seeing an unverified map.
 
-### 3.5 Runtime statistics
+`BPF_PROG_LOAD` accepts Linux's `fd_array` / `fd_array_cnt` contract. A
+non-zero count eagerly validates and binds every map or BTF fd; maps appear
+once in `bpf_prog_info.map_ids`, while type-erased strong references keep BTF
+objects alive without making the Rust-derived verifier depend on BTF. The
+64-distinct-map and 64-distinct-BTF limits match Linux. Count zero preserves
+the legacy lazy form used by `BPF_PSEUDO_MAP_IDX`: each instruction resolves
+its signed index directly from userspace's array. Sparse indices are recorded
+explicitly beside the immutable image, not inferred from the used-map vector,
+so duplicate maps, BTF entries, and unused slots cannot renumber a reference.
+The verifier, interpreter, and JIT consume that same index table; none rewrites
+the submitted instructions. A missing array is `EPROTO`, an unreadable entry
+is `EFAULT`, an unopened fd is `EBADF`, and a live non-map/non-BTF fd is
+`EINVAL`.
+
+### 3.5 Object pinning
+
+`BPF_OBJ_PIN` stores a strong reference to a map, program, or link in bpffs;
+`BPF_OBJ_GET` creates a fresh close-on-exec fd for that same object. Pinning
+therefore extends object lifetime without preserving the creating descriptor's
+map access mode. `BPF_F_PATH_FD` gives both commands `openat(2)` pathname
+semantics through the existing VFS `resolve_at_path` contract: relative paths
+are anchored beneath a live directory fd, absolute paths ignore it, and a
+relative path reports `EBADF` or `ENOTDIR` before bpffs lookup. A nonzero
+`path_fd` without the flag is `EINVAL`. Resolution is subsequently passed
+through the ordinary cwd/chroot normalization, so path-fd pinning cannot escape
+the task's filesystem view.
+
+### 3.6 Runtime statistics
 
 `BPF_ENABLE_STATS(BPF_STATS_RUN_TIME)` returns a close-on-exec anonymous fd and
 globally enables Linux-visible `bpf_prog_info.run_cnt` / `run_time_ns` while at
@@ -223,6 +269,82 @@ The runtime's always-on `runs` / return-value / trap counters remain separate:
 kernel attach logic and diagnostics use them even when userspace has not paid
 the timestamp cost. Only the gated counters are exposed through
 `bpf_prog_info`, matching Linux rather than leaking the internal bookkeeping.
+
+### 3.7 Program instruction introspection
+
+`BPF_OBJ_GET_INFO_BY_FD` exposes both instruction images through Linux's
+`bpf_prog_info` in/out fields. `xlated_prog_insns` is the exact immutable
+Linux-ISA image accepted at load: NARF records map-fd and map-index resolution
+beside the image and never patches its immediates. `jited_prog_insns` is the
+sealed native text when the verifier and architecture JIT admitted the program;
+an interpreted program reports length zero. The caller supplies capacities in
+`xlated_prog_len` / `jited_prog_len`; each buffer receives at most that prefix,
+while both returned lengths report the complete images. Zero capacity performs
+a sizing query without touching its pointer, and a non-zero copy to an invalid
+pointer returns `EFAULT`. The syscall-wide privileged BPF credential gate also
+guards native dumps, which can contain resolved kernel addresses.
+
+### 3.8 Program tags
+
+Every successfully loaded `BpfProg` records Linux's stable eight-byte program
+tag and exposes it through `BpfProg::tag()` and `bpf_prog_info.tag`. The tag is
+the first eight bytes of SHA-256 over the submitted Linux instruction slots.
+Before hashing, both immediate halves of `BPF_PSEUDO_MAP_FD` and
+`BPF_PSEUDO_MAP_VALUE` loads are zeroed: descriptor numbers are process-local
+allocation results and cannot define program identity. Map-index pseudo loads
+remain unchanged because their indices are stable inputs from the load-time fd
+array. Hashing is streamed through `narf_crypto::sha256::Sha256`; it does not
+mutate or duplicate the immutable instruction image retained for execution and
+introspection.
+
+### 3.9 Program license metadata
+
+Linux-shaped loads copy `bpf_attr.license` with the kernel's 127-byte bound;
+a null or invalid pointer is `EFAULT`, while a non-terminated 127-byte prefix
+is accepted and classified as non-GPL. `BpfProg::load_with_license` records the
+classification and `BpfProg::gpl_compatible()` exposes it to
+`bpf_prog_info.gpl_compatible`. Classification is an exact byte-string match
+against Linux's set: `GPL`, `GPL v2`, `GPL and additional rights`,
+`Dual BSD/GPL`, `Dual MIT/GPL`, and `Dual MPL/GPL`. Case changes, trailing
+spaces, `GPL v3`, and other licenses remain valid loads but report false.
+
+NARF's typed kfunc registry has no GPL-only category, so the bit is load
+metadata rather than a second helper allowlist. If a future kfunc gains such a
+policy, it must consume this stored classification during verification rather
+than re-reading mutable userspace memory.
+
+### 3.10 Program provenance metadata
+
+Every successful load records its completion time in monotonic nanoseconds
+since boot. A Linux-shaped `BPF_PROG_LOAD` additionally snapshots the loader's
+effective uid in `LoadMetadata`; later credential changes cannot rewrite the
+program's provenance. `BpfProg::load_time_ns()` and
+`BpfProg::created_by_uid()` expose the immutable values through
+`bpf_prog_info.load_time` and `created_by_uid`. Direct in-kernel loaders have
+no userspace credential and therefore use uid 0.
+
+### 3.11 Program verifier log
+
+`BPF_PROG_LOAD` accepts Linux's coupled `log_level`, `log_size`, and `log_buf`
+fields, including all four public log bits. When requested, NARF writes one
+NUL-terminated verdict record: successful loads report the accepted instruction
+count, and verifier failures report `LoadError`/`VerifyError`, retaining every
+available instruction index. `log_true_size` includes the terminator and is
+written whenever the caller's attribute size covers it. A truncated log is
+`ENOSPC`, an invalid destination is `EFAULT`, and either log delivery error
+supersedes the underlying verifier result, matching Linux finalization.
+
+### 3.12 Named raw tracepoints
+
+`BPF_RAW_TRACEPOINT_OPEN` copies Linux's bounded 127-byte name, resolves only
+sites explicitly published by `narf_tracing::register_named_probe`, and returns
+a close-on-exec owning `BpfLink`. Closing the last link fd detaches the program.
+Static marker metadata does not imply a runnable dispatch site and therefore
+does not resolve by itself. The link retains the name and caller cookie for
+`bpf_link_info` (`BPF_LINK_TYPE_RAW_TRACEPOINT`), including Linux's in/out name
+buffer, true-length, truncation, and `EFAULT` behavior. Raw and id-selected
+attaches both claim the resolved dispatch id in the single-owner table, so the
+two ABIs cannot attach independently to one physical hook.
 
 ## 4. Invariants
 
@@ -349,7 +471,7 @@ rejected. `VerifyError` carries an instruction index wherever one exists.
 
 `narf-bpf-isa` → nothing. `narf-bpf-verifier` → `isa`. `narf-bpf-jit` → `isa`,
 `verifier`. `narf-bpf` → those plus `narf-lib`, `narf-arch`, `narf-memory`,
-`narf-capabilities`, `narf-rcu`, `narf-filesystem`, `narf-tracing`,
+`narf-capabilities`, `narf-crypto`, `narf-rcu`, `narf-filesystem`, `narf-tracing`,
 `narf-init`. `narf-userspace` → `narf-bpf` (never the reverse).
 
 Capabilities: `Jit` (0x0053), `BpfProgLoad`/`BpfAttach`/`BpfMap`/`BpfArena`/

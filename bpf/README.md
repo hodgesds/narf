@@ -38,9 +38,13 @@ Landed:
 - **Extension contracts** — the `kfunc!` and `struct_ops!` macros (Rust-native
   type descriptors, no BTF, no trampoline).
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
-- **`bpf(2)`** — load, test-run, the full map element and batch ops, object info
-  and id/fd enumeration for progs/maps/links/BTF, pin/get, attach/detach, link
-  create/update/detach, keyed-map freeze, program-map lifetime binding,
+- **`bpf(2)`** — load, test-run, the full map element (including atomic
+  lookup-and-delete) and batch ops, descriptor-local map read/write modes,
+  object info and id/fd enumeration for progs/maps/links/BTF, pin/get with
+  directory-fd-relative paths, attach/detach, link create/update/detach,
+  keyed-map freeze, load-time map/BTF fd arrays, program-map lifetime binding,
+  translated/native instruction dumps, stable Linux program tags, license and
+  load-provenance metadata, bounded verifier logs, named raw-tracepoint opens,
   fd-gated runtime statistics, prog-query, task-fd-query, and iterators.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call

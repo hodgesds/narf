@@ -45,7 +45,8 @@
 //! | the path is not a pin (`GET`)             | EACCES  | `bpf_inode_type` |
 //! | the path does not exist (`GET`)           | ENOENT  | `user_path_at` |
 //! | reserved `file_flags` / stray `path_fd`   | EINVAL  | `CHECK_ATTR` |
-//! | `BPF_F_PATH_FD` / `BPF_F_RDONLY|WRONLY`   | ENOTSUP | — see LINUX-GAPs |
+//! | relative path + bad `path_fd`              | EBADF   | `user_path_at` |
+//! | relative path + non-directory `path_fd`    | ENOTDIR | `user_path_at` |
 //!
 //! One deliberate ordering divergence: Linux's `user_path_create` reports
 //! `EEXIST` *before* the "is this bpffs?" check, so pinning onto an existing
@@ -79,9 +80,6 @@ const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-/// Linux's userspace-visible `EOPNOTSUPP`, which equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
-
 /// `union bpf_attr`, zero-extended. Same rule and bound as `sys_bpf.rs`.
 const ATTR_BUF: usize = 256;
 
@@ -159,24 +157,28 @@ fn common_path(attr: &[u8; ATTR_BUF], size: usize, allowed_flags: u32) -> Result
     if file_flags & BPF_F_PATH_FD == 0 && u32_at(attr, OB_PATH_FD) != 0 {
         return Err(-EINVAL);
     }
-    // LINUX-GAP: `BPF_F_PATH_FD` (Linux 6.5) resolves `pathname` against an
-    // open directory fd instead of the cwd. NARF's path resolution takes an
-    // absolute or cwd-relative string; threading a dirfd through it is the
-    // `*at(2)` rework, not a flag. `ENOTSUP` rather than "ignore the flag and
-    // resolve against cwd", which would silently pin into the wrong directory.
-    if file_flags & BPF_F_PATH_FD != 0 {
-        return Err(-ENOTSUP);
-    }
-
     let path_uptr = u64_at(attr, OB_PATHNAME);
     // `copy_user_cstr` walks user memory a page at a time looking for the NUL;
     // bulk-reading `PATH_MAX` would fault on a path that ends near the end of
     // a mapping. A null pointer, a fault, or a missing NUL all land here.
     let raw = copy_user_cstr(path_uptr, PATH_MAX).ok_or(-EFAULT)?;
+    // `path_fd` is signed in the UAPI. With the flag clear Linux substitutes
+    // AT_FDCWD; with it set, ordinary openat(2) rules apply. In particular an
+    // absolute path ignores even an invalid fd, while a relative path returns
+    // EBADF or ENOTDIR before filesystem lookup. `resolve_at_path` is shared
+    // with the other *at handlers, so this cannot drift into a BPF-only path
+    // interpretation.
+    const AT_FDCWD: i64 = -100;
+    let path_fd = if file_flags & BPF_F_PATH_FD != 0 {
+        i64::from(u32_at(attr, OB_PATH_FD) as i32)
+    } else {
+        AT_FDCWD
+    };
+    let anchored = resolve_at_path(current_task_id(), path_fd, &raw)?;
     // `resolve_cwd_path`, never `apply_chroot` directly: the latter skips both
     // the cwd join and `//` normalisation, which is how `pivot_root(".", ".")`
     // and systemd's `/run//systemd` paths broke before.
-    Ok(resolve_cwd_path(current_task_id(), &raw))
+    Ok(resolve_cwd_path(current_task_id(), &anchored))
 }
 
 /// Which BPF object class an fd holds, if any.
@@ -269,6 +271,11 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         return -EINVAL;
     }
 
+    let file_flags = u32_at(&attr, OB_FILE_FLAGS);
+    let access = match super::map_access_from_flags(file_flags) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let path = match common_path(
         &attr,
         size,
@@ -277,16 +284,6 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // LINUX-GAP: `BPF_F_RDONLY` / `BPF_F_WRONLY` on the returned fd. Linux
-    // honours them and the fd then refuses the other direction. NARF's
-    // `MapFile` has one mode, so accepting the flag would hand back a fully
-    // writable fd to a caller that asked for a read-only one — a lie about
-    // privilege, which is the one class of lie worth an errno. Same answer
-    // `BPF_MAP_GET_FD_BY_ID` gives for `open_flags`.
-    if u32_at(&attr, OB_FILE_FLAGS) & (BPF_F_RDONLY | BPF_F_WRONLY) != 0 {
-        return -ENOTSUP;
-    }
-
     // Two failure shapes, and Linux distinguishes them: a path that does not
     // resolve is `ENOENT` (`user_path_at`), a path that resolves to something
     // which is not a BPF object is `EACCES` (`bpf_inode_type`). Collapsing them
@@ -307,6 +304,24 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         }
         Err(e) => return e,
     };
+
+    // A pin holds the object, not the access mode of the fd that created it.
+    // Reopening a map therefore gets a fresh `MapFile` with this call's mode.
+    // Linux ignores these mode flags for programs and refuses them for links.
+    if let Some(map_file) = obj
+        .as_any()
+        .and_then(|any| any.downcast_ref::<MapFile>())
+    {
+        return super::install_map_fd(map_file.map(), access);
+    }
+    if obj
+        .as_any()
+        .and_then(|any| any.downcast_ref::<LinkFile>())
+        .is_some()
+        && file_flags & (BPF_F_RDONLY | BPF_F_WRONLY) != 0
+    {
+        return -EINVAL;
+    }
 
     // A *new fd holding its own reference*: the object now survives this fd's
     // close only if the pin (or another fd) still holds it.

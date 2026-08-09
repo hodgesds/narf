@@ -168,6 +168,8 @@ fn load(
             insns: asm(items),
             context: ctx,
             maps: alloc::vec![(MAP_FD, Arc::clone(map))],
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         },
     )
 }

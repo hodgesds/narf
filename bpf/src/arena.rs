@@ -609,6 +609,8 @@ mod smokes {
             // map work on a sibling branch; an empty list is what a program
             // with no `LD_IMM64` map reference carries.
             maps: alloc::vec::Vec::new(),
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
         }
     }
 

@@ -71,6 +71,8 @@ fn load_returning(name: &str, idx: i32) -> Result<Arc<BpfProg>, &'static str> {
             insns: asm(&[mov_imm(0, idx), EXIT]),
             context: Context::Atomic,
             maps: Vec::new(),
+            map_indices: Vec::new(),
+            load_references: Vec::new(),
         },
     )
     .map_err(|_| "load rejected")

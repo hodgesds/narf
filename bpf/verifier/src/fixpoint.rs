@@ -515,9 +515,10 @@ impl Analysis<'_, '_> {
     /// failure as an unknown fd and reports as one, carrying the index in the
     /// `fd` field because that is the number the instruction actually held.
     fn map_by_idx(&self, at: u32, idx: i32) -> Result<MapDesc, VerifyError> {
-        usize::try_from(idx)
-            .ok()
-            .and_then(|i| self.prog.maps.get(i))
+        self.prog
+            .maps
+            .iter()
+            .find(|map| map.fd_array_idx == Some(idx))
             .copied()
             .ok_or(VerifyError::UnknownMap { at, fd: idx })
     }

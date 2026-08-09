@@ -46,6 +46,59 @@ impl CapType for ProbeHandlerInstall {
 static NEXT_PROBE_ID: AtomicU32 = AtomicU32::new(1);
 static PROBE_OBSERVER: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Copy, Clone, Debug)]
+struct NamedProbe {
+    name: &'static str,
+    probe_id: u32,
+}
+
+/// Bound on kernel tracepoint names exported to name-based attach APIs.
+const MAX_NAMED_PROBES: usize = 256;
+static NAMED_PROBES: IrqSafeSpinLock<Vec<NamedProbe>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Why a kernel tracepoint name could not be registered.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NamedProbeError {
+    /// Names are non-empty, NUL-free, and at most Linux's 127-byte copy bound.
+    InvalidName,
+    /// Tracepoint names are kernel-wide unique.
+    DuplicateName,
+    /// The bounded registry is full.
+    TableFull,
+}
+
+/// Reserve an id and publish a kernel tracepoint under a stable name.
+///
+/// Registration is a cold-path operation. The firing site retains the returned
+/// id and continues to call [`fire`] directly, so name lookup adds no hot-path
+/// work. Names are globally unique because Linux's raw-tracepoint ABI has no
+/// provider namespace in its selector.
+pub fn register_named_probe(name: &'static str) -> Result<u32, NamedProbeError> {
+    if name.is_empty() || name.len() > 127 || name.as_bytes().contains(&0) {
+        return Err(NamedProbeError::InvalidName);
+    }
+    let mut probes = NAMED_PROBES.lock();
+    if probes.iter().any(|entry| entry.name == name) {
+        return Err(NamedProbeError::DuplicateName);
+    }
+    if probes.len() >= MAX_NAMED_PROBES {
+        return Err(NamedProbeError::TableFull);
+    }
+    let probe_id = reserve_probe_id();
+    probes.push(NamedProbe { name, probe_id });
+    Ok(probe_id)
+}
+
+/// Resolve a registered kernel tracepoint name to its dispatch id.
+#[must_use]
+pub fn named_probe_id(name: &str) -> Option<u32> {
+    NAMED_PROBES
+        .lock()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.probe_id)
+}
+
 /// Install one allocation-free observer invoked for every dynamic probe fire.
 pub fn install_probe_observer(observer: fn(u32, ProbeArgs)) {
     PROBE_OBSERVER.store(observer as usize, Ordering::Release);
