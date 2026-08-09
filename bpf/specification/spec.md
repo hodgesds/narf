@@ -323,6 +323,17 @@ program's provenance. `BpfProg::load_time_ns()` and
 `bpf_prog_info.load_time` and `created_by_uid`. Direct in-kernel loaders have
 no userspace credential and therefore use uid 0.
 
+### 3.11 Program verifier log
+
+`BPF_PROG_LOAD` accepts Linux's coupled `log_level`, `log_size`, and `log_buf`
+fields, including all four public log bits. When requested, NARF writes one
+NUL-terminated verdict record: successful loads report the accepted instruction
+count, and verifier failures report `LoadError`/`VerifyError`, retaining every
+available instruction index. `log_true_size` includes the terminator and is
+written whenever the caller's attribute size covers it. A truncated log is
+`ENOSPC`, an invalid destination is `EFAULT`, and either log delivery error
+supersedes the underlying verifier result, matching Linux finalization.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

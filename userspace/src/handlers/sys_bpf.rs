@@ -57,6 +57,7 @@ const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 const EBUSY: i64 = 16;
 const EPROTO: i64 = 71;
+const ENOSPC: i64 = 28;
 /// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
 /// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
 const ENOTSUP: i64 = 95;
@@ -113,10 +114,17 @@ const PL_PROG_TYPE: usize = 0;
 const PL_INSN_CNT: usize = 4;
 const PL_INSNS: usize = 8;
 const PL_LICENSE: usize = 16;
+const PL_LOG_LEVEL: usize = 24;
+const PL_LOG_SIZE: usize = 28;
+const PL_LOG_BUF: usize = 32;
 const PL_PROG_NAME: usize = 48;
 const PL_FD_ARRAY: usize = 120;
+const PL_LOG_TRUE_SIZE: usize = 140;
 const PL_FD_ARRAY_CNT: usize = 148;
 const PROG_NAME_LEN: usize = 16;
+
+/// `BPF_LOG_LEVEL1 | BPF_LOG_LEVEL2 | BPF_LOG_STATS | BPF_LOG_FIXED`.
+const BPF_LOG_MASK: u32 = 15;
 
 // `struct { … } test` field offsets.
 const T_PROG_FD: usize = 0;
@@ -212,6 +220,81 @@ fn read_prog_license(uptr: u64) -> Result<bool, i64> {
         }
     }
     Ok(GPL.iter().any(|accepted| *accepted == &license[..len]))
+}
+
+/// One bounded verifier diagnostic destined for `BPF_PROG_LOAD.log_buf`.
+struct ProgLog {
+    ubuf: u64,
+    size: u32,
+    attr_uptr: u64,
+    attr_size: usize,
+    wanted: bool,
+}
+
+impl ProgLog {
+    /// Validate Linux's three coupled verifier-log fields.
+    fn new(attr_uptr: u64, attr_size: usize, attr: &[u8; ATTR_BUF]) -> Result<Self, i64> {
+        let level = u32_at(attr, PL_LOG_LEVEL);
+        let size = u32_at(attr, PL_LOG_SIZE);
+        let ubuf = u64_at(attr, PL_LOG_BUF);
+        if (ubuf != 0) != (size != 0)
+            || (ubuf != 0 && level == 0)
+            || level & !BPF_LOG_MASK != 0
+            || size > u32::MAX >> 2
+        {
+            return Err(-EINVAL);
+        }
+        Ok(Self {
+            ubuf,
+            size,
+            attr_uptr,
+            attr_size,
+            wanted: ubuf != 0 && level != 0,
+        })
+    }
+
+    /// Copy a NUL-terminated diagnostic and publish its untruncated size.
+    ///
+    /// As in Linux, a bad log pointer returns `EFAULT`, and a buffer too small
+    /// for the full message returns `ENOSPC`; either error supersedes the
+    /// verifier's verdict because the requested diagnostic was not delivered.
+    fn emit(&self, msg: &str) -> Result<(), i64> {
+        let true_size = if self.wanted {
+            msg.len().saturating_add(1)
+        } else {
+            0
+        };
+        let mut copy_error = None;
+        if self.wanted {
+            let cap = self.size as usize;
+            let keep = core::cmp::min(msg.len(), cap - 1);
+            let mut out = alloc::vec::Vec::with_capacity(keep + 1);
+            out.extend_from_slice(&msg.as_bytes()[..keep]);
+            out.push(0);
+            // SAFETY: the caller supplied this buffer; `copy_to_user`
+            // range-validates it and SMAP-brackets the bounded copy.
+            if unsafe { copy_to_user(self.ubuf, &out) }.is_err() {
+                copy_error = Some(-EFAULT);
+            }
+        }
+
+        if self.attr_size >= PL_LOG_TRUE_SIZE + 4 {
+            let dst = self
+                .attr_uptr
+                .checked_add(PL_LOG_TRUE_SIZE as u64)
+                .ok_or(-EFAULT)?;
+            let value = u32::try_from(true_size).unwrap_or(u32::MAX);
+            // SAFETY: four-byte output inside the caller's supplied attr.
+            unsafe { copy_to_user(dst, &value.to_le_bytes()) }.map_err(|_| -EFAULT)?;
+        }
+        if let Some(e) = copy_error {
+            return Err(e);
+        }
+        if self.wanted && true_size > self.size as usize {
+            return Err(-ENOSPC);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
@@ -416,6 +499,10 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     if size < PL_LICENSE + 8 {
         return -EINVAL;
     }
+    let log = match ProgLog::new(attr_uptr, size, &attr) {
+        Ok(log) => log,
+        Err(e) => return e,
+    };
 
     let prog_type = u32_at(&attr, PL_PROG_TYPE);
     let insn_cnt = u32_at(&attr, PL_INSN_CNT) as usize;
@@ -473,7 +560,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         Err(e) => return e,
     };
 
-    let prog = match BpfProg::load_with_metadata(
+    let load_result = BpfProg::load_with_metadata(
         load_cap(),
         LoadRequest {
             name,
@@ -487,14 +574,28 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
             gpl_compatible,
             created_by_uid: read_uidgid(current_task_id()).euid,
         },
-    ) {
-        Ok(p) => p,
-        // Linux returns -EINVAL for a rejected program and puts the reason in
-        // `log_buf`. NARF's `VerifyError` carries an instruction index for
-        // every variant that has one; surfacing it through `log_buf` is the
-        // Phase 2 job, when there is a verifier producing them.
-        Err(narf_bpf::LoadError::AuthorityRevoked) => return -EPERM,
-        Err(_) => return -EINVAL,
+    );
+    let prog = match load_result {
+        Ok(p) => {
+            let message = alloc::format!("verification accepted: {} instructions\n", p.len());
+            if let Err(e) = log.emit(&message) {
+                return e;
+            }
+            p
+        }
+        Err(narf_bpf::LoadError::AuthorityRevoked) => {
+            return log
+                .emit("program load authority was revoked\n")
+                .err()
+                .unwrap_or(-EPERM);
+        }
+        Err(e) => {
+            let message = alloc::format!("verification rejected: {e:?}\n");
+            return match log.emit(&message) {
+                Ok(()) => -EINVAL,
+                Err(log_error) => log_error,
+            };
+        }
     };
 
     let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =

@@ -34,7 +34,7 @@ const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 
 /// A `union bpf_attr` big enough for `prog_load` and `test`.
-const ATTR_LEN: usize = 128;
+const ATTR_LEN: usize = 160;
 
 fn put_u32(buf: &mut [u8; ATTR_LEN], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -234,6 +234,114 @@ fn smoke_abi_bpf_prog_load_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_neg);
+
+fn smoke_abi_bpf_prog_load_log_pos() -> TestResult {
+    with_setup(|| {
+        let license = b"GPL\0";
+        // `exit` reads R0 before it has been initialized. This pins that a
+        // verifier rejection includes both the variant and instruction index.
+        let invalid = [0x95u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut log = [0xAAu8; 192];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, 1);
+        put_u64(&mut attr, 8, invalid.as_ptr() as u64);
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        put_u32(&mut attr, 24, 1); // BPF_LOG_LEVEL1
+        put_u32(&mut attr, 28, log.len() as u32);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_LOAD did not preserve a verifier rejection");
+        }
+        let true_size = get_u32(&attr, 140) as usize;
+        if true_size == 0 || true_size > log.len() {
+            return Err("BPF_PROG_LOAD did not report the verifier log's true size");
+        }
+        if log[true_size - 1] != 0 {
+            return Err("BPF_PROG_LOAD verifier log is not NUL terminated");
+        }
+        let text = core::str::from_utf8(&log[..true_size - 1])
+            .map_err(|_| "BPF_PROG_LOAD verifier log was not UTF-8")?;
+        if !text.contains("UninitRegister") || !text.contains("at: 0") {
+            return Err("BPF_PROG_LOAD verifier log omitted the rejection location");
+        }
+
+        // Successful verification also produces a bounded diagnostic when
+        // requested, and still returns the program fd.
+        let valid = ret_imm(1);
+        let mut success_log = [0u8; 96];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, 2);
+        put_u64(&mut attr, 8, valid.as_ptr() as u64);
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, success_log.len() as u32);
+        put_u64(&mut attr, 32, success_log.as_mut_ptr() as u64);
+        let fd = call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        )
+        .ok_or("bpf() not Ok")?;
+        if fd < 0 || !success_log.starts_with(b"verification accepted: 2 instructions\n\0") {
+            return Err("successful BPF_PROG_LOAD did not return its verifier log");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_log_pos);
+
+fn smoke_abi_bpf_prog_load_log_neg() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(1);
+        let license = b"GPL\0";
+        let base = || {
+            let mut attr = [0u8; ATTR_LEN];
+            put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+            put_u32(&mut attr, 4, 2);
+            put_u64(&mut attr, 8, insns.as_ptr() as u64);
+            put_u64(&mut attr, 16, license.as_ptr() as u64);
+            attr
+        };
+
+        let mut log = [0xAAu8; 64];
+        let mut attr = base();
+        put_u32(&mut attr, 28, log.len() as u32);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EINVAL) {
+            return Err("BPF_PROG_LOAD accepted a log buffer without log_level");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 16); // outside BPF_LOG_MASK
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EINVAL) {
+            return Err("BPF_PROG_LOAD accepted an unknown log_level bit");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, 1);
+        put_u64(&mut attr, 32, log.as_mut_ptr() as u64);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(-28 /* ENOSPC */) {
+            return Err("BPF_PROG_LOAD did not report a truncated verifier log");
+        }
+        if log[0] != 0 || get_u32(&attr, 140) <= 1 {
+            return Err("truncated verifier log did not publish NUL and true size");
+        }
+        let mut attr = base();
+        put_u32(&mut attr, 24, 1);
+        put_u32(&mut attr, 28, 64);
+        put_u64(&mut attr, 32, u64::MAX);
+        if bpf(BPF_PROG_LOAD, &attr) != Some(EFAULT) {
+            return Err("BPF_PROG_LOAD with a bad verifier log pointer was not EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_log_neg);
 
 // ── BPF_PROG_TEST_RUN ───────────────────────────────────────────────
 
