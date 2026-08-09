@@ -161,6 +161,7 @@ fn check_attr_tail(attr: &[u8; ATTR_BUF], last_field_end: usize, size: usize) ->
 // tail) come from.
 const PI_TYPE: usize = 0;
 const PI_ID: usize = 4;
+const PI_TAG: usize = 8;
 const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
 const PI_JITED_PROG_INSNS: usize = 24;
@@ -461,6 +462,7 @@ fn prog_info(
         },
     );
     put_u32(&mut out, PI_ID, prog.id);
+    out[PI_TAG..PI_TAG + narf_bpf::prog::PROG_TAG_SIZE].copy_from_slice(&prog.tag());
     put_u32(&mut out, PI_JITED_PROG_LEN, jited.len() as u32);
     // NARF does not rewrite instructions (spec §1.7), so the "translated"
     // program *is* the loaded one and its length is exact rather than an
@@ -478,9 +480,6 @@ fn prog_info(
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
     // Everything else stays zero, and each is a deliberate absence:
     //
-    // LINUX-GAP: `tag` — Linux's SHA-1 over the instruction image. NARF
-    // computes no program tag, and a fabricated one would collide across
-    // distinct programs, which is exactly what a tag exists to rule out.
     // LINUX-GAP: `load_time`, `created_by_uid` — not recorded on `BpfProg`, and
     // recording them is new bookkeeping on the load path rather than reporting
     // of something already known.

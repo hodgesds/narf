@@ -284,6 +284,19 @@ a sizing query without touching its pointer, and a non-zero copy to an invalid
 pointer returns `EFAULT`. The syscall-wide privileged BPF credential gate also
 guards native dumps, which can contain resolved kernel addresses.
 
+### 3.8 Program tags
+
+Every successfully loaded `BpfProg` records Linux's stable eight-byte program
+tag and exposes it through `BpfProg::tag()` and `bpf_prog_info.tag`. The tag is
+the first eight bytes of SHA-256 over the submitted Linux instruction slots.
+Before hashing, both immediate halves of `BPF_PSEUDO_MAP_FD` and
+`BPF_PSEUDO_MAP_VALUE` loads are zeroed: descriptor numbers are process-local
+allocation results and cannot define program identity. Map-index pseudo loads
+remain unchanged because their indices are stable inputs from the load-time fd
+array. Hashing is streamed through `narf_crypto::sha256::Sha256`; it does not
+mutate or duplicate the immutable instruction image retained for execution and
+introspection.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches
@@ -409,7 +422,7 @@ rejected. `VerifyError` carries an instruction index wherever one exists.
 
 `narf-bpf-isa` → nothing. `narf-bpf-verifier` → `isa`. `narf-bpf-jit` → `isa`,
 `verifier`. `narf-bpf` → those plus `narf-lib`, `narf-arch`, `narf-memory`,
-`narf-capabilities`, `narf-rcu`, `narf-filesystem`, `narf-tracing`,
+`narf-capabilities`, `narf-crypto`, `narf-rcu`, `narf-filesystem`, `narf-tracing`,
 `narf-init`. `narf-userspace` → `narf-bpf` (never the reverse).
 
 Capabilities: `Jit` (0x0053), `BpfProgLoad`/`BpfAttach`/`BpfMap`/`BpfArena`/

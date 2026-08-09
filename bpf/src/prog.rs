@@ -10,6 +10,7 @@ use narf_bpf_verifier::kfunc::Context;
 use narf_bpf_verifier::SubprogInfo;
 use narf_bpf_verifier::{VerifyError, DEFAULT_FUEL, MAX_STACK_BYTES};
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+use narf_crypto::sha256::Sha256;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
@@ -40,6 +41,9 @@ impl CapType for BpfAttach {
 /// `BPF_COMPLEXITY_LIMIT_INSNS` here. This is a memory bound on the copy from
 /// userspace, nothing more.
 pub const MAX_INSNS: usize = 1 << 16;
+
+/// Bytes Linux exposes as a program tag.
+pub const PROG_TAG_SIZE: usize = 8;
 
 /// Why loading failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +109,8 @@ pub struct BpfProg {
     pub name: String,
     /// Kernel-wide id.
     pub id: u32,
+    /// Stable Linux-compatible identity of the submitted instruction image.
+    tag: [u8; PROG_TAG_SIZE],
     /// The validated instruction image. Verification does not rewrite
     /// instructions — lowering happens once, in the JIT (spec §1.7).
     insns: Vec<Insn>,
@@ -171,6 +177,43 @@ pub struct BpfProg {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Match Linux's `bpf_prog_calc_tag`: hash the submitted slots, except that
+/// the two immediate halves of map-fd and map-value pseudo loads are zero.
+/// File descriptors are process-local allocation results and therefore cannot
+/// be part of a stable program identity. Map-index pseudo loads remain intact
+/// because their indices are stable inputs from the loader's fd array.
+fn calculate_tag(insns: &[Insn]) -> [u8; PROG_TAG_SIZE] {
+    use narf_bpf_isa::opcode::{PSEUDO_MAP_FD, PSEUDO_MAP_VALUE};
+
+    let mut sha = Sha256::new();
+    let mut map_imm_tail = false;
+    for &original in insns {
+        let mut insn = original;
+        if !map_imm_tail
+            && insn.is_wide_imm()
+            && matches!(insn.src_raw(), PSEUDO_MAP_FD | PSEUDO_MAP_VALUE)
+        {
+            insn.imm = 0;
+            map_imm_tail = true;
+        } else if map_imm_tail
+            && insn.code == 0
+            && insn.dst_raw() == 0
+            && insn.src_raw() == 0
+            && insn.off == 0
+        {
+            insn.imm = 0;
+            map_imm_tail = false;
+        } else {
+            map_imm_tail = false;
+        }
+        sha.update(&insn.to_bytes());
+    }
+    let digest = sha.finalize();
+    let mut tag = [0u8; PROG_TAG_SIZE];
+    tag.copy_from_slice(&digest[..PROG_TAG_SIZE]);
+    tag
+}
 
 /// A load request.
 #[derive(Debug)]
@@ -248,6 +291,7 @@ impl BpfProg {
         }
         let registry = crate::kfunc::registry().ok_or(LoadError::NoRegistry)?;
         reject_unrunnable(&req.insns)?;
+        let tag = calculate_tag(&req.insns);
 
         // Descriptors for every kfunc the program may call. The whole
         // registry, because NARF has one call ABI and one closed kfunc set —
@@ -347,6 +391,7 @@ impl BpfProg {
         let prog = Arc::new(Self {
             name: req.name,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            tag,
             insns: req.insns,
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
@@ -410,6 +455,15 @@ impl BpfProg {
     #[must_use]
     pub fn instructions(&self) -> &[Insn] {
         &self.insns
+    }
+
+    /// Linux-compatible program tag: the first eight bytes of SHA-256 over
+    /// the submitted instruction image after normalizing unstable map file
+    /// descriptors.
+    #[inline]
+    #[must_use]
+    pub const fn tag(&self) -> [u8; PROG_TAG_SIZE] {
+        self.tag
     }
 
     /// The map named by this file descriptor, or `None`.

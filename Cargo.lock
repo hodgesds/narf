@@ -679,6 +679,7 @@ dependencies = [
  "narf-bpf-verifier",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-filesystem",
  "narf-init",
  "narf-kernel-test",

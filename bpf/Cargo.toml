@@ -52,6 +52,7 @@ narf-memory       = { path = "../memory" }
 narf-rcu          = { path = "../rcu" }
 narf-arch         = { path = "../arch" }
 narf-capabilities = { path = "../capabilities" }
+narf-crypto       = { path = "../crypto" }
 narf-filesystem   = { path = "../filesystem" }
 narf-net          = { path = "../net" }
 narf-tracing      = { path = "../tracing" }

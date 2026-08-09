@@ -2745,6 +2745,7 @@ const INFO_BUF: usize = 320;
 // `struct bpf_prog_info` field offsets.
 const PI_TYPE: usize = 0;
 const PI_ID: usize = 4;
+const PI_TAG: usize = 8;
 const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
 const PI_JITED_PROG_INSNS: usize = 24;
@@ -2876,6 +2877,12 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         if info_u32(&info, PI_ID) == 0 {
             return Err("bpf_prog_info.id is 0 — ids start at 1");
         }
+        // First eight bytes of SHA-256 over `ret_imm(7)`, independently
+        // generated with Linux's program-tag algorithm. This pins byte order,
+        // digest choice, and truncation rather than merely checking non-zero.
+        if info[PI_TAG..PI_TAG + 8] != [0x9e, 0xfe, 0x88, 0x73, 0x12, 0x07, 0x41, 0xb3] {
+            return Err("bpf_prog_info.tag is not Linux's SHA-256 program tag");
+        }
         // NARF does not rewrite instructions, so the xlated length is exactly
         // the loaded image.
         if info_u32(&info, PI_XLATED_PROG_LEN) != insns.len() as u32 {
@@ -2917,6 +2924,48 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_prog_pos);
+
+/// Linux removes map fds from the tag input because descriptor numbers are
+/// allocation-local. Two otherwise-identical programs must therefore retain
+/// one identity even when their maps arrived through different fds.
+fn smoke_abi_bpf_obj_get_info_prog_tag_map_fd_pos() -> TestResult {
+    with_setup(|| {
+        let map_a = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        let map_b = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if map_a < 0 || map_b < 0 || map_a == map_b {
+            return Err("BPF_MAP_CREATE did not return two distinct descriptors");
+        }
+        let prog_a =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_a)).ok_or("bpf() not Ok")?;
+        let prog_b =
+            load_prog(BPF_PROG_TYPE_TRACING, &ld_map_fd_prog(map_b)).ok_or("bpf() not Ok")?;
+        if prog_a < 0 || prog_b < 0 {
+            return Err("BPF_PROG_LOAD rejected a map-fd program");
+        }
+
+        let mut info_a = [0u8; INFO_BUF];
+        let mut info_b = [0u8; INFO_BUF];
+        if obj_info(prog_a, &mut info_a, PROG_INFO_LEN as u32).0 != Some(0)
+            || obj_info(prog_b, &mut info_b, PROG_INFO_LEN as u32).0 != Some(0)
+        {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed for a map-fd program");
+        }
+        let expected = [0x0b, 0xd0, 0x16, 0x86, 0x76, 0xc7, 0xc7, 0x79];
+        if info_a[PI_TAG..PI_TAG + 8] != expected || info_b[PI_TAG..PI_TAG + 8] != expected {
+            return Err("program tag retained an unstable map descriptor");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(prog_a as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_b as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_a as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_b as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_bpf_obj_get_info_prog_tag_map_fd_pos
+);
 
 fn smoke_abi_bpf_obj_get_info_neg() -> TestResult {
     with_setup(|| {
