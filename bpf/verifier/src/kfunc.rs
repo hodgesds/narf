@@ -159,6 +159,9 @@ impl TypeKey {
 pub enum PtrKind {
     /// A typed kernel object, identified by [`TypeKey`].
     Object,
+    /// A synchronous typed-tracing wrapper, identified by its schema key.
+    /// Opaque except to the mediated trace-read kfunc.
+    TraceObject,
     /// An untyped byte region whose length is the *following* argument.
     /// Rust spelling: `&[u8]` / `&mut [u8]`.
     Mem,
@@ -220,6 +223,15 @@ impl ArgFlags {
     pub const CONST: ArgFlags = ArgFlags(1 << 3);
     /// Read-only; the program may not write through this pointer.
     pub const READONLY: ArgFlags = ArgFlags(1 << 4);
+    /// Accept any typed [`PtrKind::TraceObject`] schema key.
+    ///
+    /// Reserved for mediated tracing shims whose runtime wrapper carries and
+    /// re-checks the concrete schema. Ordinary object-taking kfuncs remain
+    /// exact-key matched.
+    pub const ANY_TRACE_OBJECT: ArgFlags = ArgFlags(1 << 5);
+    /// Constant offset selecting one exact field of an earlier object arg.
+    /// The copied width comes from an earlier `SIZED_BY_NEXT` memory argument.
+    pub const OBJECT_FIELD_OFFSET: ArgFlags = ArgFlags(1 << 6);
 
     /// Union of two flag sets.
     ///
@@ -438,6 +450,18 @@ impl KfuncDesc {
             return Err(KfuncError::NullAddress);
         }
         validate_type(self.ret, usize::MAX)?;
+        // Trace-object provenance comes only from a typed tracing context.
+        // Allowing a kfunc to manufacture one would bypass that boundary and
+        // let an ordinary kernel-object address reach the copy mediator.
+        if matches!(
+            self.ret.kind,
+            TypeKind::Ptr {
+                kind: PtrKind::TraceObject,
+                ..
+            }
+        ) {
+            return Err(KfuncError::TraceObjectReturn);
+        }
         for (i, a) in self.args.iter().enumerate() {
             validate_type(*a, i)?;
             // A sized region needs a following argument to be its length.
@@ -466,6 +490,23 @@ impl KfuncDesc {
             if a.flags.contains(ArgFlags::CONST) && !matches!(a.kind, TypeKind::Scalar { .. }) {
                 return Err(KfuncError::ConstOnNonScalar(i));
             }
+            if a.flags.contains(ArgFlags::ANY_TRACE_OBJECT)
+                && !matches!(
+                    a.kind,
+                    TypeKind::Ptr {
+                        kind: PtrKind::TraceObject,
+                        key: TypeKey::NONE,
+                    }
+                )
+            {
+                return Err(KfuncError::AnyTraceObjectOnWrongType(i));
+            }
+            if a.flags.contains(ArgFlags::OBJECT_FIELD_OFFSET)
+                && (!a.flags.contains(ArgFlags::CONST)
+                    || !matches!(a.kind, TypeKind::Scalar { .. }))
+            {
+                return Err(KfuncError::FieldOffsetOnWrongType(i));
+            }
             // A lock guard is never sleep-safe, in either position. Checking
             // arguments too closes the hole where a kfunc *takes back* a guard
             // it claims survived a sleep, which would legitimise the very
@@ -479,6 +520,40 @@ impl KfuncDesc {
             ) && a.domain.survives_await()
             {
                 return Err(KfuncError::SleepableLockGuardArg(i));
+            }
+        }
+        // `ANY_TRACE_OBJECT` is safe only as one half of the mediated typed-read
+        // relation. Without the exact field-offset and sized destination
+        // arguments, a generic trace-object wrapper would be an untyped kernel
+        // pointer disguised as a kfunc parameter.
+        for (i, _) in self
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT))
+        {
+            let fields_after = self.args[i + 1..]
+                .iter()
+                .filter(|arg| arg.flags.contains(ArgFlags::OBJECT_FIELD_OFFSET))
+                .count();
+            if fields_after != 1 {
+                return Err(KfuncError::UnpairedTraceObject(i));
+            }
+        }
+        for (i, arg) in self.args.iter().enumerate() {
+            if !arg.flags.contains(ArgFlags::OBJECT_FIELD_OFFSET) {
+                continue;
+            }
+            let objects_before = self.args[..i]
+                .iter()
+                .filter(|arg| arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT))
+                .count();
+            let regions_before = self.args[..i]
+                .iter()
+                .filter(|arg| arg.flags.contains(ArgFlags::SIZED_BY_NEXT))
+                .count();
+            if objects_before != 1 || regions_before != 1 {
+                return Err(KfuncError::UnpairedFieldOffset(i));
             }
         }
         // A lock guard is never sleep-safe; a kfunc claiming otherwise would
@@ -543,10 +618,22 @@ pub enum KfuncError {
     /// [`ArgFlags::CONST`] on a non-scalar argument, where it has no meaning
     /// and was previously ignored.
     ConstOnNonScalar(usize),
+    /// [`ArgFlags::ANY_TRACE_OBJECT`] was used anywhere except a trace-object pointer
+    /// whose key is [`TypeKey::NONE`].
+    AnyTraceObjectOnWrongType(usize),
+    /// [`ArgFlags::OBJECT_FIELD_OFFSET`] was not also a constant scalar.
+    FieldOffsetOnWrongType(usize),
+    /// A generic trace-object argument had no unique later field-offset argument.
+    UnpairedTraceObject(usize),
+    /// A field-offset argument had no unique earlier generic trace object and
+    /// sized destination region.
+    UnpairedFieldOffset(usize),
     /// An argument had type [`TypeKind::Void`].
     VoidArgument(usize),
     /// A lock guard was declared sleep-safe in return position.
     SleepableLockGuard,
+    /// A kfunc attempted to manufacture typed-tracing provenance.
+    TraceObjectReturn,
     /// A lock guard argument was declared sleep-safe. Separate from
     /// [`SleepableLockGuard`](Self::SleepableLockGuard) so the diagnostic can
     /// name which parameter.

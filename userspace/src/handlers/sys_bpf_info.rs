@@ -93,9 +93,8 @@ const GI_PROG_FD_END: usize = 4;
 /// `BPF_MAP_GET_FD_BY_ID_LAST_FIELD` is `open_flags`.
 const GI_MAP_FD_END: usize = 12;
 
-/// `enum bpf_prog_type` values `sys_bpf.rs`'s `prog_load` accepts, reported
-/// back here. The mapping is one-to-one in both directions, which is why it can
-/// be a `match` and not a stored field.
+/// Default `enum bpf_prog_type` values for direct in-kernel programs, which do
+/// not carry syscall load metadata.
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 
@@ -175,6 +174,7 @@ const PI_NAME: usize = 64;
 const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
+const PI_RECURSION_MISSES: usize = 208;
 /// `sizeof(struct bpf_prog_info)`.
 const PROG_INFO_LEN: usize = 232;
 
@@ -467,10 +467,10 @@ fn prog_info(
     put_u32(
         &mut out,
         PI_TYPE,
-        match prog.context() {
+        prog.linux_prog_type().unwrap_or(match prog.context() {
             Context::Atomic => BPF_PROG_TYPE_TRACING,
             Context::Sleepable => BPF_PROG_TYPE_SYSCALL,
-        },
+        }),
     );
     put_u32(&mut out, PI_ID, prog.id);
     out[PI_TAG..PI_TAG + narf_bpf::prog::PROG_TAG_SIZE].copy_from_slice(&prog.tag());
@@ -492,6 +492,11 @@ fn prog_info(
     put_u32(&mut out, PI_GPL_COMPATIBLE, u32::from(prog.gpl_compatible()));
     put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
+    put_u64(
+        &mut out,
+        PI_RECURSION_MISSES,
+        prog.recursion_misses(),
+    );
     // Everything else stays zero, and each is a deliberate absence:
     //
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no offload, no netns
@@ -502,10 +507,6 @@ fn prog_info(
     // are none to enumerate.
     // LINUX-GAP: `btf_id`, `func_info*`, `line_info*`, `attach_btf_obj_id`,
     // `attach_btf_id` — BTF is a separate stream; zero means "no BTF".
-    // LINUX-GAP: `recursion_misses` — `run_atomic` declines a nested invocation
-    // (spec §1.5) but does not count the refusal, so this would under-report
-    // rather than be absent. Zero says "not counted"; a partial count would say
-    // "counted, and it was low".
     // LINUX-GAP: `verified_insns` — Linux reports instructions the verifier
     // *processed*, which is a path count, not the image size already in
     // `xlated_prog_len`. NARF's verifier does not report one.

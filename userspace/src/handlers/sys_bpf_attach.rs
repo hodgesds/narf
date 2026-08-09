@@ -79,6 +79,11 @@ const ENOTSUP: i64 = 95;
 /// works on a newer kernel and vice versa.
 const ATTR_BUF: usize = 256;
 
+// `enum bpf_prog_type` values relevant to this module. Kept local because the
+// program loader and attach handlers are sibling modules.
+const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
+const BPF_PROG_TYPE_TRACING: u32 = 26;
+
 // `enum bpf_attach_type`, from include/uapi/linux/bpf.h. Only the two NARF has
 // a surface for are named; the rest are handled by range.
 const BPF_TRACE_FENTRY: u32 = 24;
@@ -289,6 +294,23 @@ fn resolve_target(attach_type: u32, target: u32) -> Result<LinkTarget, i64> {
     }
 }
 
+/// Whether a syscall-loaded program may use one of NARF's generic attach
+/// surfaces. Raw-tracepoint programs have their own name-based command and
+/// must not become fentry, XDP, or iterator programs merely because all of
+/// those paths currently execute in an atomic context.
+fn generic_attach_type_matches(prog: &BpfProg) -> bool {
+    prog.linux_prog_type()
+        .is_none_or(|prog_type| prog_type == BPF_PROG_TYPE_TRACING)
+}
+
+fn link_update_type_matches(link: &BpfLink, prog: &BpfProg) -> bool {
+    if link.raw_tracepoint().is_some() {
+        prog.linux_prog_type() == Some(BPF_PROG_TYPE_RAW_TRACEPOINT)
+    } else {
+        generic_attach_type_matches(prog)
+    }
+}
+
 /// Map a link-layer failure onto the errno Linux uses for it.
 fn errno(e: LinkError) -> i64 {
     match e {
@@ -332,6 +354,9 @@ pub(crate) fn bpf_prog_attach(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if !generic_attach_type_matches(&prog) {
+        return -EINVAL;
+    }
     match link::prog_attach(link_caps(), &target, prog) {
         Ok(()) => 0,
         Err(e) => errno(e),
@@ -391,6 +416,9 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if !generic_attach_type_matches(&prog) {
+        return -EINVAL;
+    }
     let bpf_link = match BpfLink::create(link_caps(), target, prog) {
         Ok(l) => l,
         Err(e) => return errno(e),
@@ -478,6 +506,9 @@ pub(crate) fn bpf_raw_tracepoint_open(attr_uptr: u64, size: usize) -> i64 {
         Ok(prog) => prog,
         Err(e) => return e,
     };
+    if prog.linux_prog_type() != Some(BPF_PROG_TYPE_RAW_TRACEPOINT) {
+        return -EINVAL;
+    }
     let name = match raw_tracepoint_name(u64_at(&attr, RT_NAME)) {
         Ok(name) => name,
         Err(e) => return e,
@@ -555,6 +586,9 @@ fn create_iter_link(attr: &[u8; ATTR_BUF]) -> i64 {
             Ok(p) => p,
             Err(e) => return e,
         };
+        if !generic_attach_type_matches(&prog) {
+            return -EINVAL;
+        }
         open_cloexec_fd(Arc::new(crate::bpf_iter::IterLinkFile::new(prog, kind)))
     }
 }
@@ -579,6 +613,9 @@ pub(crate) fn bpf_link_update(attr_uptr: u64, size: usize) -> i64 {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if !link_update_type_matches(&bpf_link, &new_prog) {
+        return -EINVAL;
+    }
     let old_prog = if flags & BPF_F_REPLACE != 0 {
         match prog_from_fd(u32_at(&attr, LU_OLD_PROG_FD)) {
             Ok(p) => Some(p),

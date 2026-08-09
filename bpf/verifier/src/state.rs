@@ -64,6 +64,10 @@ pub enum PtrClass {
     /// fault-recoverable probe load, because NARF has no in-kernel BTF and
     /// therefore no field layout to check against.
     Object,
+    /// A stack-lived tracing wrapper carrying one Rust-native object schema.
+    /// Direct loads are opaque; only the mediated trace-read signature accepts
+    /// this provenance.
+    TraceObject,
     /// A pointer into a BPF arena. Arithmetic is unrestricted.
     Arena,
     /// A critical-section guard. Linear, and never sleep-safe.
@@ -91,7 +95,10 @@ impl PtrClass {
     #[inline]
     #[must_use]
     pub const fn is_faulting(self) -> bool {
-        matches!(self, PtrClass::Object | PtrClass::Arena)
+        matches!(
+            self,
+            PtrClass::Object | PtrClass::TraceObject | PtrClass::Arena
+        )
     }
 }
 
@@ -100,7 +107,7 @@ impl PtrClass {
 pub struct PtrVal {
     /// What kind of region.
     pub class: PtrClass,
-    /// Which type, for [`PtrClass::Object`].
+    /// Which type/schema, for [`PtrClass::Object`] and [`PtrClass::TraceObject`].
     pub key: TypeKey,
     /// How long it stays valid.
     pub domain: ValidityDomain,

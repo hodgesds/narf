@@ -37,6 +37,7 @@ pub(crate) fn verified(items: &[Decoded]) -> VerifiedProgram {
         max_stack_bytes: 64,
         initial_fuel: 1024,
         fault_sites: Vec::new(),
+        bare_access_sites: Vec::new(),
         subprogs: Vec::new(),
         uses_arena: false,
         kfunc_calls: Vec::new(),

@@ -224,10 +224,12 @@ FRAME/domain-0 memory itself. A read of core-kernel state (the info-leak class)
 is therefore closed by *mediation plus the verifier*, not by the domain tag.
 Concretely:
 
-- `narf_probe_read(dst, src: Trusted<Object>, offset, len)` runs its
-  fault-recoverable copy in the FRAME shim (full visibility) into the program's
-  `DOMAIN_BPF`-pkey buffer. The shim holds the visibility; the program never
-  does, so a verifier escape in a tracing program stays contained.
+- `narf_probe_read(dst, len, src: TraceSource, offset)` runs its mediated copy
+  in the FRAME shim (full visibility) into a verifier-bounded program buffer.
+  `TraceSource` is a wildcard only at the kfunc signature: the program carries
+  one concrete Rust-native object schema, and both the verifier and live wrapper
+  require an exact declared `(offset, len)`. The shim holds the visibility; the
+  program never does, so a verifier escape in a tracing program stays contained.
 - The source **must be a verifier-tracked pointer** (`Trusted`/`Owned`/`Object`)
   obtained from ctx or an acquiring kfunc — never a raw scalar. This is enforced
   *for free* by the existing kfunc argument typing (`ArgDesc`), which already
@@ -257,7 +259,8 @@ map onto NARF as:
   type machinery for the overlap and drag in the rejected CO-RE.
 
 Sequencing, with the security reason for it: mediated `narf_probe_read` (bytes
-off a trusted handle, §7.3) **precedes** typed direct access. Typed direct access
+off a schema-tracked handle, §7.3) **precedes** typed direct access. The
+mediated slice has now landed; typed direct access remains deferred. Direct access
 puts *all* read-safety in the verifier — a single point of failure a verifier
 bug defeats, and (per §7.3) confinement does not catch a domain-0 read. The
 mediated shim re-checks bounds at runtime, so a verifier bug does not bypass it.
@@ -329,6 +332,13 @@ The struct_ops consumer and the confinement fence have both landed on PKS.
   PK-`#PF` (vector 14, error-code bit 5) while a store into a `BPF`-tagged page
   succeeds — the fence is load-bearing. Runs under QEMU (PKS exposed), skips
   where PKS is absent.
+- **Typed tracing mediation.** `TypedProbe` schemas feed the verifier's
+  `ObjectDesc`; a distinct `TraceObject` provenance prevents ordinary kernel
+  object pointers from satisfying `narf_probe_read`, which admits only exact
+  declared fields and whose live `TypedProbeRef` repeats the check. Kfuncs
+  cannot return `TraceObject`. Typed programs are atomic-only and cannot use
+  either public raw-context execution entry point. Direct object loads remain
+  opaque.
 
 Deferred from here: kfunc-shim behaviour is already correct (shims run in FRAME,
 which stays rw), so the "no-kfunc only" restriction §7 anticipated proved

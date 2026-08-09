@@ -12,7 +12,8 @@
 //!
 //! * `BPF_PROG_LOAD` (5) — verify and load, returning a program fd.
 //!   The Linux license string is copied, classified, and retained for program
-//!   introspection.
+//!   introspection. Atomic fentry and raw-tracepoint types retain their distinct
+//!   Linux identities even though they share one verifier context.
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
 //! * `BPF_MAP_CREATE` (0), the five keyed element commands, batch commands,
@@ -133,12 +134,11 @@ const T_RETVAL: usize = 4;
 const T_CTX_SIZE_IN: usize = 40;
 const T_CTX_IN: usize = 48;
 
-/// `enum bpf_prog_type`. NARF maps the two Linux tracing types onto its own
-/// two execution contexts and rejects the rest, because a context is declared
-/// by the *hook* here — spec §4.5. `BPF_PROG_TYPE_TRACING` (26) is the
-/// fentry/fexit family, which NARF's dynamic probes are; the sleepable
-/// counterpart is `BPF_PROG_TYPE_SYSCALL` (31), whose whole point in Linux is
-/// that it runs in process context and may sleep.
+/// `enum bpf_prog_type` values NARF accepts. Program type remains object
+/// identity even when two types share an execution context: raw tracepoints
+/// and fentry are both atomic, but Linux does not permit attaching one through
+/// the other's API.
+const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 
@@ -516,7 +516,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     // is verified *for*, and attaching to a hook that provides the other one
     // is rejected by type at attach (spec §4.5).
     let context = match prog_type {
-        BPF_PROG_TYPE_TRACING => Context::Atomic,
+        BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => Context::Atomic,
         BPF_PROG_TYPE_SYSCALL => Context::Sleepable,
         // LINUX-GAP: socket filters, XDP, cgroup hooks, LSM, struct_ops, and
         // the rest arrive with their attach surfaces in Phase 5/6.
@@ -575,6 +575,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         LoadMetadata {
             gpl_compatible,
             created_by_uid: read_uidgid(current_task_id()).euid,
+            linux_prog_type: Some(prog_type),
         },
     );
     let prog = match load_result {

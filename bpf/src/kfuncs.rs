@@ -11,7 +11,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::types::fnv1a32_nonzero;
+use crate::types::{fnv1a32_nonzero, TraceFieldOffset, TraceSource};
 
 /// The `call` immediate for [`narf_yield`].
 ///
@@ -66,6 +66,28 @@ crate::kfunc! {
         COUNTERS
             .get(slot as usize)
             .map_or(u64::MAX, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Copy one declared field from the current typed tracing object.
+    ///
+    /// The verifier requires `offset` and `dst.len()` to exactly match the
+    /// schema attached to the program. The live wrapper checks both again so
+    /// verifier unsoundness cannot widen this into an arbitrary kernel read.
+    #[context(Atomic)]
+    pub fn narf_probe_read(
+        dst: &mut [u8],
+        _dst_len: u64,
+        source: TraceSource,
+        offset: TraceFieldOffset,
+    ) -> i64 {
+        // SAFETY: this kfunc can only receive `TraceSource` from a program
+        // entered through `BpfProg::run_typed_probe`; public raw-context entry
+        // points decline typed programs before interpreting or entering JIT.
+        if unsafe { source.copy_field(offset.get(), dst) } {
+            0
+        } else {
+            -22 // EINVAL: runtime schema or object-bound mismatch.
+        }
     }
 
 }

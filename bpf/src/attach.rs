@@ -1,6 +1,6 @@
 //! Attach adapters. Attach #1: tracing / dynamic probes.
 //!
-//! `ProbeArgs([u64; 4])` is already the BPF ctx-array shape, so
+//! Scalar `ProbeArgs` is already the BPF ctx-array shape, so
 //! `ProbeHandler::fire` *is* the ABI boundary and there is no trampoline.
 //! Linux needs one (`bpf_jit_comp.c:3150-3210` spills the target function's
 //! native arguments into a stack array and passes that as the ctx) precisely
@@ -72,8 +72,19 @@ impl ProbeHandler for ProbeProgram {
         // declined — a nested fire, per §1.5's depth counter. Dropping the
         // invocation is the designed behaviour; corrupting the frame below it
         // is not.
-        let ctx: [u64; MAX_CTX_WORDS] = args.0;
-        match self.prog.run_atomic(ctx, MAX_CTX_WORDS) {
+        // SAFETY: `ProbeHandler::fire` is the synchronous callback made by
+        // `tracing::fire_typed`; neither the borrowed wrapper nor its context
+        // word escapes this invocation of `run_atomic`.
+        let typed = unsafe { args.typed() };
+        let outcome = if let Some(typed) = typed {
+            self.prog.run_typed_probe(typed)
+        } else {
+            if self.prog.typed_probe_type().is_some() {
+                return;
+            }
+            self.prog.run_atomic(args.words(), MAX_CTX_WORDS)
+        };
+        match outcome {
             Some(Outcome::Returned(_)) | None => {}
             Some(Outcome::Trapped(_)) => {
                 // The trap is already counted on the program (`prog.traps()`).

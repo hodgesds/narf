@@ -61,8 +61,8 @@ use crate::kfunc::{
 use crate::liveness::{self, Masks};
 use crate::state::{weaker_domain, AbsState, AbsValue, PtrClass, PtrVal, Ref, Stack, NO_REF};
 use crate::{
-    FaultSite, KfuncCallSite, MapDesc, Program, SubprogInfo, VerifiedProgram, VerifyError,
-    MAX_STACK_BYTES,
+    BareAccessSite, FaultSite, KfuncCallSite, MapDesc, Program, SubprogInfo, VerifiedProgram,
+    VerifyError, MAX_STACK_BYTES,
 };
 
 /// Everything the fixpoint accumulates that outlives a single block.
@@ -72,6 +72,9 @@ struct Analysis<'a, 'p> {
     live: Masks,
     prec: Masks,
     fault_sites: Vec<FaultSite>,
+    /// Raw dereferences whose pointer class is Stack or Ctx. Appended per
+    /// fixpoint visit and deduplicated when verification converges.
+    bare_access_sites: Vec<BareAccessSite>,
     /// Every kfunc `call` the fixpoint resolved. Appended per visit, so the
     /// same site lands here once per worklist round; deduped at the end, as
     /// `fault_sites` is.
@@ -101,6 +104,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         ir: &ir,
         prog,
         fault_sites: Vec::new(),
+        bare_access_sites: Vec::new(),
         kfunc_calls: Vec::new(),
         uses_arena: false,
         entry: vec![None; ir.subprogs.len()],
@@ -175,6 +179,10 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     kfunc_calls.sort_unstable_by_key(|c| c.insn_index);
     kfunc_calls.dedup_by_key(|c| c.insn_index);
 
+    let mut bare_access_sites = a.bare_access_sites;
+    bare_access_sites.sort_unstable_by_key(|site| site.insn_index);
+    bare_access_sites.dedup_by_key(|site| site.insn_index);
+
     let subprogs = ir
         .subprogs
         .iter()
@@ -191,6 +199,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         max_stack_bytes,
         initial_fuel: crate::DEFAULT_FUEL,
         fault_sites,
+        bare_access_sites,
         subprogs,
         uses_arena: a.uses_arena,
         kfunc_calls,
@@ -929,7 +938,7 @@ impl Analysis<'_, '_> {
             // live kernel object into an arbitrary read/write primitive —
             // six instructions, verified clean, with a recorded fault site.
             match p.class {
-                PtrClass::Object => {
+                PtrClass::Object | PtrClass::TraceObject => {
                     // No BTF, so nothing says how large the object is and no
                     // offset can be proved to land inside it — not even a
                     // constant one, since the constant comes from an
@@ -1002,6 +1011,8 @@ impl Analysis<'_, '_> {
             if lo >= 0 || lo < -i64::from(MAX_STACK_BYTES) || hi > 0 {
                 return Err(VerifyError::OutOfBounds { at });
             }
+            self.bare_access_sites
+                .push(BareAccessSite { insn_index: at });
             return Ok(match addr.as_const() {
                 Some(a) => Resolved::Const(a),
                 // // LINUX-GAP: the range is proved, but nothing narrower is
@@ -1024,10 +1035,13 @@ impl Analysis<'_, '_> {
             // The context is a tuple, so a field is always at a constant
             // offset; a variable one would name a field the verifier cannot
             // identify and would have to type as the join of all of them.
-            return addr
+            let resolved = addr
                 .as_const()
                 .map(Resolved::Const)
-                .ok_or(VerifyError::OutOfBounds { at });
+                .ok_or(VerifyError::OutOfBounds { at })?;
+            self.bare_access_sites
+                .push(BareAccessSite { insn_index: at });
+            return Ok(resolved);
         }
         Ok(Resolved::Opaque)
     }
@@ -1498,6 +1512,11 @@ impl Analysis<'_, '_> {
                     if arg.flags.contains(ArgFlags::CONST) && s.as_const().is_none() {
                         return Err(bad);
                     }
+                    if arg.flags.contains(ArgFlags::OBJECT_FIELD_OFFSET)
+                        && !self.object_field_matches(st, at, k, desc, &s)
+                    {
+                        return Err(bad);
+                    }
                 }
                 (TypeKind::Ptr { kind, key }, AbsValue::Ptr(p)) => {
                     if p.nullable && !arg.flags.contains(ArgFlags::NULLABLE) {
@@ -1511,6 +1530,7 @@ impl Analysis<'_, '_> {
                     }
                     let want = match kind {
                         PtrKind::Object => PtrClass::Object,
+                        PtrKind::TraceObject => PtrClass::TraceObject,
                         PtrKind::Mem => PtrClass::Mem,
                         PtrKind::Arena => PtrClass::Arena,
                         PtrKind::Ctx => PtrClass::Ctx,
@@ -1532,7 +1552,11 @@ impl Analysis<'_, '_> {
                         // A byte region may be anything with a length: a stack
                         // slice, a map value, an arena range.
                         self.check_mem_arg(st, at, k, desc, &p)?;
-                    } else if p.class != want || (kind == PtrKind::Object && p.key != key) {
+                    } else if p.class != want
+                        || (matches!(kind, PtrKind::Object | PtrKind::TraceObject)
+                            && !arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT)
+                            && p.key != key)
+                    {
                         return Err(bad);
                     } else if p.off.as_const() != Some(0) {
                         // The offset must be exactly zero for every non-`Mem`
@@ -1603,6 +1627,63 @@ impl Analysis<'_, '_> {
             }
         }
         Ok(())
+    }
+
+    /// Validate the relational part of the typed probe-read signature.
+    ///
+    /// `OBJECT_FIELD_OFFSET` names an exact field of an earlier object
+    /// argument; the access width is the constant length paired with an
+    /// earlier `SIZED_BY_NEXT` memory destination. The runtime repeats this
+    /// check against the live wrapper, so this improves load-time diagnostics
+    /// without becoming the only bounds check.
+    fn object_field_matches(
+        &self,
+        st: &AbsState,
+        at: u32,
+        field_arg: usize,
+        desc: &KfuncDesc,
+        offset: &Scalar,
+    ) -> bool {
+        let Some(offset) = offset.as_const().and_then(|v| u32::try_from(v).ok()) else {
+            return false;
+        };
+        let object = (0..field_arg).rev().find_map(|i| {
+            let arg = desc.args[i];
+            if !arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT) {
+                return None;
+            }
+            let reg = Reg::new(i as u8 + 1)?;
+            match self.get(st, at, reg).ok()? {
+                AbsValue::Ptr(p) if p.class == PtrClass::TraceObject => Some(p),
+                _ => None,
+            }
+        });
+        let Some(object) = object else {
+            return false;
+        };
+        let width = (0..field_arg).find_map(|i| {
+            if !desc.args[i].flags.contains(ArgFlags::SIZED_BY_NEXT) {
+                return None;
+            }
+            let len_reg = Reg::new(i as u8 + 2)?;
+            match self.get(st, at, len_reg).ok()? {
+                AbsValue::Scalar(s) => s.as_const().and_then(|v| u32::try_from(v).ok()),
+                _ => None,
+            }
+        });
+        let Some(width) = width else {
+            return false;
+        };
+        self.prog
+            .objects
+            .iter()
+            .find(|candidate| candidate.key == object.key)
+            .is_some_and(|object| {
+                object
+                    .fields
+                    .iter()
+                    .any(|field| field.offset == offset && field.size == width)
+            })
     }
 
     /// Check a `&[u8]`-shaped argument: a pointer plus the following
@@ -1856,6 +1937,7 @@ fn value_of(d: &ArgDesc, ref_id: u32) -> AbsValue {
         TypeKind::Ptr { kind, key } => {
             let class = match kind {
                 PtrKind::Object => PtrClass::Object,
+                PtrKind::TraceObject => PtrClass::TraceObject,
                 PtrKind::Mem => PtrClass::Mem,
                 PtrKind::Arena => PtrClass::Arena,
                 PtrKind::Ctx => PtrClass::Ctx,

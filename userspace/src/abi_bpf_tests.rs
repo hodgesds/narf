@@ -29,8 +29,9 @@ const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
 
-/// `BPF_PROG_TYPE_TRACING`. NARF maps it to `Context::Atomic` — the probe
-/// sites are the fentry-shaped hook, and they run with IRQs masked.
+/// Atomic probe program types NARF keeps distinct at attach time.
+const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
+const BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 
@@ -230,6 +231,9 @@ fn smoke_abi_bpf_prog_load_neg() -> TestResult {
         // A program type whose attach surface does not exist yet.
         if load_prog(BPF_PROG_TYPE_SOCKET_FILTER, &ret_imm(0)) != Some(EOPNOTSUPP) {
             return Err("an unimplemented prog_type did not return EOPNOTSUPP");
+        }
+        if load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, &ret_imm(0)) != Some(EOPNOTSUPP) {
+            return Err("writable raw tracepoints were accepted without writable ctx support");
         }
         Ok(())
     })
@@ -2015,6 +2019,64 @@ fn smoke_abi_bpf_enable_stats_pos() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_abi_bpf_enable_stats_pos);
 
+fn smoke_abi_bpf_prog_info_recursion_misses_pos() -> TestResult {
+    with_setup(|| {
+        use narf_bpf::mem::BpfStack;
+
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+
+        let provider = narf_bpf::mem::PerCpuRegion;
+        let mut occupied = alloc::vec::Vec::new();
+        for _ in 0..narf_memory::bpf_stack::MAX_NEST {
+            occupied.push(
+                provider
+                    .acquire(64)
+                    .ok_or("could not occupy every per-CPU nesting level")?,
+            );
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, prog_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EAGAIN)
+        {
+            return Err("BPF_PROG_TEST_RUN did not report a nesting refusal");
+        }
+
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD failed after a nesting refusal");
+        }
+        if info_u64(&info, PI_RECURSION_MISSES) != 1 {
+            return Err("bpf_prog_info.recursion_misses did not report the refusal");
+        }
+
+        drop(occupied);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(0)
+        {
+            return Err("BPF_PROG_TEST_RUN did not recover after releasing stack levels");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&info, PI_RECURSION_MISSES) != 1
+        {
+            return Err("a successful run changed bpf_prog_info.recursion_misses");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_prog_info_recursion_misses_pos);
+
 fn smoke_abi_bpf_enable_stats_neg() -> TestResult {
     with_setup(|| {
         if enable_stats(1) != Some(EINVAL) {
@@ -2663,6 +2725,7 @@ fn load_prog_fd_array_raw(insns: &[u8], fd_array: u64, fd_array_cnt: u32) -> Opt
     attr[0..4].copy_from_slice(&BPF_PROG_TYPE_TRACING.to_le_bytes());
     attr[4..8].copy_from_slice(&((insns.len() / 8) as u32).to_le_bytes());
     attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+    attr[16..24].copy_from_slice(&(c"GPL".as_ptr() as u64).to_le_bytes());
     attr[48..52].copy_from_slice(b"fdar");
     attr[PL_FD_ARRAY..PL_FD_ARRAY + 8].copy_from_slice(&fd_array.to_le_bytes());
     attr[PL_FD_ARRAY_CNT..PL_FD_ARRAY_CNT + 4].copy_from_slice(&fd_array_cnt.to_le_bytes());
@@ -2973,6 +3036,7 @@ const PI_NAME: usize = 64;
 const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
+const PI_RECURSION_MISSES: usize = 208;
 
 // `struct bpf_map_info` field offsets.
 const MI_TYPE: usize = 0;
@@ -4192,7 +4256,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
         const COOKIE: u64 = 0x1122_3344_5566_7788;
         let probe_id = narf_tracing::register_named_probe("abi_raw_tp")
             .map_err(|_| "could not register the named tracepoint")?;
-        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if prog_fd < 0 {
             return Err("BPF_PROG_LOAD rejected the raw-tracepoint program");
         }
@@ -4273,9 +4337,10 @@ fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
         narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
         let mut prog_info = [0u8; INFO_BUF];
         if obj_info(prog_fd, &mut prog_info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&prog_info, PI_TYPE) != BPF_PROG_TYPE_RAW_TRACEPOINT
             || info_u64(&prog_info, PI_RUN_CNT) != 1
         {
-            return Err("the named raw tracepoint did not run its program");
+            return Err("the named raw tracepoint lost its type or did not run");
         }
         let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
         narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
@@ -4298,7 +4363,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         const UNKNOWN: &[u8] = b"abi_raw_tp_missing\0";
         let _probe_id = narf_tracing::register_named_probe("abi_raw_tp_neg")
             .map_err(|_| "could not register the negative-test tracepoint")?;
-        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if prog_fd < 0 {
             return Err("BPF_PROG_LOAD failed");
         }
@@ -4323,16 +4388,23 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         {
             return Err("an unopened raw tracepoint program fd was not EBADF");
         }
-        let sleepable = load_prog(BPF_PROG_TYPE_SYSCALL, &ret_imm(1)).ok_or("bpf() not Ok")?;
-        if sleepable < 0 {
-            return Err("BPF_PROG_LOAD rejected the sleepable negative fixture");
+        let tracing = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if tracing < 0 {
+            return Err("BPF_PROG_LOAD rejected the tracing negative fixture");
         }
         if bpf(
             BPF_RAW_TRACEPOINT_OPEN,
-            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, sleepable as u32, 0),
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, tracing as u32, 0),
         ) != Some(EINVAL)
         {
-            return Err("a sleepable program attached to an atomic raw tracepoint");
+            return Err("an atomic fentry program attached through the raw-tracepoint API");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(prog_fd as u32, fresh_probe(), BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("a raw-tracepoint program attached through the fentry API");
         }
         let mut attr = raw_tracepoint_attr(KNOWN.as_ptr() as u64, prog_fd as u32, 0);
         put_u32(&mut attr, 12, 1);
@@ -4350,7 +4422,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         {
             return Err("BPF_RAW_TRACEPOINT_OPEN accepted a truncated attr");
         }
-        let _ = call(Syscall::Close.raw(), a0(sleepable as u64));
+        let _ = call(Syscall::Close.raw(), a0(tracing as u64));
         let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
         Ok(())
     })

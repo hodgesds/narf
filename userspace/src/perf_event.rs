@@ -2336,7 +2336,7 @@ fn record_trace_loss(cpu: usize, type_id: u64) {
 
 fn capture_dynamic_probe(probe_id: u32, args: narf_tracing::ProbeArgs) {
     let mut bytes = [0; 32];
-    for (chunk, value) in bytes.chunks_exact_mut(8).zip(args.0) {
+    for (chunk, value) in bytes.chunks_exact_mut(8).zip(args.words()) {
         chunk.copy_from_slice(&value.to_ne_bytes());
     }
     capture_trace(u64::from(probe_id), &bytes);

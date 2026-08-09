@@ -89,6 +89,15 @@ pub fn install_probe_observer(observer: fn(u32, ProbeArgs));
 pub fn install_event_observer(observer: fn(u64, &[u8]));
 pub fn register_named_probe(name: &'static str) -> Result<u32, NamedProbeError>;
 pub fn named_probe_id(name: &str) -> Option<u32>;
+pub fn fire(probe_id: u32, args: ProbeArgs);
+pub fn fire_typed<T: TypedProbe>(probe_id: u32, value: &T);
+
+pub struct ProbeField { pub name: &'static str, pub offset: u32, pub size: u32 }
+pub unsafe trait TypedProbe: 'static {
+    const TYPE_NAME: &'static str;
+    const TYPE_KEY: u32;
+    const FIELDS: &'static [ProbeField];
+}
 
 pub enum ProbeAction {
     Capture { fields: &'static [Field] },
@@ -104,6 +113,18 @@ The two observer slots are kernel-internal, allocation-free bridges. A dynamic
 installed observer before normal handler/sink dispatch. The perf compatibility
 adapter uses these slots to defer exact IDs and payload bytes into its own
 bounded per-CPU record queue; observer callbacks must not block or allocate.
+
+`fire_typed` borrows one Rust object for the complete synchronous dispatch and
+exposes only the fields named by its `TypedProbe` implementation. The unsafe
+implementation contract requires every offset/size to describe initialized,
+dispatch-stable bytes of the named field inside `Self` and `TYPE_NAME` to be
+kernel-wide unique. The dispatch wrapper is private and stack-lived; scalar
+observers receive four zero words, and typed handlers may inspect it only
+before their callback returns. BPF typed-probe
+programs additionally compare type key, object size, and the complete field
+layout at attach/run time. They cannot enter through a public raw-context run
+API. Field bytes are copied through the mediated `narf_probe_read` kfunc; direct
+object dereference remains rejected. See `bpf/specification/spec.md` §3.14.
 
 `register_named_probe` is the cold-path bridge from Linux's flat raw-tracepoint
 name namespace to NARF's dispatch IDs. A site registers once, retains the

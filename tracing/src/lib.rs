@@ -49,9 +49,9 @@ pub mod tdigest;
 pub use hwtrace::{HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
 
 pub use dispatch::{
-    fire, install_probe_observer, named_probe_id, register_named_probe, reserve_probe_id,
-    table as handler_table, HandlerTable, NamedProbeError, ProbeArgs, ProbeHandler,
-    ProbeHandlerInstall, RegisterError,
+    fire, fire_typed, install_probe_observer, named_probe_id, register_named_probe,
+    reserve_probe_id, table as handler_table, type_key, HandlerTable, NamedProbeError, ProbeArgs,
+    ProbeField, ProbeHandler, ProbeHandlerInstall, RegisterError, TypedProbe, TypedProbeRef,
 };
 pub use fntime::{scope, FnTime, ScopeGuard, Welford};
 pub use sketch::{Histogram, HISTOGRAM_BUCKETS};

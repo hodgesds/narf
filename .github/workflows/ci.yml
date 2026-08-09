@@ -221,6 +221,14 @@ jobs:
             qemu-efi-aarch64 \
             xorriso
 
+      # Ubuntu's QEMU 8.2 can silently terminate NARF under MTTCG during
+      # device probing. The kernel-test and musl-demo jobs already use this
+      # pinned newer build for the same failure mode; iso-boot must exercise
+      # the guest under the same stable emulator.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        if: matrix.arch == 'x86_64'
+        uses: ./.github/actions/setup-qemu
+
       - name: Install Limine
         uses: ./.github/actions/setup-limine
 
