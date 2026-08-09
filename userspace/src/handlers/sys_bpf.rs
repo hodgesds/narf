@@ -85,6 +85,7 @@ const BPF_BTF_GET_FD_BY_ID: u32 = 19;
 const BPF_MAP_FREEZE: u32 = 22;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
 const BPF_PROG_QUERY: u32 = 16;
+const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
 const BPF_TASK_FD_QUERY: u32 = 20;
 const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
 const BPF_ITER_CREATE: u32 = 33;
@@ -363,6 +364,7 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         // Attach — `sys_bpf_attach.rs`.
         BPF_PROG_ATTACH => bpf_prog_attach(attr_uptr, size),
         BPF_PROG_DETACH => bpf_prog_detach(attr_uptr, size),
+        BPF_RAW_TRACEPOINT_OPEN => bpf_raw_tracepoint_open(attr_uptr, size),
         BPF_LINK_CREATE => bpf_link_create(attr_uptr, size),
         BPF_LINK_UPDATE => bpf_link_update(attr_uptr, size),
         BPF_LINK_DETACH => bpf_link_detach(attr_uptr, size),

@@ -334,6 +334,18 @@ written whenever the caller's attribute size covers it. A truncated log is
 `ENOSPC`, an invalid destination is `EFAULT`, and either log delivery error
 supersedes the underlying verifier result, matching Linux finalization.
 
+### 3.12 Named raw tracepoints
+
+`BPF_RAW_TRACEPOINT_OPEN` copies Linux's bounded 127-byte name, resolves only
+sites explicitly published by `narf_tracing::register_named_probe`, and returns
+a close-on-exec owning `BpfLink`. Closing the last link fd detaches the program.
+Static marker metadata does not imply a runnable dispatch site and therefore
+does not resolve by itself. The link retains the name and caller cookie for
+`bpf_link_info` (`BPF_LINK_TYPE_RAW_TRACEPOINT`), including Linux's in/out name
+buffer, true-length, truncation, and `EFAULT` behavior. Raw and id-selected
+attaches both claim the resolved dispatch id in the single-owner table, so the
+two ABIs cannot attach independently to one physical hook.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

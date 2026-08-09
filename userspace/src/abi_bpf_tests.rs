@@ -24,6 +24,7 @@ const BPF_PROG_BIND_MAP: u64 = 35;
 /// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
 /// in the "deliberately absent" list now that pinning has landed.
 const BPF_PROG_QUERY: u64 = 16;
+const BPF_RAW_TRACEPOINT_OPEN: u64 = 17;
 const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
@@ -4177,6 +4178,185 @@ fn fresh_probe() -> u32 {
     narf_tracing::dispatch::reserve_probe_id()
 }
 
+fn raw_tracepoint_attr(name: u64, prog_fd: u32, cookie: u64) -> [u8; ATTR_LEN] {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u64(&mut attr, 0, name);
+    put_u32(&mut attr, 8, prog_fd);
+    put_u64(&mut attr, 16, cookie);
+    attr
+}
+
+fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
+    with_setup(|| {
+        const NAME: &[u8] = b"abi_raw_tp\0";
+        const COOKIE: u64 = 0x1122_3344_5566_7788;
+        let probe_id = narf_tracing::register_named_probe("abi_raw_tp")
+            .map_err(|_| "could not register the named tracepoint")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD rejected the raw-tracepoint program");
+        }
+        let stats_fd = enable_stats(0).ok_or("BPF_ENABLE_STATS not Ok")?;
+        if stats_fd < 0 {
+            return Err("BPF_ENABLE_STATS failed");
+        }
+        let attr = raw_tracepoint_attr(NAME.as_ptr() as u64, prog_fd as u32, COOKIE);
+        let link_fd = bpf(BPF_RAW_TRACEPOINT_OPEN, &attr).ok_or("bpf() not Ok")?;
+        if link_fd < 0 {
+            return Err("BPF_RAW_TRACEPOINT_OPEN rejected a registered name");
+        }
+        let flags = call(Syscall::Fcntl.raw(), a2(link_fd as u64, 1, 0)).ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("raw-tracepoint link fd is not close-on-exec");
+        }
+        if bpf(BPF_RAW_TRACEPOINT_OPEN, &attr) != Some(-16 /* EBUSY */) {
+            return Err("a second raw-tracepoint link did not report EBUSY");
+        }
+
+        let mut name_out = [0xAAu8; 32];
+        let mut link_info = [0u8; INFO_BUF];
+        put_info_u64(&mut link_info, LI_RAW_NAME, name_out.as_mut_ptr() as u64);
+        put_info_u32(&mut link_info, LI_RAW_NAME_LEN, name_out.len() as u32);
+        let (r, back) = obj_info(link_fd, &mut link_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(0) || back != RAW_LINK_INFO_LEN as u32 {
+            return Err("raw-tracepoint BPF_OBJ_GET_INFO_BY_FD failed");
+        }
+        if info_u32(&link_info, LI_TYPE) != BPF_LINK_TYPE_RAW_TRACEPOINT
+            || info_u32(&link_info, LI_PROG_ID) != id_of(prog_fd)?
+        {
+            return Err("raw-tracepoint link info reported the wrong type or program");
+        }
+        if info_u64(&link_info, LI_RAW_NAME) != name_out.as_mut_ptr() as u64
+            || info_u32(&link_info, LI_RAW_NAME_LEN) != NAME.len() as u32
+            || info_u64(&link_info, LI_RAW_COOKIE) != COOKIE
+            || name_out[..NAME.len()] != NAME[..]
+        {
+            return Err("raw-tracepoint link info lost its name or cookie");
+        }
+
+        let mut size_info = [0u8; INFO_BUF];
+        let (r, back) = obj_info(link_fd, &mut size_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(0)
+            || back != RAW_LINK_INFO_LEN as u32
+            || info_u32(&size_info, LI_RAW_NAME_LEN) != NAME.len() as u32
+            || info_u64(&size_info, LI_RAW_COOKIE) != COOKIE
+        {
+            return Err("raw-tracepoint link info sizing lost the true length");
+        }
+
+        let mut short_name = [0xAAu8; 4];
+        let mut short_info = [0u8; INFO_BUF];
+        put_info_u64(&mut short_info, LI_RAW_NAME, short_name.as_mut_ptr() as u64);
+        put_info_u32(&mut short_info, LI_RAW_NAME_LEN, short_name.len() as u32);
+        let (r, back) = obj_info(link_fd, &mut short_info, RAW_LINK_INFO_LEN as u32);
+        if r != Some(ENOSPC)
+            || back != RAW_LINK_INFO_LEN as u32
+            || short_name != *b"abi\0"
+            || info_u32(&short_info, LI_RAW_NAME_LEN) != short_name.len() as u32
+        {
+            return Err("raw-tracepoint link info truncation diverged from Linux");
+        }
+
+        let mut bad_info = [0u8; INFO_BUF];
+        put_info_u64(&mut bad_info, LI_RAW_NAME, u64::MAX);
+        put_info_u32(&mut bad_info, LI_RAW_NAME_LEN, 4);
+        if obj_info(link_fd, &mut bad_info, RAW_LINK_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("raw-tracepoint link info did not reject an invalid name pointer");
+        }
+
+        let mut mismatched_info = [0u8; INFO_BUF];
+        put_info_u32(&mut mismatched_info, LI_RAW_NAME_LEN, 1);
+        if obj_info(link_fd, &mut mismatched_info, RAW_LINK_INFO_LEN as u32).0 != Some(EINVAL) {
+            return Err("raw-tracepoint link info accepted a mismatched name pointer/capacity");
+        }
+
+        narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
+        let mut prog_info = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut prog_info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&prog_info, PI_RUN_CNT) != 1
+        {
+            return Err("the named raw tracepoint did not run its program");
+        }
+        let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
+        narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
+        let mut after = [0u8; INFO_BUF];
+        if obj_info(prog_fd, &mut after, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u64(&after, PI_RUN_CNT) != 1
+        {
+            return Err("closing the raw-tracepoint link did not detach it");
+        }
+        let _ = call(Syscall::Close.raw(), a0(stats_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_raw_tracepoint_open_pos);
+
+fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
+    with_setup(|| {
+        const KNOWN: &[u8] = b"abi_raw_tp_neg\0";
+        const UNKNOWN: &[u8] = b"abi_raw_tp_missing\0";
+        let _probe_id = narf_tracing::register_named_probe("abi_raw_tp_neg")
+            .map_err(|_| "could not register the negative-test tracepoint")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(UNKNOWN.as_ptr() as u64, prog_fd as u32, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("an unknown raw tracepoint name was not ENOENT");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(u64::MAX, prog_fd as u32, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("an invalid raw tracepoint name pointer was not EFAULT");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, 4095, 0),
+        ) != Some(EBADF)
+        {
+            return Err("an unopened raw tracepoint program fd was not EBADF");
+        }
+        let sleepable = load_prog(BPF_PROG_TYPE_SYSCALL, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if sleepable < 0 {
+            return Err("BPF_PROG_LOAD rejected the sleepable negative fixture");
+        }
+        if bpf(
+            BPF_RAW_TRACEPOINT_OPEN,
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, sleepable as u32, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("a sleepable program attached to an atomic raw tracepoint");
+        }
+        let mut attr = raw_tracepoint_attr(KNOWN.as_ptr() as u64, prog_fd as u32, 0);
+        put_u32(&mut attr, 12, 1);
+        if bpf(BPF_RAW_TRACEPOINT_OPEN, &attr) != Some(EINVAL) {
+            return Err("BPF_RAW_TRACEPOINT_OPEN accepted its reserved word");
+        }
+        if call(
+            Syscall::Bpf.raw(),
+            a2(
+                BPF_RAW_TRACEPOINT_OPEN,
+                attr.as_ptr() as u64,
+                8, // truncated before prog_fd
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_RAW_TRACEPOINT_OPEN accepted a truncated attr");
+        }
+        let _ = call(Syscall::Close.raw(), a0(sleepable as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_raw_tracepoint_open_neg);
+
 // ── BPF iterators: BPF_LINK_CREATE(BPF_TRACE_ITER) + BPF_ITER_CREATE ──
 
 const BPF_TRACE_ITER: u32 = 28;
@@ -4986,7 +5166,8 @@ kernel_test_in!("bpf", smoke_bpf_syscall_link_close_detaches_xdp);
 const BPF_BTF_GET_FD_BY_ID: u64 = 19;
 const BPF_BTF_GET_NEXT_ID: u64 = 23;
 
-/// `enum bpf_link_type`. The two NARF can produce.
+/// `enum bpf_link_type` values NARF can produce.
+const BPF_LINK_TYPE_RAW_TRACEPOINT: u32 = 1;
 const BPF_LINK_TYPE_TRACING: u32 = 2;
 const BPF_LINK_TYPE_XDP: u32 = 6;
 
@@ -5001,6 +5182,10 @@ const LI_UNION: usize = 16;
 /// reports this number back, so a caller compiled against the full struct knows
 /// the tail is untouched.
 const LINK_INFO_LEN: usize = 32;
+const RAW_LINK_INFO_LEN: usize = 40;
+const LI_RAW_NAME: usize = 16;
+const LI_RAW_NAME_LEN: usize = 24;
+const LI_RAW_COOKIE: usize = 32;
 
 // `struct bpf_btf_info` field offsets.
 const BI_BTF: usize = 0;

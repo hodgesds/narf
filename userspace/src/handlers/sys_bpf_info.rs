@@ -63,6 +63,7 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
+const ENOSPC: i64 = 28;
 
 /// As `sys_bpf.rs`: `union bpf_attr` grows every release and Linux accepts any
 /// size, zero-extending. Copy what the caller supplied into a zeroed buffer.
@@ -204,7 +205,7 @@ const LI_UNION: usize = 16;
 const LI_TRACING_TARGET_OBJ_ID: usize = 20;
 /// `tracing.target_btf_id`.
 const LI_TRACING_TARGET_BTF_ID: usize = 24;
-/// How much of `struct bpf_link_info` NARF fills.
+/// How much of `struct bpf_link_info` NARF fills for tracing and XDP links.
 ///
 /// Short of Linux's 64, and deliberately so — the same call the `MAP_INFO_LEN`
 /// note above makes. Every union member NARF can produce (`tracing`'s three
@@ -213,8 +214,15 @@ const LI_TRACING_TARGET_BTF_ID: usize = 24;
 /// would read a `cookie` or a `kprobe_multi.count` that was never written.
 /// Reporting 32 says exactly which prefix is real.
 const LINK_INFO_LEN: usize = 32;
+/// Raw-tracepoint info additionally includes its 64-bit cookie.
+const RAW_LINK_INFO_LEN: usize = 40;
 
-/// `enum bpf_link_type`. Only the two NARF has surfaces for.
+const LI_RAW_NAME: usize = 16;
+const LI_RAW_NAME_LEN: usize = 24;
+const LI_RAW_COOKIE: usize = 32;
+
+/// `enum bpf_link_type` values NARF can produce.
+const BPF_LINK_TYPE_RAW_TRACEPOINT: u32 = 1;
 const BPF_LINK_TYPE_TRACING: u32 = 2;
 const BPF_LINK_TYPE_XDP: u32 = 6;
 /// `enum bpf_attach_type`'s `BPF_TRACE_FENTRY`, echoed into
@@ -542,7 +550,11 @@ fn link_info(
     user_len: usize,
     link: &alloc::sync::Arc<narf_bpf::link::BpfLink>,
 ) -> i64 {
-    let mut out = [0u8; LINK_INFO_LEN];
+    let mut uin = [0u8; RAW_LINK_INFO_LEN];
+    if let Err(e) = read_user_info(uinfo, user_len, &mut uin) {
+        return e;
+    }
+    let mut out = [0u8; RAW_LINK_INFO_LEN];
     put_u32(&mut out, LI_ID, link.id());
     // `prog_id` is 0 once the link has been detached — `BPF_LINK_DETACH` leaves
     // the fd valid and the link dead, and reporting the last program it held
@@ -551,33 +563,65 @@ fn link_info(
     if let Some(p) = link.prog() {
         put_u32(&mut out, LI_PROG_ID, p.id);
     }
-    match link.target() {
-        LinkTarget::Probe(_) => {
-            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_TRACING);
-            put_u32(&mut out, LI_UNION, BPF_TRACE_FENTRY);
-            // LINUX-GAP: `tracing.target_obj_id` / `tracing.target_btf_id`.
-            // Linux names an fentry target by BTF id; NARF names it by
-            // `narf_tracing::dispatch` probe id, and nothing joins the two
-            // (see `sys_bpf_attach.rs`'s header). Writing the probe id into a
-            // field documented as a BTF type id would be a value that looks
-            // resolvable and is not, so both stay 0 — which for
-            // `target_btf_id` already means "none".
-            put_u32(&mut out, LI_TRACING_TARGET_OBJ_ID, 0);
-            put_u32(&mut out, LI_TRACING_TARGET_BTF_ID, 0);
+    let mut object_len = LINK_INFO_LEN;
+    if let Some((name, cookie)) = link.raw_tracepoint() {
+        object_len = RAW_LINK_INFO_LEN;
+        put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_RAW_TRACEPOINT);
+        let name_uptr = u64_at(&uin, LI_RAW_NAME);
+        let capacity = u32_at(&uin, LI_RAW_NAME_LEN) as usize;
+        if (name_uptr != 0) != (capacity != 0) {
+            return -EINVAL;
         }
-        LinkTarget::Xdp(iface) => {
-            put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_XDP);
-            // 0 for an interface that has since been unregistered: `ifindex`
-            // has no "unknown" encoding other than 0, and a stale index would
-            // name whichever interface now sits at that position.
-            put_u32(
-                &mut out,
-                LI_UNION,
-                super::ifindex_for_iface(iface).unwrap_or(0),
-            );
+        put_u64(&mut out, LI_RAW_NAME, name_uptr);
+        put_u32(&mut out, LI_RAW_NAME_LEN, name.len().saturating_add(1) as u32);
+        put_u64(&mut out, LI_RAW_COOKIE, cookie);
+        if name_uptr != 0 {
+            let keep = name.len().min(capacity - 1);
+            let mut bytes = alloc::vec::Vec::with_capacity(keep + 1);
+            bytes.extend_from_slice(&name.as_bytes()[..keep]);
+            bytes.push(0);
+            // SAFETY: the caller supplied this name buffer and capacity;
+            // `copy_to_user` validates the bounded destination range.
+            if let Err(e) = unsafe { copy_to_user(name_uptr, &bytes) } {
+                return -(e as i64);
+            }
+            if capacity <= name.len() {
+                // Linux returns before copying the local `bpf_link_info` back
+                // on truncation. The name buffer still receives its bounded,
+                // NUL-terminated prefix, while the caller's in/out length and
+                // `attr.info_len` remain unchanged.
+                return -ENOSPC;
+            }
+        }
+    } else {
+        match link.target() {
+            LinkTarget::Probe(_) => {
+                put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_TRACING);
+                put_u32(&mut out, LI_UNION, BPF_TRACE_FENTRY);
+                // LINUX-GAP: `tracing.target_obj_id` / `tracing.target_btf_id`.
+                // Linux names an fentry target by BTF id; NARF names it by
+                // `narf_tracing::dispatch` probe id, and nothing joins the two
+                // (see `sys_bpf_attach.rs`'s header). Writing the probe id into a
+                // field documented as a BTF type id would be a value that looks
+                // resolvable and is not, so both stay 0 — which for
+                // `target_btf_id` already means "none".
+                put_u32(&mut out, LI_TRACING_TARGET_OBJ_ID, 0);
+                put_u32(&mut out, LI_TRACING_TARGET_BTF_ID, 0);
+            }
+            LinkTarget::Xdp(iface) => {
+                put_u32(&mut out, LI_TYPE, BPF_LINK_TYPE_XDP);
+                // 0 for an interface that has since been unregistered: `ifindex`
+                // has no "unknown" encoding other than 0, and a stale index would
+                // name whichever interface now sits at that position.
+                put_u32(
+                    &mut out,
+                    LI_UNION,
+                    super::ifindex_for_iface(iface).unwrap_or(0),
+                );
+            }
         }
     }
-    write_info(attr_uptr, uinfo, user_len, &out, LINK_INFO_LEN)
+    write_info(attr_uptr, uinfo, user_len, &out, object_len)
 }
 
 fn btf_info(attr_uptr: u64, uinfo: u64, user_len: usize, file: &super::BtfFile) -> i64 {

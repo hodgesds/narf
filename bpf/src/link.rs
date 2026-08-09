@@ -330,11 +330,24 @@ fn do_detach(caps: &LinkCaps, target: &LinkTarget) -> Result<(), LinkError> {
     }
 }
 
+/// Linux-visible metadata that is independent of the physical hook identity.
+///
+/// A raw tracepoint and an id-selected tracing link may claim the same probe
+/// slot, so both deliberately use [`LinkTarget::Probe`] in the owner table.
+/// Keeping the name and cookie here avoids making two observably different
+/// values compare equal merely because they contend for that same slot.
+#[derive(Debug)]
+enum LinkMetadata {
+    Standard,
+    RawTracepoint { name: String, cookie: u64 },
+}
+
 /// An owning handle on one attach.
 #[derive(Debug)]
 pub struct BpfLink {
     id: u32,
     target: LinkTarget,
+    metadata: LinkMetadata,
     caps: LinkCaps,
     /// The attached program, and the "still attached" flag in one: `take()`ing
     /// it under the lock is the single point that decides which caller performs
@@ -356,6 +369,39 @@ impl BpfLink {
         target: LinkTarget,
         prog: Arc<BpfProg>,
     ) -> Result<Arc<Self>, LinkError> {
+        Self::create_inner(caps, target, LinkMetadata::Standard, prog)
+    }
+
+    /// Attach `prog` to a registered raw tracepoint and retain its Linux-visible
+    /// name and cookie for `BPF_OBJ_GET_INFO_BY_FD`.
+    ///
+    /// The actual owner-table target is the resolved probe id, so an id-based
+    /// tracing attach and a raw-tracepoint attach cannot both own one hook.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::create`].
+    pub fn create_raw_tracepoint(
+        caps: LinkCaps,
+        probe_id: u32,
+        name: String,
+        cookie: u64,
+        prog: Arc<BpfProg>,
+    ) -> Result<Arc<Self>, LinkError> {
+        Self::create_inner(
+            caps,
+            LinkTarget::Probe(probe_id),
+            LinkMetadata::RawTracepoint { name, cookie },
+            prog,
+        )
+    }
+
+    fn create_inner(
+        caps: LinkCaps,
+        target: LinkTarget,
+        metadata: LinkMetadata,
+        prog: Arc<BpfProg>,
+    ) -> Result<Arc<Self>, LinkError> {
         // Checked here as well as inside the attach adapters: the claim below
         // must not be taken (and then have to be unwound) on behalf of an
         // authority that is already dead.
@@ -373,6 +419,7 @@ impl BpfLink {
         let link = Arc::new(Self {
             id,
             target,
+            metadata,
             caps,
             prog: IrqSafeSpinLock::new(Some(prog)),
         });
@@ -395,6 +442,16 @@ impl BpfLink {
     #[must_use]
     pub fn target(&self) -> &LinkTarget {
         &self.target
+    }
+
+    /// Raw-tracepoint name and attach cookie, if this link was opened through
+    /// `BPF_RAW_TRACEPOINT_OPEN`.
+    #[must_use]
+    pub fn raw_tracepoint(&self) -> Option<(&str, u64)> {
+        match &self.metadata {
+            LinkMetadata::Standard => None,
+            LinkMetadata::RawTracepoint { name, cookie } => Some((name, *cookie)),
+        }
     }
 
     /// The attached program, or `None` once detached.
