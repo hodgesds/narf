@@ -93,9 +93,8 @@ const GI_PROG_FD_END: usize = 4;
 /// `BPF_MAP_GET_FD_BY_ID_LAST_FIELD` is `open_flags`.
 const GI_MAP_FD_END: usize = 12;
 
-/// `enum bpf_prog_type` values `sys_bpf.rs`'s `prog_load` accepts, reported
-/// back here. The mapping is one-to-one in both directions, which is why it can
-/// be a `match` and not a stored field.
+/// Default `enum bpf_prog_type` values for direct in-kernel programs, which do
+/// not carry syscall load metadata.
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SYSCALL: u32 = 31;
 
@@ -467,10 +466,10 @@ fn prog_info(
     put_u32(
         &mut out,
         PI_TYPE,
-        match prog.context() {
+        prog.linux_prog_type().unwrap_or(match prog.context() {
             Context::Atomic => BPF_PROG_TYPE_TRACING,
             Context::Sleepable => BPF_PROG_TYPE_SYSCALL,
-        },
+        }),
     );
     put_u32(&mut out, PI_ID, prog.id);
     out[PI_TAG..PI_TAG + narf_bpf::prog::PROG_TAG_SIZE].copy_from_slice(&prog.tag());

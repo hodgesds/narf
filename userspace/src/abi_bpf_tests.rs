@@ -29,8 +29,9 @@ const BPF_BTF_LOAD: u64 = 18;
 
 const EOPNOTSUPP: i64 = -95;
 
-/// `BPF_PROG_TYPE_TRACING`. NARF maps it to `Context::Atomic` — the probe
-/// sites are the fentry-shaped hook, and they run with IRQs masked.
+/// Atomic probe program types NARF keeps distinct at attach time.
+const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
+const BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: u32 = 24;
 const BPF_PROG_TYPE_TRACING: u32 = 26;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 
@@ -230,6 +231,9 @@ fn smoke_abi_bpf_prog_load_neg() -> TestResult {
         // A program type whose attach surface does not exist yet.
         if load_prog(BPF_PROG_TYPE_SOCKET_FILTER, &ret_imm(0)) != Some(EOPNOTSUPP) {
             return Err("an unimplemented prog_type did not return EOPNOTSUPP");
+        }
+        if load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, &ret_imm(0)) != Some(EOPNOTSUPP) {
+            return Err("writable raw tracepoints were accepted without writable ctx support");
         }
         Ok(())
     })
@@ -4192,7 +4196,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
         const COOKIE: u64 = 0x1122_3344_5566_7788;
         let probe_id = narf_tracing::register_named_probe("abi_raw_tp")
             .map_err(|_| "could not register the named tracepoint")?;
-        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if prog_fd < 0 {
             return Err("BPF_PROG_LOAD rejected the raw-tracepoint program");
         }
@@ -4273,9 +4277,10 @@ fn smoke_abi_bpf_raw_tracepoint_open_pos() -> TestResult {
         narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
         let mut prog_info = [0u8; INFO_BUF];
         if obj_info(prog_fd, &mut prog_info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&prog_info, PI_TYPE) != BPF_PROG_TYPE_RAW_TRACEPOINT
             || info_u64(&prog_info, PI_RUN_CNT) != 1
         {
-            return Err("the named raw tracepoint did not run its program");
+            return Err("the named raw tracepoint lost its type or did not run");
         }
         let _ = call(Syscall::Close.raw(), a0(link_fd as u64));
         narf_tracing::dispatch::fire(probe_id, narf_tracing::dispatch::ProbeArgs::none());
@@ -4298,7 +4303,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         const UNKNOWN: &[u8] = b"abi_raw_tp_missing\0";
         let _probe_id = narf_tracing::register_named_probe("abi_raw_tp_neg")
             .map_err(|_| "could not register the negative-test tracepoint")?;
-        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        let prog_fd = load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if prog_fd < 0 {
             return Err("BPF_PROG_LOAD failed");
         }
@@ -4323,16 +4328,23 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         {
             return Err("an unopened raw tracepoint program fd was not EBADF");
         }
-        let sleepable = load_prog(BPF_PROG_TYPE_SYSCALL, &ret_imm(1)).ok_or("bpf() not Ok")?;
-        if sleepable < 0 {
-            return Err("BPF_PROG_LOAD rejected the sleepable negative fixture");
+        let tracing = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
+        if tracing < 0 {
+            return Err("BPF_PROG_LOAD rejected the tracing negative fixture");
         }
         if bpf(
             BPF_RAW_TRACEPOINT_OPEN,
-            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, sleepable as u32, 0),
+            &raw_tracepoint_attr(KNOWN.as_ptr() as u64, tracing as u32, 0),
         ) != Some(EINVAL)
         {
-            return Err("a sleepable program attached to an atomic raw tracepoint");
+            return Err("an atomic fentry program attached through the raw-tracepoint API");
+        }
+        if bpf(
+            BPF_LINK_CREATE,
+            &link_attr(prog_fd as u32, fresh_probe(), BPF_TRACE_FENTRY),
+        ) != Some(EINVAL)
+        {
+            return Err("a raw-tracepoint program attached through the fentry API");
         }
         let mut attr = raw_tracepoint_attr(KNOWN.as_ptr() as u64, prog_fd as u32, 0);
         put_u32(&mut attr, 12, 1);
@@ -4350,7 +4362,7 @@ fn smoke_abi_bpf_raw_tracepoint_open_neg() -> TestResult {
         {
             return Err("BPF_RAW_TRACEPOINT_OPEN accepted a truncated attr");
         }
-        let _ = call(Syscall::Close.raw(), a0(sleepable as u64));
+        let _ = call(Syscall::Close.raw(), a0(tracing as u64));
         let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
         Ok(())
     })

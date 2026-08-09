@@ -117,6 +117,11 @@ pub struct BpfProg {
     load_time_ns: u64,
     /// Effective uid of the task that loaded the program.
     created_by_uid: u32,
+    /// Linux `enum bpf_prog_type` supplied by a syscall-shaped loader.
+    ///
+    /// Separate from `context`: several Linux program types execute in the
+    /// same atomic context but are not interchangeable at attach time.
+    linux_prog_type: Option<u32>,
     /// The validated instruction image. Verification does not rewrite
     /// instructions — lowering happens once, in the JIT (spec §1.7).
     insns: Vec<Insn>,
@@ -189,6 +194,8 @@ pub struct LoadMetadata {
     pub gpl_compatible: bool,
     /// Effective uid of the task issuing `BPF_PROG_LOAD`.
     pub created_by_uid: u32,
+    /// Declared Linux program type, absent for direct in-kernel loaders.
+    pub linux_prog_type: Option<u32>,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -288,6 +295,7 @@ impl BpfProg {
             LoadMetadata {
                 gpl_compatible,
                 created_by_uid: 0,
+                linux_prog_type: None,
             },
         )
     }
@@ -460,6 +468,7 @@ impl BpfProg {
             gpl_compatible: metadata.gpl_compatible,
             load_time_ns: narf_time::monotonic_ns(),
             created_by_uid: metadata.created_by_uid,
+            linux_prog_type: metadata.linux_prog_type,
             insns: req.insns,
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
@@ -554,6 +563,16 @@ impl BpfProg {
     #[must_use]
     pub const fn created_by_uid(&self) -> u32 {
         self.created_by_uid
+    }
+
+    /// Linux program type captured by a syscall-shaped loader.
+    ///
+    /// Direct in-kernel loaders return `None`; their execution context remains
+    /// available through [`Self::context`].
+    #[inline]
+    #[must_use]
+    pub const fn linux_prog_type(&self) -> Option<u32> {
+        self.linux_prog_type
     }
 
     /// The map named by this file descriptor, or `None`.

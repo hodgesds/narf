@@ -339,6 +339,13 @@ supersedes the underlying verifier result, matching Linux finalization.
 `BPF_RAW_TRACEPOINT_OPEN` copies Linux's bounded 127-byte name, resolves only
 sites explicitly published by `narf_tracing::register_named_probe`, and returns
 a close-on-exec owning `BpfLink`. Closing the last link fd detaches the program.
+`BPF_PROG_LOAD` accepts `BPF_PROG_TYPE_RAW_TRACEPOINT` as an atomic program and
+retains type 17 in `LoadMetadata`; `BpfProg::linux_prog_type()` keeps that
+object identity separate from its verifier `Context`. The raw-open command
+requires this type, while fentry, XDP, and iterator paths reject it even though
+they are also atomic. `BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE` remains
+`EOPNOTSUPP`: NARF's probe context is read-only, so accepting type 24 would
+promise write-through argument semantics the runtime cannot provide.
 Static marker metadata does not imply a runnable dispatch site and therefore
 does not resolve by itself. The link retains the name and caller cookie for
 `bpf_link_info` (`BPF_LINK_TYPE_RAW_TRACEPOINT`), including Linux's in/out name
