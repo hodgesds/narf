@@ -40,8 +40,8 @@ Landed:
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
 - **`bpf(2)`** — load, test-run, the full map element and batch ops, object info
   and id/fd enumeration for progs/maps/links/BTF, pin/get, attach/detach, link
-  create/update/detach, keyed-map freeze, prog-query, task-fd-query, and
-  iterators.
+  create/update/detach, keyed-map freeze, program-map lifetime binding,
+  prog-query, task-fd-query, and iterators.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call
 (register-allocation blockers — these fall back to the interpreter); typed
