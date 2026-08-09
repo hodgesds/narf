@@ -401,6 +401,17 @@ impl BpfProg {
         self.insns.is_empty()
     }
 
+    /// Immutable Linux instruction image accepted at load time.
+    ///
+    /// NARF keeps map resolution beside this image rather than rewriting its
+    /// immediates, so these are also the bytes reported as translated
+    /// instructions by `BPF_OBJ_GET_INFO_BY_FD`.
+    #[inline]
+    #[must_use]
+    pub fn instructions(&self) -> &[Insn] {
+        &self.insns
+    }
+
     /// The map named by this file descriptor, or `None`.
     ///
     /// What the interpreter resolves `LD_IMM64`'s `MapFd` form against. The
@@ -835,6 +846,19 @@ impl BpfProg {
         self.jit
             .as_ref()
             .map_or(0, crate::jit_glue::JitImage::text_len)
+    }
+
+    /// Emitted native instruction bytes, empty when this program is interpreted.
+    ///
+    /// This is the privileged introspection view behind
+    /// `bpf_prog_info.jited_prog_insns`; execution continues to enter through
+    /// the sealed image owned by the program.
+    #[inline]
+    #[must_use]
+    pub fn jited_bytes(&self) -> &[u8] {
+        self.jit
+            .as_ref()
+            .map_or(&[], crate::jit_glue::JitImage::text)
     }
 
     /// Run the program on a heap stack owned by the caller's future.

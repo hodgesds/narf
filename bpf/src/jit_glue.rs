@@ -278,6 +278,24 @@ impl JitImage {
         self.alloc.as_ref().map_or(0, |a| a.len)
     }
 
+    /// Bytes of emitted text for privileged program introspection.
+    ///
+    /// The allocation remains mapped read-execute for this image's lifetime;
+    /// sealing removes writable aliases, not read access through its program
+    /// VA. `BPF_OBJ_GET_INFO_BY_FD` holds the owning program `Arc` while it
+    /// copies this slice, so reclamation cannot race the read.
+    #[inline]
+    #[must_use]
+    pub fn text(&self) -> &[u8] {
+        let Some(a) = self.alloc.as_ref() else {
+            return &[];
+        };
+        // SAFETY: `a.va..a.va+a.len` is the live mapping owned by this image.
+        // It remains readable until `JitImage::drop`, which cannot run while
+        // this borrow exists.
+        unsafe { core::slice::from_raw_parts(a.as_ptr(), a.len) }
+    }
+
     /// Whether the emitted code dereferences the arena slot base.
     #[inline]
     #[must_use]

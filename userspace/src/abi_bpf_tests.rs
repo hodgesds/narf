@@ -2747,6 +2747,7 @@ const PI_TYPE: usize = 0;
 const PI_ID: usize = 4;
 const PI_JITED_PROG_LEN: usize = 16;
 const PI_XLATED_PROG_LEN: usize = 20;
+const PI_JITED_PROG_INSNS: usize = 24;
 const PI_XLATED_PROG_INSNS: usize = 32;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
@@ -2895,6 +2896,10 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         {
             return Err("BPF_PROG_TEST_RUN failed");
         }
+        // Length fields are input capacities as well as outputs. Start a fresh
+        // sizing query rather than accidentally requesting copies to the null
+        // pointers from the first query.
+        let mut info = [0u8; INFO_BUF];
         let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
         if r != Some(0) {
             return Err("second BPF_OBJ_GET_INFO_BY_FD failed");
@@ -2985,32 +2990,113 @@ fn smoke_abi_bpf_obj_get_info_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_neg);
 
-/// The instruction-dump fields. NARF has no dump path, and a caller that asked
-/// for the image must not get a success with its buffer untouched — it would
-/// disassemble whatever was already there.
+/// The instruction-dump fields use their length words as input capacities and
+/// output true lengths. Exercise prefixes deliberately: accepting only a full
+/// buffer would break the two-call sizing pattern used by bpftool.
+fn smoke_abi_bpf_obj_get_info_dump_pos() -> TestResult {
+    with_setup(|| {
+        let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok_or("bpf() not Ok")?;
+        if map_fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        // A map pseudo-load makes the exact-byte assertion load-bearing: Linux
+        // normally rewrites this immediate to a kernel pointer, while NARF's
+        // contract keeps the submitted fd in the immutable translated image.
+        let xlated = ld_map_fd_prog(map_fd);
+        let fd = load_prog(BPF_PROG_TYPE_TRACING, &xlated).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let jited = prog_behind_fd(fd)
+            .ok_or("program fd did not hold BpfProg")?
+            .jited_bytes()
+            .to_vec();
+        if jited.len() < 2 {
+            return Err("trivial program did not produce a dumpable JIT image");
+        }
+
+        let xlated_cap = xlated.len() - 3;
+        let jited_cap = jited.len() - 1;
+        let mut xlated_out = alloc::vec![0xA5; xlated_cap + 1];
+        let mut jited_out = alloc::vec![0xA5; jited_cap + 1];
+        let mut info = [0u8; INFO_BUF];
+        info[PI_XLATED_PROG_LEN..PI_XLATED_PROG_LEN + 4]
+            .copy_from_slice(&(xlated_cap as u32).to_le_bytes());
+        info[PI_JITED_PROG_LEN..PI_JITED_PROG_LEN + 4]
+            .copy_from_slice(&(jited_cap as u32).to_le_bytes());
+        put_info_u64(
+            &mut info,
+            PI_XLATED_PROG_INSNS,
+            xlated_out.as_mut_ptr() as u64,
+        );
+        put_info_u64(
+            &mut info,
+            PI_JITED_PROG_INSNS,
+            jited_out.as_mut_ptr() as u64,
+        );
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("BPF_OBJ_GET_INFO_BY_FD instruction dump failed");
+        }
+        if xlated_out[..xlated_cap] != xlated[..xlated_cap] || xlated_out[xlated_cap] != 0xA5 {
+            return Err("translated dump did not copy exactly its declared prefix");
+        }
+        if jited_out[..jited_cap] != jited[..jited_cap] || jited_out[jited_cap] != 0xA5 {
+            return Err("JIT dump did not copy exactly its declared prefix");
+        }
+        if info_u32(&info, PI_XLATED_PROG_LEN) != xlated.len() as u32
+            || info_u32(&info, PI_JITED_PROG_LEN) != jited.len() as u32
+        {
+            return Err("instruction dump did not report full output lengths");
+        }
+        if info_u64(&info, PI_XLATED_PROG_INSNS) != xlated_out.as_ptr() as u64
+            || info_u64(&info, PI_JITED_PROG_INSNS) != jited_out.as_ptr() as u64
+        {
+            return Err("instruction dump did not preserve its in/out pointers");
+        }
+
+        // Capacity zero is a sizing query even when the pointer is nonsense.
+        let mut info = [0u8; INFO_BUF];
+        put_info_u64(&mut info, PI_XLATED_PROG_INSNS, u64::MAX);
+        put_info_u64(&mut info, PI_JITED_PROG_INSNS, u64::MAX);
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+            return Err("zero-capacity instruction sizing query touched its pointer");
+        }
+        if info_u32(&info, PI_XLATED_PROG_LEN) != xlated.len() as u32
+            || info_u32(&info, PI_JITED_PROG_LEN) != jited.len() as u32
+        {
+            return Err("instruction sizing query returned the wrong lengths");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_obj_get_info_dump_pos);
+
 fn smoke_abi_bpf_obj_get_info_dump_neg() -> TestResult {
     with_setup(|| {
         let fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("BPF_PROG_LOAD failed");
         }
-        let mut sink = [0u8; INFO_BUF];
+
         let mut info = [0u8; INFO_BUF];
-        put_info_u64(&mut info, PI_XLATED_PROG_INSNS, sink.as_mut_ptr() as u64);
-        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EOPNOTSUPP) {
-            return Err("a request to dump xlated instructions did not return ENOTSUP");
+        info[PI_XLATED_PROG_LEN..PI_XLATED_PROG_LEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("translated dump with a null output pointer was not EFAULT");
         }
-        // …and the same call without the dump pointer still works, so the
-        // refusal is scoped to the feature and not to the command.
+
         let mut info = [0u8; INFO_BUF];
-        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
-            return Err("BPF_OBJ_GET_INFO_BY_FD failed without a dump request");
+        info[PI_JITED_PROG_LEN..PI_JITED_PROG_LEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(EFAULT) {
+            return Err("JIT dump with a null output pointer was not EFAULT");
         }
+
         let _ = call(Syscall::Close.raw(), a0(fd as u64));
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_get_info_dump_neg);
+kernel_test_in!("bpf", smoke_abi_bpf_obj_get_info_dump_neg);
 
 /// `nr_map_ids` / `map_ids` — the in/out pair a loader uses to rediscover the
 /// maps a program holds.

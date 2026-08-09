@@ -270,6 +270,20 @@ kernel attach logic and diagnostics use them even when userspace has not paid
 the timestamp cost. Only the gated counters are exposed through
 `bpf_prog_info`, matching Linux rather than leaking the internal bookkeeping.
 
+### 3.7 Program instruction introspection
+
+`BPF_OBJ_GET_INFO_BY_FD` exposes both instruction images through Linux's
+`bpf_prog_info` in/out fields. `xlated_prog_insns` is the exact immutable
+Linux-ISA image accepted at load: NARF records map-fd and map-index resolution
+beside the image and never patches its immediates. `jited_prog_insns` is the
+sealed native text when the verifier and architecture JIT admitted the program;
+an interpreted program reports length zero. The caller supplies capacities in
+`xlated_prog_len` / `jited_prog_len`; each buffer receives at most that prefix,
+while both returned lengths report the complete images. Zero capacity performs
+a sizing query without touching its pointer, and a non-zero copy to an invalid
+pointer returns `EFAULT`. The syscall-wide privileged BPF credential gate also
+guards native dumps, which can contain resolved kernel addresses.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

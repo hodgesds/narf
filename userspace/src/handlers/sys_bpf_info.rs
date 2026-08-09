@@ -63,8 +63,6 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-/// Linux's userspace-visible `EOPNOTSUPP`, which equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
 
 /// As `sys_bpf.rs`: `union bpf_attr` grows every release and Linux accepts any
 /// size, zero-extending. Copy what the caller supplied into a zeroed buffer.
@@ -382,24 +380,14 @@ fn prog_info(
         return e;
     }
 
-    // LINUX-GAP: the instruction-dump fields. Linux lets a privileged caller
-    // pass a buffer in `xlated_prog_insns` / `jited_prog_insns` and copies the
-    // program image into it; NARF has no dump path. Refusing loudly rather than
-    // reporting a length and writing nothing — a caller that asked for the
-    // image and got a silently untouched buffer would disassemble whatever was
-    // already there. `bpftool prog list` (which never sets these) is
-    // unaffected; `bpftool prog dump` gets a clean "this kernel does not do
-    // that".
-    // `>=`, not `>`: a field spanning bytes `[off, off+8)` is fully supplied
-    // once `user_len` reaches `off + 8`. Off by one here silently ignores a
-    // dump request from a caller whose struct ends exactly at the field.
-    let wants_xlated =
-        user_len >= PI_XLATED_PROG_INSNS + 8 && u64_at(&uin, PI_XLATED_PROG_INSNS) != 0;
-    let wants_jited =
-        user_len >= PI_JITED_PROG_INSNS + 8 && u64_at(&uin, PI_JITED_PROG_INSNS) != 0;
-    if wants_xlated || wants_jited {
-        return -ENOTSUP;
-    }
+    // Both lengths are in/out: the caller supplies buffer capacities and the
+    // kernel reports the full image lengths even when it copied only prefixes.
+    // A non-zero pointer with zero capacity is only a sizing query; a non-zero
+    // capacity with a null pointer faults when the corresponding image exists.
+    let xlated_cap = u32_at(&uin, PI_XLATED_PROG_LEN) as usize;
+    let jited_cap = u32_at(&uin, PI_JITED_PROG_LEN) as usize;
+    let xlated_uptr = u64_at(&uin, PI_XLATED_PROG_INSNS);
+    let jited_uptr = u64_at(&uin, PI_JITED_PROG_INSNS);
 
     // The in-value of `nr_map_ids` is the caller's array capacity; the
     // out-value is the true count. Both halves matter: a caller sizing its
@@ -432,6 +420,37 @@ fn prog_info(
         }
     }
 
+    let xlated_len = prog.len() * core::mem::size_of::<narf_bpf_isa::Insn>();
+    let mut copied = 0usize;
+    let want_xlated = xlated_cap.min(xlated_len);
+    for insn in prog.instructions() {
+        if copied == want_xlated {
+            break;
+        }
+        let bytes = insn.to_bytes();
+        let n = (want_xlated - copied).min(bytes.len());
+        let dst = match xlated_uptr.checked_add(copied as u64) {
+            Some(dst) => dst,
+            None => return -EFAULT,
+        };
+        // SAFETY: `copy_to_user` validates each destination range and
+        // SMAP-brackets the copy. `n` is bounded by one encoded instruction.
+        if let Err(e) = unsafe { copy_to_user(dst, &bytes[..n]) } {
+            return -(e as i64);
+        }
+        copied += n;
+    }
+
+    let jited = prog.jited_bytes();
+    let want_jited = jited_cap.min(jited.len());
+    if want_jited > 0 {
+        // SAFETY: `copy_to_user` validates the caller-provided buffer. The
+        // source is the sealed text mapping held live by `prog`'s `Arc`.
+        if let Err(e) = unsafe { copy_to_user(jited_uptr, &jited[..want_jited]) } {
+            return -(e as i64);
+        }
+    }
+
     let mut out = [0u8; PROG_INFO_LEN];
     put_u32(
         &mut out,
@@ -442,16 +461,18 @@ fn prog_info(
         },
     );
     put_u32(&mut out, PI_ID, prog.id);
-    put_u32(&mut out, PI_JITED_PROG_LEN, prog.jited_len() as u32);
+    put_u32(&mut out, PI_JITED_PROG_LEN, jited.len() as u32);
     // NARF does not rewrite instructions (spec §1.7), so the "translated"
     // program *is* the loaded one and its length is exact rather than an
     // approximation of a rewritten image.
-    put_u32(
-        &mut out,
-        PI_XLATED_PROG_LEN,
-        (prog.len() * core::mem::size_of::<narf_bpf_isa::Insn>()) as u32,
-    );
+    put_u32(&mut out, PI_XLATED_PROG_LEN, xlated_len as u32);
+    // Linux copies the in/out buffer addresses back unchanged. Keeping them
+    // makes a single returned `bpf_prog_info` self-describing to callers that
+    // reuse it for another partial dump.
+    put_u64(&mut out, PI_JITED_PROG_INSNS, jited_uptr);
+    put_u64(&mut out, PI_XLATED_PROG_INSNS, xlated_uptr);
     put_u32(&mut out, PI_NR_MAP_IDS, nr_maps as u32);
+    put_u64(&mut out, PI_MAP_IDS, map_ids_uptr);
     put_name(&mut out, PI_NAME, &prog.name);
     put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
