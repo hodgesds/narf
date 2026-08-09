@@ -17,6 +17,7 @@ const BPF_PROG_LOAD: u64 = 5;
 const BPF_OBJ_PIN: u64 = 6;
 const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
+const BPF_MAP_FREEZE: u64 = 22;
 /// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
 /// in the "deliberately absent" list now that pinning has landed.
 const BPF_PROG_QUERY: u64 = 16;
@@ -688,6 +689,16 @@ fn elem(cmd: u64, fd: i64, key: u64, value: u64, flags: u64) -> Option<i64> {
     )
 }
 
+/// Freeze one map using the Linux `map_fd`-only attribute shape.
+fn freeze_map(fd: i64) -> Option<i64> {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, 0, fd as u32);
+    call(
+        Syscall::Bpf.raw(),
+        a2(BPF_MAP_FREEZE, attr.as_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
 // ── BPF_MAP_CREATE ──────────────────────────────────────────────────
 
 fn smoke_abi_bpf_map_create_pos() -> TestResult {
@@ -1087,6 +1098,159 @@ fn smoke_abi_bpf_map_hash_elem_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_map_hash_elem_neg);
+
+// ── BPF_MAP_FREEZE ─────────────────────────────────────────────────
+
+fn smoke_abi_bpf_map_freeze_pos() -> TestResult {
+    with_setup(|| {
+        let fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_MAP_CREATE failed");
+        }
+        let key: u32 = 7;
+        let value: u64 = 0x1122_3344_5566_7788;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            fd,
+            (&key) as *const u32 as u64,
+            (&value) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(0)
+        {
+            return Err("seed update failed before freeze");
+        }
+        if freeze_map(fd) != Some(0) {
+            return Err("BPF_MAP_FREEZE failed on a keyed map");
+        }
+        if freeze_map(fd) != Some(EBUSY) {
+            return Err("a repeated BPF_MAP_FREEZE was not EBUSY");
+        }
+
+        // Reads survive, and the value present at freeze time is unchanged.
+        let mut read = 0u64;
+        if elem(
+            BPF_MAP_LOOKUP_ELEM,
+            fd,
+            (&key) as *const u32 as u64,
+            (&mut read) as *mut u64 as u64,
+            0,
+        ) != Some(0)
+            || read != value
+        {
+            return Err("lookup on a frozen map failed or returned the wrong value");
+        }
+
+        // Every syscall mutation path observes the same object-level bit.
+        let replacement = 9u64;
+        if elem(
+            BPF_MAP_UPDATE_ELEM,
+            fd,
+            (&key) as *const u32 as u64,
+            (&replacement) as *const u64 as u64,
+            BPF_ANY,
+        ) != Some(-1 /* EPERM */)
+        {
+            return Err("single update mutated a frozen map");
+        }
+        if elem(BPF_MAP_DELETE_ELEM, fd, (&key) as *const u32 as u64, 0, 0)
+            != Some(-1 /* EPERM */)
+        {
+            return Err("single delete mutated a frozen map");
+        }
+        let keys = [key];
+        let values = [replacement];
+        if batch(
+            BPF_MAP_UPDATE_BATCH,
+            fd,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            values.as_ptr() as u64,
+            1,
+            BPF_ANY,
+        )
+        .0 != Some(-1 /* EPERM */)
+        {
+            return Err("batch update mutated a frozen map");
+        }
+        if batch(
+            BPF_MAP_DELETE_BATCH,
+            fd,
+            0,
+            0,
+            keys.as_ptr() as u64,
+            0,
+            1,
+            0,
+        )
+        .0 != Some(-1 /* EPERM */)
+        {
+            return Err("batch delete mutated a frozen map");
+        }
+        let mut out_key = 0u32;
+        let mut out_value = 0u64;
+        let mut cursor = 0u32;
+        if batch(
+            BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+            fd,
+            0,
+            (&mut cursor) as *mut u32 as u64,
+            (&mut out_key) as *mut u32 as u64,
+            (&mut out_value) as *mut u64 as u64,
+            1,
+            0,
+        )
+        .0 != Some(-1 /* EPERM */)
+        {
+            return Err("lookup-and-delete batch mutated a frozen map");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_freeze_pos);
+
+fn smoke_abi_bpf_map_freeze_neg() -> TestResult {
+    with_setup(|| {
+        if freeze_map(4095) != Some(EBADF) {
+            return Err("BPF_MAP_FREEZE on an unopened fd was not EBADF");
+        }
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 || freeze_map(prog_fd) != Some(EINVAL) {
+            return Err("BPF_MAP_FREEZE on a program fd was not EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+
+        // A ring has a writable consumer-page mmap surface that NARF cannot
+        // account as an active writer yet, so claiming to freeze it would be
+        // false. Refuse that map kind explicitly.
+        let ring = create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 4096).ok_or("bpf() not Ok")?;
+        if ring < 0 || freeze_map(ring) != Some(EOPNOTSUPP) {
+            return Err("BPF_MAP_FREEZE on a ring buffer was not EOPNOTSUPP");
+        }
+        let _ = call(Syscall::Close.raw(), a0(ring as u64));
+
+        let mut attr = [0u8; ATTR_LEN];
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_MAP_FREEZE, attr.as_ptr() as u64, 3),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_MAP_FREEZE accepted a truncated attr");
+        }
+        attr[4] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_MAP_FREEZE, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_MAP_FREEZE accepted a non-zero attr tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_map_freeze_neg);
 
 // ── BPF_MAP_GET_NEXT_KEY ────────────────────────────────────────────
 

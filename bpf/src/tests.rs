@@ -3356,6 +3356,58 @@ fn smoke_bpf_map_file_is_a_handle() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_map_file_is_a_handle);
 
+fn smoke_bpf_map_freeze_separates_syscall_and_program_writes() -> TestResult {
+    checked(|| {
+        let m = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let key = k32(7);
+        let before = 11u64.to_le_bytes();
+
+        // An admitted syscall writer makes a concurrent freeze fail. The
+        // writer remains usable after that refusal and releasing it lets a
+        // later freeze linearize successfully.
+        let writer = m
+            .begin_sys_write()
+            .map_err(|_| "fresh map refused a syscall writer")?;
+        if m.freeze() != Err(MapError::Busy) {
+            return Err("freeze did not report an active syscall writer as Busy");
+        }
+        writer
+            .update(&key, &before, BPF_ANY)
+            .map_err(|_| "admitted syscall writer could not update")?;
+        drop(writer);
+
+        m.freeze().map_err(|_| "freeze of an idle map failed")?;
+        if !m.is_frozen() {
+            return Err("successful freeze did not persist on the map object");
+        }
+        if m.freeze() != Err(MapError::Busy) {
+            return Err("a repeated freeze was not Busy");
+        }
+        if !matches!(m.begin_sys_write(), Err(MapError::Frozen)) {
+            return Err("a frozen map admitted a new syscall writer");
+        }
+
+        // Freeze is a userspace permission change, not a program-side one.
+        // The same operation the `narf_map_update` kfunc performs must remain
+        // legal, and the syscall read view must observe it.
+        let after = 22u64.to_le_bytes();
+        m.ops()
+            .update_local(&key, &after, BPF_ANY)
+            .map_err(|_| "program-side update was blocked by freeze")?;
+        let mut out = [0u8; 8];
+        m.lookup(&key, &mut out)
+            .map_err(|_| "lookup on a frozen map failed")?;
+        if out != after {
+            return Err("frozen map lookup did not observe the program-side update");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_map_freeze_separates_syscall_and_program_writes
+);
+
 // ── map access from a program ───────────────────────────────────────
 
 /// The fd a smoke's `LD_IMM64` immediates name.

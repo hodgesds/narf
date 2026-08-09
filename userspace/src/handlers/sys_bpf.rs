@@ -13,8 +13,8 @@
 //! * `BPF_PROG_LOAD` (5) — verify and load, returning a program fd.
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
-//! * `BPF_MAP_CREATE` (0) and the four element commands (1..=4), over the four
-//!   keyed map kinds in `narf_bpf::map`.
+//! * `BPF_MAP_CREATE` (0), the four element commands (1..=4), batch commands,
+//!   and `BPF_MAP_FREEZE` (22), over the keyed map kinds in `narf_bpf::map`.
 //!
 //! The element commands take the **syscall** view of a per-CPU map: the value
 //! buffer spans every CPU at an 8-byte stride, exactly as Linux's
@@ -69,6 +69,7 @@ const BPF_PROG_GET_FD_BY_ID: u32 = 13;
 const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 const BPF_BTF_GET_FD_BY_ID: u32 = 19;
+const BPF_MAP_FREEZE: u32 = 22;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
 const BPF_PROG_QUERY: u32 = 16;
 const BPF_TASK_FD_QUERY: u32 = 20;
@@ -213,6 +214,10 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_BTF_GET_NEXT_ID => super::bpf_btf_get_next_id(attr_uptr, size),
         BPF_BTF_GET_FD_BY_ID => super::bpf_btf_get_fd_by_id(attr_uptr, size),
 
+        // Make the userspace view permanently read-only while preserving
+        // program-side updates — `BPF_MAP_FREEZE` (22).
+        BPF_MAP_FREEZE => map_freeze(attr_uptr, size),
+
         // bpffs pinning — `sys_bpf_pin.rs`.
         BPF_OBJ_PIN => super::bpf_obj_pin(attr_uptr, size),
         BPF_OBJ_GET => super::bpf_obj_get(attr_uptr, size),
@@ -230,8 +235,10 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         // LINUX-GAP: everything else — the BPF token commands (`BPF_TOKEN_CREATE`
         // — NARF has no token, and the privilege gate above is a credential check
         // rather than a delegable one), `BPF_ENABLE_STATS`, `BPF_PROG_BIND_MAP`,
-        // and `BPF_MAP_FREEZE`. `ENOTSUP` rather than `EINVAL` so a probing loader
-        // can tell "this kernel does not do that" from "you passed nonsense".
+        // and related newer commands. `ENOTSUP` rather than `EINVAL` lets a
+        // probing loader tell "this kernel does not do that" from "you passed
+        // nonsense". The implemented `BPF_MAP_FREEZE` handler separately
+        // returns `EOPNOTSUPP` for ring buffers.
         //
         // The batch element commands are NOT in that list any more:
         // `BPF_MAP_{LOOKUP,LOOKUP_AND_DELETE,UPDATE,DELETE}_BATCH` are
@@ -699,13 +706,12 @@ fn map_lookup_elem(attr_uptr: u64, size: usize) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
-    let ops = a.map.ops();
     // The syscall view: for a per-CPU kind this is every CPU's slot, so the
     // caller's buffer is `cpus * round_up(value_size, 8)` bytes. Linux requires
     // exactly the same and the man page says so; getting it wrong here would
     // read past a userspace buffer.
-    let mut out = alloc::vec![0u8; ops.syscall_value_bytes()];
-    if let Err(e) = ops.lookup(&a.key, &mut out) {
+    let mut out = alloc::vec![0u8; a.map.syscall_value_bytes()];
+    if let Err(e) = a.map.lookup(&a.key, &mut out) {
         return -(i64::from(e.errno()));
     }
     // SAFETY: range-validated inside `copy_to_user`, which also brackets SMAP.
@@ -720,13 +726,16 @@ fn map_update_elem(attr_uptr: u64, size: usize) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
-    let ops = a.map.ops();
     // SAFETY: as `elem_args`' key copy.
-    let value = match unsafe { copy_from_user_vec(a.value_uptr, ops.syscall_value_bytes()) } {
+    let value = match unsafe { copy_from_user_vec(a.value_uptr, a.map.syscall_value_bytes()) } {
         Ok(v) => v,
         Err(e) => return -(e as i64),
     };
-    match ops.update(&a.key, &value, a.flags) {
+    let write = match a.map.begin_sys_write() {
+        Ok(w) => w,
+        Err(e) => return -(i64::from(e.errno())),
+    };
+    match write.update(&a.key, &value, a.flags) {
         Ok(()) => 0,
         Err(e) => -(i64::from(e.errno())),
     }
@@ -737,7 +746,11 @@ fn map_delete_elem(attr_uptr: u64, size: usize) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
-    match a.map.ops().delete(&a.key) {
+    let write = match a.map.begin_sys_write() {
+        Ok(w) => w,
+        Err(e) => return -(i64::from(e.errno())),
+    };
+    match write.delete(&a.key) {
         Ok(()) => 0,
         Err(e) => -(i64::from(e.errno())),
     }
@@ -773,13 +786,39 @@ fn map_get_next_key(attr_uptr: u64, size: usize) -> i64 {
         }
     };
     let mut out = alloc::vec![0u8; key_size];
-    if let Err(e) = map.ops().next_key(key.as_deref(), &mut out) {
+    if let Err(e) = map.next_key(key.as_deref(), &mut out) {
         return -(i64::from(e.errno()));
     }
     // SAFETY: as above.
     match unsafe { copy_to_user(next_uptr, &out) } {
         Ok(()) => 0,
         Err(e) => -(e as i64),
+    }
+}
+
+/// `BPF_MAP_FREEZE` — permanently remove syscall-side write permission.
+///
+/// Only `map_fd` is input. Linux returns `EBUSY` both for a repeated freeze and
+/// when a syscall writer is already active, and leaves program-side writes
+/// enabled; [`BpfMap`] owns those semantics so every fd for the object observes
+/// the same state. NARF refuses ring buffers for now: their consumer page is
+/// writable through `mmap`, and the mapping layer does not yet expose the
+/// write-accounting hook needed to prove no writable alias survives the call.
+fn map_freeze(attr_uptr: u64, size: usize) -> i64 {
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < 4 || attr[4..size].iter().any(|b| *b != 0) {
+        return -EINVAL;
+    }
+    let map = match map_from_fd(u32_at(&attr, 0)) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    match map.freeze() {
+        Ok(()) => 0,
+        Err(e) => -(i64::from(e.errno())),
     }
 }
 
@@ -823,9 +862,8 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
     if u64_at(&attr, BA_FLAGS) != 0 || u64_at(&attr, BA_ELEM_FLAGS) != 0 {
         return -EINVAL;
     }
-    let ops = map.ops();
     let key_size = map.attr().key_size as usize;
-    let value_bytes = ops.syscall_value_bytes();
+    let value_bytes = map.syscall_value_bytes();
     let count_in = u32_at(&attr, BA_COUNT);
     let keys_uptr = u64_at(&attr, BA_KEYS);
     let values_uptr = u64_at(&attr, BA_VALUES);
@@ -834,6 +872,14 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
     if count_in != 0 && (keys_uptr == 0 || values_uptr == 0) {
         return -EINVAL;
     }
+    let write = if and_delete {
+        match map.begin_sys_write() {
+            Ok(w) => Some(w),
+            Err(e) => return -(i64::from(e.errno())),
+        }
+    } else {
+        None
+    };
 
     // The resume cursor: the key to walk *after*. A NULL `in_batch` starts the
     // walk; otherwise it is the key-sized token a previous call handed back.
@@ -853,7 +899,7 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
     let mut result: i64 = 0;
 
     while filled < count_in {
-        match ops.next_key(prev.as_deref(), &mut key_buf) {
+        match map.next_key(prev.as_deref(), &mut key_buf) {
             Ok(()) => {}
             // The walk is done: the batch's terminating condition.
             Err(MapError::NotFound) => {
@@ -868,11 +914,11 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
         // A key `next_key` just handed us that `lookup` cannot find raced away
         // under a concurrent delete. Stop cleanly; the caller re-drives from
         // the cursor written below.
-        if ops.lookup(&key_buf, &mut val_buf).is_err() {
+        if map.lookup(&key_buf, &mut val_buf).is_err() {
             break;
         }
         if and_delete {
-            match ops.delete(&key_buf) {
+            match write.as_ref().expect("and_delete admitted a writer").delete(&key_buf) {
                 Ok(()) => {}
                 // Same race — skip without counting it.
                 Err(MapError::NotFound) => {
@@ -942,9 +988,8 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
     if u64_at(&attr, BA_FLAGS) != 0 {
         return -EINVAL;
     }
-    let ops = map.ops();
     let key_size = map.attr().key_size as usize;
-    let value_bytes = ops.syscall_value_bytes();
+    let value_bytes = map.syscall_value_bytes();
     let count_in = u32_at(&attr, BA_COUNT);
     let keys_uptr = u64_at(&attr, BA_KEYS);
     let values_uptr = u64_at(&attr, BA_VALUES);
@@ -957,6 +1002,10 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
     if count_in != 0 && (keys_uptr == 0 || (!delete && values_uptr == 0)) {
         return -EINVAL;
     }
+    let write = match map.begin_sys_write() {
+        Ok(w) => w,
+        Err(e) => return -(i64::from(e.errno())),
+    };
 
     let mut done: u32 = 0;
     let mut result: i64 = 0;
@@ -968,7 +1017,7 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
             Err(e) => return -(e as i64),
         };
         let r = if delete {
-            ops.delete(&key)
+            write.delete(&key)
         } else {
             let voff = values_uptr + u64::from(done) * value_bytes as u64;
             // SAFETY: as above.
@@ -976,7 +1025,7 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
                 Ok(v) => v,
                 Err(e) => return -(e as i64),
             };
-            ops.update(&key, &value, elem_flags)
+            write.update(&key, &value, elem_flags)
         };
         if let Err(e) = r {
             result = -(i64::from(e.errno()));

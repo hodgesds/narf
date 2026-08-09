@@ -176,6 +176,15 @@ pub enum MapError {
     Invalid,
     /// The allocation at creation could not be satisfied. `ENOMEM`.
     NoMemory,
+    /// A syscall tried to mutate a map after [`BpfMap::freeze`]. `EPERM`.
+    /// Program-side updates deliberately remain permitted.
+    Frozen,
+    /// A freeze raced an active syscall writer, or the map was already
+    /// frozen. `EBUSY`.
+    Busy,
+    /// The requested operation has no honest implementation for this map
+    /// kind. `EOPNOTSUPP`.
+    Unsupported,
     /// The `Cap<BpfMapCap, Grant>` was revoked. `EPERM`.
     AuthorityRevoked,
 }
@@ -193,11 +202,14 @@ impl MapError {
     pub const fn errno(self) -> u32 {
         match self {
             MapError::AuthorityRevoked => 1, // EPERM
+            MapError::Frozen => 1,           // EPERM
             MapError::NotFound => 2,         // ENOENT
             MapError::Exists => 17,          // EEXIST
+            MapError::Busy => 16,            // EBUSY
             MapError::Invalid => 22,         // EINVAL
             MapError::NoMemory => 12,        // ENOMEM
             MapError::TooBig => 7,           // E2BIG
+            MapError::Unsupported => 95,     // EOPNOTSUPP
         }
     }
 }
@@ -1003,6 +1015,51 @@ pub struct BpfMap {
     /// References currently held by running BPF programs — see
     /// [`MAX_BPF_PINS`] and [`narf_map_acquire`].
     bpf_pins: AtomicU32,
+    /// Serialises the userspace-write side of `BPF_MAP_FREEZE`.
+    ///
+    /// Program writes do not enter this state: Linux's freeze contract blocks
+    /// future syscall mutations while explicitly leaving BPF-program updates
+    /// possible. `active` makes freeze fail with `EBUSY` rather than returning
+    /// while an already-admitted syscall write can still commit.
+    freeze: IrqSafeSpinLock<FreezeState>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct FreezeState {
+    frozen: bool,
+    active: u32,
+}
+
+/// One admitted userspace mutation of a map.
+///
+/// Created by [`BpfMap::begin_sys_write`]. Holding it pins the map's freeze
+/// state in the "writer active" condition; dropping it releases that claim.
+/// The only mutating methods exposed here are the syscall view. Program-side
+/// kfuncs deliberately use the private operations table directly, because
+/// `BPF_MAP_FREEZE` does not make a map read-only to BPF programs.
+#[derive(Debug)]
+pub struct SysWrite<'a> {
+    map: &'a BpfMap,
+}
+
+impl SysWrite<'_> {
+    /// Install a syscall-width value.
+    pub fn update(&self, key: &[u8], value: &[u8], flags: u64) -> Result<(), MapError> {
+        self.map.ops().update(key, value, flags)
+    }
+
+    /// Delete one key through the syscall view.
+    pub fn delete(&self, key: &[u8]) -> Result<(), MapError> {
+        self.map.ops().delete(key)
+    }
+}
+
+impl Drop for SysWrite<'_> {
+    fn drop(&mut self) {
+        let mut state = self.map.freeze.lock();
+        debug_assert!(state.active != 0, "BPF map syscall-writer count underflow");
+        state.active = state.active.saturating_sub(1);
+    }
 }
 
 /// How many references one map may have out to BPF programs at once.
@@ -1030,9 +1087,9 @@ pub const MAX_BPF_PINS: u32 = 1024;
 /// Static dispatch over the four kinds.
 ///
 /// An enum rather than `Box<dyn BpfMapOps>` because the program-facing path
-/// runs with IRQs masked and this keeps the call direct; the `dyn` form is
-/// still available through [`BpfMap::ops`] for the syscall side, which does not
-/// care.
+/// runs with IRQs masked and this keeps ownership concrete. The private
+/// [`BpfMap::ops`] projection is shared by the program kfuncs and the public,
+/// freeze-aware syscall-view methods.
 #[derive(Debug)]
 enum MapImpl {
     Array(ArrayMap),
@@ -1094,6 +1151,7 @@ impl BpfMap {
             ops,
             charged,
             bpf_pins: AtomicU32::new(0),
+            freeze: IrqSafeSpinLock::new(FreezeState::default()),
         });
         // Publish the id → map direction for `BPF_MAP_GET_FD_BY_ID`. Same
         // reasoning as `BpfProg::load_with_arena`: registering here rather than
@@ -1103,14 +1161,16 @@ impl BpfMap {
         Ok(map)
     }
 
-    /// The operations table.
+    /// The private operations table.
     ///
     /// A ring buffer answers this too — with an ops table that refuses every
     /// element command as `EINVAL`, which is what makes `BPF_MAP_LOOKUP_ELEM`
     /// and friends on a ring-buffer fd fail cleanly rather than needing a
-    /// special case at every call site.
+    /// special case at every call site. Keeping this crate-private is what
+    /// prevents another crate from bypassing [`BpfMap::begin_sys_write`] for a
+    /// userspace mutation after freeze.
     #[must_use]
-    pub fn ops(&self) -> &dyn BpfMapOps {
+    pub(crate) fn ops(&self) -> &dyn BpfMapOps {
         match &self.ops {
             MapImpl::Array(a) => a,
             MapImpl::Hash(h) => h,
@@ -1135,6 +1195,62 @@ impl BpfMap {
     #[must_use]
     pub fn attr(&self) -> MapAttr {
         self.ops().attr()
+    }
+
+    /// Bytes in the userspace view of one value.
+    #[must_use]
+    pub fn syscall_value_bytes(&self) -> usize {
+        self.ops().syscall_value_bytes()
+    }
+
+    /// Read one value through the syscall view.
+    pub fn lookup(&self, key: &[u8], out: &mut [u8]) -> Result<(), MapError> {
+        self.ops().lookup(key, out)
+    }
+
+    /// Return the key following `key` through the syscall view.
+    pub fn next_key(&self, key: Option<&[u8]>, out: &mut [u8]) -> Result<(), MapError> {
+        self.ops().next_key(key, out)
+    }
+
+    /// Admit one syscall mutation and hold its active-writer claim until the
+    /// returned guard is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::Frozen`] after a successful [`BpfMap::freeze`].
+    pub fn begin_sys_write(&self) -> Result<SysWrite<'_>, MapError> {
+        let mut state = self.freeze.lock();
+        if state.frozen {
+            return Err(MapError::Frozen);
+        }
+        state.active = state.active.checked_add(1).ok_or(MapError::Busy)?;
+        Ok(SysWrite { map: self })
+    }
+
+    /// Permanently block future syscall-side map mutations.
+    ///
+    /// Program-side updates remain legal. Repeating the operation, or racing
+    /// an already admitted syscall writer, returns [`MapError::Busy`]. Ring
+    /// buffers are refused because NARF does not yet account their writable
+    /// consumer-page mappings as active userspace writers; claiming to freeze
+    /// one would leave an existing mapping able to mutate it.
+    pub fn freeze(&self) -> Result<(), MapError> {
+        if self.ringbuf().is_some() {
+            return Err(MapError::Unsupported);
+        }
+        let mut state = self.freeze.lock();
+        if state.frozen || state.active != 0 {
+            return Err(MapError::Busy);
+        }
+        state.frozen = true;
+        Ok(())
+    }
+
+    /// Whether [`BpfMap::freeze`] has completed successfully.
+    #[must_use]
+    pub fn is_frozen(&self) -> bool {
+        self.freeze.lock().frozen
     }
 
     /// How many references running BPF programs currently hold.
