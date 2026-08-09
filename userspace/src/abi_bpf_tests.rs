@@ -439,6 +439,90 @@ fn smoke_abi_bpf_prog_test_run_ctx() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_test_run_ctx);
 
+fn smoke_abi_bpf_prog_test_run_xdp() -> TestResult {
+    with_setup(|| {
+        let fd = load_prog(BPF_PROG_TYPE_XDP, &xdp_bounded_byte_program()).ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected the bounded XDP program");
+        }
+
+        let mut frame = [0u8; 64];
+        frame[12] = 0x11;
+        let mut output = [0xAAu8; 64];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd as u32);
+        put_u32(&mut attr, 8, frame.len() as u32); // data_size_in
+        put_u32(&mut attr, 12, output.len() as u32); // data_size_out
+        put_u64(&mut attr, 16, frame.as_ptr() as u64); // data_in
+        put_u64(&mut attr, 24, output.as_mut_ptr() as u64); // data_out
+        put_u32(&mut attr, 32, 3); // repeat
+        let r = call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+        )
+        .ok_or("bpf() not Ok")?;
+        if r != 0 || get_u32(&attr, 4) != 1 {
+            return Err("XDP test-run did not report XDP_DROP");
+        }
+        if get_u32(&attr, 12) != frame.len() as u32 || output != frame {
+            return Err("XDP test-run did not copy the packet output");
+        }
+
+        // The current XDP contract is read-only, but Linux still reports a
+        // truncated data_out prefix and the actual required length.
+        let mut short = [0u8; 8];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd as u32);
+        put_u32(&mut attr, 8, frame.len() as u32);
+        put_u32(&mut attr, 12, short.len() as u32);
+        put_u64(&mut attr, 16, frame.as_ptr() as u64);
+        put_u64(&mut attr, 24, short.as_mut_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(ENOSPC)
+        {
+            return Err("short XDP data_out did not return ENOSPC");
+        }
+        if get_u32(&attr, 12) != frame.len() as u32
+            || get_u32(&attr, 4) != 1
+            || short != frame[..short.len()]
+        {
+            return Err("short XDP data_out did not publish result and required size");
+        }
+
+        // `ctx_in` must never become a raw native-pointer escape hatch.
+        let forged_ctx = [frame.as_ptr() as u64, frame.as_ptr_range().end as u64];
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd as u32);
+        put_u32(&mut attr, 8, frame.len() as u32);
+        put_u64(&mut attr, 16, frame.as_ptr() as u64);
+        put_u32(&mut attr, 40, 16);
+        put_u64(&mut attr, 48, forged_ctx.as_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("XDP test-run accepted a caller-forged context");
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, fd as u32);
+        put_u32(&mut attr, 8, 13);
+        put_u64(&mut attr, 16, frame.as_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_TEST_RUN, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("XDP test-run accepted a frame shorter than Ethernet");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_prog_test_run_xdp);
+
 fn smoke_abi_bpf_prog_test_run_neg() -> TestResult {
     with_setup(|| {
         let mut attr = [0u8; ATTR_LEN];
@@ -5221,11 +5305,6 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
         let fd = load_prog(BPF_PROG_TYPE_XDP, &xdp_bounded_byte_program()).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("BPF_PROG_LOAD rejected a trivial program");
-        }
-        let mut test = [0u8; ATTR_LEN];
-        put_u32(&mut test, 0, fd as u32);
-        if bpf(BPF_PROG_TEST_RUN, &test) != Some(EOPNOTSUPP) {
-            return Err("XDP test-run accepted a caller-forged pointer context");
         }
         let tracing_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1))
             .ok_or("tracing BPF_PROG_LOAD was not Ok")?;

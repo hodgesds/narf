@@ -413,11 +413,16 @@ a signed or 32-bit comparison, a non-constant offset, or an insufficient prefix
 proves nothing. Stack-spilled aliases are deliberately not recovered yet; that
 rejects some safe programs rather than guessing provenance.
 
-The classifier supplies live frame addresses only through `BpfProg::run_xdp`;
-the generic raw-context execution methods refuse XDP programs, and
-`BPF_PROG_TEST_RUN` returns `EOPNOTSUPP` until its `data_in` translation builds
-a real frame. The interpreter independently bounds each packet load against the
-exact borrowed slice. The JIT emits a direct read only for a verifier-published
+Live classification and `BPF_PROG_TEST_RUN` supply frame addresses only through
+`BpfProg::run_xdp`; the generic raw-context execution methods refuse XDP
+programs. Test-run copies Linux `data_in` into a kernel-owned frame, refuses
+caller `ctx_in`/`ctx_out`, CPU selection and batch mode, normalises zero repeat
+to one, and caps one synchronous call at a 64 KiB frame and 1024 iterations.
+Because XDP frames are currently immutable, `data_out` is the copied input;
+short output receives its prefix and the actual size with `ENOSPC`.
+
+The interpreter independently bounds each packet load against the exact
+borrowed slice. The JIT emits a direct read only for a verifier-published
 `bare_access_site`, so the program's dominating comparison is the native
 runtime guard. Frames remain immutable: stores are rejected by the context
 descriptor, and `XDP_TX`/`XDP_REDIRECT` remain unsupported.
@@ -508,9 +513,10 @@ a caller-supplied raw context, and direct `Object` loads stay opaque.
 region.** A same-key `data`/`data_end` comparison may certify only the prefix
 its constant offset proves, and no other pointer comparison changes memory
 access rights. `run_xdp` is the sole constructor of the real-address context;
-raw execution cannot forge it. The interpreter checks the borrowed slice again,
-while native code is admitted only at a verifier-certified access site. The
-borrow ends synchronously before the RX caller may recycle the DMA buffer.
+its callers may supply only a Rust slice, and raw execution cannot forge the
+context. The interpreter checks the borrowed slice again, while native code is
+admitted only at a verifier-certified access site. The borrow ends synchronously
+before the RX caller may recycle the DMA buffer or the test-run syscall returns.
 
 ## 5. Architecture notes
 

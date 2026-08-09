@@ -466,10 +466,14 @@ that type as object identity distinct from tracing programs even though both
 execute atomically. Only an XDP program may attach to `BPF_XDP`; tracing,
 raw-tracepoint, and sleepable programs receive `EINVAL` on a valid XDP target.
 The runtime context is kernel-constructed packet `data` / `data_end`, not a
-caller-supplied `ctx_in`. Consequently `BPF_PROG_TEST_RUN` on an XDP program
-returns `EOPNOTSUPP` until the Linux `data_in` packet translation is implemented;
-accepting arbitrary context words would let a caller forge native pointer
-bounds. Packet reads and their verifier/runtime contract are owned by
+caller-supplied `ctx_in`. `BPF_PROG_TEST_RUN` copies Linux `data_in` into a
+kernel-owned frame and passes only that immutable slice to `BpfProg::run_xdp`;
+non-zero `ctx_in`/`ctx_out`, flags, CPU selection, and batch mode are rejected.
+Zero repeat means one run; packet size and repeat are capped at 64 KiB and 1024
+so the synchronous privileged syscall remains bounded. The current read-only
+XDP contract copies the unchanged packet to `data_out`, publishes the actual
+size and average duration, and returns `ENOSPC` after copying a short output
+prefix. Packet reads and their verifier/runtime contract are owned by
 `bpf/specification/spec.md` §3.15.
 
 ## 4. Invariants & safety properties

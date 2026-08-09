@@ -950,8 +950,13 @@ impl BpfProg {
         self.run_atomic_inner(ctx, ctx_len)
     }
 
-    /// Run an XDP program against one live, read-only receive frame.
-    pub(crate) fn run_xdp(&self, frame: &[u8]) -> Option<Outcome> {
+    /// Run an XDP program against one live, read-only packet frame.
+    ///
+    /// This is also the safe test-run boundary: callers supply bytes, never
+    /// raw context words. The method constructs the paired `data`/`data_end`
+    /// addresses from this exact borrow and binds the interpreter's runtime
+    /// region to the same slice.
+    pub fn run_xdp(&self, frame: &[u8]) -> Option<Outcome> {
         if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
             return None;
         }

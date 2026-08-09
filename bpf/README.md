@@ -51,6 +51,8 @@ Landed:
   load-provenance metadata, bounded verifier logs, native raw-tracepoint program
   loads and named opens, fd-gated runtime statistics, recursion-miss accounting,
   prog-query, task-fd-query, and iterators.
+  XDP test-run translates `data_in` into a kernel-owned immutable frame rather
+  than accepting caller-authored native context pointers.
 
 Residual: JIT lowering of arena atomics and arena access under a subprogram call
 (register-allocation blockers — these fall back to the interpreter); optional
