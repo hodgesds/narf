@@ -1188,7 +1188,18 @@ impl BpfProg {
                     len: 0,
                 })
             }
-            // Unreachable: the emitters return one of the three above and
+            // The arena atomic's emitted alignment guard branches here before
+            // touching memory. As with a recovered arena fault, the handle is
+            // retained in the low half; the exact instruction and width would
+            // require a side table and are reported as their native sentinel.
+            narf_bpf_jit::status::ARENA_UNALIGNED => {
+                Outcome::Trapped(crate::interp::Trap::ArenaUnaligned {
+                    at: 0,
+                    handle: value,
+                    len: 0,
+                })
+            }
+            // Unreachable: the emitters return one of the four above and
             // nothing else. Treated as a stop rather than a value, because the
             // one thing that must not happen is a status nobody understands
             // being read as a successful return.

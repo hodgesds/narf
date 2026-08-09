@@ -427,6 +427,21 @@ borrowed slice. The JIT emits a direct read only for a verifier-published
 runtime guard. Frames remain immutable: stores are rejected by the context
 descriptor, and `XDP_TX`/`XDP_REDIRECT` remain unsupported.
 
+### 3.16 Native arena atomics
+
+The x86_64 and aarch64 JITs lower naturally aligned word and doubleword arena
+atomics after computing the same `slot_base + zero_extend(handle + off16)`
+address as ordinary arena accesses. Add, non-fetching bitwise operations,
+exchange, compare-and-exchange, load-acquire, and store-release are native;
+fetching bitwise arena operations remain interpreted on both architectures.
+
+Before the atomic memory instruction, emitted code tests the effective address
+for natural alignment. Failure returns JIT status `ARENA_UNALIGNED` with the
+offending handle and becomes `Trap::ArenaUnaligned`; it cannot partially execute
+the operation. A mapped but inaccessible address instead follows the registered
+arena exception-table entry and returns `ARENA_FAULT`. Both outcomes stop the
+program, and unsupported lowering fails closed to the interpreter.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

@@ -247,3 +247,11 @@ argument = "XDP test-run changes only the existing BPF runtime and Linux-compat 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The syscall range-validates and copies data_in into a size-bounded kernel-owned allocation before execution, then BpfProg::run_xdp alone constructs data/data_end from that exact immutable slice. Caller-supplied ctx pointers, CPU selection, flags, and batch mode are rejected; raw XDP execution remains unavailable; repeat is bounded; output copies only the owned frame prefix through the guarded user-copy path; and verifier, interpreter-region, and JIT admission checks remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Native arena-atomic lowering changes only the existing untrusted BPF JIT and runtime plus their specification and tests. It modifies no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model code and adds no trusted subsystem."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The verifier remains the sole admission path for native arena atomics. Both emitters derive the address from the page-aligned kernel arena slot base plus the verifier-tracked zero-extended handle and signed instruction displacement, reject misalignment before any atomic access, and register the actual faulting instruction for recovery before executable publication. Natural-alignment and page-fault paths return distinct terminal statuses with the offending handle; fetching bitwise arena atomics preserve the portable fail-closed boundary and interpret instead of using x86 scratch state that would destroy that handle."

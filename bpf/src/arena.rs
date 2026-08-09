@@ -1030,6 +1030,9 @@ mod smokes {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("loading the arena-atomic program failed"),
         };
+        if narf_bpf_jit::has_backend() && !prog.is_jited() {
+            return TestResult::Fail("the supported arena atomic fell back to interpretation");
+        }
         if prog.run_atomic([0; 4], 4) != Some(Outcome::Returned(1)) {
             return TestResult::Fail("the arena-atomic program did not complete");
         }
@@ -1072,6 +1075,9 @@ mod smokes {
             Ok(p) => p,
             Err(_) => return TestResult::Fail("loading the misaligned-atomic program failed"),
         };
+        if narf_bpf_jit::has_backend() && !prog.is_jited() {
+            return TestResult::Fail("the misaligned arena atomic did not reach the native guard");
+        }
         match prog.run_atomic([0; 4], 4) {
             Some(Outcome::Trapped(Trap::ArenaUnaligned { .. })) => TestResult::Pass,
             Some(Outcome::Returned(_)) => {

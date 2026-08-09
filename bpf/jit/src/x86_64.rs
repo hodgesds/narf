@@ -59,9 +59,9 @@
 //!
 //! What is left interpreted: the subprogram-address and BTF-id pseudo-forms of
 //! `LD_IMM64` (the map forms are emitted over the loader-resolved address; these
-//! two are never resolved), arena atomics, and arena accesses in a program that
-//! also makes BPF-to-BPF calls (the call frame moves `rsp`, which the arena base
-//! is parked relative to). Everything unemitted returns
+//! two are never resolved), fetching bitwise arena atomics, and arena accesses
+//! in a program that also makes BPF-to-BPF calls (the call frame moves `rsp`,
+//! which the arena base is parked relative to). Everything unemitted returns
 //! [`JitError::Unsupported`], which the caller answers by interpreting — the
 //! interpreter is a complete implementation, so an unemitted instruction costs
 //! speed and not correctness. That is the property that makes it safe to grow
@@ -538,23 +538,18 @@ fn emit_div_mod(e: &mut Emit, wide: bool, signed: bool, want_rem: bool, dst: u8,
 /// so no byte-register REX hazard arises. `LOCK` (`0xF0`) prefixes the
 /// non-implicitly-locked forms; `xchg` with a memory operand locks on its own.
 ///
-/// The fetching bitwise forms (`fetch` on or/and/xor) are **not** emitted: x86
-/// has no atomic fetch-and-{or,and,xor}, only a `cmpxchg` retry loop, so they
-/// stay interpreted — [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`]
-/// pins that boundary. Every other form is one instruction.
-fn emit_atomic(
+/// x86 has no single-instruction atomic fetch-and-{or,and,xor}, so those forms
+/// use the `cmpxchg` retry loop below. Every other form is one instruction.
+fn emit_atomic_mem(
     e: &mut Emit,
     _at: u32,
     size: Size,
     op: AtomicOp,
-    dst: Reg,
-    off: i16,
-    src: Reg,
+    m: u8,
+    disp: i32,
+    s: u8,
 ) -> Result<(), JitError> {
     let wide = size == Size::Dw;
-    let m = host(dst);
-    let s = host(src);
-    let disp = i32::from(off);
     // `lock; <op> [m + disp], s` for the group-1 read-modify-writes.
     let locked_rmw = |e: &mut Emit, opcode: u8| {
         e.b(0xF0);
@@ -610,6 +605,18 @@ fn emit_atomic(
         AtomicOp::Xor { fetch: true } => emit_atomic_fetch_bitwise(e, wide, 0x31, m, disp, s),
     }
     Ok(())
+}
+
+fn emit_atomic(
+    e: &mut Emit,
+    at: u32,
+    size: Size,
+    op: AtomicOp,
+    dst: Reg,
+    off: i16,
+    src: Reg,
+) -> Result<(), JitError> {
+    emit_atomic_mem(e, at, size, op, host(dst), i32::from(off), host(src))
 }
 
 /// A fetching bitwise atomic — `src = *m; *m op= <old value of src>` — as a
@@ -676,6 +683,9 @@ const EPILOGUE: u32 = u32::MAX;
 
 /// Reloc target meaning "the out-of-fuel epilogue".
 const OOF_EPILOGUE: u32 = u32::MAX - 1;
+
+/// Reloc target for the arena-atomic natural-alignment failure path.
+const ARENA_UNALIGNED_EPILOGUE: u32 = u32::MAX - 2;
 
 /// Where the prologue parks the arena slot base, relative to `rsp`.
 ///
@@ -847,6 +857,8 @@ fn emit_pass(
     emit_oof_epilogue(&mut e);
     let arena_at = e.len();
     emit_arena_epilogue(&mut e);
+    let arena_unaligned_at = e.len();
+    emit_arena_unaligned_epilogue(&mut e);
 
     // An arena fault site resumes at the arena epilogue, never at the next
     // instruction. Patched here, unconditionally, rather than recorded at the
@@ -865,6 +877,8 @@ fn emit_pass(
     for r in &relocs {
         let target = if r.target == OOF_EPILOGUE {
             oof_at
+        } else if r.target == ARENA_UNALIGNED_EPILOGUE {
+            arena_unaligned_at
         } else if r.target == EPILOGUE {
             // The last offset recorded is one past the body — the epilogue.
             *out.last()
@@ -987,6 +1001,13 @@ fn emit_oof_epilogue(e: &mut Emit) {
 fn emit_arena_epilogue(e: &mut Emit) {
     mov_rr(e, true, hr::RAX, hr::RCX);
     mov_reg_imm64(e, hr::RDX, status::ARENA_FAULT as i64);
+    emit_restore(e);
+}
+
+/// The arena-atomic alignment failure: status 3 and the offending handle.
+fn emit_arena_unaligned_epilogue(e: &mut Emit) {
+    mov_rr(e, true, hr::RAX, hr::RCX);
+    mov_reg_imm64(e, hr::RDX, status::ARENA_UNALIGNED as i64);
     emit_restore(e);
 }
 
@@ -1157,6 +1178,44 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
         // the access itself needs no displacement.
         alu_ri(e, true, 0, hr::RCX, i32::from(off));
     }
+}
+
+/// Refuse a misaligned arena atomic before it touches shared memory.
+///
+/// The slot base is page-aligned, so the low bits of the effective handle are
+/// the low bits of the native address. `rcx` still carries that handle when the
+/// failure epilogue runs, which keeps the native trap diagnosable.
+fn emit_arena_atomic_align_check(
+    e: &mut Emit,
+    insn_at: u32,
+    size: Size,
+    relocs: &mut Vec<Reloc>,
+) -> Result<(), JitError> {
+    let mask = match size {
+        Size::W => 3,
+        Size::Dw => 7,
+        _ => {
+            return Err(JitError::Unsupported {
+                at: insn_at,
+                what: "arena atomic narrower than a word",
+            })
+        }
+    };
+    // test rcx, imm32; jnz arena-unaligned.
+    e.rex(true, 0, hr::RCX);
+    e.b(0xF7);
+    e.modrm_rr(0, hr::RCX);
+    e.d32(mask);
+    e.bs(&[0x0F, 0x85]);
+    let at_disp = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at: at_disp,
+        next: e.len(),
+        target: ARENA_UNALIGNED_EPILOGUE,
+        width: 4,
+    });
+    Ok(())
 }
 
 /// The prefix + opcode of a memory load of `size` into host register `reg`,
@@ -1433,12 +1492,43 @@ fn emit_insn(
                 record_fault(e, fault_off);
                 return Ok(());
             }
-            // An arena atomic. Refused rather than lowered as a *non*-arena
-            // access, which is the failure this whole branch exists to prevent.
+            Decoded::Atomic {
+                size,
+                op,
+                dst,
+                src,
+                off,
+            } => {
+                // Fetching bitwise operations need a cmpxchg retry loop whose
+                // current implementation moves rsp and borrows rcx. Both are
+                // reserved by the arena fault ABI, so that narrow residual
+                // continues to interpret until it gets a no-stack loop.
+                if matches!(
+                    op,
+                    AtomicOp::Or { fetch: true }
+                        | AtomicOp::And { fetch: true }
+                        | AtomicOp::Xor { fetch: true }
+                ) {
+                    return Err(JitError::Unsupported {
+                        at,
+                        what: "fetching bitwise arena atomic not yet emitted by x86_64",
+                    });
+                }
+                emit_arena_addr(e, host(dst), off);
+                emit_arena_atomic_align_check(e, at, size, relocs)?;
+                // Collapse `[slot_base + handle]` into r11 so the ordinary
+                // atomic emitter can use its one-base memory form. rcx remains
+                // untouched for either failure epilogue.
+                alu_rr(e, true, 0x01, hr::R11, hr::RCX);
+                let fault_off = e.len();
+                emit_atomic_mem(e, at, size, op, hr::R11, 0, host(src))?;
+                record_fault(e, fault_off);
+                return Ok(());
+            }
             _ => {
                 return Err(JitError::Unsupported {
                     at,
-                    what: "arena atomic not yet emitted by the x86_64 backend",
+                    what: "instruction has no x86_64 arena lowering",
                 })
             }
         }

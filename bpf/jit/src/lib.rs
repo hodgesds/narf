@@ -161,6 +161,9 @@ pub mod status {
     /// An arena access faulted and was recovered by the exception table. The
     /// low half carries the offending **handle**, so the trap can name it.
     pub const ARENA_FAULT: u64 = 2;
+    /// An arena atomic's effective address was not naturally aligned. The low
+    /// half carries the offending handle, as it does for [`ARENA_FAULT`].
+    pub const ARENA_UNALIGNED: u64 = 3;
 }
 
 /// Which instructions are arena accesses, indexed by instruction.
