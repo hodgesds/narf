@@ -170,6 +170,7 @@ const PI_XLATED_PROG_INSNS: usize = 32;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 /// `sizeof(struct bpf_prog_info)`.
 const PROG_INFO_LEN: usize = 232;
@@ -452,11 +453,8 @@ fn prog_info(
     );
     put_u32(&mut out, PI_NR_MAP_IDS, nr_maps as u32);
     put_name(&mut out, PI_NAME, &prog.name);
-    // `run_cnt` is the one statistic NARF keeps unconditionally — Linux gates
-    // its equivalent behind `BPF_ENABLE_STATS`, so a caller that never enabled
-    // stats sees zero there and a real count here. Divergence in the generous
-    // direction, and the field means the same thing.
-    put_u64(&mut out, PI_RUN_CNT, prog.runs());
+    put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
+    put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
     // Everything else stays zero, and each is a deliberate absence:
     //
     // LINUX-GAP: `tag` — Linux's SHA-1 over the instruction image. NARF
@@ -475,8 +473,6 @@ fn prog_info(
     // are none to enumerate.
     // LINUX-GAP: `btf_id`, `func_info*`, `line_info*`, `attach_btf_obj_id`,
     // `attach_btf_id` — BTF is a separate stream; zero means "no BTF".
-    // LINUX-GAP: `run_time_ns` — not measured; the interpreter meters fuel, not
-    // wall time, so there is no cheap true value.
     // LINUX-GAP: `recursion_misses` — `run_atomic` declines a nested invocation
     // (spec §1.5) but does not count the refusal, so this would under-report
     // rather than be absent. Zero says "not counted"; a partial count would say

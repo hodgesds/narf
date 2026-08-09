@@ -18,6 +18,7 @@ const BPF_OBJ_PIN: u64 = 6;
 const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
 const BPF_MAP_FREEZE: u64 = 22;
+const BPF_ENABLE_STATS: u64 = 32;
 const BPF_PROG_BIND_MAP: u64 = 35;
 /// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
 /// in the "deliberately absent" list now that pinning has landed.
@@ -712,6 +713,16 @@ fn bind_map(prog_fd: i64, map_fd: i64, flags: u32) -> Option<i64> {
     )
 }
 
+/// Enable one Linux runtime-statistics type and return its lifetime fd.
+fn enable_stats(stats_type: u32) -> Option<i64> {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, 0, stats_type);
+    call(
+        Syscall::Bpf.raw(),
+        a2(BPF_ENABLE_STATS, attr.as_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
 // ── BPF_MAP_CREATE ──────────────────────────────────────────────────
 
 fn smoke_abi_bpf_map_create_pos() -> TestResult {
@@ -1359,6 +1370,116 @@ fn smoke_abi_bpf_prog_bind_map_neg() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_abi_bpf_prog_bind_map_neg);
+
+// ── BPF_ENABLE_STATS ───────────────────────────────────────────────
+
+fn smoke_abi_bpf_enable_stats_pos() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0)).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 {
+            return Err("BPF_PROG_LOAD failed");
+        }
+        let run = || {
+            let mut attr = [0u8; ATTR_LEN];
+            put_u32(&mut attr, 0, prog_fd as u32);
+            call(
+                Syscall::Bpf.raw(),
+                a2(BPF_PROG_TEST_RUN, attr.as_mut_ptr() as u64, ATTR_LEN as u64),
+            )
+        };
+        let read_stats = || -> Result<(u64, u64), &'static str> {
+            let mut info = [0u8; INFO_BUF];
+            if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+                return Err("BPF_OBJ_GET_INFO_BY_FD failed");
+            }
+            Ok((info_u64(&info, PI_RUN_CNT), info_u64(&info, PI_RUN_TIME_NS)))
+        };
+
+        if run() != Some(0) || read_stats()? != (0, 0) {
+            return Err("an invocation before enable was accounted");
+        }
+
+        let stats_fd = enable_stats(0).ok_or("BPF_ENABLE_STATS was not Ok")?;
+        let second = enable_stats(0).ok_or("second BPF_ENABLE_STATS was not Ok")?;
+        if stats_fd < 0 || second < 0 {
+            return Err("BPF_ENABLE_STATS rejected BPF_STATS_RUN_TIME");
+        }
+        let flags = call(
+            Syscall::Fcntl.raw(),
+            a2(stats_fd as u64, 1 /* F_GETFD */, 0),
+        )
+        .ok_or("fcntl not Ok")?;
+        if flags & 1 == 0 {
+            return Err("BPF_ENABLE_STATS fd is not close-on-exec");
+        }
+        let duplicate = call(
+            Syscall::Fcntl.raw(),
+            a2(stats_fd as u64, 0 /* F_DUPFD */, 0),
+        )
+        .ok_or("F_DUPFD not Ok")?;
+        if duplicate < 0 {
+            return Err("could not duplicate the stats fd");
+        }
+
+        if run() != Some(0) {
+            return Err("BPF_PROG_TEST_RUN failed while stats were enabled");
+        }
+        let (count1, time1) = read_stats()?;
+        if count1 != 1 {
+            return Err("enabled runtime stats did not count one invocation");
+        }
+
+        // Close both independently-created handles. The duplicate still owns
+        // the first file description, so accounting must remain enabled.
+        let _ = call(Syscall::Close.raw(), a0(stats_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(second as u64));
+        if run() != Some(0) {
+            return Err("BPF_PROG_TEST_RUN failed through a duplicated stats fd");
+        }
+        let (count2, time2) = read_stats()?;
+        if count2 != 2 || time2 < time1 || time2 == 0 {
+            return Err("duplicated stats fd did not preserve accounting");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(duplicate as u64));
+        if run() != Some(0) {
+            return Err("BPF_PROG_TEST_RUN failed after stats were disabled");
+        }
+        if read_stats()? != (count2, time2) {
+            return Err("runtime stats changed after the final enable fd closed");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_enable_stats_pos);
+
+fn smoke_abi_bpf_enable_stats_neg() -> TestResult {
+    with_setup(|| {
+        if enable_stats(1) != Some(EINVAL) {
+            return Err("BPF_ENABLE_STATS accepted an unknown stats type");
+        }
+        let mut attr = [0u8; ATTR_LEN];
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_ENABLE_STATS, attr.as_ptr() as u64, 3),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_ENABLE_STATS accepted a truncated attr");
+        }
+        attr[4] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_ENABLE_STATS, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_ENABLE_STATS accepted a non-zero attr tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_enable_stats_neg);
 
 // ── BPF_MAP_GET_NEXT_KEY ────────────────────────────────────────────
 
@@ -2035,6 +2156,7 @@ const PI_XLATED_PROG_INSNS: usize = 32;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 
 // `struct bpf_map_info` field offsets.
@@ -2176,9 +2298,6 @@ fn smoke_abi_bpf_obj_get_info_prog_pos() -> TestResult {
         let (r, _) = obj_info(fd, &mut info, PROG_INFO_LEN as u32);
         if r != Some(0) {
             return Err("second BPF_OBJ_GET_INFO_BY_FD failed");
-        }
-        if info_u64(&info, PI_RUN_CNT) != 1 {
-            return Err("bpf_prog_info.run_cnt did not count the one run");
         }
         // A program the JIT declined reports 0; one it compiled reports the
         // emitted byte count. Either is correct — what is not is a non-zero

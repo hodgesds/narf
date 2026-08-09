@@ -207,6 +207,23 @@ the load-time maps in `bpf_prog_info.map_ids`. The mutable lifetime-only set is
 lock-protected separately from the immutable runtime lookup table, so binding
 cannot race program execution into seeing an unverified map.
 
+### 3.5 Runtime statistics
+
+`BPF_ENABLE_STATS(BPF_STATS_RUN_TIME)` returns a close-on-exec anonymous fd and
+globally enables Linux-visible `bpf_prog_info.run_cnt` / `run_time_ns` while at
+least one independently-created stats file description remains live. `dup`
+shares a file description and therefore one enable reference; another enable
+call owns another reference. Entry samples the global gate once, so a run that
+started enabled is fully counted even if the last fd closes before it returns,
+and a run already in flight when the first fd opens is not counted
+retroactively. Time is measured with `narf_time::monotonic_ns` around the
+actual interpreter, JIT, or sleepable-program execution.
+
+The runtime's always-on `runs` / return-value / trap counters remain separate:
+kernel attach logic and diagnostics use them even when userspace has not paid
+the timestamp cost. Only the gated counters are exposed through
+`bpf_prog_info`, matching Linux rather than leaking the internal bookkeeping.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

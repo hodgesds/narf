@@ -17,6 +17,8 @@
 //!   and `BPF_MAP_FREEZE` (22), over the keyed map kinds in `narf_bpf::map`.
 //! * `BPF_PROG_BIND_MAP` (35) — add a map lifetime reference to an already
 //!   loaded program without making the map addressable by its instructions.
+//! * `BPF_ENABLE_STATS` (32) — fd-lifetime-gated program `run_cnt` and
+//!   `run_time_ns` accounting.
 //!
 //! The element commands take the **syscall** view of a per-CPU map: the value
 //! buffer spans every CPU at an 8-byte stride, exactly as Linux's
@@ -48,6 +50,7 @@ const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
+const EBUSY: i64 = 16;
 /// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
 /// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
 const ENOTSUP: i64 = 95;
@@ -84,6 +87,7 @@ const BPF_LINK_UPDATE: u32 = 29;
 // `BPF_LINK_GET_*_BY_ID` reaches this handler and its iterator commands do not.
 const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 const BPF_LINK_GET_NEXT_ID: u32 = 31;
+const BPF_ENABLE_STATS: u32 = 32;
 const BPF_LINK_DETACH: u32 = 34;
 const BPF_PROG_BIND_MAP: u32 = 35;
 const BPF_MAP_LOOKUP_BATCH: u32 = 24;
@@ -235,6 +239,7 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_PROG_QUERY => bpf_prog_query(attr_uptr, size),
         BPF_TASK_FD_QUERY => task_fd_query(attr_uptr, size),
         BPF_ITER_CREATE => bpf_iter_create(attr_uptr, size),
+        BPF_ENABLE_STATS => enable_stats(attr_uptr, size),
 
         // Post-load object lifetime binding; this does not extend the
         // verifier-visible map set.
@@ -242,8 +247,8 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
 
         // LINUX-GAP: everything else — the BPF token commands (`BPF_TOKEN_CREATE`
         // — NARF has no token, and the privilege gate above is a credential check
-        // rather than a delegable one), `BPF_ENABLE_STATS`, and related newer
-        // commands. `ENOTSUP` rather than `EINVAL` lets a
+        // rather than a delegable one), and related newer commands. `ENOTSUP`
+        // rather than `EINVAL` lets a
         // probing loader tell "this kernel does not do that" from "you passed
         // nonsense". The implemented `BPF_MAP_FREEZE` handler separately
         // returns `EOPNOTSUPP` for ring buffers.
@@ -706,6 +711,45 @@ fn prog_bind_map(attr_uptr: u64, size: usize) -> i64 {
     match prog.bind_map(map) {
         Ok(()) => 0,
         Err(narf_bpf::prog::BindError::NoMemory) => -ENOMEM,
+    }
+}
+
+/// `BPF_ENABLE_STATS(BPF_STATS_RUN_TIME)` — enable global runtime accounting.
+///
+/// Each successful call owns one global enable reference through the returned
+/// anonymous file description. Duplicating that fd shares the same reference;
+/// another enable call creates another. Accounting stops only when the last
+/// independent stats file is closed.
+fn enable_stats(attr_uptr: u64, size: usize) -> i64 {
+    const END: usize = 4;
+    const BPF_STATS_RUN_TIME: u32 = 0;
+
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < END
+        || u32_at(&attr, 0) != BPF_STATS_RUN_TIME
+        || attr[END..size].iter().any(|b| *b != 0)
+    {
+        return -EINVAL;
+    }
+
+    let file = match narf_bpf::stats::StatsFile::enable() {
+        Ok(f) => f,
+        Err(narf_bpf::stats::StatsError::Busy) => return -EBUSY,
+    };
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> = alloc::sync::Arc::new(file);
+    match fd::with_table(current_task_id(), |t| {
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i64,
+        None => -EMFILE,
     }
 }
 

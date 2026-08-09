@@ -48,6 +48,7 @@ pub mod mem;
 pub mod prog;
 pub mod provisional;
 pub mod ringbuf;
+pub mod stats;
 pub mod types;
 
 #[cfg(feature = "kernel-test")]

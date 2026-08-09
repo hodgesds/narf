@@ -100,6 +100,10 @@ pub struct BpfProg {
     subprogs: Vec<SubprogInfo>,
     /// Invocations.
     runs: AtomicU64,
+    /// Invocations observed while `BPF_ENABLE_STATS` had a live lease.
+    stats_runs: AtomicU64,
+    /// Nanoseconds spent executing invocations admitted to runtime stats.
+    run_time_ns: AtomicU64,
     /// Sum of return values. One of three ways an attached program's effect is
     /// observed, alongside the scratch counters in `crate::kfuncs` and — now
     /// that they exist — the maps in `crate::map`.
@@ -302,6 +306,8 @@ impl BpfProg {
             maps: req.maps,
             bound_maps: IrqSafeSpinLock::new(Vec::new()),
             runs: AtomicU64::new(0),
+            stats_runs: AtomicU64::new(0),
+            run_time_ns: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
         });
@@ -450,6 +456,20 @@ impl BpfProg {
         self.runs.load(Ordering::Relaxed)
     }
 
+    /// Invocations counted while runtime statistics were globally enabled.
+    #[inline]
+    #[must_use]
+    pub fn stats_runs(&self) -> u64 {
+        self.stats_runs.load(Ordering::Relaxed)
+    }
+
+    /// Nanoseconds accumulated while runtime statistics were globally enabled.
+    #[inline]
+    #[must_use]
+    pub fn run_time_ns(&self) -> u64 {
+        self.run_time_ns.load(Ordering::Relaxed)
+    }
+
     /// Sum of return values across every invocation.
     #[inline]
     #[must_use]
@@ -555,8 +575,9 @@ impl BpfProg {
         .with_arenas(self.arenas());
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.
+        let stats_start = crate::stats::run_start();
         let outcome = crate::interp::drive(vm.run());
-        self.record(outcome);
+        self.record(outcome, stats_start);
         Some(outcome)
     }
 
@@ -616,6 +637,7 @@ impl BpfProg {
             *w = 0;
         }
         let entry = image.entry();
+        let stats_start = crate::stats::run_start();
         // SAFETY: `entry` points at sealed, executable text emitted for this
         // program, entered with the ABI its prologue expects — `top` is the
         // frame's highest address (R10), `ctx.as_ptr()` a live `[u64; 4]` (R1),
@@ -664,7 +686,7 @@ impl BpfProg {
                 what: "compiled program returned an unknown status",
             }),
         };
-        self.record(outcome);
+        self.record(outcome, stats_start);
         Some(outcome)
     }
 
@@ -742,13 +764,18 @@ impl BpfProg {
             registry,
         )
         .with_arenas(self.arenas());
+        let stats_start = crate::stats::run_start();
         let outcome = vm.run().await;
-        self.record(outcome);
+        self.record(outcome, stats_start);
         Some(outcome)
     }
 
-    fn record(&self, outcome: Outcome) {
+    fn record(&self, outcome: Outcome, stats_start: Option<u64>) {
         self.runs.fetch_add(1, Ordering::Relaxed);
+        if let Some(elapsed) = crate::stats::run_elapsed(stats_start) {
+            self.run_time_ns.fetch_add(elapsed, Ordering::Relaxed);
+            self.stats_runs.fetch_add(1, Ordering::Relaxed);
+        }
         match outcome {
             Outcome::Returned(v) => {
                 self.accumulated.fetch_add(v, Ordering::Relaxed);

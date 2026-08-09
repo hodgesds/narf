@@ -686,6 +686,7 @@ dependencies = [
  "narf-memory",
  "narf-net",
  "narf-rcu",
+ "narf-time",
  "narf-tracing",
 ]
 
