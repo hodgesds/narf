@@ -18,6 +18,7 @@ const BPF_OBJ_PIN: u64 = 6;
 const BPF_OBJ_GET: u64 = 7;
 const BPF_PROG_TEST_RUN: u64 = 10;
 const BPF_MAP_FREEZE: u64 = 22;
+const BPF_PROG_BIND_MAP: u64 = 35;
 /// `BPF_PROG_QUERY` — still unimplemented, and the stand-in for `BPF_OBJ_PIN`
 /// in the "deliberately absent" list now that pinning has landed.
 const BPF_PROG_QUERY: u64 = 16;
@@ -699,6 +700,18 @@ fn freeze_map(fd: i64) -> Option<i64> {
     )
 }
 
+/// Bind a map to a loaded program's lifetime.
+fn bind_map(prog_fd: i64, map_fd: i64, flags: u32) -> Option<i64> {
+    let mut attr = [0u8; ATTR_LEN];
+    put_u32(&mut attr, 0, prog_fd as u32);
+    put_u32(&mut attr, 4, map_fd as u32);
+    put_u32(&mut attr, 8, flags);
+    call(
+        Syscall::Bpf.raw(),
+        a2(BPF_PROG_BIND_MAP, attr.as_ptr() as u64, ATTR_LEN as u64),
+    )
+}
+
 // ── BPF_MAP_CREATE ──────────────────────────────────────────────────
 
 fn smoke_abi_bpf_map_create_pos() -> TestResult {
@@ -1251,6 +1264,101 @@ fn smoke_abi_bpf_map_freeze_neg() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_abi_bpf_map_freeze_neg);
+
+// ── BPF_PROG_BIND_MAP ──────────────────────────────────────────────
+
+fn smoke_abi_bpf_prog_bind_map_pos() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0)).ok_or("bpf() not Ok")?;
+        let map_fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 || map_fd < 0 {
+            return Err("BPF program or map creation failed");
+        }
+        let map_id = map_id_of(map_fd)?;
+
+        if bind_map(prog_fd, map_fd, 0) != Some(0) || bind_map(prog_fd, map_fd, 0) != Some(0) {
+            return Err("BPF_PROG_BIND_MAP failed or was not idempotent");
+        }
+
+        // Explicit bindings participate in bpf_prog_info.map_ids exactly once.
+        let mut ids = [0u32; 2];
+        let mut info = [0u8; INFO_BUF];
+        info[PI_NR_MAP_IDS..PI_NR_MAP_IDS + 4].copy_from_slice(&2u32.to_le_bytes());
+        info[PI_MAP_IDS..PI_MAP_IDS + 8].copy_from_slice(&(ids.as_mut_ptr() as u64).to_le_bytes());
+        if obj_info(prog_fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&info, PI_NR_MAP_IDS) != 1
+            || ids[0] != map_id
+        {
+            return Err("program info did not report the bound map exactly once");
+        }
+
+        // The program now owns the only strong map reference. Its id remains
+        // resolvable after the creating fd closes and disappears when the
+        // program's final fd closes.
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        let reopened = fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id).ok_or("bpf() not Ok")?;
+        if reopened < 0 {
+            return Err("bound map died when its creating fd closed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(reopened as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        if fd_by_id(BPF_MAP_GET_FD_BY_ID, map_id) != Some(ENOENT) {
+            return Err("bound map survived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_prog_bind_map_pos);
+
+fn smoke_abi_bpf_prog_bind_map_neg() -> TestResult {
+    with_setup(|| {
+        let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(0)).ok_or("bpf() not Ok")?;
+        let map_fd = create_map(BPF_MAP_TYPE_HASH, 4, 8, 4).ok_or("bpf() not Ok")?;
+        if prog_fd < 0 || map_fd < 0 {
+            return Err("BPF program or map creation failed");
+        }
+
+        if bind_map(4095, map_fd, 0) != Some(EBADF) {
+            return Err("binding through an unopened program fd was not EBADF");
+        }
+        if bind_map(map_fd, map_fd, 0) != Some(EINVAL) {
+            return Err("binding through a map-as-program fd was not EINVAL");
+        }
+        if bind_map(prog_fd, 4095, 0) != Some(EBADF) {
+            return Err("binding an unopened map fd was not EBADF");
+        }
+        if bind_map(prog_fd, prog_fd, 0) != Some(EINVAL) {
+            return Err("binding a program-as-map fd was not EINVAL");
+        }
+        if bind_map(prog_fd, map_fd, 1) != Some(EINVAL) {
+            return Err("BPF_PROG_BIND_MAP accepted non-zero flags");
+        }
+
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, prog_fd as u32);
+        put_u32(&mut attr, 4, map_fd as u32);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_BIND_MAP, attr.as_ptr() as u64, 11),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_BIND_MAP accepted a truncated attr");
+        }
+        attr[12] = 1;
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_BIND_MAP, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_BIND_MAP accepted a non-zero attr tail");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(prog_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_abi_bpf_prog_bind_map_neg);
 
 // ── BPF_MAP_GET_NEXT_KEY ────────────────────────────────────────────
 

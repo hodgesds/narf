@@ -198,6 +198,15 @@ return `EOPNOTSUPP`: their writable consumer-page `mmap` is not yet represented
 in that writer accounting, so reporting success would leave a userspace alias
 that can still mutate the ring.
 
+`BPF_PROG_BIND_MAP` adds an object-wide, post-load lifetime reference from a
+program to a map. It never extends the verifier-visible or executable map set:
+only maps resolved from the instruction image at load time may be addressed by
+`LD_IMM64`. Rebinding the same object through any fd is an idempotent success;
+distinct bindings are retained until the program dies and are reported after
+the load-time maps in `bpf_prog_info.map_ids`. The mutable lifetime-only set is
+lock-protected separately from the immutable runtime lookup table, so binding
+cannot race program execution into seeing an unverified map.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

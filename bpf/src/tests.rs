@@ -3408,6 +3408,40 @@ kernel_test_in!(
     smoke_bpf_map_freeze_separates_syscall_and_program_writes
 );
 
+fn smoke_bpf_prog_bind_map_holds_lifetime_without_access() -> TestResult {
+    checked(|| {
+        let prog = load("bindmap", asm(&[mov_imm(0, 0), EXIT]), Context::Atomic)?;
+        let map = mk(MapKind::Hash, 4, 8, 4).map_err(|_| "Hash create failed")?;
+        let weak = Arc::downgrade(&map);
+
+        prog.bind_map(Arc::clone(&map))
+            .map_err(|_| "first map binding failed")?;
+        prog.bind_map(Arc::clone(&map))
+            .map_err(|_| "duplicate map binding failed")?;
+        if prog
+            .used_map_ids()
+            .map_err(|_| "used-map snapshot allocation failed")?
+            != alloc::vec![map.id]
+        {
+            return Err("duplicate binding changed the program's used-map set");
+        }
+        if prog.map_count() != 0 || prog.map_by_fd(SMOKE_MAP_FD).is_some() {
+            return Err("lifetime binding granted executable map access");
+        }
+
+        drop(map);
+        if weak.upgrade().is_none() {
+            return Err("bound map died while the program was still live");
+        }
+        drop(prog);
+        if weak.upgrade().is_some() {
+            return Err("bound map outlived the program's last reference");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_prog_bind_map_holds_lifetime_without_access);
+
 // ── map access from a program ───────────────────────────────────────
 
 /// The fd a smoke's `LD_IMM64` immediates name.

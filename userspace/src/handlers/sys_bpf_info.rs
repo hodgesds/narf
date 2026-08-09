@@ -59,6 +59,7 @@ use narf_bpf_verifier::kfunc::Context;
 const EBADF_: i64 = 9;
 const ENOENT: i64 = 2;
 const E2BIG: i64 = 7;
+const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
@@ -412,19 +413,18 @@ fn prog_info(
     } else {
         0
     };
-    let nr_maps = prog.map_count();
+    let map_ids = match prog.used_map_ids() {
+        Ok(ids) => ids,
+        Err(narf_bpf::prog::BindError::NoMemory) => return -ENOMEM,
+    };
+    let nr_maps = map_ids.len();
     if cap > 0 && map_ids_uptr != 0 {
-        for i in 0..cap.min(nr_maps) {
-            let Some(m) = prog.map_by_idx(i) else {
-                // `map_count` and `map_by_idx` read the same vector, so this
-                // cannot fire; stopping rather than panicking if it ever does.
-                break;
-            };
+        for (i, id) in map_ids.iter().take(cap).enumerate() {
             // SAFETY: range-validated inside `copy_to_user`, which brackets
             // SMAP and converts a fault into `Err(EFAULT)`. The loop is bounded
             // by the capacity the caller itself declared in `nr_map_ids`, so
             // the write never runs past the array it described.
-            let r = unsafe { copy_to_user(map_ids_uptr + (i * 4) as u64, &m.id.to_le_bytes()) };
+            let r = unsafe { copy_to_user(map_ids_uptr + (i * 4) as u64, &id.to_le_bytes()) };
             if let Err(e) = r {
                 return -(e as i64);
             }

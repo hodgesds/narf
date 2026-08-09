@@ -15,6 +15,8 @@
 //!   report the return value in `attr.test.retval`.
 //! * `BPF_MAP_CREATE` (0), the four element commands (1..=4), batch commands,
 //!   and `BPF_MAP_FREEZE` (22), over the keyed map kinds in `narf_bpf::map`.
+//! * `BPF_PROG_BIND_MAP` (35) — add a map lifetime reference to an already
+//!   loaded program without making the map addressable by its instructions.
 //!
 //! The element commands take the **syscall** view of a per-CPU map: the value
 //! buffer spans every CPU at an 8-byte stride, exactly as Linux's
@@ -41,6 +43,7 @@ use narf_capabilities::{Cap, Grant};
 const EPERM: i64 = 1;
 const EBADF_: i64 = 9;
 const EAGAIN: i64 = 11;
+const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
@@ -82,6 +85,7 @@ const BPF_LINK_UPDATE: u32 = 29;
 const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 const BPF_LINK_GET_NEXT_ID: u32 = 31;
 const BPF_LINK_DETACH: u32 = 34;
+const BPF_PROG_BIND_MAP: u32 = 35;
 const BPF_MAP_LOOKUP_BATCH: u32 = 24;
 const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
 const BPF_MAP_UPDATE_BATCH: u32 = 26;
@@ -232,10 +236,14 @@ pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
         BPF_TASK_FD_QUERY => task_fd_query(attr_uptr, size),
         BPF_ITER_CREATE => bpf_iter_create(attr_uptr, size),
 
+        // Post-load object lifetime binding; this does not extend the
+        // verifier-visible map set.
+        BPF_PROG_BIND_MAP => prog_bind_map(attr_uptr, size),
+
         // LINUX-GAP: everything else — the BPF token commands (`BPF_TOKEN_CREATE`
         // — NARF has no token, and the privilege gate above is a credential check
-        // rather than a delegable one), `BPF_ENABLE_STATS`, `BPF_PROG_BIND_MAP`,
-        // and related newer commands. `ENOTSUP` rather than `EINVAL` lets a
+        // rather than a delegable one), `BPF_ENABLE_STATS`, and related newer
+        // commands. `ENOTSUP` rather than `EINVAL` lets a
         // probing loader tell "this kernel does not do that" from "you passed
         // nonsense". The implemented `BPF_MAP_FREEZE` handler separately
         // returns `EOPNOTSUPP` for ring buffers.
@@ -656,6 +664,49 @@ fn map_from_fd(fd: u32) -> Result<alloc::sync::Arc<narf_bpf::map::BpfMap>, i64> 
         .and_then(|a| a.downcast_ref::<MapFile>())
         .map(MapFile::map)
         .ok_or(-EINVAL)
+}
+
+/// Recover the program behind a file descriptor.
+fn prog_from_fd(fd: u32) -> Result<alloc::sync::Arc<BpfProg>, i64> {
+    let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
+        Some(Some(o)) => o,
+        _ => return Err(-EBADF_),
+    };
+    ops.as_any()
+        .and_then(|a| a.downcast_ref::<ProgFile>())
+        .map(ProgFile::prog)
+        .ok_or(-EINVAL)
+}
+
+/// `BPF_PROG_BIND_MAP` — make a program hold a map lifetime reference.
+///
+/// The three-field ABI is `(prog_fd, map_fd, flags)`, with flags currently
+/// required to be zero. Binding an object the program already holds is a
+/// successful no-op. The bound map is deliberately absent from the
+/// verifier/runtime lookup table: as on Linux, this command promises lifetime,
+/// not executable access.
+fn prog_bind_map(attr_uptr: u64, size: usize) -> i64 {
+    const END: usize = 12;
+    let attr = match read_attr(attr_uptr, size) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if size < END || u32_at(&attr, 8) != 0 || attr[END..size].iter().any(|b| *b != 0) {
+        return -EINVAL;
+    }
+
+    let prog = match prog_from_fd(u32_at(&attr, 0)) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let map = match map_from_fd(u32_at(&attr, 4)) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    match prog.bind_map(map) {
+        Ok(()) => 0,
+        Err(narf_bpf::prog::BindError::NoMemory) => -ENOMEM,
+    }
 }
 
 /// The three fields every element command reads: the map, the key, and the

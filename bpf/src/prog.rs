@@ -10,6 +10,7 @@ use narf_bpf_verifier::kfunc::Context;
 use narf_bpf_verifier::SubprogInfo;
 use narf_bpf_verifier::{VerifyError, DEFAULT_FUEL, MAX_STACK_BYTES};
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
 use crate::mem::{BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, STUB_STACK_BYTES};
@@ -60,6 +61,13 @@ impl From<CapError> for LoadError {
     fn from(_: CapError) -> Self {
         LoadError::AuthorityRevoked
     }
+}
+
+/// Why an explicit map lifetime binding failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BindError {
+    /// Growing the program's bound-map set could not be allocated. `ENOMEM`.
+    NoMemory,
 }
 
 /// A loaded, verified program.
@@ -119,6 +127,14 @@ pub struct BpfProg {
     /// a map alive after the fd that created it is closed. Linux does the same
     /// through `prog->aux->used_maps`.
     maps: Vec<(i32, Arc<crate::map::BpfMap>)>,
+    /// Maps attached after load solely to share the program's lifetime.
+    ///
+    /// `BPF_PROG_BIND_MAP` does not make these maps addressable by program
+    /// instructions. Keeping them separate preserves the verifier/runtime
+    /// agreement that `maps` above is immutable, while this set may grow under
+    /// concurrent syscalls. Object identity, not the fd used for the binding,
+    /// makes repeated binds idempotent.
+    bound_maps: IrqSafeSpinLock<Vec<Arc<crate::map::BpfMap>>>,
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -284,6 +300,7 @@ impl BpfProg {
             jit,
             arenas,
             maps: req.maps,
+            bound_maps: IrqSafeSpinLock::new(Vec::new()),
             runs: AtomicU64::new(0),
             accumulated: AtomicU64::new(0),
             traps: AtomicU64::new(0),
@@ -343,10 +360,87 @@ impl BpfProg {
         self.maps.get(idx).map(|(_, m)| m)
     }
 
-    /// How many maps this program references.
+    /// How many maps the loaded instruction image may address.
     #[must_use]
     pub fn map_count(&self) -> usize {
         self.maps.len()
+    }
+
+    /// Bind `map` to this program's lifetime without granting program access.
+    ///
+    /// This is the object operation behind Linux-compatible
+    /// `BPF_PROG_BIND_MAP`. A map already referenced by the loaded instruction
+    /// image, or already explicitly bound through another fd, is a successful
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`BindError::NoMemory`] if the lifetime-reference set cannot grow.
+    pub fn bind_map(&self, map: Arc<crate::map::BpfMap>) -> Result<(), BindError> {
+        if self
+            .maps
+            .iter()
+            .any(|(_, existing)| Arc::ptr_eq(existing, &map))
+        {
+            return Ok(());
+        }
+
+        // Allocate a replacement outside the IRQ-masking lock. On a race that
+        // grows the live vector beyond our capacity, drop the lock and retry;
+        // cloning Arcs and swapping two already-allocated vectors are the only
+        // operations performed in the critical section.
+        let mut replacement = Vec::new();
+        loop {
+            let needed = self.bound_maps.lock().len() + 1;
+            if replacement.capacity() < needed {
+                replacement
+                    .try_reserve_exact(needed)
+                    .map_err(|_| BindError::NoMemory)?;
+            }
+
+            let mut bound = self.bound_maps.lock();
+            if bound.iter().any(|existing| Arc::ptr_eq(existing, &map)) {
+                return Ok(());
+            }
+            if replacement.capacity() < bound.len() + 1 {
+                drop(bound);
+                continue;
+            }
+            replacement.extend(bound.iter().cloned());
+            replacement.push(map);
+            core::mem::swap(&mut *bound, &mut replacement);
+            drop(bound);
+            return Ok(());
+        }
+    }
+
+    /// Snapshot every map id whose lifetime this program holds.
+    ///
+    /// Load-time references come first in loader order, followed by explicit
+    /// bindings in bind order. The snapshot keeps `BPF_OBJ_GET_INFO_BY_FD`
+    /// consistent while another task adds a binding.
+    ///
+    /// # Errors
+    ///
+    /// [`BindError::NoMemory`] if storage for the snapshot cannot be allocated.
+    pub fn used_map_ids(&self) -> Result<Vec<u32>, BindError> {
+        let mut ids = Vec::new();
+        loop {
+            let needed = self.maps.len() + self.bound_maps.lock().len();
+            if ids.capacity() < needed {
+                ids.try_reserve_exact(needed)
+                    .map_err(|_| BindError::NoMemory)?;
+            }
+
+            let bound = self.bound_maps.lock();
+            if ids.capacity() < self.maps.len() + bound.len() {
+                drop(bound);
+                continue;
+            }
+            ids.extend(self.maps.iter().map(|(_, map)| map.id));
+            ids.extend(bound.iter().map(|map| map.id));
+            return Ok(ids);
+        }
     }
 
     /// Invocation count.
