@@ -4479,6 +4479,20 @@ fn obj_get_flags(path: &CPath, flags: u32) -> Option<i64> {
     bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, flags, 0))
 }
 
+fn obj_pin_at(fd: i64, path: &CPath, path_fd: i64) -> Option<i64> {
+    bpf(
+        BPF_OBJ_PIN,
+        &obj_attr(path.ptr(), fd as u32, BPF_F_PATH_FD, path_fd as u32),
+    )
+}
+
+fn obj_get_at_flags(path: &CPath, path_fd: i64, flags: u32) -> Option<i64> {
+    bpf(
+        BPF_OBJ_GET,
+        &obj_attr(path.ptr(), 0, flags | BPF_F_PATH_FD, path_fd as u32),
+    )
+}
+
 /// The smallest well-formed BTF blob: a header, one `BTF_KIND_INT` named
 /// "int", and a five-byte string section. The only use here is to obtain a
 /// BTF fd.
@@ -5344,6 +5358,97 @@ fn smoke_abi_bpf_obj_pin_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_pin_pos);
 
+/// `BPF_F_PATH_FD` gives both object commands openat(2)-style anchoring.
+///
+/// The absolute-path case is load-bearing too: Linux ignores the selected fd
+/// for an absolute pathname, so eagerly validating `path_fd` would reject a
+/// request that `user_path_at` accepts.
+fn smoke_abi_bpf_obj_path_fd_pos() -> TestResult {
+    with_setup(|| {
+        const AT: &str = "/bpf-path-fd";
+        const O_DIRECTORY: u64 = 0o200000;
+        with_bpffs(AT, || {
+            let root = CPath::new(AT);
+            let dir_fd = call_open(root.ptr(), O_DIRECTORY).ok_or("open directory not Ok")?;
+            if dir_fd < 0 {
+                return Err("opening bpffs as a directory fd failed");
+            }
+            let map_fd = create_map(BPF_MAP_TYPE_ARRAY, 4, 8, 4).ok_or("bpf() not Ok")?;
+            if map_fd < 0 {
+                return Err("BPF_MAP_CREATE failed");
+            }
+
+            let relative = CPath::new("m");
+            if obj_get_at_flags(&relative, map_fd, 0) != Some(ENOTDIR) {
+                return Err("BPF_OBJ_GET with a non-directory path_fd was not ENOTDIR");
+            }
+            if obj_pin_at(map_fd, &relative, dir_fd) != Some(0) {
+                return Err("BPF_OBJ_PIN did not resolve a relative path under path_fd");
+            }
+
+            let absolute = CPath::new("/bpf-path-fd/m");
+            let by_absolute = obj_get(&absolute).ok_or("absolute BPF_OBJ_GET not Ok")?;
+            let by_relative = obj_get_at_flags(&relative, dir_fd, BPF_F_RDONLY_FLAG)
+                .ok_or("relative BPF_OBJ_GET not Ok")?;
+            if by_absolute < 0 || by_relative < 0 {
+                return Err("a path-fd pin could not be reopened");
+            }
+            if map_id_of(map_fd)? != map_id_of(by_absolute)?
+                || map_id_of(map_fd)? != map_id_of(by_relative)?
+            {
+                return Err("path-fd operations did not address the pinned map");
+            }
+
+            // Access-mode flags compose with PATH_FD rather than changing its
+            // resolution. The relative descriptor above is read-only.
+            let key = 0u32;
+            let value = 7u64;
+            let mut out = 0u64;
+            if elem(
+                BPF_MAP_UPDATE_ELEM,
+                map_fd,
+                (&key) as *const u32 as u64,
+                (&value) as *const u64 as u64,
+                BPF_ANY,
+            ) != Some(0)
+                || elem(
+                    BPF_MAP_LOOKUP_ELEM,
+                    by_relative,
+                    (&key) as *const u32 as u64,
+                    (&mut out) as *mut u64 as u64,
+                    0,
+                ) != Some(0)
+                || out != value
+                || elem(
+                    BPF_MAP_UPDATE_ELEM,
+                    by_relative,
+                    (&key) as *const u32 as u64,
+                    (&value) as *const u64 as u64,
+                    BPF_ANY,
+                ) != Some(EPERM)
+            {
+                return Err("PATH_FD did not compose with a read-only map reopen");
+            }
+
+            // openat(2) semantics: an absolute pathname does not consult its
+            // dirfd, even when the caller supplied BPF_F_PATH_FD.
+            let ignored_bad_fd = obj_get_at_flags(&absolute, 4095, 0)
+                .ok_or("absolute path-fd BPF_OBJ_GET not Ok")?;
+            if ignored_bad_fd < 0 || map_id_of(ignored_bad_fd)? != map_id_of(map_fd)? {
+                return Err("an absolute BPF_OBJ_GET incorrectly consulted path_fd");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(ignored_bad_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(by_relative as u64));
+            let _ = call(Syscall::Close.raw(), a0(by_absolute as u64));
+            let _ = call(Syscall::Close.raw(), a0(map_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(dir_fd as u64));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_obj_path_fd_pos);
+
 /// A program is pinnable too, and one reopened by path still *runs* — an fd
 /// that resolved to the right object but a broken image would pass every check
 /// in the map test above.
@@ -5458,12 +5563,15 @@ fn smoke_abi_bpf_obj_pin_neg() -> TestResult {
             {
                 return Err("BPF_OBJ_PIN accepted a flag outside its mask");
             }
-            if bpf(
-                BPF_OBJ_PIN,
-                &obj_attr(good.ptr(), fd as u32, BPF_F_PATH_FD, 0),
-            ) != Some(EOPNOTSUPP)
-            {
-                return Err("BPF_OBJ_PIN with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            let relative = CPath::new("m");
+            if obj_pin_at(fd, &relative, 4095) != Some(EBADF) {
+                return Err("BPF_OBJ_PIN with an unopened path_fd was not EBADF");
+            }
+            if obj_pin_at(fd, &relative, fd) != Some(ENOTDIR) {
+                return Err("BPF_OBJ_PIN with a non-directory path_fd was not ENOTDIR");
+            }
+            if bpf(BPF_OBJ_PIN, &obj_attr(0, fd as u32, BPF_F_PATH_FD, 4095)) != Some(EFAULT) {
+                return Err("BPF_OBJ_PIN checked path_fd before a bad pathname");
             }
             if bpf(BPF_OBJ_PIN, &obj_attr(good.ptr(), fd as u32, 0, 3)) != Some(EINVAL) {
                 return Err("a path_fd without BPF_F_PATH_FD was not rejected");
@@ -5539,8 +5647,12 @@ fn smoke_abi_bpf_obj_get_neg() -> TestResult {
             if obj_get_flags(&path, BPF_F_RDONLY_FLAG) != Some(ENOENT) {
                 return Err("BPF_OBJ_GET did not resolve a path after accepting BPF_F_RDONLY");
             }
-            if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, BPF_F_PATH_FD, 0)) != Some(EOPNOTSUPP) {
-                return Err("BPF_OBJ_GET with BPF_F_PATH_FD did not return EOPNOTSUPP");
+            let relative = CPath::new("nothing");
+            if obj_get_at_flags(&relative, 4095, 0) != Some(EBADF) {
+                return Err("BPF_OBJ_GET with an unopened path_fd was not EBADF");
+            }
+            if bpf(BPF_OBJ_GET, &obj_attr(0, 0, BPF_F_PATH_FD, 4095)) != Some(EFAULT) {
+                return Err("BPF_OBJ_GET checked path_fd before a bad pathname");
             }
             if bpf(BPF_OBJ_GET, &obj_attr(path.ptr(), 0, 0, 3)) != Some(EINVAL) {
                 return Err("a path_fd without BPF_F_PATH_FD was not rejected");

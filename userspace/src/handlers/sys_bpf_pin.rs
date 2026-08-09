@@ -45,7 +45,8 @@
 //! | the path is not a pin (`GET`)             | EACCES  | `bpf_inode_type` |
 //! | the path does not exist (`GET`)           | ENOENT  | `user_path_at` |
 //! | reserved `file_flags` / stray `path_fd`   | EINVAL  | `CHECK_ATTR` |
-//! | `BPF_F_PATH_FD`                            | ENOTSUP | — see LINUX-GAP |
+//! | relative path + bad `path_fd`              | EBADF   | `user_path_at` |
+//! | relative path + non-directory `path_fd`    | ENOTDIR | `user_path_at` |
 //!
 //! One deliberate ordering divergence: Linux's `user_path_create` reports
 //! `EEXIST` *before* the "is this bpffs?" check, so pinning onto an existing
@@ -79,9 +80,6 @@ const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-/// Linux's userspace-visible `EOPNOTSUPP`, which equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
-
 /// `union bpf_attr`, zero-extended. Same rule and bound as `sys_bpf.rs`.
 const ATTR_BUF: usize = 256;
 
@@ -159,24 +157,28 @@ fn common_path(attr: &[u8; ATTR_BUF], size: usize, allowed_flags: u32) -> Result
     if file_flags & BPF_F_PATH_FD == 0 && u32_at(attr, OB_PATH_FD) != 0 {
         return Err(-EINVAL);
     }
-    // LINUX-GAP: `BPF_F_PATH_FD` (Linux 6.5) resolves `pathname` against an
-    // open directory fd instead of the cwd. NARF's path resolution takes an
-    // absolute or cwd-relative string; threading a dirfd through it is the
-    // `*at(2)` rework, not a flag. `ENOTSUP` rather than "ignore the flag and
-    // resolve against cwd", which would silently pin into the wrong directory.
-    if file_flags & BPF_F_PATH_FD != 0 {
-        return Err(-ENOTSUP);
-    }
-
     let path_uptr = u64_at(attr, OB_PATHNAME);
     // `copy_user_cstr` walks user memory a page at a time looking for the NUL;
     // bulk-reading `PATH_MAX` would fault on a path that ends near the end of
     // a mapping. A null pointer, a fault, or a missing NUL all land here.
     let raw = copy_user_cstr(path_uptr, PATH_MAX).ok_or(-EFAULT)?;
+    // `path_fd` is signed in the UAPI. With the flag clear Linux substitutes
+    // AT_FDCWD; with it set, ordinary openat(2) rules apply. In particular an
+    // absolute path ignores even an invalid fd, while a relative path returns
+    // EBADF or ENOTDIR before filesystem lookup. `resolve_at_path` is shared
+    // with the other *at handlers, so this cannot drift into a BPF-only path
+    // interpretation.
+    const AT_FDCWD: i64 = -100;
+    let path_fd = if file_flags & BPF_F_PATH_FD != 0 {
+        i64::from(u32_at(attr, OB_PATH_FD) as i32)
+    } else {
+        AT_FDCWD
+    };
+    let anchored = resolve_at_path(current_task_id(), path_fd, &raw)?;
     // `resolve_cwd_path`, never `apply_chroot` directly: the latter skips both
     // the cwd join and `//` normalisation, which is how `pivot_root(".", ".")`
     // and systemd's `/run//systemd` paths broke before.
-    Ok(resolve_cwd_path(current_task_id(), &raw))
+    Ok(resolve_cwd_path(current_task_id(), &anchored))
 }
 
 /// Which BPF object class an fd holds, if any.

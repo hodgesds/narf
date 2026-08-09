@@ -24,9 +24,9 @@ net classifier, perf).
 `LD_IND`, unprivileged BPF, and Linux's map-type zoo beyond the five native
 kinds in §3.4.
 
-**Out of scope, for now:** offloaded programs, `bpffs` pinning, CO-RE
-relocation in-kernel (it is a userspace concern), and continuation-style JIT
-lowering of sleepable programs (§8.5).
+**Out of scope, for now:** offloaded programs, CO-RE relocation in-kernel (it
+is a userspace concern), and continuation-style JIT lowering of sleepable
+programs (§8.5).
 
 ## 2. Assumptions
 
@@ -226,7 +226,20 @@ the load-time maps in `bpf_prog_info.map_ids`. The mutable lifetime-only set is
 lock-protected separately from the immutable runtime lookup table, so binding
 cannot race program execution into seeing an unverified map.
 
-### 3.5 Runtime statistics
+### 3.5 Object pinning
+
+`BPF_OBJ_PIN` stores a strong reference to a map, program, or link in bpffs;
+`BPF_OBJ_GET` creates a fresh close-on-exec fd for that same object. Pinning
+therefore extends object lifetime without preserving the creating descriptor's
+map access mode. `BPF_F_PATH_FD` gives both commands `openat(2)` pathname
+semantics through the existing VFS `resolve_at_path` contract: relative paths
+are anchored beneath a live directory fd, absolute paths ignore it, and a
+relative path reports `EBADF` or `ENOTDIR` before bpffs lookup. A nonzero
+`path_fd` without the flag is `EINVAL`. Resolution is subsequently passed
+through the ordinary cwd/chroot normalization, so path-fd pinning cannot escape
+the task's filesystem view.
+
+### 3.6 Runtime statistics
 
 `BPF_ENABLE_STATS(BPF_STATS_RUN_TIME)` returns a close-on-exec anonymous fd and
 globally enables Linux-visible `bpf_prog_info.run_cnt` / `run_time_ns` while at
