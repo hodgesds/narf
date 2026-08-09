@@ -2725,6 +2725,7 @@ fn load_prog_fd_array_raw(insns: &[u8], fd_array: u64, fd_array_cnt: u32) -> Opt
     attr[0..4].copy_from_slice(&BPF_PROG_TYPE_TRACING.to_le_bytes());
     attr[4..8].copy_from_slice(&((insns.len() / 8) as u32).to_le_bytes());
     attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+    attr[16..24].copy_from_slice(&(c"GPL".as_ptr() as u64).to_le_bytes());
     attr[48..52].copy_from_slice(b"fdar");
     attr[PL_FD_ARRAY..PL_FD_ARRAY + 8].copy_from_slice(&fd_array.to_le_bytes());
     attr[PL_FD_ARRAY_CNT..PL_FD_ARRAY_CNT + 4].copy_from_slice(&fd_array_cnt.to_le_bytes());
