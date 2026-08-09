@@ -56,6 +56,7 @@ narf-filesystem   = { path = "../filesystem" }
 narf-net          = { path = "../net" }
 narf-tracing      = { path = "../tracing" }
 narf-init         = { path = "../init" }
+narf-time         = { path = "../time" }
 narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
 narf-boot         = { path = "../boot", optional = true }
 narf-console      = { path = "../console", optional = true }
