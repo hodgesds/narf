@@ -59,10 +59,15 @@ fn ret_imm(v: i32) -> [u8; 16] {
 }
 
 fn load_prog(prog_type: u32, insns: &[u8]) -> Option<i64> {
+    load_prog_license(prog_type, insns, b"GPL\0")
+}
+
+fn load_prog_license(prog_type: u32, insns: &[u8], license: &[u8]) -> Option<i64> {
     let mut attr = [0u8; ATTR_LEN];
     put_u32(&mut attr, 0, prog_type);
     put_u32(&mut attr, 4, (insns.len() / 8) as u32);
     put_u64(&mut attr, 8, insns.as_ptr() as u64);
+    put_u64(&mut attr, 16, license.as_ptr() as u64);
     // prog_name, a fixed 16-byte NUL-padded field at offset 48.
     attr[48..52].copy_from_slice(b"abit");
     call(
@@ -92,6 +97,107 @@ fn smoke_abi_bpf_prog_load_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_pos);
+
+fn smoke_abi_bpf_prog_load_license_pos() -> TestResult {
+    with_setup(|| {
+        const GPL_LICENSES: [&[u8]; 6] = [
+            b"GPL\0",
+            b"GPL v2\0",
+            b"GPL and additional rights\0",
+            b"Dual BSD/GPL\0",
+            b"Dual MIT/GPL\0",
+            b"Dual MPL/GPL\0",
+        ];
+        let insns = ret_imm(1);
+        for license in GPL_LICENSES {
+            let fd =
+                load_prog_license(BPF_PROG_TYPE_TRACING, &insns, license).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD rejected a GPL-compatible license");
+            }
+            let mut info = [0u8; INFO_BUF];
+            if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+                return Err("BPF_OBJ_GET_INFO_BY_FD failed for a licensed program");
+            }
+            if info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 1 {
+                return Err("bpf_prog_info did not classify a GPL-compatible license");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        for license in [b"MIT\0".as_slice(), b"GPL v3\0", b"gpl\0", b"GPL \0"] {
+            let fd =
+                load_prog_license(BPF_PROG_TYPE_TRACING, &insns, license).ok_or("bpf() not Ok")?;
+            if fd < 0 {
+                return Err("BPF_PROG_LOAD rejected a non-GPL license");
+            }
+            let mut info = [0u8; INFO_BUF];
+            if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0) {
+                return Err("BPF_OBJ_GET_INFO_BY_FD failed for a licensed program");
+            }
+            if info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 0 {
+                return Err("bpf_prog_info accepted a near-miss GPL license");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // Linux forcibly terminates its 128-byte stack buffer after copying
+        // at most 127 bytes, so lack of an earlier NUL is not itself an error.
+        let unterminated = [b'X'; 127];
+        let fd = load_prog_license(BPF_PROG_TYPE_TRACING, &insns, &unterminated)
+            .ok_or("bpf() not Ok")?;
+        if fd < 0 {
+            return Err("BPF_PROG_LOAD rejected a 127-byte unterminated license");
+        }
+        let mut info = [0u8; INFO_BUF];
+        if obj_info(fd, &mut info, PROG_INFO_LEN as u32).0 != Some(0)
+            || info_u32(&info, PI_GPL_COMPATIBLE) & 1 != 0
+        {
+            return Err("unterminated license was not accepted as non-GPL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_license_pos);
+
+fn smoke_abi_bpf_prog_load_license_neg() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(1);
+        let mut attr = [0u8; ATTR_LEN];
+        put_u32(&mut attr, 0, BPF_PROG_TYPE_TRACING);
+        put_u32(&mut attr, 4, (insns.len() / 8) as u32);
+        put_u64(&mut attr, 8, insns.as_ptr() as u64);
+
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EFAULT)
+        {
+            return Err("BPF_PROG_LOAD with a NULL license did not return EFAULT");
+        }
+        put_u64(&mut attr, 16, u64::MAX);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, ATTR_LEN as u64),
+        ) != Some(EFAULT)
+        {
+            return Err("BPF_PROG_LOAD with an invalid license did not return EFAULT");
+        }
+
+        let license = b"GPL\0";
+        put_u64(&mut attr, 16, license.as_ptr() as u64);
+        if call(
+            Syscall::Bpf.raw(),
+            a2(BPF_PROG_LOAD, attr.as_ptr() as u64, 16),
+        ) != Some(EINVAL)
+        {
+            return Err("BPF_PROG_LOAD accepted an attr truncated before license");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_prog_load_license_neg);
 
 fn smoke_abi_bpf_prog_load_neg() -> TestResult {
     with_setup(|| {
@@ -2753,6 +2859,7 @@ const PI_XLATED_PROG_INSNS: usize = 32;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 

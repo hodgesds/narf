@@ -111,6 +111,8 @@ pub struct BpfProg {
     pub id: u32,
     /// Stable Linux-compatible identity of the submitted instruction image.
     tag: [u8; PROG_TAG_SIZE],
+    /// Whether the load-time license matched Linux's GPL-compatible set.
+    gpl_compatible: bool,
     /// The validated instruction image. Verification does not rewrite
     /// instructions — lowering happens once, in the JIT (spec §1.7).
     insns: Vec<Insn>,
@@ -250,7 +252,24 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_arena(cap, req, None)
+        Self::load_with_options(cap, req, None, false)
+    }
+
+    /// Verify and load with the compatibility classification of the license
+    /// supplied through Linux's `BPF_PROG_LOAD` ABI.
+    ///
+    /// Direct in-kernel loaders use [`Self::load`] and are conservatively
+    /// non-GPL unless they opt into this metadata explicitly.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`].
+    pub fn load_with_license(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        gpl_compatible: bool,
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_options(cap, req, None, gpl_compatible)
     }
 
     /// Verify and load, binding an arena group the program may address.
@@ -284,6 +303,15 @@ impl BpfProg {
         cap: &Cap<BpfProgLoad, Grant>,
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_with_options(cap, req, arenas, false)
+    }
+
+    fn load_with_options(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        arenas: Option<Arc<crate::arena::ArenaGroup>>,
+        gpl_compatible: bool,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         if req.insns.is_empty() || req.insns.len() > MAX_INSNS {
@@ -392,6 +420,7 @@ impl BpfProg {
             name: req.name,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             tag,
+            gpl_compatible,
             insns: req.insns,
             context: req.context,
             initial_fuel: DEFAULT_FUEL,
@@ -464,6 +493,14 @@ impl BpfProg {
     #[must_use]
     pub const fn tag(&self) -> [u8; PROG_TAG_SIZE] {
         self.tag
+    }
+
+    /// Whether the program's load-time license is GPL compatible under
+    /// Linux's exact license-string classification.
+    #[inline]
+    #[must_use]
+    pub const fn gpl_compatible(&self) -> bool {
+        self.gpl_compatible
     }
 
     /// The map named by this file descriptor, or `None`.

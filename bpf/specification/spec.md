@@ -297,6 +297,22 @@ array. Hashing is streamed through `narf_crypto::sha256::Sha256`; it does not
 mutate or duplicate the immutable instruction image retained for execution and
 introspection.
 
+### 3.9 Program license metadata
+
+Linux-shaped loads copy `bpf_attr.license` with the kernel's 127-byte bound;
+a null or invalid pointer is `EFAULT`, while a non-terminated 127-byte prefix
+is accepted and classified as non-GPL. `BpfProg::load_with_license` records the
+classification and `BpfProg::gpl_compatible()` exposes it to
+`bpf_prog_info.gpl_compatible`. Classification is an exact byte-string match
+against Linux's set: `GPL`, `GPL v2`, `GPL and additional rights`,
+`Dual BSD/GPL`, `Dual MIT/GPL`, and `Dual MPL/GPL`. Case changes, trailing
+spaces, `GPL v3`, and other licenses remain valid loads but report false.
+
+NARF's typed kfunc registry has no GPL-only category, so the bit is load
+metadata rather than a second helper allowlist. If a future kfunc gains such a
+policy, it must consume this stored classification during verification rather
+than re-reading mutable userspace memory.
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

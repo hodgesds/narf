@@ -169,6 +169,7 @@ const PI_XLATED_PROG_INSNS: usize = 32;
 const PI_NR_MAP_IDS: usize = 52;
 const PI_MAP_IDS: usize = 56;
 const PI_NAME: usize = 64;
+const PI_GPL_COMPATIBLE: usize = 84;
 const PI_RUN_TIME_NS: usize = 192;
 const PI_RUN_CNT: usize = 200;
 /// `sizeof(struct bpf_prog_info)`.
@@ -476,6 +477,7 @@ fn prog_info(
     put_u32(&mut out, PI_NR_MAP_IDS, nr_maps as u32);
     put_u64(&mut out, PI_MAP_IDS, map_ids_uptr);
     put_name(&mut out, PI_NAME, &prog.name);
+    put_u32(&mut out, PI_GPL_COMPATIBLE, u32::from(prog.gpl_compatible()));
     put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
     // Everything else stays zero, and each is a deliberate absence:
@@ -483,8 +485,6 @@ fn prog_info(
     // LINUX-GAP: `load_time`, `created_by_uid` — not recorded on `BpfProg`, and
     // recording them is new bookkeeping on the load path rather than reporting
     // of something already known.
-    // LINUX-GAP: `gpl_compatible` — NARF's load ABI carries no license field,
-    // so there is nothing to be compatible with; 0 is "unknown", not "no".
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no offload, no netns
     // binding for programs.
     // LINUX-GAP: `nr_jited_ksyms`, `nr_jited_func_lens`, `jited_ksyms`,

@@ -11,6 +11,8 @@
 //! Implemented here:
 //!
 //! * `BPF_PROG_LOAD` (5) — verify and load, returning a program fd.
+//!   The Linux license string is copied, classified, and retained for program
+//!   introspection.
 //! * `BPF_PROG_TEST_RUN` (10) — run once with a caller-supplied context and
 //!   report the return value in `attr.test.retval`.
 //! * `BPF_MAP_CREATE` (0), the five keyed element commands, batch commands,
@@ -110,6 +112,7 @@ const ATTR_BUF: usize = 256;
 const PL_PROG_TYPE: usize = 0;
 const PL_INSN_CNT: usize = 4;
 const PL_INSNS: usize = 8;
+const PL_LICENSE: usize = 16;
 const PL_PROG_NAME: usize = 48;
 const PL_FD_ARRAY: usize = 120;
 const PL_FD_ARRAY_CNT: usize = 148;
@@ -173,6 +176,42 @@ fn u64_at(buf: &[u8], off: usize) -> u64 {
 /// syscall mints for itself. See the call site for why.
 fn task_may_load_bpf() -> bool {
     super::task_may_use_bpf()
+}
+
+/// Copy and classify `BPF_PROG_LOAD.license` exactly as Linux does.
+///
+/// Linux reads at most 127 bytes into a 128-byte buffer, forcibly terminates
+/// the last byte, and compares the resulting byte string against six accepted
+/// spellings. A missing terminator is therefore accepted but cannot classify
+/// as GPL-compatible unless the truncated bytes exactly match one of those
+/// short spellings (which they cannot).
+fn read_prog_license(uptr: u64) -> Result<bool, i64> {
+    const MAX_COPY: usize = 127;
+    const GPL: [&[u8]; 6] = [
+        b"GPL",
+        b"GPL v2",
+        b"GPL and additional rights",
+        b"Dual BSD/GPL",
+        b"Dual MIT/GPL",
+        b"Dual MPL/GPL",
+    ];
+
+    if uptr == 0 {
+        return Err(-EFAULT);
+    }
+    let mut license = [0u8; MAX_COPY];
+    let mut len = MAX_COPY;
+    for (i, byte) in license.iter_mut().enumerate() {
+        let src = uptr.checked_add(i as u64).ok_or(-EFAULT)?;
+        // SAFETY: one caller-provided byte, range-validated and SMAP-bracketed
+        // by `copy_from_user`; a fault is returned as `EFAULT`.
+        unsafe { copy_from_user(core::slice::from_mut(byte), src) }.map_err(|_| -EFAULT)?;
+        if *byte == 0 {
+            len = i;
+            break;
+        }
+    }
+    Ok(GPL.iter().any(|accepted| *accepted == &license[..len]))
 }
 
 pub(crate) fn sys_bpf(ctx: &mut dyn TrapContext) {
@@ -374,7 +413,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
-    if size < PL_INSNS + 8 {
+    if size < PL_LICENSE + 8 {
         return -EINVAL;
     }
 
@@ -419,6 +458,10 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     } else {
         alloc::string::String::new()
     };
+    let gpl_compatible = match read_prog_license(u64_at(&attr, PL_LICENSE)) {
+        Ok(compatible) => compatible,
+        Err(e) => return e,
+    };
 
     // Every map the program's `LD_IMM64` immediates name, resolved through the
     // caller's fd table. The `Arc`s travel into the program and keep the maps
@@ -430,7 +473,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
         Err(e) => return e,
     };
 
-    let prog = match BpfProg::load(
+    let prog = match BpfProg::load_with_license(
         load_cap(),
         LoadRequest {
             name,
@@ -440,6 +483,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
             map_indices: resolved.map_indices,
             load_references: resolved.load_references,
         },
+        gpl_compatible,
     ) {
         Ok(p) => p,
         // Linux returns -EINVAL for a rejected program and puts the reason in
