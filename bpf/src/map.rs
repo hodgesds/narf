@@ -93,6 +93,12 @@ pub enum MapKind {
     /// records. Not keyed; reached through [`crate::ringbuf::RingBuf`].
     /// `max_entries` is the data-area size in bytes.
     RingBuf = 27,
+    /// Dense `u32`-keyed table of redirect targets: each value is a 4-byte
+    /// interface index a `bpf_redirect_map` consults. Backed by the same
+    /// array storage as [`MapKind::Array`] (dense keys, one value per key);
+    /// what distinguishes it is the `value_size == 4` shape and the meaning
+    /// the XDP redirect intrinsic gives the stored ifindex. `BPF_MAP_TYPE_DEVMAP`.
+    DevMap = 14,
 }
 
 impl MapKind {
@@ -104,6 +110,7 @@ impl MapKind {
             2 => Some(MapKind::Array),
             5 => Some(MapKind::PerCpuHash),
             6 => Some(MapKind::PerCpuArray),
+            14 => Some(MapKind::DevMap),
             27 => Some(MapKind::RingBuf),
             _ => None,
         }
@@ -117,10 +124,24 @@ impl MapKind {
     }
 
     /// Whether keys are dense `u32` indices.
+    ///
+    /// [`MapKind::DevMap`] is included: it is array-backed and its key *is* the
+    /// slot index, so it shares the array key rules (exactly 4 bytes wide).
     #[inline]
     #[must_use]
     pub const fn is_array(self) -> bool {
-        matches!(self, MapKind::Array | MapKind::PerCpuArray)
+        matches!(
+            self,
+            MapKind::Array | MapKind::PerCpuArray | MapKind::DevMap
+        )
+    }
+
+    /// Whether values are 4-byte interface indices consulted by
+    /// `bpf_redirect_map` — i.e. [`MapKind::DevMap`].
+    #[inline]
+    #[must_use]
+    pub const fn is_devmap(self) -> bool {
+        matches!(self, MapKind::DevMap)
     }
 }
 
@@ -426,6 +447,12 @@ fn check_attr(attr: MapAttr) -> Result<(), MapError> {
     if attr.kind.is_array() && attr.key_size != 4 {
         // Linux's `array_map_alloc_check` requires exactly 4: the key *is* the
         // index.
+        return Err(MapError::Invalid);
+    }
+    if attr.kind.is_devmap() && attr.value_size != 4 {
+        // A devmap slot holds one 4-byte interface index. Linux's
+        // `dev_map_alloc_check` accepts `sizeof(int)` or the wider
+        // `struct bpf_devmap_val`; NARF stores only the ifindex, so it is 4.
         return Err(MapError::Invalid);
     }
     if attr.value_size > MAX_VALUE_SIZE {
@@ -1170,7 +1197,11 @@ impl BpfMap {
             return Err(MapError::NoMemory);
         }
         let built = match attr.kind {
-            MapKind::Array | MapKind::PerCpuArray => ArrayMap::new(attr).map(MapImpl::Array),
+            // A devmap is dense-`u32`-keyed storage of ifindexes — the array
+            // backend verbatim (single value per key, `value_size == 4`).
+            MapKind::Array | MapKind::PerCpuArray | MapKind::DevMap => {
+                ArrayMap::new(attr).map(MapImpl::Array)
+            }
             MapKind::Hash | MapKind::PerCpuHash => HashMap::new(attr).map(MapImpl::Hash),
             // Frame-backed, and its own cgroup accountant (see
             // `footprint_bytes`): fallible if the frames cannot be allocated.
@@ -1226,6 +1257,27 @@ impl BpfMap {
         match &self.ops {
             MapImpl::RingBuf(r) => Some(r),
             _ => None,
+        }
+    }
+
+    /// The interface index stored at `key`, for `bpf_redirect_map`.
+    ///
+    /// `None` when this is not a devmap, when `key` is past `max_entries`, or
+    /// when the slot is empty (ifindex `0`) — the three cases Linux's devmap
+    /// treats as a lookup miss, which the redirect helper answers with its
+    /// fallback action rather than a redirect. A devmap has one value per key
+    /// (`lookup_local` reads slot 0 for a non-per-CPU kind), so the copy is the
+    /// stored 4-byte ifindex verbatim.
+    #[must_use]
+    pub fn devmap_lookup(&self, key: u32) -> Option<u32> {
+        if !self.attr().kind.is_devmap() {
+            return None;
+        }
+        let mut out = [0u8; 4];
+        self.ops().lookup_local(&key.to_le_bytes(), &mut out).ok()?;
+        match u32::from_le_bytes(out) {
+            0 => None,
+            ifindex => Some(ifindex),
         }
     }
 
@@ -1700,6 +1752,52 @@ crate::kfunc! {
         match map.ops().delete(&kbuf[..n]) {
             Ok(()) => 0,
             Err(e) => kfunc_err(e),
+        }
+    }
+
+    /// Redirect the current XDP frame out the interface named by devmap slot
+    /// `key` — the `bpf_redirect_map(map, key, flags)` shape.
+    ///
+    /// On a hit, records the slot's ifindex as this CPU's redirect target
+    /// (`crate::kfuncs::set_xdp_redirect_target`, the same per-CPU slot
+    /// `bpf_redirect` writes) and returns `XDP_REDIRECT` (4); the program
+    /// propagates that return and the classifier sends the frame out that iface.
+    /// On a *miss* — `map` is not a devmap, `key` is past `max_entries`, or the
+    /// slot is empty — it returns `flags` as the caller's chosen fallback action,
+    /// which is Linux's devmap-helper contract (`bpf_redirect_map(m, k,
+    /// XDP_PASS)` passes on miss). A `flags` that is not a bare XDP action
+    /// (`ABORTED`/`DROP`/`PASS`/`TX`, i.e. `> XDP_TX`) is rejected up front as
+    /// `XDP_ABORTED`, exactly as Linux rejects an out-of-range fallback.
+    ///
+    /// Unlike the ring-buffer and frame-resize kfuncs this is an ordinary shim,
+    /// not an interpreter intrinsic: the map handle is a real kernel address on
+    /// both backends (`LD_IMM64`'s map pseudo-form resolves to it), so the JIT
+    /// lowers the call natively and the interpreter dispatches it through the
+    /// registry — no VM-local state to reach, nothing to special-case.
+    ///
+    /// // LINUX-GAP: `BPF_F_BROADCAST` fan-out (one frame to every devmap port)
+    /// is not modelled — a single-target redirect only. The runtime devmap-kind
+    /// check stands in for Linux's load-time map-type/func-id compatibility
+    /// check, which NARF's one kfunc ABI does not carry.
+    #[context(Atomic)]
+    pub fn bpf_redirect_map(map: crate::types::Trusted<BpfMap>, key: u32, flags: u64) -> u64 {
+        /// XDP_ABORTED — also the rejected-flags and no-target answer.
+        const XDP_ABORTED: u64 = 0;
+        /// XDP_TX, the largest value a bare fallback action may hold.
+        const XDP_TX: u64 = 3;
+        /// XDP_REDIRECT, returned once a target is armed.
+        const XDP_REDIRECT: u64 = 4;
+        if flags > XDP_TX {
+            return XDP_ABORTED;
+        }
+        // SAFETY: see `map_of`.
+        let map = unsafe { map_of(&map) };
+        match map.devmap_lookup(key) {
+            Some(ifindex) => {
+                crate::kfuncs::set_xdp_redirect_target(ifindex);
+                XDP_REDIRECT
+            }
+            None => flags,
         }
     }
 }

@@ -53,6 +53,18 @@ pub fn clear_xdp_redirect_target() {
     XDP_REDIRECT_TARGET[current_cpu()].store(0, Ordering::Relaxed);
 }
 
+/// Record `ifindex` as this CPU's pending XDP redirect target.
+///
+/// The shared write both [`bpf_redirect`] and `bpf_redirect_map` make: it
+/// `+1`-biases the value so a real ifindex of 0 stays distinct from the "no
+/// request" sentinel [`clear_xdp_redirect_target`] leaves, and
+/// [`take_xdp_redirect_target`] un-biases on read. Called on the same CPU with
+/// IRQs masked (the caller holds `XDP_PROGS`), so the store pairs with the
+/// classifier's read a few instructions later.
+pub fn set_xdp_redirect_target(ifindex: u32) {
+    XDP_REDIRECT_TARGET[current_cpu()].store(ifindex.wrapping_add(1), Ordering::Relaxed);
+}
+
 /// The kfunc id of `bpf_xdp_adjust_head`, for the interpreter's interception
 /// and the JIT's refusal. Derived from the name exactly as the registry's ids
 /// are, so the two cannot drift.
@@ -138,13 +150,12 @@ crate::kfunc! {
     /// return value is the action the program is expected to propagate.
     ///
     /// `flags` is accepted for Linux source compatibility and currently
-    /// ignored: `BPF_F_BROADCAST`/`BPF_F_EXCLUDE_INGRESS` need devmap fan-out,
-    /// which this read-only surface does not implement (see `attach_xdp.rs`).
+    /// ignored: `BPF_F_BROADCAST`/`BPF_F_EXCLUDE_INGRESS` need devmap *fan-out*
+    /// (one frame to many ports), which is a further step beyond the single-port
+    /// `bpf_redirect_map` (see `crate::map`).
     #[context(Atomic)]
     pub fn bpf_redirect(ifindex: u32, _flags: u64) -> u64 {
-        // `+1`-biased so a real ifindex of 0 is still distinguishable from the
-        // "no request" sentinel the classifier clears the slot to.
-        XDP_REDIRECT_TARGET[current_cpu()].store(ifindex.wrapping_add(1), Ordering::Relaxed);
+        set_xdp_redirect_target(ifindex);
         // XDP_REDIRECT.
         4
     }

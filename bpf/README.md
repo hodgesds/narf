@@ -53,8 +53,14 @@ Landed:
   `data < data_end` is required before the next access). Actions:
   `PASS`/`DROP`/`ABORTED` plus `TX` and `REDIRECT` as retransmission of the
   *possibly-modified, possibly-resized* frame — `TX` reflects out the ingress
-  iface, `REDIRECT` sends out the iface named by a `bpf_redirect(ifindex)` kfunc.
-  `devmap`/`cpumap` fan-out remains a follow-on.
+  iface, `REDIRECT` sends out the iface named by a `bpf_redirect(ifindex)` kfunc
+  or by a `bpf_redirect_map(devmap, key, flags)` lookup into a
+  `BPF_MAP_TYPE_DEVMAP` (a dense `u32`-keyed table of ifindexes) — a hit arms the
+  looked-up ifindex and returns `REDIRECT`, a miss returns the program's `flags`
+  fallback action. `bpf_redirect_map` is an ordinary shim the JIT lowers natively
+  (the map handle is a real address on both backends), not an interpreter
+  intrinsic. `BPF_F_BROADCAST` devmap *fan-out* (one frame to many ports) and
+  `cpumap` remain a follow-on.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with

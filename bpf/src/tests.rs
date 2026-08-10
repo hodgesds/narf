@@ -2700,7 +2700,7 @@ fn smoke_bpf_xdp_adjust_head_grows_within_headroom() -> TestResult {
     frame[0] = 0xD7; // original byte 0 — must reappear at offset 32 after the grow
     match prog.run_xdp(&mut frame) {
         // Success (PASS), delivered length capped at the caller frame's capacity.
-        Some((Outcome::Returned(2), len)) if len == 64 => {}
+        Some((Outcome::Returned(2), 64)) => {}
         _ => return TestResult::Fail("adjust_head(-32) within headroom did not succeed"),
     }
     if frame[0] != 0 {
@@ -4270,6 +4270,122 @@ fn smoke_bpf_map_kfunc_reports_errnos() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_map_kfunc_reports_errnos);
+
+fn smoke_bpf_devmap_shape_and_lookup() -> TestResult {
+    checked(|| {
+        // The Linux `BPF_MAP_TYPE_DEVMAP` number decodes to the devmap kind.
+        if MapKind::from_linux(14) != Some(MapKind::DevMap) {
+            return Err("BPF_MAP_TYPE_DEVMAP did not decode to DevMap");
+        }
+        // A devmap slot holds exactly one 4-byte ifindex, and its key is the
+        // slot index — 4 bytes, like any array kind. Both other shapes are
+        // rejected at creation.
+        if mk(MapKind::DevMap, 4, 8, 4).is_ok() {
+            return Err("a devmap with a non-4-byte value was accepted");
+        }
+        if mk(MapKind::DevMap, 8, 4, 4).is_ok() {
+            return Err("a devmap with a non-4-byte key was accepted");
+        }
+
+        let m = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        // A fresh slot, and a key past `max_entries`, are both misses.
+        if m.devmap_lookup(0).is_some() {
+            return Err("a fresh devmap slot was not a miss");
+        }
+        if m.devmap_lookup(999).is_some() {
+            return Err("a key past max_entries was not a miss");
+        }
+        // Install ifindex 7 at slot 2; read it back and confirm it stays in its
+        // own slot.
+        m.ops()
+            .update(&k32(2), &7u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        if m.devmap_lookup(2) != Some(7) {
+            return Err("devmap_lookup did not return the installed ifindex");
+        }
+        if m.devmap_lookup(1).is_some() || m.devmap_lookup(3).is_some() {
+            return Err("a devmap update leaked into a neighbour slot");
+        }
+
+        // `devmap_lookup` is a miss on a non-devmap even when a value is present.
+        let arr = mk(MapKind::Array, 4, 4, 4).map_err(|_| "Array create failed")?;
+        arr.ops()
+            .update(&k32(0), &5u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "Array update rejected")?;
+        if arr.devmap_lookup(0).is_some() {
+            return Err("devmap_lookup treated a plain array as a devmap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_devmap_shape_and_lookup);
+
+fn smoke_bpf_redirect_map_arms_target() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target};
+    checked(|| {
+        // A devmap with ifindex 7 at slot 0; slot 1 left empty.
+        let m = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        m.ops()
+            .update(&k32(0), &7u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+
+        // `bpf_redirect_map(map, key, flags)` — flags is the miss fallback.
+        let build = |key: i32, flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, key),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // A hit: key 0 → XDP_REDIRECT (4) and ifindex 7 armed as the target.
+        let hit = load_with_map("redirmap-hit", build(0, 2), &m)
+            .map_err(|_| "load rejected a bpf_redirect_map program")?;
+        // The map handle is a real address on both backends, so this is an
+        // ordinary shim the JIT lowers natively — not an interpreter intrinsic.
+        if !hit.is_jited() {
+            return Err("a bpf_redirect_map program did not JIT");
+        }
+        // Native and interpreted must agree: XDP_REDIRECT with ifindex 7 armed.
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                hit.run_atomic_interpreted([0; 4], 4)
+            } else {
+                hit.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a devmap hit did not return XDP_REDIRECT"),
+            }
+            if take_xdp_redirect_target() != Some(7) {
+                return Err("a devmap hit did not arm the ifindex as the redirect target");
+            }
+        }
+
+        // A miss: empty slot 1 → the fallback action (XDP_PASS, 2), no target.
+        let miss = load_with_map("redirmap-miss", build(1, 2), &m).map_err(|_| "load rejected")?;
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                miss.run_atomic_interpreted([0; 4], 4)
+            } else {
+                miss.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(2)) => {}
+                _ => return Err("a devmap miss did not return the fallback action"),
+            }
+            if take_xdp_redirect_target().is_some() {
+                return Err("a devmap miss armed a redirect target anyway");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_arms_target);
 
 fn smoke_bpf_map_kfunc_wrong_buffer_width_is_einval() -> TestResult {
     checked(|| {
