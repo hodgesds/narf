@@ -933,6 +933,62 @@ fn smoke_bpf_typed_probe_reads_declared_field() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_typed_probe_reads_declared_field);
 
+fn typed_direct_read_program(offset: i32, size: Size) -> Vec<Insn> {
+    // r6 = typed object from ctx[0]; r0 = *(size *)(r6 + offset); return it.
+    // No mediator kfunc: the load itself is the certified typed read.
+    asm(&[ldx(6, 1, 0), ldx_size(size, 0, 6, offset as i16), EXIT])
+}
+
+fn smoke_bpf_typed_probe_direct_field_load_reads_bytes() -> TestResult {
+    use narf_tracing::dispatch::{self, ProbeArgs, ProbeHandlerInstall};
+
+    let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
+    let Ok(prog) = load_typed::<TypedTraceSample>(
+        "typed-direct-read",
+        typed_direct_read_program(value_offset, Size::Dw),
+    ) else {
+        return TestResult::Fail("load rejected an exact direct typed field read");
+    };
+    // A direct typed load reads its field through the tracing wrapper, an
+    // indirection the JIT does not emit — so the program is refused by gate 5
+    // and runs interpreted even where a native backend exists.
+    if prog.is_jited() {
+        return TestResult::Fail("a direct typed load must not reach the native backend");
+    }
+    // The raw execution API must still decline a caller-forged wrapper pointer.
+    if prog.run_atomic([0; 4], 4).is_some() || prog.run_atomic_interpreted([0; 4], 4).is_some() {
+        return TestResult::Fail("direct typed program accepted a raw context execution");
+    }
+
+    let attach_cap = Cap::<crate::prog::BpfAttach, Grant>::bootstrap();
+    let install_cap = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let probe_id = dispatch::reserve_probe_id();
+    if crate::attach::attach_probe(&attach_cap, &install_cap, probe_id, prog.clone()).is_err() {
+        return TestResult::Fail("direct typed attach failed");
+    }
+
+    // A scalar fire and the wrong schema must not run it; only the matching
+    // typed fire does, and it reads the exact field bytes back.
+    dispatch::fire(probe_id, ProbeArgs::one(u64::MAX));
+    dispatch::fire_typed(probe_id, &OtherTypedTraceSample { value: 9 });
+    let sample = TypedTraceSample {
+        pid: 41,
+        flags: 7,
+        value: 0x1122_3344_5566_7788,
+    };
+    dispatch::fire_typed(probe_id, &sample);
+    let _ = crate::attach::detach_probe(&install_cap, probe_id);
+
+    if prog.runs() != 1 || prog.traps() != 0 {
+        return TestResult::Fail("direct typed dispatch ran the wrong number of times or trapped");
+    }
+    if prog.accumulated() != sample.value {
+        return TestResult::Fail("direct typed load read the wrong field bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_typed_probe_direct_field_load_reads_bytes);
+
 fn smoke_bpf_typed_probe_rejects_non_field_reads() -> TestResult {
     let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
     // A shifted offset and a truncated width are both inside the object, but
@@ -951,16 +1007,21 @@ fn smoke_bpf_typed_probe_rejects_non_field_reads() -> TestResult {
         }
     }
 
-    // Direct dereference remains forbidden even for a declared field. The
-    // mediated path is what supplies the independent runtime recheck.
-    let direct = asm(&[ldx(6, 1, 0), ldx(0, 6, value_offset as i16), EXIT]);
-    match load_typed::<TypedTraceSample>("typed-direct", direct) {
-        Err(crate::prog::LoadError::Rejected(narf_bpf_verifier::VerifyError::OpaqueDeref {
-            ..
-        })) => TestResult::Pass,
-        Err(_) => TestResult::Fail("direct typed load failed for the wrong reason"),
-        Ok(_) => TestResult::Fail("direct typed object dereference was accepted"),
+    // A *direct* load — no mediator kfunc — is admitted only at an exact
+    // declared field, the same boundary the kfunc enforces. A shifted offset
+    // and a truncated width both stay inside the object and both are rejected,
+    // and rejection is never a fallback to a raw dereference.
+    for (offset, width) in [(value_offset + 1, Size::Dw), (value_offset, Size::W)] {
+        let bad = asm(&[ldx(6, 1, 0), ldx_size(width, 0, 6, offset as i16), EXIT]);
+        match load_typed::<TypedTraceSample>("typed-direct-bad", bad) {
+            Err(crate::prog::LoadError::Rejected(
+                narf_bpf_verifier::VerifyError::TypedFieldMismatch { .. },
+            )) => {}
+            Err(_) => return TestResult::Fail("bad direct typed load failed for the wrong reason"),
+            Ok(_) => return TestResult::Fail("a non-field direct typed load passed verification"),
+        }
     }
+    TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_typed_probe_rejects_non_field_reads);
 
@@ -2075,6 +2136,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
             arena,
         }],
         bare_access_sites: alloc::vec![narf_bpf_verifier::BareAccessSite { insn_index: 0 }],
+        typed_load_sites: alloc::vec::Vec::new(),
         subprogs: alloc::vec::Vec::new(),
         uses_arena: arena,
         kfunc_calls: alloc::vec::Vec::new(),

@@ -79,10 +79,25 @@ use narf_bpf_isa::{
 };
 use narf_bpf_verifier::kfunc::Context;
 
-use narf_bpf_verifier::SubprogInfo;
+use narf_bpf_verifier::{SubprogInfo, TypedLoadSite};
 
 use crate::kfunc::{KfuncShim, Registry};
 use crate::mem::StackFrame;
+
+/// A typed-probe program's authoritative field source.
+///
+/// The interpreter reads a certified typed load from [`Self::wrapper`] — the
+/// live [`narf_tracing::TypedProbeRef`] `run_typed_probe` was handed — rather
+/// than from the program's own register, so the field a load names is decided by
+/// the verifier's [`TypedLoadSite`] and rechecked by the wrapper, never by a
+/// value the program computed.
+#[derive(Copy, Clone)]
+struct TypedProbe<'a> {
+    /// The live tracing wrapper the fields are copied from.
+    wrapper: &'a narf_tracing::TypedProbeRef,
+    /// Certified typed-load sites, sorted by instruction index.
+    sites: &'a [TypedLoadSite],
+}
 
 /// Synthetic base of the program's stack region.
 ///
@@ -203,6 +218,15 @@ pub enum Trap {
     /// program's own list disagreed, and the alternative to trapping is handing
     /// a kfunc a null it will treat as non-null.
     UnresolvedMap { at: u32 },
+    /// A certified typed field load whose live wrapper declined the field, or
+    /// which ran with no wrapper bound.
+    ///
+    /// Normally impossible: the verifier proved the `(offset, size)` names an
+    /// exact schema field, and a typed program only runs with its wrapper bound.
+    /// Reaching it means the schema the program was verified against and the
+    /// live object disagreed, or a typed-load site was reached outside a typed
+    /// run — either way the load names no field and must not read anything.
+    BadTypedField { at: u32, offset: u32, len: usize },
 }
 
 /// How a program run ended.
@@ -369,6 +393,16 @@ pub struct Vm<'a> {
     /// after a `data`/`data_end` comparison; this runtime bound independently
     /// keeps the interpreter from dereferencing any other kernel address.
     readonly_region: Option<&'a [u8]>,
+    /// The live tracing wrapper a typed-probe program reads its declared fields
+    /// from, paired with the certified typed-load sites the verifier proved.
+    ///
+    /// A direct field load names its field through this wrapper — never through
+    /// the program-supplied register value — so a verifier bug cannot widen it
+    /// into a read of any other address, and `TypedProbeRef::copy_field` repeats
+    /// the field-existence and whole-object bound checks at runtime. `None` for
+    /// every non-typed program, which is what makes a typed-load site
+    /// unreachable — and therefore a trap — for one.
+    typed_probe: Option<TypedProbe<'a>>,
     /// The ring buffer a live `bpf_ringbuf_reserve` targets, or `None` when no
     /// reservation is outstanding. Holding the `Arc` keeps the ring alive for
     /// the reservation even if the program's own reference were somehow
@@ -436,6 +470,7 @@ impl<'a> Vm<'a> {
             maps,
             map_indices: &[],
             readonly_region: None,
+            typed_probe: None,
             reserve_map: None,
             reserve_len: 0,
             reserve_buf: [0u8; MAX_RESERVE],
@@ -466,6 +501,23 @@ impl<'a> Vm<'a> {
     #[must_use]
     pub fn with_readonly_region(mut self, bytes: &'a [u8]) -> Self {
         self.readonly_region = Some(bytes);
+        self
+    }
+
+    /// Bind the live tracing wrapper and the certified typed-load sites a
+    /// typed-probe program reads its declared fields from.
+    ///
+    /// Without this a certified typed load has no wrapper to read through and
+    /// traps — fail-closed, the same shape as an unbound arena. The sites are
+    /// the verifier's, so the interpreter services exactly the loads the
+    /// verifier admitted and no others.
+    #[must_use]
+    pub fn with_typed_probe(
+        mut self,
+        wrapper: &'a narf_tracing::TypedProbeRef,
+        sites: &'a [TypedLoadSite],
+    ) -> Self {
+        self.typed_probe = Some(TypedProbe { wrapper, sites });
         self
     }
 
@@ -698,6 +750,56 @@ impl<'a> Vm<'a> {
         Err(Trap::BadAccess { at, addr, len })
     }
 
+    /// The field offset of the certified typed load at `at`, or `None` if this
+    /// instruction is an ordinary load.
+    ///
+    /// A binary search over the verifier's sorted sites, so an instruction the
+    /// verifier did not certify as a typed load can never take the wrapper path.
+    #[inline]
+    fn typed_load_field(&self, at: u32) -> Option<u32> {
+        let probe = self.typed_probe.as_ref()?;
+        probe
+            .sites
+            .binary_search_by_key(&at, |site| site.insn_index)
+            .ok()
+            .map(|i| probe.sites[i].field_offset)
+    }
+
+    /// Read one certified typed field through the live tracing wrapper.
+    ///
+    /// The field comes from the wrapper `run_typed_probe` bound, not from the
+    /// program's register, and `copy_field` repeats the field-existence and
+    /// whole-object bound checks — so a verifier bug cannot turn this into a read
+    /// of any other address. A declined copy is a trap rather than a zeroed
+    /// register: unlike a fault-recoverable probe, a schema mismatch here means
+    /// the program and the object disagree, which the verifier proved impossible.
+    fn typed_field_load(
+        &self,
+        at: u32,
+        field_offset: u32,
+        size: Size,
+        signed: bool,
+    ) -> Result<u64, Trap> {
+        let len = size_bytes(size);
+        let probe = self.typed_probe.as_ref().ok_or(Trap::BadTypedField {
+            at,
+            offset: field_offset,
+            len,
+        })?;
+        let mut buf = [0u8; 8];
+        if !probe
+            .wrapper
+            .copy_field(u64::from(field_offset), &mut buf[..len])
+        {
+            return Err(Trap::BadTypedField {
+                at,
+                offset: field_offset,
+                len,
+            });
+        }
+        Ok(widen(u64::from_le_bytes(buf), size, signed))
+    }
+
     fn store(&mut self, at: u32, addr: u64, size: Size, value: u64) -> Result<(), Trap> {
         let len = size_bytes(size);
         let bytes = value.to_le_bytes();
@@ -914,8 +1016,17 @@ impl<'a> Vm<'a> {
                     src,
                     off,
                 } => {
-                    let addr = self.reg(src).wrapping_add(off as i64 as u64);
-                    let v = self.load(at, addr, size, sign_extend)?;
+                    // A certified typed load reads its declared field through the
+                    // live tracing wrapper, not by dereferencing the program's
+                    // register: `off` is the field offset the verifier matched
+                    // against the schema, and `copy_field` rechecks it. Every
+                    // other load takes the ordinary region-resolving path.
+                    let v = if let Some(field_offset) = self.typed_load_field(at) {
+                        self.typed_field_load(at, field_offset, size, sign_extend)?
+                    } else {
+                        let addr = self.reg(src).wrapping_add(off as i64 as u64);
+                        self.load(at, addr, size, sign_extend)?
+                    };
                     self.set_reg(at, dst, v)?;
                     pc = next;
                 }

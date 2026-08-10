@@ -265,14 +265,29 @@ map onto NARF as:
   type machinery for the overlap and drag in the rejected CO-RE.
 
 Sequencing, with the security reason for it: mediated `narf_probe_read` (bytes
-off a schema-tracked handle, §7.3) **precedes** typed direct access. The
-mediated slice has now landed; typed direct access remains deferred. Direct access
-puts *all* read-safety in the verifier — a single point of failure a verifier
-bug defeats, and (per §7.3) confinement does not catch a domain-0 read. The
-mediated shim re-checks bounds at runtime, so a verifier bug does not bypass it.
-Typed direct access is the speed / ergonomics play; mediation is the
-defense-in-depth play, and it wins on the "a verifier bug is a primitive"
-priority this whole note is organized around.
+off a schema-tracked handle, §7.3) **precedes** typed direct access. Both have
+now landed. A direct `BPF_LDX` load through a schema-tracked trace pointer is
+admitted only when the verifier proves the base is a `TraceObject` pointer at
+offset zero and the `(offset, size)` names one exact declared field of its
+schema — the same field-existence check `narf_probe_read` performs, moved to
+verification time (`verifier/src/fixpoint.rs`'s `typed_field_load`). A load that
+is not so proven is rejected (`VerifyError::TypedFieldMismatch`), never lowered
+to a raw dereference.
+
+Direct access would put *all* read-safety in the verifier — a single point of
+failure a verifier bug defeats, and (per §7.3) confinement does not catch a
+domain-0 read — so it keeps the mediated path's defense-in-depth rather than
+trading it away. The base register holds the *tracing wrapper*, not the object,
+so the field lives one indirection past it; the certified load is therefore not
+a bare host dereference. It is deliberately **not** recorded as a
+`BareAccessSite`, so the JIT's pointer-base gate refuses the program and it runs
+interpreted, where the interpreter reads the field through the live
+`TypedProbeRef` and `copy_field` repeats the field and whole-object bound checks
+at runtime. So a verifier bug that mis-admitted a field still cannot widen the
+read past the object. Typed direct access is the speed / ergonomics play;
+mediation is the defense-in-depth play, and the direct path keeps the latter's
+runtime recheck rather than discarding it — which is why it wins on the "a
+verifier bug is a primitive" priority this whole note is organized around.
 
 ## 8. Scope / non-goals
 
