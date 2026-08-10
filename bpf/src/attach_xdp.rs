@@ -3,7 +3,7 @@
 //! `net/src/bypass/classifier.rs` has named this seam since it was written
 //! ("a future eBPF surface would feed the same table"). This is that surface.
 //!
-//! ## Writable frame, dynamically bounded, resizing deferred
+//! ## Writable, resizable frame, dynamically bounded
 //!
 //! **The frame is writable.** A program may rewrite header bytes in place —
 //! `data[k] = v` for a `k` it proved below `data_end` — and `XDP_TX` /
@@ -12,9 +12,21 @@
 //! `bpf_redirect` kfunc in [`crate::kfuncs`]). [`BpfXdp::run`] receives the
 //! frame `&mut`, threaded from `narf_net::iface::RxHandler` through each
 //! driver's RX path; virtio-net and e1000 hand over a `&mut` borrow of the
-//! buffer they own and recycle. What is deferred is frame *resizing*:
-//! `bpf_xdp_adjust_head`/`_tail` (head/tailroom) and `devmap`/`cpumap` fan-out
-//! (`BPF_F_BROADCAST`) are follow-ons.
+//! buffer they own and recycle.
+//!
+//! **The frame is resizable.** `bpf_xdp_adjust_head`/`_tail` move `data` /
+//! `data_end` to trim or grow the packet. Because a bare RX frame has no slack —
+//! the driver hands over a slice sized to exactly the packet — a program that
+//! calls one is run against a per-CPU staging buffer laid out
+//! `[headroom | packet | tailroom]` (see [`crate::prog::run_xdp`] and
+//! [`crate::xdp_stage`]), so a grow has real room on either side. The resulting
+//! `[data, data_end)` window is copied back into the caller's frame and its
+//! length threaded through [`BpfXdp::run`] → the classifier → the RX handler, so
+//! `XDP_PASS`/`TX`/`REDIRECT` all act on the resized packet. These two kfuncs are
+//! interpreter intrinsics — the JIT refuses a program that calls one, exactly as
+//! it refuses the ring-buffer intrinsics. A non-resizing program pays no staging
+//! copy: it runs against the frame directly. What is still deferred is
+//! `devmap`/`cpumap` fan-out (`BPF_F_BROADCAST`).
 //!
 //! **Frame reads and writes are dynamically bounded, identically.** Context
 //! words 0 and 1 are the frame's `data` and exclusive `data_end` pointers. A
@@ -61,7 +73,7 @@ impl XdpProgram for BpfXdp {
         &self.name
     }
 
-    fn run(&self, _iface: &str, frame: &mut [u8]) -> XdpAction {
+    fn run(&self, _iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
         // Drop any redirect target a prior frame's `bpf_redirect` left on this
         // CPU: a program that calls `bpf_redirect` and then returns something
         // other than 4 must not have that ifindex leak into the *next* frame
@@ -75,35 +87,45 @@ impl XdpProgram for BpfXdp {
         // here, and severe: an unbounded loop verifies (fuel bounds it at
         // runtime), so a program that exhausts fuel would have silently dropped
         // *every frame on the interface*.
+        //
+        // `run_xdp` also returns the resulting packet length: a program that
+        // called `bpf_xdp_adjust_head`/`_tail` resized the frame, and the moved
+        // `[data, data_end)` window is what the verdict below applies to (already
+        // copied into `frame[..len]`). A non-resizing program returns
+        // `frame.len()` unchanged.
         match self.prog.run_xdp(frame) {
             // Linux's XDP action constants: DROP=1, PASS=2, TX=3, REDIRECT=4.
             // Matching those keeps a program written against Linux's constants
             // behaving the same way.
-            Some(crate::interp::Outcome::Returned(v)) => match v {
-                1 => XdpAction::Drop,
-                2 => XdpAction::Pass,
-                // Reflect the (possibly-rewritten) frame out the ingress iface.
-                3 => XdpAction::Tx,
-                // Redirect: the target ifindex is whatever `bpf_redirect`
-                // stashed for this frame on this CPU. A bare `return 4` with no
-                // preceding `bpf_redirect` has no target — treat that as
-                // `Aborted` (a redirect with nowhere to go is a program bug),
-                // matching Linux, where `XDP_REDIRECT` without a prior helper
-                // that primed the redirect info is dropped as an error.
-                4 => match crate::kfuncs::take_xdp_redirect_target() {
-                    Some(ifindex) => XdpAction::Redirect { ifindex },
-                    None => XdpAction::Aborted,
-                },
-                // Any other *returned* value is a program bug. Linux treats an
-                // unknown action as XDP_ABORTED, and so does this — dropping
-                // while counting it, so a broken program is visible rather than
-                // silently passing everything.
-                _ => XdpAction::Aborted,
-            },
-            // Trapped, or declined by the stack provider: pass the frame.
-            // Dropping traffic because a filter could not run would turn a
-            // resource limit into a network outage.
-            Some(crate::interp::Outcome::Trapped(_)) | None => XdpAction::Pass,
+            Some((crate::interp::Outcome::Returned(v), len)) => {
+                let action = match v {
+                    1 => XdpAction::Drop,
+                    2 => XdpAction::Pass,
+                    // Reflect the (possibly-rewritten) frame out the ingress
+                    // iface.
+                    3 => XdpAction::Tx,
+                    // Redirect: the target ifindex is whatever `bpf_redirect`
+                    // stashed for this frame on this CPU. A bare `return 4` with
+                    // no preceding `bpf_redirect` has no target — treat that as
+                    // `Aborted` (a redirect with nowhere to go is a program bug),
+                    // matching Linux, where `XDP_REDIRECT` without a prior helper
+                    // that primed the redirect info is dropped as an error.
+                    4 => match crate::kfuncs::take_xdp_redirect_target() {
+                        Some(ifindex) => XdpAction::Redirect { ifindex },
+                        None => XdpAction::Aborted,
+                    },
+                    // Any other *returned* value is a program bug. Linux treats
+                    // an unknown action as XDP_ABORTED, and so does this —
+                    // dropping while counting it, so a broken program is visible
+                    // rather than silently passing everything.
+                    _ => XdpAction::Aborted,
+                };
+                (action, len)
+            }
+            // Trapped, or declined by the stack provider: pass the frame
+            // unresized. Dropping traffic because a filter could not run would
+            // turn a resource limit into a network outage.
+            Some((crate::interp::Outcome::Trapped(_), _)) | None => (XdpAction::Pass, frame.len()),
         }
     }
 }

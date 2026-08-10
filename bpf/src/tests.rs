@@ -2494,17 +2494,17 @@ fn smoke_bpf_xdp_program_decides() -> TestResult {
     if prog.run_xdp_interpreted(&mut frame) != Some(Outcome::Returned(1)) {
         return TestResult::Fail("interpreter did not read the bounded frame byte");
     }
-    if x.run("test0", &mut frame) != XdpAction::Drop {
+    if x.run("test0", &mut frame).0 != XdpAction::Drop {
         return TestResult::Fail("program did not read the matching frame byte");
     }
     // Change the matched byte → PASS. If the context were zeroed, both frames
     // would take the same branch and this would be the failure.
     frame[12] = 0x22;
-    if x.run("test0", &mut frame) != XdpAction::Pass {
+    if x.run("test0", &mut frame).0 != XdpAction::Pass {
         return TestResult::Fail("verdict did not follow the frame contents");
     }
     // A short frame takes the explicit bounds-failure branch.
-    if x.run("test0", &mut [0u8; 3]) != XdpAction::Pass {
+    if x.run("test0", &mut [0u8; 3]).0 != XdpAction::Pass {
         return TestResult::Fail("a short frame was mishandled");
     }
     TestResult::Pass
@@ -2558,7 +2558,7 @@ fn smoke_bpf_xdp_rewrites_frame() -> TestResult {
     // verdict is XDP_TX and the frame reflects the write.
     let x = crate::attach_xdp::BpfXdp::for_test(alloc::sync::Arc::clone(&prog), "rw0");
     let mut frame = [0u8; 64];
-    if x.run("rw0", &mut frame) != XdpAction::Tx {
+    if x.run("rw0", &mut frame).0 != XdpAction::Tx {
         return TestResult::Fail("rewrite program did not surface as XDP_TX");
     }
     if frame[12] != 0xAB {
@@ -2567,12 +2567,166 @@ fn smoke_bpf_xdp_rewrites_frame() -> TestResult {
     // A short frame fails the dominating bound and takes the PASS branch without
     // touching memory — the store is never reached, so nothing is written.
     let mut short = [0u8; 8];
-    if x.run("rw0", &mut short) != XdpAction::Pass {
+    if x.run("rw0", &mut short).0 != XdpAction::Pass {
         return TestResult::Fail("a short frame was not passed unmodified");
     }
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_rewrites_frame);
+
+/// The `data`/`data_end`-reload prologue shared by the adjust smokes.
+///
+/// Saves the context in R6 (callee-saved, so it survives the adjust call),
+/// loads `data`/`data_end` into R2/R3, and proves `data + 14 <= data_end` so a
+/// read at offset 12 is admitted — the check every packet access needs.
+fn xdp_prove_14(short_branch: i16) -> [Decoded; 6] {
+    [
+        mov_reg(6, 1), // r6 = ctx
+        ldx(2, 1, 0),  // r2 = data
+        ldx(3, 1, 8),  // r3 = data_end
+        mov_reg(4, 2), // r4 = data
+        alu_imm(AluOp::Add, 4, 14),
+        jgt_reg(4, 3, short_branch), // data + 14 > data_end -> short-frame branch
+    ]
+}
+
+fn smoke_bpf_xdp_adjust_head_shrinks_and_reads() -> TestResult {
+    // `bpf_xdp_adjust_head(ctx, +14)` removes the 14-byte Ethernet header from the
+    // front: `data += 14`. The program then re-reads `data` (the kfunc moved it
+    // and the verifier invalidated the old bound), re-proves `data + 1 <=
+    // data_end`, and returns the new byte 0 — which is byte 14 of the original
+    // frame. `run_xdp` is called directly, so the return value is the byte read
+    // and the paired length is the resulting window. This proves both that the
+    // pointer moved and that the packet re-read is against the shifted window.
+    let insns = asm(&[
+        mov_reg(6, 1), // r6 = ctx (survives the adjust call)
+        // adjust_head(ctx, +14)
+        mov_reg(1, 6),
+        mov_imm(2, 14),
+        call("bpf_xdp_adjust_head"),
+        // Re-read the moved data/data_end and prove one byte is live.
+        ldx(2, 6, 0), // r2 = data (moved)
+        ldx(3, 6, 8), // r3 = data_end
+        mov_reg(4, 2),
+        alu_imm(AluOp::Add, 4, 1),
+        jgt_reg(4, 3, 2),           // empty after trim -> return 0
+        ldx_size(Size::B, 0, 2, 0), // r0 = data[0]  (== original byte 14)
+        EXIT,
+        mov_imm(0, 0), // empty-window branch: return 0
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-head", insns) else {
+        return TestResult::Fail("load rejected an adjust_head program");
+    };
+    // A resizing program must run interpreted — the JIT refuses it.
+    if prog.is_jited() {
+        return TestResult::Fail("an adjust program was unexpectedly JITed");
+    }
+    let mut frame = [0u8; 64];
+    frame[14] = 0x5A; // becomes the new byte 0 after adjust_head(+14)
+    match prog.run_xdp(&mut frame) {
+        Some((Outcome::Returned(0x5A), len)) if len == 64 - 14 => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("adjust_head(+14) did not shift data and shrink the window");
+        }
+    }
+    // The delivered bytes start at the old offset 14.
+    if frame[0] != 0x5A {
+        return TestResult::Fail("the trimmed frame did not start at the shifted data pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_shrinks_and_reads);
+
+fn smoke_bpf_xdp_adjust_tail_trims() -> TestResult {
+    // `bpf_xdp_adjust_tail(ctx, -4)` drops four trailing bytes: `data_end -= 4`.
+    // The window shrinks with `data` unmoved, so the delivered length is the
+    // original minus 4 and the delivered header bytes are unchanged.
+    let mut items = alloc::vec::Vec::new();
+    items.extend_from_slice(&xdp_prove_14(4));
+    items.extend_from_slice(&[
+        mov_reg(1, 6),
+        mov_imm(2, -4),
+        call("bpf_xdp_adjust_tail"),
+        mov_imm(0, 2), // XDP_PASS
+        EXIT,
+        mov_imm(0, 2), // short-frame PASS
+        EXIT,
+    ]);
+    let insns = asm(&items);
+    let Ok(prog) = load_xdp("xdp-adj-tail", insns) else {
+        return TestResult::Fail("load rejected an adjust_tail program");
+    };
+    let mut frame = [0u8; 64];
+    frame[0] = 0xC3; // a header byte the trim must preserve
+    match prog.run_xdp(&mut frame) {
+        Some((Outcome::Returned(2), len)) if len == 64 - 4 => {}
+        _ => return TestResult::Fail("adjust_tail(-4) did not trim the window by four bytes"),
+    }
+    if frame[0] != 0xC3 {
+        return TestResult::Fail("adjust_tail moved data — only data_end should move");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_tail_trims);
+
+fn smoke_bpf_xdp_adjust_head_grows_within_headroom() -> TestResult {
+    // A negative delta grows the head, prepending headroom: `data -= 32`. The
+    // staged buffer has 256 bytes of headroom, so this succeeds and the delivered
+    // window is 32 bytes longer. The program checks the kfunc returned 0.
+    let insns = asm(&[
+        mov_reg(6, 1),
+        mov_reg(1, 6),
+        mov_imm(2, -32),
+        call("bpf_xdp_adjust_head"), // r0 = 0 on success
+        // Return the kfunc's status directly (0 = success), then PASS is decided
+        // by the classifier only for a returned action — here the test reads the
+        // window length, so return 2 (PASS) after asserting success by branch.
+        jne_imm(0, 0, 1), // if status != 0, skip the PASS store (leave r0 nonzero)
+        mov_imm(0, 2),    // XDP_PASS
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-grow", insns) else {
+        return TestResult::Fail("load rejected an adjust_head grow program");
+    };
+    let mut frame = [0u8; 64];
+    match prog.run_xdp(&mut frame) {
+        Some((Outcome::Returned(2), len)) if len == 64 + 32 => {}
+        _ => return TestResult::Fail("adjust_head(-32) did not grow the window within headroom"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_grows_within_headroom);
+
+fn smoke_bpf_xdp_adjust_head_grow_past_headroom_enomem() -> TestResult {
+    // A grow larger than the staged headroom (256 bytes) has nowhere to go:
+    // `bpf_xdp_adjust_head` returns -ENOMEM and leaves `data` unmoved, so the
+    // delivered window is unchanged. The program returns the kfunc's status,
+    // which the test reads as a negative value; the length stays the original.
+    let insns = asm(&[
+        mov_reg(6, 1),
+        mov_reg(1, 6),
+        mov_imm(2, -9999),
+        call("bpf_xdp_adjust_head"), // r0 = -ENOMEM (no room)
+        EXIT,                        // return the status verbatim
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-nomem", insns) else {
+        return TestResult::Fail("load rejected the grow-past-headroom program");
+    };
+    let mut frame = [0u8; 64];
+    match prog.run_xdp(&mut frame) {
+        // -ENOMEM is -12, which the u64 return carries as its two's-complement.
+        Some((Outcome::Returned(v), len)) if v == (-12i64) as u64 && len == 64 => {}
+        _ => {
+            return TestResult::Fail(
+                "a grow past headroom did not return -ENOMEM with data unmoved",
+            )
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_grow_past_headroom_enomem);
 
 fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
     // Linux treats an unrecognised XDP return as XDP_ABORTED. So does this: a
@@ -2585,7 +2739,7 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
         return TestResult::Fail("load rejected");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "test1");
-    if x.run("test1", &mut [0u8; 64]) != XdpAction::Aborted {
+    if x.run("test1", &mut [0u8; 64]).0 != XdpAction::Aborted {
         return TestResult::Fail("an unknown action was not treated as aborted");
     }
     TestResult::Pass
@@ -2603,7 +2757,7 @@ fn smoke_bpf_xdp_tx_reflects() -> TestResult {
         return TestResult::Fail("load rejected an XDP_TX program");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "tx0");
-    if x.run("tx0", &mut [0u8; 64]) != XdpAction::Tx {
+    if x.run("tx0", &mut [0u8; 64]).0 != XdpAction::Tx {
         return TestResult::Fail("return code 3 did not map to XdpAction::Tx");
     }
     TestResult::Pass
@@ -2629,7 +2783,7 @@ fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
         return TestResult::Fail("load rejected a program calling bpf_redirect");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "redir0");
-    match x.run("redir0", &mut [0u8; 64]) {
+    match x.run("redir0", &mut [0u8; 64]).0 {
         XdpAction::Redirect { ifindex } if ifindex == IFINDEX as u32 => {}
         _ => {
             return TestResult::Fail("bpf_redirect target ifindex was not conveyed to the verdict");
@@ -2643,7 +2797,7 @@ fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
         return TestResult::Fail("load rejected a bare return-4 program");
     };
     let y = crate::attach_xdp::BpfXdp::for_test(bare_prog, "redir1");
-    if y.run("redir1", &mut [0u8; 64]) != XdpAction::Aborted {
+    if y.run("redir1", &mut [0u8; 64]).0 != XdpAction::Aborted {
         return TestResult::Fail("XDP_REDIRECT with no bpf_redirect target was not aborted");
     }
     TestResult::Pass

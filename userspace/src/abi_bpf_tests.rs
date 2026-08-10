@@ -5332,21 +5332,23 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
 
         let mut frame = [0u8; 64];
         frame[12] = 0x11;
-        if !matches!(classify(IFACE, &mut frame), Verdict::Dropped) {
+        // `classify` returns `(Verdict, len)`; these programs do not resize, so
+        // only the verdict is checked.
+        if !matches!(classify(IFACE, &mut frame).0, Verdict::Dropped) {
             return Err("the linked XDP program did not read and drop the matching frame");
         }
         frame[12] = 0x22;
-        if !matches!(classify(IFACE, &mut frame), Verdict::PassThrough) {
+        if !matches!(classify(IFACE, &mut frame).0, Verdict::PassThrough) {
             return Err("the bounded XDP read did not distinguish packet bytes");
         }
-        if !matches!(classify(IFACE, &mut [0u8; 3]), Verdict::PassThrough) {
+        if !matches!(classify(IFACE, &mut [0u8; 3]).0, Verdict::PassThrough) {
             return Err("the XDP data_end guard did not pass a short frame");
         }
         if call(Syscall::Close.raw(), a0(link_fd as u64)) != Some(0) {
             return Err("closing the link fd failed");
         }
         frame[12] = 0x11;
-        if !matches!(classify(IFACE, &mut frame), Verdict::PassThrough) {
+        if !matches!(classify(IFACE, &mut frame).0, Verdict::PassThrough) {
             return Err("frames were still dropped after the link fd was closed");
         }
         Ok(())

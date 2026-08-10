@@ -542,6 +542,19 @@ impl<'a> Vm<'a> {
         self.steps
     }
 
+    /// The context words as they stand.
+    ///
+    /// After a staged XDP run these hold the program's final `data`/`data_end`,
+    /// which the frame-resizing intrinsics rewrite in place — the staged run path
+    /// reads them back to recover the effective packet window. For every other
+    /// program the words are whatever was handed in, since only the XDP adjust
+    /// intrinsics write them.
+    #[inline]
+    #[must_use]
+    pub const fn context_words(&self) -> [u64; MAX_CTX_WORDS] {
+        self.ctx
+    }
+
     // ── memory ──────────────────────────────────────────────────────
 
     /// Resolve `addr..addr+len` to a stack-region byte range.
@@ -670,6 +683,73 @@ impl<'a> Vm<'a> {
     fn ringbuf_discard(&mut self) {
         self.reserve_map = None;
         self.reserve_len = 0;
+    }
+
+    /// The staged frame buffer's `[base, base + len)` real-address extent, or
+    /// `None` when no packet region is bound.
+    ///
+    /// The XDP entry path stages the packet into a per-CPU buffer with headroom
+    /// before it and tailroom after, and binds that whole buffer as the packet
+    /// region (see `crate::prog::run_xdp`). The adjust intrinsics move
+    /// `data`/`data_end` within this extent — into the headroom to grow the head,
+    /// into the tailroom to grow the tail — and every access remains confined to
+    /// it by the same runtime bound the read/store paths apply.
+    #[inline]
+    fn packet_extent(&self) -> Option<(u64, u64)> {
+        let region = self.packet_region.as_deref()?;
+        let base = region.as_ptr() as u64;
+        Some((base, base + region.len() as u64))
+    }
+
+    /// `bpf_xdp_adjust_head(ctx, delta)`: move `data` (`ctx[0]`) by `delta`.
+    ///
+    /// `delta > 0` shrinks from the front (`data += delta`); `delta < 0` grows,
+    /// prepending headroom (`data -= |delta|`). The new `data` must stay within
+    /// the staged buffer and at or below `data_end`. Returns `0` on success, or
+    /// `-ENOMEM` (`-12`) when there is no room — in which case `data` is left
+    /// unmoved, so the operation is fail-closed. The verifier drops every proven
+    /// packet bound at the call, so the program must re-compare `data < data_end`
+    /// before its next packet access; that re-read sees the value written here.
+    fn xdp_adjust_head(&mut self, delta: i32) -> u64 {
+        let Some((buf_start, buf_end)) = self.packet_extent() else {
+            return (-12i64) as u64;
+        };
+        let data = self.ctx[0];
+        let data_end = self.ctx[1];
+        // `delta` is a byte count; apply it as a signed offset on `data`.
+        // `checked_add_signed` catches a wrap the bounds test below would
+        // otherwise have to reason about.
+        let Some(new_data) = data.checked_add_signed(i64::from(delta)) else {
+            return (-12i64) as u64;
+        };
+        if new_data < buf_start || new_data > buf_end || new_data > data_end {
+            return (-12i64) as u64;
+        }
+        self.ctx[0] = new_data;
+        0
+    }
+
+    /// `bpf_xdp_adjust_tail(ctx, delta)`: move `data_end` (`ctx[1]`) by `delta`.
+    ///
+    /// `delta > 0` grows the tail (appends tailroom); `delta < 0` shrinks
+    /// (`data_end += delta`). The new `data_end` must stay at or above `data` and
+    /// within the staged buffer. Returns `0` on success or `-ENOMEM` (`-12`) with
+    /// `data_end` unmoved. As with the head, the verifier invalidates the packet
+    /// bounds at the call, so the moved end is re-read on the next comparison.
+    fn xdp_adjust_tail(&mut self, delta: i32) -> u64 {
+        let Some((buf_start, buf_end)) = self.packet_extent() else {
+            return (-12i64) as u64;
+        };
+        let data = self.ctx[0];
+        let data_end = self.ctx[1];
+        let Some(new_end) = data_end.checked_add_signed(i64::from(delta)) else {
+            return (-12i64) as u64;
+        };
+        if new_end < buf_start || new_end > buf_end || new_end < data {
+            return (-12i64) as u64;
+        }
+        self.ctx[1] = new_end;
+        0
     }
 
     /// The address a map handle carries.
@@ -1528,6 +1608,25 @@ impl<'a> Vm<'a> {
             } else {
                 self.ringbuf_discard();
                 0
+            };
+            self.regs[1..6].fill(0);
+            return Ok(());
+        }
+        // The XDP frame-resizing kfuncs are intrinsics for the same reason the
+        // ring-buffer ones are: they move the packet window (`ctx[0]`/`ctx[1]`,
+        // i.e. `data`/`data_end`) inside the VM's staged frame buffer, which a
+        // plain shim cannot reach. The interpreter rewrites those context words
+        // directly; the program re-reads them on its next `*(ctx+0)` load. The
+        // JIT refuses any program that calls one (`kfuncs::is_xdp_adjust`), so
+        // this is the only backend that runs them. `delta` arrives in R2 as a
+        // sign-extended 32-bit value; R1 is the (synthetic) context pointer,
+        // which the intrinsic does not dereference.
+        if crate::kfuncs::is_xdp_adjust(id) {
+            let delta = self.regs[2] as i32;
+            self.regs[0] = if id == crate::kfuncs::XDP_ADJUST_HEAD_ID {
+                self.xdp_adjust_head(delta)
+            } else {
+                self.xdp_adjust_tail(delta)
             };
             self.regs[1..6].fill(0);
             return Ok(());

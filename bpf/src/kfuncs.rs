@@ -53,6 +53,24 @@ pub fn clear_xdp_redirect_target() {
     XDP_REDIRECT_TARGET[current_cpu()].store(0, Ordering::Relaxed);
 }
 
+/// The kfunc id of `bpf_xdp_adjust_head`, for the interpreter's interception
+/// and the JIT's refusal. Derived from the name exactly as the registry's ids
+/// are, so the two cannot drift.
+pub const XDP_ADJUST_HEAD_ID: i32 = fnv1a32_nonzero("bpf_xdp_adjust_head") as i32;
+/// The kfunc id of `bpf_xdp_adjust_tail`.
+pub const XDP_ADJUST_TAIL_ID: i32 = fnv1a32_nonzero("bpf_xdp_adjust_tail") as i32;
+
+/// Whether `id` names one of the XDP frame-resizing interpreter intrinsics.
+///
+/// Both `bpf_xdp_adjust_head`/`_tail` move the packet window inside the VM's
+/// staged frame buffer, which native code has no handle on. The JIT refuses any
+/// program that calls one (as it does the ring-buffer intrinsics), so such a
+/// program runs interpreted and the interpreter intercepts the id.
+#[must_use]
+pub fn is_xdp_adjust(id: i32) -> bool {
+    id == XDP_ADJUST_HEAD_ID || id == XDP_ADJUST_TAIL_ID
+}
+
 /// The `call` immediate for [`narf_yield`].
 ///
 /// The interpreter intercepts this id rather than calling the shim, because
@@ -129,6 +147,48 @@ crate::kfunc! {
         XDP_REDIRECT_TARGET[current_cpu()].store(ifindex.wrapping_add(1), Ordering::Relaxed);
         // XDP_REDIRECT.
         4
+    }
+
+    /// Move the XDP frame's `data` pointer by `delta` bytes — the
+    /// `bpf_xdp_adjust_head(ctx, delta)` shape.
+    ///
+    /// `delta > 0` shrinks the packet from the front (removes `delta` header
+    /// bytes: `data += delta`); `delta < 0` grows it, prepending `|delta|` bytes
+    /// of headroom (`data -= |delta|`). The new `data` must stay within the
+    /// staged frame buffer and at or below `data_end`. Returns `0` on success or
+    /// `-ENOMEM` when there is no room, in which case `data` is left unmoved
+    /// (fail-closed). The kfunc writes the new `data` back into `ctx[0]` and
+    /// re-bases the packet window, so the program re-reads the moved pointer on
+    /// its next `*(ctx+0)` load — and the verifier drops every proven packet
+    /// bound at this call, forcing a fresh `data < data_end` before the next
+    /// access.
+    ///
+    /// This body is unreachable: the interpreter intercepts the call and
+    /// mutates the VM's context words and packet window directly, because in the
+    /// interpreter the context is synthetic (see [`XDP_ADJUST_HEAD_ID`] and
+    /// `crate::interp`). It declines with `-ENOMEM` rather than panicking, so a
+    /// bypassed interception fails closed.
+    #[context(Atomic)]
+    pub fn bpf_xdp_adjust_head(ctx: crate::types::XdpCtx, delta: i32) -> i64 {
+        let _ = (ctx, delta);
+        -12 // -ENOMEM
+    }
+
+    /// Move the XDP frame's `data_end` pointer by `delta` bytes — the
+    /// `bpf_xdp_adjust_tail(ctx, delta)` shape.
+    ///
+    /// `delta > 0` grows the packet, appending `delta` bytes of tailroom;
+    /// `delta < 0` shrinks it (`data_end += delta`). The new `data_end` must
+    /// stay at or above `data` and within the staged frame buffer. Returns `0`
+    /// on success or `-ENOMEM` when there is no room, leaving `data_end` unmoved.
+    /// Writes the new `data_end` back into `ctx[1]` and re-bases the packet
+    /// window; the verifier drops every proven packet bound at the call.
+    ///
+    /// Interpreter intrinsic, as [`bpf_xdp_adjust_head`]; this body never runs.
+    #[context(Atomic)]
+    pub fn bpf_xdp_adjust_tail(ctx: crate::types::XdpCtx, delta: i32) -> i64 {
+        let _ = (ctx, delta);
+        -12 // -ENOMEM
     }
 
     /// Copy one declared field from the current typed tracing object.

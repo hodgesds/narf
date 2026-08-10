@@ -1553,6 +1553,25 @@ impl Analysis<'_, '_> {
             p.size = Some(sz);
         }
         st.regs[Reg::R0.as_usize()] = ret;
+
+        // A kfunc handed the mutable context pointer can resize the packet
+        // frame — `bpf_xdp_adjust_head`/`_tail` move `data`/`data_end`. Its
+        // `PtrKind::Ctx` argument is the structural marker: no read-only helper
+        // takes one, so its presence is exactly "this call may have moved the
+        // packet window". Every proven packet extent is therefore struck off,
+        // so a subsequent packet access without a fresh `data < data_end`
+        // comparison is rejected. See [`AbsState::invalidate_packet_bounds`].
+        if desc.args.iter().any(|a| {
+            matches!(
+                a.kind,
+                TypeKind::Ptr {
+                    kind: PtrKind::Ctx,
+                    ..
+                }
+            )
+        }) {
+            st.invalidate_packet_bounds();
+        }
         Ok(())
     }
 

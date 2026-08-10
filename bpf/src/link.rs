@@ -726,18 +726,21 @@ mod smokes {
     }
 
     /// `classify()`'s verdict, as predicates — a payload-carrying variant is
-    /// awkward to pattern-match at each call site.
-    fn dropped(v: Verdict) -> bool {
-        matches!(v, Verdict::Dropped)
+    /// awkward to pattern-match at each call site. `classify` returns the
+    /// verdict paired with the resulting packet length (an XDP program may
+    /// resize the frame); these predicates ignore the length, which the
+    /// dedicated adjust smokes cover.
+    fn dropped(v: (Verdict, usize)) -> bool {
+        matches!(v.0, Verdict::Dropped)
     }
-    fn passed_through(v: Verdict) -> bool {
-        matches!(v, Verdict::PassThrough)
+    fn passed_through(v: (Verdict, usize)) -> bool {
+        matches!(v.0, Verdict::PassThrough)
     }
-    fn transmit(v: Verdict) -> bool {
-        matches!(v, Verdict::Transmit)
+    fn transmit(v: (Verdict, usize)) -> bool {
+        matches!(v.0, Verdict::Transmit)
     }
-    fn redirects_to(v: Verdict, ifindex: u32) -> bool {
-        matches!(v, Verdict::Redirect { ifindex: got } if got == ifindex)
+    fn redirects_to(v: (Verdict, usize), ifindex: u32) -> bool {
+        matches!(v.0, Verdict::Redirect { ifindex: got } if got == ifindex)
     }
 
     /// `r1 = ifindex; r2 = 0; call bpf_redirect; exit` — the XDP_REDIRECT

@@ -17,6 +17,7 @@ use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
 use crate::mem::{
     BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, STUB_STACK_BYTES,
 };
+use crate::xdp_stage::{XDP_HEADROOM, XDP_STAGE_LEN, XDP_STAGE_PACKET_MAX};
 
 /// Authority to load and verify a BPF program.
 ///
@@ -172,6 +173,15 @@ pub struct BpfProg {
     insns: Vec<Insn>,
     /// The execution context this program was verified for.
     context: Context,
+    /// Whether the program calls `bpf_xdp_adjust_head`/`_tail`.
+    ///
+    /// Set at load from the verifier's resolved kfunc-call sites. When true the
+    /// XDP run path stages the frame into a per-CPU buffer with head/tailroom so
+    /// a grow has somewhere to go, and delivers the resulting `[data, data_end)`
+    /// window rather than the original frame — see [`Self::run_xdp`]. False for
+    /// every program that does not resize, so the common RX path is unchanged and
+    /// pays no staging copy.
+    uses_xdp_adjust: bool,
     /// Rust-native typed-probe schema, for runtime attach validation.
     typed_probe: Option<TypedProbeLayout>,
     /// Loads the verifier certified as exact typed-field reads through the
@@ -570,6 +580,12 @@ impl BpfProg {
         // acceptance is *defined* as leaning on the interpreter's runtime
         // bounds checks, which native code does not perform.
         let mut jit = None;
+        // Whether the program resizes the frame. Read from the verifier's
+        // resolved call sites so it cannot disagree with what the interpreter
+        // will intercept; the `provisional` path below leaves it false, which is
+        // correct — that path accepts only non-`Value` `LD_IMM64` forms, none of
+        // which is a kfunc call.
+        let mut uses_xdp_adjust = false;
         let stack_bytes = match narf_bpf_verifier::verify(&prog) {
             Ok(v) => {
                 if v.max_stack_bytes > MAX_STACK_BYTES {
@@ -592,6 +608,10 @@ impl BpfProg {
                     &req.map_indices,
                 )
                 .ok();
+                uses_xdp_adjust = v
+                    .kfunc_calls
+                    .iter()
+                    .any(|c| crate::kfuncs::is_xdp_adjust(c.id));
                 subprogs = v.subprogs;
                 typed_load_sites = v.typed_load_sites;
                 v.max_stack_bytes.max(1)
@@ -628,6 +648,7 @@ impl BpfProg {
             linux_prog_type: metadata.linux_prog_type,
             insns: req.insns,
             context: req.context,
+            uses_xdp_adjust,
             typed_probe,
             typed_load_sites,
             initial_fuel: DEFAULT_FUEL,
@@ -973,30 +994,159 @@ impl BpfProg {
         self.run_atomic_inner(ctx, ctx_len)
     }
 
-    /// Run an XDP program against one live, writable packet frame.
+    /// Run an XDP program against one live, writable packet frame, returning the
+    /// verdict and the resulting packet length.
     ///
     /// This is also the safe test-run boundary: callers supply bytes, never
-    /// raw context words. The method constructs the paired `data`/`data_end`
-    /// addresses from this exact borrow and binds the interpreter's runtime
-    /// region to the same slice.
+    /// raw context words. The returned length is what the frame's effective
+    /// `[data, data_end)` window is after the program returns, and `frame` holds
+    /// those bytes in `frame[..len]` — that is what `XDP_PASS` delivers and
+    /// `XDP_TX`/`XDP_REDIRECT` retransmit. For a program that does not resize the
+    /// frame the length is just `frame.len()`.
     ///
     /// The frame is `&mut`: a program that rewrites a header byte writes it in
     /// place, so the borrow the caller passed in reflects the mutation on
-    /// return — that is the frame `XDP_TX` reflects and `XDP_REDIRECT` forwards.
-    /// The native (JITed) path writes the packet through the address the ctx
-    /// pair already carries, and the interpreter services the same bounded
+    /// return. The native (JITed) path writes the packet through the address the
+    /// ctx pair already carries, and the interpreter services the same bounded
     /// store against this slice; the two agree on `[data, data_end)`.
-    pub fn run_xdp(&self, frame: &mut [u8]) -> Option<Outcome> {
+    ///
+    /// ## Frame resizing
+    ///
+    /// A program that calls `bpf_xdp_adjust_head`/`_tail` needs head/tailroom the
+    /// bare RX frame does not have — the driver hands a slice sized to exactly
+    /// the packet. So a resizing program (known from a load-time flag, and always
+    /// interpreted — the JIT refuses one) is staged into a per-CPU buffer laid
+    /// out `[headroom | packet | tailroom]`, with `data`/`data_end` pointing at
+    /// the packet sub-range. The adjust intrinsics move those pointers within the
+    /// buffer; on return the effective packet is `[data, data_end)` of the
+    /// staged buffer, which is copied back into `frame[..len]`. Because `frame`
+    /// is the delivery/retransmit buffer, a grown packet can only be delivered up
+    /// to `frame.len()` bytes — the staging gives the program room to work, and
+    /// the copy-back is bounded by the caller's frame. A non-resizing program
+    /// runs against `frame` directly with no staging copy, so the common RX path
+    /// is untouched.
+    pub fn run_xdp(&self, frame: &mut [u8]) -> Option<(Outcome, usize)> {
         if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
             return None;
         }
+        if self.uses_xdp_adjust {
+            return self.run_xdp_staged(frame);
+        }
         let range = frame.as_ptr_range();
-        self.run_atomic_inner_with_region(
+        let len = frame.len();
+        let outcome = self.run_atomic_inner_with_region(
             [range.start as u64, range.end as u64, 0, 0],
             2,
             Some(frame),
             None,
+        )?;
+        Some((outcome, len))
+    }
+
+    /// Run a frame-resizing XDP program against a per-CPU staged buffer.
+    ///
+    /// The frame is copied into `[headroom | packet | tailroom]`; the program
+    /// runs against the packet sub-range with `data`/`data_end` pointing into the
+    /// staged buffer, so `bpf_xdp_adjust_head`/`_tail` have real room on either
+    /// side. On return the effective packet `[data, data_end)` is copied back
+    /// into `frame`, truncated to `frame.len()` — the delivery/retransmit ceiling
+    /// — and its length returned. Always interpreted: the JIT refuses a program
+    /// that calls an adjust intrinsic.
+    fn run_xdp_staged(&self, frame: &mut [u8]) -> Option<(Outcome, usize)> {
+        // Larger than a staged buffer fits: deliver it unresized rather than
+        // truncating. The program still runs against the frame directly; any
+        // adjust it attempts finds no headroom/tailroom and returns `-ENOMEM`.
+        if frame.len() > XDP_STAGE_PACKET_MAX {
+            let range = frame.as_ptr_range();
+            let len = frame.len();
+            let outcome = self.run_atomic_inner_with_region(
+                [range.start as u64, range.end as u64, 0, 0],
+                2,
+                Some(frame),
+                None,
+            )?;
+            return Some((outcome, len));
+        }
+        // Claim this CPU's staging buffer. An XDP program runs with IRQs masked
+        // and `XDP_PROGS` held (`classifier::run_xdp`), so between the claim and
+        // the copy-back the running CPU cannot change and no other frame on this
+        // CPU can reach the same buffer — the same invariant the per-CPU redirect
+        // slot in `crate::kfuncs` relies on.
+        let mut stage = crate::xdp_stage::Guard::claim();
+        let plen = frame.len();
+        {
+            let buf = stage.bytes_mut();
+            // Zero the headroom/tailroom the program may grow into, then place
+            // the packet after the headroom. Zeroed slack is harmless to read
+            // (the verifier still confines a legitimate access to
+            // `[data, data_end)`) and is what a grown header/trailer starts as,
+            // matching Linux.
+            buf[..XDP_HEADROOM].fill(0);
+            buf[XDP_HEADROOM..XDP_HEADROOM + plen].copy_from_slice(frame);
+            buf[XDP_HEADROOM + plen..].fill(0);
+        }
+        let base = stage.bytes_mut().as_ptr() as u64;
+        let data = base + XDP_HEADROOM as u64;
+        let data_end = data + plen as u64;
+
+        // Interpreted, always: the JIT refuses a program that calls an adjust
+        // intrinsic, so this never has a native image to prefer. The interpreter
+        // reports the final context words back, from which the effective packet
+        // window is recovered.
+        let (outcome, final_ctx) =
+            self.run_xdp_staged_interp([data, data_end, 0, 0], stage.bytes_mut())?;
+
+        // The effective packet is `[data, data_end)` the program left behind.
+        // The intrinsics only ever move these within `[base, base + STAGE_LEN]`,
+        // so the offsets recover exactly; guard against a nonsensical pair by
+        // falling back to the original window.
+        let (out_data, out_end) = (final_ctx[0], final_ctx[1]);
+        let (off, out_len) =
+            if out_end >= out_data && out_data >= base && out_end <= base + XDP_STAGE_LEN as u64 {
+                ((out_data - base) as usize, (out_end - out_data) as usize)
+            } else {
+                (XDP_HEADROOM, plen)
+            };
+        let copy = out_len.min(frame.len());
+        frame[..copy].copy_from_slice(&stage.bytes_mut()[off..off + copy]);
+        Some((outcome, copy))
+    }
+
+    /// Interpret a staged XDP program, returning the verdict and the final
+    /// context words (`[data, data_end, …]`) the program left behind.
+    ///
+    /// Split from [`Self::run_atomic_interpreted_inner`] because the staged path
+    /// alone needs the resized window back: `bpf_xdp_adjust_head`/`_tail` rewrite
+    /// `ctx[0]`/`ctx[1]`, and the caller copies out `[data, data_end)`. Every
+    /// other interpreter caller discards the context on return.
+    fn run_xdp_staged_interp(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        region: &mut [u8],
+    ) -> Option<(Outcome, [u64; MAX_CTX_WORDS])> {
+        let _confined = crate::domain::enter();
+        let frame = self.acquire_atomic_frame()?;
+        let registry = crate::kfunc::registry()?;
+        let mut vm = Vm::new(
+            crate::interp::VmProgram {
+                insns: &self.insns,
+                subprogs: &self.subprogs,
+                context: self.context,
+                fuel: self.initial_fuel,
+                maps: &self.maps,
+            },
+            ctx,
+            2,
+            frame,
+            registry,
         )
+        .with_arenas(self.arenas())
+        .with_map_indices(&self.map_indices)
+        .with_packet_region(region);
+        let stats_start = crate::stats::run_start();
+        let outcome = crate::interp::drive(vm.run());
+        self.record(outcome, stats_start);
+        Some((outcome, vm.context_words()))
     }
 
     /// Run the XDP path through the interpreter for kernel differential tests.

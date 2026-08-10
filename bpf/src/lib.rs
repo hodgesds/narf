@@ -50,6 +50,7 @@ pub mod provisional;
 pub mod ringbuf;
 pub mod stats;
 pub mod types;
+pub mod xdp_stage;
 
 #[cfg(feature = "kernel-test")]
 mod kfunc_tests;

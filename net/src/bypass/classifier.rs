@@ -24,21 +24,22 @@
 //! the daemon claim and the flow table, mirroring Linux's ordering in
 //! `netif_receive_skb_core`.
 //!
-//! The attached surface is **writable**. It offers `Pass`/`Drop`, in-place
-//! **header rewrite** (a bounds-checked store through the packet's `data`
-//! pointer), plus frame *retransmission* — `XDP_TX` (reflect out the ingress
-//! iface) and `XDP_REDIRECT` (send out a named iface) — of the
-//! **possibly-modified** frame. [`XdpProgram::run`] takes `&mut [u8]`, threaded
-//! from `iface::RxHandler` through each driver's RX path (virtio-net / e1000
-//! hand over a `&mut` borrow of their DMA/scratch buffer). That is a real
-//! bump-in-the-wire capability — inspect, rewrite, reflect, forward — reachable
-//! without a userspace daemon.
+//! The attached surface is **writable and resizable**. It offers `Pass`/`Drop`,
+//! in-place **header rewrite** (a bounds-checked store through the packet's
+//! `data` pointer), **frame resizing** (`bpf_xdp_adjust_head`/`_tail` move
+//! `data`/`data_end` to trim or grow the packet), plus frame *retransmission* —
+//! `XDP_TX` (reflect out the ingress iface) and `XDP_REDIRECT` (send out a named
+//! iface) — of the **possibly-modified, possibly-resized** frame.
+//! [`XdpProgram::run`] takes `&mut [u8]` and returns `(action, len)`: `len` is
+//! the resulting `[data, data_end)` length, and the packet occupies
+//! `frame[..len]`. The `&mut` slice is threaded from `iface::RxHandler` through
+//! each driver's RX path (virtio-net / e1000 hand over a `&mut` borrow of their
+//! DMA/scratch buffer); the resize is staged in `narf-bpf` and only the length
+//! crosses this seam. That is a real bump-in-the-wire capability — inspect,
+//! rewrite, resize, reflect, forward — reachable without a userspace daemon.
 //!
-//! What remains deferred is frame *resizing*: `bpf_xdp_adjust_head`/`_tail`
-//! (headroom/tailroom) are not implemented — a program may rewrite existing
-//! bytes but not grow or shrink the frame. `devmap`/`cpumap` fan-out
-//! (`BPF_F_BROADCAST`) is likewise a follow-on; `XDP_REDIRECT` here targets a
-//! single interface by ifindex.
+//! What remains deferred is `devmap`/`cpumap` fan-out (`BPF_F_BROADCAST`);
+//! `XDP_REDIRECT` here targets a single interface by ifindex.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -307,23 +308,29 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
 /// `narf-bpf`; declared here so `narf-net` keeps no dependency on the BPF
 /// subsystem, which is the same shape `PLUGGABILITY.md` uses everywhere else.
 ///
-/// **Writable.** [`Self::run`] takes `&mut [u8]`, so a program may rewrite
-/// header bytes in place (a store through the packet's `data` pointer, bounds-
-/// checked against `data_end` by the verifier and again by the interpreter).
-/// `XDP_TX` and `XDP_REDIRECT` then retransmit the *modified* frame — reflect
-/// out the ingress iface, or forward out a program-chosen one. What is *not*
-/// yet supported is frame resizing: `bpf_xdp_adjust_head`/`_tail`
-/// (head/tailroom), and `devmap`/`cpumap` fan-out, are deferred.
+/// **Writable and resizable.** [`Self::run`] takes `&mut [u8]`, so a program may
+/// rewrite header bytes in place (a store through the packet's `data` pointer,
+/// bounds-checked against `data_end` by the verifier and again by the
+/// interpreter) and resize the frame (`bpf_xdp_adjust_head`/`_tail`). It returns
+/// `(action, len)`: the resulting packet is `frame[..len]`, which `XDP_TX` and
+/// `XDP_REDIRECT` retransmit — reflect out the ingress iface, or forward out a
+/// program-chosen one. What is *not* yet supported is `devmap`/`cpumap` fan-out
+/// (`BPF_F_BROADCAST`), which is deferred.
 pub trait XdpProgram: Send + Sync + 'static {
     /// A name, for diagnostics.
     fn name(&self) -> &str;
-    /// Decide the frame's fate. Must not block.
+    /// Decide the frame's fate and report the resulting packet length. Must not
+    /// block.
     ///
     /// `frame` is `&mut`: the program may rewrite header bytes in place
-    /// (bounds-checked against `data_end` by the BPF verifier + runtime). The
-    /// mutation is what an ensuing `XDP_TX`/`XDP_REDIRECT` reflects, and it is
-    /// visible to the kernel stack on `Pass`.
-    fn run(&self, iface: &str, frame: &mut [u8]) -> XdpAction;
+    /// (bounds-checked against `data_end` by the BPF verifier + runtime), and may
+    /// *resize* the frame with `bpf_xdp_adjust_head`/`_tail`. The returned length
+    /// is the effective `[data, data_end)` window after the run, and the packet
+    /// bytes occupy `frame[..len]` — that is what an ensuing `XDP_TX`/
+    /// `XDP_REDIRECT` retransmits and what the kernel stack sees on `Pass`. A
+    /// program that only rewrites bytes (or does nothing) returns `frame.len()`.
+    /// `len` never exceeds `frame.len()`.
+    fn run(&self, iface: &str, frame: &mut [u8]) -> (XdpAction, usize);
 }
 
 /// What an [`XdpProgram`] decided.
@@ -440,14 +447,14 @@ pub fn count_xdp_tx_drop() {
 ///   off. That is a latency characteristic of attaching a program at all, not
 ///   something this function can fix; recorded in `bpf/specification/spec.md`
 ///   §8 rather than left for someone to discover from a jitter graph.
-fn run_xdp(iface: &str, frame: &mut [u8]) -> XdpAction {
+fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
     // Fast path for the overwhelmingly common case: nothing attached. Without
     // this, every RX frame paid an IRQ-save, a `lock cmpxchg`, and a linear
     // `String == &str` scan before the existing daemon and flow-table locks —
     // roughly a third more locking on the bypass path for a feature that is
     // off. `POLL_MODE` next door already uses this shape.
     if !XDP_ANY.load(Ordering::Relaxed) {
-        return XdpAction::Pass;
+        return (XdpAction::Pass, frame.len());
     }
     // The program runs while `XDP_PROGS` is held. That is a deliberate,
     // recorded limitation rather than an oversight: `Box<dyn XdpProgram>` is
@@ -457,11 +464,11 @@ fn run_xdp(iface: &str, frame: &mut [u8]) -> XdpAction {
     // contains nothing that re-enters this module. If that ever stops being
     // true, this deadlocks on a non-reentrant lock, so switch to `Arc` before
     // widening the kfunc set rather than after.
-    let action = {
+    let (action, len) = {
         let g = XDP_PROGS.lock();
         match g.iter().find(|(n, _)| n == iface) {
             Some((_, p)) => p.run(iface, frame),
-            None => return XdpAction::Pass,
+            None => return (XdpAction::Pass, frame.len()),
         }
     };
     match action {
@@ -476,39 +483,48 @@ fn run_xdp(iface: &str, frame: &mut [u8]) -> XdpAction {
         }
         XdpAction::Pass => {}
     }
-    action
+    // A resizing program can only deliver up to the caller frame's length; the
+    // run path already bounds the copy-back, so this is belt to that brace.
+    (action, len.min(frame.len()))
 }
 
 /// Classify an inbound L2 frame originating from `iface_name`.
-/// Returns the verdict and, if consumed, the frame is already
-/// staged into UMEM + posted to the RX ring of the chosen socket.
-pub fn classify(iface_name: &str, frame: &mut [u8]) -> Verdict {
+///
+/// Returns the verdict and the effective packet length after any XDP program
+/// ran: an attached program may resize the frame (`bpf_xdp_adjust_head`/`_tail`),
+/// so the live packet is `frame[..len]`, which is what every path below — the
+/// daemon/flow bypass, and the caller's `Pass`/`Transmit`/`Redirect` handling —
+/// must use. On a `Consumed` verdict the frame is already staged into UMEM +
+/// posted to the RX ring of the chosen socket. `len` never exceeds `frame.len()`.
+pub fn classify(iface_name: &str, frame: &mut [u8]) -> (Verdict, usize) {
     // An XDP program runs first — ahead of the daemon claim and the flow
     // table, mirroring Linux, where XDP sits in front of everything in
     // `netif_receive_skb_core`. It takes the frame `&mut` (in-place header
-    // rewrite); once it returns, every path below re-borrows immutably and so
-    // sees the possibly-modified bytes.
-    match run_xdp(iface_name, &mut *frame) {
-        XdpAction::Drop | XdpAction::Aborted => return Verdict::Dropped,
+    // rewrite and/or resize); once it returns, every path below re-borrows
+    // immutably over the resulting `frame[..len]` window and so sees the
+    // possibly-modified, possibly-resized bytes.
+    let len = match run_xdp(iface_name, &mut *frame) {
+        (XdpAction::Drop | XdpAction::Aborted, _) => return (Verdict::Dropped, 0),
         // Retransmit verdicts return to the caller unconsumed by the bypass
         // table: the caller sends the frame after `XDP_PROGS` is released, so
         // no transmit happens with IRQs masked. The frame does NOT continue to
         // the daemon/flow table or the kernel stack.
-        XdpAction::Tx => return Verdict::Transmit,
-        XdpAction::Redirect { ifindex } => return Verdict::Redirect { ifindex },
-        XdpAction::Pass => {}
-    }
+        (XdpAction::Tx, len) => return (Verdict::Transmit, len),
+        (XdpAction::Redirect { ifindex }, len) => return (Verdict::Redirect { ifindex }, len),
+        (XdpAction::Pass, len) => len,
+    };
+    let packet = &frame[..len];
 
     // Whole-NIC daemon attach — pure forward, no L3 parse needed.
     if let Some(sock) = daemon_socket(iface_name) {
-        return stage_into_socket(&sock, frame);
+        return (stage_into_socket(&sock, packet), len);
     }
 
     // Per-flow path: extract 5-tuple. Only IPv4 today — IPv6 5-tuple
     // matching slots in here when the bypass surface grows v6.
-    let key = match extract_flow_key(frame) {
+    let key = match extract_flow_key(packet) {
         Some(k) => k,
-        None => return Verdict::PassThrough,
+        None => return (Verdict::PassThrough, len),
     };
 
     let candidate = {
@@ -518,10 +534,11 @@ pub fn classify(iface_name: &str, frame: &mut [u8]) -> Verdict {
             .find(|c| c.key.matches(&key))
             .map(|c| c.socket.clone())
     };
-    match candidate {
-        Some(sock) => stage_into_socket(&sock, frame),
+    let verdict = match candidate {
+        Some(sock) => stage_into_socket(&sock, packet),
         None => Verdict::PassThrough,
-    }
+    };
+    (verdict, len)
 }
 
 /// Extract the 5-tuple from an Ethernet+IPv4+UDP/TCP frame. Returns

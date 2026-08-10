@@ -655,6 +655,61 @@ unsafe impl BpfType for Guard<'_> {
     }
 }
 
+/// The program's context pointer, as a kfunc argument.
+///
+/// A program enters with R1 pointing at its context tuple, and a kfunc that
+/// must *mutate* that tuple — `bpf_xdp_adjust_head`/`_tail`, which move the
+/// packet's `data`/`data_end` words so the program re-reads them — takes one of
+/// these. It is the Rust spelling of `PtrKind::Ctx`, which the verifier types
+/// as the context pointer (offset must be zero, read as it was handed in) and
+/// which no read-only helper declares — so its presence is the structural
+/// marker the verifier keys packet-bound invalidation on.
+///
+/// The value is never dereferenced through this handle. The XDP adjust kfuncs
+/// are interpreter intrinsics (like `bpf_ringbuf_reserve`): the interpreter
+/// intercepts their ids and mutates the VM's own context words and packet
+/// window directly, because in the interpreter the context is synthetic — R1 is
+/// a fabricated base, not a kernel address. The handle exists only so the
+/// signature can *name* the context argument and the verifier can see it.
+#[derive(Copy, Clone, Debug)]
+pub struct XdpCtx(u64);
+
+impl XdpCtx {
+    /// The raw context register, for the interpreter's interception path.
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+// SAFETY: stores the register verbatim and never dereferences it. The XDP
+// adjust kfuncs that take one are interpreter intrinsics whose bodies never
+// run; the interpreter reaches the real context words directly.
+unsafe impl BpfType for XdpCtx {
+    const DESC: ArgDesc = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Ctx,
+            key: TypeKey::NONE,
+        },
+        // The context pointer is valid for the whole non-preemptible run, and
+        // no stronger — it is not something the program may hold across an
+        // await (an XDP program never awaits regardless).
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    };
+    // A context pointer has no meaning coming back out of a program.
+    const LEGAL_IN_RET: bool = false;
+    #[inline]
+    unsafe fn from_raw(raw: u64, _next: u64) -> Self {
+        Self(raw)
+    }
+    #[inline]
+    fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
 // ── flag-carrying wrappers ──────────────────────────────────────────
 
 /// A value the verifier has proved constant. Linux spells it `__k`.

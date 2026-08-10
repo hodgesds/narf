@@ -5662,7 +5662,7 @@ fn smoke_bypass_classifier_per_flow_match() -> TestResult {
     };
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
     let mut frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
-    match crate::bypass::classify("lo.bypass-flow", &mut frame) {
+    match crate::bypass::classify("lo.bypass-flow", &mut frame).0 {
         crate::bypass::Verdict::Consumed => {}
         _ => return TestResult::Fail("expected Consumed"),
     }
@@ -5697,7 +5697,7 @@ fn smoke_bypass_classifier_no_match_pass_through() -> TestResult {
     };
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
     let mut frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 99], 80);
-    match crate::bypass::classify("lo.bypass-nopass", &mut frame) {
+    match crate::bypass::classify("lo.bypass-nopass", &mut frame).0 {
         crate::bypass::Verdict::PassThrough => TestResult::Pass,
         _ => TestResult::Fail("non-matching frame should pass through"),
     }
@@ -5725,7 +5725,7 @@ fn smoke_bypass_classifier_wildcard_matches() -> TestResult {
     let key = crate::bypass::FlowKey::default();
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
     let mut frame = bypass_build_eth_ipv4_tcp([1, 2, 3, 4], 9999);
-    match crate::bypass::classify("lo.bypass-wc", &mut frame) {
+    match crate::bypass::classify("lo.bypass-wc", &mut frame).0 {
         crate::bypass::Verdict::Consumed => TestResult::Pass,
         _ => TestResult::Fail("wildcard should match"),
     }
@@ -5776,7 +5776,7 @@ fn smoke_bypass_classifier_lpm_more_specific_wins() -> TestResult {
     };
     let _ = crate::bypass::register_flow(narrow, parts_b.socket.clone()).expect("narrow");
     let mut frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
-    let _ = crate::bypass::classify("lo.bypass-lpm", &mut frame);
+    let _ = crate::bypass::classify("lo.bypass-lpm", &mut frame).0;
     let mut rx_b = parts_b.rx_cons;
     if rx_b.try_recv().ok().flatten().is_none() {
         return TestResult::Fail("more-specific claim should win");
@@ -6040,7 +6040,7 @@ fn smoke_bypass_end_to_end_rx() -> TestResult {
     let key = crate::bypass::FlowKey::default();
     let _ = crate::bypass::register_flow(key, parts.socket.clone()).expect("register");
     let mut frame = bypass_build_eth_ipv4_tcp([10, 0, 0, 1], 80);
-    let v = crate::bypass::classify("lo.bypass-e2e", &mut frame);
+    let (v, _len) = crate::bypass::classify("lo.bypass-e2e", &mut frame);
     match v {
         crate::bypass::Verdict::Consumed => {}
         _ => return TestResult::Fail("classifier should consume"),

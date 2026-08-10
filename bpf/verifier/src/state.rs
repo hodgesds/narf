@@ -713,6 +713,31 @@ impl AbsState {
         self.refs.iter().filter(|r| r.is_lock).count()
     }
 
+    /// Drop every proven packet-extent bound.
+    ///
+    /// A `data`/`data_end` comparison publishes a readable prefix as `size` on
+    /// every live [`PtrClass::Mem`] register aliasing the packet (see
+    /// `fixpoint::refine`). After a kfunc resizes the frame —
+    /// `bpf_xdp_adjust_head`/`_tail` move `data`/`data_end` — that prefix is no
+    /// longer sound: the old bound may now overrun the shrunk packet or
+    /// under-describe the grown one. So the proof is struck off every packet
+    /// pointer, forcing the program to re-establish it with a fresh comparison
+    /// before its next packet access, exactly as Linux invalidates
+    /// packet-derived ranges after an adjust helper (`clear_all_pkt_pointers`).
+    ///
+    /// Only registers carry a packet extent — `refine` leaves stack spills
+    /// unrefined — so clearing `size` there is the whole of it. The pointer
+    /// itself survives: a subsequent `data < data_end` re-derives the bound.
+    pub fn invalidate_packet_bounds(&mut self) {
+        for r in &mut self.regs {
+            if let AbsValue::Ptr(p) = r {
+                if p.class == PtrClass::Mem && p.key.is_some() {
+                    p.size = None;
+                }
+            }
+        }
+    }
+
     /// Forget every register holding `id`, after it has been released.
     pub fn kill_ref(&mut self, id: u32) {
         for r in &mut self.regs {

@@ -488,6 +488,106 @@ fn dynamic_region_identity_must_match() {
     );
 }
 
+/// A frame-resizing kfunc in the `bpf_xdp_adjust_*` shape: it takes the mutable
+/// context pointer and a scalar delta. The `PtrKind::Ctx` argument is the marker
+/// the verifier keys packet-bound invalidation on.
+static ADJUST_ARGS: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Ctx,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    },
+    ArgDesc::SCALAR64,
+];
+
+fn adjust_kfunc() -> KfuncDesc {
+    kfunc(
+        "bpf_xdp_adjust_head",
+        ADJUST_ARGS,
+        ADJUST_ARGS[1],
+        Context::Atomic,
+    )
+}
+
+#[test]
+fn adjust_invalidates_proven_packet_bounds() {
+    // Prove `data + 14 <= data_end` (bytes 0..14 live), read byte 12, then call
+    // the adjust kfunc — which may have moved `data`/`data_end`. A second read at
+    // offset 12 with no fresh comparison must be rejected: the proof the first
+    // read leaned on was struck off at the call.
+    //
+    // The ctx pointer is stashed in R6 (callee-saved) so it survives the call —
+    // R1..R5 are clobbered — and `data` is reloaded from it afterwards, exactly
+    // as a real XDP program re-reads the moved pointer. The reloaded `data`
+    // carries no proven extent, so the read at offset 12 is out of bounds.
+    let prog = [
+        movr(6, 1),             // r6 = ctx (survives the call)
+        ldx(Size::Dw, 2, 1, 0), // r2 = data
+        ldx(Size::Dw, 3, 1, 8), // r3 = data_end
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 7), // data + 14 > data_end -> exit-0
+        ldx(Size::H, 0, 2, 12),    // first read: proven in bounds
+        movr(1, 6),                // r1 = ctx
+        mov(2, 4),                 // r2 = delta (any scalar)
+        call(0),                   // bpf_xdp_adjust_head(ctx, delta) — invalidates
+        ldx(Size::Dw, 2, 6, 0),    // reload data from ctx: no proven extent
+        ldx(Size::H, 0, 2, 12),    // read WITHOUT a fresh check -> rejected
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ];
+    assert_eq!(
+        check_full(
+            &prog,
+            PACKET_CTX_WRITABLE,
+            &[adjust_kfunc()],
+            Context::Atomic
+        )
+        .expect_err("a packet read after an adjust with no re-check must fail"),
+        VerifyError::OutOfBounds { at: 11 },
+    );
+}
+
+#[test]
+fn adjust_then_fresh_check_verifies() {
+    // The same shape, but the program re-proves `data + 14 <= data_end` after the
+    // adjust before reading again. With the bound re-established, the second read
+    // is admitted — invalidation forces a re-check, it does not forbid access.
+    let prog = [
+        movr(6, 1),             // r6 = ctx
+        ldx(Size::Dw, 2, 1, 0), // r2 = data
+        ldx(Size::Dw, 3, 1, 8), // r3 = data_end
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 11), // short frame -> exit-0
+        ldx(Size::H, 0, 2, 12),     // first read
+        movr(1, 6),                 // r1 = ctx
+        mov(2, 4),                  // r2 = delta
+        call(0),                    // adjust -> bounds invalidated
+        // Re-read data/data_end (they may have moved) and re-prove the bound.
+        ldx(Size::Dw, 2, 6, 0),
+        ldx(Size::Dw, 3, 6, 8),
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 2), // still short -> exit-0
+        ldx(Size::H, 0, 2, 12),    // second read: freshly certified
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ];
+    check_full(
+        &prog,
+        PACKET_CTX_WRITABLE,
+        &[adjust_kfunc()],
+        Context::Atomic,
+    )
+    .expect("a fresh data < data_end after the adjust re-certifies the read");
+}
+
 /// An acquiring kfunc: `fn acquire() -> Option<Owned<T>>`.
 fn acquire_kfunc() -> KfuncDesc {
     kfunc(

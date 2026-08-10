@@ -768,16 +768,23 @@ fn prog_test_run_xdp(
 
     let start = narf_time::monotonic_ns();
     let mut retval = 0u32;
+    // The post-program packet length. A program that calls
+    // `bpf_xdp_adjust_head`/`_tail` resizes the frame, and `run_xdp` reports the
+    // resulting `[data, data_end)` length in `frame[..out_len]` — matching Linux
+    // `BPF_PROG_TEST_RUN`, which returns `xdp->data_end - xdp->data` as
+    // `data_size_out`. A non-resizing program leaves it at `frame.len()`.
+    let mut out_len = frame.len();
     for _ in 0..repeat {
         // `&mut`: a program that rewrites the frame updates this buffer in
         // place, and the modified bytes are what `data_out` copies back —
         // matching Linux `BPF_PROG_TEST_RUN`, which returns the post-program
         // packet. Repeats run against the frame as the previous iteration left
         // it, the same as Linux.
-        let Some(outcome) = prog.run_xdp(&mut frame) else {
+        let Some((outcome, len)) = prog.run_xdp(&mut frame) else {
             return -EAGAIN;
         };
         retval = (outcome.value() & 0xFFFF_FFFF) as u32;
+        out_len = len;
     }
     let duration = narf_time::monotonic_ns()
         .saturating_sub(start)
@@ -785,16 +792,19 @@ fn prog_test_run_xdp(
         .unwrap_or(0)
         .min(u64::from(u32::MAX)) as u32;
 
-    let copied = core::cmp::min(frame.len(), data_size_out);
+    // Only the resulting window is meaningful output: a resizing program's
+    // packet is `frame[..out_len]`, and `out_len <= frame.len()`.
+    let packet = &frame[..out_len];
+    let copied = core::cmp::min(packet.len(), data_size_out);
     if copied != 0 {
         // SAFETY: `copy_to_user` validates the requested output prefix and
         // brackets SMAP. The source is the owned frame, now holding whatever the
         // program wrote into it.
-        if let Err(e) = unsafe { copy_to_user(data_out, &frame[..copied]) } {
+        if let Err(e) = unsafe { copy_to_user(data_out, &packet[..copied]) } {
             return -(e as i64);
         }
     }
-    let actual_size = frame.len() as u32;
+    let actual_size = packet.len() as u32;
     for (off, bytes) in [
         (T_DATA_SIZE_OUT, actual_size.to_le_bytes()),
         (T_RETVAL, retval.to_le_bytes()),
@@ -806,7 +816,7 @@ fn prog_test_run_xdp(
         }
     }
 
-    if data_size_out < frame.len() && data_out != 0 {
+    if data_size_out < packet.len() && data_out != 0 {
         -ENOSPC
     } else {
         0

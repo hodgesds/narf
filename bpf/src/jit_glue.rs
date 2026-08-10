@@ -513,6 +513,17 @@ pub fn try_compile(
     {
         return Err(JitSkip::Unsupported);
     }
+    // The XDP frame-resizing kfuncs are interpreter intrinsics too — they move
+    // the packet window inside the VM's staged frame buffer and rewrite the
+    // context words, neither of which native code can reach. A program that
+    // calls one runs interpreted; the interpreter intercepts the same ids
+    // (`kfuncs::is_xdp_adjust`).
+    if v.kfunc_calls
+        .iter()
+        .any(|c| crate::kfuncs::is_xdp_adjust(c.id))
+    {
+        return Err(JitSkip::Unsupported);
+    }
     scan_program(v)?;
 
     let map_imm64 = resolve_map_imm64(v, maps, map_indices);
