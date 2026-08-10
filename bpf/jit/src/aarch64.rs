@@ -94,11 +94,13 @@
 //! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
 //! [`emit_subprog_call`]). Left interpreted: the subprogram-address and BTF-id
 //! pseudo-forms of `LD_IMM64` (the map forms are emitted over the loader-resolved
-//! address) and arena accesses in a program that also makes BPF-to-BPF calls.
-//! Fetching bitwise arena atomics *are* emitted: the LSE fetch lands the old
-//! value in a scratch that is not the recovery handle (or, for AND, only after
-//! the faulting `LDCLR`), so the handle survives to name a fault. Everything
-//! unemitted returns
+//! address) and an arena access *inside* a subprogram — the base is parked
+//! relative to `sp`, which a call moves, and this backend has no spare register
+//! to anchor the entry `sp` the way x86-64 does, so it stays interpreted (an
+//! arena access in the main program composes with calls fine). Fetching bitwise
+//! arena atomics *are* emitted: the LSE fetch lands the old value in a scratch
+//! that is not the recovery handle (or, for AND, only after the faulting
+//! `LDCLR`), so the handle survives to name a fault. Everything unemitted returns
 //! [`JitError::Unsupported`] and runs interpreted, which is a complete
 //! implementation — so an unemitted instruction costs speed, not correctness.
 //!
@@ -1374,6 +1376,19 @@ fn emit_insn(
     // non-arena arms — anything else falls through to `Unsupported` and runs
     // interpreted rather than being lowered as a bare dereference.
     if arena {
+        // An arena access *inside* a subprogram falls back: the base is parked
+        // relative to `sp`, which a BPF-to-BPF call moves, and the single
+        // entry-frame fault epilogue could not recover a subprogram-depth fault.
+        // (The x86-64 backend anchors the entry `sp` in a spare register to lift
+        // this; aarch64 has no equally free register without growing every
+        // arena frame, so it stays interpreted here — still correct, just not
+        // native. Arena accesses in the main program compose with calls fine.)
+        if !in_main {
+            return Err(JitError::Unsupported {
+                at,
+                what: "arena access inside a subprogram has no aarch64 lowering",
+            });
+        }
         match *insn {
             Decoded::Load {
                 size,

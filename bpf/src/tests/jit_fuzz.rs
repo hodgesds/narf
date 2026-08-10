@@ -1565,3 +1565,74 @@ kernel_test_in!(
     "bpf/fuzz",
     smoke_bpf_jit_fuzz_fetching_bitwise_arena_atomic_matches_the_interpreter
 );
+
+fn smoke_bpf_jit_arena_access_inside_a_subprogram_matches_the_interpreter() -> TestResult {
+    // The residual this closes: an arena access at call depth 1, where a
+    // BPF-to-BPF call has moved `sp`. `main` calls `sub`, which takes the arena
+    // base and stores then loads through it. Two offsets: one in bounds (returns
+    // the value) and one past the one-page arena (faults *inside the
+    // subprogram*). The x86-64 backend reaches the base through the entry-`sp`
+    // anchor and, on the fault, resets `sp` to it before unwinding — so both must
+    // agree with the interpreter, value and trap discriminant alike. aarch64
+    // leaves a subprogram arena access interpreted, so `diff_run` reports it as
+    // not-compiled there; the run itself still has to match the expectation.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let cap = crate::arena::kernel_arena_cap();
+    let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
+        Ok(g) => alloc::sync::Arc::new(g),
+        Err(_) => return TestResult::Fail("could not reserve an arena for the subprogram probe"),
+    };
+    for &(off, in_bounds) in &[(0i16, true), (8000i16, false)] {
+        // main: call sub; exit (returns sub's R0).
+        // sub:  r0 = arena base; *(u64*)(r0+off) = 0x5A; r0 = *(u64*)(r0+off); exit
+        let items = alloc::vec![
+            super::subprog_call(1),
+            Decoded::Exit,
+            call_arena_base(),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(0),
+                off,
+                src: Source::Imm(0x5A),
+            },
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(0),
+                src: r(0),
+                off,
+            },
+            Decoded::Exit,
+        ];
+        let Some(p) = load_against(&group, &items) else {
+            note!("bpf-fuzz: the verifier rejected the subprogram arena probe (off={off})");
+            return TestResult::Fail("the subprogram arena probe no longer verifies");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            // aarch64 leaves a subprogram arena access interpreted — not a
+            // divergence, just no native side to compare.
+            Err(e) if e == NOT_COMPILED => {}
+            Err(e) => {
+                note!("bpf-fuzz: subprogram arena access diverged (off={off}) — {e}");
+                return TestResult::Fail("native and interpreted subprogram arena runs diverged");
+            }
+        }
+        match (p.run_atomic([0; 4], 4), in_bounds) {
+            (Some(Outcome::Returned(0x5A)), true) => {}
+            (Some(Outcome::Trapped(crate::interp::Trap::ArenaOutOfBounds { .. })), false) => {}
+            (other, _) => {
+                note!("bpf-fuzz: subprogram arena probe off={off} gave {other:?}");
+                return TestResult::Fail("a subprogram arena access produced the wrong outcome");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/fuzz",
+    smoke_bpf_jit_arena_access_inside_a_subprogram_matches_the_interpreter
+);

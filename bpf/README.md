@@ -54,12 +54,18 @@ Landed:
   XDP test-run translates `data_in` into a kernel-owned immutable frame rather
   than accepting caller-authored native context pointers.
 
-Residual: JIT lowering of arena access under a subprogram call (a register-
-allocation blocker — it falls back to the interpreter); optional direct
-typed-field loads (mediated typed tracing has landed); and the non-PKS hardware
-domain-confinement backends (below). Fetching bitwise arena atomics now lower on
-both architectures (x86_64 via a `cmpxchg` loop that preserves R0 in a reserved
-frame word; aarch64 via its LSE fetch).
+Residual: optional direct typed-field loads (mediated typed tracing has landed)
+and the non-PKS hardware domain-confinement backends (below).
+
+Two former JIT residuals now lower. **Fetching bitwise arena atomics**: x86_64
+via a `cmpxchg` loop that preserves R0 in a reserved frame word, aarch64 via its
+LSE fetch. **Arena access under a BPF-to-BPF call**: x86_64 anchors the entry
+`rsp` in a spare register, so an arena access reaches its base at any call depth
+and an arena fault or out-of-fuel exit resets `rsp` to that anchor before
+unwinding — an arena access inside a subprogram now JITs. aarch64 has no equally
+free register, so it composes arena with calls for accesses in the *main*
+program and leaves an access inside a subprogram interpreted (correct, not
+native).
 
 The JIT is enabled **behind the verifier**: the interpreter's safety came from
 never dereferencing a program-supplied address, and native code trades that for
