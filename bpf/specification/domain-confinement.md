@@ -1,7 +1,8 @@
 # `bpf/` — hardware-domain confinement (design note)
 
 Status: **design, pre-implementation.** Companion to `spec.md`. Scoped to
-PKS/Intel first; AMD PCID and aarch64 MTE are deferred (§8).
+PKS/Intel enforces per-page; AMD PCID (CR3-swap) and aarch64 MTE (structural)
+are now wired too (§8, §11).
 
 ## 1. Purpose
 
@@ -291,14 +292,17 @@ verifier bug is a primitive" priority this whole note is organized around.
 
 ## 8. Scope / non-goals
 
-- **PKS / Intel SPR+ only**, first cut. Enforcement is already live there.
-- **AMD PCID deferred.** PCID isolates spatially via per-domain PML4s, not
-  per-page pkeys, so "BPF in a domain" there means giving BPF a private VA range
-  and a CR3 switch on entry (~50–100 cyc) — a larger change. The confinement
-  *policy* (§3) is identical; only the mechanism differs.
-- **aarch64 MTE deferred.** `enter_domain`/`exit_domain` are structural saves
-  today; real tag-fault enforcement is a Stage-3 allocator task
-  (`arch/src/aarch64/mte.rs`).
+- **PKS / Intel SPR+**: enforcement is live (per-page pkeys, one `WRMSR`).
+- **AMD PCID: wired.** PCID isolates spatially via per-domain PML4s, not per-page
+  pkeys, so "BPF in a domain" there is a `CR3` switch on entry (~50–100 cyc) into
+  the BPF domain's PML4. `run_atomic` now takes that switch (validated under KVM,
+  boot reports `domain enforcer: pcid`); the BPF PML4 is a bootstrap byte-clone,
+  so BPF's own kernel-VA regions stay mapped while its private VA range is its
+  own. The confinement *policy* (§3) is identical; only the mechanism differs.
+  Strength grows as subsystems move state into their private domains.
+- **aarch64 MTE: wired, structural.** `enter_domain`/`exit_domain` do a
+  `SCTLR_EL1`/`GCR_EL1` save that `run_atomic` now takes; real tag-fault
+  enforcement is a Stage-3 allocator task (`arch/src/aarch64/mte.rs`).
 - Not changing the verifier, the kfunc surface, or the map ABI. This is a
   containment layer *under* them.
 
@@ -340,11 +344,18 @@ The struct_ops consumer and the confinement fence have both landed on PKS.
 
 - **Domain.** `DomainId::BPF = 14` (`lib/src/id.rs`), taking the former
   `DRIVER_5` slot; the dedicated-driver pool is now `DRIVER_0..=DRIVER_4` (cap 5).
-- **Fence.** `bpf/src/domain.rs`: `enter() -> Confined` calls
-  `pks::enter_domain(FRAME, BPF)` when the PKS backend is live and restores on
-  `Drop`; a no-op on AMD PCID / aarch64 MTE (deferred, §8). `BpfProg::run_atomic`
-  holds the guard across the whole run, so **both** the interpreter and the JIT
-  path are confined — feasible precisely because FRAME stays rw (§4.1).
+- **Fence.** `bpf/src/domain.rs`: `enter() -> Confined` enters the BPF domain
+  through the unified `Pks::enter_domain(FRAME, BPF)` on x86_64 and
+  `Mte::enter_domain(FRAME, BPF)` on aarch64, restoring on `Drop`.
+  `BpfProg::run_atomic` holds the guard across the whole run, so **both** the
+  interpreter and the JIT path are confined — feasible precisely because FRAME
+  stays rw (§4.1). The x86_64 seam drives **PKS** on Intel SPR+ and **PCID** on
+  AMD / pre-SPR (a `CR3` swap into the BPF domain's PML4, a bootstrap byte-clone
+  so every BPF kernel-VA region stays mapped); the aarch64 seam drives **MTE** as
+  a structural `SCTLR_EL1`/`GCR_EL1` save (real tag-fault enforcement pairs with
+  the Stage-3 MTE-tag-aware allocator). Validated under KVM: the boot reports
+  `domain enforcer: pcid` and the full bpf suite runs green with every
+  `run_atomic` behind a real CR3 swap into the BPF PML4.
 - **Non-breaking.** Every page BPF touches today is FRAME (arena/text are mapped
   with no `pk()`), so no memory-tagging was needed and all runtime smokes pass
   with the fence live under real PKS.
@@ -363,7 +374,10 @@ The struct_ops consumer and the confinement fence have both landed on PKS.
 
 Deferred from here: kfunc-shim behaviour is already correct (shims run in FRAME,
 which stays rw), so the "no-kfunc only" restriction §7 anticipated proved
-unnecessary. Remaining: subsystem memory-tagging (which turns the fence from
-"isolates BPF from other domains" into "protects the cap table", once
-`capabilities/` tags its table into `CAPS`), optional BPF-private-memory tagging
-into `DOMAIN_BPF` (hardening), and the AMD PCID / aarch64 MTE backends.
+unnecessary. The AMD PCID and aarch64 MTE backends are now wired (the x86_64 seam
+dispatches PKS/PCID; the aarch64 seam does a structural MTE save). Remaining:
+subsystem memory-tagging (which turns the fence from "isolates BPF from other
+domains" into "protects the cap table", once `capabilities/` tags its table into
+`CAPS`), optional BPF-private-memory tagging into `DOMAIN_BPF` (hardening), and —
+for MTE — the Stage-3 tag-aware allocator that upgrades the structural save into
+real tag-fault enforcement.

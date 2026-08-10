@@ -65,8 +65,18 @@ time), and is refused otherwise rather than lowered to a raw dereference. The
 base register holds the tracing wrapper rather than the object, so the certified
 load is serviced by the interpreter through the live `TypedProbeRef` — with the
 runtime field recheck intact — and is deliberately kept out of the JIT's bare-
-dereference set. Residual: the non-PKS hardware domain-confinement backends
-(below).
+dereference set.
+
+BPF's hardware confinement is now wired on every backend, not just PKS: on
+x86_64 `run_atomic` enters the BPF domain through the unified `Pks` enforcer, so
+an AMD / pre-SPR host drives it via **PCID** (a `CR3` swap into the BPF domain's
+PML4 — a bootstrap byte-clone, so every BPF kernel-VA region stays mapped) rather
+than falling back to unconfined; on aarch64 it enters via **MTE** (a structural
+`SCTLR_EL1`/`GCR_EL1` save today, real tag-fault enforcement pairing with the
+Stage-3 MTE-tag-aware allocator). As with PKS, the mechanism is complete on each
+backend and the isolation strength grows as subsystems move state into private
+domains. Residual: subsystem private-domain tagging, which turns the fence from
+an escape-containment property into a positive one (below).
 
 Two former JIT residuals now lower. **Fetching bitwise arena atomics**: x86_64
 via a `cmpxchg` loop that preserves R0 in a reserved frame word, aarch64 via its
