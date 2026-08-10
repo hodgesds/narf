@@ -41,7 +41,11 @@ Landed:
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
   XDP exposes read-only `data`/`data_end` pointers: packet loads require a
   verifier-proved dynamic bound and are independently slice-bounded by the
-  interpreter.
+  interpreter. Actions: `PASS`/`DROP`/`ABORTED` plus `TX` and `REDIRECT` as
+  retransmission of the *unmodified* frame — `TX` reflects out the ingress
+  iface, `REDIRECT` sends out the iface named by a `bpf_redirect(ifindex)`
+  kfunc. In-place packet mutation (writable data, `bpf_xdp_adjust_head`) and
+  `devmap`/`cpumap` fan-out remain a follow-on.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with

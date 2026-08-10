@@ -9,9 +9,49 @@
 //! Invariant §4.6 applies to every one of them: no global allocator, no
 //! `alloc_frame`, no lock a caller might already hold.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use narf_lib::percpu::{current_cpu, MAX_CPUS};
 
 use crate::types::{fnv1a32_nonzero, TraceFieldOffset, TraceSource};
+
+/// XDP redirect target, one slot per CPU.
+///
+/// `bpf_redirect` has no writable context word to convey the target ifindex
+/// through — the XDP frame is read-only (see `attach_xdp.rs`). Instead it
+/// stashes the ifindex here and the classifier reads it back when the program
+/// returns `XDP_REDIRECT` (4). A per-CPU slot rather than one global cell
+/// because an XDP program runs with IRQs masked (`run_xdp` holds `XDP_PROGS`,
+/// an `IrqSafeSpinLock`), so between the `bpf_redirect` call and the
+/// classifier's read the running CPU cannot change and no other frame on this
+/// CPU can overwrite the slot. `+1` biasing distinguishes "no redirect
+/// requested" (0) from "redirect to ifindex 0"; the classifier only consults
+/// the slot on a return of 4, so a stale value from a prior frame is never
+/// mistaken for a live request.
+static XDP_REDIRECT_TARGET: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Read and clear the current CPU's pending XDP redirect target.
+///
+/// Returns the ifindex a `bpf_redirect` on this CPU stashed, or `None` if the
+/// program requested no redirect. Called by the classifier immediately after
+/// an XDP program returns 4, on the same CPU with IRQs still masked, so the
+/// read pairs with the store the program made a few instructions earlier.
+#[must_use]
+pub fn take_xdp_redirect_target() -> Option<u32> {
+    let slot = &XDP_REDIRECT_TARGET[current_cpu()];
+    match slot.swap(0, Ordering::Relaxed) {
+        0 => None,
+        biased => Some(biased - 1),
+    }
+}
+
+/// Drop any stale redirect target on the current CPU.
+///
+/// Called before running an XDP program so a `bpf_redirect` from a *previous*
+/// frame that then returned a non-redirect action cannot leak into this one.
+pub fn clear_xdp_redirect_target() {
+    XDP_REDIRECT_TARGET[current_cpu()].store(0, Ordering::Relaxed);
+}
 
 /// The `call` immediate for [`narf_yield`].
 ///
@@ -66,6 +106,29 @@ crate::kfunc! {
         COUNTERS
             .get(slot as usize)
             .map_or(u64::MAX, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Request that the current XDP frame be redirected out interface `ifindex`.
+    ///
+    /// Models Linux's `bpf_redirect(ifindex, flags)` helper. The frame is
+    /// read-only, so there is no writable context word to carry the target
+    /// through; instead the ifindex is stashed in a per-CPU slot that the
+    /// classifier consults when the program returns `XDP_REDIRECT` (4). The
+    /// program itself still has to return 4 for the redirect to take effect —
+    /// this kfunc only records *where*. Returns `XDP_REDIRECT` so a program may
+    /// `return bpf_redirect(n, 0)` directly, matching Linux, where the helper's
+    /// return value is the action the program is expected to propagate.
+    ///
+    /// `flags` is accepted for Linux source compatibility and currently
+    /// ignored: `BPF_F_BROADCAST`/`BPF_F_EXCLUDE_INGRESS` need devmap fan-out,
+    /// which this read-only surface does not implement (see `attach_xdp.rs`).
+    #[context(Atomic)]
+    pub fn bpf_redirect(ifindex: u32, _flags: u64) -> u64 {
+        // `+1`-biased so a real ifindex of 0 is still distinguishable from the
+        // "no request" sentinel the classifier clears the slot to.
+        XDP_REDIRECT_TARGET[current_cpu()].store(ifindex.wrapping_add(1), Ordering::Relaxed);
+        // XDP_REDIRECT.
+        4
     }
 
     /// Copy one declared field from the current typed tracing object.

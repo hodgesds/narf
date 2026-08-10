@@ -236,6 +236,46 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
     send_fn(frame)
 }
 
+/// Send a complete Ethernet frame out the interface named `iface_name`.
+/// Returns `Err` if no such iface is registered or the driver failed.
+///
+/// The retransmit primitive behind XDP `XDP_TX` (reflect out the ingress
+/// iface) and `XDP_REDIRECT` (send out a target iface). We look the send fn up
+/// under the lock and release it before calling — the driver's send path may
+/// re-enter the registry, and holding the `IrqSafeSpinLock` across it would
+/// deadlock. The classifier is the sole XDP caller and invokes this only after
+/// its own `XDP_PROGS` lock is released, so no BPF-side lock is held here.
+pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
+    let send_fn = {
+        let g = IFACES.lock();
+        let v = g.as_ref().ok_or(())?;
+        let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
+        e.send
+    };
+    send_fn(frame)
+}
+
+/// Send a frame out the interface at synthetic `ifindex`.
+///
+/// The ifindex space matches the rtnetlink dump responder's: index 1 is the
+/// synthetic loopback (nothing to transmit onto — treated as `Err`), and
+/// 2, 3, … map to registered interfaces in registration order (the same order
+/// [`snapshot_all`] returns). This is the resolution XDP `XDP_REDIRECT` uses to
+/// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
+/// if the ifindex names no registered iface or the driver failed.
+pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
+    // 0 and 1 are reserved (0 = "none", 1 = loopback); registered NICs start
+    // at 2, so subtract the two reserved slots to index the registry.
+    let pos = (ifindex as usize).checked_sub(2).ok_or(())?;
+    let send_fn = {
+        let g = IFACES.lock();
+        let v = g.as_ref().ok_or(())?;
+        let e = v.get(pos).ok_or(())?;
+        e.send
+    };
+    send_fn(frame)
+}
+
 /// First interface visible in `net_ns_id`.
 pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();

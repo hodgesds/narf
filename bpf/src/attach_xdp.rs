@@ -5,12 +5,16 @@
 //!
 //! ## Two limitations, both structural and both recorded
 //!
-//! **The frame is read-only.** Linux's XDP programs rewrite headers and can
-//! return `XDP_TX` or `XDP_REDIRECT`. Those need a `&mut [u8]` frame, which
-//! means widening `narf_net::iface::RxHandler` and every driver RX path feeding
-//! it — virtio-net and e1000 both hand over an immutable borrow of a DMA buffer
-//! today. Deferred deliberately; `Pass`/`Drop` is what filtering and
-//! drop-based mitigation need, and it is reached without touching a driver.
+//! **The frame is read-only.** `XDP_TX` and `XDP_REDIRECT` *are* supported, but
+//! only as retransmission of the **unmodified** frame — reflect it back out the
+//! ingress iface (`XDP_TX`), or send it out a program-chosen one
+//! (`XDP_REDIRECT`, target ifindex conveyed through the `bpf_redirect` kfunc in
+//! [`crate::kfuncs`]). What is deferred is in-place *mutation*: Linux's XDP
+//! programs also rewrite headers and `bpf_xdp_adjust_head`, which need a
+//! `&mut [u8]` frame, which means widening `narf_net::iface::RxHandler` and
+//! every driver RX path feeding it — virtio-net and e1000 both hand over an
+//! immutable borrow of a DMA buffer today. `devmap`/`cpumap` fan-out
+//! (`BPF_F_BROADCAST`) is likewise a follow-on.
 //!
 //! **Frame reads are dynamically bounded.** Context words 0 and 1 are the
 //! frame's `data` and exclusive `data_end` pointers. A program must compare a
@@ -54,6 +58,13 @@ impl XdpProgram for BpfXdp {
     }
 
     fn run(&self, _iface: &str, frame: &[u8]) -> XdpAction {
+        // Drop any redirect target a prior frame's `bpf_redirect` left on this
+        // CPU: a program that calls `bpf_redirect` and then returns something
+        // other than 4 must not have that ifindex leak into the *next* frame
+        // that returns 4. Cleared before the run and consumed (swap-to-clear)
+        // on a return of 4, so the slot holds a live request for at most the
+        // window between this program's `bpf_redirect` call and its return.
+        crate::kfuncs::clear_xdp_redirect_target();
         // Only a program that *returned* decides. `Outcome::value()` is 0 for a
         // trap, so matching on it treated every trap as an unknown action and
         // therefore dropped the frame — the exact opposite of the policy stated
@@ -61,11 +72,24 @@ impl XdpProgram for BpfXdp {
         // runtime), so a program that exhausts fuel would have silently dropped
         // *every frame on the interface*.
         match self.prog.run_xdp(frame) {
-            // Linux's XDP_PASS is 2 and XDP_DROP is 1; matching those keeps a
-            // program written against Linux's constants behaving the same way.
+            // Linux's XDP action constants: DROP=1, PASS=2, TX=3, REDIRECT=4.
+            // Matching those keeps a program written against Linux's constants
+            // behaving the same way.
             Some(crate::interp::Outcome::Returned(v)) => match v {
                 1 => XdpAction::Drop,
                 2 => XdpAction::Pass,
+                // Reflect the unmodified frame out the ingress iface.
+                3 => XdpAction::Tx,
+                // Redirect: the target ifindex is whatever `bpf_redirect`
+                // stashed for this frame on this CPU. A bare `return 4` with no
+                // preceding `bpf_redirect` has no target — treat that as
+                // `Aborted` (a redirect with nowhere to go is a program bug),
+                // matching Linux, where `XDP_REDIRECT` without a prior helper
+                // that primed the redirect info is dropped as an error.
+                4 => match crate::kfuncs::take_xdp_redirect_target() {
+                    Some(ifindex) => XdpAction::Redirect { ifindex },
+                    None => XdpAction::Aborted,
+                },
                 // Any other *returned* value is a program bug. Linux treats an
                 // unknown action as XDP_ABORTED, and so does this — dropping
                 // while counting it, so a broken program is visible rather than

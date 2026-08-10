@@ -725,13 +725,57 @@ mod smokes {
         .ok()
     }
 
-    /// `classify()`'s verdict, as a pair of predicates — `Verdict` carries a
-    /// payload on `Consumed` and so is not `PartialEq`.
+    /// `classify()`'s verdict, as predicates — a payload-carrying variant is
+    /// awkward to pattern-match at each call site.
     fn dropped(v: Verdict) -> bool {
         matches!(v, Verdict::Dropped)
     }
     fn passed_through(v: Verdict) -> bool {
         matches!(v, Verdict::PassThrough)
+    }
+    fn transmit(v: Verdict) -> bool {
+        matches!(v, Verdict::Transmit)
+    }
+    fn redirects_to(v: Verdict, ifindex: u32) -> bool {
+        matches!(v, Verdict::Redirect { ifindex: got } if got == ifindex)
+    }
+
+    /// `r1 = ifindex; r2 = 0; call bpf_redirect; exit` — the XDP_REDIRECT
+    /// shape. `bpf_redirect` stashes the ifindex per-CPU and leaves
+    /// XDP_REDIRECT (4) in r0, which the trailing `exit` returns verbatim.
+    fn redirect_xdp_prog(name: &str, ifindex: i32) -> Option<Arc<BpfProg>> {
+        use narf_bpf_isa::CallTarget;
+        let mut insns: Vec<Insn> = Vec::new();
+        for d in [
+            Decoded::Mov {
+                wide: true,
+                dst: Reg::new(1).expect("r1"),
+                src: Source::Imm(ifindex),
+                sign_extend: None,
+            },
+            Decoded::Mov {
+                wide: true,
+                dst: Reg::new(2).expect("r2"),
+                src: Source::Imm(0),
+                sign_extend: None,
+            },
+            Decoded::Call(CallTarget::Kfunc(crate::kfunc::id_for("bpf_redirect"))),
+            Decoded::Exit,
+        ] {
+            insns.extend_from_slice(encode(d).slots());
+        }
+        BpfProg::load_for_xdp(
+            load_cap(),
+            LoadRequest {
+                name: String::from(name),
+                insns,
+                context: Context::Atomic,
+                maps: Vec::new(),
+                map_indices: Vec::new(),
+                load_references: Vec::new(),
+            },
+        )
+        .ok()
     }
 
     // ── tracing links ───────────────────────────────────────────────
@@ -992,6 +1036,62 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("bpf", smoke_bpf_link_drop_detaches_xdp);
+
+    /// `XDP_TX` and `XDP_REDIRECT` surface as retransmit verdicts through the
+    /// real `classify()` entry point — the same path a NIC's RX takes.
+    ///
+    /// This is the end-to-end proof that the whole chain holds: a program
+    /// returning 3 (`XDP_TX`) makes `classify` yield `Verdict::Transmit`, and a
+    /// program that calls `bpf_redirect(N)` then returns 4 makes it yield
+    /// `Verdict::Redirect{ifindex: N}` — the ifindex having survived the trip
+    /// through the per-CPU slot the kfunc stashed it in. The classifier does
+    /// NOT transmit here (it holds `XDP_PROGS` with IRQs masked while the
+    /// program runs); it hands the verdict back and the `tcp_stack` RX path
+    /// sends after the lock is released.
+    fn smoke_bpf_link_xdp_tx_and_redirect_verdicts() -> TestResult {
+        const TX_IFACE: &str = "bpf-link-xdp-tx";
+        const REDIR_IFACE: &str = "bpf-link-xdp-redir";
+        const TARGET_IFINDEX: i32 = 4;
+
+        // XDP_TX (3) → Verdict::Transmit.
+        let Some(tx_prog) = ret_xdp_prog("linkxdp_tx", 3) else {
+            return TestResult::Fail("load rejected a trivial XDP_TX program");
+        };
+        let tx_link =
+            match BpfLink::create(caps(), LinkTarget::Xdp(String::from(TX_IFACE)), tx_prog) {
+                Ok(l) => l,
+                Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP_TX target"),
+            };
+        if !transmit(classify(TX_IFACE, &[0u8; 64])) {
+            return TestResult::Fail("XDP_TX did not yield Verdict::Transmit");
+        }
+        drop(tx_link);
+        if !passed_through(classify(TX_IFACE, &[0u8; 64])) {
+            return TestResult::Fail("frames were still transmitted after the link was dropped");
+        }
+
+        // bpf_redirect(N) then return 4 → Verdict::Redirect{ifindex: N}.
+        let Some(redir_prog) = redirect_xdp_prog("linkxdp_redir", TARGET_IFINDEX) else {
+            return TestResult::Fail("load rejected a program calling bpf_redirect");
+        };
+        let redir_link = match BpfLink::create(
+            caps(),
+            LinkTarget::Xdp(String::from(REDIR_IFACE)),
+            redir_prog,
+        ) {
+            Ok(l) => l,
+            Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP_REDIRECT target"),
+        };
+        if !redirects_to(classify(REDIR_IFACE, &[0u8; 64]), TARGET_IFINDEX as u32) {
+            return TestResult::Fail("bpf_redirect ifindex did not reach Verdict::Redirect");
+        }
+        drop(redir_link);
+        if !passed_through(classify(REDIR_IFACE, &[0u8; 64])) {
+            return TestResult::Fail("frames were still redirected after the link was dropped");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bpf", smoke_bpf_link_xdp_tx_and_redirect_verdicts);
 
     /// Two links cannot share an interface either — and here the owner table is
     /// the *only* thing enforcing it.

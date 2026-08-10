@@ -2459,6 +2459,64 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_unknown_action_aborts);
 
+fn smoke_bpf_xdp_tx_reflects() -> TestResult {
+    // Linux's XDP_TX is 3. A program returning it asks for the unmodified frame
+    // to be reflected back out the ingress iface; `BpfXdp::run` must surface
+    // that as `XdpAction::Tx` (the classifier then turns it into a
+    // `Verdict::Transmit` — proven end-to-end in `link.rs`).
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    let insns = asm(&[mov_imm(0, 3), EXIT]);
+    let Ok(prog) = load_xdp("xdp-tx", insns) else {
+        return TestResult::Fail("load rejected an XDP_TX program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "tx0");
+    if x.run("tx0", &[0u8; 64]) != XdpAction::Tx {
+        return TestResult::Fail("return code 3 did not map to XdpAction::Tx");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_tx_reflects);
+
+fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
+    // A program calls `bpf_redirect(ifindex, 0)` — which stashes the ifindex in
+    // a per-CPU slot and itself returns XDP_REDIRECT (4) — then returns R0. The
+    // dispatch reads the slot back and yields `XdpAction::Redirect{ifindex}`.
+    // This is the whole point of the per-CPU-slot mechanism: a read-only frame
+    // has no context word to carry the target, so it rides the slot instead.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    const IFINDEX: i32 = 7;
+    let insns = asm(&[
+        mov_imm(1, IFINDEX), // r1 = ifindex
+        mov_imm(2, 0),       // r2 = flags
+        call("bpf_redirect"),
+        // `bpf_redirect` leaves XDP_REDIRECT (4) in r0; return it verbatim.
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-redir", insns) else {
+        return TestResult::Fail("load rejected a program calling bpf_redirect");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "redir0");
+    match x.run("redir0", &[0u8; 64]) {
+        XdpAction::Redirect { ifindex } if ifindex == IFINDEX as u32 => {}
+        _ => {
+            return TestResult::Fail("bpf_redirect target ifindex was not conveyed to the verdict");
+        }
+    }
+    // A second run with no `bpf_redirect` must not inherit the prior target:
+    // `BpfXdp::run` clears the slot before running, and a bare `return 4` with
+    // nothing primed is a program bug → Aborted.
+    let bare = asm(&[mov_imm(0, 4), EXIT]);
+    let Ok(bare_prog) = load_xdp("xdp-redir-bare", bare) else {
+        return TestResult::Fail("load rejected a bare return-4 program");
+    };
+    let y = crate::attach_xdp::BpfXdp::for_test(bare_prog, "redir1");
+    if y.run("redir1", &[0u8; 64]) != XdpAction::Aborted {
+        return TestResult::Fail("XDP_REDIRECT with no bpf_redirect target was not aborted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_redirect_carries_ifindex);
+
 fn smoke_bpf_jit_fuel_covers_every_path() -> TestResult {
     // The risk fuel emission actually has: if a back-edge target is not a block
     // start, the loop bypasses the burn and runs forever. `block_starts` marks

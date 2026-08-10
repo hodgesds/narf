@@ -24,10 +24,17 @@
 //! the daemon claim and the flow table, mirroring Linux's ordering in
 //! `netif_receive_skb_core`.
 //!
-//! The attached surface is **read-only** and offers `Pass`/`Drop` only. Header
-//! rewriting, `XDP_TX` and `XDP_REDIRECT` need a `&mut [u8]` frame, which means
-//! widening `iface::RxHandler` and every driver RX path that feeds it — see
-//! [`XdpProgram`] for why that is deferred rather than done.
+//! The attached surface is **read-only**. It offers `Pass`/`Drop` plus frame
+//! *retransmission* — `XDP_TX` (reflect out the ingress iface) and
+//! `XDP_REDIRECT` (send out a named iface) — of the **unmodified** frame. That
+//! is a real bump-in-the-wire capability (reflect / forward) reachable without
+//! touching a driver RX path.
+//!
+//! What remains deferred is in-place **mutation**: header rewriting and
+//! `bpf_xdp_adjust_head`/`_tail` need a `&mut [u8]` frame, which means widening
+//! `iface::RxHandler` and every driver RX path that feeds it — see
+//! [`XdpProgram`]. `devmap`/`cpumap` fan-out (`BPF_F_BROADCAST`) is likewise a
+//! follow-on; `XDP_REDIRECT` here targets a single interface by ifindex.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -242,7 +249,7 @@ fn daemon_socket(iface_name: &str) -> Option<Arc<XdpSocket>> {
 }
 
 /// Verdict the classifier returns to the iface-side RX dispatch.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Frame was consumed by the bypass path. Caller must NOT pass
     /// it to the kernel TCP stack.
@@ -254,6 +261,16 @@ pub enum Verdict {
     /// fall through. Today we drop — that matches Linux's XDP
     /// XDP_DROP semantics when XSK FILL is starved.
     Dropped,
+    /// `XDP_TX`: retransmit the (unmodified) frame back out the ingress
+    /// interface. The caller sends after the `XDP_PROGS` lock is released —
+    /// [`run_xdp`] deliberately does not transmit while it holds the lock with
+    /// IRQs masked.
+    Transmit,
+    /// `XDP_REDIRECT`: send the (unmodified) frame out the interface named by
+    /// `ifindex`. Same as [`Verdict::Transmit`] but out a program-chosen NIC;
+    /// the caller resolves the ifindex and transmits after the lock is
+    /// released.
+    Redirect { ifindex: u32 },
 }
 
 /// Toggle per-iface poll mode. `on = true` masks RX IRQ; `false`
@@ -286,12 +303,14 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
 /// `narf-bpf`; declared here so `narf-net` keeps no dependency on the BPF
 /// subsystem, which is the same shape `PLUGGABILITY.md` uses everywhere else.
 ///
-/// **Read-only.** Linux's XDP programs rewrite headers and can return `XDP_TX`
-/// or `XDP_REDIRECT`; those need a `&mut [u8]` frame, which means widening
+/// **Read-only.** `XDP_TX` and `XDP_REDIRECT` are supported here as
+/// retransmission of the *unmodified* frame — reflect out the ingress iface,
+/// or forward out a program-chosen one. What is *not* supported is in-place
+/// mutation: Linux's XDP programs also rewrite headers and
+/// `bpf_xdp_adjust_head`, which need a `&mut [u8]` frame, which means widening
 /// `RxHandler` (`iface.rs:468`) and every driver RX path that feeds it —
 /// virtio-net and e1000 both hand over an immutable borrow of a DMA buffer
-/// today. That refactor is deferred, so this surface offers `Pass`/`Drop` only,
-/// which is what filtering and drop-based mitigation need.
+/// today. That refactor, and `devmap`/`cpumap` fan-out, are deferred.
 pub trait XdpProgram: Send + Sync + 'static {
     /// A name, for diagnostics.
     fn name(&self) -> &str;
@@ -310,6 +329,11 @@ pub enum XdpAction {
     /// separately, matching Linux's `XDP_ABORTED`, so a broken program is
     /// visible rather than merely quiet.
     Aborted,
+    /// `XDP_TX`: reflect the (unmodified) frame back out the ingress iface.
+    Tx,
+    /// `XDP_REDIRECT`: send the (unmodified) frame out interface `ifindex`.
+    /// The ifindex is the value a `bpf_redirect` kfunc stashed for this frame.
+    Redirect { ifindex: u32 },
 }
 
 type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
@@ -320,6 +344,16 @@ static XDP_ABORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// answer, which is the same latitude the daemon and flow tables already have.
 static XDP_ANY: AtomicBool = AtomicBool::new(false);
 static XDP_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program asked to retransmit (`XDP_TX` + `XDP_REDIRECT`). Counted at
+/// the *decision*, so a subsequent driver send failure does not un-count it —
+/// the counter reflects program intent, and `XDP_TX_DROPS` records the send
+/// failures separately.
+static XDP_TXS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Retransmit requests (`XDP_TX`/`XDP_REDIRECT`) the caller could not send —
+/// unknown target iface, or the driver's send returned `Err`. The frame is
+/// dropped in that case, matching Linux, where a redirect to a down/absent
+/// device is a drop.
+static XDP_TX_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Attach `prog` to `iface`, replacing any program already there.
 ///
@@ -358,6 +392,24 @@ pub fn xdp_stats() -> (u64, u64) {
         XDP_DROPS.load(Ordering::Relaxed),
         XDP_ABORTS.load(Ordering::Relaxed),
     )
+}
+
+/// (retransmit requests, retransmit send failures) attributed to XDP programs.
+/// The first counts `XDP_TX` + `XDP_REDIRECT` decisions; the second counts
+/// those the caller could not actually send (unknown iface or driver `Err`).
+#[must_use]
+pub fn xdp_tx_stats() -> (u64, u64) {
+    (
+        XDP_TXS.load(Ordering::Relaxed),
+        XDP_TX_DROPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Record that a retransmit verdict (`Transmit`/`Redirect`) could not be sent.
+/// The `tcp_stack` RX path calls this after a failed `iface::send_on` so a
+/// redirect to a down/absent device is visible as a drop rather than silent.
+pub fn count_xdp_tx_drop() {
+    XDP_TX_DROPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Run the attached program, if any.
@@ -409,6 +461,9 @@ fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
         XdpAction::Aborted => {
             XDP_ABORTS.fetch_add(1, Ordering::Relaxed);
         }
+        XdpAction::Tx | XdpAction::Redirect { .. } => {
+            XDP_TXS.fetch_add(1, Ordering::Relaxed);
+        }
         XdpAction::Pass => {}
     }
     action
@@ -423,6 +478,12 @@ pub fn classify(iface_name: &str, frame: &[u8]) -> Verdict {
     // `netif_receive_skb_core`.
     match run_xdp(iface_name, frame) {
         XdpAction::Drop | XdpAction::Aborted => return Verdict::Dropped,
+        // Retransmit verdicts return to the caller unconsumed by the bypass
+        // table: the caller sends the frame after `XDP_PROGS` is released, so
+        // no transmit happens with IRQs masked. The frame does NOT continue to
+        // the daemon/flow table or the kernel stack.
+        XdpAction::Tx => return Verdict::Transmit,
+        XdpAction::Redirect { ifindex } => return Verdict::Redirect { ifindex },
         XdpAction::Pass => {}
     }
 
