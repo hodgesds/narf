@@ -432,8 +432,14 @@ descriptor, and `XDP_TX`/`XDP_REDIRECT` remain unsupported.
 The x86_64 and aarch64 JITs lower naturally aligned word and doubleword arena
 atomics after computing the same `slot_base + zero_extend(handle + off16)`
 address as ordinary arena accesses. Add, non-fetching bitwise operations,
-exchange, compare-and-exchange, load-acquire, and store-release are native;
-fetching bitwise arena operations remain interpreted on both architectures.
+exchange, compare-and-exchange, load-acquire, and store-release are native, as
+are the fetching bitwise operations. x86_64 has no single-instruction atomic
+fetch-and/or/xor, so those become a `cmpxchg` retry loop that preserves R0 in a
+reserved frame word (the arena fault ABI already claims `rcx` and `r11`, and the
+loop must not move `rsp`); the comparand load is the sole faulting access, after
+which the recovery handle in `rcx` is free to serve as the loop's scratch.
+aarch64 uses its LSE fetch forms directly, landing the old value in a scratch
+that is not the recovery handle so a fault still names the offending index.
 
 Before the atomic memory instruction, emitted code tests the effective address
 for natural alignment. Failure returns JIT status `ARENA_UNALIGNED` with the

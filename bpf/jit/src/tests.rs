@@ -914,7 +914,7 @@ fn an_arena_atomic_uses_the_slot_relative_shape_and_records_its_fault() {
 }
 
 #[test]
-fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
+fn a_fetching_bitwise_arena_atomic_lowers_with_an_r0_spill_slot() {
     let prog = verified_arena(
         &[
             Decoded::Atomic {
@@ -930,10 +930,48 @@ fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
         0,
         None,
     );
-    assert!(matches!(
-        compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+    let c = compile(&prog).expect("the fetching bitwise arena atomic compiles");
+    // The prologue widened its reservation to `sub rsp, 24` so the cmpxchg loop
+    // has a frame word to preserve R0 in — `ATOMIC_SPILL_RESERVE`.
+    assert!(
+        c.code.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x18]),
+        "prologue must reserve 24 bytes for the atomic spill slot"
+    );
+    // Exactly one faulting access — the comparand load — recovered as an arena
+    // fault, never the `cmpxchg` (which the load proves cannot fault).
+    assert_eq!(c.faults.0.len(), 1);
+    let fault = c.faults.0[0];
+    assert!(fault.arena && fault.fixup_off > fault.fault_off);
+    assert_eq!(
+        &c.code[fault.fault_off as usize..fault.fault_off as usize + 2],
+        &[0x49, 0x8B],
+        "the fault site is `mov rax, [r11]`, not a locked rmw"
+    );
+}
+
+#[test]
+fn a_fetching_bitwise_arena_atomic_with_r0_source_still_lowers() {
+    // src == R0 aliases `cmpxchg`'s comparand, so the operand is read back from
+    // the spill slot rather than a register. It must still compile to one arena
+    // fault (the `op r, r/m` operand form, opcode 0x33 for XOR, is exercised).
+    let prog = verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: true },
+                dst: r(2),
+                src: r(0),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("an R0-source fetching bitwise arena atomic compiles");
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
 }
 
 /// The prologue, hand-derived from the Intel SDM.

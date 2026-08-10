@@ -1401,7 +1401,10 @@ fn a64_an_arena_atomic_uses_the_slot_relative_shape_and_records_its_fault() {
 }
 
 #[test]
-fn a64_a_fetching_bitwise_arena_atomic_still_falls_back() {
+fn a64_a_fetching_bitwise_arena_atomic_lowers_via_lse() {
+    // The fetch OR/XOR forms land the old value in `hr::IMM`, leaving the
+    // recovery handle in `hr::AHANDLE` untouched, so the LSE fetch instruction
+    // is the sole faulting access and the arena handle survives to name it.
     let prog = crate::tests::verified_arena(
         &[
             Decoded::Atomic {
@@ -1417,10 +1420,34 @@ fn a64_a_fetching_bitwise_arena_atomic_still_falls_back() {
         0,
         None,
     );
-    assert!(matches!(
-        aarch64::compile(&prog),
-        Err(crate::JitError::Unsupported { at: 0, .. })
-    ));
+    let c = aarch64::compile(&prog).expect("the fetching bitwise arena atomic lowers on aarch64");
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
+}
+
+#[test]
+fn a64_a_fetching_bitwise_and_arena_atomic_faults_at_the_ldclr() {
+    // AND materialises `~src` first, so its faulting access is the *second*
+    // emitted word (the `LDCLR`) — the handle in `hr::AHANDLE` is only written
+    // back on success, never at the fault.
+    let prog = crate::tests::verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: narf_bpf_isa::AtomicOp::And { fetch: true },
+                dst: r(1),
+                src: r(2),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = aarch64::compile(&prog).expect("an AND fetching bitwise arena atomic lowers");
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
 }
 
 // ── differential: reference evaluator vs. emulated native code ───────

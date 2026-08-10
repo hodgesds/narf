@@ -54,10 +54,12 @@ Landed:
   XDP test-run translates `data_in` into a kernel-owned immutable frame rather
   than accepting caller-authored native context pointers.
 
-Residual: JIT lowering of fetching bitwise arena atomics and arena access under
-a subprogram call (register-allocation blockers — these fall back to the
-interpreter); optional direct typed-field loads (mediated typed tracing has
-landed); and the non-PKS hardware domain-confinement backends (below).
+Residual: JIT lowering of arena access under a subprogram call (a register-
+allocation blocker — it falls back to the interpreter); optional direct
+typed-field loads (mediated typed tracing has landed); and the non-PKS hardware
+domain-confinement backends (below). Fetching bitwise arena atomics now lower on
+both architectures (x86_64 via a `cmpxchg` loop that preserves R0 in a reserved
+frame word; aarch64 via its LSE fetch).
 
 The JIT is enabled **behind the verifier**: the interpreter's safety came from
 never dereferencing a program-supplied address, and native code trades that for

@@ -94,8 +94,11 @@
 //! conditional jumps, `exit`, **kfunc calls**, and **BPF-to-BPF calls** (see
 //! [`emit_subprog_call`]). Left interpreted: the subprogram-address and BTF-id
 //! pseudo-forms of `LD_IMM64` (the map forms are emitted over the loader-resolved
-//! address), fetching bitwise arena atomics, and arena accesses in a program
-//! that also makes BPF-to-BPF calls. Everything unemitted returns
+//! address) and arena accesses in a program that also makes BPF-to-BPF calls.
+//! Fetching bitwise arena atomics *are* emitted: the LSE fetch lands the old
+//! value in a scratch that is not the recovery handle (or, for AND, only after
+//! the faulting `LDCLR`), so the handle survives to name a fault. Everything
+//! unemitted returns
 //! [`JitError::Unsupported`] and runs interpreted, which is a complete
 //! implementation — so an unemitted instruction costs speed, not correctness.
 //!
@@ -1420,24 +1423,17 @@ fn emit_insn(
                 src,
                 off,
             } => {
-                if matches!(
-                    op,
-                    AtomicOp::Or { fetch: true }
-                        | AtomicOp::And { fetch: true }
-                        | AtomicOp::Xor { fetch: true }
-                ) {
-                    // Keep arena lowering's portable repertoire identical to
-                    // x86_64, whose fetch-bitwise cmpxchg loop cannot preserve
-                    // the arena recovery handle without a new scratch shape.
-                    return Err(JitError::Unsupported {
-                        at,
-                        what: "fetching bitwise arena atomic not yet emitted",
-                    });
-                }
                 emit_arena_addr(e, host(dst), off);
                 emit_arena_atomic_align_check(e, at, size, relocs)?;
                 // AND materialises `~src` before its LSE instruction; every
-                // other form's first emitted word is the faulting access.
+                // other form's first emitted word is the faulting access. This
+                // holds for the fetching bitwise forms too: the fetch OR/XOR
+                // land the old value in `hr::IMM` (leaving `hr::AHANDLE`'s
+                // recovery handle untouched), and fetch AND lands it in
+                // `hr::AHANDLE` only *after* the faulting `LDCLR` — a faulting
+                // LSE atomic takes the exception before writeback, so the handle
+                // still names the offending index at the fault, and once the
+                // access succeeds the handle is spent and free to overwrite.
                 let fault_off = e.len()
                     + if matches!(op, AtomicOp::And { .. }) {
                         4
