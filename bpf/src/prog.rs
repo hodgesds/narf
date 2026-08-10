@@ -163,6 +163,11 @@ pub struct BpfProg {
     context: Context,
     /// Rust-native typed-probe schema, for runtime attach validation.
     typed_probe: Option<TypedProbeLayout>,
+    /// Loads the verifier certified as exact typed-field reads through the
+    /// tracing wrapper. The interpreter services these through the live
+    /// [`narf_tracing::TypedProbeRef`] rather than as bare dereferences; empty
+    /// for every non-typed program.
+    typed_load_sites: Vec<narf_bpf_verifier::TypedLoadSite>,
     /// Starting fuel for each invocation.
     initial_fuel: u64,
     /// Bytes of BPF stack the program may use.
@@ -544,6 +549,11 @@ impl BpfProg {
         };
 
         let mut subprogs: Vec<SubprogInfo> = Vec::new();
+        // Certified typed-field loads, empty unless a clean `verify()` produced
+        // them. A `provisional` program never reaches a typed load — typed
+        // programs are always fully verified — so leaving this empty on that
+        // path is correct rather than merely conservative.
+        let mut typed_load_sites: Vec<narf_bpf_verifier::TypedLoadSite> = Vec::new();
         // `None` unless a clean `verify()` produced a program that passed every
         // gate. Deliberately not set on the `provisional` path below: that
         // acceptance is *defined* as leaning on the interpreter's runtime
@@ -572,6 +582,7 @@ impl BpfProg {
                 )
                 .ok();
                 subprogs = v.subprogs;
+                typed_load_sites = v.typed_load_sites;
                 v.max_stack_bytes.max(1)
             }
             // The abstract interpreter is live, so this arm no longer catches
@@ -607,6 +618,7 @@ impl BpfProg {
             insns: req.insns,
             context: req.context,
             typed_probe,
+            typed_load_sites,
             initial_fuel: DEFAULT_FUEL,
             stack_bytes,
             subprogs,
@@ -965,6 +977,7 @@ impl BpfProg {
             [range.start as u64, range.end as u64, 0, 0],
             2,
             Some(frame),
+            None,
         )
     }
 
@@ -980,6 +993,7 @@ impl BpfProg {
             [range.start as u64, range.end as u64, 0, 0],
             2,
             Some(frame),
+            None,
         )
     }
 
@@ -988,11 +1002,15 @@ impl BpfProg {
         if !self.accepts_typed_probe(typed) {
             return None;
         }
-        self.run_atomic_inner([typed.as_context_word(), 0, 0, 0], 1)
+        // The wrapper travels alongside its context word: the context word is
+        // what the program reads through `ctx[0]`, and the wrapper is what a
+        // certified typed load reads its field from — the authoritative source
+        // the interpreter uses rather than the program's own register.
+        self.run_atomic_inner_with_region([typed.as_context_word(), 0, 0, 0], 1, None, Some(typed))
     }
 
     fn run_atomic_inner(&self, ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> Option<Outcome> {
-        self.run_atomic_inner_with_region(ctx, ctx_len, None)
+        self.run_atomic_inner_with_region(ctx, ctx_len, None, None)
     }
 
     fn run_atomic_inner_with_region(
@@ -1000,6 +1018,7 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
         readonly_region: Option<&[u8]>,
+        typed: Option<&narf_tracing::TypedProbeRef>,
     ) -> Option<Outcome> {
         // Confine the whole run to the BPF hardware domain: a verifier or JIT
         // escape that stores into another subsystem's domain (the cap table, the
@@ -1025,7 +1044,7 @@ impl BpfProg {
                 return self.run_atomic_native(ctx, ctx_len, slot_base);
             }
         }
-        self.run_atomic_interpreted_inner(ctx, ctx_len, readonly_region)
+        self.run_atomic_interpreted_inner(ctx, ctx_len, readonly_region, typed)
     }
 
     /// Run interpreted, whatever `self.jit` holds.
@@ -1043,7 +1062,7 @@ impl BpfProg {
         if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
             return None;
         }
-        self.run_atomic_interpreted_inner(ctx, ctx_len, None)
+        self.run_atomic_interpreted_inner(ctx, ctx_len, None, None)
     }
 
     fn run_atomic_interpreted_inner(
@@ -1051,6 +1070,7 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
         readonly_region: Option<&[u8]>,
+        typed: Option<&narf_tracing::TypedProbeRef>,
     ) -> Option<Outcome> {
         if self.context != Context::Atomic {
             return None;
@@ -1087,6 +1107,12 @@ impl BpfProg {
         .with_map_indices(&self.map_indices);
         if let Some(region) = readonly_region {
             vm = vm.with_readonly_region(region);
+        }
+        // Only a typed run binds a wrapper, and only then can a certified typed
+        // load reach a field — a program with no bound wrapper traps on one,
+        // which is the fail-closed shape an unbound arena has.
+        if let Some(wrapper) = typed {
+            vm = vm.with_typed_probe(wrapper, &self.typed_load_sites);
         }
         // An atomic program cannot reach an await point, so the future
         // completes on its first poll and `drive` never spins.

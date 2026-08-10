@@ -58,8 +58,15 @@ Landed:
   XDP test-run translates `data_in` into a kernel-owned immutable frame rather
   than accepting caller-authored native context pointers.
 
-Residual: optional direct typed-field loads (mediated typed tracing has landed)
-and the non-PKS hardware domain-confinement backends (below).
+Direct typed-field loads now land alongside the mediated path: a `BPF_LDX`
+through a schema-tracked trace pointer is verifier-admitted only at an exact
+declared field (the same check `narf_probe_read` runs, moved to verification
+time), and is refused otherwise rather than lowered to a raw dereference. The
+base register holds the tracing wrapper rather than the object, so the certified
+load is serviced by the interpreter through the live `TypedProbeRef` — with the
+runtime field recheck intact — and is deliberately kept out of the JIT's bare-
+dereference set. Residual: the non-PKS hardware domain-confinement backends
+(below).
 
 Two former JIT residuals now lower. **Fetching bitwise arena atomics**: x86_64
 via a `cmpxchg` loop that preserves R0 in a reserved frame word, aarch64 via its

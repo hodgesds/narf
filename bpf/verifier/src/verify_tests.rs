@@ -3137,6 +3137,99 @@ fn ordinary_kernel_objects_cannot_satisfy_the_typed_mediator() {
     );
 }
 
+/// `r6 = ctx[0]; r0 = *(size *)(r6 + offset); exit` against a one-field schema
+/// carried on a `ctx_kind` context pointer. The direct-load counterpart of
+/// [`verify_typed_field_with_context`], with no mediator kfunc in play.
+fn verify_direct_typed_field_with_context(
+    offset: i16,
+    size: Size,
+    ctx_kind: PtrKind,
+) -> Result<VerifiedProgram, VerifyError> {
+    const KEY: TypeKey = TypeKey(77);
+    let ctx = [ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: ctx_kind,
+            key: KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    }];
+    let fields = [ObjectField { offset: 8, size: 8 }];
+    let objects = [ObjectDesc {
+        key: KEY,
+        size: 16,
+        fields: &fields,
+    }];
+    let image = encode_all(&[ldx(Size::Dw, 6, 1, 0), ldx(size, 0, 6, offset), EXIT]);
+    verify(&Program {
+        insns: &image,
+        context: Context::Atomic,
+        ctx_fields: &ctx,
+        kfuncs: &[],
+        maps: &[],
+        objects: &objects,
+    })
+}
+
+fn verify_direct_typed_field(offset: i16, size: Size) -> Result<VerifiedProgram, VerifyError> {
+    verify_direct_typed_field_with_context(offset, size, PtrKind::TraceObject)
+}
+
+#[test]
+fn a_direct_load_of_an_exact_declared_field_verifies() {
+    let verified =
+        verify_direct_typed_field(8, Size::Dw).expect("an exact declared field load should verify");
+    // The load is certified as a typed read, not as a bare dereference: the base
+    // register holds the tracing wrapper, so lowering `[wrapper + 8]` as a bare
+    // load would read the wrapper, not the object. The interpreter services it
+    // through the wrapper instead.
+    assert_eq!(
+        verified
+            .typed_load_sites
+            .iter()
+            .map(|site| (site.insn_index, site.field_offset, site.size))
+            .collect::<Vec<_>>(),
+        vec![(1, 8, 8)],
+        "the direct field load should be recorded as a certified typed load",
+    );
+    assert!(
+        !verified
+            .bare_access_sites
+            .iter()
+            .any(|site| site.insn_index == 1),
+        "a typed field load must never be admitted as a bare dereference",
+    );
+}
+
+#[test]
+fn a_direct_load_of_an_in_object_non_field_is_rejected() {
+    // Both are wholly inside the 16-byte object but neither is the one declared
+    // field: a shifted offset, and a truncated width at the right offset.
+    for (offset, size) in [(9i16, Size::Dw), (8, Size::W)] {
+        assert!(
+            matches!(
+                verify_direct_typed_field(offset, size),
+                Err(VerifyError::TypedFieldMismatch { at: 1, reg: 6 })
+            ),
+            "offset={offset} size={size:?} is not a declared field",
+        );
+    }
+}
+
+#[test]
+fn a_direct_load_through_an_ordinary_object_pointer_is_rejected() {
+    // The same schema on an ordinary `Object` context pointer: no trace-object
+    // provenance, so the load stays opaque exactly as it did before typed direct
+    // access landed.
+    assert!(
+        matches!(
+            verify_direct_typed_field_with_context(8, Size::Dw, PtrKind::Object),
+            Err(VerifyError::OpaqueDeref { at: 1, reg: 6 })
+        ),
+        "an ordinary object pointer must not admit a direct field load",
+    );
+}
+
 // ── null tests must be 64-bit to refine a pointer ───────────────────
 
 #[test]
