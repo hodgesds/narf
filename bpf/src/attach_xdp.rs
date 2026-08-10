@@ -3,24 +3,28 @@
 //! `net/src/bypass/classifier.rs` has named this seam since it was written
 //! ("a future eBPF surface would feed the same table"). This is that surface.
 //!
-//! ## Two limitations, both structural and both recorded
+//! ## Writable frame, dynamically bounded, resizing deferred
 //!
-//! **The frame is read-only.** `XDP_TX` and `XDP_REDIRECT` *are* supported, but
-//! only as retransmission of the **unmodified** frame — reflect it back out the
-//! ingress iface (`XDP_TX`), or send it out a program-chosen one
-//! (`XDP_REDIRECT`, target ifindex conveyed through the `bpf_redirect` kfunc in
-//! [`crate::kfuncs`]). What is deferred is in-place *mutation*: Linux's XDP
-//! programs also rewrite headers and `bpf_xdp_adjust_head`, which need a
-//! `&mut [u8]` frame, which means widening `narf_net::iface::RxHandler` and
-//! every driver RX path feeding it — virtio-net and e1000 both hand over an
-//! immutable borrow of a DMA buffer today. `devmap`/`cpumap` fan-out
-//! (`BPF_F_BROADCAST`) is likewise a follow-on.
+//! **The frame is writable.** A program may rewrite header bytes in place —
+//! `data[k] = v` for a `k` it proved below `data_end` — and `XDP_TX` /
+//! `XDP_REDIRECT` then retransmit the *modified* frame (reflect out the ingress
+//! iface, or send out a program-chosen one, target ifindex conveyed through the
+//! `bpf_redirect` kfunc in [`crate::kfuncs`]). [`BpfXdp::run`] receives the
+//! frame `&mut`, threaded from `narf_net::iface::RxHandler` through each
+//! driver's RX path; virtio-net and e1000 hand over a `&mut` borrow of the
+//! buffer they own and recycle. What is deferred is frame *resizing*:
+//! `bpf_xdp_adjust_head`/`_tail` (head/tailroom) and `devmap`/`cpumap` fan-out
+//! (`BPF_F_BROADCAST`) are follow-ons.
 //!
-//! **Frame reads are dynamically bounded.** Context words 0 and 1 are the
-//! frame's `data` and exclusive `data_end` pointers. A program must compare a
-//! derived data pointer against that paired end before dereferencing it; the
-//! verifier turns only the safe edge into a native bare-access certificate,
-//! and the interpreter independently confines reads to this exact slice.
+//! **Frame reads and writes are dynamically bounded, identically.** Context
+//! words 0 and 1 are the frame's `data` and exclusive `data_end` pointers. A
+//! program must compare a derived data pointer against that paired end before
+//! dereferencing it for either a load or a store; the verifier bounds a write
+//! against `data_end` with the same interval check it bounds a read, turns only
+//! the safe edge into a native bare-access certificate, and the interpreter
+//! independently confines both to this exact slice — a store one past either
+//! edge traps rather than writing. `data_end` itself stays read-only and is
+//! never dereferenceable.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -57,7 +61,7 @@ impl XdpProgram for BpfXdp {
         &self.name
     }
 
-    fn run(&self, _iface: &str, frame: &[u8]) -> XdpAction {
+    fn run(&self, _iface: &str, frame: &mut [u8]) -> XdpAction {
         // Drop any redirect target a prior frame's `bpf_redirect` left on this
         // CPU: a program that calls `bpf_redirect` and then returns something
         // other than 4 must not have that ifindex leak into the *next* frame
@@ -78,7 +82,7 @@ impl XdpProgram for BpfXdp {
             Some(crate::interp::Outcome::Returned(v)) => match v {
                 1 => XdpAction::Drop,
                 2 => XdpAction::Pass,
-                // Reflect the unmodified frame out the ingress iface.
+                // Reflect the (possibly-rewritten) frame out the ingress iface.
                 3 => XdpAction::Tx,
                 // Redirect: the target ifindex is whatever `bpf_redirect`
                 // stashed for this frame on this CPU. A bare `return 4` with no

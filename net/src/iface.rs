@@ -505,7 +505,12 @@ pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
 // essential with multiple NICs on overlapping subnets (e.g. two QEMU
 // user-mode NICs both at 10.0.2.0/24), where a global address lookup
 // would otherwise reply out the wrong NIC. `""` means "ingress unknown".
-type RxHandler = fn(&str, &[u8]);
+//
+// The frame is `&mut`: an attached XDP program may rewrite header bytes in
+// place before the stack parses or the driver reflects the frame. The buffer
+// is the driver's own DMA/scratch buffer, mutated before anything downstream
+// copies it out, so an in-place write is sound (see `on_rx_frame_from`).
+type RxHandler = fn(&str, &mut [u8]);
 
 static RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
@@ -514,7 +519,13 @@ pub fn install_rx_handler(h: RxHandler) {
 }
 
 /// Dispatch a frame received on a known ingress interface.
-pub fn on_rx_frame_from(iface_name: &str, frame: &[u8]) {
+///
+/// `frame` is the driver's own RX buffer, passed `&mut` so an attached XDP
+/// program can rewrite it in place. The driver retains ownership and recycles
+/// the buffer afterwards; mutating it before the stack copies the payload out
+/// (or the driver reflects it for `XDP_TX`) is the whole point of a writable
+/// XDP surface.
+pub fn on_rx_frame_from(iface_name: &str, frame: &mut [u8]) {
     let v = RX_HANDLER.load(Ordering::Acquire);
     if v == 0 {
         return;
@@ -530,7 +541,7 @@ pub fn on_rx_frame_from(iface_name: &str, frame: &[u8]) {
 }
 
 /// Dispatch a frame whose ingress iface is unknown (legacy callers).
-pub fn on_rx_frame(frame: &[u8]) {
+pub fn on_rx_frame(frame: &mut [u8]) {
     on_rx_frame_from("", frame);
 }
 

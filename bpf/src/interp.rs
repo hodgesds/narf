@@ -388,11 +388,15 @@ pub struct Vm<'a> {
     maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
     /// Sparse `bpf_attr.prog_load.fd_array` positions for map-index loads.
     map_indices: &'a [crate::prog::IndexedMap],
-    /// One hook-owned, read-only byte region whose real address is exposed in
-    /// the context (currently an XDP frame). The verifier admits reads only
-    /// after a `data`/`data_end` comparison; this runtime bound independently
-    /// keeps the interpreter from dereferencing any other kernel address.
-    readonly_region: Option<&'a [u8]>,
+    /// One hook-owned, writable byte region whose real address is exposed in
+    /// the context (currently an XDP frame). The verifier admits a load or a
+    /// store only after a `data`/`data_end` comparison; this runtime bound
+    /// independently confines both to `[data, data_end)`, so a bounded
+    /// in-place header rewrite lands in the frame and anything outside it traps
+    /// rather than aliasing another kernel address. Held as `&mut` so the store
+    /// path can write it and the driver sees the mutation before it retransmits
+    /// (`XDP_TX`) or forwards (`XDP_REDIRECT`) the frame.
+    packet_region: Option<&'a mut [u8]>,
     /// The live tracing wrapper a typed-probe program reads its declared fields
     /// from, paired with the certified typed-load sites the verifier proved.
     ///
@@ -469,7 +473,7 @@ impl<'a> Vm<'a> {
             arenas: &[],
             maps,
             map_indices: &[],
-            readonly_region: None,
+            packet_region: None,
             typed_probe: None,
             reserve_map: None,
             reserve_len: 0,
@@ -497,10 +501,13 @@ impl<'a> Vm<'a> {
         self
     }
 
-    /// Bind the hook-owned byte region named by a dynamic context pair.
+    /// Bind the hook-owned writable byte region named by a dynamic context
+    /// pair (an XDP frame). Loads read it and bounded stores write it in place;
+    /// the region's real base and length are the runtime bound the verifier's
+    /// `data`/`data_end` proof mirrors.
     #[must_use]
-    pub fn with_readonly_region(mut self, bytes: &'a [u8]) -> Self {
-        self.readonly_region = Some(bytes);
+    pub fn with_packet_region(mut self, bytes: &'a mut [u8]) -> Self {
+        self.packet_region = Some(bytes);
         self
     }
 
@@ -718,7 +725,7 @@ impl<'a> Vm<'a> {
                 return Ok(widen(raw, size, signed));
             }
         }
-        if let Some(bytes) = self.readonly_region {
+        if let Some(bytes) = self.packet_region.as_deref() {
             let base = bytes.as_ptr() as u64;
             let limit = base.checked_add(bytes.len() as u64);
             let end = addr.checked_add(len as u64);
@@ -814,8 +821,30 @@ impl<'a> Vm<'a> {
             self.reserve_buf[lo..hi].copy_from_slice(&bytes[..len]);
             return Ok(());
         }
-        // The context region is deliberately not tried here: it is read-only, so
-        // a store into it must be rejected rather than silently aliasing.
+        // The context tuple region is deliberately not tried here: it is
+        // read-only (the four `ctx` words), so a store into it must be rejected
+        // rather than silently aliasing.
+        //
+        // The packet region *is* writable: this is the in-place header rewrite
+        // an XDP program performs. The bound is exactly the read path's — the
+        // store lands only in `[data, data_end)`, and one past either edge is a
+        // trap, never a write. `checked_add` on both sides for the same reason
+        // `load` uses it: an unchecked `addr + len` could wrap `u64::MAX` to 0
+        // and satisfy both guards, turning a fail-closed bound into a wild
+        // write in the layer that is supposed to hold when the verifier is
+        // wrong.
+        if let Some(region) = self.packet_region.as_deref_mut() {
+            let base = region.as_ptr() as u64;
+            let limit = base.checked_add(region.len() as u64);
+            let end = addr.checked_add(len as u64);
+            if let (Some(limit), Some(end)) = (limit, end) {
+                if addr >= base && end <= limit {
+                    let off = (addr - base) as usize;
+                    region[off..off + len].copy_from_slice(&bytes[..len]);
+                    return Ok(());
+                }
+            }
+        }
         if self.has_arena() {
             let kva = self.arena_kva(at, addr, len)?;
             // SAFETY: as in `load` — `arena_kva` bounded the range to a mapped,

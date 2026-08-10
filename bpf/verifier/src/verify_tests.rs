@@ -364,6 +364,110 @@ fn dynamic_region_end_is_not_dereferenceable() {
     );
 }
 
+/// The XDP context as the loader now types it: `data` writable (no `READONLY`),
+/// `data_end` still read-only. Mirrors `narf_bpf::prog::XDP_CTX`.
+static PACKET_CTX_WRITABLE: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: PACKET_KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    },
+    PACKET_CTX[1],
+];
+
+/// Prove `data + `checked` <= data_end`, then store `imm` at `store_off` with
+/// `store_size` through the data pointer. Mirrors `packet_read_program`, with a
+/// store in place of the load.
+fn packet_store_program(checked: i32, store_off: i16, store_size: Size) -> Vec<Decoded> {
+    vec![
+        ldx(Size::Dw, 2, 1, 0),
+        ldx(Size::Dw, 3, 1, 8),
+        movr(4, 2),
+        alu(AluOp::Add, 4, checked),
+        jmpr(CondOp::Gt, 4, 3, 3),
+        st(store_size, 2, store_off, 0xAB),
+        mov(0, 0),
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ]
+}
+
+#[test]
+fn dynamic_region_check_certifies_packet_store() {
+    // With `data` writable, a store bounded by a dominating `data + 14 <=
+    // data_end` is admitted — the same interval `access()` checks for a read —
+    // and the store instruction is published as a native bare access, so the
+    // JIT lowers it exactly as it lowers the bounded read.
+    let verified = check_ctx(&packet_store_program(14, 12, Size::H), PACKET_CTX_WRITABLE)
+        .expect("data + 14 <= data_end proves a two-byte store at offset 12");
+    assert_eq!(
+        verified
+            .bare_access_sites
+            .iter()
+            .map(|site| site.insn_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 5],
+        "both context loads and the dynamically bounded packet store are native-safe"
+    );
+}
+
+#[test]
+fn packet_store_without_dominating_check_is_rejected() {
+    // No proven `data < data_end`, so the store has no region bound and is
+    // rejected — identical to the unchecked-read case, since the bound is the
+    // same for both.
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 2, 1, 0), st(Size::H, 2, 12, 0xAB), EXIT],
+            PACKET_CTX_WRITABLE,
+        )
+        .expect_err("an unchecked packet store must fail"),
+        VerifyError::OutOfBounds { at: 1 }
+    );
+}
+
+#[test]
+fn packet_store_must_stay_within_the_proven_bound() {
+    // `data + 13 <= data_end` proves 13 bytes live; a two-byte store at offset
+    // 12 touches byte 13, one past the bound. Rejected, exactly as the
+    // one-byte-short read is.
+    assert_eq!(
+        check_ctx(&packet_store_program(13, 12, Size::H), PACKET_CTX_WRITABLE)
+            .expect_err("a store past the proven bound must fail"),
+        VerifyError::OutOfBounds { at: 5 }
+    );
+}
+
+#[test]
+fn packet_store_through_data_end_is_rejected() {
+    // `data_end` is read-only and never dereferenceable: a store through it is
+    // rejected before any bound is even considered.
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 3, 1, 8), st(Size::B, 3, 0, 0xAB), EXIT],
+            PACKET_CTX_WRITABLE,
+        )
+        .expect_err("the exclusive end marker must not be writable"),
+        VerifyError::WriteToReadOnly { at: 1 }
+    );
+}
+
+#[test]
+fn packet_store_is_still_rejected_when_data_is_readonly() {
+    // The read-only XDP typing (both pointers `READONLY`) must still reject a
+    // store — this is the guarantee removing `READONLY` from `data` relaxes, and
+    // the negative that proves the flag is what admits the write.
+    assert_eq!(
+        check_ctx(&packet_store_program(14, 12, Size::H), PACKET_CTX)
+            .expect_err("a store through a READONLY data pointer must fail"),
+        VerifyError::WriteToReadOnly { at: 5 }
+    );
+}
+
 #[test]
 fn dynamic_region_identity_must_match() {
     static WRONG_END_CTX: &[ArgDesc] = &[

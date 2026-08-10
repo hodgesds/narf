@@ -55,14 +55,25 @@ const XDP_PACKET_KEY: narf_bpf_verifier::TypeKey = narf_bpf_verifier::TypeKey(
 );
 
 const XDP_CTX: [narf_bpf_verifier::ArgDesc; 2] = [
+    // `data` — the packet's writable base. No `READONLY`: a store through a
+    // derived data pointer is admitted, and the verifier bounds it against
+    // `data_end` exactly as it does a load (`fixpoint::access` checks the same
+    // `p.size` interval for a write as for a read; only `p.readonly` would
+    // reject the write). An in-place header rewrite is therefore verifier-legal,
+    // while an out-of-bounds store is still `OutOfBounds`. See
+    // `crate::attach_xdp` for the runtime that makes the frame a real `&mut`.
     narf_bpf_verifier::ArgDesc {
         kind: narf_bpf_verifier::TypeKind::Ptr {
             kind: narf_bpf_verifier::PtrKind::Mem,
             key: XDP_PACKET_KEY,
         },
         domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
-        flags: narf_bpf_verifier::ArgFlags::READONLY,
+        flags: narf_bpf_verifier::ArgFlags::NONE,
     },
+    // `data_end` — the exclusive end marker. `READONLY` and never
+    // dereferenceable: it exists only to bound the region, so a load or store
+    // through it is rejected (the read test `dynamic_region_end_is_not_
+    // dereferenceable` is joined by the write case in `verify_tests`).
     narf_bpf_verifier::ArgDesc {
         kind: narf_bpf_verifier::TypeKind::Ptr {
             kind: narf_bpf_verifier::PtrKind::MemEnd,
@@ -962,13 +973,20 @@ impl BpfProg {
         self.run_atomic_inner(ctx, ctx_len)
     }
 
-    /// Run an XDP program against one live, read-only packet frame.
+    /// Run an XDP program against one live, writable packet frame.
     ///
     /// This is also the safe test-run boundary: callers supply bytes, never
     /// raw context words. The method constructs the paired `data`/`data_end`
     /// addresses from this exact borrow and binds the interpreter's runtime
     /// region to the same slice.
-    pub fn run_xdp(&self, frame: &[u8]) -> Option<Outcome> {
+    ///
+    /// The frame is `&mut`: a program that rewrites a header byte writes it in
+    /// place, so the borrow the caller passed in reflects the mutation on
+    /// return — that is the frame `XDP_TX` reflects and `XDP_REDIRECT` forwards.
+    /// The native (JITed) path writes the packet through the address the ctx
+    /// pair already carries, and the interpreter services the same bounded
+    /// store against this slice; the two agree on `[data, data_end)`.
+    pub fn run_xdp(&self, frame: &mut [u8]) -> Option<Outcome> {
         if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
             return None;
         }
@@ -983,7 +1001,7 @@ impl BpfProg {
 
     /// Run the XDP path through the interpreter for kernel differential tests.
     #[cfg(feature = "kernel-test")]
-    pub(crate) fn run_xdp_interpreted(&self, frame: &[u8]) -> Option<Outcome> {
+    pub(crate) fn run_xdp_interpreted(&self, frame: &mut [u8]) -> Option<Outcome> {
         if self.linux_prog_type != Some(BPF_PROG_TYPE_XDP) || self.context != Context::Atomic {
             return None;
         }
@@ -1017,7 +1035,7 @@ impl BpfProg {
         &self,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
-        readonly_region: Option<&[u8]>,
+        packet_region: Option<&mut [u8]>,
         typed: Option<&narf_tracing::TypedProbeRef>,
     ) -> Option<Outcome> {
         // Confine the whole run to the BPF hardware domain: a verifier or JIT
@@ -1044,7 +1062,7 @@ impl BpfProg {
                 return self.run_atomic_native(ctx, ctx_len, slot_base);
             }
         }
-        self.run_atomic_interpreted_inner(ctx, ctx_len, readonly_region, typed)
+        self.run_atomic_interpreted_inner(ctx, ctx_len, packet_region, typed)
     }
 
     /// Run interpreted, whatever `self.jit` holds.
@@ -1069,7 +1087,7 @@ impl BpfProg {
         &self,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
-        readonly_region: Option<&[u8]>,
+        packet_region: Option<&mut [u8]>,
         typed: Option<&narf_tracing::TypedProbeRef>,
     ) -> Option<Outcome> {
         if self.context != Context::Atomic {
@@ -1105,8 +1123,8 @@ impl BpfProg {
         )
         .with_arenas(self.arenas())
         .with_map_indices(&self.map_indices);
-        if let Some(region) = readonly_region {
-            vm = vm.with_readonly_region(region);
+        if let Some(region) = packet_region {
+            vm = vm.with_packet_region(region);
         }
         // Only a typed run binds a wrapper, and only then can a certified typed
         // load reach a field — a program with no bound wrapper traps on one,

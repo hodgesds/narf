@@ -1022,12 +1022,12 @@ mod smokes {
             Ok(l) => l,
             Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP target"),
         };
-        let frame = [0u8; 64];
-        if !dropped(classify(IFACE, &frame)) {
+        let mut frame = [0u8; 64];
+        if !dropped(classify(IFACE, &mut frame)) {
             return TestResult::Fail("the linked XDP program did not drop the frame");
         }
         drop(link);
-        if !passed_through(classify(IFACE, &frame)) {
+        if !passed_through(classify(IFACE, &mut frame)) {
             return TestResult::Fail("frames were still dropped after the link was dropped");
         }
         if prog.runs() != 1 {
@@ -1062,11 +1062,11 @@ mod smokes {
                 Ok(l) => l,
                 Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP_TX target"),
             };
-        if !transmit(classify(TX_IFACE, &[0u8; 64])) {
+        if !transmit(classify(TX_IFACE, &mut [0u8; 64])) {
             return TestResult::Fail("XDP_TX did not yield Verdict::Transmit");
         }
         drop(tx_link);
-        if !passed_through(classify(TX_IFACE, &[0u8; 64])) {
+        if !passed_through(classify(TX_IFACE, &mut [0u8; 64])) {
             return TestResult::Fail("frames were still transmitted after the link was dropped");
         }
 
@@ -1082,11 +1082,11 @@ mod smokes {
             Ok(l) => l,
             Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP_REDIRECT target"),
         };
-        if !redirects_to(classify(REDIR_IFACE, &[0u8; 64]), TARGET_IFINDEX as u32) {
+        if !redirects_to(classify(REDIR_IFACE, &mut [0u8; 64]), TARGET_IFINDEX as u32) {
             return TestResult::Fail("bpf_redirect ifindex did not reach Verdict::Redirect");
         }
         drop(redir_link);
-        if !passed_through(classify(REDIR_IFACE, &[0u8; 64])) {
+        if !passed_through(classify(REDIR_IFACE, &mut [0u8; 64])) {
             return TestResult::Fail("frames were still redirected after the link was dropped");
         }
         TestResult::Pass
@@ -1125,7 +1125,7 @@ mod smokes {
         // attach, its drop has had the chance to strip the interface — which is
         // the damage this test exists to detect.
         drop(second);
-        let still_dropping = dropped(classify(IFACE, &[0u8; 64]));
+        let still_dropping = dropped(classify(IFACE, &mut [0u8; 64]));
         drop(link);
         if second_taken {
             return TestResult::Fail("a second link took an interface a link already held");
@@ -1133,7 +1133,7 @@ mod smokes {
         if !still_dropping {
             return TestResult::Fail("the first link's program is no longer on the interface");
         }
-        if !passed_through(classify(IFACE, &[0u8; 64])) {
+        if !passed_through(classify(IFACE, &mut [0u8; 64])) {
             return TestResult::Fail("dropping the surviving link left a program behind");
         }
         TestResult::Pass
@@ -1182,7 +1182,7 @@ mod smokes {
             Ok(l) => l,
             Err(_) => return TestResult::Fail("the interface was left unusable by the refusal"),
         };
-        let ok = dropped(classify(IFACE, &[0u8; 64]));
+        let ok = dropped(classify(IFACE, &mut [0u8; 64]));
         drop(link);
         if !ok {
             return TestResult::Fail("the refused sleepable program was still on the interface");
@@ -1207,8 +1207,8 @@ mod smokes {
             Ok(l) => l,
             Err(_) => return TestResult::Fail("BpfLink::create failed for an XDP target"),
         };
-        let frame = [0u8; 64];
-        if !dropped(classify(IFACE, &frame)) {
+        let mut frame = [0u8; 64];
+        if !dropped(classify(IFACE, &mut frame)) {
             return TestResult::Fail("the first program did not drop");
         }
         // `BPF_F_REPLACE` naming the wrong program must not apply.
@@ -1216,7 +1216,7 @@ mod smokes {
             drop(link);
             return TestResult::Fail("BPF_F_REPLACE accepted the wrong expected program");
         }
-        if !dropped(classify(IFACE, &frame)) {
+        if !dropped(classify(IFACE, &mut frame)) {
             drop(link);
             return TestResult::Fail("a refused update changed the attached program");
         }
@@ -1224,12 +1224,12 @@ mod smokes {
             drop(link);
             return TestResult::Fail("a correctly-guarded update was refused");
         }
-        if !passed_through(classify(IFACE, &frame)) {
+        if !passed_through(classify(IFACE, &mut frame)) {
             drop(link);
             return TestResult::Fail("the updated program is not the one running");
         }
         drop(link);
-        if !passed_through(classify(IFACE, &frame)) {
+        if !passed_through(classify(IFACE, &mut frame)) {
             return TestResult::Fail("dropping an updated link left a program behind");
         }
         TestResult::Pass

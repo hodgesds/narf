@@ -761,7 +761,7 @@ fn prog_test_run_xdp(
     // SAFETY: the helper validates the complete userspace range before
     // allocation/copy and enforces the global syscall-copy limit. The tighter
     // XDP limit above additionally bounds synchronous execution cost.
-    let frame = match unsafe { copy_from_user_vec(data_in, data_size_in) } {
+    let mut frame = match unsafe { copy_from_user_vec(data_in, data_size_in) } {
         Ok(frame) => frame,
         Err(e) => return -(e as i64),
     };
@@ -769,7 +769,12 @@ fn prog_test_run_xdp(
     let start = narf_time::monotonic_ns();
     let mut retval = 0u32;
     for _ in 0..repeat {
-        let Some(outcome) = prog.run_xdp(&frame) else {
+        // `&mut`: a program that rewrites the frame updates this buffer in
+        // place, and the modified bytes are what `data_out` copies back —
+        // matching Linux `BPF_PROG_TEST_RUN`, which returns the post-program
+        // packet. Repeats run against the frame as the previous iteration left
+        // it, the same as Linux.
+        let Some(outcome) = prog.run_xdp(&mut frame) else {
             return -EAGAIN;
         };
         retval = (outcome.value() & 0xFFFF_FFFF) as u32;
@@ -783,7 +788,8 @@ fn prog_test_run_xdp(
     let copied = core::cmp::min(frame.len(), data_size_out);
     if copied != 0 {
         // SAFETY: `copy_to_user` validates the requested output prefix and
-        // brackets SMAP. The source remains the owned immutable frame.
+        // brackets SMAP. The source is the owned frame, now holding whatever the
+        // program wrote into it.
         if let Err(e) = unsafe { copy_to_user(data_out, &frame[..copied]) } {
             return -(e as i64);
         }

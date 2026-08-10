@@ -1609,7 +1609,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                             Some(t) => t,
                             None => return, // controller vanished
                         };
-                        let (buf, total_len) = match taken {
+                        let (mut buf, total_len) = match taken {
                             Some(t) => t,
                             None => break,
                         };
@@ -1637,7 +1637,15 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         // hot path.
                         if idx == 0 {
                             let end = (12 + payload_len as usize).min(buf.len());
-                            narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
+                            // `&mut`: an attached XDP program may rewrite header
+                            // bytes in place. `buf` is a DmaBuffer this pump owns
+                            // for the duration (recycled into the RX pool on the
+                            // next take); the device is not reading it back, so an
+                            // in-place write before dispatch is sound.
+                            narf_net::iface::on_rx_frame_from(
+                                "vnet0",
+                                &mut buf.as_mut_slice()[12..end],
+                            );
                             // The tap consumed the frame synchronously + completely.
                             // (The legacy rx_prod/rx_cons channel is NOT drained in
                             // production, so pushing there would wedge after 64
@@ -1839,14 +1847,16 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
 /// drop. Returns `true` iff a frame was actually processed.
 fn vnet0_drain_fn() -> bool {
     let taken = with_controller(|c| c.rx_take()).flatten();
-    let (buf, total_len) = match taken {
+    let (mut buf, total_len) = match taken {
         Some(t) => t,
         None => return false,
     };
     let payload_len = total_len.saturating_sub(12);
     let end = (12 + payload_len as usize).min(buf.len());
     if payload_len != 0 {
-        narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
+        // `&mut`: as in the async pump, the program may rewrite header bytes in
+        // place. `buf` is owned here until it is recycled below.
+        narf_net::iface::on_rx_frame_from("vnet0", &mut buf.as_mut_slice()[12..end]);
     }
     // Recycle the consumed buffer into the RX frame pool instead of freeing.
     with_controller(|c| {

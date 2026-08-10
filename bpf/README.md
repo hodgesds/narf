@@ -39,13 +39,16 @@ Landed:
 - **Extension contracts** — the `kfunc!` and `struct_ops!` macros (Rust-native
   type descriptors, no BTF, no trampoline).
 - **Attach surfaces** — dynamic probes, net classifier (XDP), perf, struct_ops.
-  XDP exposes read-only `data`/`data_end` pointers: packet loads require a
-  verifier-proved dynamic bound and are independently slice-bounded by the
-  interpreter. Actions: `PASS`/`DROP`/`ABORTED` plus `TX` and `REDIRECT` as
-  retransmission of the *unmodified* frame — `TX` reflects out the ingress
-  iface, `REDIRECT` sends out the iface named by a `bpf_redirect(ifindex)`
-  kfunc. In-place packet mutation (writable data, `bpf_xdp_adjust_head`) and
-  `devmap`/`cpumap` fan-out remain a follow-on.
+  XDP exposes a writable `data` pointer paired with a read-only `data_end`:
+  packet loads *and* stores require a verifier-proved dynamic bound and are
+  independently slice-bounded by the interpreter (a write is bounds-checked
+  against `data_end` with the same interval check as a read, and the JIT lowers
+  a bounded store natively, symmetric to a bounded read). A program may rewrite
+  header bytes in place. Actions: `PASS`/`DROP`/`ABORTED` plus `TX` and
+  `REDIRECT` as retransmission of the *possibly-modified* frame — `TX` reflects
+  out the ingress iface, `REDIRECT` sends out the iface named by a
+  `bpf_redirect(ifindex)` kfunc. Frame *resizing* (`bpf_xdp_adjust_head`/`_tail`)
+  and `devmap`/`cpumap` fan-out remain a follow-on.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with
@@ -55,8 +58,9 @@ Landed:
   load-provenance metadata, bounded verifier logs, native raw-tracepoint program
   loads and named opens, fd-gated runtime statistics, recursion-miss accounting,
   prog-query, task-fd-query, and iterators.
-  XDP test-run translates `data_in` into a kernel-owned immutable frame rather
-  than accepting caller-authored native context pointers.
+  XDP test-run translates `data_in` into a kernel-owned writable frame (never a
+  caller-authored native context pointer) and copies the post-program bytes back
+  to `data_out`, matching Linux `BPF_PROG_TEST_RUN`.
 
 Direct typed-field loads now land alongside the mediated path: a `BPF_LDX`
 through a schema-tracked trace pointer is verifier-admitted only at an exact

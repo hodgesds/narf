@@ -24,17 +24,21 @@
 //! the daemon claim and the flow table, mirroring Linux's ordering in
 //! `netif_receive_skb_core`.
 //!
-//! The attached surface is **read-only**. It offers `Pass`/`Drop` plus frame
-//! *retransmission* — `XDP_TX` (reflect out the ingress iface) and
-//! `XDP_REDIRECT` (send out a named iface) — of the **unmodified** frame. That
-//! is a real bump-in-the-wire capability (reflect / forward) reachable without
-//! touching a driver RX path.
+//! The attached surface is **writable**. It offers `Pass`/`Drop`, in-place
+//! **header rewrite** (a bounds-checked store through the packet's `data`
+//! pointer), plus frame *retransmission* — `XDP_TX` (reflect out the ingress
+//! iface) and `XDP_REDIRECT` (send out a named iface) — of the
+//! **possibly-modified** frame. [`XdpProgram::run`] takes `&mut [u8]`, threaded
+//! from `iface::RxHandler` through each driver's RX path (virtio-net / e1000
+//! hand over a `&mut` borrow of their DMA/scratch buffer). That is a real
+//! bump-in-the-wire capability — inspect, rewrite, reflect, forward — reachable
+//! without a userspace daemon.
 //!
-//! What remains deferred is in-place **mutation**: header rewriting and
-//! `bpf_xdp_adjust_head`/`_tail` need a `&mut [u8]` frame, which means widening
-//! `iface::RxHandler` and every driver RX path that feeds it — see
-//! [`XdpProgram`]. `devmap`/`cpumap` fan-out (`BPF_F_BROADCAST`) is likewise a
-//! follow-on; `XDP_REDIRECT` here targets a single interface by ifindex.
+//! What remains deferred is frame *resizing*: `bpf_xdp_adjust_head`/`_tail`
+//! (headroom/tailroom) are not implemented — a program may rewrite existing
+//! bytes but not grow or shrink the frame. `devmap`/`cpumap` fan-out
+//! (`BPF_F_BROADCAST`) is likewise a follow-on; `XDP_REDIRECT` here targets a
+//! single interface by ifindex.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -261,15 +265,15 @@ pub enum Verdict {
     /// fall through. Today we drop — that matches Linux's XDP
     /// XDP_DROP semantics when XSK FILL is starved.
     Dropped,
-    /// `XDP_TX`: retransmit the (unmodified) frame back out the ingress
+    /// `XDP_TX`: retransmit the (possibly-rewritten) frame back out the ingress
     /// interface. The caller sends after the `XDP_PROGS` lock is released —
     /// [`run_xdp`] deliberately does not transmit while it holds the lock with
     /// IRQs masked.
     Transmit,
-    /// `XDP_REDIRECT`: send the (unmodified) frame out the interface named by
-    /// `ifindex`. Same as [`Verdict::Transmit`] but out a program-chosen NIC;
-    /// the caller resolves the ifindex and transmits after the lock is
-    /// released.
+    /// `XDP_REDIRECT`: send the (possibly-rewritten) frame out the interface
+    /// named by `ifindex`. Same as [`Verdict::Transmit`] but out a
+    /// program-chosen NIC; the caller resolves the ifindex and transmits after
+    /// the lock is released.
     Redirect { ifindex: u32 },
 }
 
@@ -303,19 +307,23 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
 /// `narf-bpf`; declared here so `narf-net` keeps no dependency on the BPF
 /// subsystem, which is the same shape `PLUGGABILITY.md` uses everywhere else.
 ///
-/// **Read-only.** `XDP_TX` and `XDP_REDIRECT` are supported here as
-/// retransmission of the *unmodified* frame — reflect out the ingress iface,
-/// or forward out a program-chosen one. What is *not* supported is in-place
-/// mutation: Linux's XDP programs also rewrite headers and
-/// `bpf_xdp_adjust_head`, which need a `&mut [u8]` frame, which means widening
-/// `RxHandler` (`iface.rs:468`) and every driver RX path that feeds it —
-/// virtio-net and e1000 both hand over an immutable borrow of a DMA buffer
-/// today. That refactor, and `devmap`/`cpumap` fan-out, are deferred.
+/// **Writable.** [`Self::run`] takes `&mut [u8]`, so a program may rewrite
+/// header bytes in place (a store through the packet's `data` pointer, bounds-
+/// checked against `data_end` by the verifier and again by the interpreter).
+/// `XDP_TX` and `XDP_REDIRECT` then retransmit the *modified* frame — reflect
+/// out the ingress iface, or forward out a program-chosen one. What is *not*
+/// yet supported is frame resizing: `bpf_xdp_adjust_head`/`_tail`
+/// (head/tailroom), and `devmap`/`cpumap` fan-out, are deferred.
 pub trait XdpProgram: Send + Sync + 'static {
     /// A name, for diagnostics.
     fn name(&self) -> &str;
     /// Decide the frame's fate. Must not block.
-    fn run(&self, iface: &str, frame: &[u8]) -> XdpAction;
+    ///
+    /// `frame` is `&mut`: the program may rewrite header bytes in place
+    /// (bounds-checked against `data_end` by the BPF verifier + runtime). The
+    /// mutation is what an ensuing `XDP_TX`/`XDP_REDIRECT` reflects, and it is
+    /// visible to the kernel stack on `Pass`.
+    fn run(&self, iface: &str, frame: &mut [u8]) -> XdpAction;
 }
 
 /// What an [`XdpProgram`] decided.
@@ -329,10 +337,12 @@ pub enum XdpAction {
     /// separately, matching Linux's `XDP_ABORTED`, so a broken program is
     /// visible rather than merely quiet.
     Aborted,
-    /// `XDP_TX`: reflect the (unmodified) frame back out the ingress iface.
+    /// `XDP_TX`: reflect the (possibly-rewritten) frame back out the ingress
+    /// iface.
     Tx,
-    /// `XDP_REDIRECT`: send the (unmodified) frame out interface `ifindex`.
-    /// The ifindex is the value a `bpf_redirect` kfunc stashed for this frame.
+    /// `XDP_REDIRECT`: send the (possibly-rewritten) frame out interface
+    /// `ifindex`. The ifindex is the value a `bpf_redirect` kfunc stashed for
+    /// this frame.
     Redirect { ifindex: u32 },
 }
 
@@ -430,7 +440,7 @@ pub fn count_xdp_tx_drop() {
 ///   off. That is a latency characteristic of attaching a program at all, not
 ///   something this function can fix; recorded in `bpf/specification/spec.md`
 ///   §8 rather than left for someone to discover from a jitter graph.
-fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
+fn run_xdp(iface: &str, frame: &mut [u8]) -> XdpAction {
     // Fast path for the overwhelmingly common case: nothing attached. Without
     // this, every RX frame paid an IRQ-save, a `lock cmpxchg`, and a linear
     // `String == &str` scan before the existing daemon and flow-table locks —
@@ -472,11 +482,13 @@ fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
 /// Classify an inbound L2 frame originating from `iface_name`.
 /// Returns the verdict and, if consumed, the frame is already
 /// staged into UMEM + posted to the RX ring of the chosen socket.
-pub fn classify(iface_name: &str, frame: &[u8]) -> Verdict {
+pub fn classify(iface_name: &str, frame: &mut [u8]) -> Verdict {
     // An XDP program runs first — ahead of the daemon claim and the flow
     // table, mirroring Linux, where XDP sits in front of everything in
-    // `netif_receive_skb_core`.
-    match run_xdp(iface_name, frame) {
+    // `netif_receive_skb_core`. It takes the frame `&mut` (in-place header
+    // rewrite); once it returns, every path below re-borrows immutably and so
+    // sees the possibly-modified bytes.
+    match run_xdp(iface_name, &mut *frame) {
         XdpAction::Drop | XdpAction::Aborted => return Verdict::Dropped,
         // Retransmit verdicts return to the caller unconsumed by the bypass
         // table: the caller sends the frame after `XDP_PROGS` is released, so

@@ -138,6 +138,14 @@ fn st_imm(dst: u8, off: i16, v: i32) -> Decoded {
         src: Source::Imm(v),
     }
 }
+fn stx_size(size: Size, dst: u8, off: i16, src: u8) -> Decoded {
+    Decoded::Store {
+        size,
+        dst: r(dst),
+        off,
+        src: Source::Reg(r(src)),
+    }
+}
 fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
     Decoded::Alu {
         wide: true,
@@ -2483,25 +2491,88 @@ fn smoke_bpf_xdp_program_decides() -> TestResult {
     // A frame whose EtherType's first byte is 0x11 → matches → DROP.
     let mut frame = [0u8; 64];
     frame[12] = 0x11;
-    if prog.run_xdp_interpreted(&frame) != Some(Outcome::Returned(1)) {
+    if prog.run_xdp_interpreted(&mut frame) != Some(Outcome::Returned(1)) {
         return TestResult::Fail("interpreter did not read the bounded frame byte");
     }
-    if x.run("test0", &frame) != XdpAction::Drop {
+    if x.run("test0", &mut frame) != XdpAction::Drop {
         return TestResult::Fail("program did not read the matching frame byte");
     }
     // Change the matched byte → PASS. If the context were zeroed, both frames
     // would take the same branch and this would be the failure.
     frame[12] = 0x22;
-    if x.run("test0", &frame) != XdpAction::Pass {
+    if x.run("test0", &mut frame) != XdpAction::Pass {
         return TestResult::Fail("verdict did not follow the frame contents");
     }
     // A short frame takes the explicit bounds-failure branch.
-    if x.run("test0", &[0u8; 3]) != XdpAction::Pass {
+    if x.run("test0", &mut [0u8; 3]) != XdpAction::Pass {
         return TestResult::Fail("a short frame was mishandled");
     }
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_program_decides);
+
+fn smoke_bpf_xdp_rewrites_frame() -> TestResult {
+    // A writable XDP frame: prove that byte 12 is live (`data + 14 <= data_end`),
+    // rewrite it in place with a bounded store, then return XDP_TX (3). After
+    // the run the caller's frame buffer must hold the written byte — that is the
+    // frame `XDP_TX` reflects and `XDP_REDIRECT` forwards. Both the interpreter
+    // and the JIT (which lowers the bounded store natively, symmetric to the
+    // bounded read) must land the write; the differential run below exercises
+    // the interpreter explicitly.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+
+    let insns = asm(&[
+        ldx(2, 1, 0),  // r2 = data
+        ldx(3, 1, 8),  // r3 = data_end
+        mov_reg(4, 2), // r4 = data
+        alu_imm(AluOp::Add, 4, 14),
+        jgt_reg(4, 3, 4),            // short frame -> XDP_PASS
+        mov_imm(5, 0xAB),            // r5 = new byte value
+        stx_size(Size::B, 2, 12, 5), // data[12] = 0xAB  (bounded store)
+        mov_imm(0, 3),               // XDP_TX
+        EXIT,
+        mov_imm(0, 2), // XDP_PASS (short frame)
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-rewrite", insns) else {
+        return TestResult::Fail("load rejected a program that stores into the packet");
+    };
+    // The bounded packet store is native-safe, so a program with a JIT backend
+    // must compile rather than fall back — the write JITs symmetric to the read.
+    if narf_bpf_jit::has_backend() && !prog.is_jited() {
+        return TestResult::Fail("a bounded packet store unexpectedly fell back from the JIT");
+    }
+
+    // Interpreter path: the differential runner writes through the bounded
+    // store against the exact slice, and the byte must change.
+    let mut frame = [0u8; 64];
+    frame[12] = 0x11;
+    if prog.run_xdp_interpreted(&mut frame) != Some(Outcome::Returned(3)) {
+        return TestResult::Fail("interpreter did not return XDP_TX from the rewrite program");
+    }
+    if frame[12] != 0xAB {
+        return TestResult::Fail("interpreter did not rewrite the bounded frame byte");
+    }
+
+    // Dispatch path (`BpfXdp::run`, whichever backend the program took): the
+    // verdict is XDP_TX and the frame reflects the write.
+    let x = crate::attach_xdp::BpfXdp::for_test(alloc::sync::Arc::clone(&prog), "rw0");
+    let mut frame = [0u8; 64];
+    if x.run("rw0", &mut frame) != XdpAction::Tx {
+        return TestResult::Fail("rewrite program did not surface as XDP_TX");
+    }
+    if frame[12] != 0xAB {
+        return TestResult::Fail("the frame did not reflect the in-place rewrite after run");
+    }
+    // A short frame fails the dominating bound and takes the PASS branch without
+    // touching memory — the store is never reached, so nothing is written.
+    let mut short = [0u8; 8];
+    if x.run("rw0", &mut short) != XdpAction::Pass {
+        return TestResult::Fail("a short frame was not passed unmodified");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_rewrites_frame);
 
 fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
     // Linux treats an unrecognised XDP return as XDP_ABORTED. So does this: a
@@ -2514,7 +2585,7 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
         return TestResult::Fail("load rejected");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "test1");
-    if x.run("test1", &[0u8; 64]) != XdpAction::Aborted {
+    if x.run("test1", &mut [0u8; 64]) != XdpAction::Aborted {
         return TestResult::Fail("an unknown action was not treated as aborted");
     }
     TestResult::Pass
@@ -2532,7 +2603,7 @@ fn smoke_bpf_xdp_tx_reflects() -> TestResult {
         return TestResult::Fail("load rejected an XDP_TX program");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "tx0");
-    if x.run("tx0", &[0u8; 64]) != XdpAction::Tx {
+    if x.run("tx0", &mut [0u8; 64]) != XdpAction::Tx {
         return TestResult::Fail("return code 3 did not map to XdpAction::Tx");
     }
     TestResult::Pass
@@ -2558,7 +2629,7 @@ fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
         return TestResult::Fail("load rejected a program calling bpf_redirect");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "redir0");
-    match x.run("redir0", &[0u8; 64]) {
+    match x.run("redir0", &mut [0u8; 64]) {
         XdpAction::Redirect { ifindex } if ifindex == IFINDEX as u32 => {}
         _ => {
             return TestResult::Fail("bpf_redirect target ifindex was not conveyed to the verdict");
@@ -2572,7 +2643,7 @@ fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
         return TestResult::Fail("load rejected a bare return-4 program");
     };
     let y = crate::attach_xdp::BpfXdp::for_test(bare_prog, "redir1");
-    if y.run("redir1", &[0u8; 64]) != XdpAction::Aborted {
+    if y.run("redir1", &mut [0u8; 64]) != XdpAction::Aborted {
         return TestResult::Fail("XDP_REDIRECT with no bpf_redirect target was not aborted");
     }
     TestResult::Pass

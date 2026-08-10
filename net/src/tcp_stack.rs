@@ -116,7 +116,13 @@ pub fn arp_resolve_in(net_ns_id: u64, ip: [u8; 4], timeout_ms: u64) -> Result<[u
 
 /// Top-level RX path called by the iface registry. Parses the
 /// L2 header and routes by ethertype.
-pub fn rx_handler(iface_name: &str, frame: &[u8]) {
+///
+/// `frame` is `&mut` because the bypass classifier runs the attached XDP
+/// program, which may rewrite bytes in place. Once `classify` returns the
+/// frame is only re-borrowed immutably (parse, deliver, and — for `XDP_TX`/
+/// `XDP_REDIRECT` — retransmit), so downstream code sees the *possibly-
+/// modified* frame, which is exactly what those verdicts must reflect.
+pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
@@ -145,22 +151,25 @@ pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     match crate::bypass::classifier::classify(&bypass_iface, frame) {
         crate::bypass::classifier::Verdict::Consumed => return,
         crate::bypass::classifier::Verdict::Dropped => return,
-        // XDP_TX: reflect the unmodified frame back out the iface it arrived
-        // on. `classify` returns this *after* releasing its `XDP_PROGS` lock,
-        // so transmitting here does not run with that lock held or IRQs masked
-        // by it. A send failure (link down, driver full) drops the frame — the
-        // same fate XDP_TX has in Linux when the ring cannot take it — and is
-        // counted so it is visible rather than silent.
+        // XDP_TX: reflect the (possibly-rewritten) frame back out the iface it
+        // arrived on. `classify` returns this *after* releasing its `XDP_PROGS`
+        // lock, so transmitting here does not run with that lock held or IRQs
+        // masked by it — and the `&mut` borrow the program held is gone, so
+        // this immutable re-borrow sees the bytes it wrote. A send failure
+        // (link down, driver full) drops the frame — the same fate XDP_TX has
+        // in Linux when the ring cannot take it — and is counted so it is
+        // visible rather than silent.
         crate::bypass::classifier::Verdict::Transmit => {
             if iface::send_on(&bypass_iface, frame).is_err() {
                 crate::bypass::classifier::count_xdp_tx_drop();
             }
             return;
         }
-        // XDP_REDIRECT: send the unmodified frame out the program-chosen iface,
-        // resolved from the ifindex `bpf_redirect` stashed. An unknown ifindex
-        // or a driver error drops the frame (a redirect to a down/absent device
-        // is a drop in Linux too) and is counted.
+        // XDP_REDIRECT: send the (possibly-rewritten) frame out the
+        // program-chosen iface, resolved from the ifindex `bpf_redirect`
+        // stashed. An unknown ifindex or a driver error drops the frame (a
+        // redirect to a down/absent device is a drop in Linux too) and is
+        // counted.
         crate::bypass::classifier::Verdict::Redirect { ifindex } => {
             if iface::send_on_ifindex(ifindex, frame).is_err() {
                 crate::bypass::classifier::count_xdp_tx_drop();
