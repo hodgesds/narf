@@ -1542,7 +1542,11 @@ pub fn rx_pump_step() -> bool {
     if n == 0 {
         return false;
     }
-    narf_net::iface::on_rx_frame_from("eth0", &buf[..n]);
+    // `&mut`: an attached XDP program may rewrite header bytes in place. `buf`
+    // is this function's own stack scratch buffer holding a copy of the RX
+    // descriptor's payload, so mutating it before the stack parses it out is
+    // sound and never touches the live DMA ring.
+    narf_net::iface::on_rx_frame_from("eth0", &mut buf[..n]);
     true
 }
 

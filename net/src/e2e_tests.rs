@@ -1253,7 +1253,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
     // Build a full Ethernet frame (ETH + IPv4 + TCP SYN) and inject
     // through rx_handler to exercise the netfilter conntrack path.
     let client_iss: u32 = 0x8000_0000;
-    let syn_full = build_tcp_frame(TcpFrameSpec {
+    let mut syn_full = build_tcp_frame(TcpFrameSpec {
         src_mac: [0x02, 0, 0, 0, 0, 0x05],
         dst_mac: [0x02, 0, 0, 0, 0, 0x05],
         src_ip: LOCAL_IP,
@@ -1266,7 +1266,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         window: 65535,
         payload: &[],
     });
-    crate::tcp_stack::rx_handler("", &syn_full);
+    crate::tcp_stack::rx_handler("", &mut syn_full);
     let _ = drain_captured();
 
     // Conntrack snapshot should have a TCP entry for this flow.
@@ -1298,7 +1298,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack_full = build_tcp_frame(TcpFrameSpec {
+    let mut ack_full = build_tcp_frame(TcpFrameSpec {
         src_mac: [0x02, 0, 0, 0, 0, 0x05],
         dst_mac: [0x02, 0, 0, 0, 0, 0x05],
         src_ip: LOCAL_IP,
@@ -1311,7 +1311,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         window: 65535,
         payload: &[],
     });
-    crate::tcp_stack::rx_handler("", &ack_full);
+    crate::tcp_stack::rx_handler("", &mut ack_full);
     let _ = drain_captured();
 
     // After ACK, conntrack sub-state should be ESTABLISHED.

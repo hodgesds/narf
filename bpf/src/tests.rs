@@ -138,6 +138,14 @@ fn st_imm(dst: u8, off: i16, v: i32) -> Decoded {
         src: Source::Imm(v),
     }
 }
+fn stx_size(size: Size, dst: u8, off: i16, src: u8) -> Decoded {
+    Decoded::Store {
+        size,
+        dst: r(dst),
+        off,
+        src: Source::Reg(r(src)),
+    }
+}
 fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
     Decoded::Alu {
         wide: true,
@@ -241,13 +249,21 @@ fn load_xdp(
     name: &str,
     insns: Vec<Insn>,
 ) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
+    load_xdp_with_maps(name, insns, alloc::vec::Vec::new())
+}
+
+fn load_xdp_with_maps(
+    name: &str,
+    insns: Vec<Insn>,
+    maps: alloc::vec::Vec<(i32, Arc<crate::map::BpfMap>)>,
+) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
     BpfProg::load_for_xdp(
         load_cap(),
         LoadRequest {
             name: alloc::string::String::from(name),
             insns,
             context: Context::Atomic,
-            maps: alloc::vec::Vec::new(),
+            maps,
             map_indices: alloc::vec::Vec::new(),
             load_references: alloc::vec::Vec::new(),
         },
@@ -933,6 +949,62 @@ fn smoke_bpf_typed_probe_reads_declared_field() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_typed_probe_reads_declared_field);
 
+fn typed_direct_read_program(offset: i32, size: Size) -> Vec<Insn> {
+    // r6 = typed object from ctx[0]; r0 = *(size *)(r6 + offset); return it.
+    // No mediator kfunc: the load itself is the certified typed read.
+    asm(&[ldx(6, 1, 0), ldx_size(size, 0, 6, offset as i16), EXIT])
+}
+
+fn smoke_bpf_typed_probe_direct_field_load_reads_bytes() -> TestResult {
+    use narf_tracing::dispatch::{self, ProbeArgs, ProbeHandlerInstall};
+
+    let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
+    let Ok(prog) = load_typed::<TypedTraceSample>(
+        "typed-direct-read",
+        typed_direct_read_program(value_offset, Size::Dw),
+    ) else {
+        return TestResult::Fail("load rejected an exact direct typed field read");
+    };
+    // A direct typed load reads its field through the tracing wrapper, an
+    // indirection the JIT does not emit — so the program is refused by gate 5
+    // and runs interpreted even where a native backend exists.
+    if prog.is_jited() {
+        return TestResult::Fail("a direct typed load must not reach the native backend");
+    }
+    // The raw execution API must still decline a caller-forged wrapper pointer.
+    if prog.run_atomic([0; 4], 4).is_some() || prog.run_atomic_interpreted([0; 4], 4).is_some() {
+        return TestResult::Fail("direct typed program accepted a raw context execution");
+    }
+
+    let attach_cap = Cap::<crate::prog::BpfAttach, Grant>::bootstrap();
+    let install_cap = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let probe_id = dispatch::reserve_probe_id();
+    if crate::attach::attach_probe(&attach_cap, &install_cap, probe_id, prog.clone()).is_err() {
+        return TestResult::Fail("direct typed attach failed");
+    }
+
+    // A scalar fire and the wrong schema must not run it; only the matching
+    // typed fire does, and it reads the exact field bytes back.
+    dispatch::fire(probe_id, ProbeArgs::one(u64::MAX));
+    dispatch::fire_typed(probe_id, &OtherTypedTraceSample { value: 9 });
+    let sample = TypedTraceSample {
+        pid: 41,
+        flags: 7,
+        value: 0x1122_3344_5566_7788,
+    };
+    dispatch::fire_typed(probe_id, &sample);
+    let _ = crate::attach::detach_probe(&install_cap, probe_id);
+
+    if prog.runs() != 1 || prog.traps() != 0 {
+        return TestResult::Fail("direct typed dispatch ran the wrong number of times or trapped");
+    }
+    if prog.accumulated() != sample.value {
+        return TestResult::Fail("direct typed load read the wrong field bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_typed_probe_direct_field_load_reads_bytes);
+
 fn smoke_bpf_typed_probe_rejects_non_field_reads() -> TestResult {
     let value_offset = core::mem::offset_of!(TypedTraceSample, value) as i32;
     // A shifted offset and a truncated width are both inside the object, but
@@ -951,16 +1023,21 @@ fn smoke_bpf_typed_probe_rejects_non_field_reads() -> TestResult {
         }
     }
 
-    // Direct dereference remains forbidden even for a declared field. The
-    // mediated path is what supplies the independent runtime recheck.
-    let direct = asm(&[ldx(6, 1, 0), ldx(0, 6, value_offset as i16), EXIT]);
-    match load_typed::<TypedTraceSample>("typed-direct", direct) {
-        Err(crate::prog::LoadError::Rejected(narf_bpf_verifier::VerifyError::OpaqueDeref {
-            ..
-        })) => TestResult::Pass,
-        Err(_) => TestResult::Fail("direct typed load failed for the wrong reason"),
-        Ok(_) => TestResult::Fail("direct typed object dereference was accepted"),
+    // A *direct* load — no mediator kfunc — is admitted only at an exact
+    // declared field, the same boundary the kfunc enforces. A shifted offset
+    // and a truncated width both stay inside the object and both are rejected,
+    // and rejection is never a fallback to a raw dereference.
+    for (offset, width) in [(value_offset + 1, Size::Dw), (value_offset, Size::W)] {
+        let bad = asm(&[ldx(6, 1, 0), ldx_size(width, 0, 6, offset as i16), EXIT]);
+        match load_typed::<TypedTraceSample>("typed-direct-bad", bad) {
+            Err(crate::prog::LoadError::Rejected(
+                narf_bpf_verifier::VerifyError::TypedFieldMismatch { .. },
+            )) => {}
+            Err(_) => return TestResult::Fail("bad direct typed load failed for the wrong reason"),
+            Ok(_) => return TestResult::Fail("a non-field direct typed load passed verification"),
+        }
     }
+    TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_typed_probe_rejects_non_field_reads);
 
@@ -2075,6 +2152,7 @@ fn smoke_bpf_jit_gates_two_and_three_refuse_what_they_name() -> TestResult {
             arena,
         }],
         bare_access_sites: alloc::vec![narf_bpf_verifier::BareAccessSite { insn_index: 0 }],
+        typed_load_sites: alloc::vec::Vec::new(),
         subprogs: alloc::vec::Vec::new(),
         uses_arena: arena,
         kfunc_calls: alloc::vec::Vec::new(),
@@ -2421,25 +2499,256 @@ fn smoke_bpf_xdp_program_decides() -> TestResult {
     // A frame whose EtherType's first byte is 0x11 → matches → DROP.
     let mut frame = [0u8; 64];
     frame[12] = 0x11;
-    if prog.run_xdp_interpreted(&frame) != Some(Outcome::Returned(1)) {
+    if prog.run_xdp_interpreted(&mut frame) != Some(Outcome::Returned(1)) {
         return TestResult::Fail("interpreter did not read the bounded frame byte");
     }
-    if x.run("test0", &frame) != XdpAction::Drop {
+    if x.run("test0", &mut frame).0 != XdpAction::Drop {
         return TestResult::Fail("program did not read the matching frame byte");
     }
     // Change the matched byte → PASS. If the context were zeroed, both frames
     // would take the same branch and this would be the failure.
     frame[12] = 0x22;
-    if x.run("test0", &frame) != XdpAction::Pass {
+    if x.run("test0", &mut frame).0 != XdpAction::Pass {
         return TestResult::Fail("verdict did not follow the frame contents");
     }
     // A short frame takes the explicit bounds-failure branch.
-    if x.run("test0", &[0u8; 3]) != XdpAction::Pass {
+    if x.run("test0", &mut [0u8; 3]).0 != XdpAction::Pass {
         return TestResult::Fail("a short frame was mishandled");
     }
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_program_decides);
+
+fn smoke_bpf_xdp_rewrites_frame() -> TestResult {
+    // A writable XDP frame: prove that byte 12 is live (`data + 14 <= data_end`),
+    // rewrite it in place with a bounded store, then return XDP_TX (3). After
+    // the run the caller's frame buffer must hold the written byte — that is the
+    // frame `XDP_TX` reflects and `XDP_REDIRECT` forwards. Both the interpreter
+    // and the JIT (which lowers the bounded store natively, symmetric to the
+    // bounded read) must land the write; the differential run below exercises
+    // the interpreter explicitly.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+
+    let insns = asm(&[
+        ldx(2, 1, 0),  // r2 = data
+        ldx(3, 1, 8),  // r3 = data_end
+        mov_reg(4, 2), // r4 = data
+        alu_imm(AluOp::Add, 4, 14),
+        jgt_reg(4, 3, 4),            // short frame -> XDP_PASS
+        mov_imm(5, 0xAB),            // r5 = new byte value
+        stx_size(Size::B, 2, 12, 5), // data[12] = 0xAB  (bounded store)
+        mov_imm(0, 3),               // XDP_TX
+        EXIT,
+        mov_imm(0, 2), // XDP_PASS (short frame)
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-rewrite", insns) else {
+        return TestResult::Fail("load rejected a program that stores into the packet");
+    };
+    // The bounded packet store is native-safe, so a program with a JIT backend
+    // must compile rather than fall back — the write JITs symmetric to the read.
+    if narf_bpf_jit::has_backend() && !prog.is_jited() {
+        return TestResult::Fail("a bounded packet store unexpectedly fell back from the JIT");
+    }
+
+    // Interpreter path: the differential runner writes through the bounded
+    // store against the exact slice, and the byte must change.
+    let mut frame = [0u8; 64];
+    frame[12] = 0x11;
+    if prog.run_xdp_interpreted(&mut frame) != Some(Outcome::Returned(3)) {
+        return TestResult::Fail("interpreter did not return XDP_TX from the rewrite program");
+    }
+    if frame[12] != 0xAB {
+        return TestResult::Fail("interpreter did not rewrite the bounded frame byte");
+    }
+
+    // Dispatch path (`BpfXdp::run`, whichever backend the program took): the
+    // verdict is XDP_TX and the frame reflects the write.
+    let x = crate::attach_xdp::BpfXdp::for_test(alloc::sync::Arc::clone(&prog), "rw0");
+    let mut frame = [0u8; 64];
+    if x.run("rw0", &mut frame).0 != XdpAction::Tx {
+        return TestResult::Fail("rewrite program did not surface as XDP_TX");
+    }
+    if frame[12] != 0xAB {
+        return TestResult::Fail("the frame did not reflect the in-place rewrite after run");
+    }
+    // A short frame fails the dominating bound and takes the PASS branch without
+    // touching memory — the store is never reached, so nothing is written.
+    let mut short = [0u8; 8];
+    if x.run("rw0", &mut short).0 != XdpAction::Pass {
+        return TestResult::Fail("a short frame was not passed unmodified");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_rewrites_frame);
+
+/// The `data`/`data_end`-reload prologue shared by the adjust smokes.
+///
+/// Saves the context in R6 (callee-saved, so it survives the adjust call),
+/// loads `data`/`data_end` into R2/R3, and proves `data + 14 <= data_end` so a
+/// read at offset 12 is admitted — the check every packet access needs.
+fn xdp_prove_14(short_branch: i16) -> [Decoded; 6] {
+    [
+        mov_reg(6, 1), // r6 = ctx
+        ldx(2, 1, 0),  // r2 = data
+        ldx(3, 1, 8),  // r3 = data_end
+        mov_reg(4, 2), // r4 = data
+        alu_imm(AluOp::Add, 4, 14),
+        jgt_reg(4, 3, short_branch), // data + 14 > data_end -> short-frame branch
+    ]
+}
+
+fn smoke_bpf_xdp_adjust_head_shrinks_and_reads() -> TestResult {
+    // `bpf_xdp_adjust_head(ctx, +14)` removes the 14-byte Ethernet header from the
+    // front: `data += 14`. The program then re-reads `data` (the kfunc moved it
+    // and the verifier invalidated the old bound), re-proves `data + 1 <=
+    // data_end`, and returns the new byte 0 — which is byte 14 of the original
+    // frame. `run_xdp` is called directly, so the return value is the byte read
+    // and the paired length is the resulting window. This proves both that the
+    // pointer moved and that the packet re-read is against the shifted window.
+    let insns = asm(&[
+        mov_reg(6, 1), // r6 = ctx (survives the adjust call)
+        // adjust_head(ctx, +14)
+        mov_reg(1, 6),
+        mov_imm(2, 14),
+        call("bpf_xdp_adjust_head"),
+        // Re-read the moved data/data_end and prove one byte is live.
+        ldx(2, 6, 0), // r2 = data (moved)
+        ldx(3, 6, 8), // r3 = data_end
+        mov_reg(4, 2),
+        alu_imm(AluOp::Add, 4, 1),
+        jgt_reg(4, 3, 2),           // empty after trim -> return 0
+        ldx_size(Size::B, 0, 2, 0), // r0 = data[0]  (== original byte 14)
+        EXIT,
+        mov_imm(0, 0), // empty-window branch: return 0
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-head", insns) else {
+        return TestResult::Fail("load rejected an adjust_head program");
+    };
+    // A resizing program must run interpreted — the JIT refuses it.
+    if prog.is_jited() {
+        return TestResult::Fail("an adjust program was unexpectedly JITed");
+    }
+    let mut frame = [0u8; 64];
+    frame[14] = 0x5A; // becomes the new byte 0 after adjust_head(+14)
+    match prog.run_xdp(&mut frame) {
+        Some((Outcome::Returned(0x5A), len)) if len == 64 - 14 => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("adjust_head(+14) did not shift data and shrink the window");
+        }
+    }
+    // The delivered bytes start at the old offset 14.
+    if frame[0] != 0x5A {
+        return TestResult::Fail("the trimmed frame did not start at the shifted data pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_shrinks_and_reads);
+
+fn smoke_bpf_xdp_adjust_tail_trims() -> TestResult {
+    // `bpf_xdp_adjust_tail(ctx, -4)` drops four trailing bytes: `data_end -= 4`.
+    // The window shrinks with `data` unmoved, so the delivered length is the
+    // original minus 4 and the delivered header bytes are unchanged.
+    let mut items = alloc::vec::Vec::new();
+    // The short-frame branch skips the five main-body instructions
+    // (mov/mov/call/mov/EXIT) to land on the short-frame PASS, which sets R0
+    // before its EXIT — a bare jump to the main EXIT would read an
+    // uninitialised R0 and the verifier would reject the load.
+    items.extend_from_slice(&xdp_prove_14(5));
+    items.extend_from_slice(&[
+        mov_reg(1, 6),
+        mov_imm(2, -4),
+        call("bpf_xdp_adjust_tail"),
+        mov_imm(0, 2), // XDP_PASS
+        EXIT,
+        mov_imm(0, 2), // short-frame PASS
+        EXIT,
+    ]);
+    let insns = asm(&items);
+    let Ok(prog) = load_xdp("xdp-adj-tail", insns) else {
+        return TestResult::Fail("load rejected an adjust_tail program");
+    };
+    let mut frame = [0u8; 64];
+    frame[0] = 0xC3; // a header byte the trim must preserve
+    match prog.run_xdp(&mut frame) {
+        Some((Outcome::Returned(2), len)) if len == 64 - 4 => {}
+        _ => return TestResult::Fail("adjust_tail(-4) did not trim the window by four bytes"),
+    }
+    if frame[0] != 0xC3 {
+        return TestResult::Fail("adjust_tail moved data — only data_end should move");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_tail_trims);
+
+fn smoke_bpf_xdp_adjust_head_grows_within_headroom() -> TestResult {
+    // A negative delta grows the head, prepending headroom: `data -= 32`. The
+    // staged buffer has 256 bytes of headroom, so the kfunc succeeds (returns 0)
+    // rather than -ENOMEM — the branch below turns that into XDP_PASS. Delivery
+    // is bounded by the caller frame's capacity, so a grow beyond 64 bytes cannot
+    // lengthen this 64-byte frame; the observable effect is the *content* shift:
+    // the delivered window now begins 32 bytes earlier in the staged buffer, so
+    // its first 32 bytes are the zeroed prepended headroom and the original byte 0
+    // lands at offset 32.
+    let insns = asm(&[
+        mov_reg(6, 1),
+        mov_reg(1, 6),
+        mov_imm(2, -32),
+        call("bpf_xdp_adjust_head"), // r0 = 0 on success, -ENOMEM otherwise
+        jne_imm(0, 0, 1),            // if status != 0, skip the PASS store (leave r0 nonzero)
+        mov_imm(0, 2),               // XDP_PASS
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-grow", insns) else {
+        return TestResult::Fail("load rejected an adjust_head grow program");
+    };
+    let mut frame = [0u8; 64];
+    frame[0] = 0xD7; // original byte 0 — must reappear at offset 32 after the grow
+    match prog.run_xdp(&mut frame) {
+        // Success (PASS), delivered length capped at the caller frame's capacity.
+        Some((Outcome::Returned(2), 64)) => {}
+        _ => return TestResult::Fail("adjust_head(-32) within headroom did not succeed"),
+    }
+    if frame[0] != 0 {
+        return TestResult::Fail("the grown head did not prepend zeroed headroom at offset 0");
+    }
+    if frame[32] != 0xD7 {
+        return TestResult::Fail("the grow did not shift the original byte 0 to offset 32");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_grows_within_headroom);
+
+fn smoke_bpf_xdp_adjust_head_grow_past_headroom_enomem() -> TestResult {
+    // A grow larger than the staged headroom (256 bytes) has nowhere to go:
+    // `bpf_xdp_adjust_head` returns -ENOMEM and leaves `data` unmoved, so the
+    // delivered window is unchanged. The program returns the kfunc's status,
+    // which the test reads as a negative value; the length stays the original.
+    let insns = asm(&[
+        mov_reg(6, 1),
+        mov_reg(1, 6),
+        mov_imm(2, -9999),
+        call("bpf_xdp_adjust_head"), // r0 = -ENOMEM (no room)
+        EXIT,                        // return the status verbatim
+    ]);
+    let Ok(prog) = load_xdp("xdp-adj-nomem", insns) else {
+        return TestResult::Fail("load rejected the grow-past-headroom program");
+    };
+    let mut frame = [0u8; 64];
+    match prog.run_xdp(&mut frame) {
+        // -ENOMEM is -12, which the u64 return carries as its two's-complement.
+        Some((Outcome::Returned(v), len)) if v == (-12i64) as u64 && len == 64 => {}
+        _ => {
+            return TestResult::Fail(
+                "a grow past headroom did not return -ENOMEM with data unmoved",
+            )
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_adjust_head_grow_past_headroom_enomem);
 
 fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
     // Linux treats an unrecognised XDP return as XDP_ABORTED. So does this: a
@@ -2452,12 +2761,136 @@ fn smoke_bpf_xdp_unknown_action_aborts() -> TestResult {
         return TestResult::Fail("load rejected");
     };
     let x = crate::attach_xdp::BpfXdp::for_test(prog, "test1");
-    if x.run("test1", &[0u8; 64]) != XdpAction::Aborted {
+    if x.run("test1", &mut [0u8; 64]).0 != XdpAction::Aborted {
         return TestResult::Fail("an unknown action was not treated as aborted");
     }
     TestResult::Pass
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_unknown_action_aborts);
+
+fn smoke_bpf_xdp_tx_reflects() -> TestResult {
+    // Linux's XDP_TX is 3. A program returning it asks for the unmodified frame
+    // to be reflected back out the ingress iface; `BpfXdp::run` must surface
+    // that as `XdpAction::Tx` (the classifier then turns it into a
+    // `Verdict::Transmit` — proven end-to-end in `link.rs`).
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    let insns = asm(&[mov_imm(0, 3), EXIT]);
+    let Ok(prog) = load_xdp("xdp-tx", insns) else {
+        return TestResult::Fail("load rejected an XDP_TX program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "tx0");
+    if x.run("tx0", &mut [0u8; 64]).0 != XdpAction::Tx {
+        return TestResult::Fail("return code 3 did not map to XdpAction::Tx");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_tx_reflects);
+
+fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
+    // A program calls `bpf_redirect(ifindex, 0)` — which stashes the ifindex in
+    // a per-CPU slot and itself returns XDP_REDIRECT (4) — then returns R0. The
+    // dispatch reads the slot back and yields `XdpAction::Redirect{ifindex}`.
+    // This is the whole point of the per-CPU-slot mechanism: a read-only frame
+    // has no context word to carry the target, so it rides the slot instead.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    const IFINDEX: i32 = 7;
+    let insns = asm(&[
+        mov_imm(1, IFINDEX), // r1 = ifindex
+        mov_imm(2, 0),       // r2 = flags
+        call("bpf_redirect"),
+        // `bpf_redirect` leaves XDP_REDIRECT (4) in r0; return it verbatim.
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp("xdp-redir", insns) else {
+        return TestResult::Fail("load rejected a program calling bpf_redirect");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "redir0");
+    match x.run("redir0", &mut [0u8; 64]).0 {
+        XdpAction::Redirect { ifindex } if ifindex == IFINDEX as u32 => {}
+        _ => {
+            return TestResult::Fail("bpf_redirect target ifindex was not conveyed to the verdict");
+        }
+    }
+    // A second run with no `bpf_redirect` must not inherit the prior target:
+    // `BpfXdp::run` clears the slot before running, and a bare `return 4` with
+    // nothing primed is a program bug → Aborted.
+    let bare = asm(&[mov_imm(0, 4), EXIT]);
+    let Ok(bare_prog) = load_xdp("xdp-redir-bare", bare) else {
+        return TestResult::Fail("load rejected a bare return-4 program");
+    };
+    let y = crate::attach_xdp::BpfXdp::for_test(bare_prog, "redir1");
+    if y.run("redir1", &mut [0u8; 64]).0 != XdpAction::Aborted {
+        return TestResult::Fail("XDP_REDIRECT with no bpf_redirect target was not aborted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_redirect_carries_ifindex);
+
+fn smoke_bpf_xdp_redirect_map_kinds_reach_the_verdict() -> TestResult {
+    // The two `bpf_redirect_map` target kinds reach the attach-layer verdict
+    // distinctly: a devmap hit becomes `XdpAction::Redirect{ifindex}` (send out
+    // a NIC), a cpumap hit becomes `XdpAction::RedirectCpu{cpu}` (deliver to the
+    // local stack). The per-CPU redirect slot is kind-tagged, and `BpfXdp::run`
+    // decodes the tag — this proves the whole read-back path, not just the kfunc.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    let build = |flags: i32| {
+        asm(&[
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1), // key
+            mov_imm(3, flags),
+            call("bpf_redirect_map"),
+            EXIT,
+        ])
+    };
+
+    // Devmap: slot 1 → ifindex 9.
+    let dev = match mk(MapKind::DevMap, 4, 4, 4) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("DevMap create failed"),
+    };
+    if dev
+        .ops()
+        .update(&k32(1), &9u32.to_le_bytes(), BPF_ANY)
+        .is_err()
+    {
+        return TestResult::Fail("DevMap update rejected");
+    }
+    let Ok(dev_prog) =
+        load_xdp_with_maps("xdp-redir-dev", build(2), alloc::vec![(SMOKE_MAP_FD, dev)])
+    else {
+        return TestResult::Fail("load rejected a devmap bpf_redirect_map XDP program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(dev_prog, "rdm-dev");
+    match x.run("rdm-dev", &mut [0u8; 64]).0 {
+        XdpAction::Redirect { ifindex: 9 } => {}
+        _ => return TestResult::Fail("a devmap redirect did not reach Redirect{ifindex=9}"),
+    }
+
+    // Cpumap: CPU 1 enabled → local-delivery verdict carrying the CPU.
+    let cpu = match mk(MapKind::CpuMap, 4, 4, 4) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("CpuMap create failed"),
+    };
+    if cpu
+        .ops()
+        .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+        .is_err()
+    {
+        return TestResult::Fail("CpuMap update rejected");
+    }
+    let Ok(cpu_prog) =
+        load_xdp_with_maps("xdp-redir-cpu", build(2), alloc::vec![(SMOKE_MAP_FD, cpu)])
+    else {
+        return TestResult::Fail("load rejected a cpumap bpf_redirect_map XDP program");
+    };
+    let y = crate::attach_xdp::BpfXdp::for_test(cpu_prog, "rdm-cpu");
+    match y.run("rdm-cpu", &mut [0u8; 64]).0 {
+        XdpAction::RedirectCpu { cpu: 1 } => {}
+        _ => return TestResult::Fail("a cpumap redirect did not reach RedirectCpu{cpu=1}"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_redirect_map_kinds_reach_the_verdict);
 
 fn smoke_bpf_jit_fuel_covers_every_path() -> TestResult {
     // The risk fuel emission actually has: if a back-edge target is not a block
@@ -3911,6 +4344,434 @@ fn smoke_bpf_map_kfunc_reports_errnos() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_map_kfunc_reports_errnos);
+
+fn smoke_bpf_devmap_shape_and_lookup() -> TestResult {
+    checked(|| {
+        // The Linux `BPF_MAP_TYPE_DEVMAP` number decodes to the devmap kind.
+        if MapKind::from_linux(14) != Some(MapKind::DevMap) {
+            return Err("BPF_MAP_TYPE_DEVMAP did not decode to DevMap");
+        }
+        // A devmap slot holds exactly one 4-byte ifindex, and its key is the
+        // slot index — 4 bytes, like any array kind. Both other shapes are
+        // rejected at creation.
+        if mk(MapKind::DevMap, 4, 8, 4).is_ok() {
+            return Err("a devmap with a non-4-byte value was accepted");
+        }
+        if mk(MapKind::DevMap, 8, 4, 4).is_ok() {
+            return Err("a devmap with a non-4-byte key was accepted");
+        }
+
+        let m = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        // A fresh slot, and a key past `max_entries`, are both misses.
+        if m.devmap_lookup(0).is_some() {
+            return Err("a fresh devmap slot was not a miss");
+        }
+        if m.devmap_lookup(999).is_some() {
+            return Err("a key past max_entries was not a miss");
+        }
+        // Install ifindex 7 at slot 2; read it back and confirm it stays in its
+        // own slot.
+        m.ops()
+            .update(&k32(2), &7u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        if m.devmap_lookup(2) != Some(7) {
+            return Err("devmap_lookup did not return the installed ifindex");
+        }
+        if m.devmap_lookup(1).is_some() || m.devmap_lookup(3).is_some() {
+            return Err("a devmap update leaked into a neighbour slot");
+        }
+
+        // `devmap_lookup` is a miss on a non-devmap even when a value is present.
+        let arr = mk(MapKind::Array, 4, 4, 4).map_err(|_| "Array create failed")?;
+        arr.ops()
+            .update(&k32(0), &5u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "Array update rejected")?;
+        if arr.devmap_lookup(0).is_some() {
+            return Err("devmap_lookup treated a plain array as a devmap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_devmap_shape_and_lookup);
+
+fn smoke_bpf_redirect_map_arms_target() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target, RedirectTarget};
+    checked(|| {
+        // A devmap with ifindex 7 at slot 0; slot 1 left empty.
+        let m = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        m.ops()
+            .update(&k32(0), &7u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+
+        // `bpf_redirect_map(map, key, flags)` — flags is the miss fallback.
+        let build = |key: i32, flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, key),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // A hit: key 0 → XDP_REDIRECT (4) and ifindex 7 armed as the target.
+        let hit = load_with_map("redirmap-hit", build(0, 2), &m)
+            .map_err(|_| "load rejected a bpf_redirect_map program")?;
+        // The map handle is a real address on both backends, so this is an
+        // ordinary shim the JIT lowers natively — not an interpreter intrinsic.
+        if !hit.is_jited() {
+            return Err("a bpf_redirect_map program did not JIT");
+        }
+        // Native and interpreted must agree: XDP_REDIRECT with ifindex 7 armed.
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                hit.run_atomic_interpreted([0; 4], 4)
+            } else {
+                hit.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a devmap hit did not return XDP_REDIRECT"),
+            }
+            if take_xdp_redirect_target() != Some(RedirectTarget::Iface(7)) {
+                return Err("a devmap hit did not arm the ifindex as the redirect target");
+            }
+        }
+
+        // A miss: empty slot 1 → the fallback action (XDP_PASS, 2), no target.
+        let miss = load_with_map("redirmap-miss", build(1, 2), &m).map_err(|_| "load rejected")?;
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                miss.run_atomic_interpreted([0; 4], 4)
+            } else {
+                miss.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(2)) => {}
+                _ => return Err("a devmap miss did not return the fallback action"),
+            }
+            if take_xdp_redirect_target().is_some() {
+                return Err("a devmap miss armed a redirect target anyway");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_arms_target);
+
+fn smoke_bpf_cpumap_shape_and_target() -> TestResult {
+    checked(|| {
+        // The Linux `BPF_MAP_TYPE_CPUMAP` number decodes to the cpumap kind, and
+        // its 4-byte value / 4-byte key shape is enforced like any array kind.
+        if MapKind::from_linux(16) != Some(MapKind::CpuMap) {
+            return Err("BPF_MAP_TYPE_CPUMAP did not decode to CpuMap");
+        }
+        if mk(MapKind::CpuMap, 4, 8, 4).is_ok() {
+            return Err("a cpumap with a non-4-byte value was accepted");
+        }
+        if mk(MapKind::CpuMap, 8, 4, 4).is_ok() {
+            return Err("a cpumap with a non-4-byte key was accepted");
+        }
+
+        let m = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        // An empty slot and a past-the-end key are both non-targets.
+        if m.cpumap_has_target(0) || m.cpumap_has_target(999) {
+            return Err("a fresh/out-of-range cpumap slot was a target");
+        }
+        // Enable CPU 1 (a non-zero qsize marker) and confirm only it is live.
+        m.ops()
+            .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        if !m.cpumap_has_target(1) {
+            return Err("an enabled cpumap slot was not a target");
+        }
+        if m.cpumap_has_target(0) || m.cpumap_has_target(2) {
+            return Err("a cpumap update leaked into a neighbour slot");
+        }
+        // A cpumap is not a devmap: devmap_lookup is always a miss on it.
+        if m.devmap_lookup(1).is_some() {
+            return Err("devmap_lookup treated a cpumap as a devmap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_cpumap_shape_and_target);
+
+fn smoke_bpf_redirect_map_cpumap_arms_local_delivery() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target, RedirectTarget};
+    checked(|| {
+        // A cpumap with CPU 1 enabled; CPU 2 left empty.
+        let m = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        m.ops()
+            .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+
+        let build = |key: i32, flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, key),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // A hit on CPU 1 → XDP_REDIRECT (4) with the CPU armed as the target.
+        let hit = load_with_map("cpumap-hit", build(1, 2), &m)
+            .map_err(|_| "load rejected a cpumap bpf_redirect_map program")?;
+        if !hit.is_jited() {
+            return Err("a cpumap bpf_redirect_map program did not JIT");
+        }
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                hit.run_atomic_interpreted([0; 4], 4)
+            } else {
+                hit.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a cpumap hit did not return XDP_REDIRECT"),
+            }
+            if take_xdp_redirect_target() != Some(RedirectTarget::Cpu(1)) {
+                return Err("a cpumap hit did not arm the CPU as the redirect target");
+            }
+        }
+
+        // A miss on the empty CPU 2 → the fallback action (XDP_PASS), no target.
+        let miss = load_with_map("cpumap-miss", build(2, 2), &m).map_err(|_| "load rejected")?;
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                miss.run_atomic_interpreted([0; 4], 4)
+            } else {
+                miss.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(2)) => {}
+                _ => return Err("a cpumap miss did not return the fallback action"),
+            }
+            if take_xdp_redirect_target().is_some() {
+                return Err("a cpumap miss armed a redirect target anyway");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_cpumap_arms_local_delivery);
+
+fn smoke_bpf_devmap_ports_enumerates_live_entries() -> TestResult {
+    checked(|| {
+        // A devmap with live ports at slots 0 and 3 (8 and 5), the rest empty.
+        let m = mk(MapKind::DevMap, 4, 4, 8).map_err(|_| "DevMap create failed")?;
+        m.ops()
+            .update(&k32(0), &8u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        m.ops()
+            .update(&k32(3), &5u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+
+        // Enumeration skips empty slots and returns live ifindexes in key order.
+        let mut ports = [0u32; 8];
+        if m.devmap_ports(&mut ports) != 2 || ports[0] != 8 || ports[1] != 5 {
+            return Err("devmap_ports did not enumerate the live entries in order");
+        }
+        // A short output buffer caps the count and keeps the first entries.
+        let mut one = [0u32; 1];
+        if m.devmap_ports(&mut one) != 1 || one[0] != 8 {
+            return Err("devmap_ports did not cap at the output buffer");
+        }
+        // A cpumap yields nothing — enumeration is devmap-only.
+        let c = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        c.ops()
+            .update(&k32(0), &1u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        if c.devmap_ports(&mut ports) != 0 {
+            return Err("devmap_ports enumerated a cpumap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_devmap_ports_enumerates_live_entries);
+
+fn smoke_bpf_redirect_map_broadcast_fans_out() -> TestResult {
+    use crate::kfuncs::{
+        clear_xdp_redirect_target, copy_broadcast_ports, take_xdp_redirect_target, RedirectTarget,
+    };
+    checked(|| {
+        // A devmap with three live ports (2, 4, 7).
+        let m = mk(MapKind::DevMap, 4, 4, 8).map_err(|_| "DevMap create failed")?;
+        for (slot, ifindex) in [(0u32, 2u32), (2, 4), (5, 7)] {
+            m.ops()
+                .update(&k32(slot), &ifindex.to_le_bytes(), BPF_ANY)
+                .map_err(|_| "DevMap update rejected")?;
+        }
+
+        // bpf_redirect_map(map, key_ignored, flags). BPF_F_BROADCAST = 8,
+        // BPF_F_EXCLUDE_INGRESS = 16.
+        let build = |flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, 999), // key ignored on broadcast
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // Broadcast: XDP_REDIRECT, and all three live ports staged (no exclude).
+        let bcast =
+            load_with_map("redirmap-bcast", build(8), &m).map_err(|_| "load rejected broadcast")?;
+        if !bcast.is_jited() {
+            return Err("a broadcast bpf_redirect_map program did not JIT");
+        }
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                bcast.run_atomic_interpreted([0; 4], 4)
+            } else {
+                bcast.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a broadcast did not return XDP_REDIRECT"),
+            }
+            match take_xdp_redirect_target() {
+                Some(RedirectTarget::Broadcast {
+                    n: 3,
+                    exclude_ingress: false,
+                }) => {}
+                _ => return Err("a broadcast did not arm three ports without exclude-ingress"),
+            }
+            let mut ports = [0u32; crate::kfuncs::MAX_BROADCAST_PORTS];
+            let count = copy_broadcast_ports(&mut ports[..3]);
+            if count != 3 || ports[0] != 2 || ports[1] != 4 || ports[2] != 7 {
+                return Err("the staged broadcast ports were not the live devmap entries");
+            }
+        }
+
+        // BPF_F_EXCLUDE_INGRESS (16) rides alongside and is recorded.
+        let excl = load_with_map("redirmap-bcast-excl", build(8 | 16), &m)
+            .map_err(|_| "load rejected broadcast+exclude")?;
+        clear_xdp_redirect_target();
+        if excl.run_atomic([0; 4], 4) != Some(Outcome::Returned(4)) {
+            return Err("broadcast+exclude did not return XDP_REDIRECT");
+        }
+        match take_xdp_redirect_target() {
+            Some(RedirectTarget::Broadcast {
+                n: 3,
+                exclude_ingress: true,
+            }) => {}
+            _ => return Err("broadcast did not record BPF_F_EXCLUDE_INGRESS"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_broadcast_fans_out);
+
+fn smoke_bpf_redirect_map_broadcast_rejects_bad_shapes() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target};
+    checked(|| {
+        let build = |flags: i32, fd: i32| {
+            asm(&[
+                ld_map_fd(1, fd),
+                mov_imm(2, 0),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // Broadcast on a cpumap is rejected (XDP_ABORTED = 0): fan-out is
+        // devmap-only.
+        let c = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        c.ops()
+            .update(&k32(0), &1u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        let p = load_with_map("bcast-cpumap", build(8, SMOKE_MAP_FD), &c)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast on a cpumap was not aborted");
+        }
+        if take_xdp_redirect_target().is_some() {
+            return Err("a rejected broadcast armed a target");
+        }
+
+        // An empty devmap has no ports to fan out to → aborted.
+        let empty = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        let p = load_with_map("bcast-empty", build(8, SMOKE_MAP_FD), &empty)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast on an empty devmap was not aborted");
+        }
+
+        // A stray flag bit alongside BPF_F_BROADCAST (8 | 32) is rejected.
+        let d = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        d.ops()
+            .update(&k32(0), &2u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        let p = load_with_map("bcast-badflag", build(8 | 32, SMOKE_MAP_FD), &d)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast with a stray flag bit was not aborted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_broadcast_rejects_bad_shapes);
+
+fn smoke_bpf_xdp_broadcast_stages_ports_for_the_sender() -> TestResult {
+    // End-to-end through the attach layer: a broadcasting XDP program yields
+    // `XdpAction::Broadcast`, and the ports it fanned out to are staged into the
+    // net classifier's per-CPU buffer for the RX handler to drain and send.
+    use narf_net::bypass::classifier::{take_xdp_broadcast, XdpAction, XdpProgram};
+    let m = match mk(MapKind::DevMap, 4, 4, 8) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("DevMap create failed"),
+    };
+    for (slot, ifindex) in [(0u32, 3u32), (4, 6)] {
+        if m.ops()
+            .update(&k32(slot), &ifindex.to_le_bytes(), BPF_ANY)
+            .is_err()
+        {
+            return TestResult::Fail("DevMap update rejected");
+        }
+    }
+    let insns = asm(&[
+        ld_map_fd(1, SMOKE_MAP_FD),
+        mov_imm(2, 0),
+        mov_imm(3, 8 | 16), // BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS
+        call("bpf_redirect_map"),
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp_with_maps("xdp-bcast", insns, alloc::vec![(SMOKE_MAP_FD, m)]) else {
+        return TestResult::Fail("load rejected a broadcast XDP program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "bcast0");
+    if x.run("bcast0", &mut [0u8; 64]).0 != XdpAction::Broadcast {
+        return TestResult::Fail("a broadcast did not surface as XdpAction::Broadcast");
+    }
+    // The sender drains the staged ports and the exclude-ingress flag.
+    let mut ports = [0u32; 8];
+    let (n, exclude_ingress) = take_xdp_broadcast(&mut ports);
+    if n != 2 || ports[0] != 3 || ports[1] != 6 {
+        return TestResult::Fail(
+            "the broadcast did not stage the live devmap ports for the sender",
+        );
+    }
+    if !exclude_ingress {
+        return TestResult::Fail(
+            "the broadcast did not stage BPF_F_EXCLUDE_INGRESS for the sender",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_broadcast_stages_ports_for_the_sender);
 
 fn smoke_bpf_map_kfunc_wrong_buffer_width_is_einval() -> TestResult {
     checked(|| {

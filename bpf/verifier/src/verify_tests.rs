@@ -364,6 +364,110 @@ fn dynamic_region_end_is_not_dereferenceable() {
     );
 }
 
+/// The XDP context as the loader now types it: `data` writable (no `READONLY`),
+/// `data_end` still read-only. Mirrors `narf_bpf::prog::XDP_CTX`.
+static PACKET_CTX_WRITABLE: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Mem,
+            key: PACKET_KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    },
+    PACKET_CTX[1],
+];
+
+/// Prove `data + `checked` <= data_end`, then store `imm` at `store_off` with
+/// `store_size` through the data pointer. Mirrors `packet_read_program`, with a
+/// store in place of the load.
+fn packet_store_program(checked: i32, store_off: i16, store_size: Size) -> Vec<Decoded> {
+    vec![
+        ldx(Size::Dw, 2, 1, 0),
+        ldx(Size::Dw, 3, 1, 8),
+        movr(4, 2),
+        alu(AluOp::Add, 4, checked),
+        jmpr(CondOp::Gt, 4, 3, 3),
+        st(store_size, 2, store_off, 0xAB),
+        mov(0, 0),
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ]
+}
+
+#[test]
+fn dynamic_region_check_certifies_packet_store() {
+    // With `data` writable, a store bounded by a dominating `data + 14 <=
+    // data_end` is admitted — the same interval `access()` checks for a read —
+    // and the store instruction is published as a native bare access, so the
+    // JIT lowers it exactly as it lowers the bounded read.
+    let verified = check_ctx(&packet_store_program(14, 12, Size::H), PACKET_CTX_WRITABLE)
+        .expect("data + 14 <= data_end proves a two-byte store at offset 12");
+    assert_eq!(
+        verified
+            .bare_access_sites
+            .iter()
+            .map(|site| site.insn_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 5],
+        "both context loads and the dynamically bounded packet store are native-safe"
+    );
+}
+
+#[test]
+fn packet_store_without_dominating_check_is_rejected() {
+    // No proven `data < data_end`, so the store has no region bound and is
+    // rejected — identical to the unchecked-read case, since the bound is the
+    // same for both.
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 2, 1, 0), st(Size::H, 2, 12, 0xAB), EXIT],
+            PACKET_CTX_WRITABLE,
+        )
+        .expect_err("an unchecked packet store must fail"),
+        VerifyError::OutOfBounds { at: 1 }
+    );
+}
+
+#[test]
+fn packet_store_must_stay_within_the_proven_bound() {
+    // `data + 13 <= data_end` proves 13 bytes live; a two-byte store at offset
+    // 12 touches byte 13, one past the bound. Rejected, exactly as the
+    // one-byte-short read is.
+    assert_eq!(
+        check_ctx(&packet_store_program(13, 12, Size::H), PACKET_CTX_WRITABLE)
+            .expect_err("a store past the proven bound must fail"),
+        VerifyError::OutOfBounds { at: 5 }
+    );
+}
+
+#[test]
+fn packet_store_through_data_end_is_rejected() {
+    // `data_end` is read-only and never dereferenceable: a store through it is
+    // rejected before any bound is even considered.
+    assert_eq!(
+        check_ctx(
+            &[ldx(Size::Dw, 3, 1, 8), st(Size::B, 3, 0, 0xAB), EXIT],
+            PACKET_CTX_WRITABLE,
+        )
+        .expect_err("the exclusive end marker must not be writable"),
+        VerifyError::WriteToReadOnly { at: 1 }
+    );
+}
+
+#[test]
+fn packet_store_is_still_rejected_when_data_is_readonly() {
+    // The read-only XDP typing (both pointers `READONLY`) must still reject a
+    // store — this is the guarantee removing `READONLY` from `data` relaxes, and
+    // the negative that proves the flag is what admits the write.
+    assert_eq!(
+        check_ctx(&packet_store_program(14, 12, Size::H), PACKET_CTX)
+            .expect_err("a store through a READONLY data pointer must fail"),
+        VerifyError::WriteToReadOnly { at: 5 }
+    );
+}
+
 #[test]
 fn dynamic_region_identity_must_match() {
     static WRONG_END_CTX: &[ArgDesc] = &[
@@ -382,6 +486,106 @@ fn dynamic_region_identity_must_match() {
             .expect_err("an unrelated end pointer must not refine the packet"),
         VerifyError::OutOfBounds { at: 5 }
     );
+}
+
+/// A frame-resizing kfunc in the `bpf_xdp_adjust_*` shape: it takes the mutable
+/// context pointer and a scalar delta. The `PtrKind::Ctx` argument is the marker
+/// the verifier keys packet-bound invalidation on.
+static ADJUST_ARGS: &[ArgDesc] = &[
+    ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::Ctx,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    },
+    ArgDesc::SCALAR64,
+];
+
+fn adjust_kfunc() -> KfuncDesc {
+    kfunc(
+        "bpf_xdp_adjust_head",
+        ADJUST_ARGS,
+        ADJUST_ARGS[1],
+        Context::Atomic,
+    )
+}
+
+#[test]
+fn adjust_invalidates_proven_packet_bounds() {
+    // Prove `data + 14 <= data_end` (bytes 0..14 live), read byte 12, then call
+    // the adjust kfunc — which may have moved `data`/`data_end`. A second read at
+    // offset 12 with no fresh comparison must be rejected: the proof the first
+    // read leaned on was struck off at the call.
+    //
+    // The ctx pointer is stashed in R6 (callee-saved) so it survives the call —
+    // R1..R5 are clobbered — and `data` is reloaded from it afterwards, exactly
+    // as a real XDP program re-reads the moved pointer. The reloaded `data`
+    // carries no proven extent, so the read at offset 12 is out of bounds.
+    let prog = [
+        movr(6, 1),             // r6 = ctx (survives the call)
+        ldx(Size::Dw, 2, 1, 0), // r2 = data
+        ldx(Size::Dw, 3, 1, 8), // r3 = data_end
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 7), // data + 14 > data_end -> exit-0
+        ldx(Size::H, 0, 2, 12),    // first read: proven in bounds
+        movr(1, 6),                // r1 = ctx
+        mov(2, 4),                 // r2 = delta (any scalar)
+        call(0),                   // bpf_xdp_adjust_head(ctx, delta) — invalidates
+        ldx(Size::Dw, 2, 6, 0),    // reload data from ctx: no proven extent
+        ldx(Size::H, 0, 2, 12),    // read WITHOUT a fresh check -> rejected
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ];
+    assert_eq!(
+        check_full(
+            &prog,
+            PACKET_CTX_WRITABLE,
+            &[adjust_kfunc()],
+            Context::Atomic
+        )
+        .expect_err("a packet read after an adjust with no re-check must fail"),
+        VerifyError::OutOfBounds { at: 11 },
+    );
+}
+
+#[test]
+fn adjust_then_fresh_check_verifies() {
+    // The same shape, but the program re-proves `data + 14 <= data_end` after the
+    // adjust before reading again. With the bound re-established, the second read
+    // is admitted — invalidation forces a re-check, it does not forbid access.
+    let prog = [
+        movr(6, 1),             // r6 = ctx
+        ldx(Size::Dw, 2, 1, 0), // r2 = data
+        ldx(Size::Dw, 3, 1, 8), // r3 = data_end
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 11), // short frame -> exit-0
+        ldx(Size::H, 0, 2, 12),     // first read
+        movr(1, 6),                 // r1 = ctx
+        mov(2, 4),                  // r2 = delta
+        call(0),                    // adjust -> bounds invalidated
+        // Re-read data/data_end (they may have moved) and re-prove the bound.
+        ldx(Size::Dw, 2, 6, 0),
+        ldx(Size::Dw, 3, 6, 8),
+        movr(4, 2),
+        alu(AluOp::Add, 4, 14),
+        jmpr(CondOp::Gt, 4, 3, 2), // still short -> exit-0
+        ldx(Size::H, 0, 2, 12),    // second read: freshly certified
+        EXIT,
+        mov(0, 0),
+        EXIT,
+    ];
+    check_full(
+        &prog,
+        PACKET_CTX_WRITABLE,
+        &[adjust_kfunc()],
+        Context::Atomic,
+    )
+    .expect("a fresh data < data_end after the adjust re-certifies the read");
 }
 
 /// An acquiring kfunc: `fn acquire() -> Option<Owned<T>>`.
@@ -3134,6 +3338,99 @@ fn ordinary_kernel_objects_cannot_satisfy_the_typed_mediator() {
             Err(VerifyError::KfuncSignature { at: 6, arg: 2, .. })
         ),
         "an ordinary object pointer must not acquire trace-object provenance"
+    );
+}
+
+/// `r6 = ctx[0]; r0 = *(size *)(r6 + offset); exit` against a one-field schema
+/// carried on a `ctx_kind` context pointer. The direct-load counterpart of
+/// [`verify_typed_field_with_context`], with no mediator kfunc in play.
+fn verify_direct_typed_field_with_context(
+    offset: i16,
+    size: Size,
+    ctx_kind: PtrKind,
+) -> Result<VerifiedProgram, VerifyError> {
+    const KEY: TypeKey = TypeKey(77);
+    let ctx = [ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: ctx_kind,
+            key: KEY,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::READONLY,
+    }];
+    let fields = [ObjectField { offset: 8, size: 8 }];
+    let objects = [ObjectDesc {
+        key: KEY,
+        size: 16,
+        fields: &fields,
+    }];
+    let image = encode_all(&[ldx(Size::Dw, 6, 1, 0), ldx(size, 0, 6, offset), EXIT]);
+    verify(&Program {
+        insns: &image,
+        context: Context::Atomic,
+        ctx_fields: &ctx,
+        kfuncs: &[],
+        maps: &[],
+        objects: &objects,
+    })
+}
+
+fn verify_direct_typed_field(offset: i16, size: Size) -> Result<VerifiedProgram, VerifyError> {
+    verify_direct_typed_field_with_context(offset, size, PtrKind::TraceObject)
+}
+
+#[test]
+fn a_direct_load_of_an_exact_declared_field_verifies() {
+    let verified =
+        verify_direct_typed_field(8, Size::Dw).expect("an exact declared field load should verify");
+    // The load is certified as a typed read, not as a bare dereference: the base
+    // register holds the tracing wrapper, so lowering `[wrapper + 8]` as a bare
+    // load would read the wrapper, not the object. The interpreter services it
+    // through the wrapper instead.
+    assert_eq!(
+        verified
+            .typed_load_sites
+            .iter()
+            .map(|site| (site.insn_index, site.field_offset, site.size))
+            .collect::<Vec<_>>(),
+        vec![(1, 8, 8)],
+        "the direct field load should be recorded as a certified typed load",
+    );
+    assert!(
+        !verified
+            .bare_access_sites
+            .iter()
+            .any(|site| site.insn_index == 1),
+        "a typed field load must never be admitted as a bare dereference",
+    );
+}
+
+#[test]
+fn a_direct_load_of_an_in_object_non_field_is_rejected() {
+    // Both are wholly inside the 16-byte object but neither is the one declared
+    // field: a shifted offset, and a truncated width at the right offset.
+    for (offset, size) in [(9i16, Size::Dw), (8, Size::W)] {
+        assert!(
+            matches!(
+                verify_direct_typed_field(offset, size),
+                Err(VerifyError::TypedFieldMismatch { at: 1, reg: 6 })
+            ),
+            "offset={offset} size={size:?} is not a declared field",
+        );
+    }
+}
+
+#[test]
+fn a_direct_load_through_an_ordinary_object_pointer_is_rejected() {
+    // The same schema on an ordinary `Object` context pointer: no trace-object
+    // provenance, so the load stays opaque exactly as it did before typed direct
+    // access landed.
+    assert!(
+        matches!(
+            verify_direct_typed_field_with_context(8, Size::Dw, PtrKind::Object),
+            Err(VerifyError::OpaqueDeref { at: 1, reg: 6 })
+        ),
+        "an ordinary object pointer must not admit a direct field load",
     );
 }
 

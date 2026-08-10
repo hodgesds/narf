@@ -93,6 +93,19 @@ pub enum MapKind {
     /// records. Not keyed; reached through [`crate::ringbuf::RingBuf`].
     /// `max_entries` is the data-area size in bytes.
     RingBuf = 27,
+    /// Dense `u32`-keyed table of redirect targets: each value is a 4-byte
+    /// interface index a `bpf_redirect_map` consults. Backed by the same
+    /// array storage as [`MapKind::Array`] (dense keys, one value per key);
+    /// what distinguishes it is the `value_size == 4` shape and the meaning
+    /// the XDP redirect intrinsic gives the stored ifindex. `BPF_MAP_TYPE_DEVMAP`.
+    DevMap = 14,
+    /// Dense `u32`-keyed table whose key is a target CPU and whose 4-byte value
+    /// enables that CPU as a `bpf_redirect_map` target (a non-zero value marks
+    /// the slot live; it stands in for Linux's `struct bpf_cpumap_val` queue
+    /// config). On NARF's single RX-processing context a cpumap redirect is
+    /// local delivery — see [`crate::kfuncs::RedirectTarget::Cpu`].
+    /// `BPF_MAP_TYPE_CPUMAP`.
+    CpuMap = 16,
 }
 
 impl MapKind {
@@ -104,6 +117,8 @@ impl MapKind {
             2 => Some(MapKind::Array),
             5 => Some(MapKind::PerCpuHash),
             6 => Some(MapKind::PerCpuArray),
+            14 => Some(MapKind::DevMap),
+            16 => Some(MapKind::CpuMap),
             27 => Some(MapKind::RingBuf),
             _ => None,
         }
@@ -117,10 +132,40 @@ impl MapKind {
     }
 
     /// Whether keys are dense `u32` indices.
+    ///
+    /// [`MapKind::DevMap`] is included: it is array-backed and its key *is* the
+    /// slot index, so it shares the array key rules (exactly 4 bytes wide).
     #[inline]
     #[must_use]
     pub const fn is_array(self) -> bool {
-        matches!(self, MapKind::Array | MapKind::PerCpuArray)
+        matches!(
+            self,
+            MapKind::Array | MapKind::PerCpuArray | MapKind::DevMap | MapKind::CpuMap
+        )
+    }
+
+    /// Whether values are 4-byte interface indices consulted by
+    /// `bpf_redirect_map` — i.e. [`MapKind::DevMap`].
+    #[inline]
+    #[must_use]
+    pub const fn is_devmap(self) -> bool {
+        matches!(self, MapKind::DevMap)
+    }
+
+    /// Whether keys are target CPUs consulted by `bpf_redirect_map` — i.e.
+    /// [`MapKind::CpuMap`].
+    #[inline]
+    #[must_use]
+    pub const fn is_cpumap(self) -> bool {
+        matches!(self, MapKind::CpuMap)
+    }
+
+    /// Whether this is one of the `bpf_redirect_map` target kinds (devmap or
+    /// cpumap), which share the `value_size == 4` shape.
+    #[inline]
+    #[must_use]
+    pub const fn is_redirect_map(self) -> bool {
+        self.is_devmap() || self.is_cpumap()
     }
 }
 
@@ -228,6 +273,15 @@ pub const BPF_EXIST: u64 = 2;
 /// (`map_flags & BPF_F_LOCK` + `!btf_record_has_field(...)` ⇒ `EINVAL`), so
 /// the errno is the same for the same reason.
 pub const BPF_F_LOCK: u64 = 4;
+
+/// `bpf_redirect_map` flag: fan the frame out to every live port of the map
+/// (a devmap), ignoring `key`, rather than redirecting to a single target.
+pub const BPF_F_BROADCAST: u64 = 8;
+
+/// `bpf_redirect_map` flag: with [`BPF_F_BROADCAST`], skip the interface the
+/// frame arrived on. The ingress iface is resolved by the sender, which alone
+/// knows it.
+pub const BPF_F_EXCLUDE_INGRESS: u64 = 16;
 
 /// The one map interface.
 ///
@@ -426,6 +480,13 @@ fn check_attr(attr: MapAttr) -> Result<(), MapError> {
     if attr.kind.is_array() && attr.key_size != 4 {
         // Linux's `array_map_alloc_check` requires exactly 4: the key *is* the
         // index.
+        return Err(MapError::Invalid);
+    }
+    if attr.kind.is_redirect_map() && attr.value_size != 4 {
+        // A devmap slot holds one 4-byte interface index; a cpumap slot a
+        // 4-byte enable/qsize marker. Linux's `dev_map_alloc_check` /
+        // `cpu_map_alloc` accept the wider `struct bpf_devmap_val` /
+        // `bpf_cpumap_val`; NARF stores only the 4-byte field it uses.
         return Err(MapError::Invalid);
     }
     if attr.value_size > MAX_VALUE_SIZE {
@@ -1170,7 +1231,11 @@ impl BpfMap {
             return Err(MapError::NoMemory);
         }
         let built = match attr.kind {
-            MapKind::Array | MapKind::PerCpuArray => ArrayMap::new(attr).map(MapImpl::Array),
+            // A devmap/cpumap is dense-`u32`-keyed storage of a 4-byte field —
+            // the array backend verbatim (single value per key).
+            MapKind::Array | MapKind::PerCpuArray | MapKind::DevMap | MapKind::CpuMap => {
+                ArrayMap::new(attr).map(MapImpl::Array)
+            }
             MapKind::Hash | MapKind::PerCpuHash => HashMap::new(attr).map(MapImpl::Hash),
             // Frame-backed, and its own cgroup accountant (see
             // `footprint_bytes`): fallible if the frames cannot be allocated.
@@ -1227,6 +1292,73 @@ impl BpfMap {
             MapImpl::RingBuf(r) => Some(r),
             _ => None,
         }
+    }
+
+    /// The interface index stored at `key`, for `bpf_redirect_map`.
+    ///
+    /// `None` when this is not a devmap, when `key` is past `max_entries`, or
+    /// when the slot is empty (ifindex `0`) — the three cases Linux's devmap
+    /// treats as a lookup miss, which the redirect helper answers with its
+    /// fallback action rather than a redirect. A devmap has one value per key
+    /// (`lookup_local` reads slot 0 for a non-per-CPU kind), so the copy is the
+    /// stored 4-byte ifindex verbatim.
+    #[must_use]
+    pub fn devmap_lookup(&self, key: u32) -> Option<u32> {
+        if !self.attr().kind.is_devmap() {
+            return None;
+        }
+        let mut out = [0u8; 4];
+        self.ops().lookup_local(&key.to_le_bytes(), &mut out).ok()?;
+        match u32::from_le_bytes(out) {
+            0 => None,
+            ifindex => Some(ifindex),
+        }
+    }
+
+    /// Copy this devmap's live interface indices into `out`, returning how many
+    /// were written (`min(out.len(), live entries)`). A live entry is a slot
+    /// whose ifindex is non-zero — the same "populated" test [`Self::devmap_lookup`]
+    /// uses. `bpf_redirect_map`'s `BPF_F_BROADCAST` path fans a frame out to
+    /// these; entries past `out.len()` are dropped, capping a broadcast at the
+    /// caller's buffer.
+    #[must_use]
+    pub fn devmap_ports(&self, out: &mut [u32]) -> usize {
+        if !self.attr().kind.is_devmap() {
+            return 0;
+        }
+        let max = self.attr().max_entries;
+        let mut n = 0;
+        let mut key = 0;
+        while key < max && n < out.len() {
+            if let Some(ifindex) = self.devmap_lookup(key) {
+                out[n] = ifindex;
+                n += 1;
+            }
+            key += 1;
+        }
+        n
+    }
+
+    /// Whether CPU `key` is a live `bpf_redirect_map` target in this cpumap.
+    ///
+    /// `false` when this is not a cpumap, when `key` is past `max_entries`, or
+    /// when the slot's 4-byte enable marker is `0` — the same miss cases the
+    /// devmap has. The target the redirect arms is the *key* (the CPU), not the
+    /// stored value, which is only the live/qsize marker.
+    #[must_use]
+    pub fn cpumap_has_target(&self, key: u32) -> bool {
+        if !self.attr().kind.is_cpumap() {
+            return false;
+        }
+        let mut out = [0u8; 4];
+        if self
+            .ops()
+            .lookup_local(&key.to_le_bytes(), &mut out)
+            .is_err()
+        {
+            return false;
+        }
+        u32::from_le_bytes(out) != 0
     }
 
     /// The immutable shape.
@@ -1700,6 +1832,92 @@ crate::kfunc! {
         match map.ops().delete(&kbuf[..n]) {
             Ok(()) => 0,
             Err(e) => kfunc_err(e),
+        }
+    }
+
+    /// Redirect the current XDP frame to `bpf_redirect_map(map, key, flags)`'s
+    /// target — an interface (devmap) or a CPU's stack (cpumap).
+    ///
+    /// On a hit it arms this CPU's redirect target — a devmap arms the slot's
+    /// ifindex (`crate::kfuncs::set_xdp_redirect_iface`, the same slot
+    /// `bpf_redirect` writes), a cpumap arms the key CPU
+    /// (`set_xdp_redirect_cpu`) — and returns `XDP_REDIRECT` (4); the program
+    /// propagates that and the classifier acts on the target (send out the iface,
+    /// or deliver to the local stack). On a *miss* — `key` past `max_entries` or
+    /// an empty slot — it returns `flags` as the caller's chosen fallback action,
+    /// Linux's devmap-helper contract (`bpf_redirect_map(m, k, XDP_PASS)` passes
+    /// on miss). A `map` that is neither a devmap nor a cpumap, or a `flags` that
+    /// is not a bare XDP action (`ABORTED`/`DROP`/`PASS`/`TX`, i.e. `> XDP_TX`),
+    /// is `XDP_ABORTED`, matching Linux's rejection of an incompatible map or an
+    /// out-of-range fallback.
+    ///
+    /// Unlike the ring-buffer and frame-resize kfuncs this is an ordinary shim,
+    /// not an interpreter intrinsic: the map handle is a real kernel address on
+    /// both backends (`LD_IMM64`'s map pseudo-form resolves to it), so the JIT
+    /// lowers the call natively and the interpreter dispatches it through the
+    /// registry — no VM-local state to reach, nothing to special-case.
+    ///
+    /// // LINUX-GAP: `BPF_F_BROADCAST` fan-out (one frame to every port) is not
+    /// modelled — a single-target redirect only — and a cpumap redirect is local
+    /// delivery rather than cross-CPU steering (see
+    /// [`crate::kfuncs::RedirectTarget::Cpu`]). The runtime map-kind check stands
+    /// in for Linux's load-time map-type/func-id compatibility check, which
+    /// NARF's one kfunc ABI does not carry.
+    #[context(Atomic)]
+    pub fn bpf_redirect_map(map: crate::types::Trusted<BpfMap>, key: u32, flags: u64) -> u64 {
+        /// XDP_ABORTED — also the rejected-flags and wrong-map answer.
+        const XDP_ABORTED: u64 = 0;
+        /// XDP_TX, the largest value a bare fallback action may hold.
+        const XDP_TX: u64 = 3;
+        /// XDP_REDIRECT, returned once a target is armed.
+        const XDP_REDIRECT: u64 = 4;
+        // SAFETY: see `map_of`.
+        let map = unsafe { map_of(&map) };
+        let kind = map.attr().kind;
+
+        // Broadcast fan-out: send the frame out *every* live devmap port, the
+        // `key` ignored. Devmap-only, and only the two broadcast bits are valid
+        // alongside `BPF_F_BROADCAST` — a fallback action would be meaningless
+        // when there is no single-target lookup to miss.
+        if flags & BPF_F_BROADCAST != 0 {
+            if flags & !(BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS) != 0 || !kind.is_devmap() {
+                return XDP_ABORTED;
+            }
+            let mut ports = [0u32; crate::kfuncs::MAX_BROADCAST_PORTS];
+            let n = map.devmap_ports(&mut ports);
+            if n == 0 {
+                // No live ports — nothing to fan out to, a program bug.
+                return XDP_ABORTED;
+            }
+            crate::kfuncs::set_xdp_redirect_broadcast(
+                &ports[..n],
+                flags & BPF_F_EXCLUDE_INGRESS != 0,
+            );
+            return XDP_REDIRECT;
+        }
+
+        // Single-target: `flags` is a bare fallback action returned on a miss.
+        if flags > XDP_TX {
+            return XDP_ABORTED;
+        }
+        if kind.is_devmap() {
+            match map.devmap_lookup(key) {
+                Some(ifindex) => {
+                    crate::kfuncs::set_xdp_redirect_iface(ifindex);
+                    XDP_REDIRECT
+                }
+                None => flags,
+            }
+        } else if kind.is_cpumap() {
+            if map.cpumap_has_target(key) {
+                crate::kfuncs::set_xdp_redirect_cpu(key);
+                XDP_REDIRECT
+            } else {
+                flags
+            }
+        } else {
+            // Not a redirect map — Linux rejects this at load; NARF at runtime.
+            XDP_ABORTED
         }
     }
 }

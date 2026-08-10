@@ -79,10 +79,25 @@ use narf_bpf_isa::{
 };
 use narf_bpf_verifier::kfunc::Context;
 
-use narf_bpf_verifier::SubprogInfo;
+use narf_bpf_verifier::{SubprogInfo, TypedLoadSite};
 
 use crate::kfunc::{KfuncShim, Registry};
 use crate::mem::StackFrame;
+
+/// A typed-probe program's authoritative field source.
+///
+/// The interpreter reads a certified typed load from [`Self::wrapper`] — the
+/// live [`narf_tracing::TypedProbeRef`] `run_typed_probe` was handed — rather
+/// than from the program's own register, so the field a load names is decided by
+/// the verifier's [`TypedLoadSite`] and rechecked by the wrapper, never by a
+/// value the program computed.
+#[derive(Copy, Clone)]
+struct TypedProbe<'a> {
+    /// The live tracing wrapper the fields are copied from.
+    wrapper: &'a narf_tracing::TypedProbeRef,
+    /// Certified typed-load sites, sorted by instruction index.
+    sites: &'a [TypedLoadSite],
+}
 
 /// Synthetic base of the program's stack region.
 ///
@@ -203,6 +218,15 @@ pub enum Trap {
     /// program's own list disagreed, and the alternative to trapping is handing
     /// a kfunc a null it will treat as non-null.
     UnresolvedMap { at: u32 },
+    /// A certified typed field load whose live wrapper declined the field, or
+    /// which ran with no wrapper bound.
+    ///
+    /// Normally impossible: the verifier proved the `(offset, size)` names an
+    /// exact schema field, and a typed program only runs with its wrapper bound.
+    /// Reaching it means the schema the program was verified against and the
+    /// live object disagreed, or a typed-load site was reached outside a typed
+    /// run — either way the load names no field and must not read anything.
+    BadTypedField { at: u32, offset: u32, len: usize },
 }
 
 /// How a program run ended.
@@ -364,11 +388,25 @@ pub struct Vm<'a> {
     maps: &'a [(i32, alloc::sync::Arc<crate::map::BpfMap>)],
     /// Sparse `bpf_attr.prog_load.fd_array` positions for map-index loads.
     map_indices: &'a [crate::prog::IndexedMap],
-    /// One hook-owned, read-only byte region whose real address is exposed in
-    /// the context (currently an XDP frame). The verifier admits reads only
-    /// after a `data`/`data_end` comparison; this runtime bound independently
-    /// keeps the interpreter from dereferencing any other kernel address.
-    readonly_region: Option<&'a [u8]>,
+    /// One hook-owned, writable byte region whose real address is exposed in
+    /// the context (currently an XDP frame). The verifier admits a load or a
+    /// store only after a `data`/`data_end` comparison; this runtime bound
+    /// independently confines both to `[data, data_end)`, so a bounded
+    /// in-place header rewrite lands in the frame and anything outside it traps
+    /// rather than aliasing another kernel address. Held as `&mut` so the store
+    /// path can write it and the driver sees the mutation before it retransmits
+    /// (`XDP_TX`) or forwards (`XDP_REDIRECT`) the frame.
+    packet_region: Option<&'a mut [u8]>,
+    /// The live tracing wrapper a typed-probe program reads its declared fields
+    /// from, paired with the certified typed-load sites the verifier proved.
+    ///
+    /// A direct field load names its field through this wrapper — never through
+    /// the program-supplied register value — so a verifier bug cannot widen it
+    /// into a read of any other address, and `TypedProbeRef::copy_field` repeats
+    /// the field-existence and whole-object bound checks at runtime. `None` for
+    /// every non-typed program, which is what makes a typed-load site
+    /// unreachable — and therefore a trap — for one.
+    typed_probe: Option<TypedProbe<'a>>,
     /// The ring buffer a live `bpf_ringbuf_reserve` targets, or `None` when no
     /// reservation is outstanding. Holding the `Arc` keeps the ring alive for
     /// the reservation even if the program's own reference were somehow
@@ -435,7 +473,8 @@ impl<'a> Vm<'a> {
             arenas: &[],
             maps,
             map_indices: &[],
-            readonly_region: None,
+            packet_region: None,
+            typed_probe: None,
             reserve_map: None,
             reserve_len: 0,
             reserve_buf: [0u8; MAX_RESERVE],
@@ -462,10 +501,30 @@ impl<'a> Vm<'a> {
         self
     }
 
-    /// Bind the hook-owned byte region named by a dynamic context pair.
+    /// Bind the hook-owned writable byte region named by a dynamic context
+    /// pair (an XDP frame). Loads read it and bounded stores write it in place;
+    /// the region's real base and length are the runtime bound the verifier's
+    /// `data`/`data_end` proof mirrors.
     #[must_use]
-    pub fn with_readonly_region(mut self, bytes: &'a [u8]) -> Self {
-        self.readonly_region = Some(bytes);
+    pub fn with_packet_region(mut self, bytes: &'a mut [u8]) -> Self {
+        self.packet_region = Some(bytes);
+        self
+    }
+
+    /// Bind the live tracing wrapper and the certified typed-load sites a
+    /// typed-probe program reads its declared fields from.
+    ///
+    /// Without this a certified typed load has no wrapper to read through and
+    /// traps — fail-closed, the same shape as an unbound arena. The sites are
+    /// the verifier's, so the interpreter services exactly the loads the
+    /// verifier admitted and no others.
+    #[must_use]
+    pub fn with_typed_probe(
+        mut self,
+        wrapper: &'a narf_tracing::TypedProbeRef,
+        sites: &'a [TypedLoadSite],
+    ) -> Self {
+        self.typed_probe = Some(TypedProbe { wrapper, sites });
         self
     }
 
@@ -481,6 +540,19 @@ impl<'a> Vm<'a> {
     #[must_use]
     pub const fn steps(&self) -> u64 {
         self.steps
+    }
+
+    /// The context words as they stand.
+    ///
+    /// After a staged XDP run these hold the program's final `data`/`data_end`,
+    /// which the frame-resizing intrinsics rewrite in place — the staged run path
+    /// reads them back to recover the effective packet window. For every other
+    /// program the words are whatever was handed in, since only the XDP adjust
+    /// intrinsics write them.
+    #[inline]
+    #[must_use]
+    pub const fn context_words(&self) -> [u64; MAX_CTX_WORDS] {
+        self.ctx
     }
 
     // ── memory ──────────────────────────────────────────────────────
@@ -613,6 +685,73 @@ impl<'a> Vm<'a> {
         self.reserve_len = 0;
     }
 
+    /// The staged frame buffer's `[base, base + len)` real-address extent, or
+    /// `None` when no packet region is bound.
+    ///
+    /// The XDP entry path stages the packet into a per-CPU buffer with headroom
+    /// before it and tailroom after, and binds that whole buffer as the packet
+    /// region (see `crate::prog::run_xdp`). The adjust intrinsics move
+    /// `data`/`data_end` within this extent — into the headroom to grow the head,
+    /// into the tailroom to grow the tail — and every access remains confined to
+    /// it by the same runtime bound the read/store paths apply.
+    #[inline]
+    fn packet_extent(&self) -> Option<(u64, u64)> {
+        let region = self.packet_region.as_deref()?;
+        let base = region.as_ptr() as u64;
+        Some((base, base + region.len() as u64))
+    }
+
+    /// `bpf_xdp_adjust_head(ctx, delta)`: move `data` (`ctx[0]`) by `delta`.
+    ///
+    /// `delta > 0` shrinks from the front (`data += delta`); `delta < 0` grows,
+    /// prepending headroom (`data -= |delta|`). The new `data` must stay within
+    /// the staged buffer and at or below `data_end`. Returns `0` on success, or
+    /// `-ENOMEM` (`-12`) when there is no room — in which case `data` is left
+    /// unmoved, so the operation is fail-closed. The verifier drops every proven
+    /// packet bound at the call, so the program must re-compare `data < data_end`
+    /// before its next packet access; that re-read sees the value written here.
+    fn xdp_adjust_head(&mut self, delta: i32) -> u64 {
+        let Some((buf_start, buf_end)) = self.packet_extent() else {
+            return (-12i64) as u64;
+        };
+        let data = self.ctx[0];
+        let data_end = self.ctx[1];
+        // `delta` is a byte count; apply it as a signed offset on `data`.
+        // `checked_add_signed` catches a wrap the bounds test below would
+        // otherwise have to reason about.
+        let Some(new_data) = data.checked_add_signed(i64::from(delta)) else {
+            return (-12i64) as u64;
+        };
+        if new_data < buf_start || new_data > buf_end || new_data > data_end {
+            return (-12i64) as u64;
+        }
+        self.ctx[0] = new_data;
+        0
+    }
+
+    /// `bpf_xdp_adjust_tail(ctx, delta)`: move `data_end` (`ctx[1]`) by `delta`.
+    ///
+    /// `delta > 0` grows the tail (appends tailroom); `delta < 0` shrinks
+    /// (`data_end += delta`). The new `data_end` must stay at or above `data` and
+    /// within the staged buffer. Returns `0` on success or `-ENOMEM` (`-12`) with
+    /// `data_end` unmoved. As with the head, the verifier invalidates the packet
+    /// bounds at the call, so the moved end is re-read on the next comparison.
+    fn xdp_adjust_tail(&mut self, delta: i32) -> u64 {
+        let Some((buf_start, buf_end)) = self.packet_extent() else {
+            return (-12i64) as u64;
+        };
+        let data = self.ctx[0];
+        let data_end = self.ctx[1];
+        let Some(new_end) = data_end.checked_add_signed(i64::from(delta)) else {
+            return (-12i64) as u64;
+        };
+        if new_end < buf_start || new_end > buf_end || new_end < data {
+            return (-12i64) as u64;
+        }
+        self.ctx[1] = new_end;
+        0
+    }
+
     /// The address a map handle carries.
     ///
     /// `Arc::as_ptr`, not a synthetic token: the kfunc shim reconstitutes a
@@ -666,7 +805,7 @@ impl<'a> Vm<'a> {
                 return Ok(widen(raw, size, signed));
             }
         }
-        if let Some(bytes) = self.readonly_region {
+        if let Some(bytes) = self.packet_region.as_deref() {
             let base = bytes.as_ptr() as u64;
             let limit = base.checked_add(bytes.len() as u64);
             let end = addr.checked_add(len as u64);
@@ -698,6 +837,56 @@ impl<'a> Vm<'a> {
         Err(Trap::BadAccess { at, addr, len })
     }
 
+    /// The field offset of the certified typed load at `at`, or `None` if this
+    /// instruction is an ordinary load.
+    ///
+    /// A binary search over the verifier's sorted sites, so an instruction the
+    /// verifier did not certify as a typed load can never take the wrapper path.
+    #[inline]
+    fn typed_load_field(&self, at: u32) -> Option<u32> {
+        let probe = self.typed_probe.as_ref()?;
+        probe
+            .sites
+            .binary_search_by_key(&at, |site| site.insn_index)
+            .ok()
+            .map(|i| probe.sites[i].field_offset)
+    }
+
+    /// Read one certified typed field through the live tracing wrapper.
+    ///
+    /// The field comes from the wrapper `run_typed_probe` bound, not from the
+    /// program's register, and `copy_field` repeats the field-existence and
+    /// whole-object bound checks — so a verifier bug cannot turn this into a read
+    /// of any other address. A declined copy is a trap rather than a zeroed
+    /// register: unlike a fault-recoverable probe, a schema mismatch here means
+    /// the program and the object disagree, which the verifier proved impossible.
+    fn typed_field_load(
+        &self,
+        at: u32,
+        field_offset: u32,
+        size: Size,
+        signed: bool,
+    ) -> Result<u64, Trap> {
+        let len = size_bytes(size);
+        let probe = self.typed_probe.as_ref().ok_or(Trap::BadTypedField {
+            at,
+            offset: field_offset,
+            len,
+        })?;
+        let mut buf = [0u8; 8];
+        if !probe
+            .wrapper
+            .copy_field(u64::from(field_offset), &mut buf[..len])
+        {
+            return Err(Trap::BadTypedField {
+                at,
+                offset: field_offset,
+                len,
+            });
+        }
+        Ok(widen(u64::from_le_bytes(buf), size, signed))
+    }
+
     fn store(&mut self, at: u32, addr: u64, size: Size, value: u64) -> Result<(), Trap> {
         let len = size_bytes(size);
         let bytes = value.to_le_bytes();
@@ -712,8 +901,30 @@ impl<'a> Vm<'a> {
             self.reserve_buf[lo..hi].copy_from_slice(&bytes[..len]);
             return Ok(());
         }
-        // The context region is deliberately not tried here: it is read-only, so
-        // a store into it must be rejected rather than silently aliasing.
+        // The context tuple region is deliberately not tried here: it is
+        // read-only (the four `ctx` words), so a store into it must be rejected
+        // rather than silently aliasing.
+        //
+        // The packet region *is* writable: this is the in-place header rewrite
+        // an XDP program performs. The bound is exactly the read path's — the
+        // store lands only in `[data, data_end)`, and one past either edge is a
+        // trap, never a write. `checked_add` on both sides for the same reason
+        // `load` uses it: an unchecked `addr + len` could wrap `u64::MAX` to 0
+        // and satisfy both guards, turning a fail-closed bound into a wild
+        // write in the layer that is supposed to hold when the verifier is
+        // wrong.
+        if let Some(region) = self.packet_region.as_deref_mut() {
+            let base = region.as_ptr() as u64;
+            let limit = base.checked_add(region.len() as u64);
+            let end = addr.checked_add(len as u64);
+            if let (Some(limit), Some(end)) = (limit, end) {
+                if addr >= base && end <= limit {
+                    let off = (addr - base) as usize;
+                    region[off..off + len].copy_from_slice(&bytes[..len]);
+                    return Ok(());
+                }
+            }
+        }
         if self.has_arena() {
             let kva = self.arena_kva(at, addr, len)?;
             // SAFETY: as in `load` — `arena_kva` bounded the range to a mapped,
@@ -914,8 +1125,17 @@ impl<'a> Vm<'a> {
                     src,
                     off,
                 } => {
-                    let addr = self.reg(src).wrapping_add(off as i64 as u64);
-                    let v = self.load(at, addr, size, sign_extend)?;
+                    // A certified typed load reads its declared field through the
+                    // live tracing wrapper, not by dereferencing the program's
+                    // register: `off` is the field offset the verifier matched
+                    // against the schema, and `copy_field` rechecks it. Every
+                    // other load takes the ordinary region-resolving path.
+                    let v = if let Some(field_offset) = self.typed_load_field(at) {
+                        self.typed_field_load(at, field_offset, size, sign_extend)?
+                    } else {
+                        let addr = self.reg(src).wrapping_add(off as i64 as u64);
+                        self.load(at, addr, size, sign_extend)?
+                    };
                     self.set_reg(at, dst, v)?;
                     pc = next;
                 }
@@ -1388,6 +1608,25 @@ impl<'a> Vm<'a> {
             } else {
                 self.ringbuf_discard();
                 0
+            };
+            self.regs[1..6].fill(0);
+            return Ok(());
+        }
+        // The XDP frame-resizing kfuncs are intrinsics for the same reason the
+        // ring-buffer ones are: they move the packet window (`ctx[0]`/`ctx[1]`,
+        // i.e. `data`/`data_end`) inside the VM's staged frame buffer, which a
+        // plain shim cannot reach. The interpreter rewrites those context words
+        // directly; the program re-reads them on its next `*(ctx+0)` load. The
+        // JIT refuses any program that calls one (`kfuncs::is_xdp_adjust`), so
+        // this is the only backend that runs them. `delta` arrives in R2 as a
+        // sign-extended 32-bit value; R1 is the (synthetic) context pointer,
+        // which the intrinsic does not dereference.
+        if crate::kfuncs::is_xdp_adjust(id) {
+            let delta = self.regs[2] as i32;
+            self.regs[0] = if id == crate::kfuncs::XDP_ADJUST_HEAD_ID {
+                self.xdp_adjust_head(delta)
+            } else {
+                self.xdp_adjust_tail(delta)
             };
             self.regs[1..6].fill(0);
             return Ok(());

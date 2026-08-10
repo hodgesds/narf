@@ -38,6 +38,7 @@ pub(crate) fn verified(items: &[Decoded]) -> VerifiedProgram {
         initial_fuel: 1024,
         fault_sites: Vec::new(),
         bare_access_sites: Vec::new(),
+        typed_load_sites: Vec::new(),
         subprogs: Vec::new(),
         uses_arena: false,
         kfunc_calls: Vec::new(),
@@ -244,18 +245,29 @@ fn an_arena_program_reaches_its_arena_access_once_the_call_is_emitted() {
         v
     };
     let c = compile(&prog).expect("the call is emitted now, and the store always was");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
-    // 19 bytes of call sequence, then the arena store.
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
+    // The kfunc call is wrapped to preserve the pinned arena base in `r10`:
+    // 8 bytes save (`sub rsp,16; mov [rsp],r10`), the 19-byte call sequence, then
+    // 8 bytes restore (`mov r10,[rsp]; add rsp,16`) — 35 bytes — then the store.
     assert_eq!(
-        &body[19..33],
+        &body[35..48],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]  — the parked slot base
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]    — the pinned slot base
             0x89, 0xC1, // mov ecx, eax    — zero-extend the handle
             // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
             0x49, 0xC7, 0x04, 0x0B, 0x01, 0x00, 0x00, 0x00,
         ],
         "an arena store must lower to the slot-relative shape, never a bare \
          dereference of the handle"
+    );
+    // The wrap itself: the save is the first thing the call emits.
+    assert_eq!(
+        &body[..8],
+        &[
+            0x48, 0x83, 0xEC, 0x10, // sub rsp, 16
+            0x4C, 0x89, 0x14, 0x24, // mov [rsp], r10
+        ],
+        "an arena program must save the pinned base across a kfunc call"
     );
     // …and it is covered, resuming at the arena epilogue rather than at the
     // next instruction.
@@ -298,20 +310,23 @@ fn the_arena_fixup_is_the_epilogue_and_not_the_next_instruction() {
     assert_eq!(c.faults.0.len(), 1);
     let f = c.faults.0[0];
     // The arena-fault epilogue precedes the equal-sized unaligned epilogue;
-    // both are `mov rax, rcx; mov rdx, status; RESTORE`.
-    let arena_epilogue_len = 3 + 10 + RESTORE.len();
+    // both are `mov rsp, r10; mov rax, rcx; mov rdx, status; RESTORE` — the
+    // `mov rsp, r10` resets to the entry frame so a fault inside a subprogram
+    // unwinds correctly.
+    let arena_epilogue_len = 3 + 3 + 10 + RESTORE.len();
     let arena_epi = c.code.len() - 2 * arena_epilogue_len;
     assert_eq!(
         f.fixup_off as usize, arena_epi,
         "the fixup must name the arena epilogue"
     );
     assert_eq!(
-        &c.code[arena_epi..arena_epi + 13],
+        &c.code[arena_epi..arena_epi + 16],
         &[
+            0x4C, 0x89, 0xD4, // mov rsp, r10  — reset to the entry frame
             0x48, 0x89, 0xC8, // mov rax, rcx  — the offending handle
             0x48, 0xBA, 0x02, 0, 0, 0, 0, 0, 0, 0, // mov rdx, 2 (ARENA_FAULT)
         ],
-        "the arena epilogue must return the handle and the arena status"
+        "the arena epilogue must reset rsp then return the handle and the arena status"
     );
 }
 
@@ -340,11 +355,11 @@ fn an_arena_access_lowers_to_the_slot_relative_shape() {
         None,
     );
     let c = compile(&prog).expect("compiles");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
-        &body[..21],
+        &body[..20],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]  — the parked slot base
             0x89, 0xF1, // mov ecx, esi   — R2 is rsi; zero-extended
             0x48, 0x81, 0xC1, 0x08, 0x00, 0x00, 0x00, // add rcx, 8
             // 49 C7 04 0B 01 00 00 00 — mov qword [r11 + rcx*1], 1
@@ -406,17 +421,17 @@ fn an_arena_load_and_a_register_store_take_the_same_shape() {
         Some(3),
     );
     let c = compile(&load).expect("compiles");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
-        &body[..9],
+        &body[..8],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]
             0x89, 0xF1, // mov ecx, esi
             0x49, 0x8B, 0x14, // mov rdx, [r11 + rcx*1] — R3 is rdx
         ],
         "an arena load must take the slot-relative shape"
     );
-    assert_eq!(body[9], 0x0B, "SIB: index rcx, base r11");
+    assert_eq!(body[8], 0x0B, "SIB: index rcx, base r11");
     // The destination is *not* recorded for zeroing: an arena fault stops the
     // program, so nothing would ever read it. The verifier's `dst_reg` is
     // deliberately dropped here.
@@ -438,11 +453,11 @@ fn an_arena_load_and_a_register_store_take_the_same_shape() {
         None,
     );
     let c = compile(&store).expect("compiles");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
-        &body[..10],
+        &body[..9],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]
             0x89, 0xF1, // mov ecx, esi
             0x49, 0x89, 0x14, 0x0B, // mov [r11 + rcx*1], rdx
         ],
@@ -471,11 +486,11 @@ fn a_narrower_arena_access_takes_the_slot_relative_shape() {
         None,
     );
     let c = compile(&store).expect("a narrower arena store is emitted now");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
-        &body[..14],
+        &body[..13],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]
             0x89, 0xF1, // mov ecx, esi
             0x41, 0xC7, 0x04, 0x0B, // mov dword [r11 + rcx*1], ...  (REX.B, no REX.W)
             0x01, 0x00, 0x00, 0x00, // imm32 = 1
@@ -507,11 +522,11 @@ fn a_narrower_arena_access_takes_the_slot_relative_shape() {
         None,
     );
     let c = compile(&byte_store).expect("a byte arena store is emitted now");
-    let body = &c.code[PROLOGUE.len() + FUEL_BURN_LEN..];
+    let body = &c.code[ARENA_PROLOGUE.len() + FUEL_BURN_LEN..];
     assert_eq!(
-        &body[..10],
+        &body[..9],
         &[
-            0x4C, 0x8B, 0x1C, 0x24, // mov r11, [rsp]
+            0x4D, 0x8B, 0x1A, // mov r11, [r10]
             0x89, 0xF9, // mov ecx, edi  (R1 is rdi)
             0x41, 0x88, 0x34, 0x0B, // mov byte [r11 + rcx*1], sil  (REX.B for r11)
         ],
@@ -914,7 +929,7 @@ fn an_arena_atomic_uses_the_slot_relative_shape_and_records_its_fault() {
 }
 
 #[test]
-fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
+fn a_fetching_bitwise_arena_atomic_lowers_with_an_r0_spill_slot() {
     let prog = verified_arena(
         &[
             Decoded::Atomic {
@@ -930,10 +945,48 @@ fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
         0,
         None,
     );
-    assert!(matches!(
-        compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
-    ));
+    let c = compile(&prog).expect("the fetching bitwise arena atomic compiles");
+    // The prologue widened its reservation to `sub rsp, 24` so the cmpxchg loop
+    // has a frame word to preserve R0 in — `ATOMIC_SPILL_RESERVE`.
+    assert!(
+        c.code.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x18]),
+        "prologue must reserve 24 bytes for the atomic spill slot"
+    );
+    // Exactly one faulting access — the comparand load — recovered as an arena
+    // fault, never the `cmpxchg` (which the load proves cannot fault).
+    assert_eq!(c.faults.0.len(), 1);
+    let fault = c.faults.0[0];
+    assert!(fault.arena && fault.fixup_off > fault.fault_off);
+    assert_eq!(
+        &c.code[fault.fault_off as usize..fault.fault_off as usize + 2],
+        &[0x49, 0x8B],
+        "the fault site is `mov rax, [r11]`, not a locked rmw"
+    );
+}
+
+#[test]
+fn a_fetching_bitwise_arena_atomic_with_r0_source_still_lowers() {
+    // src == R0 aliases `cmpxchg`'s comparand, so the operand is read back from
+    // the spill slot rather than a register. It must still compile to one arena
+    // fault (the `op r, r/m` operand form, opcode 0x33 for XOR, is exercised).
+    let prog = verified_arena(
+        &[
+            Decoded::Atomic {
+                size: Size::Dw,
+                op: AtomicOp::Xor { fetch: true },
+                dst: r(2),
+                src: r(0),
+                off: 0,
+            },
+            mov(0, 0),
+            EXIT,
+        ],
+        0,
+        None,
+    );
+    let c = compile(&prog).expect("an R0-source fetching bitwise arena atomic compiles");
+    assert_eq!(c.faults.0.len(), 1);
+    assert!(c.faults.0[0].arena);
 }
 
 /// The prologue, hand-derived from the Intel SDM.
@@ -949,9 +1002,9 @@ fn a_fetching_bitwise_arena_atomic_still_falls_back_without_losing_its_shape() {
 /// `r12` holds the fuel counter and is likewise callee-saved. `mov r12, rdx`
 /// runs before anything can write rdx, which R3 maps to.
 ///
-/// `mov [rsp], rcx` parks the arena slot base in the alignment padding, and
-/// likewise has to run before anything writes `rcx` — a variable shift and a
-/// kfunc call both do.
+/// This is the prologue of a program with **no arena**. An arena program adds a
+/// single `mov r10, rcx` here (pinning the slot base in `r10`) right after the
+/// `sub rsp`, before anything can write `rcx`.
 const PROLOGUE: &[u8] = &[
     0x55, // push rbp
     0x53, // push rbx
@@ -960,8 +1013,25 @@ const PROLOGUE: &[u8] = &[
     0x41, 0x56, // push r14
     0x41, 0x57, // push r15
     0x48, 0x83, 0xEC, 0x08, // sub rsp, 8     (SysV alignment; see STACK_ALIGN_PAD)
-    0x48, 0x89, 0x0C, 0x24, // mov [rsp], rcx (the arena slot base; ARENA_BASE_SLOT)
     0x49, 0x89, 0xD4, // mov r12, rdx   (fuel)
+    0x48, 0x89, 0xFD, // mov rbp, rdi
+    0x48, 0x89, 0xF7, // mov rdi, rsi
+];
+
+/// The prologue an arena program emits: [`PROLOGUE`] with the arena base park
+/// (`mov [rsp], rcx`) and the entry-`rsp` anchor (`mov r10, rsp`) inserted right
+/// after the `sub rsp`.
+const ARENA_PROLOGUE: &[u8] = &[
+    0x55, // push rbp
+    0x53, // push rbx
+    0x41, 0x54, // push r12
+    0x41, 0x55, // push r13
+    0x41, 0x56, // push r14
+    0x41, 0x57, // push r15
+    0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+    0x48, 0x89, 0x0C, 0x24, // mov [rsp], rcx  (park the arena slot base)
+    0x49, 0x89, 0xE2, // mov r10, rsp    (anchor the entry rsp)
+    0x49, 0x89, 0xD4, // mov r12, rdx    (fuel)
     0x48, 0x89, 0xFD, // mov rbp, rdi
     0x48, 0x89, 0xF7, // mov rdi, rsi
 ];

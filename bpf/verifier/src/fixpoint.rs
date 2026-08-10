@@ -61,8 +61,8 @@ use crate::kfunc::{
 use crate::liveness::{self, Masks};
 use crate::state::{weaker_domain, AbsState, AbsValue, PtrClass, PtrVal, Ref, Stack, NO_REF};
 use crate::{
-    BareAccessSite, FaultSite, KfuncCallSite, MapDesc, Program, SubprogInfo, VerifiedProgram,
-    VerifyError, MAX_STACK_BYTES,
+    BareAccessSite, FaultSite, KfuncCallSite, MapDesc, Program, SubprogInfo, TypedLoadSite,
+    VerifiedProgram, VerifyError, MAX_STACK_BYTES,
 };
 
 /// Everything the fixpoint accumulates that outlives a single block.
@@ -75,6 +75,11 @@ struct Analysis<'a, 'p> {
     /// Raw dereferences whose pointer class is Stack or Ctx. Appended per
     /// fixpoint visit and deduplicated when verification converges.
     bare_access_sites: Vec<BareAccessSite>,
+    /// Direct trace-object field loads proved to name an exact schema field.
+    /// Accumulated and deduplicated the same way as [`Self::bare_access_sites`];
+    /// every duplicate of a given index is byte-identical because the field is a
+    /// pure function of the instruction and the schema.
+    typed_load_sites: Vec<TypedLoadSite>,
     /// Every kfunc `call` the fixpoint resolved. Appended per visit, so the
     /// same site lands here once per worklist round; deduped at the end, as
     /// `fault_sites` is.
@@ -105,6 +110,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         prog,
         fault_sites: Vec::new(),
         bare_access_sites: Vec::new(),
+        typed_load_sites: Vec::new(),
         kfunc_calls: Vec::new(),
         uses_arena: false,
         entry: vec![None; ir.subprogs.len()],
@@ -183,6 +189,10 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
     bare_access_sites.sort_unstable_by_key(|site| site.insn_index);
     bare_access_sites.dedup_by_key(|site| site.insn_index);
 
+    let mut typed_load_sites = a.typed_load_sites;
+    typed_load_sites.sort_unstable_by_key(|site| site.insn_index);
+    typed_load_sites.dedup_by_key(|site| site.insn_index);
+
     let subprogs = ir
         .subprogs
         .iter()
@@ -200,6 +210,7 @@ pub fn run(prog: &Program<'_>) -> Result<VerifiedProgram, VerifyError> {
         initial_fuel: crate::DEFAULT_FUEL,
         fault_sites,
         bare_access_sites,
+        typed_load_sites,
         subprogs,
         uses_arena: a.uses_arena,
         kfunc_calls,
@@ -273,6 +284,11 @@ enum Resolved {
     /// safety comes from the exception table, or a sized region with no
     /// per-byte state to update.
     Opaque,
+    /// A direct load proved to name an exact declared field of a trace-object
+    /// pointer. The runtime reads it through the tracing wrapper rather than as
+    /// a bare dereference; the value is an unknown scalar of the access width,
+    /// exactly as a mediated read or a Linux `PTR_TO_BTF_ID` field load is.
+    TypedField,
 }
 
 /// A jump predicate, extended with the one the ISA cannot spell.
@@ -957,7 +973,7 @@ impl Analysis<'_, '_> {
             // live kernel object into an arbitrary read/write primitive —
             // six instructions, verified clean, with a recorded fault site.
             match p.class {
-                PtrClass::Object | PtrClass::TraceObject => {
+                PtrClass::Object => {
                     // No BTF, so nothing says how large the object is and no
                     // offset can be proved to land inside it — not even a
                     // constant one, since the constant comes from an
@@ -973,6 +989,19 @@ impl Analysis<'_, '_> {
                         at,
                         reg: reg.index(),
                     });
+                }
+                PtrClass::TraceObject => {
+                    // A trace-object pointer *does* carry a schema — the
+                    // Rust-native field layout the loader attached — so a direct
+                    // load can be admitted at an exact declared field, which is
+                    // the field-existence check `narf_probe_read` performs at
+                    // runtime brought forward to here. Everything else about the
+                    // opaque case still holds: a store is refused (a trace object
+                    // is read-only, caught above), a variable or shifted offset
+                    // names no field, and an in-object-but-not-a-field access is
+                    // deliberately not enough. Failing that certification is a
+                    // rejection, never a fallback to a raw dereference.
+                    return self.typed_field_load(at, reg, &p, &addr, size, write);
                 }
                 PtrClass::Arena => {
                     // The guard slots are sized from the ISA's 16-bit
@@ -1067,6 +1096,72 @@ impl Analysis<'_, '_> {
                 .push(BareAccessSite { insn_index: at });
         }
         Ok(Resolved::Opaque)
+    }
+
+    /// Admit a direct load through a trace-object pointer, but only at an exact
+    /// declared field of its schema.
+    ///
+    /// This is the mediator's field check ([`Analysis::object_field_matches`]),
+    /// applied to a bare `BPF_LDX` load instead of a
+    /// `narf_probe_read` call. The base register must carry the wrapper pointer
+    /// with no arithmetic on it — `p.off == 0` — because the runtime recovers
+    /// the wrapper from that register directly; a shifted base would name a
+    /// wrapper the interpreter never received. The effective offset is then the
+    /// load's displacement, which must be a non-negative constant naming a field
+    /// whose exact width equals the access size. A recorded [`TypedLoadSite`] is
+    /// how the interpreter learns to service the load through the wrapper; it is
+    /// pointedly *not* a [`BareAccessSite`], so the JIT refuses the program and
+    /// it runs interpreted.
+    fn typed_field_load(
+        &mut self,
+        at: u32,
+        reg: Reg,
+        p: &PtrVal,
+        addr: &Scalar,
+        size: Size,
+        write: bool,
+    ) -> Result<Resolved, VerifyError> {
+        let mismatch = VerifyError::TypedFieldMismatch {
+            at,
+            reg: reg.index(),
+        };
+        // A store never names a readable field, and a trace object is read-only
+        // regardless. Reject rather than record a certified write.
+        if write {
+            return Err(mismatch);
+        }
+        // The base must be the raw wrapper pointer: no arithmetic folded in, so
+        // the whole effective offset is the load's constant displacement.
+        if p.off.as_const() != Some(0) {
+            return Err(mismatch);
+        }
+        let Some(field_offset) = addr.as_const().and_then(|v| u32::try_from(v).ok()) else {
+            return Err(mismatch);
+        };
+        let width = size.bytes();
+        let Ok(width) = u32::try_from(width) else {
+            return Err(mismatch);
+        };
+        let names_field = self
+            .prog
+            .objects
+            .iter()
+            .find(|candidate| candidate.key == p.key)
+            .is_some_and(|object| {
+                object
+                    .fields
+                    .iter()
+                    .any(|field| field.offset == field_offset && field.size == width)
+            });
+        if !names_field {
+            return Err(mismatch);
+        }
+        self.typed_load_sites.push(TypedLoadSite {
+            insn_index: at,
+            field_offset,
+            size: width,
+        });
+        Ok(Resolved::TypedField)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1458,6 +1553,25 @@ impl Analysis<'_, '_> {
             p.size = Some(sz);
         }
         st.regs[Reg::R0.as_usize()] = ret;
+
+        // A kfunc handed the mutable context pointer can resize the packet
+        // frame — `bpf_xdp_adjust_head`/`_tail` move `data`/`data_end`. Its
+        // `PtrKind::Ctx` argument is the structural marker: no read-only helper
+        // takes one, so its presence is exactly "this call may have moved the
+        // packet window". Every proven packet extent is therefore struck off,
+        // so a subsequent packet access without a fresh `data < data_end`
+        // comparison is rejected. See [`AbsState::invalidate_packet_bounds`].
+        if desc.args.iter().any(|a| {
+            matches!(
+                a.kind,
+                TypeKind::Ptr {
+                    kind: PtrKind::Ctx,
+                    ..
+                }
+            )
+        }) {
+            st.invalidate_packet_bounds();
+        }
         Ok(())
     }
 

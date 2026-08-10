@@ -492,14 +492,11 @@ pub fn try_compile(
     if v.uses_arena && arena_count != 1 {
         return Err(JitSkip::UsesArena);
     }
-    // A BPF-to-BPF call pushes the caller's saved registers onto the host stack,
-    // which moves `rsp`/`sp` — and the arena base is parked at a fixed offset
-    // from it by the prologue. The two together would make a callee's arena
-    // access read the wrong slot, so a program that uses both runs interpreted.
-    // (`subprogs.len() > 1` is exactly "there is a call target".)
-    if v.uses_arena && v.subprogs.len() > 1 {
-        return Err(JitSkip::UsesArena);
-    }
+    // Arena and BPF-to-BPF calls now compose: the base is pinned in a register
+    // the call preserves (`r10` on x86-64, a callee-saved GPR on aarch64) rather
+    // than parked at a fixed offset from a stack pointer the call moves, so a
+    // callee's arena access reaches the same base as the caller's. See the
+    // backends' module docs on the pinned base.
     // Gate 3, relaxed: an arena access *is* a fault site, so refusing all of
     // them refuses every arena program. Other fault sites still have no
     // native lowering.
@@ -513,6 +510,17 @@ pub fn try_compile(
     if v.kfunc_calls
         .iter()
         .any(|c| crate::ringbuf::is_intrinsic(c.id))
+    {
+        return Err(JitSkip::Unsupported);
+    }
+    // The XDP frame-resizing kfuncs are interpreter intrinsics too — they move
+    // the packet window inside the VM's staged frame buffer and rewrite the
+    // context words, neither of which native code can reach. A program that
+    // calls one runs interpreted; the interpreter intercepts the same ids
+    // (`kfuncs::is_xdp_adjust`).
+    if v.kfunc_calls
+        .iter()
+        .any(|c| crate::kfuncs::is_xdp_adjust(c.id))
     {
         return Err(JitSkip::Unsupported);
     }

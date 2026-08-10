@@ -38,9 +38,13 @@
 //!   to a move — see [`neutralise_dead_calls`].
 //!
 //! The instruction *repertoire* is deliberately exactly what the backends
-//! lower: a shape neither backend emits (a fetching bitwise arena atomic) would
-//! make every program containing it fall back, and a fuzzer whose subjects fall
-//! back is a fuzzer comparing the interpreter with itself.
+//! lower: a shape neither backend emits would make every program containing it
+//! fall back, and a fuzzer whose subjects fall back is a fuzzer comparing the
+//! interpreter with itself. The fetching bitwise arena atomic used to be such a
+//! shape; both backends now lower it, so `generate_arena` emits the full atomic
+//! repertoire and
+//! [`smoke_bpf_jit_fuzz_fetching_bitwise_arena_atomic_matches_the_interpreter`]
+//! pins one exact instance as a differential.
 //!
 //! Three lowered shapes are deliberately *not* generated here and are covered by
 //! goldens plus targeted `smoke_bpf_jit_*_matches_the_interpreter` tests instead:
@@ -50,8 +54,6 @@
 //! which would turn most programs into fuel-bounded spins). None carries the kind
 //! of interaction — flags, addressing, register aliasing — that the fuzzer
 //! exists to shake out.
-//! [`smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`] pins the boundary, so
-//! extending a backend makes this module's repertoire go stale *loudly*.
 //!
 //! ## Determinism and replay
 //!
@@ -819,11 +821,11 @@ fn emit_unit(
             opaque[0] = true;
             cls.call += 1;
         }
-        // A stack atomic on an 8-aligned slot phase C initialised. Only the
-        // shapes both backends lower are generated — the fetching bitwise forms
-        // need an x86 cmpxchg loop and stay interpreted, and cmpxchg avoids R0
-        // as the store value (it would alias aarch64 `CASAL` Rs==Rt). See
-        // `smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back`.
+        // A stack atomic on an 8-aligned slot phase C initialised. The full
+        // repertoire is generated — `pick_atomic_op` includes the fetching
+        // bitwise forms, which both backends lower against a certified base (an
+        // x86 cmpxchg loop, an aarch64 LSE fetch) — and cmpxchg avoids R0 as the
+        // store value (it would alias aarch64 `CASAL` Rs==Rt).
         86..=90 => {
             let k = rng.below(SLOT_OFFS.len() as u32) as usize;
             let size = if rng.chance(50) { Size::Dw } else { Size::W };
@@ -1264,6 +1266,38 @@ fn generate_arena(seed: u64, pages: usize) -> Vec<Decoded> {
         }
     }
 
+    // Sometimes an atomic against the arena, aligned and in bounds. The full
+    // repertoire is generated — including the fetching bitwise forms, which both
+    // backends now lower (an x86 `cmpxchg` loop that preserves R0 in the frame,
+    // an aarch64 LSE fetch) — so the differential exercises those paths against
+    // the interpreter rather than leaving them uncovered.
+    if rng.chance(60) {
+        let max_slot = ((room - 8).max(0) / 8) as u32;
+        // Slot offsets are 8-aligned, so both word and doubleword atomics clear
+        // the runtime natural-alignment guard.
+        let off = (rng.below(max_slot + 1) * 8) as i16;
+        let size = if rng.chance(50) { Size::Dw } else { Size::W };
+        // Avoid R6 (the arena base) as the operand: a fetching form overwrites
+        // its source with the loaded value, which must not disturb the base the
+        // accesses below still address. R10 is never returned by `reg`.
+        let src = {
+            let s = rng.reg();
+            if s == 6 {
+                1
+            } else {
+                s
+            }
+        };
+        let op = pick_atomic_op(&mut rng, src);
+        prog.push(Decoded::Atomic {
+            size,
+            op,
+            dst: r(6),
+            src: r(src),
+            off,
+        });
+    }
+
     // …and, sometimes, one access the arena cannot satisfy. Last, so
     // everything above still executed identically on both paths before the
     // trap. The verifier accepts these — it bounds a displacement against a
@@ -1472,26 +1506,22 @@ fn smoke_bpf_jit_fuzz_replays_pinned_arena_seeds() -> TestResult {
 }
 kernel_test_in!("bpf/fuzz", smoke_bpf_jit_fuzz_replays_pinned_arena_seeds);
 
-// ── the repertoire boundary ─────────────────────────────────────────
+// ── a newly-lowered shape, pinned as a differential ─────────────────
 
-fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
-    // The generator's repertoire is "what both backends lower", which is a
-    // claim about *other* files. This is that claim, executed.
+fn smoke_bpf_jit_fuzz_fetching_bitwise_arena_atomic_matches_the_interpreter() -> TestResult {
+    // This program was the repertoire boundary's probe while a fetching bitwise
+    // arena atomic was the one arena shape neither backend emitted. Both now
+    // lower it — the x86 `cmpxchg` loop preserves R0 in a reserved frame word
+    // rather than on the stack, and aarch64 uses its LSE fetch — so the same
+    // program is now a *positive* check: it must JIT, and the native run must
+    // agree with the interpreter, including the trap discriminant on a fault.
     //
-    // Each program below is well-formed and contains exactly one shape neither
-    // backend emits, so it must load and must *not* compile. When somebody
-    // teaches a backend one of these, this test goes red at that entry — which
-    // is the signal to add the shape to the fuzzer's repertoire rather than to
-    // leave it silently uncovered. Deleting the entry to get green is the one
-    // wrong move, and saying so here is cheaper than finding out later.
+    // Its whole-repertoire cousin lives in `generate_arena`, which now emits
+    // atomics (fetching forms included); this pins one exact instance so a
+    // regression names the shape rather than surfacing as a seed.
     if !narf_bpf_jit::has_backend() {
         return TestResult::Skip(NO_BACKEND);
     }
-    // A fetching bitwise arena atomic is the durable probe: it verifies through
-    // the real loader (given an arena to point at), but the x86 cmpxchg loop's
-    // scratch state collides with the fault-recovery handle contract. aarch64
-    // deliberately keeps the same portable arena repertoire, so both backends
-    // leave it interpreted. Other arena atomics are lowered now.
     let cap = crate::arena::kernel_arena_cap();
     let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
         Ok(g) => alloc::sync::Arc::new(g),
@@ -1501,7 +1531,7 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
         call_arena_base(),    // R0 = the arena base handle
         super::mov_reg(6, 0), // park it in R6, which survives the call
         super::mov_imm(0, 0), // R0 = 0, so `exit` does not return a pointer
-        super::mov_imm(1, 7), // the addend
+        super::mov_imm(1, 7), // the operand
         Decoded::Atomic {
             size: Size::Dw,
             op: AtomicOp::Or { fetch: true },
@@ -1512,22 +1542,97 @@ fn smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back() -> TestResult {
         Decoded::Exit,
     ];
     let Some(p) = load_against(&group, &items) else {
-        // A shape the *verifier* refuses is not evidence about the backends, and
-        // silently skipping it would hollow this out.
         note!("bpf-fuzz: the verifier rejected the arena-atomic probe");
-        return TestResult::Fail("the unlowered-shape probe no longer verifies");
+        return TestResult::Fail("the fetching bitwise arena-atomic probe no longer verifies");
     };
-    if p.is_jited() {
-        note!(
-            "bpf-fuzz: a backend now lowers a fetching bitwise arena atomic — extend the repertoire"
-        );
-        return TestResult::Fail(
-            "a backend gained a shape the fuzzer does not generate — extend the repertoire",
-        );
+    if !p.is_jited() {
+        note!("bpf-fuzz: a fetching bitwise arena atomic no longer JITs — the lowering regressed");
+        return TestResult::Fail("a fetching bitwise arena atomic fell back to the interpreter");
+    }
+    match diff_run(&p, [0; 4]) {
+        Ok(()) => TestResult::Pass,
+        Err(e) if e == NO_BACKEND => TestResult::Skip(NO_BACKEND),
+        Err(e) if e == NOT_COMPILED => {
+            TestResult::Fail("the arena atomic verified and JITed but the differential skipped it")
+        }
+        Err(e) => {
+            note!("bpf-fuzz: fetching bitwise arena atomic diverged — {e}");
+            TestResult::Fail("native and interpreted runs of the arena atomic diverged")
+        }
+    }
+}
+kernel_test_in!(
+    "bpf/fuzz",
+    smoke_bpf_jit_fuzz_fetching_bitwise_arena_atomic_matches_the_interpreter
+);
+
+fn smoke_bpf_jit_arena_access_inside_a_subprogram_matches_the_interpreter() -> TestResult {
+    // The residual this closes: an arena access at call depth 1, where a
+    // BPF-to-BPF call has moved `sp`. `main` calls `sub`, which takes the arena
+    // base and stores then loads through it. Two offsets: one in bounds (returns
+    // the value) and one past the one-page arena (faults *inside the
+    // subprogram*). The x86-64 backend reaches the base through the entry-`sp`
+    // anchor and, on the fault, resets `sp` to it before unwinding — so both must
+    // agree with the interpreter, value and trap discriminant alike. aarch64
+    // leaves a subprogram arena access interpreted, so `diff_run` reports it as
+    // not-compiled there; the run itself still has to match the expectation.
+    if !narf_bpf_jit::has_backend() {
+        return TestResult::Skip(NO_BACKEND);
+    }
+    let cap = crate::arena::kernel_arena_cap();
+    let group = match crate::arena::ArenaGroup::with_one(cap, 1) {
+        Ok(g) => alloc::sync::Arc::new(g),
+        Err(_) => return TestResult::Fail("could not reserve an arena for the subprogram probe"),
+    };
+    for &(off, in_bounds) in &[(0i16, true), (8000i16, false)] {
+        // main: call sub; exit (returns sub's R0).
+        // sub:  r0 = arena base; *(u64*)(r0+off) = 0x5A; r0 = *(u64*)(r0+off); exit
+        let items = alloc::vec![
+            super::subprog_call(1),
+            Decoded::Exit,
+            call_arena_base(),
+            Decoded::Store {
+                size: Size::Dw,
+                dst: r(0),
+                off,
+                src: Source::Imm(0x5A),
+            },
+            Decoded::Load {
+                size: Size::Dw,
+                sign_extend: false,
+                dst: r(0),
+                src: r(0),
+                off,
+            },
+            Decoded::Exit,
+        ];
+        let Some(p) = load_against(&group, &items) else {
+            note!("bpf-fuzz: the verifier rejected the subprogram arena probe (off={off})");
+            return TestResult::Fail("the subprogram arena probe no longer verifies");
+        };
+        match diff_run(&p, [0; 4]) {
+            Ok(()) => {}
+            Err(e) if e == NO_BACKEND => return TestResult::Skip(NO_BACKEND),
+            // aarch64 leaves a subprogram arena access interpreted — not a
+            // divergence, just no native side to compare.
+            Err(e) if e == NOT_COMPILED => {}
+            Err(e) => {
+                note!("bpf-fuzz: subprogram arena access diverged (off={off}) — {e}");
+                return TestResult::Fail("native and interpreted subprogram arena runs diverged");
+            }
+        }
+        match (p.run_atomic([0; 4], 4), in_bounds) {
+            (Some(Outcome::Returned(0x5A)), true) => {}
+            (Some(Outcome::Trapped(crate::interp::Trap::ArenaOutOfBounds { .. })), false) => {}
+            (other, _) => {
+                note!("bpf-fuzz: subprogram arena probe off={off} gave {other:?}");
+                return TestResult::Fail("a subprogram arena access produced the wrong outcome");
+            }
+        }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "bpf/fuzz",
-    smoke_bpf_jit_fuzz_unlowered_shapes_still_fall_back
+    smoke_bpf_jit_arena_access_inside_a_subprogram_matches_the_interpreter
 );

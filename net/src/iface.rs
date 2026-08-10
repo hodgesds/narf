@@ -236,6 +236,61 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
     send_fn(frame)
 }
 
+/// Send a complete Ethernet frame out the interface named `iface_name`.
+/// Returns `Err` if no such iface is registered or the driver failed.
+///
+/// The retransmit primitive behind XDP `XDP_TX` (reflect out the ingress
+/// iface) and `XDP_REDIRECT` (send out a target iface). We look the send fn up
+/// under the lock and release it before calling — the driver's send path may
+/// re-enter the registry, and holding the `IrqSafeSpinLock` across it would
+/// deadlock. The classifier is the sole XDP caller and invokes this only after
+/// its own `XDP_PROGS` lock is released, so no BPF-side lock is held here.
+pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
+    let send_fn = {
+        let g = IFACES.lock();
+        let v = g.as_ref().ok_or(())?;
+        let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
+        e.send
+    };
+    send_fn(frame)
+}
+
+/// Send a frame out the interface at synthetic `ifindex`.
+///
+/// The ifindex space matches the rtnetlink dump responder's: index 1 is the
+/// synthetic loopback (nothing to transmit onto — treated as `Err`), and
+/// 2, 3, … map to registered interfaces in registration order (the same order
+/// [`snapshot_all`] returns). This is the resolution XDP `XDP_REDIRECT` uses to
+/// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
+/// if the ifindex names no registered iface or the driver failed.
+pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
+    // 0 and 1 are reserved (0 = "none", 1 = loopback); registered NICs start
+    // at 2, so subtract the two reserved slots to index the registry.
+    let pos = (ifindex as usize).checked_sub(2).ok_or(())?;
+    let send_fn = {
+        let g = IFACES.lock();
+        let v = g.as_ref().ok_or(())?;
+        let e = v.get(pos).ok_or(())?;
+        e.send
+    };
+    send_fn(frame)
+}
+
+/// The synthetic ifindex of `iface_name`, in the same space
+/// [`send_on_ifindex`] resolves: index 1 is loopback and 2, 3, … are the
+/// registered interfaces in registration order. `None` if no interface has that
+/// name. Used by XDP `BPF_F_EXCLUDE_INGRESS` to skip the ingress iface in a
+/// broadcast fan-out.
+#[must_use]
+pub fn ifindex_of(iface_name: &str) -> Option<u32> {
+    let g = IFACES.lock();
+    let v = g.as_ref()?;
+    let pos = v.iter().position(|e| e.name == iface_name)?;
+    // 0 = "none", 1 = loopback, registered NICs start at 2 — mirror
+    // `send_on_ifindex`'s `pos + 2`.
+    Some((pos + 2) as u32)
+}
+
 /// First interface visible in `net_ns_id`.
 pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
@@ -465,7 +520,12 @@ pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
 // essential with multiple NICs on overlapping subnets (e.g. two QEMU
 // user-mode NICs both at 10.0.2.0/24), where a global address lookup
 // would otherwise reply out the wrong NIC. `""` means "ingress unknown".
-type RxHandler = fn(&str, &[u8]);
+//
+// The frame is `&mut`: an attached XDP program may rewrite header bytes in
+// place before the stack parses or the driver reflects the frame. The buffer
+// is the driver's own DMA/scratch buffer, mutated before anything downstream
+// copies it out, so an in-place write is sound (see `on_rx_frame_from`).
+type RxHandler = fn(&str, &mut [u8]);
 
 static RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
@@ -474,7 +534,13 @@ pub fn install_rx_handler(h: RxHandler) {
 }
 
 /// Dispatch a frame received on a known ingress interface.
-pub fn on_rx_frame_from(iface_name: &str, frame: &[u8]) {
+///
+/// `frame` is the driver's own RX buffer, passed `&mut` so an attached XDP
+/// program can rewrite it in place. The driver retains ownership and recycles
+/// the buffer afterwards; mutating it before the stack copies the payload out
+/// (or the driver reflects it for `XDP_TX`) is the whole point of a writable
+/// XDP surface.
+pub fn on_rx_frame_from(iface_name: &str, frame: &mut [u8]) {
     let v = RX_HANDLER.load(Ordering::Acquire);
     if v == 0 {
         return;
@@ -490,7 +556,7 @@ pub fn on_rx_frame_from(iface_name: &str, frame: &[u8]) {
 }
 
 /// Dispatch a frame whose ingress iface is unknown (legacy callers).
-pub fn on_rx_frame(frame: &[u8]) {
+pub fn on_rx_frame(frame: &mut [u8]) {
     on_rx_frame_from("", frame);
 }
 

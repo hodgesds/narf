@@ -24,10 +24,23 @@
 //! the daemon claim and the flow table, mirroring Linux's ordering in
 //! `netif_receive_skb_core`.
 //!
-//! The attached surface is **read-only** and offers `Pass`/`Drop` only. Header
-//! rewriting, `XDP_TX` and `XDP_REDIRECT` need a `&mut [u8]` frame, which means
-//! widening `iface::RxHandler` and every driver RX path that feeds it — see
-//! [`XdpProgram`] for why that is deferred rather than done.
+//! The attached surface is **writable and resizable**. It offers `Pass`/`Drop`,
+//! in-place **header rewrite** (a bounds-checked store through the packet's
+//! `data` pointer), **frame resizing** (`bpf_xdp_adjust_head`/`_tail` move
+//! `data`/`data_end` to trim or grow the packet), plus frame *retransmission* —
+//! `XDP_TX` (reflect out the ingress iface) and `XDP_REDIRECT` (send out a named
+//! iface) — of the **possibly-modified, possibly-resized** frame.
+//! [`XdpProgram::run`] takes `&mut [u8]` and returns `(action, len)`: `len` is
+//! the resulting `[data, data_end)` length, and the packet occupies
+//! `frame[..len]`. The `&mut` slice is threaded from `iface::RxHandler` through
+//! each driver's RX path (virtio-net / e1000 hand over a `&mut` borrow of their
+//! DMA/scratch buffer); the resize is staged in `narf-bpf` and only the length
+//! crosses this seam. That is a real bump-in-the-wire capability — inspect,
+//! rewrite, resize, reflect, forward — reachable without a userspace daemon.
+//!
+//! `XDP_REDIRECT` also drives a devmap/cpumap (`bpf_redirect_map`): a single
+//! interface, a CPU's local stack, or — with `BPF_F_BROADCAST` — a fan-out to
+//! every live devmap port (optionally excluding the ingress iface).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -242,7 +255,7 @@ fn daemon_socket(iface_name: &str) -> Option<Arc<XdpSocket>> {
 }
 
 /// Verdict the classifier returns to the iface-side RX dispatch.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Frame was consumed by the bypass path. Caller must NOT pass
     /// it to the kernel TCP stack.
@@ -254,6 +267,22 @@ pub enum Verdict {
     /// fall through. Today we drop — that matches Linux's XDP
     /// XDP_DROP semantics when XSK FILL is starved.
     Dropped,
+    /// `XDP_TX`: retransmit the (possibly-rewritten) frame back out the ingress
+    /// interface. The caller sends after the `XDP_PROGS` lock is released —
+    /// [`run_xdp`] deliberately does not transmit while it holds the lock with
+    /// IRQs masked.
+    Transmit,
+    /// `XDP_REDIRECT`: send the (possibly-rewritten) frame out the interface
+    /// named by `ifindex`. Same as [`Verdict::Transmit`] but out a
+    /// program-chosen NIC; the caller resolves the ifindex and transmits after
+    /// the lock is released.
+    Redirect { ifindex: u32 },
+    /// `XDP_REDIRECT` with `BPF_F_BROADCAST`: fan the (possibly-rewritten) frame
+    /// out to every port a devmap named. Same as [`Verdict::Redirect`] but to a
+    /// *set* of NICs; the caller drains the staged port list with
+    /// [`take_xdp_broadcast`] and sends to each after the lock is released,
+    /// skipping the ingress iface when the program asked to exclude it.
+    Broadcast,
 }
 
 /// Toggle per-iface poll mode. `on = true` masks RX IRQ; `false`
@@ -286,17 +315,30 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
 /// `narf-bpf`; declared here so `narf-net` keeps no dependency on the BPF
 /// subsystem, which is the same shape `PLUGGABILITY.md` uses everywhere else.
 ///
-/// **Read-only.** Linux's XDP programs rewrite headers and can return `XDP_TX`
-/// or `XDP_REDIRECT`; those need a `&mut [u8]` frame, which means widening
-/// `RxHandler` (`iface.rs:468`) and every driver RX path that feeds it —
-/// virtio-net and e1000 both hand over an immutable borrow of a DMA buffer
-/// today. That refactor is deferred, so this surface offers `Pass`/`Drop` only,
-/// which is what filtering and drop-based mitigation need.
+/// **Writable and resizable.** [`Self::run`] takes `&mut [u8]`, so a program may
+/// rewrite header bytes in place (a store through the packet's `data` pointer,
+/// bounds-checked against `data_end` by the verifier and again by the
+/// interpreter) and resize the frame (`bpf_xdp_adjust_head`/`_tail`). It returns
+/// `(action, len)`: the resulting packet is `frame[..len]`, which `XDP_TX` and
+/// `XDP_REDIRECT` retransmit — reflect out the ingress iface, forward out a
+/// program-chosen one (`bpf_redirect`/devmap), or deliver to the local stack
+/// (cpumap, see [`XdpAction::RedirectCpu`]). What is *not* yet supported is
+/// `BPF_F_BROADCAST` fan-out (one frame to many ports), which is deferred.
 pub trait XdpProgram: Send + Sync + 'static {
     /// A name, for diagnostics.
     fn name(&self) -> &str;
-    /// Decide the frame's fate. Must not block.
-    fn run(&self, iface: &str, frame: &[u8]) -> XdpAction;
+    /// Decide the frame's fate and report the resulting packet length. Must not
+    /// block.
+    ///
+    /// `frame` is `&mut`: the program may rewrite header bytes in place
+    /// (bounds-checked against `data_end` by the BPF verifier + runtime), and may
+    /// *resize* the frame with `bpf_xdp_adjust_head`/`_tail`. The returned length
+    /// is the effective `[data, data_end)` window after the run, and the packet
+    /// bytes occupy `frame[..len]` — that is what an ensuing `XDP_TX`/
+    /// `XDP_REDIRECT` retransmits and what the kernel stack sees on `Pass`. A
+    /// program that only rewrites bytes (or does nothing) returns `frame.len()`.
+    /// `len` never exceeds `frame.len()`.
+    fn run(&self, iface: &str, frame: &mut [u8]) -> (XdpAction, usize);
 }
 
 /// What an [`XdpProgram`] decided.
@@ -310,6 +352,25 @@ pub enum XdpAction {
     /// separately, matching Linux's `XDP_ABORTED`, so a broken program is
     /// visible rather than merely quiet.
     Aborted,
+    /// `XDP_TX`: reflect the (possibly-rewritten) frame back out the ingress
+    /// iface.
+    Tx,
+    /// `XDP_REDIRECT`: send the (possibly-rewritten) frame out interface
+    /// `ifindex`. The ifindex is the value a `bpf_redirect` kfunc stashed for
+    /// this frame.
+    Redirect { ifindex: u32 },
+    /// `XDP_REDIRECT` into a cpumap: deliver the (possibly-rewritten) frame to
+    /// CPU `cpu`'s network stack. NARF has one RX-processing context, so this
+    /// resolves to *local* delivery — the frame continues up the local stack,
+    /// exactly as `Pass` does — and `cpu` is carried for fidelity/diagnostics.
+    /// Cross-CPU steering is the documented degradation.
+    RedirectCpu { cpu: u32 },
+    /// `XDP_REDIRECT` with `BPF_F_BROADCAST`: fan the (possibly-rewritten) frame
+    /// out to every port a devmap named. The port list and the exclude-ingress
+    /// flag were staged into this CPU's buffer by [`stage_xdp_broadcast`]; the
+    /// caller drains them with [`take_xdp_broadcast`] and sends after the
+    /// `XDP_PROGS` lock is released, like the other retransmit verdicts.
+    Broadcast,
 }
 
 type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
@@ -320,6 +381,76 @@ static XDP_ABORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// answer, which is the same latitude the daemon and flow tables already have.
 static XDP_ANY: AtomicBool = AtomicBool::new(false);
 static XDP_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program asked to retransmit (`XDP_TX` + `XDP_REDIRECT`). Counted at
+/// the *decision*, so a subsequent driver send failure does not un-count it —
+/// the counter reflects program intent, and `XDP_TX_DROPS` records the send
+/// failures separately.
+static XDP_TXS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Retransmit requests (`XDP_TX`/`XDP_REDIRECT`) the caller could not send —
+/// unknown target iface, or the driver's send returned `Err`. The frame is
+/// dropped in that case, matching Linux, where a redirect to a down/absent
+/// device is a drop.
+static XDP_TX_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program redirected into a cpumap. On NARF's single RX-processing
+/// context these are delivered to the local stack (the target CPU is us), so
+/// they are counted here rather than under `XDP_TXS`, which is retransmission
+/// out a device.
+static XDP_CPU_REDIRECTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program broadcast (`BPF_F_BROADCAST`) out a devmap's ports. Counted
+/// once per broadcast *decision*, not once per port sent.
+static XDP_BROADCASTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The most ports a single `BPF_F_BROADCAST` fans out to here — matches the
+/// BPF side's `MAX_BROADCAST_PORTS`, which caps how many the staging call ever
+/// passes. A fixed size keeps the per-CPU buffer allocation-free.
+pub const MAX_XDP_BROADCAST_PORTS: usize = 16;
+
+/// Per-CPU staging for a pending `BPF_F_BROADCAST`: the devmap ports and the
+/// exclude-ingress flag. Written by [`stage_xdp_broadcast`] while the BPF side
+/// holds `XDP_PROGS` (IRQs masked), drained by [`take_xdp_broadcast`] in the
+/// same `rx_handler` call on the same CPU — the same discipline as the BPF-side
+/// redirect slot, and safe because NARF drains RX one frame at a time in a
+/// cooperative poll loop rather than by nested `rx_handler` re-entry.
+static XDP_BCAST_PORTS: [[AtomicU32; MAX_XDP_BROADCAST_PORTS]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { AtomicU32::new(0) }; MAX_XDP_BROADCAST_PORTS] }; narf_lib::percpu::MAX_CPUS];
+/// Companion to [`XDP_BCAST_PORTS`]: the low 16 bits hold the staged port count,
+/// bit 16 the exclude-ingress flag.
+static XDP_BCAST_META: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// Bit in [`XDP_BCAST_META`] marking `BPF_F_EXCLUDE_INGRESS`.
+const XDP_BCAST_EXCLUDE_INGRESS_BIT: u32 = 1 << 16;
+
+/// Stage the ports a `BPF_F_BROADCAST` will fan out to on this CPU, plus whether
+/// to skip the ingress iface. Called by the BPF `attach_xdp` bridge while it
+/// holds `XDP_PROGS`; [`take_xdp_broadcast`] reads it back in the same
+/// `rx_handler` call.
+pub fn stage_xdp_broadcast(ports: &[u32], exclude_ingress: bool) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let n = ports.len().min(MAX_XDP_BROADCAST_PORTS);
+    for (slot, &ifindex) in XDP_BCAST_PORTS[cpu].iter().zip(&ports[..n]) {
+        slot.store(ifindex, Ordering::Relaxed);
+    }
+    let mut meta = n as u32;
+    if exclude_ingress {
+        meta |= XDP_BCAST_EXCLUDE_INGRESS_BIT;
+    }
+    XDP_BCAST_META[cpu].store(meta, Ordering::Relaxed);
+}
+
+/// Drain this CPU's staged broadcast ports into `out`, returning
+/// `(count, exclude_ingress)`. `count` is `min(staged, out.len())`. Read once,
+/// right after a [`Verdict::Broadcast`], on the same CPU.
+#[must_use]
+pub fn take_xdp_broadcast(out: &mut [u32]) -> (usize, bool) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let meta = XDP_BCAST_META[cpu].swap(0, Ordering::Relaxed);
+    let staged = (meta & 0xFFFF) as usize;
+    let n = staged.min(out.len()).min(MAX_XDP_BROADCAST_PORTS);
+    for (dst, slot) in out[..n].iter_mut().zip(&XDP_BCAST_PORTS[cpu]) {
+        *dst = slot.load(Ordering::Relaxed);
+    }
+    (n, meta & XDP_BCAST_EXCLUDE_INGRESS_BIT != 0)
+}
 
 /// Attach `prog` to `iface`, replacing any program already there.
 ///
@@ -360,6 +491,36 @@ pub fn xdp_stats() -> (u64, u64) {
     )
 }
 
+/// (retransmit requests, retransmit send failures) attributed to XDP programs.
+/// The first counts `XDP_TX` + `XDP_REDIRECT` decisions; the second counts
+/// those the caller could not actually send (unknown iface or driver `Err`).
+#[must_use]
+pub fn xdp_tx_stats() -> (u64, u64) {
+    (
+        XDP_TXS.load(Ordering::Relaxed),
+        XDP_TX_DROPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Record that a retransmit verdict (`Transmit`/`Redirect`) could not be sent.
+/// The `tcp_stack` RX path calls this after a failed `iface::send_on` so a
+/// redirect to a down/absent device is visible as a drop rather than silent.
+pub fn count_xdp_tx_drop() {
+    XDP_TX_DROPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Frames a program redirected into a cpumap, delivered to the local stack.
+#[must_use]
+pub fn xdp_cpu_redirects() -> u64 {
+    XDP_CPU_REDIRECTS.load(Ordering::Relaxed)
+}
+
+/// Frames a program broadcast out a devmap's ports (`BPF_F_BROADCAST`).
+#[must_use]
+pub fn xdp_broadcasts() -> u64 {
+    XDP_BROADCASTS.load(Ordering::Relaxed)
+}
+
 /// Run the attached program, if any.
 ///
 /// **The program runs while `XDP_PROGS` is held**, and with interrupts masked
@@ -378,14 +539,14 @@ pub fn xdp_stats() -> (u64, u64) {
 ///   off. That is a latency characteristic of attaching a program at all, not
 ///   something this function can fix; recorded in `bpf/specification/spec.md`
 ///   §8 rather than left for someone to discover from a jitter graph.
-fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
+fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
     // Fast path for the overwhelmingly common case: nothing attached. Without
     // this, every RX frame paid an IRQ-save, a `lock cmpxchg`, and a linear
     // `String == &str` scan before the existing daemon and flow-table locks —
     // roughly a third more locking on the bypass path for a feature that is
     // off. `POLL_MODE` next door already uses this shape.
     if !XDP_ANY.load(Ordering::Relaxed) {
-        return XdpAction::Pass;
+        return (XdpAction::Pass, frame.len());
     }
     // The program runs while `XDP_PROGS` is held. That is a deliberate,
     // recorded limitation rather than an oversight: `Box<dyn XdpProgram>` is
@@ -395,11 +556,11 @@ fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
     // contains nothing that re-enters this module. If that ever stops being
     // true, this deadlocks on a non-reentrant lock, so switch to `Arc` before
     // widening the kfunc set rather than after.
-    let action = {
+    let (action, len) = {
         let g = XDP_PROGS.lock();
         match g.iter().find(|(n, _)| n == iface) {
             Some((_, p)) => p.run(iface, frame),
-            None => return XdpAction::Pass,
+            None => return (XdpAction::Pass, frame.len()),
         }
     };
     match action {
@@ -409,33 +570,66 @@ fn run_xdp(iface: &str, frame: &[u8]) -> XdpAction {
         XdpAction::Aborted => {
             XDP_ABORTS.fetch_add(1, Ordering::Relaxed);
         }
+        XdpAction::Tx | XdpAction::Redirect { .. } => {
+            XDP_TXS.fetch_add(1, Ordering::Relaxed);
+        }
+        XdpAction::RedirectCpu { .. } => {
+            XDP_CPU_REDIRECTS.fetch_add(1, Ordering::Relaxed);
+        }
+        XdpAction::Broadcast => {
+            XDP_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+        }
         XdpAction::Pass => {}
     }
-    action
+    // A resizing program can only deliver up to the caller frame's length; the
+    // run path already bounds the copy-back, so this is belt to that brace.
+    (action, len.min(frame.len()))
 }
 
 /// Classify an inbound L2 frame originating from `iface_name`.
-/// Returns the verdict and, if consumed, the frame is already
-/// staged into UMEM + posted to the RX ring of the chosen socket.
-pub fn classify(iface_name: &str, frame: &[u8]) -> Verdict {
+///
+/// Returns the verdict and the effective packet length after any XDP program
+/// ran: an attached program may resize the frame (`bpf_xdp_adjust_head`/`_tail`),
+/// so the live packet is `frame[..len]`, which is what every path below — the
+/// daemon/flow bypass, and the caller's `Pass`/`Transmit`/`Redirect` handling —
+/// must use. On a `Consumed` verdict the frame is already staged into UMEM +
+/// posted to the RX ring of the chosen socket. `len` never exceeds `frame.len()`.
+pub fn classify(iface_name: &str, frame: &mut [u8]) -> (Verdict, usize) {
     // An XDP program runs first — ahead of the daemon claim and the flow
     // table, mirroring Linux, where XDP sits in front of everything in
-    // `netif_receive_skb_core`.
-    match run_xdp(iface_name, frame) {
-        XdpAction::Drop | XdpAction::Aborted => return Verdict::Dropped,
-        XdpAction::Pass => {}
-    }
+    // `netif_receive_skb_core`. It takes the frame `&mut` (in-place header
+    // rewrite and/or resize); once it returns, every path below re-borrows
+    // immutably over the resulting `frame[..len]` window and so sees the
+    // possibly-modified, possibly-resized bytes.
+    let len = match run_xdp(iface_name, &mut *frame) {
+        (XdpAction::Drop | XdpAction::Aborted, _) => return (Verdict::Dropped, 0),
+        // Retransmit verdicts return to the caller unconsumed by the bypass
+        // table: the caller sends the frame after `XDP_PROGS` is released, so
+        // no transmit happens with IRQs masked. The frame does NOT continue to
+        // the daemon/flow table or the kernel stack.
+        (XdpAction::Tx, len) => return (Verdict::Transmit, len),
+        (XdpAction::Redirect { ifindex }, len) => return (Verdict::Redirect { ifindex }, len),
+        // A devmap broadcast fans out to a set of NICs after the lock releases,
+        // the same deferral `Transmit`/`Redirect` use; the ports are already
+        // staged for the caller to drain.
+        (XdpAction::Broadcast, len) => return (Verdict::Broadcast, len),
+        // A cpumap redirect delivers to the local stack — the running CPU is the
+        // only RX-processing context — so it continues down this function exactly
+        // as `Pass` does, over the possibly-resized `frame[..len]`.
+        (XdpAction::Pass | XdpAction::RedirectCpu { .. }, len) => len,
+    };
+    let packet = &frame[..len];
 
     // Whole-NIC daemon attach — pure forward, no L3 parse needed.
     if let Some(sock) = daemon_socket(iface_name) {
-        return stage_into_socket(&sock, frame);
+        return (stage_into_socket(&sock, packet), len);
     }
 
     // Per-flow path: extract 5-tuple. Only IPv4 today — IPv6 5-tuple
     // matching slots in here when the bypass surface grows v6.
-    let key = match extract_flow_key(frame) {
+    let key = match extract_flow_key(packet) {
         Some(k) => k,
-        None => return Verdict::PassThrough,
+        None => return (Verdict::PassThrough, len),
     };
 
     let candidate = {
@@ -445,10 +639,11 @@ pub fn classify(iface_name: &str, frame: &[u8]) -> Verdict {
             .find(|c| c.key.matches(&key))
             .map(|c| c.socket.clone())
     };
-    match candidate {
-        Some(sock) => stage_into_socket(&sock, frame),
+    let verdict = match candidate {
+        Some(sock) => stage_into_socket(&sock, packet),
         None => Verdict::PassThrough,
-    }
+    };
+    (verdict, len)
 }
 
 /// Extract the 5-tuple from an Ethernet+IPv4+UDP/TCP frame. Returns

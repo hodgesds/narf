@@ -213,6 +213,30 @@ pub struct BareAccessSite {
     pub insn_index: u32,
 }
 
+/// A `BPF_LDX` load proved to name an exact declared field of a schema-tracked
+/// [`PtrClass::TraceObject`](crate::state::PtrClass) pointer.
+///
+/// The same field-existence check `narf_probe_read` performs at runtime, moved
+/// to verification time: the base register holds a trace-object pointer at
+/// offset zero and the `(field_offset, size)` pair names one exact field of the
+/// pointer's schema. That certifies the load as safe *provenance*, but not as a
+/// bare host dereference: the base register holds the address of the tracing
+/// wrapper, not of the object, so the field lives one indirection away
+/// (`narf_tracing::TypedProbeRef::copy_field`). The load is therefore never
+/// added to [`BareAccessSite`] — the JIT's pointer-base gate refuses it and the
+/// whole program runs interpreted, where the interpreter reads the field
+/// through the wrapper and repeats the runtime bound check.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TypedLoadSite {
+    /// Index of the `BPF_LDX` load.
+    pub insn_index: u32,
+    /// Byte offset of the field from the object base, as named by the load's
+    /// displacement.
+    pub field_offset: u32,
+    /// Exact field width the load reads, in bytes.
+    pub size: u32,
+}
+
 /// A `call` to a kfunc, as resolved during verification.
 ///
 /// The verifier resolves each `call`'s immediate against [`Program::kfuncs`]
@@ -275,6 +299,12 @@ pub struct VerifiedProgram {
     pub fault_sites: Vec<FaultSite>,
     /// Instructions proved safe to lower as bare host-pointer dereferences.
     pub bare_access_sites: Vec<BareAccessSite>,
+    /// `BPF_LDX` loads proved to name an exact declared field of a trace-object
+    /// pointer, sorted by instruction index. Certified typed reads the
+    /// interpreter services through the tracing wrapper; deliberately disjoint
+    /// from [`Self::bare_access_sites`] so the JIT does not lower one as a bare
+    /// dereference of the wrapper.
+    pub typed_load_sites: Vec<TypedLoadSite>,
     /// Subprogram boundaries and stack usage.
     pub subprogs: Vec<SubprogInfo>,
     /// Whether the program touches an arena, and so needs the arena base
@@ -396,6 +426,16 @@ pub enum VerifyError {
     /// access is an arbitrary kernel read/write primitive rather than a
     /// recoverable fault.
     OpaqueDeref { at: u32, reg: u8 },
+    /// A direct load through a trace-object pointer whose `(offset, size)` does
+    /// not name an exact declared field of the pointer's schema.
+    ///
+    /// A trace-object pointer is the one opaque class a direct load *can* reach,
+    /// but only at an exact field: this is the same authority boundary
+    /// `narf_probe_read` enforces at runtime, brought forward to verification.
+    /// A shifted offset, a truncated width, a variable offset, or a store — all
+    /// land here rather than reaching the object. An in-object-but-not-a-field
+    /// access is deliberately not enough; the schema is the boundary.
+    TypedFieldMismatch { at: u32, reg: u8 },
     /// An arena access whose offset could not be proved inside the window.
     ///
     /// The guard slots are derived from the ISA's 16-bit displacement, so

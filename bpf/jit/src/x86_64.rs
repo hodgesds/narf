@@ -18,36 +18,33 @@
 //! call then needs almost no shuffling, which is the hot path this exists for.
 //! `rcx`, `r10`, `r11` and `r12` are deliberately left out of the map — `rcx`
 //! because variable shifts require it, `r12` because it holds the fuel counter
-//! (see [`hr::R12`]), and `r11` because a call target's absolute address has to
-//! be materialised somewhere ([`hr::R11`]). `r10` still has no named constant;
-//! an unused constant reserving a register is a claim nothing checks.
+//! (see [`hr::R12`]), `r11` because a call target's absolute address has to be
+//! materialised somewhere ([`hr::R11`]), and `r10` because it pins the arena
+//! window base for a program that uses one ([`hr::R10`]).
 //!
-//! This paragraph used to say `r12` was reserved "because an arena program pins
-//! it to the window base", contradicting [`hr::R12`] two screens down. Worth
-//! recording *why* that is not merely a typo to swap back: the map leaves **no
-//! callee-saved register free**. rbx, rbp and r13..r15 are BPF R6..R10, r12 is
-//! fuel, and Linux's choice of `r12` for the arena base is unavailable here for
-//! exactly that reason. A pinned arena base therefore has to come from
-//! somewhere — a seventh saved slot reloaded per access, or a re-balanced map —
-//! and that decision belongs with the code that needs it, not with a comment
-//! claiming a register is already spoken for.
+//! The map leaves **no callee-saved register free**: rbx, rbp and r13..r15 are
+//! BPF R6..R10, r12 is fuel, and Linux's choice of `r12` for the arena base is
+//! unavailable here for exactly that reason. `r10` is the one free host register,
+//! and for a program that uses an arena it holds the **entry frame's `rsp`** — an
+//! anchor set once in the prologue (a program without an arena never touches it).
+//! The arena base itself stays parked in the entry frame; an access reaches it
+//! through `[r10 + slot]`.
 //!
-//! **It came from the first of those.** The arena base arrives as the fourth
-//! entry argument in `rcx` and the prologue parks it in the 8-byte slot it
-//! already claims for SysV alignment ([`STACK_ALIGN_PAD`]); an arena access
-//! reloads it into `r11` and uses `rcx` as the index. Both are caller-saved,
-//! which would be fatal for a *pinned* base and is irrelevant for one reloaded
-//! per access — and it is why the frame shape does not change at all, so a
-//! program with no arena pays nothing.
+//! **A BPF-to-BPF call used to break the `rsp`-parked base two ways.** The base
+//! sits at a fixed offset from a stack pointer the call moves, so (1) a callee's
+//! arena access read the wrong slot, and (2) an arena fault or out-of-fuel exit
+//! reached from a callee resumed at the single entry-frame teardown with `rsp`
+//! several frames too deep. Anchoring `r10` fixes both: the access reads
+//! `[r10 + slot]`, and the fault/out-of-fuel epilogues do `mov rsp, r10` before
+//! unwinding, so the teardown is correct at any depth. So arena and BPF-to-BPF
+//! calls now compose.
 //!
-//! **Kfunc calls needed none of that.** The register pressure that blocks a
-//! pinned arena base does not touch call emission, and the reason is worth
-//! stating because the two look like the same problem: a call needs *scratch*,
-//! which is caller-saved and plentiful, while an arena base needs a value that
-//! survives a call, which is callee-saved and exhausted. BPF's own ABI then
-//! does the rest — R1..R5 are caller-saved by definition and R0 takes the
-//! result, and those are exactly the registers SysV lets a callee destroy. So
-//! nothing is saved around a call and nothing is reloaded after one.
+//! **Kfunc calls are the one exception.** `r10` is caller-saved, so a `call`
+//! into a kfunc's Rust may destroy it — [`emit_kfunc_call`]'s arena wrapper saves
+//! it below `rsp` across the call and reloads it after, balanced so the call sees
+//! the alignment SysV wants. BPF's own R1..R5 need no such care: they are
+//! caller-saved by definition and R0 takes the result, exactly the registers
+//! SysV lets a callee destroy, so nothing else is saved around a call.
 //!
 //! ## What is emitted, and what is not
 //!
@@ -59,9 +56,13 @@
 //!
 //! What is left interpreted: the subprogram-address and BTF-id pseudo-forms of
 //! `LD_IMM64` (the map forms are emitted over the loader-resolved address; these
-//! two are never resolved), fetching bitwise arena atomics, and arena accesses
-//! in a program that also makes BPF-to-BPF calls (the call frame moves `rsp`,
-//! which the arena base is parked relative to). Everything unemitted returns
+//! two are never resolved). Arena accesses now compose with BPF-to-BPF calls —
+//! the entry `rsp` is anchored in [`hr::R10`], so an access reaches its base at
+//! any call depth and a fault resets `rsp` to the anchor before unwinding. And a
+//! fetching bitwise arena atomic — the one arena shape x86 cannot express in a
+//! single instruction — is emitted as a `cmpxchg` loop that preserves R0 in
+//! [`ATOMIC_SPILL_SLOT`] (a reserved frame word) rather than on the stack.
+//! Everything unemitted returns
 //! [`JitError::Unsupported`], which the caller answers by interpreting — the
 //! interpreter is a complete implementation, so an unemitted instruction costs
 //! speed and not correctness. That is the property that makes it safe to grow
@@ -128,6 +129,21 @@ mod hr {
     /// address into it cannot be clobbering a BPF register — the same argument
     /// [`RCX`] rests on.
     pub const R11: u8 = 11;
+    /// The entry frame's `rsp`, for a program that uses an arena — an anchor to
+    /// the entry frame that survives a BPF-to-BPF call's `rsp` movement.
+    ///
+    /// Absent from [`super::REGS`] and otherwise unused, so claiming it costs no
+    /// BPF register — the one free host register the map leaves. The arena base
+    /// stays parked in the entry frame (see [`ARENA_BASE_SLOT`]); an access at
+    /// any call depth reaches it through `[r10 + slot]` rather than `[rsp + slot]`,
+    /// because a call moves `rsp` but not `r10`. And an arena fault or an
+    /// out-of-fuel exit reached from a subprogram resets `rsp` to `r10` before
+    /// unwinding, so the single entry-frame teardown is correct however deep the
+    /// fault was. Caller-saved, so a kfunc call clobbers it and
+    /// [`emit_kfunc_call`]'s arena wrapper saves and restores it; a BPF-to-BPF
+    /// call does not, because the callee is this crate's own emitted code, which
+    /// only ever reads `r10`.
+    pub const R10: u8 = 10;
     /// Scratch. Variable shifts require the count in `cl`, and `rcx` is
     /// deliberately absent from [`super::REGS`] so no BPF register can alias
     /// it — which is what makes moving a count into it unconditionally safe.
@@ -656,6 +672,82 @@ fn emit_atomic_fetch_bitwise(e: &mut Emit, wide: bool, opcode: u8, m: u8, disp: 
     mov_rr(e, wide, s, hr::R11); // src = old
 }
 
+/// A fetching bitwise atomic against the **arena** — `src = *m; *m op= src`.
+///
+/// The arena fault ABI holds `rcx` (the recovery handle) and `r11` (the
+/// effective address, in `m`), so the `cmpxchg` loop the certified-base form
+/// runs cannot be reused: it pushes `rax` and borrows `rcx`, both forbidden
+/// here. This form instead preserves R0 in [`ATOMIC_SPILL_SLOT`] (a reserved
+/// frame word, so no `rsp` movement and nothing the arena epilogue depends on
+/// is disturbed) and reuses `rcx` as the candidate register — legal because
+/// `rcx` is needed only up to the comparand load, the sole faulting access:
+/// once it proves the line mapped, no instruction below it can fault, so the
+/// handle is spent.
+///
+/// `op_rm` is the `op r/m, r` opcode (used against a register operand) and
+/// `op_r` the `op r, r/m` opcode (used against the spilled operand when
+/// `src` *is* R0, whose live value the comparand load would otherwise destroy).
+/// The caller has already parked the effective address in `r11`.
+fn emit_arena_atomic_fetch_bitwise(
+    e: &mut Emit,
+    wide: bool,
+    op_rm: u8,
+    op_r: u8,
+    src: u8,
+    src_is_r0: bool,
+) {
+    // mov [r10 + spill], rax — save R0 at full width, in the reserved entry-frame
+    // word (reached through the `r10` anchor, so it is the same slot at any call
+    // depth). When src is R0 this is also the operand, read back below.
+    e.rex(true, hr::RAX, hr::R10);
+    e.b(0x89);
+    e.modrm_mem(hr::RAX, hr::R10, ATOMIC_SPILL_SLOT);
+    // mov (e)ax, [r11] — the initial comparand, and the only faulting access.
+    // rcx still names the handle and rsp has not moved, so an out-of-bounds
+    // handle recovers through the arena epilogue exactly as a plain load does.
+    let fault_off = e.len();
+    e.rex(wide, hr::RAX, hr::R11);
+    e.b(0x8B);
+    e.modrm_mem(hr::RAX, hr::R11, 0);
+    // Past the load the line is mapped; nothing below faults, so rcx is free.
+    let retry = e.len();
+    mov_rr(e, wide, hr::RCX, hr::RAX); // candidate = old
+    if src_is_r0 {
+        // op (e)cx, [r10 + spill] — operand is the saved R0.
+        e.rex(wide, hr::RCX, hr::R10);
+        e.b(op_r);
+        e.modrm_mem(hr::RCX, hr::R10, ATOMIC_SPILL_SLOT);
+    } else {
+        // op (e)cx, src — candidate op= operand.
+        alu_rr(e, wide, op_rm, hr::RCX, src);
+    }
+    // lock cmpxchg [r11], rcx — stores the candidate and sets ZF on a match,
+    // else reloads rax with the current value and loops.
+    e.b(0xF0);
+    e.rex(wide, hr::RCX, hr::R11);
+    e.bs(&[0x0F, 0xB1]);
+    e.modrm_mem(hr::RCX, hr::R11, 0);
+    // jnz retry
+    e.b(0x75);
+    let back = retry as i64 - (e.len() as i64 + 1);
+    debug_assert!(
+        (-128..=127).contains(&back),
+        "arena cmpxchg loop out of rel8 reach"
+    );
+    e.b(back as i8 as u8);
+    // rax now holds the fetched old value.
+    if !src_is_r0 {
+        mov_rr(e, wide, src, hr::RAX); // src = old
+                                       // mov rax, [r10 + spill] — restore R0 at full width.
+        e.rex(true, hr::RAX, hr::R10);
+        e.b(0x8B);
+        e.modrm_mem(hr::RAX, hr::R10, ATOMIC_SPILL_SLOT);
+    }
+    // When src is R0, rax already holds the fetched value and is R0, so there is
+    // nothing to move or restore.
+    record_fault(e, fault_off);
+}
+
 const fn cond_cc(op: CondOp) -> u8 {
     match op {
         CondOp::Eq => 0x4,
@@ -687,18 +779,30 @@ const OOF_EPILOGUE: u32 = u32::MAX - 1;
 /// Reloc target for the arena-atomic natural-alignment failure path.
 const ARENA_UNALIGNED_EPILOGUE: u32 = u32::MAX - 2;
 
-/// Where the prologue parks the arena slot base, relative to `rsp`.
-///
-/// The [`STACK_ALIGN_PAD`] slot, reused rather than added to. A second 8-byte
-/// slot would move `rsp` by 64 instead of 56 across the prologue, which is
-/// `0 mod 16` again and would put the residue back where SysV does not want it —
-/// so a dedicated slot would have cost 16 bytes and a re-derivation of the
-/// alignment argument, for a value that is read at most once per arena access.
-///
-/// `rsp` does not move between the prologue and any access: a `call` pushes its
-/// return address *below* this slot and the callee's whole frame is below that,
-/// so the parked base survives a kfunc call untouched.
+/// Where the prologue parks the arena slot base, relative to the entry `rsp`
+/// (which [`hr::R10`] anchors). Reuses the [`STACK_ALIGN_PAD`] word the frame
+/// already claims; an arena access reloads it into `r11` through `r10`, so the
+/// parking offset is fixed while the addressing survives a call's `rsp` move.
 const ARENA_BASE_SLOT: i32 = 0;
+
+/// Where R0 is preserved across the `cmpxchg` loop a fetching bitwise arena
+/// atomic compiles to — x86 has no single-instruction atomic fetch-and/or/xor,
+/// and the loop needs `rax`, which holds R0, while the arena fault ABI already
+/// claims `rcx` (the recovery handle) and `r11` (the effective address), leaving
+/// no host register free to save R0 into.
+///
+/// Read only by [`emit_arena_atomic_fetch_bitwise`], and only reserved (via
+/// [`ATOMIC_SPILL_RESERVE`]) when [`needs_atomic_spill`] holds, so a program
+/// without that one instruction shape keeps the ordinary 8-byte frame.
+const ATOMIC_SPILL_SLOT: i32 = 8;
+
+/// The prologue's `rsp` reservation when [`ATOMIC_SPILL_SLOT`] is needed.
+///
+/// Still `≡ 8 (mod 16)` like [`STACK_ALIGN_PAD`], so the SysV call-alignment
+/// argument is untouched: adding a usable word costs 16 bytes (the word plus a
+/// word of alignment filler), because a bare 8-byte addition would flip the
+/// residue and misalign a `call` from the body.
+const ATOMIC_SPILL_RESERVE: i32 = STACK_ALIGN_PAD + 16;
 
 /// A branch whose target is a BPF instruction index, resolved once every
 /// instruction's offset is known.
@@ -794,7 +898,20 @@ fn emit_pass(
     // emitter cannot disagree — see [`crate::arena_access_map`].
     let arena = crate::arena_access_map(prog);
 
-    emit_prologue(&mut e, prog);
+    // The frame reservation, chosen once so the prologue and every epilogue
+    // agree on how much `rsp` to release. Widened only for the one instruction
+    // shape that needs a spill slot; see [`needs_atomic_spill`].
+    let reserve = if needs_atomic_spill(prog, &arena) {
+        ATOMIC_SPILL_RESERVE
+    } else {
+        STACK_ALIGN_PAD
+    };
+
+    // Whether the program touches an arena at all — if so the base is pinned in
+    // `r10` by the prologue and kfunc calls are wrapped to preserve it.
+    let uses_arena = arena.iter().any(|&a| a);
+
+    emit_prologue(&mut e, reserve, uses_arena);
 
     // Slot boundaries sorted by start, so the loop can track which subprogram
     // each instruction belongs to: a subprogram `exit` returns to its caller
@@ -835,6 +952,7 @@ fn emit_pass(
             &mut relocs,
             &prog.kfunc_calls,
             arena[i],
+            uses_arena,
             in_main,
             cur_stack,
             map_imm64,
@@ -852,13 +970,13 @@ fn emit_pass(
     }
     out.push(e.len());
 
-    emit_epilogue(&mut e);
+    emit_epilogue(&mut e, reserve);
     let oof_at = e.len();
-    emit_oof_epilogue(&mut e);
+    emit_oof_epilogue(&mut e, reserve, uses_arena);
     let arena_at = e.len();
-    emit_arena_epilogue(&mut e);
+    emit_arena_epilogue(&mut e, reserve, uses_arena);
     let arena_unaligned_at = e.len();
-    emit_arena_unaligned_epilogue(&mut e);
+    emit_arena_unaligned_epilogue(&mut e, reserve, uses_arena);
 
     // An arena fault site resumes at the arena epilogue, never at the next
     // instruction. Patched here, unconditionally, rather than recorded at the
@@ -932,13 +1050,45 @@ fn emit_rsp_adjust(e: &mut Emit, slash: u8, imm: i32) {
     e.b(imm as u8);
 }
 
+/// Whether the program contains a fetching bitwise atomic against the arena —
+/// the one lowering that needs [`ATOMIC_SPILL_SLOT`].
+///
+/// Scanned once, up front, because the reservation is baked into the prologue
+/// before any instruction is emitted. A decode error is reported as "no spill
+/// needed" here and surfaces as the same `JitError::Decode` when the body loop
+/// reaches it, so nothing is masked.
+fn needs_atomic_spill(prog: &VerifiedProgram, arena: &[bool]) -> bool {
+    let mut i = 0usize;
+    while i < prog.insns.len() {
+        let (insn, width) = match decode(&prog.insns, i) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        if arena.get(i).copied().unwrap_or(false)
+            && matches!(
+                insn,
+                Decoded::Atomic {
+                    op: AtomicOp::Or { fetch: true }
+                        | AtomicOp::And { fetch: true }
+                        | AtomicOp::Xor { fetch: true },
+                    ..
+                }
+            )
+        {
+            return true;
+        }
+        i += width;
+    }
+    false
+}
+
 /// `push rbx; push r13; push r14; push r15; mov rbp, rdi` and the fuel setup.
 ///
 /// R6..R9 map to callee-saved host registers, so they must be preserved for
 /// the caller. R10 (the BPF frame pointer) is loaded from the first argument:
 /// the runtime passes the frame top, so the same code works on the per-CPU
 /// region and on a sleepable program's heap stack without recompiling.
-fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
+fn emit_prologue(e: &mut Emit, reserve: i32, uses_arena: bool) {
     // `rbp` first, and it is not optional: R10 maps to rbp, so the body
     // overwrites it — and rbp is callee-saved in SysV. Omitting it destroyed
     // the *caller's* frame pointer on every invocation, which then misbehaved
@@ -950,16 +1100,23 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
         }
         e.b(0x50 | (r & 7));
     }
-    // `sub rsp, 8` — see [`STACK_ALIGN_PAD`]. Released by `emit_restore`.
-    emit_rsp_adjust(e, 5, STACK_ALIGN_PAD);
-    // Park the arena slot base (SysV arg 4, `rcx`) in that slot, **before**
-    // anything writes `rcx` — `emit_shift` and `emit_kfunc_call` both do. See
-    // [`ARENA_BASE_SLOT`]. Emitted unconditionally, for the same reason the pad
-    // itself is: one store per invocation is cheaper than two prologue shapes to
-    // reason about, and a program with no arena simply never reads it back.
-    e.rex(true, hr::RCX, hr::RSP);
-    e.b(0x89);
-    e.modrm_mem(hr::RCX, hr::RSP, ARENA_BASE_SLOT);
+    // `sub rsp, reserve` — [`STACK_ALIGN_PAD`], widened to [`ATOMIC_SPILL_RESERVE`]
+    // only when the program has a fetching bitwise arena atomic. Released by the
+    // matching `emit_restore`, which is passed the same `reserve`.
+    emit_rsp_adjust(e, 5, reserve);
+    // For an arena program: park the slot base (SysV arg 4, `rcx`) in the frame,
+    // **before** anything writes `rcx` — `emit_shift` and `emit_kfunc_call` both
+    // do — and anchor the entry `rsp` in `r10`, so an access at any call depth
+    // reaches the base and a fault epilogue can reset `rsp`. See [`hr::R10`]. A
+    // program without an arena leaves both instructions (and `r10`) out.
+    if uses_arena {
+        // mov [rsp + ARENA_BASE_SLOT], rcx
+        e.rex(true, hr::RCX, hr::RSP);
+        e.b(0x89);
+        e.modrm_mem(hr::RCX, hr::RSP, ARENA_BASE_SLOT);
+        // mov r10, rsp
+        mov_rr(e, true, hr::R10, hr::RSP);
+    }
     // r12 := rdx (fuel) **before** anything writes rdx, which R3 maps to.
     // Ordering matters for the same reason as the rdi/rsi pair below.
     mov_rr(e, true, hr::R12, hr::RDX);
@@ -970,27 +1127,42 @@ fn emit_prologue(e: &mut Emit, _prog: &VerifiedProgram) {
 }
 
 /// The normal epilogue: `rdx = 0` (fuel intact), restore, return.
-fn emit_epilogue(e: &mut Emit) {
+fn emit_epilogue(e: &mut Emit, reserve: i32) {
     // rdx is the high half of the 128-bit return — the exhaustion flag.
     // Zeroed here so a clean exit is unambiguous.
     e.rex(true, 0, hr::RDX);
     e.b(0x31);
     e.modrm_rr(hr::RDX, hr::RDX);
-    emit_restore(e);
+    emit_restore(e, reserve);
+}
+
+/// Reset `rsp` to the entry frame before unwinding, for an arena program.
+///
+/// The out-of-fuel and arena-fault epilogues are reachable from any call depth
+/// (a subprogram's fuel burn branches here; a subprogram's arena access faults
+/// into here through the exception table), and at that point `rsp` sits several
+/// frames deep. [`hr::R10`] anchors the entry `rsp`, so `mov rsp, r10` puts the
+/// single entry-frame teardown back on the frame it tears down. A non-arena
+/// program never sets `r10` and never reaches these from depth, so it skips it.
+fn emit_reset_rsp_to_anchor(e: &mut Emit, uses_arena: bool) {
+    if uses_arena {
+        mov_rr(e, true, hr::RSP, hr::R10); // mov rsp, r10
+    }
 }
 
 /// The out-of-fuel epilogue: `rdx = 1`, and `rax` is left as-is (meaningless).
-fn emit_oof_epilogue(e: &mut Emit) {
+fn emit_oof_epilogue(e: &mut Emit, reserve: i32, uses_arena: bool) {
+    emit_reset_rsp_to_anchor(e, uses_arena);
     mov_reg_imm64(e, hr::RDX, status::OUT_OF_FUEL as i64);
-    emit_restore(e);
+    emit_restore(e, reserve);
 }
 
 /// The arena-fault epilogue: `rdx = 2`, `rax = rcx` (the offending handle).
 ///
-/// Reached only through the exception table — nothing branches here — so the
-/// stack is exactly as the faulting instruction left it, which is the state
-/// [`emit_restore`] expects. That is the whole reason the fixup can be a plain
-/// resume address with no per-site stub: the body never moves `rsp`.
+/// Reached only through the exception table — nothing branches here. `rsp` is
+/// first reset to the entry frame ([`emit_reset_rsp_to_anchor`]), so the fault
+/// recovers correctly even when it happened inside a subprogram; then
+/// [`emit_restore`] unwinds the single entry frame.
 ///
 /// **Not** Linux's `ex_handler_bpf` shape, and deliberately. Zeroing the
 /// destination and resuming would make an out-of-bounds arena access *return a
@@ -998,23 +1170,25 @@ fn emit_oof_epilogue(e: &mut Emit) {
 /// with two verdicts, decided by whether it happened to clear `jit_glue`'s
 /// gates. `rcx` still holds the handle because [`emit_arena_addr`] folded the
 /// displacement into it, so the trap names the value instead of inferring it.
-fn emit_arena_epilogue(e: &mut Emit) {
+fn emit_arena_epilogue(e: &mut Emit, reserve: i32, uses_arena: bool) {
+    emit_reset_rsp_to_anchor(e, uses_arena);
     mov_rr(e, true, hr::RAX, hr::RCX);
     mov_reg_imm64(e, hr::RDX, status::ARENA_FAULT as i64);
-    emit_restore(e);
+    emit_restore(e, reserve);
 }
 
 /// The arena-atomic alignment failure: status 3 and the offending handle.
-fn emit_arena_unaligned_epilogue(e: &mut Emit) {
+fn emit_arena_unaligned_epilogue(e: &mut Emit, reserve: i32, uses_arena: bool) {
+    emit_reset_rsp_to_anchor(e, uses_arena);
     mov_rr(e, true, hr::RAX, hr::RCX);
     mov_reg_imm64(e, hr::RDX, status::ARENA_UNALIGNED as i64);
-    emit_restore(e);
+    emit_restore(e, reserve);
 }
 
-fn emit_restore(e: &mut Emit) {
-    // `add rsp, 8` — undo [`STACK_ALIGN_PAD`] before the pops, or every one of
-    // them would read the wrong slot.
-    emit_rsp_adjust(e, 0, STACK_ALIGN_PAD);
+fn emit_restore(e: &mut Emit, reserve: i32) {
+    // `add rsp, reserve` — undo the prologue's reservation before the pops, or
+    // every one of them would read the wrong slot. Must match `emit_prologue`.
+    emit_rsp_adjust(e, 0, reserve);
     for r in [hr::R15, hr::R14, hr::R13, hr::R12, hr::RBX, hr::RBP] {
         if r >= 8 {
             e.b(0x41);
@@ -1165,10 +1339,12 @@ fn emit_arena_addr(e: &mut Emit, handle: u8, off: i16) {
         handle != hr::RCX && handle != hr::R11,
         "the arena scratch registers must not be a BPF register"
     );
-    // mov r11, [rsp] — the slot base the prologue parked.
-    e.rex(true, hr::R11, hr::RSP);
+    // mov r11, [r10 + ARENA_BASE_SLOT] — the parked slot base, reached through
+    // the entry-`rsp` anchor rather than `rsp` directly, so a BPF-to-BPF call
+    // (which moves `rsp`) cannot make a callee's access read the wrong slot.
+    e.rex(true, hr::R11, hr::R10);
     e.b(0x8B);
-    e.modrm_mem(hr::R11, hr::RSP, ARENA_BASE_SLOT);
+    e.modrm_mem(hr::R11, hr::R10, ARENA_BASE_SLOT);
     // mov ecx, <handle>d. The 32-bit form zero-extends, which is what bounds
     // the index to `[0, 2^32)` in the bytes rather than by inheritance from the
     // verifier. See the module docs.
@@ -1441,6 +1617,7 @@ fn emit_insn(
     relocs: &mut Vec<Reloc>,
     calls: &[KfuncCallSite],
     arena: bool,
+    uses_arena: bool,
     in_main: bool,
     cur_stack: u32,
     map_imm64: &[(u32, u64)],
@@ -1499,30 +1676,40 @@ fn emit_insn(
                 src,
                 off,
             } => {
-                // Fetching bitwise operations need a cmpxchg retry loop whose
-                // current implementation moves rsp and borrows rcx. Both are
-                // reserved by the arena fault ABI, so that narrow residual
-                // continues to interpret until it gets a no-stack loop.
-                if matches!(
-                    op,
-                    AtomicOp::Or { fetch: true }
-                        | AtomicOp::And { fetch: true }
-                        | AtomicOp::Xor { fetch: true }
-                ) {
-                    return Err(JitError::Unsupported {
-                        at,
-                        what: "fetching bitwise arena atomic not yet emitted by x86_64",
-                    });
-                }
                 emit_arena_addr(e, host(dst), off);
                 emit_arena_atomic_align_check(e, at, size, relocs)?;
                 // Collapse `[slot_base + handle]` into r11 so the ordinary
                 // atomic emitter can use its one-base memory form. rcx remains
                 // untouched for either failure epilogue.
                 alu_rr(e, true, 0x01, hr::R11, hr::RCX);
-                let fault_off = e.len();
-                emit_atomic_mem(e, at, size, op, hr::R11, 0, host(src))?;
-                record_fault(e, fault_off);
+                // Fetching bitwise operations have no single x86 instruction and
+                // need a `cmpxchg` loop, which claims `rax` (R0) — preserved in
+                // [`ATOMIC_SPILL_SLOT`], since the arena fault ABI already holds
+                // `rcx` and `r11`. Every other form is the shared emitter.
+                if let AtomicOp::Or { fetch: true }
+                | AtomicOp::And { fetch: true }
+                | AtomicOp::Xor { fetch: true } = op
+                {
+                    let wide = size == Size::Dw;
+                    let (op_rm, op_r) = match op {
+                        AtomicOp::Or { .. } => (0x09u8, 0x0Bu8),
+                        AtomicOp::And { .. } => (0x21, 0x23),
+                        // The match arm proves this is the Xor case.
+                        _ => (0x31, 0x33),
+                    };
+                    emit_arena_atomic_fetch_bitwise(
+                        e,
+                        wide,
+                        op_rm,
+                        op_r,
+                        host(src),
+                        src.as_usize() == 0,
+                    );
+                } else {
+                    let fault_off = e.len();
+                    emit_atomic_mem(e, at, size, op, hr::R11, 0, host(src))?;
+                    record_fault(e, fault_off);
+                }
                 return Ok(());
             }
             _ => {
@@ -1536,7 +1723,26 @@ fn emit_insn(
     match *insn {
         Decoded::Call(CallTarget::Kfunc(id)) => {
             let site = resolve_call(calls, at, id)?;
+            // `r10` pins the arena base and is caller-saved, so a kfunc call
+            // would destroy it. Save it below `rsp` across the call and reload
+            // it after — 16 bytes so the `call` still sees `rsp % 16 == 0`, and
+            // balanced so nothing downstream sees `rsp` move. Only when the
+            // program uses an arena; otherwise `r10` holds nothing.
+            if uses_arena {
+                emit_rsp_adjust(e, 5, 16); // sub rsp, 16
+                                           // mov [rsp], r10
+                e.rex(true, hr::R10, hr::RSP);
+                e.b(0x89);
+                e.modrm_mem(hr::R10, hr::RSP, 0);
+            }
             emit_kfunc_call(e, site.addr);
+            if uses_arena {
+                // mov r10, [rsp]
+                e.rex(true, hr::R10, hr::RSP);
+                e.b(0x8B);
+                e.modrm_mem(hr::R10, hr::RSP, 0);
+                emit_rsp_adjust(e, 0, 16); // add rsp, 16
+            }
         }
 
         Decoded::Call(CallTarget::Subprog(rel)) => {
