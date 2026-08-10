@@ -2644,7 +2644,11 @@ fn smoke_bpf_xdp_adjust_tail_trims() -> TestResult {
     // The window shrinks with `data` unmoved, so the delivered length is the
     // original minus 4 and the delivered header bytes are unchanged.
     let mut items = alloc::vec::Vec::new();
-    items.extend_from_slice(&xdp_prove_14(4));
+    // The short-frame branch skips the five main-body instructions
+    // (mov/mov/call/mov/EXIT) to land on the short-frame PASS, which sets R0
+    // before its EXIT — a bare jump to the main EXIT would read an
+    // uninitialised R0 and the verifier would reject the load.
+    items.extend_from_slice(&xdp_prove_14(5));
     items.extend_from_slice(&[
         mov_reg(1, 6),
         mov_imm(2, -4),
@@ -2673,27 +2677,37 @@ kernel_test_in!("bpf", smoke_bpf_xdp_adjust_tail_trims);
 
 fn smoke_bpf_xdp_adjust_head_grows_within_headroom() -> TestResult {
     // A negative delta grows the head, prepending headroom: `data -= 32`. The
-    // staged buffer has 256 bytes of headroom, so this succeeds and the delivered
-    // window is 32 bytes longer. The program checks the kfunc returned 0.
+    // staged buffer has 256 bytes of headroom, so the kfunc succeeds (returns 0)
+    // rather than -ENOMEM — the branch below turns that into XDP_PASS. Delivery
+    // is bounded by the caller frame's capacity, so a grow beyond 64 bytes cannot
+    // lengthen this 64-byte frame; the observable effect is the *content* shift:
+    // the delivered window now begins 32 bytes earlier in the staged buffer, so
+    // its first 32 bytes are the zeroed prepended headroom and the original byte 0
+    // lands at offset 32.
     let insns = asm(&[
         mov_reg(6, 1),
         mov_reg(1, 6),
         mov_imm(2, -32),
-        call("bpf_xdp_adjust_head"), // r0 = 0 on success
-        // Return the kfunc's status directly (0 = success), then PASS is decided
-        // by the classifier only for a returned action — here the test reads the
-        // window length, so return 2 (PASS) after asserting success by branch.
-        jne_imm(0, 0, 1), // if status != 0, skip the PASS store (leave r0 nonzero)
-        mov_imm(0, 2),    // XDP_PASS
+        call("bpf_xdp_adjust_head"), // r0 = 0 on success, -ENOMEM otherwise
+        jne_imm(0, 0, 1),            // if status != 0, skip the PASS store (leave r0 nonzero)
+        mov_imm(0, 2),               // XDP_PASS
         EXIT,
     ]);
     let Ok(prog) = load_xdp("xdp-adj-grow", insns) else {
         return TestResult::Fail("load rejected an adjust_head grow program");
     };
     let mut frame = [0u8; 64];
+    frame[0] = 0xD7; // original byte 0 — must reappear at offset 32 after the grow
     match prog.run_xdp(&mut frame) {
-        Some((Outcome::Returned(2), len)) if len == 64 + 32 => {}
-        _ => return TestResult::Fail("adjust_head(-32) did not grow the window within headroom"),
+        // Success (PASS), delivered length capped at the caller frame's capacity.
+        Some((Outcome::Returned(2), len)) if len == 64 => {}
+        _ => return TestResult::Fail("adjust_head(-32) within headroom did not succeed"),
+    }
+    if frame[0] != 0 {
+        return TestResult::Fail("the grown head did not prepend zeroed headroom at offset 0");
+    }
+    if frame[32] != 0xD7 {
+        return TestResult::Fail("the grow did not shift the original byte 0 to offset 32");
     }
     TestResult::Pass
 }
