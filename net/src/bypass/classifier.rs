@@ -313,9 +313,10 @@ pub fn is_poll_mode(iface_name: &str) -> bool {
 /// bounds-checked against `data_end` by the verifier and again by the
 /// interpreter) and resize the frame (`bpf_xdp_adjust_head`/`_tail`). It returns
 /// `(action, len)`: the resulting packet is `frame[..len]`, which `XDP_TX` and
-/// `XDP_REDIRECT` retransmit — reflect out the ingress iface, or forward out a
-/// program-chosen one. What is *not* yet supported is `devmap`/`cpumap` fan-out
-/// (`BPF_F_BROADCAST`), which is deferred.
+/// `XDP_REDIRECT` retransmit — reflect out the ingress iface, forward out a
+/// program-chosen one (`bpf_redirect`/devmap), or deliver to the local stack
+/// (cpumap, see [`XdpAction::RedirectCpu`]). What is *not* yet supported is
+/// `BPF_F_BROADCAST` fan-out (one frame to many ports), which is deferred.
 pub trait XdpProgram: Send + Sync + 'static {
     /// A name, for diagnostics.
     fn name(&self) -> &str;
@@ -351,6 +352,12 @@ pub enum XdpAction {
     /// `ifindex`. The ifindex is the value a `bpf_redirect` kfunc stashed for
     /// this frame.
     Redirect { ifindex: u32 },
+    /// `XDP_REDIRECT` into a cpumap: deliver the (possibly-rewritten) frame to
+    /// CPU `cpu`'s network stack. NARF has one RX-processing context, so this
+    /// resolves to *local* delivery — the frame continues up the local stack,
+    /// exactly as `Pass` does — and `cpu` is carried for fidelity/diagnostics.
+    /// Cross-CPU steering is the documented degradation.
+    RedirectCpu { cpu: u32 },
 }
 
 type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
@@ -371,6 +378,11 @@ static XDP_TXS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 /// dropped in that case, matching Linux, where a redirect to a down/absent
 /// device is a drop.
 static XDP_TX_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program redirected into a cpumap. On NARF's single RX-processing
+/// context these are delivered to the local stack (the target CPU is us), so
+/// they are counted here rather than under `XDP_TXS`, which is retransmission
+/// out a device.
+static XDP_CPU_REDIRECTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Attach `prog` to `iface`, replacing any program already there.
 ///
@@ -429,6 +441,12 @@ pub fn count_xdp_tx_drop() {
     XDP_TX_DROPS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Frames a program redirected into a cpumap, delivered to the local stack.
+#[must_use]
+pub fn xdp_cpu_redirects() -> u64 {
+    XDP_CPU_REDIRECTS.load(Ordering::Relaxed)
+}
+
 /// Run the attached program, if any.
 ///
 /// **The program runs while `XDP_PROGS` is held**, and with interrupts masked
@@ -481,6 +499,9 @@ fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
         XdpAction::Tx | XdpAction::Redirect { .. } => {
             XDP_TXS.fetch_add(1, Ordering::Relaxed);
         }
+        XdpAction::RedirectCpu { .. } => {
+            XDP_CPU_REDIRECTS.fetch_add(1, Ordering::Relaxed);
+        }
         XdpAction::Pass => {}
     }
     // A resizing program can only deliver up to the caller frame's length; the
@@ -511,7 +532,10 @@ pub fn classify(iface_name: &str, frame: &mut [u8]) -> (Verdict, usize) {
         // the daemon/flow table or the kernel stack.
         (XdpAction::Tx, len) => return (Verdict::Transmit, len),
         (XdpAction::Redirect { ifindex }, len) => return (Verdict::Redirect { ifindex }, len),
-        (XdpAction::Pass, len) => len,
+        // A cpumap redirect delivers to the local stack — the running CPU is the
+        // only RX-processing context — so it continues down this function exactly
+        // as `Pass` does, over the possibly-resized `frame[..len]`.
+        (XdpAction::Pass | XdpAction::RedirectCpu { .. }, len) => len,
     };
     let packet = &frame[..len];
 

@@ -249,13 +249,21 @@ fn load_xdp(
     name: &str,
     insns: Vec<Insn>,
 ) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
+    load_xdp_with_maps(name, insns, alloc::vec::Vec::new())
+}
+
+fn load_xdp_with_maps(
+    name: &str,
+    insns: Vec<Insn>,
+    maps: alloc::vec::Vec<(i32, Arc<crate::map::BpfMap>)>,
+) -> Result<alloc::sync::Arc<BpfProg>, crate::prog::LoadError> {
     BpfProg::load_for_xdp(
         load_cap(),
         LoadRequest {
             name: alloc::string::String::from(name),
             insns,
             context: Context::Atomic,
-            maps: alloc::vec::Vec::new(),
+            maps,
             map_indices: alloc::vec::Vec::new(),
             load_references: alloc::vec::Vec::new(),
         },
@@ -2818,6 +2826,72 @@ fn smoke_bpf_xdp_redirect_carries_ifindex() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_xdp_redirect_carries_ifindex);
 
+fn smoke_bpf_xdp_redirect_map_kinds_reach_the_verdict() -> TestResult {
+    // The two `bpf_redirect_map` target kinds reach the attach-layer verdict
+    // distinctly: a devmap hit becomes `XdpAction::Redirect{ifindex}` (send out
+    // a NIC), a cpumap hit becomes `XdpAction::RedirectCpu{cpu}` (deliver to the
+    // local stack). The per-CPU redirect slot is kind-tagged, and `BpfXdp::run`
+    // decodes the tag — this proves the whole read-back path, not just the kfunc.
+    use narf_net::bypass::classifier::{XdpAction, XdpProgram};
+    let build = |flags: i32| {
+        asm(&[
+            ld_map_fd(1, SMOKE_MAP_FD),
+            mov_imm(2, 1), // key
+            mov_imm(3, flags),
+            call("bpf_redirect_map"),
+            EXIT,
+        ])
+    };
+
+    // Devmap: slot 1 → ifindex 9.
+    let dev = match mk(MapKind::DevMap, 4, 4, 4) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("DevMap create failed"),
+    };
+    if dev
+        .ops()
+        .update(&k32(1), &9u32.to_le_bytes(), BPF_ANY)
+        .is_err()
+    {
+        return TestResult::Fail("DevMap update rejected");
+    }
+    let Ok(dev_prog) =
+        load_xdp_with_maps("xdp-redir-dev", build(2), alloc::vec![(SMOKE_MAP_FD, dev)])
+    else {
+        return TestResult::Fail("load rejected a devmap bpf_redirect_map XDP program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(dev_prog, "rdm-dev");
+    match x.run("rdm-dev", &mut [0u8; 64]).0 {
+        XdpAction::Redirect { ifindex: 9 } => {}
+        _ => return TestResult::Fail("a devmap redirect did not reach Redirect{ifindex=9}"),
+    }
+
+    // Cpumap: CPU 1 enabled → local-delivery verdict carrying the CPU.
+    let cpu = match mk(MapKind::CpuMap, 4, 4, 4) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("CpuMap create failed"),
+    };
+    if cpu
+        .ops()
+        .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+        .is_err()
+    {
+        return TestResult::Fail("CpuMap update rejected");
+    }
+    let Ok(cpu_prog) =
+        load_xdp_with_maps("xdp-redir-cpu", build(2), alloc::vec![(SMOKE_MAP_FD, cpu)])
+    else {
+        return TestResult::Fail("load rejected a cpumap bpf_redirect_map XDP program");
+    };
+    let y = crate::attach_xdp::BpfXdp::for_test(cpu_prog, "rdm-cpu");
+    match y.run("rdm-cpu", &mut [0u8; 64]).0 {
+        XdpAction::RedirectCpu { cpu: 1 } => {}
+        _ => return TestResult::Fail("a cpumap redirect did not reach RedirectCpu{cpu=1}"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_redirect_map_kinds_reach_the_verdict);
+
 fn smoke_bpf_jit_fuel_covers_every_path() -> TestResult {
     // The risk fuel emission actually has: if a back-edge target is not a block
     // start, the loop bypasses the burn and runs forever. `block_starts` marks
@@ -4321,7 +4395,7 @@ fn smoke_bpf_devmap_shape_and_lookup() -> TestResult {
 kernel_test_in!("bpf", smoke_bpf_devmap_shape_and_lookup);
 
 fn smoke_bpf_redirect_map_arms_target() -> TestResult {
-    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target};
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target, RedirectTarget};
     checked(|| {
         // A devmap with ifindex 7 at slot 0; slot 1 left empty.
         let m = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
@@ -4360,7 +4434,7 @@ fn smoke_bpf_redirect_map_arms_target() -> TestResult {
                 Some(Outcome::Returned(4)) => {}
                 _ => return Err("a devmap hit did not return XDP_REDIRECT"),
             }
-            if take_xdp_redirect_target() != Some(7) {
+            if take_xdp_redirect_target() != Some(RedirectTarget::Iface(7)) {
                 return Err("a devmap hit did not arm the ifindex as the redirect target");
             }
         }
@@ -4386,6 +4460,107 @@ fn smoke_bpf_redirect_map_arms_target() -> TestResult {
     })
 }
 kernel_test_in!("bpf", smoke_bpf_redirect_map_arms_target);
+
+fn smoke_bpf_cpumap_shape_and_target() -> TestResult {
+    checked(|| {
+        // The Linux `BPF_MAP_TYPE_CPUMAP` number decodes to the cpumap kind, and
+        // its 4-byte value / 4-byte key shape is enforced like any array kind.
+        if MapKind::from_linux(16) != Some(MapKind::CpuMap) {
+            return Err("BPF_MAP_TYPE_CPUMAP did not decode to CpuMap");
+        }
+        if mk(MapKind::CpuMap, 4, 8, 4).is_ok() {
+            return Err("a cpumap with a non-4-byte value was accepted");
+        }
+        if mk(MapKind::CpuMap, 8, 4, 4).is_ok() {
+            return Err("a cpumap with a non-4-byte key was accepted");
+        }
+
+        let m = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        // An empty slot and a past-the-end key are both non-targets.
+        if m.cpumap_has_target(0) || m.cpumap_has_target(999) {
+            return Err("a fresh/out-of-range cpumap slot was a target");
+        }
+        // Enable CPU 1 (a non-zero qsize marker) and confirm only it is live.
+        m.ops()
+            .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        if !m.cpumap_has_target(1) {
+            return Err("an enabled cpumap slot was not a target");
+        }
+        if m.cpumap_has_target(0) || m.cpumap_has_target(2) {
+            return Err("a cpumap update leaked into a neighbour slot");
+        }
+        // A cpumap is not a devmap: devmap_lookup is always a miss on it.
+        if m.devmap_lookup(1).is_some() {
+            return Err("devmap_lookup treated a cpumap as a devmap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_cpumap_shape_and_target);
+
+fn smoke_bpf_redirect_map_cpumap_arms_local_delivery() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target, RedirectTarget};
+    checked(|| {
+        // A cpumap with CPU 1 enabled; CPU 2 left empty.
+        let m = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        m.ops()
+            .update(&k32(1), &64u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+
+        let build = |key: i32, flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, key),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // A hit on CPU 1 → XDP_REDIRECT (4) with the CPU armed as the target.
+        let hit = load_with_map("cpumap-hit", build(1, 2), &m)
+            .map_err(|_| "load rejected a cpumap bpf_redirect_map program")?;
+        if !hit.is_jited() {
+            return Err("a cpumap bpf_redirect_map program did not JIT");
+        }
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                hit.run_atomic_interpreted([0; 4], 4)
+            } else {
+                hit.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a cpumap hit did not return XDP_REDIRECT"),
+            }
+            if take_xdp_redirect_target() != Some(RedirectTarget::Cpu(1)) {
+                return Err("a cpumap hit did not arm the CPU as the redirect target");
+            }
+        }
+
+        // A miss on the empty CPU 2 → the fallback action (XDP_PASS), no target.
+        let miss = load_with_map("cpumap-miss", build(2, 2), &m).map_err(|_| "load rejected")?;
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                miss.run_atomic_interpreted([0; 4], 4)
+            } else {
+                miss.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(2)) => {}
+                _ => return Err("a cpumap miss did not return the fallback action"),
+            }
+            if take_xdp_redirect_target().is_some() {
+                return Err("a cpumap miss armed a redirect target anyway");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_cpumap_arms_local_delivery);
 
 fn smoke_bpf_map_kfunc_wrong_buffer_width_is_einval() -> TestResult {
     checked(|| {

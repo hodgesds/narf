@@ -9,60 +9,97 @@
 //! Invariant §4.6 applies to every one of them: no global allocator, no
 //! `alloc_frame`, no lock a caller might already hold.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
 
 use crate::types::{fnv1a32_nonzero, TraceFieldOffset, TraceSource};
 
+/// A pending XDP redirect target armed by `bpf_redirect`/`bpf_redirect_map`.
+///
+/// The kind the frame's `XDP_REDIRECT` (4) return resolves to: send out an
+/// interface, or deliver to a CPU's stack. The classifier reads it back through
+/// [`take_xdp_redirect_target`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RedirectTarget {
+    /// Send the frame out this interface index — `bpf_redirect(ifindex)` or a
+    /// devmap `bpf_redirect_map`.
+    Iface(u32),
+    /// Deliver the frame to CPU `cpu`'s network stack — a cpumap
+    /// `bpf_redirect_map`. On NARF's single RX-processing context this resolves
+    /// to *local* delivery (the running CPU); the cross-CPU steering Linux does
+    /// is the documented degradation. The value is carried for fidelity and
+    /// diagnostics.
+    Cpu(u32),
+}
+
+/// Encode a [`RedirectTarget`] into the per-CPU slot word. Kind in the high 32
+/// bits (always ≥ 1 for a live request, so the whole word is non-zero even when
+/// the value is 0), value in the low 32.
+const REDIRECT_KIND_IFACE: u64 = 1;
+const REDIRECT_KIND_CPU: u64 = 2;
+
 /// XDP redirect target, one slot per CPU.
 ///
-/// `bpf_redirect` has no writable context word to convey the target ifindex
-/// through — the XDP frame is read-only (see `attach_xdp.rs`). Instead it
-/// stashes the ifindex here and the classifier reads it back when the program
-/// returns `XDP_REDIRECT` (4). A per-CPU slot rather than one global cell
-/// because an XDP program runs with IRQs masked (`run_xdp` holds `XDP_PROGS`,
-/// an `IrqSafeSpinLock`), so between the `bpf_redirect` call and the
-/// classifier's read the running CPU cannot change and no other frame on this
-/// CPU can overwrite the slot. `+1` biasing distinguishes "no redirect
-/// requested" (0) from "redirect to ifindex 0"; the classifier only consults
+/// `bpf_redirect`/`bpf_redirect_map` have no writable context word to convey the
+/// target through — the XDP context is synthetic (see `attach_xdp.rs`). Instead
+/// they stash the target here and the classifier reads it back when the program
+/// returns `XDP_REDIRECT` (4). A per-CPU slot rather than one global cell because
+/// an XDP program runs with IRQs masked (`run_xdp` holds `XDP_PROGS`, an
+/// `IrqSafeSpinLock`), so between the arming call and the classifier's read the
+/// running CPU cannot change and no other frame on this CPU can overwrite the
+/// slot. A zero word means "no redirect requested"; the classifier only consults
 /// the slot on a return of 4, so a stale value from a prior frame is never
-/// mistaken for a live request.
-static XDP_REDIRECT_TARGET: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+/// mistaken for a live request. The non-zero kind tag in the high bits is what
+/// keeps a target of value 0 (ifindex 0, CPU 0) distinct from that sentinel.
+static XDP_REDIRECT_TARGET: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Read and clear the current CPU's pending XDP redirect target.
 ///
-/// Returns the ifindex a `bpf_redirect` on this CPU stashed, or `None` if the
-/// program requested no redirect. Called by the classifier immediately after
-/// an XDP program returns 4, on the same CPU with IRQs still masked, so the
-/// read pairs with the store the program made a few instructions earlier.
+/// Returns the target a `bpf_redirect`/`bpf_redirect_map` on this CPU stashed,
+/// or `None` if the program requested no redirect. Called by the classifier
+/// immediately after an XDP program returns 4, on the same CPU with IRQs still
+/// masked, so the read pairs with the store the program made a few instructions
+/// earlier.
 #[must_use]
-pub fn take_xdp_redirect_target() -> Option<u32> {
-    let slot = &XDP_REDIRECT_TARGET[current_cpu()];
-    match slot.swap(0, Ordering::Relaxed) {
-        0 => None,
-        biased => Some(biased - 1),
+pub fn take_xdp_redirect_target() -> Option<RedirectTarget> {
+    let word = XDP_REDIRECT_TARGET[current_cpu()].swap(0, Ordering::Relaxed);
+    let value = word as u32;
+    match word >> 32 {
+        REDIRECT_KIND_IFACE => Some(RedirectTarget::Iface(value)),
+        REDIRECT_KIND_CPU => Some(RedirectTarget::Cpu(value)),
+        // 0 (no request) — or an impossible tag, which we fail closed on.
+        _ => None,
     }
 }
 
 /// Drop any stale redirect target on the current CPU.
 ///
-/// Called before running an XDP program so a `bpf_redirect` from a *previous*
+/// Called before running an XDP program so an arming call from a *previous*
 /// frame that then returned a non-redirect action cannot leak into this one.
 pub fn clear_xdp_redirect_target() {
     XDP_REDIRECT_TARGET[current_cpu()].store(0, Ordering::Relaxed);
 }
 
-/// Record `ifindex` as this CPU's pending XDP redirect target.
-///
-/// The shared write both [`bpf_redirect`] and `bpf_redirect_map` make: it
-/// `+1`-biases the value so a real ifindex of 0 stays distinct from the "no
-/// request" sentinel [`clear_xdp_redirect_target`] leaves, and
-/// [`take_xdp_redirect_target`] un-biases on read. Called on the same CPU with
-/// IRQs masked (the caller holds `XDP_PROGS`), so the store pairs with the
+/// Arm interface `ifindex` as this CPU's pending redirect target — the write
+/// [`bpf_redirect`] and a devmap `bpf_redirect_map` make. Called on the same CPU
+/// with IRQs masked (the caller holds `XDP_PROGS`), so the store pairs with the
 /// classifier's read a few instructions later.
-pub fn set_xdp_redirect_target(ifindex: u32) {
-    XDP_REDIRECT_TARGET[current_cpu()].store(ifindex.wrapping_add(1), Ordering::Relaxed);
+pub fn set_xdp_redirect_iface(ifindex: u32) {
+    XDP_REDIRECT_TARGET[current_cpu()].store(
+        (REDIRECT_KIND_IFACE << 32) | u64::from(ifindex),
+        Ordering::Relaxed,
+    );
+}
+
+/// Arm CPU `cpu` as this CPU's pending redirect target — the write a cpumap
+/// `bpf_redirect_map` makes. Same slot and same masking discipline as
+/// [`set_xdp_redirect_iface`].
+pub fn set_xdp_redirect_cpu(cpu: u32) {
+    XDP_REDIRECT_TARGET[current_cpu()].store(
+        (REDIRECT_KIND_CPU << 32) | u64::from(cpu),
+        Ordering::Relaxed,
+    );
 }
 
 /// The kfunc id of `bpf_xdp_adjust_head`, for the interpreter's interception
@@ -155,7 +192,7 @@ crate::kfunc! {
     /// `bpf_redirect_map` (see `crate::map`).
     #[context(Atomic)]
     pub fn bpf_redirect(ifindex: u32, _flags: u64) -> u64 {
-        set_xdp_redirect_target(ifindex);
+        set_xdp_redirect_iface(ifindex);
         // XDP_REDIRECT.
         4
     }

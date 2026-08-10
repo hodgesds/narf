@@ -54,13 +54,17 @@ Landed:
   `PASS`/`DROP`/`ABORTED` plus `TX` and `REDIRECT` as retransmission of the
   *possibly-modified, possibly-resized* frame — `TX` reflects out the ingress
   iface, `REDIRECT` sends out the iface named by a `bpf_redirect(ifindex)` kfunc
-  or by a `bpf_redirect_map(devmap, key, flags)` lookup into a
-  `BPF_MAP_TYPE_DEVMAP` (a dense `u32`-keyed table of ifindexes) — a hit arms the
-  looked-up ifindex and returns `REDIRECT`, a miss returns the program's `flags`
-  fallback action. `bpf_redirect_map` is an ordinary shim the JIT lowers natively
-  (the map handle is a real address on both backends), not an interpreter
-  intrinsic. `BPF_F_BROADCAST` devmap *fan-out* (one frame to many ports) and
-  `cpumap` remain a follow-on.
+  or by a `bpf_redirect_map(map, key, flags)` lookup. That helper serves both
+  redirect map kinds: a `BPF_MAP_TYPE_DEVMAP` (a dense `u32`-keyed table of
+  ifindexes) arms the looked-up ifindex and sends the frame out that NIC, and a
+  `BPF_MAP_TYPE_CPUMAP` (keyed by target CPU) arms that CPU and delivers the
+  frame to its stack — which on NARF's single RX-processing context is *local*
+  delivery, the documented degradation of Linux's cross-CPU steering. A hit
+  returns `REDIRECT`; a miss (empty slot, out-of-range key), a non-redirect map,
+  or an out-of-range `flags` returns the program's `flags` fallback action.
+  `bpf_redirect_map` is an ordinary shim the JIT lowers natively (the map handle
+  is a real address on both backends), not an interpreter intrinsic. What remains
+  a follow-on is `BPF_F_BROADCAST` *fan-out* (one frame to many ports).
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with

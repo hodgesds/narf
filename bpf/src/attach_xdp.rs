@@ -111,7 +111,14 @@ impl XdpProgram for BpfXdp {
                     // matching Linux, where `XDP_REDIRECT` without a prior helper
                     // that primed the redirect info is dropped as an error.
                     4 => match crate::kfuncs::take_xdp_redirect_target() {
-                        Some(ifindex) => XdpAction::Redirect { ifindex },
+                        Some(crate::kfuncs::RedirectTarget::Iface(ifindex)) => {
+                            XdpAction::Redirect { ifindex }
+                        }
+                        // A cpumap redirect: deliver to the CPU's stack, which on
+                        // NARF's single RX-processing context is local delivery.
+                        Some(crate::kfuncs::RedirectTarget::Cpu(cpu)) => {
+                            XdpAction::RedirectCpu { cpu }
+                        }
                         None => XdpAction::Aborted,
                     },
                     // Any other *returned* value is a program bug. Linux treats
