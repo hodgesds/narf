@@ -1042,7 +1042,7 @@ impl FileOps for DevFuse {
         Box::pin(async move {
             match self.conn.read_request(buf)? {
                 Some(n) => Ok(n),
-                None => Ok(0),
+                None => Err(FsError::WouldBlock),
             }
         })
     }
@@ -1086,11 +1086,6 @@ impl FileOps for DevFuse {
             ev |= POLL_IN;
         }
         ev
-    }
-
-    fn read_should_block(&self) -> bool {
-        // A daemon read with no queued request should park, not EOF.
-        !self.conn.has_request()
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {

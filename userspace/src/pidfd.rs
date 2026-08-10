@@ -85,6 +85,35 @@ pub fn mint_for(pid: u64, assume_alive: bool) -> Arc<PidFdState> {
     st
 }
 
+/// Drop the pid→state row so a FUTURE `mint_for` on this pid number
+/// starts fresh. Called from `release_pid`, i.e. the moment the number
+/// goes back to the allocation pool.
+///
+/// The table is a cache keyed by a REUSABLE name. Without this
+/// invalidation it hands a recycled pid the previous occupant's
+/// `PidFdState` — already `exited = true` — so the new process's pidfd is
+/// born readable. NARF hands out the LOWEST free pid, so the recycled
+/// number is the one most recently freed and the stale row is the one
+/// most likely to still be there.
+///
+/// What that cost: Qt's `forkfd` watches a child through its pidfd and,
+/// on POLLIN, calls `waitid(P_PIDFD, ., WEXITED)` with NO `WNOHANG` to
+/// collect the status. A pidfd that is readable while the child is alive
+/// turns that collection into an unbounded block — kwin's main thread sat
+/// in `wait4` on a live `plasma-keyboard`, never reached its Wayland
+/// event loop, and every client's `connect()` to wayland-0 went
+/// unaccepted.
+///
+/// Existing `Arc` holders are deliberately untouched: a pidfd opened
+/// against the OLD process must keep reporting that process's exit. Only
+/// the lookup path for new mints is invalidated.
+pub fn forget_pid(pid: u64) {
+    let mut g = PIDFD_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&pid);
+    }
+}
+
 /// Called by `on_child_exit(pid)` — flip the exited flag on any
 /// minted state so future `poll_readiness` returns POLLIN.
 ///

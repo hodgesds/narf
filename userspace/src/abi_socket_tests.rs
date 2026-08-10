@@ -529,8 +529,8 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_neg);
 // or recv on an empty-but-OPEN stream socket returned 0 (which the caller
 // reads as EOF / peer-hangup) instead of -EAGAIN. GLib's GDBus/GSocket poll
 // loop treated that phantom 0 as a hangup and the KDE session-bus handshake
-// (and libdbus's next marshalled message) desynced. `read_should_block()` is
-// true exactly while the peer is still open, so EOF (peer closed) stays 0.
+// (and libdbus's next marshalled message) desynced. The file op now returns
+// `WouldBlock` while the peer is open, so EOF (peer closed) stays 0.
 const SOCK_NONBLOCK: u64 = 0x800;
 const MSG_DONTWAIT: u64 = 0x40;
 
@@ -782,6 +782,259 @@ fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_read_eof_after_peer_shutdown
+);
+
+/// A server parked in `ppoll`/`epoll_wait` with an INFINITE timeout on a
+/// LISTENING AF_UNIX socket must wake within bounded time of a peer's
+/// `connect()` (a compositor's wayland-0 listener is exactly this shape).
+/// The park machinery (`park_should_block` + the readiness-generation
+/// lost-wake guard + the ~10 ms backstop) already bounds the re-scan for
+/// any event source that (a) publishes a readiness notify and (b) reports
+/// POLLIN when the re-executed scan asks again. This pins BOTH halves for
+/// the listen/accept side — the data side's equivalents are the shutdown
+/// generation check above and the eventfd `readiness_notifies` test in
+/// `tests/fd_io.rs`:
+///   1. `connect()` must bump the readiness generation (the wake channel
+///      that breaks an infinite park out of its re-park loop), and
+///   2. the same poll scan a parked poller re-executes on wake must flip
+///      the listener 0 → POLLIN once a connection is pending.
+///
+/// Either half regressing re-opens the "listener never accepts / accepts
+/// only on an unrelated wake" class (weston no-serve).
+fn smoke_abi_socket_unix_listener_connect_wakes_parked_poller() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-listener-wake");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+
+        // pollfd { fd: srv, events: POLLIN(0x1), revents: 0 } — 8 bytes.
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&(srv as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&0x1u16.to_ne_bytes());
+        // Negative half: an idle listener must NOT report POLLIN — a false
+        // positive here would make the parked server spin accept/EAGAIN.
+        if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("idle listener reported ready before any connect");
+        }
+
+        let before = narf_net::readiness::generation();
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("client connect failed");
+        }
+        // Half 1: the wake channel. Without this bump a poller parked with
+        // an infinite timeout only ever re-scans off the 10 ms backstop —
+        // and before that backstop existed, never.
+        if narf_net::readiness::generation() <= before {
+            return Err("connect() did not publish a readiness wake for a parked listener");
+        }
+        // Half 2: the re-scan's answer. poll(timeout=0) runs the same
+        // `poll_scan` a woken parked poller re-executes.
+        pfd[6..8].copy_from_slice(&0u16.to_ne_bytes()); // clear revents
+        match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+            Some(1) if u16::from_ne_bytes(pfd[6..8].try_into().unwrap()) & 0x1 != 0 => {}
+            _ => return Err("pending connection did not make the listener POLLIN"),
+        }
+        // And the accept the woken server then issues must deliver it.
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept() after the poll wake did not return a connection fd");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_listener_connect_wakes_parked_poller
+);
+
+/// A listening AF_UNIX socket watched through an epoll fd that is ITSELF
+/// polled — libwayland's shape. `wl_event_loop` owns an epoll containing
+/// the display socket and hands its fd to the toolkit's main loop, which
+/// `poll(2)`s it alongside everything else. So a client's `connect()` has
+/// to travel: listener → epoll ready-list → the outer `poll` over the
+/// epoll fd. A break anywhere on that chain looks identical from outside
+/// — the compositor simply never accepts.
+///
+/// Covers both trigger modes deliberately. Level-triggered is a plain
+/// "is the ready list non-empty" query; EPOLLET adds the edge bookkeeping
+/// (`last_mask` / `poll_edge_token`) that `EpollInstance::poll_readiness`
+/// has to mirror from `collect_ready`, and a listener's edge comes from
+/// `listener_readable_token`, which only the enqueue in `connect()`
+/// advances.
+fn smoke_abi_socket_listener_readable_through_nested_epoll() -> TestResult {
+    with_setup(|| {
+        for (label, et) in [("level", 0u32), ("edge", crate::epoll::EPOLLET)] {
+            let srv = open_unix_stream()?;
+            let (addr, alen) = unix_sockaddr(if et == 0 {
+                b"/abi-nested-epoll-lvl"
+            } else {
+                b"/abi-nested-epoll-et"
+            });
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(srv, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err("listener bind failed");
+            }
+            if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+                return Err("listen failed");
+            }
+
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+            if epfd < 0 {
+                return Err("epoll_create failed");
+            }
+            let epfd = epfd as u64;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&(1u32 | et).to_ne_bytes()); // EPOLLIN [| EPOLLET]
+            interest[4..].copy_from_slice(&0x4C49_5354u64.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd, 1, srv, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl ADD of the listener failed");
+            }
+
+            // pollfd { fd: epfd, events: POLLIN, revents: 0 }.
+            let mut pfd = [0u8; 8];
+            pfd[0..4].copy_from_slice(&(epfd as i32).to_ne_bytes());
+            pfd[4..6].copy_from_slice(&0x1u16.to_ne_bytes());
+
+            // Negative half: an idle listener must not make the epoll fd
+            // readable, or the outer loop spins on an epoll_wait that
+            // returns nothing.
+            if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+                return Err("idle listener made the nested epoll fd readable");
+            }
+
+            let cli = open_unix_stream()?;
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(cli, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("connect status")?
+                != 0
+            {
+                return Err("client connect failed");
+            }
+
+            // The epoll fd must now be POLLIN to an outer poll(2)...
+            pfd[6..8].copy_from_slice(&0u16.to_ne_bytes());
+            match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+                Some(1) if u16::from_ne_bytes(pfd[6..8].try_into().unwrap()) & 0x1 != 0 => {}
+                _ => {
+                    return Err(if et == 0 {
+                        "pending connection did not make the nested epoll fd POLLIN (level)"
+                    } else {
+                        "pending connection did not make the nested epoll fd POLLIN (edge)"
+                    })
+                }
+            }
+            // ...and the epoll_wait the woken loop then runs must agree.
+            // Disagreement here is worse than a miss: the outer poll returns
+            // ready, epoll_wait returns nothing, and the loop spins hot.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err(if et == 0 {
+                    "outer poll said ready but epoll_wait delivered no event (level)"
+                } else {
+                    "outer poll said ready but epoll_wait delivered no event (edge)"
+                });
+            }
+            // And the accept it then issues must produce the connection.
+            let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+            if conn < 0 {
+                return Err("accept after the nested-epoll wake returned no connection");
+            }
+            let _ = label;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_listener_readable_through_nested_epoll
+);
+
+/// A task parked in `epoll_wait` with an INFINITE timeout on a CONNECTED
+/// AF_UNIX socketpair must wake when its peer sends.
+///
+/// This is the shape a udev worker sits in: `epoll_wait(-1)` on its worker
+/// socket, waiting for udevd to hand it a device event. Measured on a real
+/// boot, those workers park with `checks` CLIMBING — the park re-fires and
+/// the scan re-runs — and still never see a message, until udevd is stuck
+/// at "18 children at max", `/run/udev/data` stays empty, no device gets a
+/// `seat` tag, and libinput enumerates nothing.
+///
+/// The neighbouring `..._epoll_level_redelivers_partial_read` covers the
+/// SCAN (`epoll_wait` with timeout 0, asking "is it ready now"). It cannot
+/// catch a missing wake, because a fresh scan finds the data whether or not
+/// anything was ever notified. Both halves are asserted here for the same
+/// reason they are on the listener test:
+///   1. `send()` must bump the readiness generation — the channel that
+///      breaks an infinite park out of its re-park loop.
+///   2. the re-executed scan must then report the fd ready.
+///
+/// Half 1 failing is invisible to every timeout-0 epoll test in the file.
+fn smoke_abi_socket_connected_pair_send_wakes_parked_epoll() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let epfd = add_level_epollin(rx)?;
+
+        // Negative half: an idle pair must not report ready, or a parked
+        // worker degenerates into a read/EAGAIN spin.
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("idle socketpair reported epoll-ready before any send");
+        }
+
+        let before = narf_net::readiness::generation();
+        let wire = b"udev-device-event";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(tx, wire.as_ptr() as u64, wire.len() as u64, 0),
+        ) != Some(wire.len() as i64)
+        {
+            return Err("send on the connected pair failed");
+        }
+
+        // Half 1: the wake channel. Without this bump a peer parked in
+        // `epoll_wait(-1)` only ever re-scans off the lost-wake backstop —
+        // which is exactly the "checks climbing, nothing ever ready" shape
+        // the udev workers show.
+        if narf_net::readiness::generation() <= before {
+            return Err("send() published no readiness wake for a parked epoll waiter");
+        }
+        // Half 2: the scan a woken waiter re-executes must see the data.
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("sent bytes did not make the connected pair epoll-readable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connected_pair_send_wakes_parked_epoll
 );
 
 // ─────────────────────────── SocketShutdown ───────────────────────────

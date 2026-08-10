@@ -711,10 +711,10 @@ fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
 kernel_test_in!("filesystem", smoke_filesystem_fifo_rdwr_round_trip);
 
 /// EOF: once the last writer handle is dropped, a reader at an empty buffer
-/// reads 0 (end-of-file), and `read_should_block` reports false (don't park).
+/// reads 0; while a writer remains, it returns `WouldBlock`.
 fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
     use crate::fifo::FifoNode;
-    use crate::FileOps;
+    use crate::{FileOps, FsError};
     use alloc::sync::Arc;
 
     let node = FifoNode::new(0x2000, 0o666);
@@ -730,17 +730,17 @@ fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
         true,
     ));
 
-    // Writer open + empty buffer ⇒ the read must PARK (block), not EOF.
-    if !reader.read_should_block() {
-        return TestResult::Fail("empty FIFO with open writer should block");
+    // Writer open + empty buffer ⇒ would-block, not EOF.
+    let mut buf = [0u8; 8];
+    if !matches!(
+        fifo_poll_once(reader.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("empty FIFO with open writer did not report would-block");
     }
 
     // Drop the last writer: now an empty read is genuine EOF.
     drop(writer);
-    if reader.read_should_block() {
-        return TestResult::Fail("empty FIFO with no writer must not block (EOF)");
-    }
-    let mut buf = [0u8; 8];
     match fifo_poll_once(reader.read(0, &mut buf)) {
         Some(Ok(0)) => TestResult::Pass,
         _ => TestResult::Fail("closed-writer FIFO read did not report EOF (0)"),
@@ -1197,14 +1197,13 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
         return TestResult::Fail("translation produced unexpected bytes");
     }
 
-    // Second read with empty ring returns 0 (non-blocking).
+    // An empty console is an interrupt-driven blocking source, not EOF.
+    // Direct FileOps callers observe the explicit WouldBlock result; the
+    // syscall layer converts it to a parked read or O_NONBLOCK/EAGAIN.
     let mut buf = [0u8; 4];
-    let n = match poll_once(console.read(0, &mut buf)) {
-        Some(Ok(n)) => n,
-        _ => return TestResult::Fail("second /dev/console read returned Pending or Err"),
-    };
-    if n != 0 {
-        return TestResult::Fail("empty ring should return 0 bytes");
+    match poll_once(console.read(0, &mut buf)) {
+        Some(Err(crate::FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("empty console read should return WouldBlock"),
     }
     TestResult::Pass
 }
@@ -1979,6 +1978,118 @@ fn smoke_dev_input_dir_enumerate_finds_event0() -> TestResult {
 kernel_test_in!(
     "filesystem/devfs_input",
     smoke_dev_input_dir_enumerate_finds_event0
+);
+
+/// A chown/chmod on an evdev node must OUTLIVE the fd that made it.
+///
+/// udev applies `GROUP="input", MODE="0660"` to every `/dev/input/event*`
+/// (50-udev-default.rules). `InputEventFile` implemented neither setter, so
+/// the trait defaults returned `Unsupported` and udev logged, once its event
+/// loop finally survived long enough to get here:
+///
+/// ```text
+/// event1: Failed to set owner/mode of /dev/input/event1 to uid=0, gid=104,
+///         mode=0660: Operation not supported
+/// ```
+///
+/// The node then stayed root:root. That reads as cosmetic because the mode was
+/// already 0660 — but 0660 root:root cannot be opened by a compositor running
+/// as uid 1000, which is the same failure shape that supplementary-group DAC
+/// support was added for on the DRM nodes.
+///
+/// The assertion is deliberately made through a SECOND, freshly-opened handle:
+/// every `open()` builds a new `InputEventFile`, so state kept on the instance
+/// would pass a same-handle read-back while still being useless to the next
+/// opener. This is the property that forced a shared node table.
+fn smoke_dev_input_chown_persists_across_reopen() -> TestResult {
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    const GID_INPUT: u32 = 104;
+    let (id, _node) = ROUTER.register_device(DeviceCaps::new());
+    let first = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None for live device");
+        }
+    };
+
+    // Boot default: root:root, 0660 — what Linux's evdev creates before udev.
+    let mut fail: Option<&'static str> = None;
+    if first.owners() != (0, 0) {
+        fail = Some("a fresh evdev node did not start out root-owned");
+    }
+    if fail.is_none() && first.stat().mode.perms != 0o660 {
+        fail = Some("a fresh evdev node did not start at mode 0660");
+    }
+
+    // What udev does.
+    if fail.is_none() {
+        if poll_once_devfs_input(first.set_owners(0, GID_INPUT)).is_none() {
+            fail = Some("set_owners returned Pending");
+        } else if poll_once_devfs_input(first.set_perms(0o660)).is_none() {
+            fail = Some("set_perms returned Pending");
+        }
+    }
+    // udev closes its fd; the compositor opens its own later.
+    drop(first);
+
+    if fail.is_none() {
+        match InputEventFile::open(id, DeviceKind::Hardware) {
+            Some(second) => {
+                if second.owners() != (0, GID_INPUT) {
+                    fail = Some("chown did not survive reopen — a later opener sees root:root");
+                } else if second.stat().mode.perms != 0o660 {
+                    fail = Some("mode did not survive reopen");
+                }
+            }
+            None => fail = Some("reopen returned None for live device"),
+        }
+    }
+
+    ROUTER.unregister_device(id);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_chown_persists_across_reopen
+);
+
+/// `EVDEV_NODE_META` keys ownership by event number and never removes
+/// entries. That is only safe because `ROUTER.register_device` allocates ids
+/// monotonically (`next_id += 1`) and never recycles them after an
+/// unregister — so a replugged device gets a FRESH node rather than
+/// inheriting the previous occupant's uid/gid.
+///
+/// That invariant lives in another crate (`narf-input`), where a future
+/// free-list or id-reuse optimisation would silently hand a new device the
+/// old one's permissions — a comment in this file would keep looking correct
+/// while being wrong. Pin it here instead.
+fn smoke_evdev_device_ids_are_never_recycled() -> TestResult {
+    use narf_input::evdev::{DeviceCaps, ROUTER};
+
+    let (first, _n1) = ROUTER.register_device(DeviceCaps::new());
+    ROUTER.unregister_device(first);
+    let (second, _n2) = ROUTER.register_device(DeviceCaps::new());
+    ROUTER.unregister_device(second);
+
+    if second == first {
+        // Reusing the id would make a fresh device inherit the previous
+        // node's ownership out of EVDEV_NODE_META.
+        return TestResult::Fail(
+            "device id was recycled after unregister — evdev node ownership can leak between devices",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_evdev_device_ids_are_never_recycled
 );
 
 /// 2. InputEventFile read with empty ring + zero-size buf → 0 bytes (non-blocking).
@@ -5618,3 +5729,42 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);
+
+/// An empty `/dev/uinput` read must NOT report end-of-file.
+///
+/// `read() == 0` on a character device means the device hung up. The control
+/// file previously returned `Ok(0)` unconditionally, with a comment calling
+/// EOF "the safe answer" — it is the opposite. A reader takes it as the
+/// device going away and tears it down.
+///
+/// Linux's uinput read drains pending force-feedback requests; with none
+/// pending it BLOCKS, or returns EAGAIN on an O_NONBLOCK fd. It returns 0
+/// only at a real hangup.
+///
+/// This is the third instance of this bug class in this tree: PtyMaster::read
+/// returning 0 on an empty ring left the `foot` terminal blank (the terminal
+/// concluded its shell had exited), and the same phantom 0 on a pipe broke
+/// GLib's dbus line-read ("Unexpected lack of content trying to read a
+/// line"). The file op now expresses the empty-live-device case directly as
+/// `FsError::WouldBlock`; `sys_read` turns that into EAGAIN or a park.
+fn smoke_dev_uinput_empty_read_is_not_eof() -> TestResult {
+    use crate::devfs_input::UinputControlFile;
+    use crate::{FileOps, FsError};
+
+    let file = UinputControlFile::new();
+
+    if !file.nonblock_read_eagain() {
+        return TestResult::Fail(
+            "uinput does not opt into EAGAIN-on-empty; an O_NONBLOCK reader gets a \
+             phantom EOF and tears the device down",
+        );
+    }
+    // The raw op explicitly distinguishes "no request yet" from EOF.
+    let mut buf = [0u8; 32];
+    match poll_once_devfs_input(file.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("uinput read returned bytes NARF never synthesises"),
+        _ => TestResult::Fail("uinput empty read did not report would-block"),
+    }
+}
+kernel_test_in!("filesystem", smoke_dev_uinput_empty_read_is_not_eof);

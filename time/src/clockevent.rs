@@ -326,8 +326,7 @@ fn probe_fires(dev: &dyn ClockEvent) -> bool {
     // in boot — use a conservative cycle count that gives at
     // least 25 ms on any plausible CPU (≥2 GHz worst case;
     // slower CPUs wait longer, which is also fine for a probe).
-    let cpns = crate::wall::cycles_per_ns().max(1) as u64;
-    let probe_cycles = 50_000_000u64.saturating_mul(cpns);
+    let probe_cycles = crate::wall::ns_to_cycles(50_000_000);
     let start = crate::now_cycles();
     while crate::now_cycles().wrapping_sub(start) < probe_cycles {
         core::hint::spin_loop();

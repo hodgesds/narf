@@ -103,7 +103,7 @@ fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
 /// undershoot is fine (the wheel would just fire-due on the next
 /// poll and re-arm one tick later).
 fn cycles_delta_to_hpet_ticks(cycles: u64) -> u64 {
-    let cps = narf_time::cycles_per_ns() as u64 * 1_000_000_000;
+    let cps = narf_time::ns_to_cycles(1_000_000_000);
     let hpet_hz = narf_time::hpet::frequency_hz();
     if cps == 0 || hpet_hz == 0 {
         return 0;

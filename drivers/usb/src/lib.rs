@@ -566,7 +566,7 @@ fn spawn_supervisor_task() {
             // sleep wakes this task on time AND lets the executor halt
             // between USB pump cycles.
             let _ = irq_vector;
-            let cyc = 100_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
+            let cyc = narf_time::ns_to_cycles(100_000_000);
             narf_time::sleep_cycles(cyc).await;
         }
     });

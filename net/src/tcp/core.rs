@@ -1386,8 +1386,7 @@ fn arm_retransmit_timer(t: &mut Tcb) {
     }
     let rto = t.rtt.current_rto();
     let now = narf_scheduler::narf_time::now_cycles();
-    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-    t.retx_deadline_cycles = now.wrapping_add(rto.saturating_mul(cpn as u64));
+    t.retx_deadline_cycles = now.wrapping_add(narf_scheduler::narf_time::ns_to_cycles(rto));
 }
 
 /// Fire the RTO if the deadline has passed. Resends the oldest
@@ -1581,9 +1580,9 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let seq = t.snd_una; // probe at snd_una as a one-byte ping
                              // Schedule the next probe with exponential back-off.
         t.persist_backoff_ns = (t.persist_backoff_ns * 2).min(PERSIST_MAX_NS);
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-        t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-            .wrapping_add(t.persist_backoff_ns.saturating_mul(cpn as u64));
+        t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles().wrapping_add(
+            narf_scheduler::narf_time::ns_to_cycles(t.persist_backoff_ns),
+        );
         (
             probe,
             seq,
@@ -1631,9 +1630,8 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         return;
     }
     let now = narf_scheduler::narf_time::now_cycles();
-    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-    let idle_cycles = idle.saturating_mul(cpn as u64);
-    let intvl_cycles = intvl.saturating_mul(cpn as u64);
+    let idle_cycles = narf_scheduler::narf_time::ns_to_cycles(idle);
+    let intvl_cycles = narf_scheduler::narf_time::ns_to_cycles(intvl);
     let elapsed_since_progress = now.wrapping_sub(last_prog);
     let due = if probes == 0 {
         elapsed_since_progress >= idle_cycles
@@ -1727,10 +1725,9 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 // Receiver window closed — arm persist if not
                 // already armed.
                 if t.persist_deadline_cycles == 0 && !t.send_buf.is_empty() {
-                    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
                     t.persist_backoff_ns = PERSIST_INITIAL_NS;
                     t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-                        .wrapping_add(PERSIST_INITIAL_NS.saturating_mul(cpn as u64));
+                        .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(PERSIST_INITIAL_NS));
                 }
                 break;
             }
@@ -2036,8 +2033,7 @@ fn handle_in_syn_sent(
             if !seg.retransmitted {
                 let elapsed =
                     narf_scheduler::narf_time::now_cycles().wrapping_sub(seg.sent_at_cycles);
-                let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-                let rtt_ns = elapsed / cpn;
+                let rtt_ns = narf_scheduler::narf_time::cycles_to_ns(elapsed);
                 t.rtt.sample(rtt_ns);
             }
             t.flightsize = t.flightsize.saturating_sub(seg.len);
@@ -2070,8 +2066,7 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
             if !seg.retransmitted {
                 let elapsed =
                     narf_scheduler::narf_time::now_cycles().wrapping_sub(seg.sent_at_cycles);
-                let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-                let rtt_ns = elapsed / cpn;
+                let rtt_ns = narf_scheduler::narf_time::cycles_to_ns(elapsed);
                 t.rtt.sample(rtt_ns);
             }
             t.flightsize = t.flightsize.saturating_sub(seg.len);
@@ -2203,9 +2198,8 @@ fn handle_in_fin_wait1(
     if our_fin_acked && their_fin {
         // → TIME-WAIT.
         t.state = TcpState::TimeWait;
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-            .wrapping_add(TIME_WAIT_NS.saturating_mul(cpn as u64));
+            .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
     } else if our_fin_acked {
         t.state = TcpState::FinWait2;
     } else if their_fin {
@@ -2229,9 +2223,8 @@ fn handle_in_fin_wait2(
         process_fin(arc, hdr);
         let mut t = arc.lock();
         t.state = TcpState::TimeWait;
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-            .wrapping_add(TIME_WAIT_NS.saturating_mul(cpn as u64));
+            .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
     }
     schedule_ack(arc, !payload.is_empty() || hdr.flags & FLAG_FIN != 0);
 }
@@ -2250,9 +2243,8 @@ fn handle_in_closing(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &
     if our_fin_acked {
         let mut t = arc.lock();
         t.state = TcpState::TimeWait;
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-            .wrapping_add(TIME_WAIT_NS.saturating_mul(cpn as u64));
+            .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
     }
 }
 
@@ -2277,9 +2269,8 @@ fn handle_in_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
     // Restart the 2*MSL timer on any new segment; ACK if it was
     // a retransmitted FIN.
     let mut t = arc.lock();
-    let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
     t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-        .wrapping_add(TIME_WAIT_NS.saturating_mul(cpn as u64));
+        .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(TIME_WAIT_NS));
     drop(t);
     if hdr.flags & FLAG_FIN != 0 {
         send_ack(arc, 0);
@@ -2323,7 +2314,7 @@ fn handle_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedO
                 t.flightsize = t.flightsize.saturating_sub(f.len);
                 if !f.retransmitted {
                     let elapsed = now.wrapping_sub(f.sent_at_cycles);
-                    let rtt_ns = elapsed / cpn;
+                    let rtt_ns = narf_scheduler::narf_time::cycles_to_ns(elapsed);
                     if rtt_ns > 0 {
                         t.rtt.sample(rtt_ns);
                     }
@@ -2530,9 +2521,8 @@ fn schedule_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, had_payload: bool) {
     }
     let mut t = arc.lock();
     if t.delayed_ack_deadline_cycles == 0 {
-        let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         t.delayed_ack_deadline_cycles = narf_scheduler::narf_time::now_cycles()
-            .wrapping_add(DELAYED_ACK_NS.saturating_mul(cpn as u64));
+            .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(DELAYED_ACK_NS));
     }
 }
 

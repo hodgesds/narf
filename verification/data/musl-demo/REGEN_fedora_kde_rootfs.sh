@@ -128,6 +128,37 @@ fi
 
 # --------------------------------------------------------------- staging ---
 echo "Staging NARF-specific bits..."
+
+# Raise the user manager's start timeouts.
+#
+# Everything renders in software here (llvmpipe/kms_swrast, QPainter), so
+# Plasma starts far slower than systemd's 90s default assumes.
+# kwin_wayland is Type=dbus: systemd waits for org.kde.KWinWrapper to appear
+# within DefaultTimeoutStartSec, routinely does not get it in time, and stops
+# the unit — at which point Fedora's 10-timeout-abort.conf drop-in
+# (TimeoutStopFailureMode=abort) SIGABRTs it.
+#
+# The unit then reads "signal=ABRT ... Mem peak: 1010.3M", which looks exactly
+# like a crash or an OOM and is NEITHER. kcminit and xdg-desktop-portal were
+# TERM'd by the same mechanism, as ordering victims.
+mkdir -p "$WORK/root/etc/systemd"
+printf '%s\n' \
+  '[Manager]' \
+  'DefaultTimeoutStartSec=600s' \
+  'DefaultTimeoutStopSec=120s' \
+  > "$WORK/root/etc/systemd/user.conf"
+
+# The PTY probe (see ptyspawn_smoke_x86_64.c) — why the foot terminal renders but shows
+# no prompt. Same build rule as the DRM probe: PIE, never -static.
+if command -v gcc >/dev/null 2>&1; then
+  if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-pty-probe" \
+      "$ROOT/verification/data/musl-demo/ptyspawn_smoke_x86_64.c" 2>/dev/null; then
+    chmod 0755 "$WORK/root/usr/local/libexec/narf-pty-probe"
+    echo "Built narf-pty-probe"
+  else
+    echo "WARNING: narf-pty-probe failed to build"
+  fi
+fi
 # Fedora ships /usr/bin mode 0555. Several diagnostics below swap package
 # binaries for wrappers there, and the unprivileged build user owns the
 # directory but has no write bit. Open it for staging and restore the
@@ -320,13 +351,27 @@ fi
 # user-runtime-dir@1000.service, which creates /run/user/1000 — where the
 # manager publishes the session bus the session then connects to.
 #
-# QV4_FORCE_INTERPRETER / QT_ENABLE_REGEXP_JIT below: NARF enforces W^X —
-# nothing grants a W|X end state and the RW->RX flip needs CapKind::Jit
-# (userspace mprotect_core). Qt's QML JIT allocator performs exactly that
-# flip and gets EINVAL, which the journal shows as "mprotect failed in
-# ExecutableAllocator::makeWritable: Invalid argument". Run QML interpreted
-# rather than weaken a deliberate kernel security property for bring-up
-# convenience; plasmashell is QML-heavy so this sits on its critical path.
+# Qt's QML JIT is DISABLED. 7b6ab22b turned it on, reasoning that mprotect's
+# W^X arm returns NeedsCapJit and jit_cap_default_policy() grants a JitCap by
+# default, so the RW->RX flip no longer EINVALs. That reasoning was never
+# validated and it is wrong about which transition Qt asks for: JavaScriptCore's
+# ExecutableAllocator wants a W|X END STATE, and mprotect_core refuses that
+# outright for ANY task -- the cap gates the flip, and "nothing grants a W|X end
+# state". Measured consequence:
+#   kwin_wayland_wrapper: mprotect failed in ExecutableAllocator::makeWritable:
+#                         Invalid argument
+#   fatal-fault: comm=plasma-keyboard sig=11 #PF faultva=10 rax=0
+# i.e. the allocator returns NULL and the input method segfaults dereferencing
+# it. Do not re-enable without first running an A/B that shows plasma-keyboard
+# surviving; NARF's W^X refusal is a deliberate design position, not an
+# oversight to route around.
+# Those were set when the RW->RX flip returned EINVAL, but the kernel now
+# implements it: mprotect's W^X arm returns WxTransition::NeedsCapJit, and
+# `jit_cap_default_policy` GRANTS a JitCap by default (memory/src/wx.rs) —
+# denial is opt-in per task, not the default — after which `jit_mprotect`
+# performs the flip. W^X is still enforced; nothing grants a W|X end state.
+# plasmashell is QML-heavy and this sits on its critical path, so running
+# interpreted was costing real startup time for no security benefit.
 #
 # NOTE: keep comments OUT of the printf argument list below. A `#` inside a
 # line-continued arg list silently swallows every remaining argument, and
@@ -350,14 +395,13 @@ printf '%s\n' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
-  'Environment=QT_LOGGING_RULES=kwin_core.debug=true' \
   'Environment=QT_QPA_PLATFORM=wayland' \
-  'Environment=QV4_FORCE_INTERPRETER=1' \
-  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=KWIN_DRM_NO_AMS=1' \
   'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
   'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
+  'Environment=QV4_FORCE_INTERPRETER=1' \
+  'Environment=QT_ENABLE_REGEXP_JIT=0' \
   'Environment=GALLIUM_DRIVER=llvmpipe' \
   'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
   'RuntimeDirectory=narf-plasma' \

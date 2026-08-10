@@ -1479,7 +1479,7 @@ async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_
     // PARK on the timer wheel so the executor can halt; stay tight-poll
     // while frames are actually flowing.
     const IDLE_BACKOFF_ROUNDS: u32 = 64;
-    let idle_park_cycles = 1_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
+    let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
     let mut buf = [0u8; 2048];
     let mut idle_rounds: u32 = 0;
     loop {

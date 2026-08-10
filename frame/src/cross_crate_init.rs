@@ -213,8 +213,7 @@ fn install_net_stack() {
     // the OTHER NIC. PARK ~1 ms on the wheel after an empty drain so the
     // executor can halt; tight-poll only while frames are flowing.
     narf_scheduler::spawn_stackful(async {
-        let idle_park_cycles =
-            1_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
+        let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
         loop {
             let mut any = false;
             while narf_drivers_net::e1000::rx_pump_step() {

@@ -446,6 +446,26 @@ pub enum FsError {
     /// `fs/read_write.c::vfs_read` / `vfs_write` (FMODE_READ/FMODE_WRITE),
     /// before the file op is ever called. Maps to `EBADF`.
     BadFd,
+    /// The file is open and healthy but has nothing to give right now — an
+    /// eventfd whose counter is 0, an unexpired timerfd, an empty pipe with a
+    /// live writer, an empty socket with a live peer.
+    ///
+    /// This is what Linux's file ops return directly (`-EAGAIN` from
+    /// `fs/eventfd.c::eventfd_read`, `fs/pipe.c::pipe_read`, …), and the
+    /// syscall layer turns it into `EAGAIN` for an `O_NONBLOCK` caller or a
+    /// park for a blocking one.
+    ///
+    /// It replaces an older NARF convention where a file op signalled
+    /// would-block as `Ok(0)` and declared it out-of-band via a
+    /// separate opt-in. That split was the bug factory: `Ok(0)`
+    /// IS end-of-file for every other file, so any consumer that did not also
+    /// consult the opt-in silently converted "nothing yet" into "the fd
+    /// closed". A spurious 0 of exactly this shape killed the KDE session bus
+    /// through GLib's line-reader, and the opt-in was easy to test in
+    /// isolation while nothing proved the syscall layer still honoured it.
+    ///
+    /// Maps to POSIX `EAGAIN`/`EWOULDBLOCK`.
+    WouldBlock,
 }
 
 impl From<CapError> for FsError {
@@ -903,12 +923,6 @@ pub trait FileOps: Send + Sync {
     /// opened evdev fd's `st_rdev` against udev's MAJOR:MINOR.
     fn rdev(&self) -> u64 {
         0
-    }
-
-    /// True when a blocking read on this fd (a pipe with an open writer
-    /// and empty buffer) should park rather than return a spurious 0.
-    fn read_should_block(&self) -> bool {
-        false
     }
 
     /// True when a blocking write that made no progress (returned 0) should

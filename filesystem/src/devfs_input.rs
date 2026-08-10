@@ -56,6 +56,73 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
 
+/// Owner and permission bits of one evdev node.
+#[derive(Clone, Copy)]
+struct EvdevNodeMeta {
+    uid: u32,
+    gid: u32,
+    perms: u16,
+}
+
+impl EvdevNodeMeta {
+    /// Linux `drivers/input/evdev.c` creates event nodes root-owned at 0660;
+    /// udev assigns the `input` group afterwards.
+    const DEFAULT: Self = Self {
+        uid: 0,
+        gid: 0,
+        perms: 0o660,
+    };
+}
+
+/// Per-event-node ownership and permissions, keyed by event number. A node
+/// absent from the table carries [`EvdevNodeMeta::DEFAULT`].
+///
+/// This CANNOT live on `InputEventFile`: every `open("/dev/input/eventN")`
+/// builds a fresh one (see the type's docs), so a chown recorded on the
+/// instance would vanish when udev's fd closed and be invisible to the next
+/// opener. Linux keeps it on the inode; this table is that inode state.
+///
+/// Why it matters: udev applies `GROUP="input", MODE="0660"` to every evdev
+/// node (50-udev-default.rules). Without a writable owner, `set_owners`
+/// returned the trait default `Unsupported`, which udev reported as
+///
+/// ```text
+/// event1: Failed to set owner/mode of /dev/input/event1 to uid=0,
+///         gid=104, mode=0660: Operation not supported
+/// ```
+///
+/// and the node stayed root:root. The mode was already 0660, so the failure
+/// looked cosmetic — but 0660 root:root is unopenable by the compositor
+/// running as uid 1000, which is the same shape as the DRM-node EACCES that
+/// supplementary-group DAC support was added for.
+///
+/// Entries are never removed. That is safe only because `narf-input` issues
+/// device ids monotonically and never recycles them, so a replugged device
+/// gets a fresh node rather than inheriting the previous occupant's uid/gid —
+/// an invariant pinned by `smoke_evdev_device_ids_are_never_recycled`.
+static EVDEV_NODE_META: IrqSafeSpinLock<Vec<(u32, EvdevNodeMeta)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn evdev_meta(event_num: u32) -> EvdevNodeMeta {
+    EVDEV_NODE_META
+        .lock()
+        .iter()
+        .find(|(n, _)| *n == event_num)
+        .map(|(_, meta)| *meta)
+        .unwrap_or(EvdevNodeMeta::DEFAULT)
+}
+
+fn evdev_meta_update(event_num: u32, f: impl FnOnce(&mut EvdevNodeMeta)) {
+    let mut table = EVDEV_NODE_META.lock();
+    if let Some(entry) = table.iter_mut().find(|(n, _)| *n == event_num) {
+        f(&mut entry.1);
+        return;
+    }
+    let mut meta = EvdevNodeMeta::DEFAULT;
+    f(&mut meta);
+    table.push((event_num, meta));
+}
+
 // ── Event-record sizes ────────────────────────────────────────────────────────
 
 /// In-memory size of one internal `EvdevEvent` (16 bytes).
@@ -397,6 +464,7 @@ impl FileOps for InputEventFile {
     ///
     /// Ref: Linux `drivers/input/evdev.c` — evdev uses major 13.
     fn stat(&self) -> Stat {
+        let meta = evdev_meta(self.event_num);
         Stat {
             size: 0,
             blocks: 0,
@@ -404,10 +472,34 @@ impl FileOps for InputEventFile {
                 file_type: FileType::Special,
                 // 0o060660: device file (0o060000) | rw-rw---- (0o660).
                 // Linux assigns gid=input (typically 999) and mode 0660.
-                perms: 0o660,
+                // Read from the shared node table so a udev chmod sticks.
+                perms: meta.perms,
             },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        let meta = evdev_meta(self.event_num);
+        (meta.uid, meta.gid)
+    }
+
+    /// `chown` — udev's `GROUP="input"` assignment. Persisted in
+    /// [`EVDEV_NODE_META`] so it survives this fd's close and is visible to
+    /// the compositor's later open.
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        evdev_meta_update(self.event_num, |meta| {
+            meta.uid = uid;
+            meta.gid = gid;
+        });
+        Box::pin(async { Ok(()) })
+    }
+
+    /// `chmod` — udev's `MODE="0660"`. Masked to the permission bits;
+    /// the file type is fixed by the node.
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        evdev_meta_update(self.event_num, |meta| meta.perms = perms & 0o7777);
+        Box::pin(async { Ok(()) })
     }
 
     fn rdev(&self) -> u64 {
@@ -710,11 +802,33 @@ impl FileOps for UinputControlFile {
         })
     }
 
-    /// The control file is write-only from userspace's perspective; reads
-    /// return 0 (Linux uinput supports reading FF requests, which NARF does
-    /// not synthesise, so EOF is the safe answer).
+    /// Reads drain pending force-feedback requests. NARF never synthesises
+    /// any, so this always comes back empty — but "empty" must NOT be
+    /// reported as a 0-byte read.
+    ///
+    /// `read() == 0` on a character device means END OF FILE: the reader
+    /// concludes the device went away and stops. Linux's uinput blocks an
+    /// empty read (or returns EAGAIN on an O_NONBLOCK fd) and only ever
+    /// returns 0 at a genuine hangup. The old comment here called EOF "the
+    /// safe answer"; it is the opposite — it is a phantom hangup, exactly
+    /// the bug that left the `foot` terminal blank when PtyMaster::read
+    /// returned 0 on an empty ring, and that broke GLib's dbus line-read
+    /// when a pipe did the same.
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
+        // uinput has no end-of-file: an empty read waits for a force-feedback
+        // request. NARF synthesises none, so this is always would-block —
+        // deliberately, and matching Linux, where the wait is equally
+        // unbounded until a client uploads an effect. Reporting a hangup that
+        // did not happen is the worse failure: the reader tears the device
+        // down.
+        Box::pin(async move { Err(FsError::WouldBlock) })
+    }
+
+    /// An O_NONBLOCK reader must get EAGAIN, not a phantom EOF. `sys_read`
+    /// turns a 0-byte result into EAGAIN when this is set, which is what an
+    /// FF-aware client polling the control fd expects.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
     }
 
     /// Stat: character device, mode 0660 (matches `/dev/uinput` on Linux,

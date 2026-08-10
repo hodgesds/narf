@@ -865,15 +865,6 @@ impl FileOps for InotifyFile {
         )
     }
 
-    /// A blocking read with no queued events must PARK (POSIX), not return
-    /// a spurious 0 — inotify has no end-of-file.
-    fn read_should_block(&self) -> bool {
-        with_inotify(|m| {
-            m.get(&self.id)
-                .map(|s| s.events.is_empty())
-                .unwrap_or(false)
-        })
-    }
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let id = self.id;
         Box::pin(async move {
@@ -896,6 +887,13 @@ impl FileOps for InotifyFile {
                     let ev = st.events.pop_front().unwrap();
                     buf[written..written + ev.len()].copy_from_slice(&ev);
                     written += ev.len();
+                }
+                if written == 0 {
+                    // inotify has no end-of-file: an empty queue is
+                    // would-block (Linux fs/notify/inotify/inotify_user.c
+                    // returns -EAGAIN). A 0 here made an epoll loop spin —
+                    // epoll says ready, read says "closed", repeat.
+                    return Err(FsError::WouldBlock);
                 }
                 Ok(written)
             })
@@ -1113,14 +1111,6 @@ impl FileOps for FanotifyFile {
         }
     }
 
-    fn read_should_block(&self) -> bool {
-        with_fanotify(|m| {
-            m.get(&self.id)
-                .map(|group| group.events.is_empty())
-                .unwrap_or(false)
-        })
-    }
-
     fn nonblock_read_eagain(&self) -> bool {
         true
     }
@@ -1132,8 +1122,24 @@ impl FileOps for FanotifyFile {
         // sys_read (see `fanotify_read_into`), never reaching here. This
         // path is only hit by other read entry points; surface 0 (no
         // events delivered) rather than risk the re-entrant lock.
-        let _ = (self.id, buf);
-        Box::pin(async { Ok(0) })
+        let _ = buf;
+        // No events queued is would-block, not EOF. When events ARE queued
+        // this still reports 0: delivery needs an fd installed per event and
+        // that path lives in sys_read. Pre-existing limitation, narrowed here
+        // to the case where it cannot mislead.
+        let id = self.id;
+        let empty = with_fanotify(|m| {
+            m.get(&id)
+                .map(|group| group.events.is_empty())
+                .unwrap_or(false)
+        });
+        Box::pin(async move {
+            if empty {
+                Err(FsError::WouldBlock)
+            } else {
+                Ok(0)
+            }
+        })
     }
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
         // Writing to a fanotify fd issues access-permission responses,

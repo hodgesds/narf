@@ -130,17 +130,14 @@ const CONFIG_WAIT_MS: u64 = 5;
 const KBD_REPLY_MS: u64 = 100;
 const KBD_BAT_MS: u64 = 500;
 
-/// Wall-time TSC deadline `ms` from now. Falls back to a 1 GHz
-/// estimate if `cycles_per_ns` returned 0 (calibration didn't run);
-/// that still yields a measurable wait — never zero.
+/// Wall-time TSC deadline `ms` from now.
+///
+/// `ns_to_cycles` is the calibrated fixed-point scale, so this no longer
+/// needs the old "cycles_per_ns returned 0" fallback: the conversion
+/// floors at a 1 GHz-equivalent mult before calibration rather than
+/// collapsing to zero, so the wait is always measurable.
 fn deadline_cycles(ms: u64) -> u64 {
-    let cpns = narf_time::cycles_per_ns() as u64;
-    let cpms = if cpns == 0 {
-        1_000_000
-    } else {
-        cpns * 1_000_000
-    };
-    narf_time::now_cycles().saturating_add(cpms.saturating_mul(ms))
+    narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(ms.saturating_mul(1_000_000)))
 }
 
 /// Block until the controller's input buffer is empty OR the

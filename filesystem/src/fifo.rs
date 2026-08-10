@@ -19,8 +19,8 @@
 //!   syscall layer turns into SIGPIPE + `-EPIPE`.
 //!
 //! Blocking on `read()`/`write()` is driven the same way anonymous pipes
-//! are: `read_should_block()` reports "empty but not at EOF", and the
-//! syscall layer parks + re-executes. The open-time peer rendezvous
+//! are: reads return [`FsError::WouldBlock`] for an empty live stream, and
+//! the syscall layer parks + re-executes. The open-time peer rendezvous
 //! (O_RDONLY blocks until a writer appears, and vice versa) lives in
 //! `sys_open`, which must release every filesystem/fd-table lock before it
 //! parks — a FIFO open holding a lock across the wait would wedge the
@@ -317,10 +317,16 @@ impl FileOps for FifoHandle {
             let mut q = self.shared.queue.lock();
             let avail = q.len();
             if avail == 0 {
-                // Empty: EOF only once every writer has closed. Otherwise a
-                // 0-byte read means "try again" and the syscall layer parks
-                // (see `read_should_block`).
-                return Ok(0);
+                // Empty: EOF only once every writer has closed; otherwise
+                // would-block. Linux `fs/pipe.c::pipe_read` splits these as
+                // 0 vs -EAGAIN. Decided under the SAME lock that saw the
+                // empty queue, so a writer arriving concurrently cannot be
+                // mistaken for end-of-file.
+                return if self.shared.writers.load(Ordering::Acquire) == 0 {
+                    Ok(0)
+                } else {
+                    Err(FsError::WouldBlock)
+                };
             }
             let n = core::cmp::min(buf.len(), avail);
             for slot in buf.iter_mut().take(n) {
@@ -403,20 +409,6 @@ impl FileOps for FifoHandle {
             }
         }
         mask
-    }
-
-    fn read_should_block(&self) -> bool {
-        // Block (retry) only while readable-but-not-EOF: the queue is empty
-        // AND a writer is still open. A write-only handle never blocks a read
-        // here (it EOFs immediately above). Keying EOF on
-        // (empty && writers == 0) makes a data-arrived race re-read instead of
-        // mis-reading a transient 0 as end-of-file — the same discipline the
-        // anonymous pipe uses.
-        if !self.can_read {
-            return false;
-        }
-        let q = self.shared.queue.lock();
-        !(q.is_empty() && self.shared.writers.load(Ordering::Acquire) == 0)
     }
 
     fn write_should_block(&self) -> bool {

@@ -53,6 +53,12 @@ default = ["linux-compat"]
 # so it's usable to see what a guest process does before it dies. Off by
 # default.
 syscall-trace = []
+# Just the AF_UNIX connect->accept timestamps (UNIXENQ/UNIXACC), without the
+# full syscall firehose. `syscall-trace` writes EVERY syscall to the
+# synchronous serial console, which inflates the very latency those two
+# lines exist to measure — an observer effect large enough to invalidate the
+# number. This lets the gap be measured on an otherwise quiet boot.
+unix-latency-trace = []
 
 # In-kernel test harness build. The `abi_*_tests.rs` modules are compiled
 # unconditionally (they register into the `narf.tests` link section), so

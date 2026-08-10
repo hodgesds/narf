@@ -332,13 +332,13 @@ pub struct Pty {
     #[allow(dead_code)]
     pub(crate) window: IrqSafeSpinLock<WinSize>,
 
-    /// Session ID — placeholder; full session management is Stage 4.
-    #[allow(dead_code)]
-    pub(crate) sid: AtomicU32,
-
-    /// Foreground process group — placeholder; signal delivery is Stage 4.
-    #[allow(dead_code)]
-    pub(crate) pgid: AtomicU32,
+    /// The tty's session — Linux `tty->ctrl.session`. Installed together
+    /// with [`Self::fg_pgrp`] when a task acquires this PTY as its
+    /// controlling terminal (`TIOCSCTTY`). 0 = no session; `TIOCGSID` then
+    /// reports ENOTTY, as Linux does.
+    // Only read by the `linux-compat` ioctl path (TIOCSCTTY/TIOCGSID).
+    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
+    pub(crate) sid: AtomicU64,
 
     /// Allocation index; becomes the `/dev/pts/<N>` name.
     pub(crate) index: u32,
@@ -369,6 +369,30 @@ pub struct Pty {
     // constructed so the field is dead only when that feature is off.
     #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
     pub(crate) fg_pgrp: AtomicU64,
+    /// How many `PtySlave` handles are currently open, and whether one ever
+    /// was. Together these are the HANGUP condition: a master read may only
+    /// report end-of-stream once a slave has been opened and every one of
+    /// them has since closed.
+    ///
+    /// Both halves are needed. Without the counter an empty ring looks like
+    /// a hangup and the terminal gets a phantom EOF (the blank `foot`
+    /// window). Without `ever_opened` a master read BEFORE the child opens
+    /// its slave would report EIO instead of waiting, which is the same bug
+    /// with the sign flipped.
+    pub(crate) slave_opens: AtomicU32,
+    pub(crate) slave_ever_opened: AtomicBool,
+    /// The master has closed. Linux `pty_close` sets `TTY_OTHER_CLOSED` on
+    /// the peer either way, but the MASTER's close additionally
+    /// `tty_vhangup(tty->link)`s the slave — so the two sides end
+    /// DIFFERENTLY, and that difference is load-bearing:
+    ///
+    ///   slave closes  -> master read  = EIO   (`n_tty_wait_for_input`)
+    ///   master closes -> slave  read  = 0/EOF (`tty_read`/`tty_hung_up_p`)
+    ///
+    /// EOF is what makes a shell on a vanished terminal exit; EIO is what
+    /// tells a terminal its child is gone. Swapping them wedges one side or
+    /// the other.
+    pub(crate) master_closed: AtomicBool,
 
     /// Wave-76: slave-lock flag (TIOCSPTLCK). After ptmx_open the slave
     /// is locked; userspace calls unlockpt() / TIOCSPTLCK(0) before
@@ -387,14 +411,21 @@ impl core::fmt::Debug for Pty {
 }
 
 impl Pty {
+    /// A slave was opened at some point and none is open now — the master's
+    /// end-of-stream condition. Linux `pty_read`: EIO once the last slave
+    /// closes; before any slave opens, the master simply waits.
+    pub(crate) fn hung_up(&self) -> bool {
+        self.slave_ever_opened.load(Ordering::Acquire)
+            && self.slave_opens.load(Ordering::Acquire) == 0
+    }
+
     fn new(index: u32, uid: u32, gid: u32) -> Self {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
-            sid: AtomicU32::new(0),
-            pgid: AtomicU32::new(0),
+            sid: AtomicU64::new(0),
             index,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
@@ -402,6 +433,9 @@ impl Pty {
             // Linux: ptmx_open() starts with the slave locked. unlockpt()
             // clears via TIOCSPTLCK(0) before the slave can be opened.
             locked: AtomicBool::new(true),
+            slave_opens: AtomicU32::new(0),
+            slave_ever_opened: AtomicBool::new(false),
+            master_closed: AtomicBool::new(false),
         }
     }
 }
@@ -895,6 +929,10 @@ impl PtyMaster {
 
 impl Drop for PtyMaster {
     fn drop(&mut self) {
+        // Linux `pty_close`: the master's close sets TTY_OTHER_CLOSED on the
+        // peer AND `tty_vhangup`s it, so a slave still reading must now see
+        // end-of-file rather than wait for a writer that can never return.
+        self.pty.master_closed.store(true, Ordering::Release);
         ptmx_close(self.pty.index);
     }
 }
@@ -905,6 +943,20 @@ impl FileOps for PtyMaster {
     ///   drains `tty->link->read_buf`.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let n = self.pty.slave_tx_to_master.pop(buf);
+        // Drain first: bytes the slave wrote before it closed are still the
+        // child's output and must be delivered, exactly as Linux drains
+        // `read_buf` before reporting the hangup.
+        if n == 0 && self.pty.hung_up() {
+            // EIO, the errno Linux's `pty_read` returns on hangup — not
+            // ENOTSUP, and emphatically not Ok(0), which is the phantom EOF
+            // this whole predicate exists to avoid.
+            return Box::pin(async move { Err(FsError::Io(narf_block::BlockError::IOError)) });
+        }
+        // Empty and NOT hung up: would-block. The ring state that produced
+        // n == 0 also classifies it, without a second syscall query.
+        if n == 0 {
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         Box::pin(async move { Ok(n) })
     }
 
@@ -1075,12 +1127,26 @@ impl FileOps for PtyMaster {
         }
     }
 
-    /// POLLIN when the master's input queue (slave_tx_to_master) has
-    /// at least one byte; POLLOUT always.
+    /// POLLIN when the master's input queue (slave_tx_to_master) has at
+    /// least one byte; POLLOUT always; POLLHUP once every slave has closed.
+    ///
+    /// The HUP half matters as much as the EIO on `read`: an event loop
+    /// (foot, and every other terminal) sits in poll/epoll rather than a
+    /// bare blocking read, so without it the loop simply never wakes and
+    /// never learns its child is gone.
+    ///
+    /// Linux ref: `n_tty_poll` —
+    ///   `if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) mask |= EPOLLHUP;`
+    /// set by `pty_close` on the peer and cleared when a slave re-opens
+    /// (`pty.c` `set_bit`/`clear_bit` on `tty->link->flags`), which the
+    /// open counter reproduces.
     fn poll_readiness(&self) -> u32 {
         let mut mask = crate::POLL_OUT;
         if self.pty.slave_tx_to_master.len() > 0 {
             mask |= crate::POLL_IN;
+        }
+        if self.pty.hung_up() {
+            mask |= crate::POLL_HUP;
         }
         mask
     }
@@ -1095,6 +1161,16 @@ pub struct PtySlave {
     pty: Arc<Pty>,
 }
 
+/// Closing the last slave is the HANGUP the master read waits for.
+/// Linux: `pty_close` on the slave wakes the master's readers, and a
+/// subsequent master read returns `EIO` rather than blocking forever.
+impl Drop for PtySlave {
+    fn drop(&mut self) {
+        let prev = self.pty.slave_opens.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "PtySlave dropped without a matching open");
+    }
+}
+
 impl core::fmt::Debug for PtySlave {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PtySlave")
@@ -1105,6 +1181,8 @@ impl core::fmt::Debug for PtySlave {
 
 impl PtySlave {
     pub fn new(pty: Arc<Pty>) -> Self {
+        pty.slave_opens.fetch_add(1, Ordering::AcqRel);
+        pty.slave_ever_opened.store(true, Ordering::Release);
         Self { pty }
     }
 }
@@ -1120,13 +1198,43 @@ impl FileOps for PtySlave {
     /// Linux ref: `n_tty.c n_tty_read` → canonical buffer drain.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let mut state = self.pty.input.lock();
-        let n = if state.readable() == 0 {
-            state.take_eof();
-            0
-        } else {
-            state.drain_into(buf)
-        };
+        if state.readable() == 0 {
+            // The ONE PTY case where 0 is correct: canonical mode latches ^D
+            // as a genuine EOF a shell must see exactly once. `take_eof()`
+            // consumes that latch and reports it; anything else is "no
+            // completed line yet", which is would-block, not end-of-file.
+            // A hung-up master is also a real EOF (Linux `tty_read` /
+            // `tty_hung_up_p`).
+            let latched_eof = state.take_eof();
+            let hung_up = self.pty.master_closed.load(Ordering::Acquire);
+            drop(state);
+            return Box::pin(async move {
+                if latched_eof || hung_up {
+                    Ok(0)
+                } else {
+                    Err(FsError::WouldBlock)
+                }
+            });
+        }
+        let n = state.drain_into(buf);
+        drop(state);
+        // `readable() != 0` counts buffered bytes, but ICANON only RELEASES a
+        // completed line — an incomplete line, or input consumed as a signal
+        // character (^C), drains 0. That is would-block, not end-of-file; the
+        // readable()==0 branch above is the only place a real EOF originates.
+        if n == 0 {
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         Box::pin(async move { Ok(n) })
+    }
+
+    /// libc readers of a slave opened O_NONBLOCK expect EAGAIN on an empty
+    /// queue, not a phantom EOF. Gated the same way, so `^D` still lands.
+    fn nonblock_read_eagain(&self) -> bool {
+        // Same hangup exception: after the master closes, an O_NONBLOCK
+        // slave read reports EOF (0), not EAGAIN — there is nothing left
+        // that could ever arrive.
+        self.pty.input.lock().would_block() && !self.pty.master_closed.load(Ordering::Acquire)
     }
 
     /// Write bytes; with ECHO on, also copies them to `slave_tx_to_master`
@@ -1217,9 +1325,37 @@ impl FileOps for PtySlave {
                 // filesystem layer can't reach the per-task session
                 // table directly — userspace::handlers wires it.
                 let _ = arg;
-                if let Some(hook) = CTTY_HOOK.lock().as_ref() {
-                    hook(self.pty.index);
+                // Copy the fn pointer out before calling: the hook takes
+                // userspace's own locks, and holding CTTY_HOOK across that
+                // would invert lock order.
+                let hook = *CTTY_HOOK.lock();
+                if let Some(hook) = hook {
+                    let (sid, pgid) = hook(self.pty.index);
+                    // Linux `__proc_set_tty` (drivers/tty/tty_jobctrl.c):
+                    //     tty->ctrl.pgrp    = get_pid(task_pgrp(current));
+                    //     tty->ctrl.session = get_pid(task_session(current));
+                    // Acquiring the controlling tty installs BOTH. Recording
+                    // only the ctty (what this did before) left fg_pgrp at 0,
+                    // so `tcgetpgrp()` returned 0, which never equals the
+                    // shell's own pgrp. bash's `initialize_job_control` then
+                    // loops sending itself SIGTTIN (default action: stop), so
+                    // an interactive shell on a PTY hung forever having
+                    // written not one byte — the empty `foot` window.
+                    self.pty.sid.store(sid, Ordering::Release);
+                    self.pty.fg_pgrp.store(pgid, Ordering::Release);
                 }
+                Ok(0)
+            }
+            TIOCGSID => {
+                // Linux `tiocgsid`: the session of the tty's session leader.
+                // ENOTTY while the tty has no session, matching Linux's
+                // `if (!real_tty->ctrl.session) return -ENOTTY;`.
+                let sid = self.pty.sid.load(Ordering::Acquire);
+                if sid == 0 {
+                    return Err(FsError::Unsupported);
+                }
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
+                unsafe { write_user_i32(arg, sid as i32)? };
                 Ok(0)
             }
             TIOCGWINSZ => {
@@ -1286,6 +1422,12 @@ impl FileOps for PtySlave {
         if self.pty.input.lock().readable() > 0 {
             mask |= crate::POLL_IN;
         }
+        // Linux `n_tty_poll`: EPOLLHUP once the peer closed. Without it a
+        // shell sitting in poll/epoll on its tty never learns the terminal
+        // went away and never exits.
+        if self.pty.master_closed.load(Ordering::Acquire) {
+            mask |= crate::POLL_HUP;
+        }
         mask
     }
 
@@ -1312,8 +1454,16 @@ impl FileOps for PtySlave {
 // the filesystem crate depend on userspace, we expose a function-pointer
 // hook the userspace crate installs at boot.
 
+/// Records the caller's controlling tty and reports back the caller's
+/// `(session id, process group id)` — both in the visible-pid space.
+///
+/// The return value is what lets `TIOCSCTTY` implement Linux's
+/// `__proc_set_tty` (drivers/tty/tty_jobctrl.c), which installs the tty's
+/// session AND its foreground process group as one operation. Without the
+/// pgrp half, `tcgetpgrp()` answers 0 forever and a job-control shell's
+/// `initialize_job_control` loop never converges — see the TIOCSCTTY arm.
 #[cfg(feature = "linux-compat")]
-type CttyHook = fn(pty_index: u32);
+type CttyHook = fn(pty_index: u32) -> (u64, u64);
 
 #[cfg(feature = "linux-compat")]
 static CTTY_HOOK: IrqSafeSpinLock<Option<CttyHook>> = IrqSafeSpinLock::new(None);

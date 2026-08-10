@@ -465,6 +465,18 @@ pub struct SocketFile {
     /// new one before its next epoll scan, leaving the sampled mask at POLLIN
     /// throughout. Each enqueue is nevertheless a new accept-ready edge.
     listener_readable_token: AtomicU64,
+    /// `unix-latency-trace` only: tid that called `listen()` on this socket.
+    /// The starved-accept sweep runs inside the watchdog's timer trap, where
+    /// walking every task's fd table to find the acceptor would take the fd
+    /// lock the interrupted CPU may already hold. Recording the acceptor at
+    /// listen() time makes the sweep a pure read.
+    #[cfg(feature = "unix-latency-trace")]
+    listen_owner_tid: AtomicU64,
+    /// `unix-latency-trace`: the fd `listen()` was called on, recorded by
+    /// `sys_socket_listen` (the dispatch layer below does not see it).
+    /// Compared against the acceptor's recorded poll fd set.
+    #[cfg(feature = "unix-latency-trace")]
+    listen_owner_fd: AtomicU32,
     /// Receive-progress generation for AF_NETLINK queues.  A monitor can
     /// drain one message between EPOLLET scans; advancing this token on that
     /// drain preserves the next queued message's edge without manufacturing
@@ -748,6 +760,15 @@ impl core::fmt::Debug for DgramPacket {
 struct NetlinkUserPacket {
     payload: Vec<u8>,
     sender_portid: u32,
+    /// Destination multicast group as a `sockaddr_nl.nl_groups` MASK
+    /// (0 for unicast). Linux reports this to the receiver via
+    /// `netlink_group_mask(NETLINK_CB(skb).dst_group)` in `netlink_recvmsg`,
+    /// and libudev's `device_monitor_receive_device` uses it to tell a
+    /// multicast broadcast from a unicast message: anything arriving with
+    /// `nl_groups == 0` is treated as unicast and DISCARDED unless it comes
+    /// from the monitor's trusted sender. Dropping this field would make
+    /// every udev broadcast silently ignored by its listeners.
+    group: u32,
 }
 
 impl SocketFile {
@@ -846,6 +867,10 @@ impl SocketFile {
             last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
             dgram_readable_token: AtomicU64::new(0),
             listener_readable_token: AtomicU64::new(0),
+            #[cfg(feature = "unix-latency-trace")]
+            listen_owner_tid: AtomicU64::new(0),
+            #[cfg(feature = "unix-latency-trace")]
+            listen_owner_fd: AtomicU32::new(u32::MAX),
             netlink_readable_token: AtomicU64::new(0),
             netlink_portid: AtomicU32::new(0),
             netlink_groups: AtomicU32::new(0),
@@ -1055,11 +1080,33 @@ impl SocketFile {
         if destination == (0, 0) {
             return None;
         }
-        // Userspace multicast requires authority NARF does not grant through
-        // uid/capability emulation. Kernel-originated protocol notifications
-        // continue to use their dedicated broadcast paths.
+        // Multicast: deliver to every socket subscribed to the group.
+        //
+        // This used to return NotSupported outright, on the reasoning that
+        // "userspace multicast requires authority NARF does not grant". That
+        // broke udev completely (task #12). After a worker processes a
+        // device, udevd broadcasts the result to its libudev listeners on the
+        // UDEV_MONITOR_UDEV group; EOPNOTSUPP there is not a slow path, it is
+        // fatal:
+        //
+        //   sd-device-monitor(manager): Failed to send device to netlink
+        //       monitor: Operation not supported
+        //   Failed to broadcast event (SEQNUM=23) to libudev listeners
+        //   Worker [20] exited with return code 1.
+        //   Event loop failed: Operation not supported
+        //
+        // udevd's event loop dies, so /run/udev/data stays empty, no input
+        // device ever gets a `seat` tag, libinput enumerates nothing, and the
+        // Wayland seat advertises keyboard-only — the dead mouse.
+        //
+        // Linux does NOT refuse this. `netlink_sendmsg` gates multicast on
+        // `netlink_allowed(sock, NL_CFG_F_NONROOT_SEND)` and fails with
+        // EPERM, not EOPNOTSUPP — and udevd runs with CAP_NET_ADMIN, so it is
+        // allowed. Matching Linux's permission model properly is task #12's
+        // follow-up; refusing every sender was both the wrong errno and the
+        // wrong answer for the one sender that matters.
         if destination.1 != 0 {
-            return Some(SocketOpResult::Err(SockError::NotSupported));
+            return Some(self.broadcast_netlink_user(buf, destination.1));
         }
         let sender = self.ensure_netlink_portid();
         let mut sockets = NETLINK_SOCKETS.lock();
@@ -1077,10 +1124,61 @@ impl SocketFile {
             .push_back(NetlinkUserPacket {
                 payload: buf.to_vec(),
                 sender_portid: sender,
+                group: 0,
             });
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
+    }
+
+    /// `sockaddr_nl.nl_groups` multicast send — Linux `netlink_broadcast`.
+    ///
+    /// `group_mask` is the raw `nl_groups` bitmask the sender supplied. Linux
+    /// derives the group NUMBER with `ffs()` (the index of the lowest set
+    /// bit, 1-based) and reports it back to receivers re-encoded as a mask
+    /// via `netlink_group_mask()`, so that round-trip is preserved here.
+    ///
+    /// Delivery is best-effort: Linux's `netlink_sendmsg` ignores
+    /// `netlink_broadcast`'s return value, so a broadcast with no subscribers
+    /// still succeeds. Returning an error for an empty listener set would
+    /// make udevd fail whenever nothing happened to be listening yet.
+    fn broadcast_netlink_user(&self, buf: &[u8], group_mask: u32) -> SocketOpResult {
+        // Linux `ffs(addr->nl_groups)`.
+        let group = group_mask.trailing_zeros() + 1;
+        let sender = self.ensure_netlink_portid();
+        let targets: Vec<Arc<SocketFile>> = {
+            let mut sockets = NETLINK_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut delivered = 0usize;
+        for target in targets {
+            if target.protocol != self.protocol {
+                continue;
+            }
+            // Never loop a broadcast back to its sender (Linux skips
+            // `sk == ssk` in `do_one_broadcast`).
+            if target.netlink_portid.load(Ordering::Acquire) == sender {
+                continue;
+            }
+            if !target.netlink_memberships.lock().contains(&group) {
+                continue;
+            }
+            target
+                .netlink_user_inbox
+                .lock()
+                .push_back(NetlinkUserPacket {
+                    payload: buf.to_vec(),
+                    sender_portid: sender,
+                    group: group_mask,
+                });
+            delivered += 1;
+        }
+        if delivered > 0 {
+            // Wake any parked poll/epoll waiter on a subscribed socket.
+            narf_net::readiness::notify(0);
+        }
+        SocketOpResult::Ok(buf.len() as u64)
     }
 
     fn recv_netlink_user(&self, buf: &mut [u8], flags: u32) -> Option<SocketOpResult> {
@@ -1090,6 +1188,7 @@ impl SocketFile {
                 inbox.front().map(|packet| NetlinkUserPacket {
                     payload: packet.payload.clone(),
                     sender_portid: packet.sender_portid,
+                    group: packet.group,
                 })
             } else {
                 inbox.pop_front()
@@ -1100,8 +1199,15 @@ impl SocketFile {
         }
         let n = buf.len().min(packet.payload.len());
         buf[..n].copy_from_slice(&packet.payload[..n]);
-        self.netlink_last_recv_group.store(0, Ordering::Release);
-        let peer = Some(Self::netlink_sockaddr(packet.sender_portid, 0));
+        // Report the ORIGINATING group, not a hardcoded 0. Linux's
+        // `netlink_recvmsg` sets `addr->nl_groups =
+        // netlink_group_mask(NETLINK_CB(skb).dst_group)`, and libudev keys
+        // its unicast-vs-multicast trust decision on exactly this field: a
+        // broadcast that arrives claiming nl_groups==0 is treated as an
+        // untrusted unicast and dropped on the floor.
+        self.netlink_last_recv_group
+            .store(packet.group, Ordering::Release);
+        let peer = Some(Self::netlink_sockaddr(packet.sender_portid, packet.group));
         Some(if n < packet.payload.len() {
             SocketOpResult::ReceivedTruncated {
                 copied: n,
@@ -1639,8 +1745,11 @@ impl FileOps for SocketFile {
                             let _ = rx.take_delivered_packet_cred();
                             Ok(n)
                         }
+                        // Closed peer = real EOF; empty-but-open =
+                        // would-block. Linux `unix_seqpacket_recvmsg` /
+                        // `unix_dgram_recvmsg` return -EAGAIN for the latter.
                         None if rx.is_closed() => Ok(0),
-                        None => Ok(0),
+                        None => Err(FsError::WouldBlock),
                     };
                 }
             }
@@ -1654,7 +1763,9 @@ impl FileOps for SocketFile {
                     drop(self.unix_take_recv_fds());
                     Ok(n)
                 }
-                Err(SockError::WouldBlock) => Ok(0),
+                // do_recv already distinguishes empty-but-open from EOF; pass
+                // its explicit would-block result through unchanged.
+                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
                 Err(_) => Err(FsError::Unsupported),
             }
         })
@@ -1669,40 +1780,6 @@ impl FileOps for SocketFile {
                 Err(_) => Err(FsError::Unsupported),
             }
         })
-    }
-
-    fn read_should_block(&self) -> bool {
-        // `read`/`recv` maps an empty ring to `Ok(0)`, which is indistinguishable
-        // from a real EOF by byte count alone. `sys_read` only blocks a 0-byte
-        // read when this returns true; the default is `false`, so WITHOUT this a
-        // blocking recv on an empty-but-open socket returns a spurious EOF the
-        // instant it finds no data — a blocking server (e.g. one that accept()s
-        // then read()s a request, rather than poll()ing first like libwayland)
-        // sees "peer closed" and gives up. Block while the rx side is still OPEN;
-        // a genuine peer-close (rx closed) correctly falls through to EOF. Use
-        // `!is_closed()` (not `!has_data()`) so data arriving between the read and
-        // this check still re-executes the read instead of returning EOF.
-        let state = self.state.lock();
-        match &*state {
-            SocketState::UnixConnected { rx, .. }
-            | SocketState::InetConnected { rx, .. }
-            | SocketState::Inet6Connected { rx, .. } => !rx.is_closed(),
-            // Kernel-TCP-over-NIC (off-box) sockets: the rx lives in the TCB,
-            // not a RingBuf here, so `readable()` is the authority — it's true
-            // when RX data is buffered OR the peer closed / the connection is
-            // dead (read returns EOF). Block a 0-byte read only while the
-            // connection is OPEN-but-empty (`!readable`). WITHOUT this arm an
-            // `InetWired` socket fell to `_ => false`, so a blocking server
-            // that accept()s then read()s (netserve) saw a spurious EOF the
-            // instant it read before the peer's first segment arrived — the
-            // off-box net-smoke `netserve-fail: read` under slow (TCG) timing;
-            // masked under KVM only because the data always beat the read.
-            SocketState::InetWired { tcb_id, .. } => !narf_net::tcp_stack::readable(*tcb_id),
-            SocketState::UnixDgram { inbox, .. } | SocketState::InetDgram { inbox, .. } => {
-                inbox.is_empty()
-            }
-            _ => false,
-        }
     }
 
     /// A readiness transition on a socket fires `readiness::notify` (the
@@ -3208,6 +3285,9 @@ impl SocketFile {
                     addr: addr.clone(),
                     pending: VecDeque::new(),
                 };
+                #[cfg(feature = "unix-latency-trace")]
+                self.listen_owner_tid
+                    .store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
                 // Pathname listeners insert into LISTENERS here. Abstract
                 // addresses were reserved in bind(), so this is a no-op.
                 if let UnixAddr::Path(p) = addr {
@@ -3308,6 +3388,33 @@ impl SocketFile {
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
+                }
+                // Wayland/dbus connect-latency diagnostic: stamp WHO connected
+                // to WHICH listener path and WHEN, so a slow accept()or is
+                // measurable from the serial log (pairs with UNIXACC below).
+                //
+                // Also available under `unix-latency-trace` alone: the full
+                // syscall firehose writes every syscall to the SYNCHRONOUS
+                // serial console, which inflates the very gap these two lines
+                // measure. Measuring it needs a quiet boot.
+                #[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+                {
+                    use core::fmt::Write as _;
+                    let comm =
+                        crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
+                            .unwrap_or_default();
+                    let path = match &uaddr {
+                        UnixAddr::Path(p) => p.as_str(),
+                        UnixAddr::Abstract(_) => "<abstract>",
+                        UnixAddr::Unnamed => "<unnamed>",
+                    };
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "UNIXENQ ms={} from={} path={}",
+                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                        comm,
+                        path,
+                    );
                 }
                 // Wake a server parked in poll/accept on the listener so it
                 // accepts the new connection immediately (not on a fallback
@@ -4682,6 +4789,112 @@ type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
+/// `unix-latency-trace` starved-accept attribution sweep, called from the
+/// stall watchdog's ~1 s window tick.
+///
+/// The `UNIXENQ`/`UNIXACC` pair measures how long a `connect()` waited for
+/// its `accept()`, but a long gap has three mutually exclusive causes and
+/// the timestamps alone cannot tell them apart. This prints, for every
+/// named AF_UNIX listener with a non-empty pending queue, the listener's
+/// own poll readiness plus the park state of the task that called
+/// `listen()`:
+///
+///   * `ready` WITHOUT `POLLIN` (0x1) while `n > 0` — a poll_mask bug,
+///     right here: the queue is non-empty and the scan says otherwise, so
+///     no amount of waking helps.
+///   * `parked=1` with CLIMBING `scans` across repeated sweeps — the
+///     acceptor's poll re-scan keeps running and keeps not returning this
+///     listener. Kernel readiness bug (and `ready` above says which half).
+///   * `parked=1` with FROZEN `scans` and `checks` — the acceptor is in a
+///     park that never re-fires. Lost wake.
+///   * `parked=1` with `futex != 0`, or `pnfds=0` — the acceptor is
+///     blocked in a NON-poll wait, so this listener is in no polled set at
+///     all. The starvation is the acceptor's own event loop, not the
+///     AF_UNIX wake path.
+///   * `parked=0` with a climbing `scans` — it is running and simply has
+///     not got round to accepting.
+///
+/// Every lock here is `try_lock`: the sweep runs in the timer trap, which
+/// can interrupt a CPU already holding any of them. A skipped sample is
+/// the correct outcome there — blocking would deadlock the machine we are
+/// trying to observe.
+impl SocketFile {
+    /// Record the fd `listen()` was called on. See `listen_owner_fd`.
+    #[cfg(feature = "unix-latency-trace")]
+    pub fn set_listen_owner_fd(&self, fd: u32) {
+        self.listen_owner_fd.store(fd, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "unix-latency-trace")]
+pub fn unix_listener_stall_sweep() {
+    use core::fmt::Write as _;
+    let Some(guard) = LISTENERS.try_lock() else {
+        return;
+    };
+    let listeners: Vec<(String, Arc<SocketFile>)> = guard
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.name.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    drop(guard);
+    let now_ms = narf_scheduler::narf_time::monotonic_ns() / 1_000_000;
+    for (name, l) in listeners {
+        // Prefer the address recorded in the socket's own state: the
+        // registry key's `name` is empty for listeners registered at bind()
+        // time (abstract addresses), which is precisely the systemd/KDE
+        // shape this sweep is aimed at.
+        let (npend, addr) = match l.state.try_lock().as_deref() {
+            Some(SocketState::UnixListener { pending, addr }) => (
+                pending.len(),
+                match addr {
+                    UnixAddr::Path(p) => p.clone(),
+                    UnixAddr::Abstract(a) => alloc::format!(
+                        "<abstract:{}>",
+                        a.iter()
+                            .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                            .collect::<String>()
+                    ),
+                    UnixAddr::Unnamed => String::from("<unnamed>"),
+                },
+            ),
+            _ => continue,
+        };
+        if npend == 0 {
+            continue;
+        }
+        let name = if name.is_empty() { addr } else { name };
+        let ready = narf_filesystem::FileOps::poll_readiness(&*l);
+        let tid = l.listen_owner_tid.load(Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "UNIXPEND ms={now_ms} name={name} n={npend} ready={ready:#x} owner_tid={tid} owner_fd={}",
+            l.listen_owner_fd.load(Ordering::Relaxed) as i32
+        );
+        let Some(task) = crate::task::task_get(tid) else {
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "UNIXPEND-OWNER name={name} tid={tid} GONE — listener outlived its acceptor"
+            );
+            continue;
+        };
+        let uc = &task.uctx;
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "UNIXPEND-OWNER name={name} tid={tid} pid={} st={} parked={} scans={} checks={} pnfds={} epfd_enc={} netio={} futex={:#x} deadline={:#x}",
+            task.pid.load(Ordering::Relaxed),
+            task.state.load(Ordering::Relaxed),
+            uc.parked_in_syscall.load(Ordering::Relaxed) as u8,
+            uc.dbg_poll_scans.load(Ordering::Relaxed),
+            uc.dbg_park_checks.load(Ordering::Relaxed),
+            uc.poll_wait_nfds.load(Ordering::Relaxed),
+            uc.epoll_wait_fd.load(Ordering::Relaxed),
+            uc.net_io_wait.load(Ordering::Relaxed) as u8,
+            uc.futex_uaddr.load(Ordering::Relaxed),
+            uc.sleep_deadline_ns.load(Ordering::Relaxed),
+        );
+    }
+}
+
 /// Release a bound AF_UNIX pathname from the stream + dgram registries so
 /// the address can be re-bound. Called by `unlink(2)` on a socket path —
 /// dbus/wayland `unlink()` a stale socket before re-`bind()`-ing it, and
@@ -4968,6 +5181,158 @@ fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unregistered_netlink_kernel_send_is_refused
+);
+
+/// A userspace multicast send must REACH the group's subscribers.
+///
+/// This is task #12's root cause. `send_netlink_user` used to answer any
+/// `nl_groups != 0` with `NotSupported`, which is what udevd hit after every
+/// processed device:
+///
+/// ```text
+/// sd-device-monitor(manager): Failed to send device to netlink monitor:
+///     Operation not supported
+/// Failed to broadcast event (SEQNUM=23) to libudev listeners
+/// Worker [20] exited with return code 1.
+/// Event loop failed: Operation not supported
+/// ```
+///
+/// That killed udevd's event loop, so `/run/udev/data` stayed empty, no input
+/// device got a `seat` tag, libinput enumerated nothing, and the Wayland seat
+/// came up keyboard-only — the dead mouse.
+///
+/// Linux permits this: `netlink_sendmsg` gates multicast on
+/// `netlink_allowed(sock, NL_CFG_F_NONROOT_SEND)` and refuses with EPERM, not
+/// EOPNOTSUPP; udevd holds CAP_NET_ADMIN and is allowed.
+///
+/// The peer-group assertion is not decoration. libudev's
+/// `device_monitor_receive_device` treats a message arriving with
+/// `nl_groups == 0` as an untrusted UNICAST and discards it, so delivering
+/// the bytes while reporting group 0 would leave udev just as broken while
+/// making this test pass. Linux reports
+/// `netlink_group_mask(NETLINK_CB(skb).dst_group)`.
+fn smoke_netlink_multicast_broadcast_reaches_group_subscriber() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2; // MONITOR_GROUP_UDEV
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+
+    if !matches!(
+        listener.dispatch_op(SocketOp::Bind {
+            addr: SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("listener could not bind to the udev multicast group");
+    }
+
+    let payload = b"add@/devices/platform/narf-input/input1/event1";
+    match sender.dispatch_op(SocketOp::Send {
+        buf: payload,
+        flags: 0,
+        addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+    }) {
+        SocketOpResult::Ok(n) if n == payload.len() as u64 => {}
+        // The exact pre-fix failure.
+        SocketOpResult::Err(SockError::NotSupported) => {
+            return TestResult::Fail(
+                "multicast send returned NotSupported — udevd's event loop dies here",
+            )
+        }
+        _ => return TestResult::Fail("multicast send did not report the full payload length"),
+    }
+
+    let mut buf = [0u8; 128];
+    let peer = match listener.dispatch_op(SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    }) {
+        SocketOpResult::Received { n, peer } => {
+            if n != payload.len() || &buf[..n] != payload {
+                return TestResult::Fail("subscriber received the wrong broadcast bytes");
+            }
+            peer
+        }
+        _ => return TestResult::Fail("group subscriber never received the broadcast"),
+    };
+    match peer.as_ref().and_then(SocketFile::netlink_addr) {
+        Some((_, groups)) if groups == UDEV_GROUP_MASK => TestResult::Pass,
+        Some((_, 0)) => TestResult::Fail(
+            "broadcast reported nl_groups=0 — libudev discards that as untrusted unicast",
+        ),
+        _ => TestResult::Fail("broadcast reported the wrong nl_groups to the receiver"),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_multicast_broadcast_reaches_group_subscriber
+);
+
+/// The negative half: a broadcast goes to the group's subscribers and to
+/// NOBODY else. Without this, "deliver to every netlink socket" would pass
+/// the positive test above while flooding unrelated listeners.
+///
+/// Covers three exclusions: a socket subscribed to a DIFFERENT group, a
+/// socket on a different PROTOCOL, and the sender itself (Linux skips
+/// `sk == ssk` in `do_one_broadcast`).
+fn smoke_netlink_multicast_skips_nonsubscribers_and_sender() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2;
+    const KERNEL_GROUP_MASK: u32 = 1;
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let other_group = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let other_proto = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+
+    // The sender joins the very group it will broadcast to: even a genuine
+    // subscriber must not receive its own broadcast.
+    for (sock, mask) in [
+        (&sender, UDEV_GROUP_MASK),
+        (&other_group, KERNEL_GROUP_MASK),
+        (&other_proto, UDEV_GROUP_MASK),
+    ] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: b"add@/devices/virtual/should-not-fan-out",
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("setup: multicast send failed");
+    }
+
+    let mut buf = [0u8; 128];
+    for (sock, who) in [
+        (&sender, "the sender received its own broadcast"),
+        (
+            &other_group,
+            "a different-group subscriber received the broadcast",
+        ),
+        (
+            &other_proto,
+            "a different-protocol socket received the broadcast",
+        ),
+    ] {
+        if let SocketOpResult::Received { .. } = sock.dispatch_op(SocketOp::Recv {
+            buf: &mut buf,
+            flags: 0,
+        }) {
+            return TestResult::Fail(who);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_multicast_skips_nonsubscribers_and_sender
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {

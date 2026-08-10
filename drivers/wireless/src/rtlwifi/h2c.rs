@@ -288,7 +288,7 @@ pub unsafe fn poll_fw_ready(mmio: &MmioRegion) -> Result<(), FwDlError> {
         mmio.write8(REG_RSV_CTRL + 1, v & !0x01);
         let v = mmio.read8(REG_SYS_FUNC_EN + 1);
         mmio.write8(REG_SYS_FUNC_EN + 1, v & !0x04);
-        narf_time::busy_wait_cycles(50 * 1_000 * narf_time::cycles_per_ns().max(1) as u64);
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000));
         let v = mmio.read8(REG_RSV_CTRL + 1);
         mmio.write8(REG_RSV_CTRL + 1, v | 0x01);
         let v = mmio.read8(REG_SYS_FUNC_EN + 1);

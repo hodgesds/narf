@@ -201,6 +201,18 @@ unit_diag_once() {
       printf 'EXECPROBE: %-46s NOT EXECUTABLE\n' "$b"
     fi
   done
+  # Why is the foot terminal empty? foot renders its grid and cursor but
+  # shows no prompt, so foot works and the SHELL it spawns produces
+  # nothing. This walks a terminal's exact PTY sequence — posix_openpt,
+  # grantpt, unlockpt(TIOCSPTLCK), ptsname(TIOCGPTN), open slave, fork,
+  # setsid+TIOCSCTTY+dup, exec, then read the master — and names the
+  # failing syscall instead of leaving "the window is blank".
+  if [ -x /usr/local/libexec/narf-pty-probe ]; then
+    /usr/local/libexec/narf-pty-probe 2>&1 |
+      while IFS= read -r l; do printf 'PTYP: %s\n' "$l"; done
+  else
+    echo "PTYP: probe binary MISSING"
+  fi
   echo "UNITBLOCK: --- failed user units, in full ---"
   for u in $(systemctl --user list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
     systemctl --user status "$u" --no-pager -n 25 2>&1 |

@@ -2530,6 +2530,167 @@ kernel_test_in!(
     smoke_chrooted_global_mountinfo_uses_visible_paths
 );
 
+// ── Smoke: execve's image read must survive a slow (contended) store ─
+// The execve image read streams the whole binary through the VFS. On a
+// disk-backed filesystem under concurrent block I/O (KDE startup streams
+// tens of MB of DSOs while services exec), one read future legitimately
+// takes millions of re-polls to complete. Pumping it with the
+// budget-capped `poll_blocking` (4M iterations) overruns → execve
+// returns EIO for a perfectly healthy binary. Observed in-guest as
+//   EXECVE-EIO read overrun off=0 size=1427000
+//     path=/mnt/usr/lib/systemd/systemd-executor
+// and as bash's "/usr/bin/plasmashell: Input/output error". The overrun
+// ALSO drops the in-flight read future — on ext2 that abandons a
+// virtio-blk request DMA'ing into a scratch buffer that Drop just
+// returned to the pool (the exact hazard `poll_io_to_completion` was
+// introduced for, and which the PT_INTERP read already uses).
+//
+// Fixture: a filesystem whose file read yields Pending ~6M times before
+// completing — more than poll_blocking's budget, far under
+// poll_io_to_completion's. The exec must reach ELF validation (junk
+// bytes → InvalidOp), NOT fail the read with EIO.
+fn smoke_execve_image_read_survives_slow_backing_store() -> TestResult {
+    use alloc::boxed::Box;
+    use narf_filesystem::{
+        DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
+    };
+
+    /// Future that completes only after `n` Pending polls — a stand-in for
+    /// a block-I/O future waiting out a contended device queue.
+    struct PendN(u64);
+    impl core::future::Future for PendN {
+        type Output = ();
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            if self.0 == 0 {
+                core::task::Poll::Ready(())
+            } else {
+                self.0 -= 1;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+    }
+
+    // More polls than poll_blocking's 4M budget; trivially inside
+    // poll_io_to_completion's 2G backstop.
+    const SLOW_READ_PENDS: u64 = 6_000_000;
+
+    struct SlowFile {
+        data: Vec<u8>,
+    }
+    impl FileOps for SlowFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move {
+                PendN(SLOW_READ_PENDS).await;
+                let start = offset as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = (self.data.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[start..start + n]);
+                Ok(n)
+            })
+        }
+        fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: self.data.len() as u64,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms: 0o755,
+                },
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    struct SlowDir {
+        file: Arc<SlowFile>,
+    }
+    impl DirOps for SlowDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            (name == "prog").then(|| self.file.clone() as Arc<dyn FileOps>)
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+
+    struct SlowFs {
+        root: Arc<SlowDir>,
+    }
+    impl FsInstance for SlowFs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            self.root.clone()
+        }
+        fn name(&self) -> &str {
+            "slowexecfs"
+        }
+    }
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_20);
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::__test_cwd_reset();
+    const TARGET: &str = "/slowexec";
+    let _ = unmount_for_test(TARGET);
+
+    // 128 junk bytes: >= the loader's 64-byte minimum, not a shebang, not
+    // ELF — so a COMPLETED read reaches ELF validation and fails InvalidOp
+    // without ever building a user context.
+    let fs: Arc<dyn FsInstance> = Arc::new(SlowFs {
+        root: Arc::new(SlowDir {
+            file: Arc::new(SlowFile {
+                data: alloc::vec![0xAAu8; 128],
+            }),
+        }),
+    });
+    let authority = narf_filesystem::bootstrap_mount_authority();
+    if narf_filesystem::registry()
+        .mount_arc(&authority, TARGET, fs)
+        .is_err()
+    {
+        return TestResult::Fail("mount of /slowexec failed");
+    }
+
+    let path = b"/slowexec/prog\0";
+    let arg0 = b"prog\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
+    let mut ectx = StubCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::sys_execve(&mut ectx);
+    let _ = unmount_for_test(TARGET);
+
+    match ectx.ret {
+        // EIO (-5): the image read was aborted by the poll budget — the bug.
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -5 => TestResult::Fail(
+            "execve EIO'd a healthy binary on a slow store (image-read poll budget overran)",
+        ),
+        // InvalidOp: the read completed and the junk failed ELF validation —
+        // the read path survived the slow store. Pass.
+        Some(r) if r.status != SyscallReturn::OK => TestResult::Pass,
+        _ => TestResult::Fail("execve on /slowexec/prog returned an unexpected status"),
+    }
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_execve_image_read_survives_slow_backing_store
+);
+
 // Helper: unmount a path under a fresh bootstrap handle. The
 // registry's unmount is keyed by path; the handle check is the
 // authority gate.

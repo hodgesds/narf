@@ -58,23 +58,28 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         }
         let mut kbuf = alloc::vec![0u8; len];
         let res = poll_blocking(ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
+        // The explicit would-block signal. `Ok(0)` is EOF, so a consumer
+        // cannot accidentally turn an empty-but-open stream into a close.
+        let res = match res {
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                if nonblock {
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    return;
+                }
+                if park_reexecute_on_io(ctx) {
+                    return;
+                }
+                // No executor (kernel-test context): fall through as a dry read.
+                Ok(0)
+            }
+            // Bytes already gathered: stop here and report them, exactly as a
+            // short read would.
+            Err(narf_filesystem::FsError::WouldBlock) => break,
+            other => other,
+        };
         match res {
             Ok(0) if total == 0 => {
-                // Nothing read yet and the stream is dry. An open-but-empty
-                // pipe/socket must NOT report EOF (`fs/pipe.c::pipe_read`:
-                // "!pipe->writers → 0" is the ONLY 0 return): O_NONBLOCK →
-                // -EAGAIN, blocking → park + RE-EXECUTE the whole readv (no
-                // bytes were consumed, so a re-run is idempotent).
-                if ops.read_should_block() {
-                    if nonblock {
-                        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-                        return;
-                    }
-                    if park_reexecute_on_io(ctx) {
-                        return;
-                    }
-                }
-                // Genuine EOF (or kernel-test context with no executor).
+                // A successful zero-byte read is genuine EOF.
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }

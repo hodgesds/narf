@@ -4039,6 +4039,10 @@ fn boot_userspace_init() {
                 // how dbus-daemon learns an activated service died.
                 ("pipehup_smoke", narf_verification::NARF_PIPEHUP_SMOKE_ELF),
                 ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
+                // The terminal chain end to end. Shipped in the KDE image
+                // since 6-Aug with nothing running it; staged here so
+                // `cargo xtask musl-demo` gates on it every run.
+                ("ptyspawn_smoke", narf_verification::NARF_PTYSPAWN_SMOKE_ELF),
                 // Linux-compat round 2: mremap / sendfile / creds / waitid.
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),
                 ("sendfile_smoke", narf_verification::NARF_SENDFILE_SMOKE_ELF),

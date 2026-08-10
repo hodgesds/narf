@@ -434,8 +434,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Poll for grant. 1 ms cap matches i915's default
         // `enable_timeout`. The PRM says "must complete within
         // 100 µs"; 10× headroom absorbs slow firmware.
-        let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
-        let budget = 1_000_000u64.saturating_mul(cpns);
+        let budget = narf_time::wall::ns_to_cycles(1_000_000);
         let start = narf_time::now_cycles();
         loop {
             let s = self.mmio.read32(PWR_WELL_CTL2);
@@ -759,8 +758,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // The plane is already armed by `program_plane`'s SURF
         // write. Spin one frame-time so the scanout flips before
         // the caller observes "modeset done".
-        let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
-        let budget = 20_000_000u64.saturating_mul(cpns);
+        let budget = narf_time::wall::ns_to_cycles(20_000_000);
         let start = narf_time::now_cycles();
         while narf_time::now_cycles().wrapping_sub(start) < budget {
             core::hint::spin_loop();
@@ -802,8 +800,7 @@ fn wait_bit<M: MmioWindow + ?Sized>(
     want_set: bool,
     timeout_ns: u64,
 ) -> bool {
-    let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
-    let budget = timeout_ns.saturating_mul(cpns);
+    let budget = narf_time::wall::ns_to_cycles(timeout_ns);
     let start = narf_time::now_cycles();
     loop {
         let v = mmio.read32(off);

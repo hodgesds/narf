@@ -401,8 +401,7 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
 
     // ~5 ms in the future: comfortably > IOAPIC programming latency,
     // well under any reasonable test timeout.
-    let cycles_per_ns = narf_time::cycles_per_ns() as u64;
-    let cycles_5ms = cycles_per_ns * 5_000_000;
+    let cycles_5ms = narf_time::ns_to_cycles(5_000_000);
     let deadline = narf_time::Instant::now().plus_cycles(cycles_5ms);
     let mut s = narf_time::SleepUntil::new(deadline);
 
@@ -415,7 +414,7 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
 
     let start = narf_time::Instant::now();
     let mut woken = false;
-    while narf_time::Instant::now().cycles_since(start) < cycles_per_ns * 500_000_000 {
+    while narf_time::Instant::now().cycles_since(start) < narf_time::ns_to_cycles(500_000_000) {
         if cw.0.load(Ordering::Relaxed) > 0 {
             woken = true;
             break;

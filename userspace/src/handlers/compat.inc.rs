@@ -551,10 +551,6 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.tty_tostop()
     }
 
-    fn read_should_block(&self) -> bool {
-        self.inner.read_should_block()
-    }
-
     fn write_should_block(&self) -> bool {
         self.inner.write_should_block()
     }
@@ -794,14 +790,41 @@ fn do_execve_resolved(
         // binary (e.g. systemd-udevd → ../../bin/udevadm) is invisible → ENOENT
         // → 203/EXIT_EXEC. (Global resolution only worked while a pivot_root bug
         // leaked the bind into the global registry.)
+        // Pump every FS future with `poll_io_to_completion`, NOT the
+        // budget-capped `poll_blocking`: the image read streams the whole
+        // binary, and under concurrent block I/O (KDE startup streams tens of
+        // MB of DSOs while services exec) one healthy read legitimately takes
+        // more re-polls than poll_blocking's budget. The overrun surfaced as
+        // execve(2) = EIO for large binaries exec'd at busy moments
+        // (plasmashell, xdg-desktop-portal-kde, systemd-executor) while the
+        // same binaries exec'd fine when quiet. Overrunning ALSO drops the
+        // in-flight read future, abandoning a virtio-blk request that is
+        // still DMA'ing into a scratch buffer Drop just returned to the pool
+        // — the exact hazard poll_io_to_completion exists for, and which the
+        // PT_INTERP read (read_path_from_vfs) already avoids the same way.
         let ops = match current_resolve_absolute(&ep, |fs, rel| {
-            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+            poll_io_to_completion(narf_filesystem::resolve_async(fs.root(), rel))
         }) {
             Some(Some(Ok(o))) => o,
             // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
             None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-2),
-            // poll_blocking overran, or a real FS error → EIO.
-            Some(None) | Some(Some(Err(_))) => return Err(-5),
+            // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
+            // Loud: a silent EIO here cost a full debugging session (bash
+            // reports only "Input/output error").
+            Some(None) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(narf_console::Writer, "EXECVE-EIO resolve overrun path={ep}");
+                return Err(-5);
+            }
+            // A real FS error → EIO.
+            Some(Some(Err(e))) => {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "EXECVE-EIO resolve err={e:?} path={ep}"
+                );
+                return Err(-5);
+            }
         };
         let file_size = ops.stat().size as usize;
         if file_size == 0 {
@@ -813,10 +836,27 @@ fn do_execve_resolved(
         let mut buf = alloc::vec![0u8; file_size];
         let mut off = 0usize;
         while off < file_size {
-            match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+            match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
-                _ => return Err(-5), // EIO
+                Some(Err(e)) => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO read err={e:?} off={off} size={file_size} path={ep}"
+                    );
+                    return Err(-5);
+                }
+                // Only a genuinely-wedged device exhausts the 2G-poll
+                // backstop. Loud, then EIO — never silently truncate.
+                None => {
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "EXECVE-EIO read overrun off={off} size={file_size} path={ep}"
+                    );
+                    return Err(-5);
+                }
             }
         }
         buf.truncate(off);
@@ -1178,7 +1218,10 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec![0u8; size];
     let mut off = 0usize;
     while off < size {
-        match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+        // Same rule as the main image read in read_exec: an exec image read
+        // is never pumped with the budget-capped poll_blocking (overrun both
+        // fails a healthy exec AND drops an in-flight block-I/O future).
+        match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
             Some(Ok(0)) => break,
             Some(Ok(n)) => off += n,
             _ => return None,
@@ -2513,6 +2556,59 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
     *e = e.saturating_add(delta_ns);
 }
 
+/// Timer-trap-safe `(user_ns, kernel_ns)` for `task`. `None` on lock
+/// contention.
+///
+/// The split is the discriminator when a process burns tens of seconds
+/// before it starts serving: overwhelmingly USER time is compute the
+/// kernel cannot help with (llvmpipe/LLVM under a software renderer),
+/// while a large KERNEL share names the syscall or fault path as the
+/// cost, which IS ours.
+#[cfg(feature = "unix-latency-trace")]
+pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
+    let u = TASK_CPU_NS
+        .try_lock()?
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
+    let k = TASK_KERN_NS
+        .try_lock()?
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
+    Some((u, k))
+}
+
+/// Fold the currently-open on-CPU kernel span into `task`'s accumulator and
+/// close it. Idempotent: a closed span (start == 0) folds nothing.
+///
+/// Called at every point the task stops executing kernel code — the park
+/// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
+/// only, never the sleep in between.
+pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
+    let start = uc.kern_span_start_ns.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if start == 0 {
+        return;
+    }
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let delta = now.saturating_sub(start);
+    if delta == 0 {
+        return;
+    }
+    let mut g = TASK_KERN_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta);
+}
+
+/// Open (or re-open) the on-CPU kernel span for the current task.
+pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
+    uc.kern_span_start_ns.store(
+        narf_scheduler::narf_time::monotonic_ns(),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
 pub fn kern_time_ns_of(task: u64) -> u64 {
     TASK_KERN_NS
@@ -2528,6 +2624,16 @@ pub fn kern_time_ns_of(task: u64) -> u64 {
 /// (TCG) execution that cumulative time crosses one tick and flaps the `times`
 /// stime==0 assertion. The times test resets it first so it measures a fresh
 /// task, which is what the assertion means.
+/// Test hook: clear `task`'s accumulated in-syscall CPU time. The
+/// no-argument form only reaches the CURRENT task, which a test driving a
+/// stand-in `UserTaskCtx` is not.
+#[doc(hidden)]
+pub fn __test_reset_kernel_time_for(task: u64) {
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
+        m.remove(&task);
+    }
+}
+
 #[doc(hidden)]
 pub fn __test_reset_kernel_time() {
     let task = current_task_id();
@@ -3256,6 +3362,26 @@ pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
 /// `proc_pid_to_tid` a second time.
 pub fn proc_comm_of_task(tid: u64) -> Option<alloc::string::String> {
     let g = PROC_COMM.lock();
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
+/// `proc_comm_of_task` for callers running in the timer trap, which can
+/// interrupt a CPU already holding `PROC_COMM` — blocking there deadlocks
+/// the machine the caller is trying to observe. Returns `None` on
+/// contention; a missing name in a diagnostic line is the right trade.
+#[cfg(feature = "unix-latency-trace")]
+pub fn proc_comm_of_task_try(tid: u64) -> Option<alloc::string::String> {
+    let g = PROC_COMM.try_lock()?;
+    g.as_ref().and_then(|m| m.get(&tid).cloned())
+}
+
+/// Timer-trap-safe argv lookup, keyed by TID (both `PROC_ARGV` and
+/// `PROC_COMM` are tid-keyed despite their `pid` parameter names — see
+/// `proc_argv_of`, which resolves pid→tid before indexing). Returns the
+/// NUL-separated pack; `None` on lock contention.
+#[cfg(feature = "unix-latency-trace")]
+pub fn proc_argv_of_task_try(tid: u64) -> Option<alloc::vec::Vec<u8>> {
+    let g = PROC_ARGV.try_lock()?;
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
@@ -5946,6 +6072,21 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
             socket_arc_register(&socket);
             let task = current_task_id();
+            // Pairs with UNIXENQ (socket.rs Connect): stamps when the
+            // listener's owner finally accept()ed, so connect→accept
+            // latency is measurable from the serial log.
+            #[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+            {
+                use core::fmt::Write as _;
+                let comm = proc_comm_of_task(task).unwrap_or_default();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "UNIXACC ms={} by={} lfd={}",
+                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                    comm,
+                    fd,
+                );
+            }
             let new_fd = match fd::with_table(task, |t| {
                 t.open(crate::fd::FdEntry {
                     ops: socket,

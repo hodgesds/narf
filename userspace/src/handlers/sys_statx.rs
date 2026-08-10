@@ -125,8 +125,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // mtime: monotonic cycles → ns via the wall-clock calibration.
     // Wall-clock per inode isn't tracked, so this surfaces a
     // stable monotonic ordering, not a real wall time.
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let mtime_ns = s.mtime_cycles / cpns;
+    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
     let mtime = StatxTimestamp {
         tv_sec: (mtime_ns / 1_000_000_000) as i64,
         tv_nsec: (mtime_ns % 1_000_000_000) as u32,

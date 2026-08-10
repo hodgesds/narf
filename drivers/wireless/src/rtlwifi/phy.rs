@@ -159,11 +159,11 @@ pub const BB_ADDR_LDELAY: u32 = 0xFFE;
 pub unsafe fn write_bb_table(mmio: &MmioRegion, table: &[BbRow]) {
     for row in table {
         if row.addr == BB_ADDR_DELAY {
-            narf_time::busy_wait_cycles(50 * 1_000 * narf_time::cycles_per_ns().max(1) as u64);
+            narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000));
             continue;
         }
         if row.addr == BB_ADDR_LDELAY {
-            narf_time::busy_wait_cycles(50 * 1_000_000 * narf_time::cycles_per_ns().max(1) as u64);
+            narf_time::busy_wait_cycles(narf_time::ns_to_cycles(50 * 1_000_000));
             continue;
         }
         // SAFETY: caller-asserted in-range.

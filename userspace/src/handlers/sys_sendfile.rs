@@ -19,7 +19,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
         return;
     }
     match copy_fd_to_fd(task, in_fd, a.arg0 as u32, a.arg2, a.arg3 as usize) {
-        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+        Some(Ok(total)) => ctx.set_return(SyscallReturn::ok(total as u64)),
+        Some(Err(_)) | None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
 }

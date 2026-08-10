@@ -2077,8 +2077,7 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
-    let cpns = narf_time::cycles_per_ns().max(1) as u64;
-    let mtime_ns = s.mtime_cycles / cpns;
+    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
     let mtime = linux_compat::Timespec {
         tv_sec: (mtime_ns / 1_000_000_000) as i64,
         tv_nsec: (mtime_ns % 1_000_000_000) as i64,
@@ -2875,7 +2874,7 @@ fn copy_fd_to_fd(
     out_fd: u32,
     in_off_ptr: u64,
     count: usize,
-) -> Option<usize> {
+) -> Option<Result<usize, narf_filesystem::FsError>> {
     let use_off_ptr = in_off_ptr != 0;
     let mut in_off: u64 = if use_off_ptr {
         // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
@@ -2890,21 +2889,32 @@ fn copy_fd_to_fd(
     const CHUNK: usize = 4096;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let kbuf: alloc::vec::Vec<u8> = fd::with_table(task, |t| {
+        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> = fd::with_table(task, |t| {
             let entry = t.get_mut(in_fd)?;
             let off = if use_off_ptr { in_off } else { entry.offset };
             let mut kbuf = alloc::vec![0u8; want];
             let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
                 Some(Ok(n)) => n,
-                _ => 0,
+                Some(Err(error)) => return Some(Err(error)),
+                None => 0,
             };
             kbuf.truncate(n);
             if !use_off_ptr {
                 entry.offset = off.saturating_add(n as u64);
             }
-            Some(kbuf)
+            Some(Ok(kbuf))
         })
         .flatten()?;
+        let kbuf = match read_result {
+            Ok(kbuf) => kbuf,
+            // A short copy is reported normally; only an initial would-block
+            // must reach splice so it can park or return EAGAIN instead of
+            // mistaking the empty pipe for EOF.
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                return Some(Err(narf_filesystem::FsError::WouldBlock));
+            }
+            Err(_) => break,
+        };
         if kbuf.is_empty() {
             break; // EOF on in_fd
         }
@@ -2931,7 +2941,7 @@ fn copy_fd_to_fd(
         // range-validates the 8-byte write-back of the advanced offset.
         let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
     }
-    Some(total)
+    Some(Ok(total))
 }
 
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
@@ -6608,6 +6618,15 @@ pub(crate) fn parent_of_get(child: u64) -> Option<u64> {
     g.as_ref().and_then(|m| m.get(&child).copied())
 }
 
+/// `parent_of_get` for the timer trap, which can interrupt a CPU already
+/// holding `PARENT_OF`. Returns `None` on contention rather than
+/// deadlocking the machine under observation.
+#[cfg(feature = "unix-latency-trace")]
+pub(crate) fn parent_of_get_try(child: u64) -> Option<u64> {
+    let g = PARENT_OF.try_lock()?;
+    g.as_ref().and_then(|m| m.get(&child).copied())
+}
+
 /// Drop the child→parent record once the child has been reaped (or is an
 /// orphan being auto-released). Lets `has_living_child` correctly report
 /// ECHILD after the last child is reaped — without this, stale entries make
@@ -7602,6 +7621,16 @@ pub fn current_task_sid_user() -> u64 {
     pgid_to_user(read_sid(current_task_id()))
 }
 
+/// The current task's process-group id in the visible-pid space — exactly
+/// what `getpgrp()` reports (see `sys_getpgrp`). Use this, never the raw
+/// [`current_task_pgid`], for any value handed to userspace or compared
+/// against a userspace-supplied pgrp; see the number-space note above
+/// `pgid_to_user`.
+#[cfg(feature = "linux-compat")]
+pub fn current_task_pgid_user() -> u64 {
+    pgid_to_user(read_pgid(current_task_id()))
+}
+
 /// Child inherits the parent's process-group id (POSIX fork semantics).
 /// Without this a forked child defaults to pgid == its own pid, which
 /// would place a shell-launched foreground job in a *different* group than
@@ -7726,13 +7755,28 @@ pub fn ctty_for(task: u64) -> Option<u32> {
 
 /// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can
 /// record the caller's controlling tty without depending on this crate.
+///
+/// Returns the caller's `(session id, process group id)` so the PTY can
+/// complete Linux's `__proc_set_tty`: acquiring a controlling terminal
+/// installs the tty's session AND its foreground process group. The pgrp
+/// half is what makes `tcgetpgrp()` answer truthfully, without which a
+/// job-control shell stops itself on SIGTTIN and never prints a prompt.
 #[cfg(feature = "linux-compat")]
-pub fn set_controlling_tty(pty_index: u32) {
+pub fn set_controlling_tty(pty_index: u32) -> (u64, u64) {
     let task = current_task_id();
-    let mut g = CTTY_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, pty_index);
+    {
+        let mut g = CTTY_TABLE.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(task, pty_index);
+        }
     }
+    // BOTH values must be in the VISIBLE-pid space, because userspace
+    // compares what tcgetpgrp() reports against its own getpgrp() — which is
+    // `pgid_to_user(read_pgid(..))`. Returning the raw task-space pgid here
+    // would reintroduce, on PTYs, exactly the divergence documented above
+    // `pgid_to_user`: a foreground leader read as "background", SIGTTIN, and
+    // a shell stopped at its first read.
+    (current_task_sid_user(), current_task_pgid_user())
 }
 
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot

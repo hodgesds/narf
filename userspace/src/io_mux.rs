@@ -56,7 +56,10 @@ impl FileOps for EventFd {
                 let mut cur = self.counter.load(Ordering::Acquire);
                 loop {
                     if cur == 0 {
-                        return Ok(0);
+                        // Linux fs/eventfd.c::eventfd_read — a zero counter is
+                        // -EAGAIN, never 0. Ok(0) here would read as EOF to any
+                        // consumer that did not also consult an opt-in.
+                        return Err(FsError::WouldBlock);
                     }
                     match self.counter.compare_exchange_weak(
                         cur,
@@ -71,7 +74,7 @@ impl FileOps for EventFd {
             } else {
                 let cur = self.counter.swap(0, Ordering::AcqRel);
                 if cur == 0 {
-                    return Ok(0);
+                    return Err(FsError::WouldBlock);
                 }
                 (cur, cur >= u64::MAX - 1)
             };
@@ -149,6 +152,20 @@ impl FileOps for EventFd {
 
     /// eventfd `write` fires `readiness::notify` (above), so a blocking poll
     /// over an eventfd can PARK instead of busy-spinning — the write wakes it.
+    /// An empty eventfd read must WAIT, never report end-of-file.
+    ///
+    /// `read()` on an eventfd whose counter is 0 blocks on Linux, or returns
+    /// EAGAIN on an O_NONBLOCK fd. It NEVER returns 0 — `read() == 0` means
+    /// hangup, and eventfd is the wakeup primitive under every Qt/GLib event
+    /// loop, so a phantom EOF there makes the loop treat its own wakeup
+    /// channel as dead.
+    ///
+    /// The read op returns [`FsError::WouldBlock`] on an empty counter, which
+    /// `sys_read` turns into a park or EAGAIN without re-classifying `Ok(0)`.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     fn readiness_notifies(&self) -> bool {
         true
     }
@@ -263,12 +280,29 @@ impl TimerFd {
 }
 
 impl FileOps for TimerFd {
+    /// An unexpired timerfd read must WAIT, never report end-of-file.
+    ///
+    /// Linux blocks a `read()` on a timerfd with no expirations, or returns
+    /// EAGAIN on an O_NONBLOCK fd. It never returns 0 — `read() == 0` means
+    /// hangup. The old comment here ("libc loops until non-zero") described
+    /// the SYMPTOM as if it were the contract: a caller handed a 0 has
+    /// nothing to wait on, so it re-reads immediately and BURNS CPU. That is
+    /// a busy-spin the kernel is inflicting on userspace, not libc's design.
+    ///
+    /// `sys_read` turns its explicit `WouldBlock` result into a park or an
+    /// EAGAIN. Same class as the pipe, PTY, /dev/uinput, and EventFd.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             self.tick();
             let mut s = self.state.lock();
             if s.expirations == 0 {
-                return Ok(0); // libc loops until non-zero
+                // Linux fs/timerfd.c::timerfd_read — an unexpired timer is
+                // -EAGAIN, never 0.
+                return Err(FsError::WouldBlock);
             }
             if buf.len() < 8 {
                 return Err(FsError::InvalidPath);
@@ -356,11 +390,25 @@ impl SignalFd {
 }
 
 impl FileOps for SignalFd {
+    /// A signalfd with nothing pending must WAIT, never report end-of-file.
+    ///
+    /// Linux blocks a `read()` on a signalfd with no pending signal in its
+    /// mask, or returns EAGAIN on an O_NONBLOCK fd; 0 would mean hangup.
+    /// Handing back 0 makes a signal-driven loop treat its own signal
+    /// channel as closed — and a caller that retries instead burns CPU.
+    ///
+    /// Same class as pipe / PtyMaster / uinput / EventFd / TimerFd.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let pending = self.pending_in_mask();
             if pending == 0 {
-                return Ok(0);
+                // Linux fs/signalfd.c::signalfd_read — no pending signal is
+                // -EAGAIN, never 0.
+                return Err(FsError::WouldBlock);
             }
             // Drain the lowest pending bit. signalfd_siginfo is
             // 128 bytes; we fill only the first 4 (ssi_signo) and

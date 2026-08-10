@@ -3,9 +3,8 @@
  *
  * A server that accept()s then read()s a request directly (rather than poll()ing
  * first, as libwayland/weston do) used to get read()==0 the instant the rx ring
- * was empty: `read` mapped the empty-ring `WouldBlock` to `Ok(0)`, and the
- * socket didn't override `read_should_block()` (default false), so `sys_read`
- * treated the empty-but-open ring as end-of-file and the server saw "client
+ * was empty: `read` mapped the empty-ring `WouldBlock` to `Ok(0)`, so
+ * `sys_read` treated the empty-but-open ring as end-of-file and the server saw "client
  * closed" and gave up. (libwayland masks it by reading only after poll reports
  * the fd readable.) This reproduces it directly:
  *   - parent: bind+listen, BLOCKING accept(), then BLOCKING read(),
@@ -27,7 +26,7 @@ static const char *SOCKPATH = "/tmp/uxe.sock";
 
 static void on_alarm(int sig) {
     (void)sig;
-    const char *m = "uxe-fail: blocking recv hung (read_should_block?)\n";
+    const char *m = "uxe-fail: blocking recv hung\n";
     (void)!write(1, m, strlen(m));
     _exit(1);
 }

@@ -236,10 +236,19 @@ fn smoke_pty_slave_icanon_blocks_until_newline() -> TestResult {
     // Write bytes without a newline.
     poll_once(master.write(0, b"partial"));
 
-    // Slave read with ICANON on should return 0 (no complete line yet).
+    // ICANON with no completed line yet is WOULD-BLOCK, not end-of-file.
+    // It used to answer Ok(0) and make a separate query say which it meant; a
+    // shell handed that 0 concludes its stdin closed and exits instantly. A
+    // real `^D` EOF still returns Ok(0) — covered by
+    // smoke_pty_slave_ctrl_d_returns_eof.
     let mut buf = [0u8; 16];
     let r = poll_once(slave.read(0, &mut buf));
-    if !matches!(r, Some(Ok(0))) {
+    if matches!(r, Some(Ok(0))) {
+        return TestResult::Fail(
+            "slave ICANON read returned EOF before newline — a shell exits on that",
+        );
+    }
+    if !matches!(r, Some(Err(FsError::WouldBlock))) {
         return TestResult::Fail("slave ICANON read returned bytes before newline");
     }
 
@@ -446,8 +455,11 @@ fn smoke_pty_ctrl_c_raises_fg_pgrp_signal() -> TestResult {
     // The ^C must not surface to the slave.
     let slave = PtySlave::new(pts_lookup(idx).expect("slave"));
     let mut buf = [0u8; 4];
+    // Consumed as a signal character ⇒ nothing left to read ⇒ would-block,
+    // NOT a 0 that the slave would read as end-of-file.
     let n = match poll_once(slave.read(0, &mut buf)) {
         Some(Ok(n)) => n,
+        Some(Err(FsError::WouldBlock)) => 0,
         _ => 99,
     };
 
@@ -862,3 +874,285 @@ fn smoke_pty_poll_readiness_tracks_ring_depth() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_poll_readiness_tracks_ring_depth);
+
+/// An EMPTY master read must say "would block", never end-of-file.
+///
+/// `read()` returning 0 on a PTY master means the slave hung up. Reporting
+/// it merely because the ring is momentarily empty hands the terminal a
+/// phantom EOF: it concludes the shell exited and stops reading forever.
+///
+/// That is precisely why the `foot` window rendered its grid and cursor but
+/// never a prompt. A probe walking a terminal's own sequence in-guest
+/// (posix_openpt, grantpt, unlockpt, ptsname, open slave, fork,
+/// setsid+TIOCSCTTY+dup, exec) showed EVERY step succeeding and the child
+/// shell exiting 0, with the master read returning `n=0 errno=0` before the
+/// child's output landed. Allocation, exec and the shell were all fine; the
+/// slave->master path reported EOF.
+///
+/// The file op returns `FsError::WouldBlock`, which `sys_read` converts to a
+/// park or EAGAIN. Both empty and data-ready directions are asserted.
+fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+
+    // Nothing written yet: the master must report would-block, not EOF.
+    // Asserted on the read itself. The old out-of-band classification let a
+    // consumer turn an empty live PTY into a phantom EOF.
+    let mut buf = [0u8; 32];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail(
+                "empty master read returned 0 — a terminal takes that as the shell \
+                 exiting and stops reading (blank foot window)",
+            )
+        }
+        _ => return TestResult::Fail("empty master read did not report would-block"),
+    }
+
+    // Now the slave writes — as a shell's stdout does.
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+    let payload = b"PTY-CHILD-ALIVE\n";
+    match poll_once(slave.write(0, payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("slave write failed"),
+    }
+
+    // With data pending the master must hand it over.
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) if n == payload.len() => {
+            if &buf[..n] != payload {
+                return TestResult::Fail("master read returned the wrong bytes");
+            }
+        }
+        _ => return TestResult::Fail("master read did not return the slave's bytes"),
+    }
+
+    // Drained again → would-block, not EOF.
+    if !matches!(
+        poll_once(master.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("drained master did not report would-block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_master_empty_read_is_would_block_not_eof
+);
+
+/// An empty slave read blocks — but a latched `^D` EOF still returns 0.
+///
+/// This is the one PTY case where a 0-byte read is sometimes CORRECT.
+/// Canonical mode latches `^D` as a genuine end-of-file a shell must see
+/// exactly once, so the empty case cannot simply be made to block: doing
+/// that would hang every shell at its first `^D` instead of exiting it.
+///
+/// But "no completed line yet" is NOT eof. A reader handed 0 there decides
+/// its input closed and exits — which is how an interactive shell dies the
+/// moment it starts, the slave-side twin of the blank `foot` window that
+/// `PtyMaster` caused.
+///
+/// So both halves are asserted together, because the fix is only correct if
+/// it distinguishes them:
+///   1. empty, no ^D        -> would-block (must NOT look like EOF)
+///   2. ^D latched          -> NOT would-block, and the read returns 0
+///   3. data queued         -> NOT would-block, read returns the data
+fn smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    // 1. Nothing typed yet: must report would-block, not EOF.
+    let mut buf = [0u8; 32];
+    if !matches!(
+        poll_once(slave.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail(
+            "empty slave read did not report would-block — a shell takes EOF as its input closing \
+             and exits immediately",
+        );
+    }
+
+    // 2. Master writes a complete line: data is ready, so no blocking.
+    match poll_once(master.write(0, b"hello\n")) {
+        Some(Ok(6)) => {}
+        _ => return TestResult::Fail("master write of a line failed"),
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(n)) if n == 6 && &buf[..n] == b"hello\n" => {}
+        _ => return TestResult::Fail("slave read did not return the queued line"),
+    }
+
+    // Drained again -> back to would-block.
+    if !matches!(
+        poll_once(slave.read(0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("drained slave did not report would-block");
+    }
+
+    // 3. ^D (EOT, 0x04) latches a REAL eof: must stop blocking and read 0.
+    match poll_once(master.write(0, b"\x04")) {
+        Some(Ok(1)) => {}
+        _ => return TestResult::Fail("master write of ^D failed"),
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("^D did not produce a 0-byte end-of-file read"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_slave_empty_blocks_but_ctrl_d_is_real_eof
+);
+
+/// The PTY hangup matrix, both directions, against the Linux sources.
+///
+/// A PTY has TWO end-of-stream conditions and they are NOT symmetric.
+/// `drivers/tty/pty.c` `pty_close` sets `TTY_OTHER_CLOSED` on the peer
+/// whichever side closes, but the MASTER's close additionally
+/// `tty_vhangup(tty->link)`s the slave. The results differ accordingly:
+///
+/// | who closed | other side's read      | other side's poll |
+/// |------------|------------------------|-------------------|
+/// | last slave | **EIO**                | POLLHUP           |
+/// | master     | **0 / EOF**            | POLLHUP           |
+///
+///   * EIO — `n_tty.c` `n_tty_wait_for_input`:
+///     `if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) return -EIO;`
+///     Checked in the WAIT path, so queued bytes drain FIRST.
+///   * 0/EOF — `tty_io.c` `tty_read` via `tty_hung_up_p()`. EOF is what
+///     makes a shell on a vanished terminal exit; EIO is what tells a
+///     terminal its child is gone. Swapping them wedges one side.
+///   * POLLHUP — `n_tty.c` `n_tty_poll`:
+///     `if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) mask |= EPOLLHUP;`
+///     An event loop never issues a bare blocking read, so without the HUP
+///     bit it simply never wakes to learn the peer is gone.
+///
+/// This was found the hard way: the `ptyspawn` smoke's child failed to
+/// exec, every slave fd closed, and the parent's master read parked FOREVER
+/// instead of reporting EIO. The negative halves matter just as much — a
+/// master read before any slave opens must still WAIT (that is the phantom
+/// EOF that left `foot` blank), and re-opening a slave must clear the
+/// condition (`pty.c` clears the bit on open).
+fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let pty = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup failed for a fresh master"),
+    };
+
+    // ── Before any slave exists: WAIT, never EOF and never HUP. ──
+    let mut buf = [0u8; 32];
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail(
+            "master read did not report would-block before any slave was opened",
+        );
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master reported POLLHUP before any slave was opened");
+    }
+
+    // ── Slave open, empty: still WAIT. ──
+    let slave = PtySlave::new(Arc::clone(&pty));
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail(
+            "master read did not report would-block with a slave open and idle",
+        );
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master reported POLLHUP with a slave still open");
+    }
+
+    // ── Slave writes, then closes. The DATA must drain before the hangup:
+    // those bytes are the child's output and Linux checks TTY_OTHER_CLOSED
+    // only in the wait path. ──
+    if poll_once(slave.write(0, b"last words")).is_none() {
+        return TestResult::Fail("slave write did not complete");
+    }
+    drop(slave);
+
+    if !pty.hung_up() {
+        return TestResult::Fail("dropping the last slave did not mark the pty hung up");
+    }
+    match poll_once(FileOps::read(&*master, 0, &mut buf)) {
+        Some(Ok(n)) if n == b"last words".len() && &buf[..n] == b"last words" => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail(
+                "hangup swallowed the slave's queued output — data must drain first",
+            )
+        }
+        _ => return TestResult::Fail("master could not read bytes queued before the hangup"),
+    }
+
+    // ── Drained AND hung up: EIO, not 0, and not a block. ──
+    match poll_once(FileOps::read(&*master, 0, &mut buf)) {
+        Some(Err(FsError::Io(_))) => {}
+        Some(Ok(0)) => {
+            return TestResult::Fail("master read returned 0 on hangup; Linux n_tty returns -EIO")
+        }
+        _ => return TestResult::Fail("master read did not report EIO after the last slave closed"),
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP == 0 {
+        return TestResult::Fail("master poll did not set POLLHUP after the last slave closed");
+    }
+
+    // ── Re-opening a slave CLEARS the condition (pty.c clears the bit on
+    // open). Without this a pty is permanently poisoned after one close. ──
+    let slave2 = PtySlave::new(Arc::clone(&pty));
+    if pty.hung_up() {
+        return TestResult::Fail("re-opening a slave did not clear the hangup");
+    }
+    if !matches!(
+        poll_once(FileOps::read(&*master, 0, &mut buf)),
+        Some(Err(FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("master did not report would-block after a slave re-opened");
+    }
+    if FileOps::poll_readiness(&*master) & crate::POLL_HUP != 0 {
+        return TestResult::Fail("master still reports POLLHUP after a slave re-opened");
+    }
+
+    // ── The other direction: master closes, slave sees EOF (0), not EIO. ──
+    drop(master);
+    if slave2.nonblock_read_eagain() {
+        return TestResult::Fail("O_NONBLOCK slave read reports EAGAIN after the master closed");
+    }
+    match poll_once(slave2.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        Some(Err(_)) => {
+            return TestResult::Fail(
+                "slave read returned an error after the master closed; Linux tty_read \
+                 returns 0 for a hung-up tty (that EOF is how a shell exits)",
+            )
+        }
+        _ => return TestResult::Fail("slave read did not report EOF after the master closed"),
+    }
+    if FileOps::poll_readiness(&slave2) & crate::POLL_HUP == 0 {
+        return TestResult::Fail("slave poll did not set POLLHUP after the master closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_pty_hangup_matrix_matches_linux);

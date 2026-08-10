@@ -891,7 +891,7 @@ impl OverlayFile {
             upper_file.set_owners(uid, gid).await?;
             upper_file.set_perms(stat.mode.perms).await?;
             if stat.mtime_cycles != 0 {
-                let mtime_ns = stat.mtime_cycles / narf_time::cycles_per_ns().max(1) as u64;
+                let mtime_ns = narf_time::cycles_to_ns(stat.mtime_cycles);
                 upper_file.set_times(None, Some(mtime_ns))?;
             }
             Self::copy_xattrs(self.lower.as_ref(), upper_file.as_ref()).await?;
@@ -1087,10 +1087,6 @@ impl FileOps for OverlayFile {
 
     fn rdev(&self) -> u64 {
         self.active().rdev()
-    }
-
-    fn read_should_block(&self) -> bool {
-        self.active().read_should_block()
     }
 
     fn write_should_block(&self) -> bool {

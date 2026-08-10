@@ -1260,3 +1260,81 @@ fn smoke_sysfs_bin_attr_reachable_from_vfs() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_bin_attr_reachable_from_vfs);
+
+/// The platform PARENT of the input devices must carry a `subsystem` link,
+/// and `/sys/bus/platform/devices` must link back to it.
+///
+/// udev's `path_id` builtin composes ID_PATH by walking a device's parents and
+/// classifying each by subsystem (systemd `udev-builtin-path_id.c`):
+///
+/// ```c
+/// } else if (streq(subsys, "platform")) {
+///         path_prepend(&path, "platform-%s", sysname);
+///         supported_transport = true;
+///         supported_parent = true;
+/// ```
+///
+/// `/sys/devices/platform/narf-input` had no `subsystem` link and there was no
+/// `/sys/bus/platform` to point at, so `sd_device_get_subsystem()` on the
+/// parent returned -ENOENT and the builtin failed outright. Measured in-guest:
+///
+/// ```text
+/// Builtin command 'path_id' fails: No such file or directory
+/// 71-seat.rules:75 IMPORT{builtin}="path_id": Failed to run builtin
+/// ```
+///
+/// 71-seat.rules is the file that assigns the `seat` TAG libinput enumerates
+/// by, so a parent that cannot be classified costs the whole seat.
+///
+/// The link TARGETS are asserted, not merely their presence: a `subsystem`
+/// pointing at the wrong depth resolves to nothing and fails exactly the same
+/// way while looking correct in a listing.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink() -> TestResult {
+    crate::sysfs::populate_input_class();
+    let root = crate::sysfs::get_root();
+
+    let Some(devices) = root.get_child("devices") else {
+        return TestResult::Fail("/sys/devices missing");
+    };
+    let Some(platform) = devices.get_child("platform") else {
+        return TestResult::Fail("/sys/devices/platform missing");
+    };
+    let Some(narf_input) = platform.get_child("narf-input") else {
+        // No input devices registered in this build/run — nothing to assert.
+        return TestResult::Pass;
+    };
+
+    // Linux: every platform device gets subsystem -> ../../../bus/platform.
+    match narf_input.get_symlink("subsystem").as_deref() {
+        Some("../../../bus/platform") => {}
+        Some(_) => return TestResult::Fail(
+            "platform parent's subsystem link points somewhere other than ../../../bus/platform",
+        ),
+        None => {
+            return TestResult::Fail(
+                "platform parent has no subsystem link — path_id cannot classify it (ENOENT)",
+            )
+        }
+    }
+
+    let Some(bus) = root.get_child("bus") else {
+        return TestResult::Fail("/sys/bus missing");
+    };
+    let Some(bus_platform) = bus.get_child("platform") else {
+        return TestResult::Fail("/sys/bus/platform missing — subsystem link dangles");
+    };
+    let Some(bus_devices) = bus_platform.get_child("devices") else {
+        return TestResult::Fail("/sys/bus/platform/devices missing");
+    };
+    match bus_devices.get_symlink("narf-input").as_deref() {
+        Some("../../../../devices/platform/narf-input") => TestResult::Pass,
+        Some(_) => TestResult::Fail("bus back-link points at the wrong depth"),
+        None => TestResult::Fail("/sys/bus/platform/devices has no back-link to narf-input"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink
+);

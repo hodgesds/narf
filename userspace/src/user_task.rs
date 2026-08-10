@@ -327,6 +327,20 @@ pub struct UserTaskCtx {
     /// FROZEN while `parked_in_syscall` stays true means the task is never
     /// re-polled at all — its backstop registration or executor wake was
     /// lost — which no CPU-time metric can distinguish from ordinary idle.
+    /// Monotonic-ns at which this task's CURRENT on-CPU kernel span began,
+    /// or 0 when it is not executing in a syscall.
+    ///
+    /// In-syscall CPU time (`ru_stime` / `tms_stime` / `/proc` stat field
+    /// 15) used to be one bracket across the whole syscall, discarded
+    /// entirely when the syscall parked — because the span would otherwise
+    /// include arbitrary off-CPU sleep. Under the own-stack executor almost
+    /// every syscall parks at least once, so the accumulator stayed EMPTY
+    /// for every task on the system and stime read 0 forever.
+    ///
+    /// Splitting the bracket at each park fixes both halves: the span is
+    /// folded and cleared before yielding, restarted on resume, so what
+    /// accumulates is exactly the on-CPU time and never the sleep.
+    pub kern_span_start_ns: AtomicU64,
     pub dbg_park_checks: AtomicU64,
     /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
     /// park time so the stall watchdog can re-run the readiness scan for a
@@ -437,6 +451,7 @@ impl UserTaskCtx {
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
+            kern_span_start_ns: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),
             poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
             poll_wait_nfds: AtomicU32::new(0),
@@ -944,6 +959,10 @@ pub fn own_stack_park() {
             }
             break;
         }
+        // Close the on-CPU kernel span BEFORE yielding: everything from here
+        // to the resume below is sleep, and billing it as stime is exactly
+        // the mistake that made the whole-syscall bracket unusable.
+        crate::handlers::close_kernel_span(uc, narf_scheduler::current_task_id().raw());
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
             (*uctx).parked_in_syscall.store(true, Ordering::Release);
@@ -959,6 +978,9 @@ pub fn own_stack_park() {
         // ctx → netserve's accept() wedged into an infinite futex wait → net
         // echo hang).
         install_current(uctx);
+        // Resumed and executing again — re-open the span.
+        // SAFETY: as above; `uctx` is this task's poller-pinned ctx.
+        crate::handlers::open_kernel_span(unsafe { &*uctx });
         // An io-wait park (a readiness scan parked in poll/epoll/blocking
         // read) must RE-EXECUTE its syscall after ANY wake — including the
         // ~10 ms lost-wake backstop — so the readiness SCAN re-runs. Silent
@@ -1848,8 +1870,8 @@ impl core::future::Future for UserTaskFuture {
                     // net that bounds the worst case to ~one tick. sleep_pumps
                     // still run in the executor's own idle path every round.
                     const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
-                    let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-                    let fallback_cycles = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+                    let fallback_cycles =
+                        narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
                     // `refresh_waker_at` — keep the slot's fire time current
                     // across parks that reuse this handle (a stale earlier
                     // deadline would pin the backstop; see park_should_block).
@@ -1881,7 +1903,7 @@ impl core::future::Future for UserTaskFuture {
                 // executor can round-robin other tasks / idle instead of
                 // re-polling us every 1ms. Register once; refresh across any
                 // spurious re-poll so we never leak a slot.
-                let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+
                 // Finite io-wait park: clamp the wheel fire to a ~10ms lost-wake
                 // backstop (same rationale as `park_fire_deadline_ns` in the
                 // own-stack path) so a lost cross-core io-wake self-heals in
@@ -1891,7 +1913,7 @@ impl core::future::Future for UserTaskFuture {
                     now,
                     this.task.uctx.net_io_wait.load(Ordering::Acquire),
                 );
-                let deadline_cycles = fire_ns.saturating_mul(cpns);
+                let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
                 // `refresh_waker_at` — see the infinite-park note above.
                 let refreshed = this.sleep_handle.is_some_and(|h| {
                     narf_scheduler::narf_time::timer_wheel::refresh_waker_at(

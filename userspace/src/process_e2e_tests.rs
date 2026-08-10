@@ -3342,6 +3342,136 @@ fn smoke_wave61_pidfd_shared_state() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
 
+/// A pidfd minted for a RECYCLED pid must not inherit the previous
+/// occupant's exit state.
+///
+/// The pidfd table is keyed by pid, and pids are reusable — NARF hands
+/// out the lowest free one, so the number a process gets is typically the
+/// one most recently freed. Without invalidation at `release_pid` the new
+/// process's pidfd is born POLLIN-readable, and a watcher that treats
+/// readable as "it exited" then calls `waitid(P_PIDFD, ., WEXITED)` with
+/// no WNOHANG — which blocks forever on a process that is very much
+/// alive. That is Qt's `forkfd` shape, and it is what left kwin's main
+/// thread in `wait4` on a live `plasma-keyboard` while every Wayland
+/// client's `connect()` went unaccepted.
+///
+/// The negative half matters as much as the positive: an fd opened
+/// against the OLD process must keep reporting THAT process's exit, or
+/// invalidation has just traded a false "exited" for a lost one.
+fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+    // Must be inside 1..=PID_MAX: `release_pid` rejects anything outside
+    // that range, so an out-of-range constant silently skips the very
+    // invalidation under test. (The neighbouring pidfd smokes use
+    // 0xA110/0xDEAD/0xB055 — all above PID_MAX — because they never
+    // release.)
+    const PID: u64 = 4242;
+
+    // First occupant: alive, then exits. Hold its fd across the reuse.
+    let old_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    crate::pidfd::notify_exit(PID);
+    if narf_filesystem::FileOps::poll_readiness(&old_fd) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("first occupant's pidfd not readable after its exit");
+    }
+
+    // Reaped: the number goes back to the pool and is handed to a new,
+    // LIVE process.
+    crate::release_pid(crate::ProcessId(PID));
+    let new_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+
+    if narf_filesystem::FileOps::poll_readiness(&new_fd) & POLL_IN != 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("recycled pid's pidfd born readable — stale exit state");
+    }
+    // The old fd still speaks for the old process.
+    if narf_filesystem::FileOps::poll_readiness(&old_fd) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("invalidation clobbered the previous occupant's pidfd");
+    }
+    // And the new one still reports ITS process's exit.
+    crate::pidfd::notify_exit(PID);
+    if narf_filesystem::FileOps::poll_readiness(&new_fd) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("recycled pid's pidfd never became readable on its own exit");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_pidfd_recycled_pid_does_not_inherit_exit
+);
+
+/// In-syscall CPU time must accumulate, and must NOT include time the
+/// syscall spent parked.
+///
+/// `ru_stime` / `tms_stime` / `/proc` stat field 15 all read one
+/// accumulator. It used to be filled by a single bracket around the whole
+/// syscall that was DISCARDED whenever the syscall parked — on the grounds
+/// that the span would otherwise include off-CPU sleep. Under the
+/// own-stack executor nearly every syscall parks at least once, so the
+/// accumulator stayed empty for every task on the system: measured on a
+/// full desktop boot, `kms=0` for all ~70 tasks.
+///
+/// Both halves are asserted, because fixing only the first is easy and
+/// wrong. Simply not skipping the fold would bill the sleep as CPU time,
+/// which is a worse lie than zero.
+///
+/// Tested against the span helpers directly, with a real `UserTaskCtx`.
+/// The ABI harness cannot reach this: it installs a task ID but no
+/// `UserTaskCtx`, so `current_user_task()` is `None` and the accounting is
+/// skipped entirely — a test written there passes for the wrong reason no
+/// matter which way the bug goes.
+fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
+    let tid = 0x5717_0000_u64;
+    let task = crate::task::Task::new_registered(tid, tid);
+    let uc = &task.uctx;
+    crate::handlers::__test_reset_kernel_time_for(tid);
+
+    // A closed span folds nothing — the idempotence the park sites rely on.
+    crate::handlers::close_kernel_span(uc, tid);
+    if crate::handlers::kern_time_ns_of(tid) != 0 {
+        return TestResult::Fail("closing an already-closed span invented CPU time");
+    }
+
+    // An open span across real work must accumulate.
+    crate::handlers::open_kernel_span(uc);
+    let spin_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000; // 2 ms
+    while narf_scheduler::narf_time::monotonic_ns() < spin_until {
+        core::hint::spin_loop();
+    }
+    crate::handlers::close_kernel_span(uc, tid);
+    let worked = crate::handlers::kern_time_ns_of(tid);
+    if worked == 0 {
+        return TestResult::Fail("an open span across 2 ms of work accumulated nothing");
+    }
+
+    // The gap between a close and the next open is sleep. It must not be
+    // billed — this is the half that makes the accumulator honest rather
+    // than merely non-zero.
+    let sleep_until = narf_scheduler::narf_time::monotonic_ns() + 5_000_000; // 5 ms
+    while narf_scheduler::narf_time::monotonic_ns() < sleep_until {
+        core::hint::spin_loop();
+    }
+    crate::handlers::open_kernel_span(uc);
+    crate::handlers::close_kernel_span(uc, tid);
+    let after_gap = crate::handlers::kern_time_ns_of(tid);
+    if after_gap.saturating_sub(worked) > 1_000_000 {
+        return TestResult::Fail("the gap between close and open was billed as CPU time");
+    }
+
+    crate::handlers::__test_reset_kernel_time_for(tid);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_kernel_time_accumulates_on_cpu_only
+);
+
 // ── Wave-65: clone3(CLONE_VM|CLONE_THREAD) + set_tid_address ──────────
 //
 // Three smokes that exercise the new clone3-shaped thread spawn:

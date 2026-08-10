@@ -267,9 +267,9 @@ pub unsafe fn init_mac(mmio: &MmioRegion, did: u16) -> Result<(), MacInitError> 
     unsafe {
         // 1. Release MAC IO reset.  `hw.c:780..794`.
         mmio.write8(REG_CR, 0xFF);
-        narf_time::busy_wait_cycles(2_000_000 * narf_time::cycles_per_ns().max(1) as u64);
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(2_000_000));
         mmio.write8(REG_HWSEQ_CTRL, 0x7F);
-        narf_time::busy_wait_cycles(2_000_000 * narf_time::cycles_per_ns().max(1) as u64);
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(2_000_000));
 
         // Wakeup-online bits: `hw.c:789..792`.
         let bytetmp = mmio.read8(REG_SYS_CLKR);

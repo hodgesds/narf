@@ -620,3 +620,93 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio2_os_release_missing_is_enoent_not_ebadf
 );
+
+/// eventfd / timerfd with nothing pending must WAIT, never report EOF.
+///
+/// `read() == 0` means hangup. Both of these returned a bare 0 when empty:
+///
+///   EventFd::read  -> Ok(0) when the counter is 0
+///   TimerFd::read  -> Ok(0) with no expirations, carrying the comment
+///                     "libc loops until non-zero" — which described the
+///                     SYMPTOM as if it were the contract. A caller handed 0
+///                     has nothing to wait on, so it re-reads at once and
+///                     BURNS CPU. That is a busy-spin the kernel inflicts on
+///                     userspace.
+///
+/// These are the wakeup and timing primitives under every Qt/GLib event
+/// loop, so a phantom EOF here is not a corner case — it is the shape of a
+/// desktop session spinning at 100% and never settling.
+///
+/// Assert the read result itself: empty-but-open is `FsError::WouldBlock`,
+/// never an ambiguous `Ok(0)` that a syscall consumer could mistake for EOF.
+fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
+    use crate::io_mux::{EventFd, TimerFd};
+    use narf_filesystem::FileOps;
+
+    // ---- eventfd: counter starts at 0 ----
+    let efd = EventFd::new(0, 0);
+    if !efd.nonblock_read_eagain() {
+        return TestResult::Fail("eventfd does not opt into EAGAIN-on-empty");
+    }
+    // A pending value must make the next read complete.
+    let mut eight = [0u8; 8];
+    eight.copy_from_slice(&1u64.to_le_bytes());
+    {
+        // Minimal local pump: these ops complete without yielding.
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn nop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, nop, nop, nop);
+        // SAFETY: `VT`'s four fn pointers are the ones defined just above and
+        // are valid for `'static`. The data pointer is null and every vtable
+        // entry ignores it (`nop` discards it; `clone` only re-wraps it), so
+        // it is never dereferenced — the contract `Waker::from_raw` requires.
+        let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&w);
+        let mut empty = [0u8; 8];
+        let mut empty_read = efd.read(0, &mut empty);
+        match empty_read.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(narf_filesystem::FsError::WouldBlock)) => {}
+            _ => return TestResult::Fail("empty eventfd read did not report would-block"),
+        }
+        drop(empty_read);
+        let mut fut = efd.write(0, &eight);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(8)) => {}
+            _ => return TestResult::Fail("eventfd write failed"),
+        }
+        drop(fut);
+        let mut value_read = efd.read(0, &mut empty);
+        match value_read.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(8)) => {}
+            _ => return TestResult::Fail("eventfd value read did not complete"),
+        }
+    }
+
+    // ---- timerfd: never armed, so no expirations ----
+    let tfd = TimerFd::new();
+    if !tfd.nonblock_read_eagain() {
+        return TestResult::Fail("timerfd does not opt into EAGAIN-on-empty");
+    }
+    {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn nop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, nop, nop, nop);
+        // SAFETY: every vtable entry ignores the null data pointer.
+        let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&w);
+        let mut empty = [0u8; 8];
+        let mut read = tfd.read(0, &mut empty);
+        match read.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(narf_filesystem::FsError::WouldBlock)) => {}
+            _ => return TestResult::Fail("unexpired timerfd read did not report would-block"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_io_mux_empty_reads_are_not_eof);

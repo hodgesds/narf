@@ -24,7 +24,6 @@ pub trait FileOps: Send + Sync {                 // filesystem/src/lib.rs:346
     // Character-device-relevant defaults you often override:
     //   fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError>
     //   fn poll_readiness(&self) -> u32                    // POLL_IN|POLL_OUT
-    //   fn read_should_block(&self) -> bool                // blocking char devs
     //   fn is_stream(&self) -> bool
     //   fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>
     //   fn rdev(&self) -> u64                              // MAJ:MIN
@@ -126,9 +125,10 @@ publishing a block device *is* publishing its `/dev` node.
 - **`stat`/`rdev`/`owners` matter.** Userspace `stat()`/`ls -l` reads them;
   return a `FileType::Special` mode and the right MAJ:MIN `rdev` so tools see a
   character (or block) special file, not a regular file.
-- **Blocking reads.** For a stream device (tty, input), override
-  `read_should_block`/`is_stream`/`poll_readiness` so `read`/`poll` block instead
-  of busy-returning 0 — the console read path depends on this.
+- **Blocking reads.** For a stream device (tty, input), return
+  `Err(FsError::WouldBlock)` when it is empty but still live, and implement
+  `is_stream`/`poll_readiness` so `read`/`poll` block instead of treating an
+  ambiguous 0-byte result as EOF — the console read path depends on this.
 - **`ioctl` is your control channel.** Override `FileOps::ioctl` for device
   control (termios, DRM ioctls, evdev `EVIOC*`); it surfaces to userspace via the
   syscall layer (see the core syscalls extending doc).

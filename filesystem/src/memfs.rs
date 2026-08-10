@@ -707,14 +707,18 @@ impl FileOps for MemFile {
                 perms: (self.perms.load(Ordering::Relaxed) & 0o7777) as u16,
             },
             // Report wall-ns as cycles so the stat ABI's cycles→ns
-            // division (`stat_linux`: mtime_cycles / cycles_per_ns)
+            // conversion (`stat_linux`: `cycles_to_ns(mtime_cycles)`)
             // hands userspace back the exact epoch-ns that utimensat /
             // the last write stored — the tar -x / cp -p / make
             // round-trip. 0 (never stamped) stays 0.
-            mtime_cycles: self
-                .mtime_ns
-                .load(Ordering::Relaxed)
-                .saturating_mul(narf_time::cycles_per_ns().max(1) as u64),
+            //
+            // `ns_to_cycles` is the exact inverse of the `cycles_to_ns`
+            // the stat path applies, so the round-trip is lossless. The
+            // old pair was `* cycles_per_ns()` here and `/ cycles_per_ns()`
+            // there — self-cancelling ONLY because both were the same
+            // truncated integer, which stopped being true the moment
+            // either side moved to the calibrated scale.
+            mtime_cycles: narf_time::ns_to_cycles(self.mtime_ns.load(Ordering::Relaxed)),
         }
     }
 

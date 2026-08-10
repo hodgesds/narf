@@ -156,6 +156,92 @@ mod stall_wd {
             LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
             LAST_TASK[cpu].store(narf_scheduler::current_task_id().raw(), Ordering::Relaxed);
         }
+        // User-mode sampling profile. The census can say a task is
+        // COMPUTING rather than stalled; only this says what it is
+        // computing. Ticks that interrupted the kernel are skipped — a
+        // kernel RIP is not the target's own code.
+        #[cfg(feature = "unix-latency-trace")]
+        if cs & 3 == 3 {
+            narf_userspace::task::dbg_profile_sample(narf_scheduler::current_task_id().raw(), rip);
+        }
+        // Starved-accept attribution for the UNIXENQ/UNIXACC latency trace.
+        // Deliberately AHEAD of the `DUMPED` gate and on its own cadence:
+        // that gate latches on the FIRST dump of the boot (an early RCU
+        // stall trips it around t+25 s), after which every later check in
+        // this function — including the park census — is dead for the rest
+        // of the run. This sweep must outlive it, because the accept
+        // starvation it observes happens minutes into the desktop session.
+        //
+        // Silent unless some AF_UNIX listener is actually holding an
+        // unaccepted connection at the sample instant, which is exactly
+        // what a long connect->accept gap is made of.
+        #[cfg(feature = "unix-latency-trace")]
+        {
+            static SWEEP_CYCLES: AtomicU64 = AtomicU64::new(0);
+            let now = narf_scheduler::narf_time::now_cycles();
+            let last = SWEEP_CYCLES.load(Ordering::Relaxed);
+            // ~2 s: fast enough to catch a transient queue, slow enough
+            // that the synchronous serial console does not itself become
+            // the reason the acceptor is late.
+            if now.wrapping_sub(last) >= narf_scheduler::narf_time::ns_to_cycles(2_000_000_000)
+                && SWEEP_CYCLES
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                narf_userspace::socket::unix_listener_stall_sweep();
+                // A process can freeze with NO client waiting on it — kwin
+                // has been observed going flat before the first wayland
+                // client even launches, and the listener sweep is silent in
+                // that case because nothing is pending. Report every parked
+                // task periodically so a freeze is attributable whether or
+                // not anyone is knocking. Every 5th sweep (~10 s) to keep
+                // the synchronous console from becoming the perturbation.
+                static CENSUS_N: AtomicU64 = AtomicU64::new(0);
+                let n = CENSUS_N.fetch_add(1, Ordering::Relaxed);
+                if n % 5 == 0 {
+                    narf_userspace::task::dbg_park_census("");
+                }
+                // The full roster, more sparsely (~30 s): it is what
+                // resolves a parent's `wantpid=N` to an actual child, and
+                // it sees children the park census cannot — a RUNNING
+                // child is in no park at all.
+                if n % 15 == 0 {
+                    narf_userspace::task::dbg_proc_roster();
+                    // Measured tick rate, with the interval MEASURED rather
+                    // than assumed.
+                    //
+                    // Two bad readings came out of assuming it. `d_ktick`
+                    // (perf) counts timer INTERRUPTS, which includes every
+                    // early arm the timer wheel requests for a parked task's
+                    // ~1 ms re-poll — so it runs far above the periodic rate
+                    // by design. And the boot's `clockevent … (probe: N
+                    // ticks)` line is an ABSOLUTE counter, not a rate;
+                    // dividing it by the probe window is meaningless because
+                    // `probe_fires` returns on the FIRST tick it sees.
+                    //
+                    // `apic::timer_ticks()` counts only genuine periodic
+                    // expiries (`on_timer_tick` bumps it solely when
+                    // `now >= periodic_next`), so this ratio is the real
+                    // configured tick rate and can be compared directly
+                    // against the 1000 Hz `select_primary` asks for.
+                    static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+                    static LAST_NS: AtomicU64 = AtomicU64::new(0);
+                    let t = narf_interrupts::x86_64::apic::timer_ticks();
+                    let ns = narf_scheduler::narf_time::monotonic_ns();
+                    let pt = LAST_TICK.swap(t, Ordering::Relaxed);
+                    let pns = LAST_NS.swap(ns, Ordering::Relaxed);
+                    if pns != 0 && ns > pns {
+                        let dt = t.saturating_sub(pt);
+                        let dms = (ns - pns) / 1_000_000;
+                        let _ = writeln!(
+                            TrapWriter,
+                            "TICKRATE periodic={dt} over_ms={dms} hz_all_cpus={}",
+                            if dms > 0 { dt * 1000 / dms } else { 0 }
+                        );
+                    }
+                }
+            }
+        }
         if DUMPED.load(Ordering::Relaxed) {
             return;
         }
@@ -171,10 +257,9 @@ mod stall_wd {
             // atomic stores on every poll park.
             narf_userspace::user_task::enable_poll_wait_recording();
         }
-        let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
         let now = narf_scheduler::narf_time::now_cycles();
         // ~1 s cadence.
-        let window = cpns.saturating_mul(1_000_000_000);
+        let window = narf_scheduler::narf_time::ns_to_cycles(1_000_000_000);
         let last = LAST_CHECK_CYCLES.load(Ordering::Relaxed);
         if now.wrapping_sub(last) < window {
             return;

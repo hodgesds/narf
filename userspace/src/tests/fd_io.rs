@@ -2251,12 +2251,11 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_getdents64_writes_linux_records);
 
-fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
+fn smoke_userspace_pipe_empty_read_is_would_block_until_writer_closes() -> TestResult {
     // The blocking-read decision behind shell `$(...)` substitution: a
     // pipe read end whose buffer is empty but whose writer is still open
-    // must report `read_should_block` (so sys_read parks and waits for
-    // data) — and must STOP reporting it once the last writer drops (so
-    // the read returns a real EOF instead of blocking forever). The
+    // must report `WouldBlock` (so sys_read parks and waits for data) — and
+    // must return EOF once the last writer drops. The
     // writer drops here via the `Arc<PipeWrite>` going out of scope,
     // mirroring what `fd::detach` does when a writer task exits.
     use narf_filesystem::FileOps;
@@ -2264,9 +2263,13 @@ fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
     if !r.readiness_notifies() || !w.readiness_notifies() {
         return TestResult::Fail("pipe endpoints must advertise readiness notifications");
     }
-    // Empty buffer + writer open → should block.
-    if !r.read_should_block() {
-        return TestResult::Fail("empty pipe with open writer should block");
+    // Empty buffer + writer open → would-block.
+    let mut empty = [0u8; 1];
+    if !matches!(
+        crate::handlers::poll_blocking(r.read(0, &mut empty)),
+        Some(Err(narf_filesystem::FsError::WouldBlock))
+    ) {
+        return TestResult::Fail("empty pipe with open writer did not report would-block");
     }
     let before_write = narf_net::readiness::generation();
     let wr = crate::handlers::poll_blocking(w.write(0, b"x"));
@@ -2283,20 +2286,23 @@ fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
     ) {
         return TestResult::Fail("pipe readiness test read failed");
     }
-    // Last writer closes → EOF; a read must NOT block (returns 0).
+    // Last writer closes → EOF.
     let before_close = narf_net::readiness::generation();
     drop(w);
     if narf_net::readiness::generation() <= before_close {
         return TestResult::Fail("pipe writer close did not notify readiness waiters");
     }
-    if r.read_should_block() {
-        return TestResult::Fail("closed writer should not block (EOF expected)");
+    if !matches!(
+        crate::handlers::poll_blocking(r.read(0, &mut empty)),
+        Some(Ok(0))
+    ) {
+        return TestResult::Fail("closed writer did not return EOF");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace",
-    smoke_userspace_pipe_read_should_block_on_open_writer
+    smoke_userspace_pipe_empty_read_is_would_block_until_writer_closes
 );
 
 fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
@@ -3342,3 +3348,413 @@ fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
+
+/// A process whose stdout IS the PTY slave must have its writes readable on
+/// the master — the exact chain a terminal emulator depends on.
+///
+/// This is the integration gap under the 31 unit tests in
+/// `filesystem/src/devfs_pty_tests.rs`: every one of those drives the `Pty`
+/// object directly (`read`, `write`, the ioctls). None routes
+/// through the fd table and `sys_write`/`sys_read`, which is where a
+/// terminal's shell actually lives. `foot` renders its grid and cursor but
+/// shows no prompt (task #11) — "the shell produced nothing" is precisely a
+/// break somewhere on this path, and nothing above the `Pty` object guarded
+/// it.
+///
+/// Deliberately driven through `kernel_syscall_entry`, not the helpers: a
+/// test that calls `PtySlave::write` proves the ring works and says nothing
+/// about fd routing, the line discipline hookup, or `sys_read` on the
+/// master. Both directions are asserted — slave→master is the shell's
+/// output, master→slave its input — because a terminal needs both and only
+/// one of them is the reported symptom.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
+    // Kernel-test fixture: stack buffers stand in for user pointers, so the
+    // production `validate_user_range` predicate needs the scoped opt-in.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        fd, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+
+    struct StubIoCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for StubIoCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let task = crate::handlers::current_task_id();
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    // Linux: ptmx_open() hands back a LOCKED slave; `unlockpt(3)` issues
+    // TIOCSPTLCK(0) before anything may open /dev/pts/<n>. A terminal does
+    // this between openpt and fork, so a test that skips it is testing a
+    // state no terminal is ever in.
+    let mut unlock: i32 = 0;
+    if narf_filesystem::FileOps::ioctl(
+        &master_obj,
+        narf_filesystem::devfs_pty::TIOCSPTLCK,
+        &mut unlock as *mut i32 as usize,
+    ) != Ok(0)
+    {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        __test_clear_global();
+        return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
+    }
+    let master: Arc<dyn narf_filesystem::FileOps> = Arc::new(master_obj);
+    let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
+        Some(Ok(s)) => s,
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            __test_clear_global();
+            return TestResult::Fail("pts_open_peer refused the freshly opened master");
+        }
+    };
+
+    let install = |ops: Arc<dyn narf_filesystem::FileOps>| {
+        fd::with_table(task, |tab| {
+            tab.open(FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+    };
+    let slave: Arc<dyn narf_filesystem::FileOps> = slave;
+    let (mfd, sfd) = match (install(master.clone()), install(slave.clone())) {
+        (Some(m), Some(s)) => (m, s),
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            __test_clear_global();
+            return TestResult::Fail("could not install the pty ends in the fd table");
+        }
+    };
+
+    let mut fail: Option<&'static str> = None;
+    // Shell output: write on the SLAVE fd, read it on the MASTER fd.
+    let out = b"narf$ ";
+    let mut wctx = StubIoCtx {
+        args: SyscallArgs {
+            arg0: sfd as u64,
+            arg1: out.as_ptr() as u64,
+            arg2: out.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+    if wctx.ret != Some(SyscallReturn::ok(out.len() as u64)) {
+        fail = Some("write to the pty slave fd did not accept the prompt");
+    }
+    if fail.is_none() {
+        let mut buf = [0u8; 32];
+        let mut rctx = StubIoCtx {
+            args: SyscallArgs {
+                arg0: mfd as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: buf.len() as u64,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+        match rctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value == out.len() as u64 => {
+                if &buf[..out.len()] != out {
+                    fail = Some("master read returned the wrong bytes");
+                }
+            }
+            // The reported symptom: a terminal that reads 0 concludes its
+            // shell exited and stops reading forever.
+            Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+                fail = Some("master read returned 0 — phantom EOF with data queued")
+            }
+            _ => fail = Some("master read did not return the slave's output"),
+        }
+    }
+
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    __test_clear_global();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_slave_as_stdout_reaches_master
+);
+
+/// `TIOCSCTTY` on a PTY slave must install the tty's foreground process
+/// group, not merely record the controlling tty.
+///
+/// Linux `__proc_set_tty` (drivers/tty/tty_jobctrl.c) does both at once:
+///
+/// ```c
+/// tty->ctrl.pgrp    = get_pid(task_pgrp(current));
+/// tty->ctrl.session = get_pid(task_session(current));
+/// ```
+///
+/// NARF recorded only the ctty index, leaving `fg_pgrp` at 0. That is not a
+/// cosmetic gap. bash's `initialize_job_control` runs
+///
+/// ```c
+/// while ((terminal_pgrp = tcgetpgrp (shell_tty)) != -1) {
+///     if (shell_pgrp != terminal_pgrp) { /* SIG_DFL */ kill (0, SIGTTIN); continue; }
+///     break;
+/// }
+/// ```
+///
+/// so a `tcgetpgrp()` of 0 never equals the shell's own pgrp, and the shell
+/// signals ITSELF with SIGTTIN — default action: stop. The measured symptom
+/// was an interactive bash on a PTY that stayed alive forever having written
+/// zero bytes: the empty `foot` window (task #11).
+///
+/// The assertion is deliberately the shell's own convergence condition
+/// (`tcgetpgrp(slave) == getpgrp()`), not "fg_pgrp is nonzero" — a nonzero
+/// but wrong pgrp hangs bash exactly as hard as a zero one.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use alloc::sync::Arc;
+    use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPTLCK};
+    use narf_filesystem::FileOps;
+
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let mut unlock: i32 = 0;
+    if FileOps::ioctl(&master, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
+    }
+    let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
+        Some(Ok(s)) => s,
+        _ => {
+            narf_filesystem::devfs_pty::ptmx_close(idx);
+            return TestResult::Fail("pts_open_peer refused the freshly opened master");
+        }
+    };
+
+    let mut fail: Option<&'static str> = None;
+
+    // NEGATIVE: before anyone acquires the tty it has no session, so
+    // TIOCGSID reports ENOTTY — Linux `tiocgsid`'s
+    // `if (!real_tty->ctrl.session) return -ENOTTY;`.
+    let mut sid_out: i32 = -1;
+    if FileOps::ioctl(&*slave, TIOCGSID, &mut sid_out as *mut i32 as usize).is_ok() {
+        fail = Some("TIOCGSID answered on a PTY that no session has acquired");
+    }
+
+    // POSITIVE: acquire the tty, then assert the shell's convergence
+    // condition holds.
+    if fail.is_none() && FileOps::ioctl(&*slave, TIOCSCTTY, 0).is_err() {
+        fail = Some("TIOCSCTTY on an unlocked PTY slave failed");
+    }
+    if fail.is_none() {
+        // Visible-pid space: this is what the shell's own getpgrp() returns.
+        let want = crate::handlers::current_task_pgid_user();
+        let mut got: i32 = -1;
+        if want == 0 {
+            // No scheduled task ⇒ the fixture cannot express the property.
+            // Say so rather than passing vacuously.
+            fail = Some("fixture has no current task: pgid 0, assertion would be vacuous");
+        } else if FileOps::ioctl(&*slave, TIOCGPGRP, &mut got as *mut i32 as usize).is_err() {
+            fail = Some("TIOCGPGRP failed after TIOCSCTTY");
+        } else if got == 0 {
+            // The exact pre-fix state.
+            fail = Some("tcgetpgrp() == 0 after TIOCSCTTY — bash would SIGTTIN-stop itself");
+        } else if got as u64 != want {
+            fail = Some("tcgetpgrp() != getpgrp() after TIOCSCTTY — job control cannot converge");
+        }
+    }
+    // The session half of the same `__proc_set_tty` store.
+    if fail.is_none() {
+        let want = crate::handlers::current_task_sid_user();
+        let mut got: i32 = -1;
+        match FileOps::ioctl(&*slave, TIOCGSID, &mut got as *mut i32 as usize) {
+            Ok(_) if got as u64 == want => {}
+            Ok(_) => fail = Some("TIOCGSID returned a session that is not the acquirer's"),
+            Err(_) => fail = Some("TIOCGSID still reports ENOTTY after TIOCSCTTY"),
+        }
+    }
+
+    drop(slave);
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
+);
+
+/// An O_NONBLOCK `read(2)` on an eventfd whose counter is 0 must return
+/// **-EAGAIN**, never a bare 0.
+///
+/// Task #13 filed this as "EventFd::read returns Ok(0) — phantom EOF". The
+/// `Ok(0)` at the FileOps layer is CORRECT and deliberate: NARF has no
+/// `FsError::WouldBlock`; "empty but open" is explicit and `sys_read` turns
+/// it into EAGAIN or a park (sys_read.rs).
+///
+/// What DID exist is a coverage hole. `smoke_io_mux_empty_reads_are_not_eof`
+/// asserted only FileOps internals and deliberately did not exercise the
+/// syscall. The regression now pins the explicit file-op error and the
+/// syscall result, so neither layer can reintroduce a phantom EOF alone.
+///
+/// That EOF is not cosmetic: a 0 from an eventfd tells an event loop its
+/// wakeup channel closed. The same shape (a spurious 0 on an O_NONBLOCK fd)
+/// previously killed the KDE session bus via GLib's line-reader — see the
+/// comment above the EAGAIN branch in sys_read.
+fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        fd, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let task = crate::handlers::current_task_id();
+    let efd = crate::io_mux::EventFd::new(0, 0);
+    let ops: Arc<dyn narf_filesystem::FileOps> = efd.clone();
+    let Some(fd_n) = fd::with_table(task, |tab| {
+        tab.open(FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_NONBLOCK,
+        })
+    }) else {
+        __test_clear_global();
+        return TestResult::Fail("could not install the eventfd in the fd table");
+    };
+
+    let mut fail: Option<&'static str> = None;
+    let mut buf = [0u8; 8];
+    let mut rctx = Ctx {
+        args: SyscallArgs {
+            arg0: fd_n as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 8,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    // -EAGAIN (11) as the negated value, matching how sys_read reports it.
+    let want_eagain = SyscallReturn::ok((-11i64) as u64);
+    match rctx.ret {
+        Some(r) if r == want_eagain => {}
+        // The exact regression: a bare 0 read as EOF by the event loop.
+        Some(r) if r == SyscallReturn::ok(0) => {
+            fail = Some("nonblocking eventfd read returned 0 — an event loop reads that as its wakeup channel closing")
+        }
+        _ => fail = Some("nonblocking eventfd read on an empty counter did not return -EAGAIN"),
+    }
+
+    // POSITIVE half: once a value is posted the SAME fd must deliver 8 bytes,
+    // so this cannot be satisfied by a version that always reports EAGAIN.
+    if fail.is_none() {
+        let one = 1u64.to_le_bytes();
+        let mut wctx = Ctx {
+            args: SyscallArgs {
+                arg0: fd_n as u64,
+                arg1: one.as_ptr() as u64,
+                arg2: 8,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+        if wctx.ret != Some(SyscallReturn::ok(8)) {
+            fail = Some("eventfd write did not accept 8 bytes");
+        } else {
+            let mut rctx2 = Ctx {
+                args: SyscallArgs {
+                    arg0: fd_n as u64,
+                    arg1: buf.as_mut_ptr() as u64,
+                    arg2: 8,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            kernel_syscall_entry(Syscall::Read.raw(), &mut rctx2);
+            match rctx2.ret {
+                Some(r) if r == SyscallReturn::ok(8) => {
+                    if u64::from_le_bytes(buf) != 1 {
+                        fail = Some("eventfd read returned the wrong counter value");
+                    }
+                }
+                _ => fail = Some("eventfd read with a pending value did not return 8"),
+            }
+        }
+    }
+
+    let _ = fd::with_table(task, |tab| tab.close(fd_n));
+    __test_clear_global();
+    match fail {
+        Some(m) => TestResult::Fail(m),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof
+);

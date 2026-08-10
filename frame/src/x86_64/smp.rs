@@ -335,8 +335,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let feats = narf_arch::x86_64::Features::probe();
         if feats.tsc_deadline {
             // 100 Hz default — match BSP's arm_periodic(100, vec).
-            let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
-            let period_cycles = (10_000_000u64).saturating_mul(cpns);
+            let period_cycles = narf_time::wall::ns_to_cycles(10_000_000);
             narf_interrupts::x86_64::apic::start_timer_tsc_deadline(
                 narf_interrupts::VECTOR_TIMER,
                 period_cycles,

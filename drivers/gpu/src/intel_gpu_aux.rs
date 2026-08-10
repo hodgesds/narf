@@ -210,13 +210,11 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     /// caller-visible "timeout" status comes from the
     /// AUX_CTL.TIMEOUT_ERROR bit, not from this spin's expiry.
     fn wait_send_complete(&self, ctl_initial: u32) -> u32 {
-        // 5 ms at any plausible TSC rate (1-5 GHz post-divide is
-        // the realistic range for Family 0x06 / Family 0x17+
-        // silicon). At cpns=1 that's 5_000_000 cycles; at cpns=5,
-        // 25_000_000. Pick the larger so we never short the wait
-        // on faster cores.
-        let cpns = narf_time::wall::cycles_per_ns().max(1) as u64;
-        let budget = 5_000_000u64.saturating_mul(cpns);
+        // 5 ms, converted through the calibrated fixed-point scale —
+        // so it is 5 ms at the ACTUAL TSC rate rather than at a
+        // truncated integer GHz (which on a 3.293 GHz part read back
+        // as 3 and shortened every such budget by ~9%).
+        let budget = narf_time::wall::ns_to_cycles(5_000_000);
         let start = narf_time::now_cycles();
         let mut ctl = ctl_initial;
         while ctl & AUX_CTL_SEND_BUSY != 0 {

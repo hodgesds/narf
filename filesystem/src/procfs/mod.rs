@@ -1973,9 +1973,48 @@ fn gen_meminfo() -> String {
     s
 }
 
+/// `(path, fs_name)` for every mount visible to `pid`, preferring that task's
+/// private mount namespace and falling back to the global registry.
+///
+/// Both `/proc/mounts` and `/proc/<pid>/mountinfo` must answer from the SAME
+/// list. They did not: `mountinfo` consulted the per-namespace hook while
+/// `/proc/mounts` only ever read the global registry, so a task in a private
+/// namespace saw its own mounts in one file and the global set in the other.
+/// Measured on the Fedora boot — `/run` (mounted inside the chroot's private
+/// namespace) was present in `mountinfo` and absent from `/proc/mounts`,
+/// along with `/dev/pts`, tracefs, debugfs and fusectl.
+///
+/// Linux renders both from the caller's namespace: `show_vfsmnt` and
+/// `show_mountinfo` (`fs/proc_namespace.c`) walk the same mount list, so no
+/// consumer has to care which file it reads. libmount (systemd, udev,
+/// util-linux) prefers `mountinfo`, while `df` and many shell tools read
+/// `/proc/mounts` — a split view makes them disagree about whether something
+/// is a mount point at all.
+pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String)> {
+    if let Some(rows) = hook_ns_mountinfo(pid) {
+        // Hook rows are "id\tparent\tpath\tfsname".
+        let parsed: Vec<(String, String)> = rows
+            .lines()
+            .filter_map(|line| {
+                let mut it = line.splitn(4, '\t');
+                let _id = it.next()?;
+                let _parent = it.next()?;
+                let path = it.next()?;
+                let fs_name = it.next()?;
+                Some((String::from(path), String::from(fs_name)))
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    crate::registry().list_with_names()
+}
+
 fn gen_mounts() -> String {
     let mut s = String::new();
-    for (path, fs_name) in crate::registry().list_with_names() {
+    // Linux `/proc/mounts` is `/proc/self/mounts`: the CALLER's namespace.
+    for (path, fs_name) in ns_mounts_for(current_pid()) {
         let _ =
             core::fmt::Write::write_fmt(&mut s, format_args!("none {} {} rw 0 0\n", path, fs_name));
     }
@@ -3021,3 +3060,52 @@ fn smoke_attr_current_empty_and_rw() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_attr_current_empty_and_rw);
+
+/// `/proc/mounts` and `/proc/<pid>/mountinfo` must list the SAME mount points.
+///
+/// They did not. `render_mountinfo` consulted the per-namespace hook while
+/// `gen_mounts` only ever read the global registry, so a task in a private
+/// mount namespace got two different answers. Measured on the Fedora KDE boot:
+/// `mountinfo` had 13 entries including `/run tmpfs`, `/proc/mounts` had 8 and
+/// was missing `/run`, `/dev/pts`, `/sys/kernel/tracing`, `/sys/kernel/debug`
+/// and `/sys/fs/fuse/connections`.
+///
+/// Linux keeps them consistent by construction — `show_vfsmnt` and
+/// `show_mountinfo` (`fs/proc_namespace.c`) walk the same list. Consumers are
+/// split (libmount/systemd/udev read mountinfo; `df` and most shell tools read
+/// `/proc/mounts`), so a divergence makes them disagree about whether a path
+/// is a mount point.
+///
+/// Asserting through the NAMESPACE HOOK is the point: with no hook installed
+/// both sources collapse to the global registry and agree trivially, which is
+/// exactly the case that never broke.
+fn mounts_ns_hook_for_consistency_test(pid: u64) -> Option<alloc::string::String> {
+    // Same shape the real hook emits: "id\tparent\tpath\tfsname".
+    (pid == 0x4d4e).then(|| {
+        alloc::string::String::from("9\t8\t/\text2\n12\t9\t/run\ttmpfs\n25\t10\t/dev/pts\tdevpts")
+    })
+}
+
+fn smoke_proc_mounts_matches_mountinfo_namespace_view() -> TestResult {
+    install_mountinfo_hook(mounts_ns_hook_for_consistency_test);
+    let rows = ns_mounts_for(0x4d4e);
+    if rows.len() != 3 {
+        return TestResult::Fail("ns_mounts_for did not read the installed namespace hook");
+    }
+    // The exact regression: /run present in the namespace view must not be
+    // dropped on the /proc/mounts side.
+    if !rows
+        .iter()
+        .any(|(path, fs)| path == "/run" && fs == "tmpfs")
+    {
+        return TestResult::Fail("/proc/mounts view lost the namespace's /run tmpfs");
+    }
+    if !rows.iter().any(|(path, _)| path == "/dev/pts") {
+        return TestResult::Fail("/proc/mounts view lost the namespace's /dev/pts");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_proc_mounts_matches_mountinfo_namespace_view
+);
