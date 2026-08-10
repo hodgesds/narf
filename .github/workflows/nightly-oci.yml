@@ -102,10 +102,17 @@ jobs:
           # just a scrolled register dump. Decode: `gdb <kernel-elf> <core>
           # -ex bt`.
           NARF_QEMU_COM2_FILE: "${{ runner.temp }}/oci-core.bin"
+        # `--retries 3`: a fresh QEMU boot per attempt. GHA's TCG has shown a
+        # rare crash right after the shell prompt (a #UD during container
+        # bring-up/teardown) that QEMU exits on — that fails fast (stdout EOF),
+        # so re-booting is cheap and clears the flake; a genuine break still
+        # fails every attempt. The login retry that tolerates TCG keystroke
+        # garbling is inside run-interactive itself.
         run: >
           cargo xtask run-interactive
           --arch=x86_64
           --features container
+          --retries 3
           --cmd "oci_smoke"
           --expect "oci-uts-isolated"
       # Only when a crash core was actually written: stage it + the matching
