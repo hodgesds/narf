@@ -9,7 +9,7 @@
 //! Invariant §4.6 applies to every one of them: no global allocator, no
 //! `alloc_frame`, no lock a caller might already hold.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
 
@@ -31,13 +31,37 @@ pub enum RedirectTarget {
     /// is the documented degradation. The value is carried for fidelity and
     /// diagnostics.
     Cpu(u32),
+    /// Fan the frame out to every interface in a devmap — a
+    /// `bpf_redirect_map(devmap, _, BPF_F_BROADCAST)`. `n` interface indices
+    /// were staged into the per-CPU broadcast buffer ([`copy_broadcast_ports`]);
+    /// `exclude_ingress` drops the interface the frame arrived on
+    /// (`BPF_F_EXCLUDE_INGRESS`), which the sender resolves since only it knows
+    /// the ingress iface.
+    Broadcast { n: u32, exclude_ingress: bool },
 }
+
+/// The most interface indices a single `BPF_F_BROADCAST` fans out to. A devmap
+/// larger than this broadcasts to the first `MAX_BROADCAST_PORTS` of its live
+/// entries; the cap keeps the per-CPU staging buffer a fixed, allocation-free
+/// size on the run path (spec §4.6), and a real fan-out target set is small.
+pub const MAX_BROADCAST_PORTS: usize = 16;
 
 /// Encode a [`RedirectTarget`] into the per-CPU slot word. Kind in the high 32
 /// bits (always ≥ 1 for a live request, so the whole word is non-zero even when
 /// the value is 0), value in the low 32.
 const REDIRECT_KIND_IFACE: u64 = 1;
 const REDIRECT_KIND_CPU: u64 = 2;
+const REDIRECT_KIND_BROADCAST: u64 = 3;
+/// Bit in the broadcast slot's value half marking `BPF_F_EXCLUDE_INGRESS`; the
+/// low 16 bits below it hold the staged port count.
+const BROADCAST_EXCLUDE_INGRESS_BIT: u32 = 1 << 16;
+
+/// Per-CPU staging for the interface indices a `BPF_F_BROADCAST` fans out to.
+/// Written by [`set_xdp_redirect_broadcast`] and read by [`copy_broadcast_ports`]
+/// on the same CPU with IRQs masked (the caller holds `XDP_PROGS`), the same
+/// discipline as [`XDP_REDIRECT_TARGET`].
+static XDP_BROADCAST_PORTS: [[AtomicU32; MAX_BROADCAST_PORTS]; MAX_CPUS] =
+    [const { [const { AtomicU32::new(0) }; MAX_BROADCAST_PORTS] }; MAX_CPUS];
 
 /// XDP redirect target, one slot per CPU.
 ///
@@ -68,6 +92,10 @@ pub fn take_xdp_redirect_target() -> Option<RedirectTarget> {
     match word >> 32 {
         REDIRECT_KIND_IFACE => Some(RedirectTarget::Iface(value)),
         REDIRECT_KIND_CPU => Some(RedirectTarget::Cpu(value)),
+        REDIRECT_KIND_BROADCAST => Some(RedirectTarget::Broadcast {
+            n: value & 0xFFFF,
+            exclude_ingress: value & BROADCAST_EXCLUDE_INGRESS_BIT != 0,
+        }),
         // 0 (no request) — or an impossible tag, which we fail closed on.
         _ => None,
     }
@@ -100,6 +128,43 @@ pub fn set_xdp_redirect_cpu(cpu: u32) {
         (REDIRECT_KIND_CPU << 32) | u64::from(cpu),
         Ordering::Relaxed,
     );
+}
+
+/// Arm a broadcast fan-out over `ports` — the write a
+/// `bpf_redirect_map(devmap, _, BPF_F_BROADCAST)` makes. Stages up to
+/// [`MAX_BROADCAST_PORTS`] interface indices into this CPU's broadcast buffer
+/// and records the count plus `exclude_ingress` in the redirect slot. Same CPU
+/// and masking discipline as [`set_xdp_redirect_iface`]; the sender reads the
+/// ports back with [`copy_broadcast_ports`].
+pub fn set_xdp_redirect_broadcast(ports: &[u32], exclude_ingress: bool) {
+    let cpu = current_cpu();
+    let n = ports.len().min(MAX_BROADCAST_PORTS);
+    for (slot, &ifindex) in XDP_BROADCAST_PORTS[cpu].iter().zip(&ports[..n]) {
+        slot.store(ifindex, Ordering::Relaxed);
+    }
+    let mut value = n as u32;
+    if exclude_ingress {
+        value |= BROADCAST_EXCLUDE_INGRESS_BIT;
+    }
+    XDP_REDIRECT_TARGET[cpu].store(
+        (REDIRECT_KIND_BROADCAST << 32) | u64::from(value),
+        Ordering::Relaxed,
+    );
+}
+
+/// Copy this CPU's staged broadcast ports into `out`, returning how many were
+/// copied (`min(out.len(), MAX_BROADCAST_PORTS)`). Read once, immediately after
+/// [`take_xdp_redirect_target`] returns [`RedirectTarget::Broadcast`], on the
+/// same CPU with IRQs still masked — so it pairs with the
+/// [`set_xdp_redirect_broadcast`] a few instructions earlier.
+#[must_use]
+pub fn copy_broadcast_ports(out: &mut [u32]) -> usize {
+    let cpu = current_cpu();
+    let n = out.len().min(MAX_BROADCAST_PORTS);
+    for (dst, slot) in out[..n].iter_mut().zip(&XDP_BROADCAST_PORTS[cpu]) {
+        *dst = slot.load(Ordering::Relaxed);
+    }
+    n
 }
 
 /// The kfunc id of `bpf_xdp_adjust_head`, for the interpreter's interception

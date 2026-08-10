@@ -63,8 +63,12 @@ Landed:
   returns `REDIRECT`; a miss (empty slot, out-of-range key), a non-redirect map,
   or an out-of-range `flags` returns the program's `flags` fallback action.
   `bpf_redirect_map` is an ordinary shim the JIT lowers natively (the map handle
-  is a real address on both backends), not an interpreter intrinsic. What remains
-  a follow-on is `BPF_F_BROADCAST` *fan-out* (one frame to many ports).
+  is a real address on both backends), not an interpreter intrinsic. It also
+  serves `BPF_F_BROADCAST`: a devmap broadcast fans the frame out to *every* live
+  port (the `key` ignored), with `BPF_F_EXCLUDE_INGRESS` skipping the iface it
+  arrived on — the staged port list is drained by the RX handler and sent to each
+  after the classifier's lock releases, the same deferral the single-target
+  retransmits use.
 - **`bpf(2)`** — load, test-run, the full map element (including atomic
   lookup-and-delete) and batch ops, descriptor-local map read/write modes,
   object info and id/fd enumeration for progs/maps/links/BTF, pin/get with

@@ -119,6 +119,23 @@ impl XdpProgram for BpfXdp {
                         Some(crate::kfuncs::RedirectTarget::Cpu(cpu)) => {
                             XdpAction::RedirectCpu { cpu }
                         }
+                        // A devmap broadcast: copy the staged ports out of the
+                        // BPF-side buffer and hand them to the net classifier,
+                        // which owns the deferred fan-out send. This is the one
+                        // place both crates meet — `attach_xdp` already bridges
+                        // BPF and net — so the port list crosses here rather than
+                        // bloating the per-frame `XdpAction`/`Verdict` with an
+                        // inline array.
+                        Some(crate::kfuncs::RedirectTarget::Broadcast { n, exclude_ingress }) => {
+                            let mut ports = [0u32; crate::kfuncs::MAX_BROADCAST_PORTS];
+                            let n = (n as usize).min(ports.len());
+                            let count = crate::kfuncs::copy_broadcast_ports(&mut ports[..n]);
+                            narf_net::bypass::classifier::stage_xdp_broadcast(
+                                &ports[..count],
+                                exclude_ingress,
+                            );
+                            XdpAction::Broadcast
+                        }
                         None => XdpAction::Aborted,
                     },
                     // Any other *returned* value is a program bug. Linux treats

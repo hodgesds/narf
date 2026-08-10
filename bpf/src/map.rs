@@ -274,6 +274,15 @@ pub const BPF_EXIST: u64 = 2;
 /// the errno is the same for the same reason.
 pub const BPF_F_LOCK: u64 = 4;
 
+/// `bpf_redirect_map` flag: fan the frame out to every live port of the map
+/// (a devmap), ignoring `key`, rather than redirecting to a single target.
+pub const BPF_F_BROADCAST: u64 = 8;
+
+/// `bpf_redirect_map` flag: with [`BPF_F_BROADCAST`], skip the interface the
+/// frame arrived on. The ingress iface is resolved by the sender, which alone
+/// knows it.
+pub const BPF_F_EXCLUDE_INGRESS: u64 = 16;
+
 /// The one map interface.
 ///
 /// Nine methods. Linux's `bpf_map_ops` has 45 slots; the difference is that
@@ -1306,6 +1315,30 @@ impl BpfMap {
         }
     }
 
+    /// Copy this devmap's live interface indices into `out`, returning how many
+    /// were written (`min(out.len(), live entries)`). A live entry is a slot
+    /// whose ifindex is non-zero — the same "populated" test [`Self::devmap_lookup`]
+    /// uses. `bpf_redirect_map`'s `BPF_F_BROADCAST` path fans a frame out to
+    /// these; entries past `out.len()` are dropped, capping a broadcast at the
+    /// caller's buffer.
+    #[must_use]
+    pub fn devmap_ports(&self, out: &mut [u32]) -> usize {
+        if !self.attr().kind.is_devmap() {
+            return 0;
+        }
+        let max = self.attr().max_entries;
+        let mut n = 0;
+        let mut key = 0;
+        while key < max && n < out.len() {
+            if let Some(ifindex) = self.devmap_lookup(key) {
+                out[n] = ifindex;
+                n += 1;
+            }
+            key += 1;
+        }
+        n
+    }
+
     /// Whether CPU `key` is a live `bpf_redirect_map` target in this cpumap.
     ///
     /// `false` when this is not a cpumap, when `key` is past `max_entries`, or
@@ -1838,12 +1871,35 @@ crate::kfunc! {
         const XDP_TX: u64 = 3;
         /// XDP_REDIRECT, returned once a target is armed.
         const XDP_REDIRECT: u64 = 4;
-        if flags > XDP_TX {
-            return XDP_ABORTED;
-        }
         // SAFETY: see `map_of`.
         let map = unsafe { map_of(&map) };
         let kind = map.attr().kind;
+
+        // Broadcast fan-out: send the frame out *every* live devmap port, the
+        // `key` ignored. Devmap-only, and only the two broadcast bits are valid
+        // alongside `BPF_F_BROADCAST` — a fallback action would be meaningless
+        // when there is no single-target lookup to miss.
+        if flags & BPF_F_BROADCAST != 0 {
+            if flags & !(BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS) != 0 || !kind.is_devmap() {
+                return XDP_ABORTED;
+            }
+            let mut ports = [0u32; crate::kfuncs::MAX_BROADCAST_PORTS];
+            let n = map.devmap_ports(&mut ports);
+            if n == 0 {
+                // No live ports — nothing to fan out to, a program bug.
+                return XDP_ABORTED;
+            }
+            crate::kfuncs::set_xdp_redirect_broadcast(
+                &ports[..n],
+                flags & BPF_F_EXCLUDE_INGRESS != 0,
+            );
+            return XDP_REDIRECT;
+        }
+
+        // Single-target: `flags` is a bare fallback action returned on a miss.
+        if flags > XDP_TX {
+            return XDP_ABORTED;
+        }
         if kind.is_devmap() {
             match map.devmap_lookup(key) {
                 Some(ifindex) => {

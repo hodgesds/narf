@@ -4562,6 +4562,217 @@ fn smoke_bpf_redirect_map_cpumap_arms_local_delivery() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_redirect_map_cpumap_arms_local_delivery);
 
+fn smoke_bpf_devmap_ports_enumerates_live_entries() -> TestResult {
+    checked(|| {
+        // A devmap with live ports at slots 0 and 3 (8 and 5), the rest empty.
+        let m = mk(MapKind::DevMap, 4, 4, 8).map_err(|_| "DevMap create failed")?;
+        m.ops()
+            .update(&k32(0), &8u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        m.ops()
+            .update(&k32(3), &5u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+
+        // Enumeration skips empty slots and returns live ifindexes in key order.
+        let mut ports = [0u32; 8];
+        if m.devmap_ports(&mut ports) != 2 || ports[0] != 8 || ports[1] != 5 {
+            return Err("devmap_ports did not enumerate the live entries in order");
+        }
+        // A short output buffer caps the count and keeps the first entries.
+        let mut one = [0u32; 1];
+        if m.devmap_ports(&mut one) != 1 || one[0] != 8 {
+            return Err("devmap_ports did not cap at the output buffer");
+        }
+        // A cpumap yields nothing — enumeration is devmap-only.
+        let c = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        c.ops()
+            .update(&k32(0), &1u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        if c.devmap_ports(&mut ports) != 0 {
+            return Err("devmap_ports enumerated a cpumap");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_devmap_ports_enumerates_live_entries);
+
+fn smoke_bpf_redirect_map_broadcast_fans_out() -> TestResult {
+    use crate::kfuncs::{
+        clear_xdp_redirect_target, copy_broadcast_ports, take_xdp_redirect_target, RedirectTarget,
+    };
+    checked(|| {
+        // A devmap with three live ports (2, 4, 7).
+        let m = mk(MapKind::DevMap, 4, 4, 8).map_err(|_| "DevMap create failed")?;
+        for (slot, ifindex) in [(0u32, 2u32), (2, 4), (5, 7)] {
+            m.ops()
+                .update(&k32(slot), &ifindex.to_le_bytes(), BPF_ANY)
+                .map_err(|_| "DevMap update rejected")?;
+        }
+
+        // bpf_redirect_map(map, key_ignored, flags). BPF_F_BROADCAST = 8,
+        // BPF_F_EXCLUDE_INGRESS = 16.
+        let build = |flags: i32| {
+            asm(&[
+                ld_map_fd(1, SMOKE_MAP_FD),
+                mov_imm(2, 999), // key ignored on broadcast
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // Broadcast: XDP_REDIRECT, and all three live ports staged (no exclude).
+        let bcast =
+            load_with_map("redirmap-bcast", build(8), &m).map_err(|_| "load rejected broadcast")?;
+        if !bcast.is_jited() {
+            return Err("a broadcast bpf_redirect_map program did not JIT");
+        }
+        for interp in [false, true] {
+            clear_xdp_redirect_target();
+            let out = if interp {
+                bcast.run_atomic_interpreted([0; 4], 4)
+            } else {
+                bcast.run_atomic([0; 4], 4)
+            };
+            match out {
+                Some(Outcome::Returned(4)) => {}
+                _ => return Err("a broadcast did not return XDP_REDIRECT"),
+            }
+            match take_xdp_redirect_target() {
+                Some(RedirectTarget::Broadcast {
+                    n: 3,
+                    exclude_ingress: false,
+                }) => {}
+                _ => return Err("a broadcast did not arm three ports without exclude-ingress"),
+            }
+            let mut ports = [0u32; crate::kfuncs::MAX_BROADCAST_PORTS];
+            let count = copy_broadcast_ports(&mut ports[..3]);
+            if count != 3 || ports[0] != 2 || ports[1] != 4 || ports[2] != 7 {
+                return Err("the staged broadcast ports were not the live devmap entries");
+            }
+        }
+
+        // BPF_F_EXCLUDE_INGRESS (16) rides alongside and is recorded.
+        let excl = load_with_map("redirmap-bcast-excl", build(8 | 16), &m)
+            .map_err(|_| "load rejected broadcast+exclude")?;
+        clear_xdp_redirect_target();
+        if excl.run_atomic([0; 4], 4) != Some(Outcome::Returned(4)) {
+            return Err("broadcast+exclude did not return XDP_REDIRECT");
+        }
+        match take_xdp_redirect_target() {
+            Some(RedirectTarget::Broadcast {
+                n: 3,
+                exclude_ingress: true,
+            }) => {}
+            _ => return Err("broadcast did not record BPF_F_EXCLUDE_INGRESS"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_broadcast_fans_out);
+
+fn smoke_bpf_redirect_map_broadcast_rejects_bad_shapes() -> TestResult {
+    use crate::kfuncs::{clear_xdp_redirect_target, take_xdp_redirect_target};
+    checked(|| {
+        let build = |flags: i32, fd: i32| {
+            asm(&[
+                ld_map_fd(1, fd),
+                mov_imm(2, 0),
+                mov_imm(3, flags),
+                call("bpf_redirect_map"),
+                EXIT,
+            ])
+        };
+
+        // Broadcast on a cpumap is rejected (XDP_ABORTED = 0): fan-out is
+        // devmap-only.
+        let c = mk(MapKind::CpuMap, 4, 4, 4).map_err(|_| "CpuMap create failed")?;
+        c.ops()
+            .update(&k32(0), &1u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "CpuMap update rejected")?;
+        let p = load_with_map("bcast-cpumap", build(8, SMOKE_MAP_FD), &c)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast on a cpumap was not aborted");
+        }
+        if take_xdp_redirect_target().is_some() {
+            return Err("a rejected broadcast armed a target");
+        }
+
+        // An empty devmap has no ports to fan out to → aborted.
+        let empty = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        let p = load_with_map("bcast-empty", build(8, SMOKE_MAP_FD), &empty)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast on an empty devmap was not aborted");
+        }
+
+        // A stray flag bit alongside BPF_F_BROADCAST (8 | 32) is rejected.
+        let d = mk(MapKind::DevMap, 4, 4, 4).map_err(|_| "DevMap create failed")?;
+        d.ops()
+            .update(&k32(0), &2u32.to_le_bytes(), BPF_ANY)
+            .map_err(|_| "DevMap update rejected")?;
+        let p = load_with_map("bcast-badflag", build(8 | 32, SMOKE_MAP_FD), &d)
+            .map_err(|_| "load rejected")?;
+        clear_xdp_redirect_target();
+        if p.run_atomic([0; 4], 4) != Some(Outcome::Returned(0)) {
+            return Err("broadcast with a stray flag bit was not aborted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("bpf", smoke_bpf_redirect_map_broadcast_rejects_bad_shapes);
+
+fn smoke_bpf_xdp_broadcast_stages_ports_for_the_sender() -> TestResult {
+    // End-to-end through the attach layer: a broadcasting XDP program yields
+    // `XdpAction::Broadcast`, and the ports it fanned out to are staged into the
+    // net classifier's per-CPU buffer for the RX handler to drain and send.
+    use narf_net::bypass::classifier::{take_xdp_broadcast, XdpAction, XdpProgram};
+    let m = match mk(MapKind::DevMap, 4, 4, 8) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("DevMap create failed"),
+    };
+    for (slot, ifindex) in [(0u32, 3u32), (4, 6)] {
+        if m.ops()
+            .update(&k32(slot), &ifindex.to_le_bytes(), BPF_ANY)
+            .is_err()
+        {
+            return TestResult::Fail("DevMap update rejected");
+        }
+    }
+    let insns = asm(&[
+        ld_map_fd(1, SMOKE_MAP_FD),
+        mov_imm(2, 0),
+        mov_imm(3, 8 | 16), // BPF_F_BROADCAST | BPF_F_EXCLUDE_INGRESS
+        call("bpf_redirect_map"),
+        EXIT,
+    ]);
+    let Ok(prog) = load_xdp_with_maps("xdp-bcast", insns, alloc::vec![(SMOKE_MAP_FD, m)]) else {
+        return TestResult::Fail("load rejected a broadcast XDP program");
+    };
+    let x = crate::attach_xdp::BpfXdp::for_test(prog, "bcast0");
+    if x.run("bcast0", &mut [0u8; 64]).0 != XdpAction::Broadcast {
+        return TestResult::Fail("a broadcast did not surface as XdpAction::Broadcast");
+    }
+    // The sender drains the staged ports and the exclude-ingress flag.
+    let mut ports = [0u32; 8];
+    let (n, exclude_ingress) = take_xdp_broadcast(&mut ports);
+    if n != 2 || ports[0] != 3 || ports[1] != 6 {
+        return TestResult::Fail(
+            "the broadcast did not stage the live devmap ports for the sender",
+        );
+    }
+    if !exclude_ingress {
+        return TestResult::Fail(
+            "the broadcast did not stage BPF_F_EXCLUDE_INGRESS for the sender",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_xdp_broadcast_stages_ports_for_the_sender);
+
 fn smoke_bpf_map_kfunc_wrong_buffer_width_is_einval() -> TestResult {
     checked(|| {
         // The map's value is 8 bytes and the program offers 4. The verifier

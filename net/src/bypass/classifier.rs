@@ -38,8 +38,9 @@
 //! crosses this seam. That is a real bump-in-the-wire capability — inspect,
 //! rewrite, resize, reflect, forward — reachable without a userspace daemon.
 //!
-//! What remains deferred is `devmap`/`cpumap` fan-out (`BPF_F_BROADCAST`);
-//! `XDP_REDIRECT` here targets a single interface by ifindex.
+//! `XDP_REDIRECT` also drives a devmap/cpumap (`bpf_redirect_map`): a single
+//! interface, a CPU's local stack, or — with `BPF_F_BROADCAST` — a fan-out to
+//! every live devmap port (optionally excluding the ingress iface).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -276,6 +277,12 @@ pub enum Verdict {
     /// program-chosen NIC; the caller resolves the ifindex and transmits after
     /// the lock is released.
     Redirect { ifindex: u32 },
+    /// `XDP_REDIRECT` with `BPF_F_BROADCAST`: fan the (possibly-rewritten) frame
+    /// out to every port a devmap named. Same as [`Verdict::Redirect`] but to a
+    /// *set* of NICs; the caller drains the staged port list with
+    /// [`take_xdp_broadcast`] and sends to each after the lock is released,
+    /// skipping the ingress iface when the program asked to exclude it.
+    Broadcast,
 }
 
 /// Toggle per-iface poll mode. `on = true` masks RX IRQ; `false`
@@ -358,6 +365,12 @@ pub enum XdpAction {
     /// exactly as `Pass` does — and `cpu` is carried for fidelity/diagnostics.
     /// Cross-CPU steering is the documented degradation.
     RedirectCpu { cpu: u32 },
+    /// `XDP_REDIRECT` with `BPF_F_BROADCAST`: fan the (possibly-rewritten) frame
+    /// out to every port a devmap named. The port list and the exclude-ingress
+    /// flag were staged into this CPU's buffer by [`stage_xdp_broadcast`]; the
+    /// caller drains them with [`take_xdp_broadcast`] and sends after the
+    /// `XDP_PROGS` lock is released, like the other retransmit verdicts.
+    Broadcast,
 }
 
 type XdpSlot = (alloc::string::String, alloc::boxed::Box<dyn XdpProgram>);
@@ -383,6 +396,61 @@ static XDP_TX_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// they are counted here rather than under `XDP_TXS`, which is retransmission
 /// out a device.
 static XDP_CPU_REDIRECTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Frames a program broadcast (`BPF_F_BROADCAST`) out a devmap's ports. Counted
+/// once per broadcast *decision*, not once per port sent.
+static XDP_BROADCASTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The most ports a single `BPF_F_BROADCAST` fans out to here — matches the
+/// BPF side's `MAX_BROADCAST_PORTS`, which caps how many the staging call ever
+/// passes. A fixed size keeps the per-CPU buffer allocation-free.
+pub const MAX_XDP_BROADCAST_PORTS: usize = 16;
+
+/// Per-CPU staging for a pending `BPF_F_BROADCAST`: the devmap ports and the
+/// exclude-ingress flag. Written by [`stage_xdp_broadcast`] while the BPF side
+/// holds `XDP_PROGS` (IRQs masked), drained by [`take_xdp_broadcast`] in the
+/// same `rx_handler` call on the same CPU — the same discipline as the BPF-side
+/// redirect slot, and safe because NARF drains RX one frame at a time in a
+/// cooperative poll loop rather than by nested `rx_handler` re-entry.
+static XDP_BCAST_PORTS: [[AtomicU32; MAX_XDP_BROADCAST_PORTS]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { AtomicU32::new(0) }; MAX_XDP_BROADCAST_PORTS] }; narf_lib::percpu::MAX_CPUS];
+/// Companion to [`XDP_BCAST_PORTS`]: the low 16 bits hold the staged port count,
+/// bit 16 the exclude-ingress flag.
+static XDP_BCAST_META: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// Bit in [`XDP_BCAST_META`] marking `BPF_F_EXCLUDE_INGRESS`.
+const XDP_BCAST_EXCLUDE_INGRESS_BIT: u32 = 1 << 16;
+
+/// Stage the ports a `BPF_F_BROADCAST` will fan out to on this CPU, plus whether
+/// to skip the ingress iface. Called by the BPF `attach_xdp` bridge while it
+/// holds `XDP_PROGS`; [`take_xdp_broadcast`] reads it back in the same
+/// `rx_handler` call.
+pub fn stage_xdp_broadcast(ports: &[u32], exclude_ingress: bool) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let n = ports.len().min(MAX_XDP_BROADCAST_PORTS);
+    for (slot, &ifindex) in XDP_BCAST_PORTS[cpu].iter().zip(&ports[..n]) {
+        slot.store(ifindex, Ordering::Relaxed);
+    }
+    let mut meta = n as u32;
+    if exclude_ingress {
+        meta |= XDP_BCAST_EXCLUDE_INGRESS_BIT;
+    }
+    XDP_BCAST_META[cpu].store(meta, Ordering::Relaxed);
+}
+
+/// Drain this CPU's staged broadcast ports into `out`, returning
+/// `(count, exclude_ingress)`. `count` is `min(staged, out.len())`. Read once,
+/// right after a [`Verdict::Broadcast`], on the same CPU.
+#[must_use]
+pub fn take_xdp_broadcast(out: &mut [u32]) -> (usize, bool) {
+    let cpu = narf_lib::percpu::current_cpu();
+    let meta = XDP_BCAST_META[cpu].swap(0, Ordering::Relaxed);
+    let staged = (meta & 0xFFFF) as usize;
+    let n = staged.min(out.len()).min(MAX_XDP_BROADCAST_PORTS);
+    for (dst, slot) in out[..n].iter_mut().zip(&XDP_BCAST_PORTS[cpu]) {
+        *dst = slot.load(Ordering::Relaxed);
+    }
+    (n, meta & XDP_BCAST_EXCLUDE_INGRESS_BIT != 0)
+}
 
 /// Attach `prog` to `iface`, replacing any program already there.
 ///
@@ -447,6 +515,12 @@ pub fn xdp_cpu_redirects() -> u64 {
     XDP_CPU_REDIRECTS.load(Ordering::Relaxed)
 }
 
+/// Frames a program broadcast out a devmap's ports (`BPF_F_BROADCAST`).
+#[must_use]
+pub fn xdp_broadcasts() -> u64 {
+    XDP_BROADCASTS.load(Ordering::Relaxed)
+}
+
 /// Run the attached program, if any.
 ///
 /// **The program runs while `XDP_PROGS` is held**, and with interrupts masked
@@ -502,6 +576,9 @@ fn run_xdp(iface: &str, frame: &mut [u8]) -> (XdpAction, usize) {
         XdpAction::RedirectCpu { .. } => {
             XDP_CPU_REDIRECTS.fetch_add(1, Ordering::Relaxed);
         }
+        XdpAction::Broadcast => {
+            XDP_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+        }
         XdpAction::Pass => {}
     }
     // A resizing program can only deliver up to the caller frame's length; the
@@ -532,6 +609,10 @@ pub fn classify(iface_name: &str, frame: &mut [u8]) -> (Verdict, usize) {
         // the daemon/flow table or the kernel stack.
         (XdpAction::Tx, len) => return (Verdict::Transmit, len),
         (XdpAction::Redirect { ifindex }, len) => return (Verdict::Redirect { ifindex }, len),
+        // A devmap broadcast fans out to a set of NICs after the lock releases,
+        // the same deferral `Transmit`/`Redirect` use; the ports are already
+        // staged for the caller to drain.
+        (XdpAction::Broadcast, len) => return (Verdict::Broadcast, len),
         // A cpumap redirect delivers to the local stack — the running CPU is the
         // only RX-processing context — so it continues down this function exactly
         // as `Pass` does, over the possibly-resized `frame[..len]`.

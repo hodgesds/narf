@@ -181,6 +181,30 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
             }
             return;
         }
+        // XDP_REDIRECT with BPF_F_BROADCAST: fan the (possibly-rewritten,
+        // possibly-resized) frame out every devmap port the program staged.
+        // Sent here, after `classify` released `XDP_PROGS`, like the single
+        // `Redirect`. `BPF_F_EXCLUDE_INGRESS` skips the iface the frame arrived
+        // on, resolved from its name since only this side knows the ingress.
+        // Each failed port is counted a drop, matching the single-target path.
+        crate::bypass::classifier::Verdict::Broadcast => {
+            let mut ports = [0u32; crate::bypass::classifier::MAX_XDP_BROADCAST_PORTS];
+            let (n, exclude_ingress) = crate::bypass::classifier::take_xdp_broadcast(&mut ports);
+            let ingress = if exclude_ingress {
+                iface::ifindex_of(&bypass_iface)
+            } else {
+                None
+            };
+            for &ifindex in &ports[..n] {
+                if Some(ifindex) == ingress {
+                    continue;
+                }
+                if iface::send_on_ifindex(ifindex, &frame[..len]).is_err() {
+                    crate::bypass::classifier::count_xdp_tx_drop();
+                }
+            }
+            return;
+        }
         crate::bypass::classifier::Verdict::PassThrough => {}
     }
     // The kernel stack likewise sees only the effective packet window: a

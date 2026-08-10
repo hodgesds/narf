@@ -276,6 +276,21 @@ pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
     send_fn(frame)
 }
 
+/// The synthetic ifindex of `iface_name`, in the same space
+/// [`send_on_ifindex`] resolves: index 1 is loopback and 2, 3, … are the
+/// registered interfaces in registration order. `None` if no interface has that
+/// name. Used by XDP `BPF_F_EXCLUDE_INGRESS` to skip the ingress iface in a
+/// broadcast fan-out.
+#[must_use]
+pub fn ifindex_of(iface_name: &str) -> Option<u32> {
+    let g = IFACES.lock();
+    let v = g.as_ref()?;
+    let pos = v.iter().position(|e| e.name == iface_name)?;
+    // 0 = "none", 1 = loopback, registered NICs start at 2 — mirror
+    // `send_on_ifindex`'s `pos + 2`.
+    Some((pos + 2) as u32)
+}
+
 /// First interface visible in `net_ns_id`.
 pub fn primary_in(net_ns_id: u64) -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
