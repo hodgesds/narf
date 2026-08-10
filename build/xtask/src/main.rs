@@ -2972,28 +2972,55 @@ fn run_interactive_boot(
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdin"))?;
 
-    // Stage 0: log in. getty prints "NARF login:" then "Password:" before
-    // the shell starts; credentials are seeded in /etc/passwd (root / narf).
-    // The reader thread only signals "narf> ", so poll the shared capture
-    // buffer for the login prompts directly.
+    // Stage 0: log in, tolerating a garbled attempt. getty prints
+    // "NARF login:" then "Password:", checks the reply against /etc/shadow
+    // (root / narf), and on a mismatch prints "Login incorrect" and re-prompts.
+    // Machine-speed keystrokes can garble under slow TCG — a byte-reordering
+    // race in the console line discipline turns `root` into e.g. `orot` — so
+    // rather than send the credentials once and then block for the full prompt
+    // timeout on a login that has already failed, retry the exchange a few
+    // times, watching for the "Login incorrect" re-prompt and trying again. The
+    // reader thread only signals "narf> ", so poll the shared capture buffer for
+    // the login-flow strings directly.
     {
-        let login_deadline = Duration::from_secs(prompt_secs);
-        for (needle, reply) in [
-            (&b"login: "[..], &b"root\n"[..]),
-            (&b"Password: "[..], &b"narf\n"[..]),
-        ] {
+        // Poll the capture buffer for `needle` at or after byte offset `from`,
+        // within `timeout`. Returns the offset just past the match, or `None`.
+        let find_from = |from: usize, needle: &[u8], timeout: Duration| -> Option<usize> {
             let start = std::time::Instant::now();
-            let mut seen = false;
-            while start.elapsed() < login_deadline {
+            loop {
                 if let Ok(g) = captured.lock() {
-                    if g.windows(needle.len()).any(|w| w == needle) {
-                        seen = true;
-                        break;
+                    let lo = from.min(g.len()).saturating_sub(needle.len());
+                    if let Some(pos) = g[lo..].windows(needle.len()).position(|w| w == needle) {
+                        return Some(lo + pos + needle.len());
                     }
+                }
+                if start.elapsed() >= timeout {
+                    return None;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            if !seen {
+        };
+        // Type `bytes` slowly enough that the console line discipline keeps up:
+        // a wider inter-byte gap than the post-login typing uses, because the
+        // login prompt's cooked-mode echo is where the reordering race bites.
+        let mut send = |bytes: &[u8]| -> bool {
+            for &b in bytes {
+                if stdin.write_all(&[b]).is_err() {
+                    return false;
+                }
+                let _ = stdin.flush();
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            true
+        };
+
+        // The first "login:" only appears once boot reaches getty — allow the
+        // full prompt budget for it. Re-prompts after a failed attempt come in
+        // seconds, so those get a short per-step timeout below.
+        let step = Duration::from_secs(30);
+        let mut mark = match find_from(0, b"login: ", Duration::from_secs(prompt_secs)) {
+            Some(m) => m,
+            None => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
@@ -3002,16 +3029,65 @@ fn run_interactive_boot(
                     prompt_secs
                 );
             }
-            for &b in reply {
-                if stdin.write_all(&[b]).is_err() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader_handle.join();
-                    bail!("xtask run-interactive: stdin write failed during login");
-                }
-                let _ = stdin.flush();
-                std::thread::sleep(Duration::from_millis(5));
+        };
+
+        const MAX_LOGIN_ATTEMPTS: usize = 8;
+        let mut logged_in = false;
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            if !send(b"root\n") {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!("xtask run-interactive: stdin write failed during login");
             }
+            // The password prompt should follow even a garbled username (the
+            // line still completes at the newline). If it doesn't, wait for the
+            // next login prompt and start the attempt over.
+            let Some(after_pw) = find_from(mark, b"Password: ", step) else {
+                if let Some(m) = find_from(mark, b"login: ", step) {
+                    mark = m;
+                }
+                continue;
+            };
+            if !send(b"narf\n") {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!("xtask run-interactive: stdin write failed during login");
+            }
+            // Success prints "Welcome to NARF"; a bad (garbled) attempt prints
+            // "Login incorrect" and re-prompts. Poll for whichever comes first so
+            // a failed attempt retries at once instead of waiting out `step`.
+            let verdict_start = std::time::Instant::now();
+            let zero = Duration::from_millis(0);
+            loop {
+                if find_from(after_pw, b"Welcome to NARF", zero).is_some() {
+                    logged_in = true;
+                    break;
+                }
+                if find_from(after_pw, b"Login incorrect", zero).is_some()
+                    || verdict_start.elapsed() >= step
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if logged_in {
+                break;
+            }
+            // Failed or timed out — resync on the next login prompt and retry.
+            if let Some(m) = find_from(after_pw, b"login: ", step) {
+                mark = m;
+            }
+        }
+        if !logged_in {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader_handle.join();
+            bail!(
+                "xtask run-interactive: could not log in after {} attempts",
+                MAX_LOGIN_ATTEMPTS
+            );
         }
     }
 
