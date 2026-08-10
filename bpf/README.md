@@ -105,8 +105,9 @@ program behind `enter_domain(FRAME, BPF)` on PKS silicon, so a verifier or JIT
 escape that stores into another subsystem's domain (the cap table, the scheduler,
 a driver) takes a protection-key fault instead of an arbitrary Ring-0 write —
 hardware defense-in-depth *under* the verifier. FRAME stays reachable, so the
-interpreter, the kfunc shims, and the fault handler keep working; the fence is a
-no-op on AMD PCID / aarch64 MTE (deferred). Because NARF BPF already reaches
+interpreter, the kfunc shims, and the fault handler keep working; on AMD PCID it
+is a `CR3` swap into the BPF domain's PML4 and on aarch64 MTE a structural
+system-register save (both wired; see below). Because NARF BPF already reaches
 memory only through its own stack/ctx/maps/arena (no raw kernel deref, no
 arbitrary `bpf_probe_read`), it cost the runtime nothing. Typed observability now
 reads through a Frame-mediated `narf_probe_read` kfunc that accepts only
@@ -114,6 +115,8 @@ schema-tracked pointers — never a raw address — and rechecks the exact field
 runtime, so the fence holds for tracing.
 
 Full design, threat model, the FRAME-stays-writable rationale, the tracing read
-model, why BTF is not the path there, and what remains (subsystem memory-tagging,
-the PCID/MTE backends) are in
+model, why BTF is not the path there, the PKS/PCID/MTE backends (all wired), and
+what remains (subsystem private-domain tagging, and the Stage-3 tag-aware
+allocator that upgrades the aarch64 structural save into real tag-fault
+enforcement) are in
 [`specification/domain-confinement.md`](specification/domain-confinement.md).
