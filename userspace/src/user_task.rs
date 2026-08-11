@@ -341,6 +341,11 @@ pub struct UserTaskCtx {
     /// folded and cleared before yielding, restarted on resume, so what
     /// accumulates is exactly the on-CPU time and never the sleep.
     pub kern_span_start_ns: AtomicU64,
+    /// True after normal syscall entry has created this task's kernel-time
+    /// ledger row. Timer preemption may close a span from IRQ context, where
+    /// inserting the first BTreeMap node (and therefore allocating) is not
+    /// permitted.
+    pub kern_account_ready: AtomicBool,
     pub dbg_park_checks: AtomicU64,
     /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
     /// park time so the stall watchdog can re-run the readiness scan for a
@@ -452,6 +457,7 @@ impl UserTaskCtx {
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             kern_span_start_ns: AtomicU64::new(0),
+            kern_account_ready: AtomicBool::new(false),
             dbg_park_checks: AtomicU64::new(0),
             poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
             poll_wait_nfds: AtomicU32::new(0),
@@ -1450,6 +1456,13 @@ pub fn install_user_task_hooks() {
     // the hook every own-stack task reports utime 0 (getrusage / times /
     // ps TIME / `time`'s user column, per the alpine probe).
     narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
+    // A CPL0 timer preemption may interrupt an active syscall. Split its
+    // kernel-time span around the off-CPU interval, matching the explicit
+    // close/yield/open sequence used by blocking syscall parks.
+    narf_scheduler::stackful::set_user_kernel_preempt_hooks(
+        crate::handlers::pause_current_kernel_span,
+        crate::handlers::resume_current_kernel_span,
+    );
     #[cfg(feature = "linux-compat")]
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that

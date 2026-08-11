@@ -1300,6 +1300,13 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
 
+    // A timer preemption is a real slice boundary just like a voluntary
+    // kernel_switch. Pause any open userspace syscall span before switching
+    // away so its off-CPU residency is not billed as kernel CPU time, and
+    // fold the complete on-CPU slice before the resume path restamps it.
+    let kernel_span_paused = pause_user_kernel_span();
+    fold_current_slice(task_ptr);
+
     // Save the user FPU before another task clobbers XMM/x87/AVX. This CPL0
     // tick preempted the current task IN THE KERNEL — but if it is a USER task
     // that trapped in for a syscall, its live SIMD state is still in the
@@ -1361,6 +1368,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         (*task_ptr)
             .tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
+    }
+    if kernel_span_paused {
+        resume_user_kernel_span();
     }
     // Restore this task's user FPU, clobbered by whatever ran while we were
     // switched out. Must run AFTER re-publishing CURRENT above (which
@@ -1447,6 +1457,10 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
         }
         drop(g);
     }
+    // This preemption ends the current on-CPU slice. Fold it before the resume
+    // path restamps tsc_started; otherwise every timer-preempted interval
+    // disappears from task-clock accounting.
+    fold_current_slice(task_ptr);
     // Save the user FPU before another task clobbers XMM/x87, and clear CURRENT
     // so a tick during the switch-out window can't re-preempt us.
     user_fpu_save();
@@ -1490,8 +1504,47 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
 static SLICE_ACCOUNT_HOOK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Optional userspace hooks that split a live syscall span around a CPL0
+/// timer preemption. `pause` returns true only when it closed a span; `resume`
+/// is then called after the task is current again and its slice clock has been
+/// restarted. Both callbacks run with interrupts disabled and must be
+/// allocation-free after their per-task accounting rows have been created.
+static KERNEL_SPAN_PAUSE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static KERNEL_SPAN_RESUME_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 pub fn set_user_slice_account_hook(hook: fn(u64)) {
     SLICE_ACCOUNT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn()) {
+    KERNEL_SPAN_PAUSE_HOOK.store(pause as usize, Ordering::Release);
+    KERNEL_SPAN_RESUME_HOOK.store(resume as usize, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pause_user_kernel_span() -> bool {
+    let hook = KERNEL_SPAN_PAUSE_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return false;
+    }
+    // SAFETY: the setter accepts exactly fn() -> bool and publishes its
+    // address with Release before this Acquire load.
+    let pause: fn() -> bool = unsafe { core::mem::transmute(hook) };
+    pause()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resume_user_kernel_span() {
+    let hook = KERNEL_SPAN_RESUME_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return;
+    }
+    // SAFETY: the setter accepts exactly fn() and publishes its address with
+    // Release before this Acquire load.
+    let resume: fn() = unsafe { core::mem::transmute(hook) };
+    resume();
 }
 
 #[cfg(target_arch = "x86_64")]

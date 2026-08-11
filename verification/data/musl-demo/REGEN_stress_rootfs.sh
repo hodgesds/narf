@@ -63,8 +63,26 @@ for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
   /usr/bin/stress-ng $s --timeout "$DUR" --metrics-brief 2>&1 || echo "STRESSOR-RC=$? for [$s]"
 done
 echo "=== perf stat: stress-ng cpu ==="
-/usr/bin/perf stat -e '{cpu-clock,task-clock}' -- \
-  /usr/bin/stress-ng --cpu 1 --timeout 1s --metrics-brief
+PERF_OUT="$(/usr/bin/perf stat -x, -e 'task-clock,task-clock:u,task-clock:k' -- \
+  /usr/bin/stress-ng --cpu 4 --timeout 1s --metrics-brief 2>&1)"
+echo "$PERF_OUT"
+# Linux defines the privilege filters as no-ops for software CPU clocks. The
+# three inherited counts must therefore agree, and a four-worker one-second
+# run must retain substantially more than one final scheduler slice.
+if ! echo "$PERF_OUT" | awk -F, '
+  $3 == "task-clock"   { total = $1 + 0; seen++ }
+  $3 == "task-clock:u" { user = $1 + 0; seen++ }
+  $3 == "task-clock:k" { kern = $1 + 0; seen++ }
+  END {
+    if (seen != 3 || total < 500 || user < 500 || kern < 500) exit 1
+    min = total; if (user < min) min = user; if (kern < min) min = kern
+    max = total; if (user > max) max = user; if (kern > max) max = kern
+    if (max - min > max * 0.02) exit 1
+  }'
+then
+  echo "PERF-CLOCK-MISMATCH"
+  exit 1
+fi
 echo "PERF-STRESS-DONE"
 echo "STRESS-DONE"
 PROBE

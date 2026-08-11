@@ -46,6 +46,8 @@ pub fn set_task_affinity(task: TaskId, requested: CpuSet)
 /// Distinct live user address spaces, including currently-polled tasks.
 pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
+pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
+pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 ```
@@ -63,6 +65,12 @@ The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch
 back, including preemption and migration.
+On x86_64, every own-stack switch-out folds the elapsed on-CPU slice through
+the slice-account hook. A CPL0 timer preemption additionally calls `pause`
+before switching and calls `resume` only when `pause` reported an open syscall
+span, preventing off-CPU residency from being charged as kernel CPU time. The
+callbacks run with interrupts disabled and may not sleep or take a non-IRQ-safe
+lock.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Ordinary background task polls deliberately do not advance it: scheduler churn

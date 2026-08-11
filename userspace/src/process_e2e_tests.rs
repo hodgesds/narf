@@ -3440,6 +3440,12 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
 
     // An open span across real work must accumulate.
     crate::handlers::open_kernel_span(uc);
+    if !uc
+        .kern_account_ready
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        return TestResult::Fail("opening a kernel span did not prepare its IRQ-safe ledger row");
+    }
     let spin_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000; // 2 ms
     while narf_scheduler::narf_time::monotonic_ns() < spin_until {
         core::hint::spin_loop();
@@ -3462,6 +3468,45 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
     let after_gap = crate::handlers::kern_time_ns_of(tid);
     if after_gap.saturating_sub(worked) > 1_000_000 {
         return TestResult::Fail("the gap between close and open was billed as CPU time");
+    }
+
+    // Model the scheduler's CPL0 timer-preemption callbacks directly. The
+    // pause must fold the active part of the syscall, while the interval
+    // before resume remains off-CPU and therefore uncharged.
+    crate::user_task::install_current(uc as *const _ as *mut _);
+    let preempt_result = (|| {
+        let current_tid = crate::handlers::current_task_id();
+        if current_tid == 0 {
+            return TestResult::Fail("timer-preemption accounting has no current task id");
+        }
+        let before_pause = crate::handlers::kern_time_ns_of(current_tid);
+        crate::handlers::open_kernel_span(uc);
+        let run_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000;
+        while narf_scheduler::narf_time::monotonic_ns() < run_until {
+            core::hint::spin_loop();
+        }
+        if !crate::handlers::pause_current_kernel_span() {
+            return TestResult::Fail("timer-preemption pause did not close an active span");
+        }
+        let paused = crate::handlers::kern_time_ns_of(current_tid);
+        if paused <= before_pause {
+            return TestResult::Fail("timer-preemption pause did not fold on-CPU time");
+        }
+        let off_cpu_until = narf_scheduler::narf_time::monotonic_ns() + 5_000_000;
+        while narf_scheduler::narf_time::monotonic_ns() < off_cpu_until {
+            core::hint::spin_loop();
+        }
+        crate::handlers::resume_current_kernel_span();
+        crate::handlers::close_kernel_span(uc, current_tid);
+        let resumed = crate::handlers::kern_time_ns_of(current_tid);
+        if resumed.saturating_sub(paused) > 1_000_000 {
+            return TestResult::Fail("timer-preemption off-CPU gap was billed as kernel time");
+        }
+        TestResult::Pass
+    })();
+    crate::user_task::clear_current();
+    if let TestResult::Fail(reason) = preempt_result {
+        return TestResult::Fail(reason);
     }
 
     crate::handlers::__test_reset_kernel_time_for(tid);

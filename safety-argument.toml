@@ -220,6 +220,14 @@ ref = "security-model/specification/spec.md#L39"
 argument = "Removing BuddyZone::free's vestigial overlap scan changes only the complexity of the existing allocator free path. Frame accounting and standard buddy coalescing remain unchanged inside the memory TCB, and no new trusted subsystem or ownership path is introduced."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler edit adds accounting callbacks at existing x86_64 stackful switch boundaries inside the already enumerated executor TCB. It does not add a trusted subsystem, change task selection, alter a task's saved domain state, or move any capability or address-space ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Timer-preemption accounting reads only the current task's scalar timestamps while its continuation is pinned on the current CPU. The pause callback completes before CURRENT_STACKFUL_TASK is cleared, the resume callback runs only after the same continuation is current again, and both use IRQ-safe per-task accounting locks. Normal syscall entry creates the task's BTreeMap row before publishing the active span, so the timer-IRQ close path only updates an existing node and cannot allocate; no user pointer, capability, domain right, or cross-task memory is exposed or modified."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The removed scan neither enforced capability checks nor assigned domain tags; it leaked an overlapping free after an ownership violation had already occurred. The audited address-space and page-table ownership fixes remain in place, while KASAN-capable kernel tests and stress teardown continue to exercise double-free and use-after-free failures."
 

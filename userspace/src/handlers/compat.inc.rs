@@ -2603,10 +2603,72 @@ pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
 
 /// Open (or re-open) the on-CPU kernel span for the current task.
 pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
+    // The pause hook can close this span from timer IRQ context. Create the
+    // task's row here, on the normal syscall path, so that close only updates
+    // an existing BTreeMap node and never allocates in the interrupt handler.
+    // The readiness load is the only recurring cost after the first syscall.
+    if !uc
+        .kern_account_ready
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        let task = current_task_id();
+        if task != 0 {
+            let mut g = TASK_KERN_NS.lock();
+            g.get_or_insert_with(BTreeMap::new).entry(task).or_insert(0);
+            uc.kern_account_ready
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
     uc.kern_span_start_ns.store(
         narf_scheduler::narf_time::monotonic_ns(),
         core::sync::atomic::Ordering::Release,
     );
+}
+
+/// Pause the current user task's active syscall span before the scheduler
+/// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
+/// when a matching resume must re-open the span.
+pub fn pause_current_kernel_span() -> bool {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return false;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // current own-stack user continuation.
+    let uc = unsafe { &*uc };
+    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    close_kernel_span(uc, current_task_id());
+    true
+}
+
+/// Resume a syscall span previously paused by `pause_current_kernel_span`.
+pub fn resume_current_kernel_span() {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // resumed own-stack user continuation.
+    open_kernel_span(unsafe { &*uc });
+}
+
+/// Elapsed time in the current task's still-open syscall span. Adding this to
+/// the folded kernel ledger produces a monotonic live snapshot: close folds
+/// the same interval before clearing the start timestamp.
+pub fn current_kernel_span_elapsed_ns() -> u64 {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return 0;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // current user continuation.
+    let start = unsafe { &*uc }
+        .kern_span_start_ns
+        .load(core::sync::atomic::Ordering::Acquire);
+    if start == 0 {
+        0
+    } else {
+        narf_scheduler::narf_time::monotonic_ns().saturating_sub(start)
+    }
 }
 
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
@@ -2651,6 +2713,28 @@ pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
     let m = g.get_or_insert_with(BTreeMap::new);
     let e = m.entry(task).or_insert(0);
     *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: charge syscall CPU time to a stand-in task so perf inheritance
+/// tests can exercise the exit snapshot without running a real child syscall.
+#[doc(hidden)]
+pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) {
+    let mut g = TASK_KERN_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: model the master exit-table sweep after perf has captured a
+/// child's final software-clock contribution.
+#[doc(hidden)]
+pub fn __test_reset_cpu_times_for(task: u64) {
+    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
+        m.remove(&task);
+    }
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
+        m.remove(&task);
+    }
 }
 
 /// This task's own accumulated user CPU time (ns).

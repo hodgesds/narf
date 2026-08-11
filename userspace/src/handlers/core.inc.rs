@@ -6086,9 +6086,12 @@ pub fn wait_init() {
     // orphanize its children. Both key on `tid`; the reap below keys on
     // `pid`, so they're independent of ordering.
     crate::user_task::register_thread_exit_observer(on_thread_exit);
-    crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
     #[cfg(feature = "linux-compat")]
+    // Perf snapshots final user + kernel software-clock time before the master
+    // table sweep removes TASK_KERN_NS. Register it ahead of that sweep; the
+    // retired total then remains readable after every inherited task exits.
     crate::user_task::register_thread_exit_observer(crate::perf_event::on_thread_exit);
+    crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
     // PROCESS-scoped (last thread of the group only): hand the process
     // to its parent (wait4 reap + SIGCHLD + waker) or auto-release if
     // orphaned. Gated on `group_dead` so a multi-threaded exit_group

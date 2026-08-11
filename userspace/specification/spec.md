@@ -282,7 +282,10 @@ For task targets, `PERF_COUNT_SW_CPU_CLOCK` derives exact time from the
 target's user and syscall CPU-time ledgers. For per-CPU targets it derives
 exact user time from scheduler continuation brackets and exact non-idle time
 from the per-CPU idle ledger; kernel-only time is their difference.
-`PERF_COUNT_SW_TASK_CLOCK` uses the corresponding per-task ledgers. Hardware `exclude_kernel` and
+`PERF_COUNT_SW_TASK_CLOCK` uses the corresponding per-task ledgers. Matching
+Linux, privilege exclusion flags do not split software CPU/task clocks:
+`cpu-clock`, `cpu-clock:u`, and `cpu-clock:k` (likewise `task-clock`) count the
+same scheduled time. Hardware `exclude_kernel` and
 `exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
 P/U exclusions on allocation and preserve them across overflow rearming.
 Pinned task groups are scheduled atomically before flexible groups and are
@@ -399,7 +402,13 @@ resume reports that shortened period, then reloads the configured full period.
 `inherit` extends
 that task set at every process or thread clone and removes the child at its
 thread-exit callback; concurrently running descendants therefore receive
-independent per-CPU slots whose counts feed the original event. Frequency mode
+independent per-CPU slots whose counts feed the original event. Software CPU
+and task clocks normalize the architecture's slice and syscall ledgers into
+scheduled time, sum every live descendant, and retire each final value before
+the exit sweep removes those ledgers, so short-lived threads remain in the
+terminal count. Live reads include the current un-folded slice
+and syscall span; timer preemption folds the slice and pauses the syscall span
+across the off-CPU interval. Frequency mode
 starts from the calibrated TSC-rate estimate and, after each real overflow,
 adjusts the following reload period from observed elapsed time toward
 `sample_freq`; each correction is bounded to fourfold to prevent a delayed
