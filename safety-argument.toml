@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "4ce57483b1c6e42e087a1fd3d83122ac80aa4751ec6f92f5d676b01dfbd094dd"
+prompt_hash = "6ad0d16abee10036094cd56a5bf070c4f85bfb17f06f0a95cfe7ff29e1f5c2f7"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -255,3 +255,11 @@ argument = "Native arena-atomic lowering changes only the existing untrusted BPF
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The verifier remains the sole admission path for native arena atomics. Both emitters derive the address from the page-aligned kernel arena slot base plus the verifier-tracked zero-extended handle and signed instruction displacement, reject misalignment before any atomic access, and register the actual faulting instruction for recovery before executable publication. Natural-alignment and page-fault paths return distinct terminal statuses with the offending handle; fetching bitwise arena atomics preserve the portable fail-closed boundary and interpret instead of using x86 scratch state that would destroy that handle."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The production fix only moves the existing TSS.rsp0 and per-CPU SYSCALL-stack hook installation from the x2APIC-only IPI branch to the common x86_64 LAPIC initialization path. Frame and the scheduler executor remain within the existing TCB set; no subsystem, authority, or TCB boundary is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The retarget hook continues to write only the current CPU's existing TSS.rsp0 and PerCpu.kernel_stack_top from a scheduler-owned task stack bound. Installing it for xAPIC restores the same per-task isolation already used by x2APIC and prevents user syscalls from sharing and corrupting the executor stack; capability checks, domain tags, address spaces, and task ownership are unchanged."

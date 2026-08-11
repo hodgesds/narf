@@ -31,6 +31,12 @@ env:
   XTASK_QEMU_NO_BALLOON: "1"
   # Extra buddy headroom for the TCG QEMU boot (matches ci.yml).
   NARF_QEMU_MEM_MB: "2048"
+  # Exercise the xAPIC fallback explicitly. The OCI fork/exec path is the
+  # regression test for per-task kernel-stack hooks being wired independently
+  # of x2APIC-only IPI support.
+  NARF_QEMU_CPU: "max,-x2apic"
+  NARF_QEMU_SMP: "1"
+  XTASK_QEMU_ACCEL: "tcg,thread=single"
 
 jobs:
   oci-container:
@@ -102,17 +108,14 @@ jobs:
           # just a scrolled register dump. Decode: `gdb <kernel-elf> <core>
           # -ex bt`.
           NARF_QEMU_COM2_FILE: "${{ runner.temp }}/oci-core.bin"
-        # `--retries 3`: a fresh QEMU boot per attempt. GHA's TCG has shown a
-        # rare crash right after the shell prompt (a #UD during container
-        # bring-up/teardown) that QEMU exits on — that fails fast (stdout EOF),
-        # so re-booting is cheap and clears the flake; a genuine break still
-        # fails every attempt. The login retry that tolerates TCG keystroke
-        # garbling is inside run-interactive itself.
+        # Run without whole-VM retries so an xAPIC kernel-stack regression is
+        # reported directly. The login retry that tolerates TCG keystroke
+        # garbling remains inside run-interactive itself.
         run: >
           cargo xtask run-interactive
           --arch=x86_64
           --features container
-          --retries 3
+          --retries 0
           --cmd "oci_smoke"
           --expect "oci-uts-isolated"
       # Only when a crash core was actually written: stage it + the matching
@@ -122,7 +125,7 @@ jobs:
         if: always()
         run: |
           if [ -s "${{ runner.temp }}/oci-core.bin" ]; then
-            cp target/x86_64-unknown-none/debug/narf-frame "${{ runner.temp }}/narf-frame"
+            cp target/x86_64-unknown-none/release/narf-frame "${{ runner.temp }}/narf-frame"
             echo "crashed=true" >> "$GITHUB_OUTPUT"
           else
             rm -f "${{ runner.temp }}/oci-core.bin"

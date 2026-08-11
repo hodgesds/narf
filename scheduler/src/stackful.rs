@@ -2342,6 +2342,55 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// The own-stack handoff must retarget the architecture's user-entry
+    /// stack for the duration of the task and restore the previous per-CPU
+    /// stack afterward. This specifically covers boot-time wiring of the
+    /// setter/getter hooks: the xAPIC fallback once skipped both hooks because
+    /// they were accidentally nested in the x2APIC-only IPI block.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_own_stack_retargets_kernel_entry_stack() -> TestResult {
+        use core::sync::atomic::AtomicU64;
+
+        static OBSERVED_TOP: AtomicU64 = AtomicU64::new(0);
+
+        struct CaptureKernelStackTop;
+        impl Future for CaptureKernelStackTop {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                OBSERVED_TOP.store(crate::current_kernel_stack_top(), Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        let baseline = crate::current_kernel_stack_top();
+        if baseline == 0 {
+            return TestResult::Fail("kernel-stack getter hook is not installed");
+        }
+
+        OBSERVED_TOP.store(0, Ordering::Release);
+        let mut task = KernelTask::new(CaptureKernelStackTop);
+        let expected_top = ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64;
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        let saved_own_stack = USE_OWN_STACK.swap(true, Ordering::AcqRel);
+        // SAFETY: single-threaded kernel smoke; the task, context, and waker
+        // remain live for the complete switch round trip.
+        let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+
+        if result != Poll::Ready(()) {
+            return TestResult::Fail("own-stack capture task did not complete");
+        }
+        if OBSERVED_TOP.load(Ordering::Acquire) != expected_top {
+            return TestResult::Fail("kernel-entry stack was not retargeted to the task stack");
+        }
+        if crate::current_kernel_stack_top() != baseline {
+            return TestResult::Fail("kernel-entry stack baseline was not restored");
+        }
+        TestResult::Pass
+    }
+
     /// `set_current_user_fs_base` must publish the user FS_BASE (TLS pointer)
     /// into the CURRENTLY-running stackful task's own per-task `user_fs_base`
     /// slot — the value `poll_to_yield` reloads on a later kernel_switch
@@ -4373,6 +4422,11 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_stackful_runs_on_dedicated_stack);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_user_own_stack_retargets_kernel_entry_stack
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",

@@ -829,6 +829,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             "  apic: {} active, 8259 PICs masked",
             if x2apic_active { "x2APIC" } else { "xAPIC" }
         );
+
+        // Per-task kernel-stack retargeting is independent of the LAPIC
+        // access mode. Both x2APIC and the xAPIC fallback run user tasks on
+        // their own kernel stacks, so both must update TSS.rsp0 and the
+        // SYSCALL gs:[8] stack pointer on every task handoff. Keeping these
+        // hooks inside the x2APIC-only IPI block left the xAPIC path using the
+        // shared executor stack; a cooperative yield then saved a task
+        // continuation over the executor continuation and crashed nightly
+        // OCI during fork/exec.
+        narf_scheduler::set_kernel_stack_hook(super::x86_64::gdt::set_task_kernel_stack);
+        // Reader counterpart: nested polls restore the outer task's stack top
+        // rather than the per-CPU baseline.
+        narf_scheduler::set_get_kernel_stack_hook(super::x86_64::percpu::kernel_stack_top);
+
         // TLB-shootdown IPI fan-out — requires x2APIC for ICR MSR
         // writes. Skipped under xAPIC fallback; cross-CPU
         // invalidation falls back to the per-CPU INVLPG only.
@@ -856,15 +870,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_scheduler::set_idle_backstop_hook(|deadline| {
                 narf_interrupts::x86_64::apic::arm_tsc_deadline_if_earlier(deadline);
             });
-            // Per-task kernel-stack retargeting (Linux `update_task_stack`):
-            // points TSS.rsp0 + SYSCALL gs:[8] at the running user task's own
-            // kernel stack so a trap/syscall lands there, not on a shared
-            // per-CPU stack. DORMANT until the scheduler wires it in (Stage 2);
-            // `top==0` restores the per-CPU baseline.
-            narf_scheduler::set_kernel_stack_hook(super::x86_64::gdt::set_task_kernel_stack);
-            // Reader counterpart: lets `poll_to_yield` snapshot the live rsp0 so a
-            // nested poll restores the OUTER task's stack top, not the baseline.
-            narf_scheduler::set_get_kernel_stack_hook(super::x86_64::percpu::kernel_stack_top);
             // Wire the memory subsystem's `invlpg_global` to
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.
