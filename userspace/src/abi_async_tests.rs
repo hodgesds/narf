@@ -499,6 +499,9 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_neg);
 // ════════════════════════════════════════════════════════════════════
 
 const FUTEX_WAKE: u64 = 1;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_PRIVATE: u64 = 0x80;
 
 fn smoke_abi_async_futex_pos() -> TestResult {
     with_setup(|| {
@@ -527,6 +530,35 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_async_classic_futex_wait_stale_eagain
 );
+
+fn smoke_abi_async_futex_timespec_timeout() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let expired = [0i64, 0i64];
+        let args = a3(
+            &word as *const u32 as u64,
+            FUTEX_WAIT | FUTEX_PRIVATE,
+            0,
+            expired.as_ptr() as u64,
+        );
+        if call(Syscall::Futex.raw(), args) != Some(-110) {
+            return Err("FUTEX_WAIT did not parse an expired relative timespec");
+        }
+
+        let invalid = [0i64, 1_000_000_000i64];
+        let args = a3(
+            &word as *const u32 as u64,
+            FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
+            0,
+            invalid.as_ptr() as u64,
+        );
+        if call(Syscall::Futex.raw(), args) != Some(-22) {
+            return Err("FUTEX_WAIT_BITSET accepted an invalid timespec");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_timespec_timeout);
 
 fn smoke_abi_async_futex_neg() -> TestResult {
     with_setup(|| {

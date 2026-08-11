@@ -3818,7 +3818,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
             return TestResult::Fail("AddressSpace::new_for_user");
         }
     };
-    *PROC_PARENT_AS.lock() = Some(parent_as);
+    *PROC_PARENT_AS.lock() = Some(parent_as.clone());
     install_address_space_lookup(lookup_proc_parent_as);
 
     let mut t = SyscallTable::new();
@@ -3890,15 +3890,19 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
         }
     }
 
-    // Snapshot the futex wake counter at ca.child_tid pre-exit.
-    let pre = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+    // pthread_join uses FUTEX_WAIT_PRIVATE, so clear_child_tid must publish
+    // its exit wake in the shared AddressSpace Arc's private namespace.
+    // A namespace-0 wake only appears to work through the timer backstop and
+    // strands under SMP thread churn.
+    let namespace = Arc::as_ptr(&parent_as) as usize as u64;
+    let pre = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
 
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
     // ca.child_tid.
     crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
 
-    let post = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+    let post = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
     if post <= pre {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;

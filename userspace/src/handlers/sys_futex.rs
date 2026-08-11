@@ -4,25 +4,11 @@ use super::*;
 pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uaddr = args.arg0;
-    let namespace = futex_namespace((args.arg1 & FUTEX_PRIVATE) != 0);
+    let raw_op = args.arg1;
+    let namespace = futex_namespace((raw_op & FUTEX_PRIVATE) != 0);
     let key = futex_key(namespace, uaddr);
-    let op = args.arg1 & FUTEX_OP_MASK;
+    let op = raw_op & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
-    // KNOWN ABI DIVERGENCE: Linux futex(2)'s 4th argument is a `struct
-    // timespec *`, but this handler consumes it as a raw nanosecond count —
-    // a stack-allocated timespec pointer (~0x7ffc_xxxx_xxxx) becomes a
-    // ~39-hour relative timeout, i.e. every real timed FUTEX_WAIT is
-    // effectively untimed and relies on the futex wake / signal wake alone.
-    // (Observed directly in the stress-ng --futex SMP strand: the child's
-    // "5 µs" wait parked with sleep_deadline_ns ≈ now + 0x7ffc_c8dd_03bd.)
-    // Harmless for musl's dominant untimed waits (timeout == NULL == 0) and
-    // for waiters that are reliably woken, and NARF's park already treats
-    // the deadline only as a backstop — but timed waits never ETIMEDOUT on
-    // schedule. Fixing this means copy_from_user of the timespec (+ the
-    // WAIT_BITSET absolute-clock variant) and updating the NARF-native
-    // callers that pass raw ns; tracked as follow-up, deliberately not
-    // folded into the signal-interruptible-park fix.
-    let timeout_ns = args.arg3; // 0 = no timeout
     let fail = SyscallReturn::ok((-1i64) as u64);
     // Start each futex op from clean park state so a stale `futex_uaddr` left
     // by a prior wait (e.g. a wake that cleared only the deadline) can't make
@@ -36,11 +22,11 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     }
     // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
     // queue (the bitmask only narrows WHICH wakes match; a superset wake is
-    // safe and musl/glibc pass MATCH_ANY). The bitset timeout is ABSOLUTE in
-    // Linux, but NARF's wait path uses the deadline only as a lost-wake
-    // backstop (the real wake is the futex wake), so the relative/absolute
-    // distinction doesn't affect correctness here.
-    let op = if op == FUTEX_WAIT_BITSET {
+    // safe and musl/glibc pass MATCH_ANY). Its timeout remains distinct:
+    // WAIT_BITSET takes an absolute deadline while WAIT takes a relative
+    // duration, as decoded below.
+    let wait_bitset = op == FUTEX_WAIT_BITSET;
+    let op = if wait_bitset {
         FUTEX_WAIT
     } else if op == FUTEX_WAKE_BITSET {
         FUTEX_WAKE
@@ -109,11 +95,22 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // (`u64::MAX`) — the poll routine parks on the timer wheel with a
             // one-tick fallback as a lost-wake safety net, but the primary
             // wake is the registered futex waker.
-            let deadline = if timeout_ns == 0 {
-                u64::MAX
-            } else {
-                narf_scheduler::narf_time::monotonic_ns().saturating_add(timeout_ns)
+            let deadline = match futex_timeout_deadline(
+                args.arg3,
+                wait_bitset,
+                (raw_op & FUTEX_CLOCK_REALTIME) != 0,
+            ) {
+                Ok(None) => u64::MAX,
+                Ok(Some(deadline)) => deadline,
+                Err(errno) => {
+                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                    return;
+                }
             };
+            if deadline <= narf_scheduler::narf_time::monotonic_ns() {
+                ctx.set_return(SyscallReturn::ok((-110i64) as u64)); // ETIMEDOUT
+                return;
+            }
             if let (Some(uctx), Some(hook)) = (
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),

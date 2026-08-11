@@ -4867,15 +4867,17 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 // the kernel records the same TaskId on both sides so the lookup
 // from exit-side `pid_raw` to "is there a clear_child_tid?" works
 // uniformly.
-/// Per-task clear_child_tid entry: (uaddr, address-space root
-/// phys). Stashing the root phys at registration time means the
-/// exit-observer can write the futex word even after the
-/// scheduler has already reaped the task's slot.
+/// Per-task clear_child_tid entry: user address, address-space root phys, and
+/// private-futex namespace. Stashing both address-space identities at
+/// registration time lets the exit observer write the word and wake the exact
+/// `FUTEX_PRIVATE` queue after the scheduler has reaped the task's slot.
 #[derive(Copy, Clone)]
 struct ClearChildTidEntry {
     uaddr: u64,
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     as_root: narf_memory::PhysAddr,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    futex_namespace: u64,
 }
 
 #[cfg(feature = "linux-compat")]
@@ -4894,11 +4896,24 @@ pub fn clear_child_tid_init() {
 
 #[cfg(feature = "linux-compat")]
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
-    set_clear_child_tid_with_as(task_id_raw, uaddr, narf_memory::PhysAddr::new(0));
+    let (as_root, futex_namespace) = current_address_space()
+        .map(|space| {
+            (
+                space.root,
+                futex_namespace_for_address_space(&space),
+            )
+        })
+        .unwrap_or((narf_memory::PhysAddr::new(0), 0));
+    set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace);
 }
 
 #[cfg(feature = "linux-compat")]
-fn set_clear_child_tid_with_as(task_id_raw: u64, uaddr: u64, as_root: narf_memory::PhysAddr) {
+fn set_clear_child_tid_with_as(
+    task_id_raw: u64,
+    uaddr: u64,
+    as_root: narf_memory::PhysAddr,
+    futex_namespace: u64,
+) {
     let mut g = CLEAR_CHILD_TID.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
@@ -4907,7 +4922,14 @@ fn set_clear_child_tid_with_as(task_id_raw: u64, uaddr: u64, as_root: narf_memor
         if uaddr == 0 {
             m.remove(&task_id_raw);
         } else {
-            m.insert(task_id_raw, ClearChildTidEntry { uaddr, as_root });
+            m.insert(
+                task_id_raw,
+                ClearChildTidEntry {
+                    uaddr,
+                    as_root,
+                    futex_namespace,
+                },
+            );
         }
     }
 }
@@ -5001,12 +5023,14 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     }
 
     // NOW bump the counter (lost-wakeup gen guard) AND fire every parked waiter
-    // on the real wait queue — AFTER the word write above, so a joiner's
-    // wake→re-read observes the cleared (0) word and proceeds instead of
-    // re-parking. `futex_bump_counter` takes the counter lock (release); the
-    // joiner's next FUTEX_WAIT gen-snapshot (acquire) then sees the prior write.
-    futex_bump_counter(uaddr);
-    futex_wake_waiters(uaddr, u32::MAX);
+    // in this address space's PRIVATE futex namespace — AFTER the word write
+    // above, so a joiner's wake→re-read observes the cleared (0) word and
+    // proceeds instead of re-parking. Linux's clear_child_tid exit wake is a
+    // private futex wake; publishing it in namespace 0 misses pthread_join's
+    // FUTEX_WAIT_PRIVATE queue and degrades every join to the timer backstop.
+    let key = futex_key(entry.futex_namespace, uaddr);
+    futex_bump_counter_key(key);
+    futex_wake_waiters_key(key, u32::MAX);
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
@@ -5341,6 +5365,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // scheduler — needed by the exit-observer to write the
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
+    let child_futex_namespace = futex_namespace_for_address_space(&child_as);
     // A new thread joins the group — bump `signal->live` BEFORE the
     // child is spawned/enqueued. Under SMP another CPU can pick up and
     // EXIT the child the instant it's runnable; a not-yet-counted first
@@ -5613,7 +5638,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // `address_space_of` returns None, but the Arc we hold in
     // `child_as` keeps the page tables alive.
     if (flags & CLONE_CHILD_CLEARTID) != 0 && ca.child_tid != 0 {
-        set_clear_child_tid_with_as(child_tid.raw(), ca.child_tid, child_as_root);
+        set_clear_child_tid_with_as(
+            child_tid.raw(),
+            ca.child_tid,
+            child_as_root,
+            child_futex_namespace,
+        );
     }
 
     // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn.
@@ -7241,6 +7271,23 @@ pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
         .insert(task_raw, pid_raw);
 }
 
+/// Release a finished non-leader thread from the task registry. Linux does
+/// not expose CLONE_THREAD siblings as wait4-reapable zombies; retaining them
+/// until the process exits leaks one Task/TCB allocation per pthread and makes
+/// sustained thread churn progressively slower.
+pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
+    let Some(leader_tid) = pid_to_task_raw(pid) else {
+        return;
+    };
+    if leader_tid == tid {
+        return;
+    }
+    crate::task::release_task(tid);
+    if let Some(m) = TASK_TO_PID.lock().as_mut() {
+        m.remove(&tid);
+    }
+}
+
 /// Linux `signal->live`: per-thread-group (per-`pid`) count of live
 /// threads. Only ever holds entries for MULTI-threaded groups — a
 /// single-threaded process is never inserted (its implicit count is 1)
@@ -7264,20 +7311,29 @@ pub fn thread_group_live_inc(pid: u64) {
 /// live thread (`group_dead`) — the caller then runs process-scoped
 /// teardown exactly once. An untracked group (single-threaded, never
 /// `inc`'d) is implicitly its own last thread and returns `true`.
-pub fn thread_group_live_dec(pid: u64) -> bool {
+/// Decrement the live count and also report whether this pid belonged to a
+/// tracked multi-threaded group. The second result lets exit cleanup avoid a
+/// process-registry lookup for ordinary single-threaded fork children.
+pub(crate) fn thread_group_live_dec_state(pid: u64) -> (bool, bool) {
     let mut g = THREAD_GROUP_LIVE.lock();
-    let Some(m) = g.as_mut() else { return true };
+    let Some(m) = g.as_mut() else {
+        return (true, false);
+    };
     match m.get_mut(&pid) {
-        None => true,
+        None => (true, false),
         Some(n) if *n <= 1 => {
             m.remove(&pid);
-            true
+            (true, true)
         }
         Some(n) => {
             *n -= 1;
-            false
+            (false, true)
         }
     }
+}
+
+pub fn thread_group_live_dec(pid: u64) -> bool {
+    thread_group_live_dec_state(pid).0
 }
 
 /// Live-thread count of thread-group `pid`. Single-threaded groups are

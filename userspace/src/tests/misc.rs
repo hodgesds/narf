@@ -1647,6 +1647,40 @@ kernel_test_in!(
     smoke_userspace_private_futex_namespaces_isolate_same_uaddr
 );
 
+fn smoke_userspace_exited_pthread_does_not_remain_zombie() -> TestResult {
+    const PID: u64 = 70_001;
+    const LEADER: u64 = 70_101;
+    const THREAD: u64 = 70_102;
+
+    crate::handlers::pid_task_map_reset();
+    crate::handlers::__test_thread_group_live_reset();
+    crate::task::__test_reset_tasks();
+    let _leader = crate::task::Task::new_registered(LEADER, PID);
+    let _thread = crate::task::Task::new_registered(THREAD, PID);
+    crate::handlers::register_pid_task_mapping(PID, LEADER);
+    crate::handlers::register_task_to_pid(THREAD, PID);
+    crate::handlers::thread_group_live_inc(PID);
+
+    // Drive the real exit fan-out. The tracked group is still live, so this
+    // must release only the non-leader task and must not run process teardown.
+    crate::user_task::notify_task_exited(PID, THREAD);
+    if crate::task::task_get(THREAD).is_some() {
+        return TestResult::Fail("exited pthread retained a zombie task entry");
+    }
+    if crate::task::task_get(LEADER).is_none() {
+        return TestResult::Fail("pthread exit released the live process leader");
+    }
+
+    crate::task::release_task(LEADER);
+    crate::handlers::__test_thread_group_live_reset();
+    crate::handlers::pid_task_map_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_userspace_exited_pthread_does_not_remain_zombie
+);
+
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
 /// A blocking park's lost-wake fallback timer must fire a ~10 ms backstop for

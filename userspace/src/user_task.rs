@@ -1121,11 +1121,23 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
     for o in thread.iter() {
         o(pid, tid);
     }
-    if crate::handlers::thread_group_live_dec(pid) {
+    let (group_dead, was_multithreaded) = crate::handlers::thread_group_live_dec_state(pid);
+    if group_dead {
         let process = PROCESS_EXIT_OBSERVERS.lock().clone();
         for o in process.iter() {
             o(pid, tid);
         }
+    }
+    // CLONE_THREAD siblings are never wait4-reapable zombies. Their future
+    // still owns an Arc until this poll returns, so the process registry can
+    // drop its reference immediately after every exit observer has run.
+    // The group leader remains registered through the ordinary process-zombie
+    // window and is released when its parent reaps the shared PID.
+    // Avoid a PID_TO_TASK registry lookup on the overwhelmingly common
+    // single-threaded fork/exit path. Only a group that was ever tracked can
+    // contain a non-leader task that needs this early release.
+    if was_multithreaded {
+        crate::handlers::release_exited_thread_task(pid, tid);
     }
 }
 
@@ -1827,8 +1839,12 @@ impl core::future::Future for UserTaskFuture {
                 // mode (musl re-checks the word) instead of sleeping it out.
                 let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
                 if fu != 0 {
-                    crate::handlers::futex_register_waiter(
+                    let key = crate::handlers::futex_key(
+                        this.task.uctx.futex_namespace.load(Ordering::Acquire),
                         fu,
+                    );
+                    crate::handlers::futex_register_waiter_key(
+                        key,
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
                     );
@@ -1838,15 +1854,19 @@ impl core::future::Future for UserTaskFuture {
                     // (musl condvar requeue handoff, robust-owner death)
                     // from re-parking this task forever.
                     let stay = crate::handlers::futex_park_should_stay(
-                        crate::handlers::futex_gen(fu),
+                        crate::handlers::futex_gen_key(key),
                         this.task.uctx.futex_park_gen.load(Ordering::Acquire),
                         crate::handlers::futex_read_user_word(fu),
                         this.task.uctx.futex_val.load(Ordering::Acquire),
                     );
                     if !stay {
-                        crate::handlers::futex_drop_waiter(fu, crate::handlers::current_task_id());
+                        crate::handlers::futex_drop_waiter_key(
+                            key,
+                            crate::handlers::current_task_id(),
+                        );
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         this.task.uctx.futex_uaddr.store(0, Ordering::Release);
+                        this.task.uctx.futex_namespace.store(0, Ordering::Release);
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
                     }
