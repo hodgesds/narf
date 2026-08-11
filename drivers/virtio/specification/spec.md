@@ -39,6 +39,12 @@ blk/net/console/rng.
   native parallelism the moment we touch real hardware. `class_blk`
   and `class_net` modules consume the per-queue rings and present
   the unified block/net subsystem interfaces.
+- virtio-gpu exposes `offered_features()` and `host_offers_virgl()` so boot
+  diagnostics and the future render-node bridge can distinguish a portable
+  2D device from a VirGL-capable host. These report the pre-negotiation host
+  offer only. v1.1 continues to negotiate just `VIRTIO_F_VERSION_1`; it MUST
+  NOT accept `VIRTIO_GPU_F_VIRGL` until resource/context lifetime management
+  and the render-node execbuffer UAPI land together.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.
@@ -117,7 +123,7 @@ match tables, the `enable_msix_for_probed` shape, the
 shared transport helpers used by other virtio drivers) are
 re-exported through SDK at `@v0`.
 
-`VIRTIO_DRIVER_ABI_MAJOR = 1`, `VIRTIO_DRIVER_ABI_MINOR = 0`.
+`VIRTIO_DRIVER_ABI_MAJOR = 1`, `VIRTIO_DRIVER_ABI_MINOR = 1`.
 Adding a new device-class driver under `drivers/virtio/`
 is a minor bump (registers a new match-table entry; doesn't
 break existing).

@@ -51,6 +51,18 @@ pub const VIRTIO_GPU_PCI_DEVICE: u16 = 0x1050;
 /// Legacy (transitional) virtio-gpu (VirtIO 1.2 §4.1.2 transitional ids).
 pub const VIRTIO_GPU_PCI_DEVICE_LEGACY: u16 = 0x1010;
 
+/// Device feature bit advertising the VirGL 3D command set.
+///
+/// We record this offer for diagnostics but deliberately do not negotiate it
+/// until the render-node resource/context/execbuffer UAPI is wired. Setting
+/// the bit early would tell the host that command submission is supported
+/// when the guest can still only drive the 2D scanout path.
+pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
+
+const fn features_offer_virgl(features: u64) -> bool {
+    features & (1u64 << VIRTIO_GPU_F_VIRGL) != 0
+}
+
 // VirtIO 1.2 §5.7.2: virtio-gpu exposes two virtqueues —
 // controlq (idx 0) for command/response, cursorq (idx 1) for
 // cursor updates. Driver-side default depths.
@@ -114,6 +126,9 @@ pub struct VirtioGpuPci {
     /// clears the global enable + restores INTx routing.
     #[allow(dead_code)]
     msix: Option<narf_bus::MsixTable>,
+    /// Complete device feature bitmap observed before negotiation. Kept for
+    /// capability diagnostics; only VERSION_1 is currently accepted.
+    offered_features: u64,
     ctrl_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _cursor_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _ctrl_layout_buf: DmaBuffer,
@@ -147,6 +162,7 @@ impl core::fmt::Debug for VirtioGpuPci {
         f.debug_struct("VirtioGpuPci")
             .field("ready", &self.is_ready())
             .field("mode", &mode)
+            .field("host_offers_virgl", &self.host_offers_virgl())
             .finish_non_exhaustive()
     }
 }
@@ -177,7 +193,9 @@ impl VirtioGpuPci {
             );
         }
 
-        // Feature negotiation: only VERSION_1.
+        // Feature negotiation: only VERSION_1. In particular, keep
+        // VIRTIO_GPU_F_VIRGL clear until the guest render-node UAPI can
+        // create resources/contexts and submit command buffers.
         // SAFETY: same.
         let feats_lo = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
@@ -251,6 +269,7 @@ impl VirtioGpuPci {
             notify_off_multiplier,
             irq_vector,
             msix,
+            offered_features: feats,
             ctrl_q: IrqSafeSpinLock::new(Some(ctrl_q)),
             _cursor_q: IrqSafeSpinLock::new(Some(cursor_q)),
             _ctrl_layout_buf: ctrl_buf,
@@ -278,6 +297,19 @@ impl VirtioGpuPci {
     /// diagnostics. `None` until something fails.
     pub fn last_error(&self) -> Option<VirtioPciError> {
         *self.last_err.lock()
+    }
+
+    /// Complete feature bitmap the host offered before negotiation.
+    pub fn offered_features(&self) -> u64 {
+        self.offered_features
+    }
+
+    /// Whether the virtual GPU is backed by a VirGL-capable host renderer.
+    ///
+    /// This reports the host offer, not a negotiated guest capability. The
+    /// current driver continues to operate in 2D mode even when this is true.
+    pub fn host_offers_virgl(&self) -> bool {
+        features_offer_virgl(self.offered_features)
     }
 
     /// Cached scanout mode (a copy — the lock is released before
