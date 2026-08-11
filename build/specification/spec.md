@@ -22,6 +22,13 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 ## 3. Public interface
 
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
+- `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
+  — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
+  `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
+  GL device and otherwise fall back to `virtio-2d`; headless runs stay on 2D.
+  Selecting VirGL does not by itself make a guest renderer available: the
+  guest must also negotiate
+  `VIRTIO_GPU_F_VIRGL` and expose the matching render-node UAPI.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run one exact
   in-kernel subsystem, then perform the normal whole-kernel boot smoke.

@@ -339,6 +339,15 @@ struct BuildArgs {
     #[arg(long, default_value = "none")]
     display: String,
 
+    /// Virtual GPU backend exposed by QEMU.
+    ///
+    /// `virtio-2d` is the universally available scanout path. `virgl`
+    /// selects QEMU's OpenGL-backed virtio-gpu device; it also requires a
+    /// GL-capable display backend such as `--display gtk,gl=on` (or an
+    /// EGL-headless backend on hosts that provide one).
+    #[arg(long, value_enum, default_value_t = GpuBackend::Auto)]
+    gpu_backend: GpuBackend,
+
     /// Hardware profile to use for QEMU.
     #[arg(long, value_enum, default_value_t = HwProfile::Full)]
     hw_profile: HwProfile,
@@ -461,12 +470,108 @@ pub enum HwProfile {
     LegacyOnly,
 }
 
+#[derive(Clone, Copy, ValueEnum, Default, Debug, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// Prefer VirGL for graphical runs when QEMU provides it, otherwise 2D.
+    #[default]
+    Auto,
+    /// Portable virtio-gpu 2D scanout.
+    #[value(name = "virtio-2d")]
+    Virtio2d,
+    /// VirGL-backed virtio-gpu using the host OpenGL stack.
+    Virgl,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Arch {
     #[value(name = "x86_64")]
     X86_64,
     #[value(name = "aarch64")]
     Aarch64,
+}
+
+fn virtio_gpu_device_arg(backend: GpuBackend) -> String {
+    let driver = match backend {
+        GpuBackend::Auto => unreachable!("auto GPU backend must be resolved before QEMU args"),
+        GpuBackend::Virtio2d => "virtio-gpu-pci",
+        GpuBackend::Virgl => "virtio-gpu-gl-pci",
+    };
+    format!("{driver},id=vgpu0,disable-legacy=on,disable-modern=off")
+}
+
+fn qemu_supports_device(qemu: &str, device: &str) -> bool {
+    let Ok(output) = Command::new(qemu).args(["-device", "help"]).output() else {
+        return false;
+    };
+    output.status.success()
+        && (String::from_utf8_lossy(&output.stdout).contains(device)
+            || String::from_utf8_lossy(&output.stderr).contains(device))
+}
+
+fn resolve_gpu_backend(arch: Arch, display: &str, requested: GpuBackend) -> GpuBackend {
+    match requested {
+        GpuBackend::Auto
+            if display != "none" && qemu_supports_device(arch.qemu_bin(), "virtio-gpu-gl-pci") =>
+        {
+            eprintln!("xtask: GPU auto selected VirGL");
+            GpuBackend::Virgl
+        }
+        GpuBackend::Auto => {
+            if display != "none" {
+                eprintln!("xtask: GPU auto fell back to virtio-gpu 2D");
+            }
+            GpuBackend::Virtio2d
+        }
+        explicit => explicit,
+    }
+}
+
+fn qemu_display_arg(display: &str, backend: GpuBackend) -> String {
+    if backend == GpuBackend::Virgl
+        && display != "none"
+        && !display.split(',').any(|part| part.starts_with("gl="))
+    {
+        format!("{display},gl=on")
+    } else {
+        display.to_string()
+    }
+}
+
+#[cfg(test)]
+mod gpu_backend_tests {
+    use super::*;
+
+    #[test]
+    fn default_gpu_backend_is_auto() {
+        let cli = Cli::try_parse_from(["xtask", "run"]).expect("default CLI must parse");
+        let Cmd::Run(args) = cli.cmd else {
+            panic!("run subcommand parsed as another variant");
+        };
+        assert_eq!(args.gpu_backend, GpuBackend::Auto);
+        assert_eq!(
+            virtio_gpu_device_arg(GpuBackend::Virtio2d),
+            "virtio-gpu-pci,id=vgpu0,disable-legacy=on,disable-modern=off"
+        );
+    }
+
+    #[test]
+    fn virgl_gpu_backend_selects_qemu_gl_device() {
+        let cli = Cli::try_parse_from(["xtask", "run", "--gpu-backend", "virgl"])
+            .expect("virgl CLI must parse");
+        let Cmd::Run(args) = cli.cmd else {
+            panic!("run subcommand parsed as another variant");
+        };
+        assert_eq!(args.gpu_backend, GpuBackend::Virgl);
+        assert_eq!(
+            virtio_gpu_device_arg(args.gpu_backend),
+            "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off"
+        );
+        assert_eq!(qemu_display_arg("gtk", args.gpu_backend), "gtk,gl=on");
+        assert_eq!(
+            qemu_display_arg("gtk,gl=off", args.gpu_backend),
+            "gtk,gl=off"
+        );
+    }
 }
 
 impl Arch {
@@ -505,9 +610,16 @@ impl Arch {
         }
     }
 
-    fn qemu_args(self, kernel: &Path, display: &str, profile: HwProfile) -> Vec<String> {
+    fn qemu_args(
+        self,
+        kernel: &Path,
+        display: &str,
+        profile: HwProfile,
+        gpu_backend: GpuBackend,
+    ) -> Vec<String> {
         let kernel = kernel.display().to_string();
-        let display = display.to_string();
+        let gpu_backend = resolve_gpu_backend(self, display, gpu_backend);
+        let display = qemu_display_arg(display, gpu_backend);
         match self {
             Arch::X86_64 => {
                 // QEMU CPU model can be overridden to exercise the
@@ -824,10 +936,7 @@ impl Arch {
                             "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
                         ]);
                     }
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-gpu-pci,id=vgpu0,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
                     if !legacy {
                         args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
                     }
@@ -990,10 +1099,7 @@ impl Arch {
                             "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
                         ]);
                     }
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-gpu-pci,id=vgpu0,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
                     args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
                     args.extend_from_slice(&[
                         "-device".into(),
@@ -1824,7 +1930,10 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.args(
+        args.arch
+            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
+    );
 
     println!("xtask: launching {} {}", qemu, kernel.display());
 
@@ -1902,7 +2011,10 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.args(
+        args.arch
+            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
+    );
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
@@ -2068,7 +2180,10 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.args(
+        args.arch
+            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
+    );
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
@@ -2815,6 +2930,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
             args.build.arch,
             &args.build.display,
             args.build.hw_profile,
+            args.build.gpu_backend,
             &args.cmd,
             &args.expect,
         ) {
@@ -2837,6 +2953,7 @@ fn run_interactive_boot(
     arch: Arch,
     display: &str,
     hw_profile: HwProfile,
+    gpu_backend: GpuBackend,
     typed_cmd: &str,
     expect: &str,
 ) -> Result<()> {
@@ -2846,7 +2963,7 @@ fn run_interactive_boot(
 
     let qemu = arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    let mut qemu_args = arch.qemu_args(kernel, display, hw_profile);
+    let mut qemu_args = arch.qemu_args(kernel, display, hw_profile, gpu_backend);
     if let Some(cpio) = cpio_path {
         qemu_args.push("-initrd".into());
         qemu_args.push(cpio.display().to_string());
@@ -3368,7 +3485,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.args(
         build
             .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
+            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
     );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -3601,7 +3718,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.args(
         build
             .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
+            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
     );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -4224,7 +4341,7 @@ fn boot_narf_redis(
     cmd.args(
         build
             .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
+            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
     );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -5026,7 +5143,7 @@ fn boot_narf_mt_echo(
     cmd.args(
         build
             .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
+            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
     );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -5424,7 +5541,7 @@ fn run_interactive_multi(
     cmd.args(
         build
             .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
+            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
     );
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -7823,7 +7940,10 @@ fn main() -> Result<()> {
                 }
             }
             if args.display == "none" {
-                args.display = "gtk".into();
+                args.display = match args.gpu_backend {
+                    GpuBackend::Auto | GpuBackend::Virtio2d => "gtk".into(),
+                    GpuBackend::Virgl => "gtk,gl=on".into(),
+                };
             }
             run_cmd(&args)
         }

@@ -12,9 +12,27 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    CTRL_Q_DEPTH, CTRL_Q_INDEX, CURSOR_Q_DEPTH, CURSOR_Q_INDEX, VIRTIO_GPU_PCI_DEVICE,
-    VIRTIO_GPU_PCI_DEVICE_LEGACY, VIRTIO_GPU_PCI_VENDOR,
+    features_offer_virgl, CTRL_Q_DEPTH, CTRL_Q_INDEX, CURSOR_Q_DEPTH, CURSOR_Q_INDEX,
+    VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_PCI_DEVICE, VIRTIO_GPU_PCI_DEVICE_LEGACY, VIRTIO_GPU_PCI_VENDOR,
 };
+
+fn smoke_virtio_gpu_virgl_offer_detection() -> TestResult {
+    let virgl = 1u64 << VIRTIO_GPU_F_VIRGL;
+    if features_offer_virgl(0) {
+        return TestResult::Fail("2D-only feature set reported VirGL");
+    }
+    if !features_offer_virgl(virgl) {
+        return TestResult::Fail("VirGL feature offer was not detected");
+    }
+    if !features_offer_virgl(virgl | (1u64 << crate::VIRTIO_F_VERSION_1)) {
+        return TestResult::Fail("transport feature masked the VirGL offer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_virgl_offer_detection
+);
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
 
