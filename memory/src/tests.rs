@@ -685,6 +685,59 @@ fn smoke_paging_map_translate_unmap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_paging_map_translate_unmap);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_paging_local_range_unmap_batches_present_leaves() -> TestResult {
+    use crate::paging::{map_4kb, translate, unmap_4kb_local_range, PageTable, PtFlags};
+    use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    let pml4 = match alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    let base = VirtAddr::new(0x567a_0000);
+    for (page, phys) in [(0, 0x1235_0000), (2, 0x1235_2000)] {
+        // SAFETY: the isolated root is owned by this test; the synthetic
+        // backing addresses are aligned and are never dereferenced.
+        if unsafe {
+            map_4kb(
+                pml4,
+                VirtAddr::new(base.as_u64() + page * 4096),
+                PhysAddr::new(phys),
+                PtFlags::WRITABLE,
+            )
+        }
+        .is_err()
+        {
+            return TestResult::Fail("range fixture map failed");
+        }
+    }
+    // SAFETY: all three pages lie in the isolated live root; the middle page
+    // is intentionally absent and must be treated as a benign miss.
+    if unsafe { unmap_4kb_local_range(pml4, base, 3) } != Ok(2) {
+        return TestResult::Fail("range unmap did not count present leaves");
+    }
+    for page in 0..3 {
+        // SAFETY: read-only walk of the still-live isolated root.
+        if unsafe { translate(pml4, VirtAddr::new(base.as_u64() + page * 4096)) }.is_some() {
+            return TestResult::Fail("range unmap left a translation behind");
+        }
+    }
+    // SAFETY: repeating an unmap over absent leaves is explicitly idempotent.
+    if unsafe { unmap_4kb_local_range(pml4, base, 3) } != Ok(0) {
+        return TestResult::Fail("repeated range unmap was not idempotent");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_paging_local_range_unmap_batches_present_leaves
+);
+
 fn smoke_frame_alloc_roundtrip() -> TestResult {
     let f = match crate::alloc_frame() {
         Ok(f) => f,
@@ -2855,6 +2908,8 @@ kernel_test_in!("memory", smoke_memory_buddy_no_duplicate_allocs);
 fn smoke_memory_address_space_region_table() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    #[cfg(feature = "kernel-test")]
+    let unmap_paths_before = crate::address_space::__test_unmap_path_counts();
     let a = AddressSpace::empty();
     if a.region_count() != 0 {
         return TestResult::Fail("fresh AS has regions");
@@ -2926,6 +2981,18 @@ fn smoke_memory_address_space_region_table() -> TestResult {
     }
     if a.region_count() != 1 {
         return TestResult::Fail("unmap did not shrink region count");
+    }
+    if a.punch_fixed(VirtAddr::new(0x4000), 0x1000).is_err() || a.region_count() != 0 {
+        return TestResult::Fail("private range punch failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        let unmap_paths_after = crate::address_space::__test_unmap_path_counts();
+        if unmap_paths_after.0 != unmap_paths_before.0 + 2
+            || unmap_paths_after.1 != unmap_paths_before.1
+        {
+            return TestResult::Fail("private teardown entered the shared transaction path");
+        }
     }
     TestResult::Pass
 }
@@ -6898,12 +6965,44 @@ fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
             paging::translate(b.root, va_b),
         )
     };
+    #[cfg(feature = "kernel-test")]
+    let unmap_paths_before = crate::address_space::__test_unmap_path_counts();
+    // Shared exact unmap and range punch must retain the serialized path after
+    // private teardown gains its lock-local fast path.
+    let unmapped_shared = a
+        .unmap_region(va_a)
+        .map(|region| region.perms.contains(RegionPerms::SHARED));
+    let punched_shared = b.punch_fixed(va_b, 4096);
+    // SAFETY: read-only walks of both still-live page-table roots.
+    let aliases_gone = unsafe {
+        paging::translate(a.root, va_a).is_none() && paging::translate(b.root, va_b).is_none()
+    };
+    #[cfg(feature = "kernel-test")]
+    let unmap_paths_after = crate::address_space::__test_unmap_path_counts();
     drop(a);
     drop(b);
     crate::free_frame(PhysFrame::new(old));
     crate::free_frame(PhysFrame::new(new));
-    match (replaced, translated) {
-        ((Ok(1), Ok(1)), (Some(left), Some(right))) if left == new && right == new => {
+    match (
+        replaced,
+        translated,
+        unmapped_shared,
+        punched_shared,
+        aliases_gone,
+    ) {
+        ((Ok(1), Ok(1)), (Some(left), Some(right)), Ok(true), Ok(()), true)
+            if left == new && right == new && {
+                #[cfg(feature = "kernel-test")]
+                {
+                    unmap_paths_after.0 == unmap_paths_before.0
+                        && unmap_paths_after.1 == unmap_paths_before.1 + 2
+                }
+                #[cfg(not(feature = "kernel-test"))]
+                {
+                    true
+                }
+            } =>
+        {
             TestResult::Pass
         }
         _ => TestResult::Fail("shared aliases did not move together"),

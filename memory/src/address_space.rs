@@ -26,6 +26,38 @@ static SHARED_MAPPING_TRANSACTION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(()
 type SharedFrameHooks = (fn(u64), fn(u64));
 static SHARED_FRAME_HOOKS: IrqSafeSpinLock<Option<SharedFrameHooks>> = IrqSafeSpinLock::new(None);
 
+#[cfg(feature = "kernel-test")]
+static PRIVATE_UNMAP_FAST_PATHS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "kernel-test")]
+static SHARED_UNMAP_TRANSACTIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_unmap_path_counts() -> (usize, usize) {
+    use core::sync::atomic::Ordering;
+
+    (
+        PRIVATE_UNMAP_FAST_PATHS.load(Ordering::Relaxed),
+        SHARED_UNMAP_TRANSACTIONS.load(Ordering::Relaxed),
+    )
+}
+
+#[inline]
+fn record_unmap_path(shared: bool) {
+    #[cfg(feature = "kernel-test")]
+    {
+        use core::sync::atomic::Ordering;
+
+        if shared {
+            SHARED_UNMAP_TRANSACTIONS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PRIVATE_UNMAP_FAST_PATHS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "kernel-test"))]
+    let _ = shared;
+}
+
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64)) {
     *SHARED_FRAME_HOOKS.lock() = Some((retain, release));
 }
@@ -1123,9 +1155,33 @@ impl AddressSpace {
     /// (below) which calls into the same primitive for every
     /// surviving region plus the page-table pages themselves.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
-        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
+        // Private regions have no externally-owned aliases, so unrelated
+        // address spaces may tear them down concurrently. Keep the region
+        // lock from classification through removal: dropping it between the
+        // SHARED check and swap_remove would let a racing MAP_FIXED replace a
+        // private mapping with a shared one and bypass the transaction.
+        //
+        // Shared regions retain the original global transaction ordering:
+        // drop the region lock, acquire transaction -> region lock, re-find
+        // the mapping, and hold the transaction through TLB invalidation and
+        // the owner's release hook below.
+        let mut regions = self.regions.lock();
+        let shared = regions
+            .iter()
+            .find(|region| region.base == base)
+            .ok_or(AddressSpaceError::Unmapped)?
+            .perms
+            .contains(RegionPerms::SHARED);
+        let _shared_transaction = if shared {
+            drop(regions);
+            let transaction = SHARED_MAPPING_TRANSACTION.lock();
+            regions = self.regions.lock();
+            Some(transaction)
+        } else {
+            None
+        };
+        record_unmap_path(shared);
         let region = {
-            let mut regions = self.regions.lock();
             let idx = regions
                 .iter()
                 .position(|r| r.base == base)
@@ -1152,6 +1208,7 @@ impl AddressSpace {
             }
             region
         };
+        drop(regions);
         // ONE cross-CPU invalidation BEFORE any frame is freed for reuse
         // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
         self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
@@ -1172,18 +1229,41 @@ impl AddressSpace {
     /// individual segments — the non-overlaid pages (e.g. the ELF header)
     /// must survive.
     pub fn punch_fixed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
-        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
         if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         let lo = base.as_u64();
         let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
 
+        // Keep huge -> regular as the address-space lock order. Holding both
+        // locks from classification through table mutation prevents a racing
+        // shared MAP_FIXED from entering the range after we decide it is
+        // private. If a shared alias is present, reacquire in transaction ->
+        // huge -> regular order and keep the transaction through PTE
+        // invalidation and the external owner's release hook.
+        let mut huge = self.huge_regions.lock();
+        let mut regions = self.regions.lock();
+        let shared = regions.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb + region.len;
+            re > lo && rb < hi && region.perms.contains(RegionPerms::SHARED)
+        });
+        let _shared_transaction = if shared {
+            drop(regions);
+            drop(huge);
+            let transaction = SHARED_MAPPING_TRANSACTION.lock();
+            huge = self.huge_regions.lock();
+            regions = self.regions.lock();
+            Some(transaction)
+        } else {
+            None
+        };
+        record_unmap_path(shared);
+
         // A hardware huge leaf cannot be split into a differently-sized
         // mapping without first manufacturing replacement backing. Permit
         // MAP_FIXED to remove whole huge regions, but reject a partial cut.
         let removed_huge = {
-            let mut huge = self.huge_regions.lock();
             if huge.iter().any(|region| {
                 let rb = region.base.as_u64();
                 let re = rb + region.len;
@@ -1206,6 +1286,7 @@ impl AddressSpace {
             *huge = kept;
             removed
         };
+        drop(huge);
         for region in removed_huge {
             let page_size = match region.size {
                 crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
@@ -1237,7 +1318,6 @@ impl AddressSpace {
         let mut to_free: Vec<PhysAddr> = Vec::new();
         let mut punched_pages: u64 = 0;
         {
-            let mut regions = self.regions.lock();
             let old_regions = core::mem::take(&mut *regions);
             let mut kept: Vec<Region> = Vec::with_capacity(old_regions.len());
             for old in old_regions {
@@ -1249,11 +1329,26 @@ impl AddressSpace {
                 }
                 let shared = old.perms.contains(RegionPerms::SHARED);
                 let total = (old.len >> 12) as usize;
-                for pg in 0..total {
+                let first = ((lo.max(rb) - rb) >> 12) as usize;
+                let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+                #[cfg(target_arch = "x86_64")]
+                if self.root.as_u64() != 0 && first < last {
+                    let start = VirtAddr::new(rb + first as u64 * 4096);
+                    // SAFETY: the range is the page-aligned intersection of
+                    // the live region and the punch window. The address-space
+                    // region lock prevents a concurrent replacement while the
+                    // range helper holds the root's PTE mutation lock once.
+                    let _ = unsafe {
+                        crate::x86_64::paging::unmap_4kb_local_range(
+                            self.root,
+                            start,
+                            (last - first) as u64,
+                        )
+                    };
+                }
+                for pg in first..last {
+                    #[cfg(target_arch = "aarch64")]
                     let pv = rb + (pg as u64) * 4096;
-                    if pv < lo || pv >= hi {
-                        continue;
-                    }
                     punched_pages += 1;
                     // Tear the leaf PTE down NOW, under the lock, with
                     // LOCAL invalidation only (one batched cross-CPU flush
@@ -1262,13 +1357,6 @@ impl AddressSpace {
                     // says "free" while a stale PTE lingers for a racing
                     // map_region+materialize to swallow via AlreadyMapped.
                     if self.root.as_u64() != 0 {
-                        #[cfg(target_arch = "x86_64")]
-                        // SAFETY: same identity-mapping precondition as
-                        // `materialize`; `pv` was covered by the region
-                        // being punched. Err (already absent) is benign.
-                        let _ = unsafe {
-                            crate::x86_64::paging::unmap_4kb_local(self.root, VirtAddr::new(pv))
-                        };
                         #[cfg(target_arch = "aarch64")]
                         // SAFETY: see the x86_64 arm.
                         let _ = unsafe {
@@ -1310,6 +1398,7 @@ impl AddressSpace {
             }
             *regions = kept;
         }
+        drop(regions);
         // ONE cross-CPU invalidation covering the punched window, BEFORE any
         // frame is freed for reuse (same mmu_gather shape + vm_shared gating
         // as `unmap_region_pages`). This also replaces the previous PER-PAGE
@@ -1412,15 +1501,12 @@ impl AddressSpace {
     /// must be a valid root and `region`'s pages were installed via it.
     #[cfg(target_arch = "x86_64")]
     unsafe fn unmap_region_leaves_local(&self, region: &Region) {
-        use crate::x86_64::paging::unmap_4kb_local;
         let pages = (region.len + 0xFFF) >> 12;
-        for i in 0..pages {
-            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
-            // SAFETY: contract documented on the function; an `Err`
-            // (already unmapped) is benign — frames are freed from
-            // region.phys, not the PTE walk.
-            let _ = unsafe { unmap_4kb_local(self.root, v) };
-        }
+        // SAFETY: contract documented on the function. The range helper keeps
+        // the existing per-leaf walk + INVLPG semantics but acquires the
+        // per-root page-table mutation lock once for the complete region.
+        let _ =
+            unsafe { crate::x86_64::paging::unmap_4kb_local_range(self.root, region.base, pages) };
     }
 
     #[cfg(target_arch = "aarch64")]

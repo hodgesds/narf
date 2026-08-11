@@ -979,6 +979,51 @@ pub unsafe fn unmap_4kb_local(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<Phy
     unsafe { unmap_4kb_impl(pml4_phys, virt, false) }
 }
 
+/// Tear down a contiguous run of 4 KiB leaves while acquiring the per-root
+/// page-table mutation lock once. Every present leaf still receives its local
+/// INVLPG; the caller owns one later cross-CPU range/full invalidation before
+/// any removed backing can be reused.
+///
+/// Returns the number of present leaves removed. Missing leaves are benign,
+/// matching repeated [`unmap_4kb_local`] calls.
+///
+/// # Safety
+/// Same contract as [`unmap_4kb_local`] for every page in the range.
+pub unsafe fn unmap_4kb_local_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError> {
+    if !is_canonical(base) {
+        return Err(MapError::NonCanonical);
+    }
+    if base.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages > 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let mut removed = 0;
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.raw() + page * 4096);
+        // SAFETY: the caller's range contract covers this page; the per-root
+        // mutation lock is held for the complete batch.
+        match unsafe { unmap_4kb_locked(pml4_phys, virt, false) } {
+            Ok(_) => removed += 1,
+            Err(MapError::AlreadyMapped) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
 unsafe fn unmap_4kb_impl(
     pml4_phys: PhysAddr,
     virt: VirtAddr,
@@ -994,6 +1039,16 @@ unsafe fn unmap_4kb_impl(
     // Serialise against concurrent map/unmap on the same root. See `pt_lock_for`.
     let _pt_guard = pt_lock_for(pml4_phys).lock();
 
+    // SAFETY: validation and lock acquisition are immediately above.
+    unsafe { unmap_4kb_locked(pml4_phys, virt, broadcast) }
+}
+
+/// Remove one already-validated leaf with `pt_lock_for(pml4_phys)` held.
+unsafe fn unmap_4kb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    broadcast: bool,
+) -> Result<PhysAddr, MapError> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller promises identity reachability.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
