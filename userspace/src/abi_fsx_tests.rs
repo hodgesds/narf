@@ -1629,11 +1629,7 @@ fn smoke_abi_fsx_journald_rotate_sequence() -> TestResult {
         // under the SAME name. This pair is what the boot log is doing.
         let old = b"/abi-jrnl/log/journal/mid/system.journal\0";
         let rotated = b"/abi-jrnl/log/journal/mid/system@0001.journal~\0";
-        if call(
-            Syscall::Rename.raw(),
-            a1(old.as_ptr() as u64, rotated.as_ptr() as u64),
-        ) != Some(0)
-        {
+        if call_rename(old.as_ptr() as u64, rotated.as_ptr() as u64) != Some(0) {
             let _ = call(Syscall::Close.raw(), a0(dfd));
             return Err("rename of the live journal aside (rotation) failed");
         }
@@ -2147,11 +2143,7 @@ fn smoke_abi_fsx_rename_replaces_existing() -> TestResult {
         if !mk(src) {
             return Err("could not create the source file");
         }
-        if call(
-            Syscall::Rename.raw(),
-            a1(src.as_ptr() as u64, dst.as_ptr() as u64),
-        ) != Some(0)
-        {
+        if call_rename(src.as_ptr() as u64, dst.as_ptr() as u64) != Some(0) {
             return Err("rename onto an ABSENT destination failed");
         }
 
@@ -2160,10 +2152,7 @@ fn smoke_abi_fsx_rename_replaces_existing() -> TestResult {
         if !mk(src) {
             return Err("could not re-create the source file");
         }
-        let r = call(
-            Syscall::Rename.raw(),
-            a1(src.as_ptr() as u64, dst.as_ptr() as u64),
-        );
+        let r = call_rename(src.as_ptr() as u64, dst.as_ptr() as u64);
         if r != Some(0) {
             return Err(
                 "rename onto an EXISTING destination failed — POSIX requires atomic \
