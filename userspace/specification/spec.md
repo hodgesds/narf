@@ -278,10 +278,11 @@ observer stops task-targeted leader groups before the monitoring process reads
 their terminal values. This is a compatibility adapter over `observability/`
 PMU authority, not an independent counter subsystem.
 
-`PERF_COUNT_SW_CPU_CLOCK` derives exact user time from scheduler continuation
-brackets and exact non-idle time from the per-CPU idle ledger; kernel-only time
-is their difference. `PERF_COUNT_SW_TASK_CLOCK` uses the corresponding
-per-task user and syscall CPU-time ledgers. Hardware `exclude_kernel` and
+For task targets, `PERF_COUNT_SW_CPU_CLOCK` derives exact time from the
+target's user and syscall CPU-time ledgers. For per-CPU targets it derives
+exact user time from scheduler continuation brackets and exact non-idle time
+from the per-CPU idle ledger; kernel-only time is their difference.
+`PERF_COUNT_SW_TASK_CLOCK` uses the corresponding per-task ledgers. Hardware `exclude_kernel` and
 `exclude_user` selectors program x86 USR/OS or aarch64 PMCCFILTR/PMEVTYPER
 P/U exclusions on allocation and preserve them across overflow rearming.
 Pinned task groups are scheduled atomically before flexible groups and are

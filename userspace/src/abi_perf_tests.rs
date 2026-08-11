@@ -190,22 +190,22 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             }
         }
 
-        let approximate_sw_attr = PerfEventAttr {
+        let task_cpu_clock_attr = PerfEventAttr {
             type_: 1,
-            config: 0, // PERF_COUNT_SW_CPU_CLOCK needs per-target accounting
+            config: 0, // PERF_COUNT_SW_CPU_CLOCK
             ..attr
         };
         match call(
             Syscall::PerfEventOpen.raw(),
             a3(
-                &approximate_sw_attr as *const _ as u64,
+                &task_cpu_clock_attr as *const _ as u64,
                 0,
                 -1i32 as u64,
                 -1i32 as u64,
             ),
         ) {
-            Some(EOPNOTSUPP) => {}
-            _ => return Err("perf_event_open admitted an approximate software event"),
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("perf_event_open rejected exact task CPU clock accounting"),
         }
 
         let exact_cpu_clock_attr = PerfEventAttr {

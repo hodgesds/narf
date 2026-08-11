@@ -1040,20 +1040,28 @@ impl PerfEventFile {
         if self.attr.type_ == PERF_TYPE_SOFTWARE {
             return match self.attr.config {
                 PERF_COUNT_SW_CPU_CLOCK => {
-                    let cpu = if self.target_cpu >= 0 {
-                        self.target_cpu as usize
+                    if self.target_task != u64::MAX {
+                        let user = crate::handlers::cpu_time_ns_of(self.target_task);
+                        let kernel = crate::handlers::kern_time_ns_of(self.target_task);
+                        if !self.counts_kernel() {
+                            user
+                        } else if !self.counts_user() {
+                            kernel
+                        } else {
+                            user.saturating_add(kernel)
+                        }
                     } else {
-                        narf_lib::percpu::current_cpu()
-                    };
-                    let user = cpu_user_time_ns(cpu);
-                    let total =
-                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
-                    if !self.counts_kernel() {
-                        user
-                    } else if !self.counts_user() {
-                        total.saturating_sub(user)
-                    } else {
-                        total
+                        let cpu = self.target_cpu as usize;
+                        let user = cpu_user_time_ns(cpu);
+                        let total = narf_time::monotonic_ns()
+                            .saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
+                        if !self.counts_kernel() {
+                            user
+                        } else if !self.counts_user() {
+                            total.saturating_sub(user)
+                        } else {
+                            total
+                        }
                     }
                 }
                 PERF_COUNT_SW_TASK_CLOCK => {
@@ -3635,17 +3643,6 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
     if pid == -1 && cpu == -1 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    // CPU_CLOCK is backed by exact per-CPU scheduler accounting: user time
-    // when exclude_kernel is set, otherwise elapsed non-idle time. It is not
-    // task accounting; admitting a pid target would return the whole CPU's
-    // time and fabricate attribution. Task consumers must use TASK_CLOCK.
-    if attr.type_ == PERF_TYPE_SOFTWARE
-        && attr.config == PERF_COUNT_SW_CPU_CLOCK
-        && (pid != -1 || cpu < 0)
-    {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
     let group_leader = if group_fd != -1 {
