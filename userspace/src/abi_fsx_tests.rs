@@ -1135,6 +1135,55 @@ fn smoke_abi_fsx_fsconfig_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_fsconfig_pos);
 
+fn smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos() -> TestResult {
+    with_setup(|| {
+        let fsname = b"tmpfs\0";
+        let key = b"ro\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: FSCONFIG_CMD_CREATE,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(CMD_CREATE) setup failed");
+        }
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 0,
+                arg2: key.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(SET_FLAG, ro) failed");
+        }
+        match call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 7,
+                ..Default::default()
+            },
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("fsconfig(CMD_RECONFIGURE) must accept VFS ro flag"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos
+);
+
 fn smoke_abi_fsx_fsconfig_neg() -> TestResult {
     with_setup(|| {
         // No fs-context for fd 999 → EBADF.
