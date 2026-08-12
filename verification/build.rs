@@ -528,6 +528,7 @@ fn main() {
         "sched_affinity_smp_smoke",
         "epoll_smoke",
         "signal_smoke",
+        "df_trap_smoke",
         "sigrcx_smoke",
         "pipeblk_smoke",
         "fs_smoke",

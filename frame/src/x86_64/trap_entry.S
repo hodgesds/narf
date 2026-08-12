@@ -129,6 +129,13 @@ common_trap:
     jz 1f
     swapgs
 1:
+    /* Interrupt/trap entry preserves the live DF bit. Userspace may be
+     * interrupted between STD and CLD, but Rust and the SysV kernel ABI
+     * require forward string operations. The user's original RFLAGS is
+     * already in the CPU-pushed frame below and IRETQ restores it, so this
+     * sanitizes only the kernel execution context.
+     */
+    cld
 
     /* Push general-purpose registers in the order the Rust TrapFrame
      * struct expects them — last-pushed first in the struct, because
