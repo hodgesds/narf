@@ -3439,10 +3439,14 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
     }
 
     // An open span across real work must accumulate.
-    crate::handlers::open_kernel_span(uc);
-    if !uc
+    crate::handlers::__test_open_kernel_span_for(uc, tid);
+    // The kernel-test task may migrate immediately after open returns, so do
+    // not assume the following load executes on the same CPU. A non-zero mask
+    // proves open prepared at least the ledger that owns this span.
+    if uc
         .kern_account_ready
         .load(core::sync::atomic::Ordering::Acquire)
+        == 0
     {
         return TestResult::Fail("opening a kernel span did not prepare its IRQ-safe ledger row");
     }
@@ -3463,7 +3467,7 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
     while narf_scheduler::narf_time::monotonic_ns() < sleep_until {
         core::hint::spin_loop();
     }
-    crate::handlers::open_kernel_span(uc);
+    crate::handlers::__test_open_kernel_span_for(uc, tid);
     crate::handlers::close_kernel_span(uc, tid);
     let after_gap = crate::handlers::kern_time_ns_of(tid);
     if after_gap.saturating_sub(worked) > 1_000_000 {
@@ -3473,22 +3477,17 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
     // Model the scheduler's CPL0 timer-preemption callbacks directly. The
     // pause must fold the active part of the syscall, while the interval
     // before resume remains off-CPU and therefore uncharged.
-    crate::user_task::install_current(uc as *const _ as *mut _);
     let preempt_result = (|| {
-        let current_tid = crate::handlers::current_task_id();
-        if current_tid == 0 {
-            return TestResult::Fail("timer-preemption accounting has no current task id");
-        }
-        let before_pause = crate::handlers::kern_time_ns_of(current_tid);
-        crate::handlers::open_kernel_span(uc);
+        let before_pause = crate::handlers::kern_time_ns_of(tid);
+        crate::handlers::__test_open_kernel_span_for(uc, tid);
         let run_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000;
         while narf_scheduler::narf_time::monotonic_ns() < run_until {
             core::hint::spin_loop();
         }
-        if !crate::handlers::pause_current_kernel_span() {
+        if !crate::handlers::__test_pause_kernel_span_for(uc, tid) {
             return TestResult::Fail("timer-preemption pause did not close an active span");
         }
-        let paused = crate::handlers::kern_time_ns_of(current_tid);
+        let paused = crate::handlers::kern_time_ns_of(tid);
         if paused <= before_pause {
             return TestResult::Fail("timer-preemption pause did not fold on-CPU time");
         }
@@ -3496,15 +3495,14 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
         while narf_scheduler::narf_time::monotonic_ns() < off_cpu_until {
             core::hint::spin_loop();
         }
-        crate::handlers::resume_current_kernel_span();
-        crate::handlers::close_kernel_span(uc, current_tid);
-        let resumed = crate::handlers::kern_time_ns_of(current_tid);
+        crate::handlers::__test_open_kernel_span_for(uc, tid);
+        crate::handlers::close_kernel_span(uc, tid);
+        let resumed = crate::handlers::kern_time_ns_of(tid);
         if resumed.saturating_sub(paused) > 1_000_000 {
             return TestResult::Fail("timer-preemption off-CPU gap was billed as kernel time");
         }
         TestResult::Pass
     })();
-    crate::user_task::clear_current();
     if let TestResult::Fail(reason) = preempt_result {
         return TestResult::Fail(reason);
     }
@@ -3515,6 +3513,36 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
 kernel_test_in!(
     "userspace/process",
     smoke_kernel_time_accumulates_on_cpu_only
+);
+
+/// CPU-time reads and teardown must aggregate every per-CPU ledger a task
+/// touched. This is the migration half of the accounting contract: hot folds
+/// stay CPU-local, but a task's externally visible total remains singular.
+fn smoke_cpu_time_aggregates_migrated_ledgers() -> TestResult {
+    const TID: u64 = 0x5717_1000;
+    crate::handlers::__test_reset_cpu_times_for(TID);
+
+    crate::handlers::__test_account_cpu_ns_on_cpu(TID, 0, 11);
+    crate::handlers::__test_account_cpu_ns_on_cpu(TID, 1, 13);
+    crate::handlers::__test_account_kernel_ns_on_cpu(TID, 0, 17);
+    crate::handlers::__test_account_kernel_ns_on_cpu(TID, 1, 19);
+
+    if crate::handlers::cpu_time_ns_of(TID) != 24 {
+        return TestResult::Fail("migrated user CPU ledgers were not aggregated");
+    }
+    if crate::handlers::kern_time_ns_of(TID) != 36 {
+        return TestResult::Fail("migrated kernel CPU ledgers were not aggregated");
+    }
+
+    crate::handlers::__test_reset_cpu_times_for(TID);
+    if crate::handlers::cpu_time_ns_of(TID) != 0 || crate::handlers::kern_time_ns_of(TID) != 0 {
+        return TestResult::Fail("CPU-time teardown left a row on a migrated ledger");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_cpu_time_aggregates_migrated_ledgers
 );
 
 // ── Wave-65: clone3(CLONE_VM|CLONE_THREAD) + set_tid_address ──────────

@@ -17,11 +17,7 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     if old_ptr != 0 {
-        let mask = SIGNAL_MASK
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or(0);
+        let mask = signal_bits_get(&SIGNAL_MASK, task);
         // NARF's internal mask layout is bit N-1 = signal N — identical to a
         // userspace `sigset_t` — so the mask copies out verbatim.
         let user_mask = mask;
@@ -46,28 +42,22 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
         // (see SIGNAL_PENDING), so the new mask installs verbatim.
         let set = u64::from_ne_bytes(buf);
-        let mut g = SIGNAL_MASK.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(fail);
-                return;
+        let updated = signal_bits_update(&SIGNAL_MASK, task, |slot| {
+            match how {
+                SIG_BLOCK => *slot |= set,
+                SIG_UNBLOCK => *slot &= !set,
+                SIG_SETMASK => *slot = set,
+                _ => return false,
             }
-        };
-        let slot = map.entry(task).or_insert(0);
-        match how {
-            SIG_BLOCK => *slot |= set,
-            SIG_UNBLOCK => *slot &= !set,
-            SIG_SETMASK => *slot = set,
-            _ => {
-                ctx.set_return(fail);
-                return;
-            }
+            // Linux strips SIGKILL/SIGSTOP from every installed mask —
+            // a task must never be able to block its own fatal kill.
+            *slot &= !UNBLOCKABLE_MASK;
+            true
+        });
+        if updated != Some(true) {
+            ctx.set_return(fail);
+            return;
         }
-        // Linux strips SIGKILL/SIGSTOP from every installed mask —
-        // a task must never be able to block its own fatal kill.
-        *slot &= !UNBLOCKABLE_MASK;
-        drop(g);
         // An explicit mask install means the user retook control of the
         // mask — drop any suspend-saved record a signal-less (aborted)
         // rt_sigsuspend left behind, so a much-later delivery can't

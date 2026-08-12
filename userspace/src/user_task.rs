@@ -341,11 +341,12 @@ pub struct UserTaskCtx {
     /// folded and cleared before yielding, restarted on resume, so what
     /// accumulates is exactly the on-CPU time and never the sleep.
     pub kern_span_start_ns: AtomicU64,
-    /// True after normal syscall entry has created this task's kernel-time
-    /// ledger row. Timer preemption may close a span from IRQ context, where
-    /// inserting the first BTreeMap node (and therefore allocating) is not
-    /// permitted.
-    pub kern_account_ready: AtomicBool,
+    /// Bit N is set after normal syscall entry has created this task's
+    /// kernel-time row in CPU N's ledger. A migrated task prepares the new
+    /// CPU's row before opening its span. Timer preemption may close a span
+    /// from IRQ context, where inserting the first BTreeMap node (and therefore
+    /// allocating) is not permitted.
+    pub kern_account_ready: AtomicU64,
     pub dbg_park_checks: AtomicU64,
     /// The fd set of an in-flight blocking `poll`/`ppoll` park, recorded at
     /// park time so the stall watchdog can re-run the readiness scan for a
@@ -457,7 +458,7 @@ impl UserTaskCtx {
             blocking_deadline_ns: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             kern_span_start_ns: AtomicU64::new(0),
-            kern_account_ready: AtomicBool::new(false),
+            kern_account_ready: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),
             poll_wait_fds: [const { AtomicU64::new(0) }; POLL_WAIT_RECORD_MAX],
             poll_wait_nfds: AtomicU32::new(0),

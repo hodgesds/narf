@@ -1,15 +1,43 @@
 // ── Signal wakers ───────────────────────────────────────────────────
 
-static SIGNAL_WAKERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+const SIGNAL_WAKE_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct SignalWakerBucket {
+    values: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
+    >,
+}
+
+impl SignalWakerBucket {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static SIGNAL_WAKERS: [SignalWakerBucket; SIGNAL_WAKE_SHARDS] =
+    [const { SignalWakerBucket::new() }; SIGNAL_WAKE_SHARDS];
+
+#[inline]
+fn signal_waker_shard(task_id: u64) -> usize {
+    task_id as usize & (SIGNAL_WAKE_SHARDS - 1)
+}
+
+#[doc(hidden)]
+pub fn __test_signal_waker_bucket_index(task_id: u64) -> usize {
+    signal_waker_shard(task_id)
+}
 
 pub fn signal_waker_init() {
-    *SIGNAL_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+    for bucket in &SIGNAL_WAKERS {
+        *bucket.values.lock() = Some(alloc::collections::BTreeMap::new());
+    }
 }
 
 pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
-    let mut g = SIGNAL_WAKERS.lock();
+    let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
     if let Some(m) = g.as_mut() {
         m.insert(task_id, waker);
     }
@@ -26,7 +54,7 @@ pub fn wake_signal(task_id: u64) {
         }
     });
     let waker = {
-        let mut g = SIGNAL_WAKERS.lock();
+        let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
         g.as_mut().and_then(|m| m.remove(&task_id))
     };
     if let Some(w) = waker {
@@ -35,7 +63,7 @@ pub fn wake_signal(task_id: u64) {
 }
 
 pub fn drop_signal_waker(task_id: u64) {
-    let mut g = SIGNAL_WAKERS.lock();
+    let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
     if let Some(m) = g.as_mut() {
         m.remove(&task_id);
     }
@@ -211,13 +239,16 @@ fn wake_all_io_waiters() {
 
 type TaskIdLookupFn = fn() -> u64;
 
-static TASK_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TaskIdLookupFn>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// Installed during boot and only replaced by sequential kernel tests. An
+// atomic callback slot keeps the syscall hot path to one acquire load; the old
+// global IRQ-safe lock bounced one cache line between every CPU and masked
+// local interrupts around every current-task lookup.
+static TASK_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the function that returns the current task's raw id.
 /// Boot wires `|| scheduler::current_task_id().raw()` here.
 pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
-    *TASK_LOOKUP.lock() = Some(lookup);
+    TASK_LOOKUP.store(lookup as usize, Ordering::Release);
 }
 
 /// Test hook: drop any installed current-task lookup so
@@ -226,12 +257,19 @@ pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
 /// reset, a test that installs a fixed-id lookup leaks it into later
 /// tests that assume the default (e.g. signalfd / per-tty pgrp tests).
 pub fn __test_reset_task_id_lookup() {
-    *TASK_LOOKUP.lock() = None;
+    TASK_LOOKUP.store(0, Ordering::Release);
 }
 
+#[inline]
 pub fn current_task_id() -> u64 {
-    let f = *TASK_LOOKUP.lock();
-    f.map(|lookup| lookup()).unwrap_or(0)
+    let raw = TASK_LOOKUP.load(Ordering::Acquire);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: the only non-zero values stored in TASK_LOOKUP are complete
+    // TaskIdLookupFn pointers. Acquire pairs with the installing release.
+    let lookup: TaskIdLookupFn = unsafe { core::mem::transmute(raw) };
+    lookup()
 }
 
 // ── Sync poll-once helper ──────────────────────────────────────────
@@ -336,8 +374,10 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 type AllAsLookupFn = fn() -> alloc::vec::Vec<Arc<AddressSpace>>;
 
-static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// Like TASK_LOOKUP, this callback is immutable after boot outside sequential
+// tests. Keep address-space-heavy syscalls and private futex operations off a
+// global IRQ-disabling callback lock.
+static AS_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -348,7 +388,7 @@ static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
 /// `current_address_space()` returns `None` and AS-dependent
 /// handlers return `InvalidOp`.
 pub fn install_address_space_lookup(lookup: AsLookupFn) {
-    *AS_LOOKUP.lock() = Some(lookup);
+    AS_LOOKUP.store(lookup as usize, Ordering::Release);
 }
 
 /// Install the scheduler bridge used by shared-page migration to snapshot all
@@ -366,18 +406,23 @@ fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
 /// Snapshot the currently-installed AS lookup (for save/restore around a
 /// test that temporarily swaps in its own). `None` if none is installed.
 pub fn address_space_lookup() -> Option<AsLookupFn> {
-    *AS_LOOKUP.lock()
+    let raw = AS_LOOKUP.load(Ordering::Acquire);
+    if raw == 0 {
+        None
+    } else {
+        // SAFETY: every non-zero AS_LOOKUP value was stored from AsLookupFn.
+        Some(unsafe { core::mem::transmute::<usize, AsLookupFn>(raw) })
+    }
 }
 
 /// Restore (or clear) the AS lookup — the counterpart to
 /// `install_address_space_lookup` that also accepts `None`.
 pub fn restore_address_space_lookup(lookup: Option<AsLookupFn>) {
-    *AS_LOOKUP.lock() = lookup;
+    AS_LOOKUP.store(lookup.map(|f| f as usize).unwrap_or(0), Ordering::Release);
 }
 
 fn current_address_space() -> Option<Arc<AddressSpace>> {
-    let f = *AS_LOOKUP.lock();
-    f.and_then(|lookup| lookup())
+    address_space_lookup().and_then(|lookup| lookup())
 }
 
 /// Public re-export of the per-task AS lookup. Used by external
@@ -4647,10 +4692,7 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
 
 fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     let task = current_task_id();
-    let pending = {
-        let g = SIGNAL_PENDING.lock();
-        g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0)
-    };
+    let pending = signal_bits_get(&SIGNAL_PENDING, task);
     let mask = signal_mask_of(task);
     if (pending & !mask) != 0 {
         if let Some(hook) = signal_delivery_hook() {
@@ -5857,20 +5899,12 @@ pub fn is_task_stopped(task: u64) -> bool {
 /// Raw pending-signal bitmask for `task` (no mask applied). Used by
 /// the poll loop to let SIGKILL break a job-control stop.
 pub fn signal_pending_bits(task: u64) -> u64 {
-    SIGNAL_PENDING
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    signal_bits_get(&SIGNAL_PENDING, task)
 }
 
 /// AND-out the given signal bits from `task`'s pending set.
 pub(crate) fn clear_pending_signal_bits(task: u64, mask: u64) {
-    if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
-        if let Some(slot) = m.get_mut(&task) {
-            *slot &= !mask;
-        }
-    }
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| *slot &= !mask);
 }
 
 /// WIFSTOPPED-shaped wstatus carrying `sig` as WSTOPSIG.
@@ -5913,12 +5947,7 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
         }
     }
     // Linux notifies the parent with SIGCHLD on stop/continue too.
-    {
-        let mut g = SIGNAL_PENDING.lock();
-        if let Some(m) = g.as_mut() {
-            *m.entry(parent).or_insert(0) |= sig_bit(17); // SIGCHLD
-        }
-    }
+    let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(17));
     crate::user_task::wake_wait_child(parent);
 }
 
@@ -6749,19 +6778,16 @@ fn release_task_tables(tid: u64) {
     // cannot outlive the task that was given it.
     narf_memory::wx::revoke_jit(tid);
     // Signal state.
-    if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SIGNAL_MASK.lock().as_mut() {
-        m.remove(&tid);
-    }
+    signal_bits_remove(&SIGNAL_PENDING, tid);
+    signal_bits_remove(&SIGNAL_READABLE_GEN, tid);
+    signal_bits_remove(&SIGNAL_MASK, tid);
     if let Some(m) = SIGACTION_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = SIG_ALTSTACK.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = SIGQUEUE_INFO.lock().as_mut() {
+    if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(tid)].values.lock().as_mut() {
         m.retain(|&(t, _), _| t != tid);
     }
     if let Some(m) = SIGRETURN_USE_RSP.lock().as_mut() {
@@ -6783,12 +6809,7 @@ fn release_task_tables(tid: u64) {
     drop_signal_waker(tid);
     drop_io_waiter(tid);
     crate::user_task::drop_wait_child_waker(tid);
-    if let Some(m) = FUTEX_WAITERS.lock().as_mut() {
-        m.retain(|_, waiters| {
-            waiters.remove(&tid);
-            !waiters.is_empty()
-        });
-    }
+    futex_drop_task_waiters(tid);
     for shard in TCB_OWNER.iter() {
         if let Some(m) = shard.lock().as_mut() {
             m.retain(|_, owner| *owner != tid);
@@ -6880,9 +6901,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
-        m.remove(&tid);
-    }
+    task_account_remove(&TASK_KERN_NS, tid);
     // POSIX record locks: normally already drained (fd::detach runs
     // first in exit-observer order and wakes the waiters); this second
     // pass is the backstop for any path that tears down tables without
@@ -7087,20 +7106,8 @@ pub fn __test_release_task_aio(tid: u64) {
 pub fn __test_task_table_residue(tid: u64) -> u32 {
     let mut r = 0u32;
     let has = |present: bool, bit: u32| if present { bit } else { 0 };
-    r |= has(
-        SIGNAL_PENDING
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
-        1 << 0,
-    );
-    r |= has(
-        SIGNAL_MASK
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
-        1 << 1,
-    );
+    r |= has(signal_bits_contains(&SIGNAL_PENDING, tid), 1 << 0);
+    r |= has(signal_bits_contains(&SIGNAL_MASK, tid), 1 << 1);
     r |= has(
         SIGACTION_TABLE
             .lock()
@@ -7109,7 +7116,8 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
         1 << 2,
     );
     r |= has(
-        SIGNAL_WAKERS
+        SIGNAL_WAKERS[signal_waker_shard(tid)]
+            .values
             .lock()
             .as_ref()
             .is_some_and(|m| m.contains_key(&tid)),
@@ -7122,13 +7130,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
             .is_some_and(|m| m.contains_key(&tid)),
         1 << 4,
     );
-    r |= has(
-        FUTEX_WAITERS
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.values().any(|w| w.contains_key(&tid))),
-        1 << 5,
-    );
+    r |= has(futex_has_task_waiter(tid), 1 << 5);
     r |= has(
         PROC_ARGV
             .lock()
@@ -7508,13 +7510,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Linux: kernel/signal.c::do_notify_parent sets SIGCHLD pending.
     // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
     const SIGCHLD: u32 = 17;
-    {
-        let mut g = SIGNAL_PENDING.lock();
-        if let Some(m) = g.as_mut() {
-            let slot = m.entry(parent).or_insert(0);
-            *slot |= sig_bit(SIGCHLD);
-        }
-    }
+    let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(SIGCHLD));
     // A parent may be parked in epoll_wait on its signalfd rather than in
     // wait4. Publishing SIGCHLD without firing the signal waker leaves that
     // task asleep indefinitely: the earlier pidfd readiness notification can

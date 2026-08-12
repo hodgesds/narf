@@ -58,7 +58,8 @@ cat > "$RD/probe.sh" <<'PROBE'
 echo "STRESS-START pid=$$"
 DUR="${STRESS_DUR:-6s}"
 for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
-         "--pthread 4" "--pipe 2" "--sock 2" "--switch 4" "--clone 2" "--cpu 2"; do
+         "--pthread 4" "--pipe 2" "--sock 2" "--switch 4" "--clone 2" \
+         "--sigrt 4" "--cpu 2"; do
   echo "=== stressor: $s ==="
   /usr/bin/stress-ng $s --timeout "$DUR" --metrics-brief 2>&1 || echo "STRESSOR-RC=$? for [$s]"
 done

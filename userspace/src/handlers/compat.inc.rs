@@ -2463,10 +2463,107 @@ pub(crate) fn sig_from_bit(bits: u64) -> u32 {
     }
 }
 
-pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-static SIGNAL_READABLE_GEN: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const SIGNAL_TABLE_BUCKETS: usize = 64;
+
+#[repr(align(64))]
+pub(crate) struct SignalBitsBucket {
+    values: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>,
+}
+
+impl SignalBitsBucket {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+type SignalBitsTable = [SignalBitsBucket; SIGNAL_TABLE_BUCKETS];
+
+pub(crate) static SIGNAL_PENDING: SignalBitsTable =
+    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+static SIGNAL_READABLE_GEN: SignalBitsTable =
+    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+
+#[inline]
+fn signal_bits_bucket(task: u64) -> usize {
+    // Task IDs are monotonic and already carry entropy in their low bits.
+    task as usize & (SIGNAL_TABLE_BUCKETS - 1)
+}
+
+#[inline]
+fn signal_bits_get_opt(table: &SignalBitsTable, task: u64) -> Option<u64> {
+    table[signal_bits_bucket(task)]
+        .values
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&task).copied())
+}
+
+#[inline]
+fn signal_bits_get(table: &SignalBitsTable, task: u64) -> u64 {
+    signal_bits_get_opt(table, task).unwrap_or(0)
+}
+
+fn signal_bits_clear(table: &SignalBitsTable) {
+    for bucket in table {
+        *bucket.values.lock() = Some(BTreeMap::new());
+    }
+}
+
+fn signal_bits_remove(table: &SignalBitsTable, task: u64) {
+    if let Some(map) = table[signal_bits_bucket(task)].values.lock().as_mut() {
+        map.remove(&task);
+    }
+}
+
+fn signal_bits_contains(table: &SignalBitsTable, task: u64) -> bool {
+    table[signal_bits_bucket(task)]
+        .values
+        .lock()
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&task))
+}
+
+fn signal_bits_update<R>(
+    table: &SignalBitsTable,
+    task: u64,
+    update: impl FnOnce(&mut u64) -> R,
+) -> Option<R> {
+    let mut values = table[signal_bits_bucket(task)].values.lock();
+    let slot = values.as_mut()?.entry(task).or_insert(0);
+    Some(update(slot))
+}
+
+fn signal_bits_update_or_init<R>(
+    table: &SignalBitsTable,
+    task: u64,
+    update: impl FnOnce(&mut u64) -> R,
+) -> R {
+    let mut values = table[signal_bits_bucket(task)].values.lock();
+    let slot = values
+        .get_or_insert_with(BTreeMap::new)
+        .entry(task)
+        .or_insert(0);
+    update(slot)
+}
+
+fn signal_bits_update_existing<R>(
+    table: &SignalBitsTable,
+    task: u64,
+    update: impl FnOnce(&mut u64) -> R,
+) -> Option<R> {
+    let mut values = table[signal_bits_bucket(task)].values.lock();
+    let slot = values.as_mut()?.get_mut(&task)?;
+    Some(update(slot))
+}
+
+/// Test hook: expose only shard identity so signal smokes can guarantee they
+/// exercise independent task buckets.
+#[doc(hidden)]
+pub fn __test_signal_bucket_index(task: u64) -> usize {
+    signal_bits_bucket(task)
+}
 
 // ── Per-task CPU-time accounting (getrusage / times) ────────────────
 //
@@ -2481,13 +2578,35 @@ static SIGNAL_READABLE_GEN: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 // user mode, summed over every user run-slice (accumulated by the
 // UserTaskFuture poll boundary in user_task.rs: it brackets each
 // enter-user-mode → trap-return slice and folds the delta in here).
+// The ledgers are per-CPU: hot-path folds touch only the executing CPU's
+// cache line, while cold readers aggregate a task across every CPU it ran on.
+// This mirrors Linux's per-CPU accounting shape and removes the global lock
+// cache-line bounce between unrelated tasks on different CPUs.
 //
 // `TASK_CHILD_CPU_NS`: nanoseconds of CPU time charged to this task's
 // REAPED children (RUSAGE_CHILDREN / tms.cutime), folded in by wait4 /
 // waitid when a zombie is collected (Linux charges child time at reap,
 // not at exit).
-static TASK_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const TASK_ACCOUNT_CPUS: usize = narf_lib::percpu::MAX_CPUS;
+
+/// One CPU's task-time ledger. Cache-line alignment keeps the lock word and
+/// BTreeMap root from false-sharing with the neighbouring CPU's hot ledger.
+#[repr(align(64))]
+struct TaskCpuLedger {
+    values: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, u64>>,
+}
+
+impl TaskCpuLedger {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+type TaskCpuLedgers = [TaskCpuLedger; TASK_ACCOUNT_CPUS];
+
+static TASK_CPU_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
 
 /// Task creation timestamp (monotonic ns) — /proc/[pid]/stat field 22
 /// (starttime, in USER_HZ ticks since boot). Recorded by
@@ -2514,6 +2633,61 @@ fn task_start_ns(tid: u64) -> u64 {
 static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+#[inline]
+fn task_account_cpu() -> usize {
+    narf_lib::percpu::current_cpu() % TASK_ACCOUNT_CPUS
+}
+
+fn task_account_add_on_cpu(
+    ledgers: &TaskCpuLedgers,
+    cpu: usize,
+    task: u64,
+    delta_ns: u64,
+) {
+    let mut values = ledgers[cpu % TASK_ACCOUNT_CPUS].values.lock();
+    let entry = values.entry(task).or_insert(0);
+    *entry = entry.saturating_add(delta_ns);
+}
+
+#[inline]
+fn task_account_add(ledgers: &TaskCpuLedgers, task: u64, delta_ns: u64) {
+    // Keep CPU selection and the update on one CPU. Without this bracket a
+    // timer could migrate the task after `current_cpu()` and make the resumed
+    // CPU write the old CPU's ledger, reintroducing cross-CPU contention.
+    narf_lib::sync::without_interrupts(|| {
+        task_account_add_on_cpu(ledgers, task_account_cpu(), task, delta_ns);
+    });
+}
+
+fn task_account_ensure_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64) {
+    ledgers[cpu % TASK_ACCOUNT_CPUS]
+        .values
+        .lock()
+        .entry(task)
+        .or_insert(0);
+}
+
+fn task_account_get(ledgers: &TaskCpuLedgers, task: u64) -> u64 {
+    ledgers.iter().fold(0u64, |total, ledger| {
+        total.saturating_add(ledger.values.lock().get(&task).copied().unwrap_or(0))
+    })
+}
+
+#[cfg(feature = "unix-latency-trace")]
+fn task_account_try_get(ledgers: &TaskCpuLedgers, task: u64) -> Option<u64> {
+    let mut total = 0u64;
+    for ledger in ledgers {
+        total = total.saturating_add(ledger.values.try_lock()?.get(&task).copied().unwrap_or(0));
+    }
+    Some(total)
+}
+
+fn task_account_remove(ledgers: &TaskCpuLedgers, task: u64) {
+    for ledger in ledgers {
+        ledger.values.lock().remove(&task);
+    }
+}
+
 /// Fold a completed user run-slice (`delta_ns` of on-CPU user time) into
 /// the currently-running task's accumulated CPU time. Called from the
 /// UserTaskFuture poll on every trap-return. Alloc-free on the hot path
@@ -2527,18 +2701,14 @@ pub fn account_user_cpu_ns(delta_ns: u64) {
     if task == 0 {
         return;
     }
-    let mut g = TASK_CPU_NS.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let e = m.entry(task).or_insert(0);
-    *e = e.saturating_add(delta_ns);
+    task_account_add(&TASK_CPU_NS, task, delta_ns);
 }
 
 /// Time this task has spent inside syscall handlers (ns) — the
 /// ru_stime / tms_stime / stat-field-15 source. Folded by
 /// `kernel_syscall_entry`'s dispatch bracket; same shape and cost as
 /// the user-time fold above (one map lock per syscall).
-static TASK_KERN_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static TASK_KERN_NS: TaskCpuLedgers = [const { TaskCpuLedger::new() }; TASK_ACCOUNT_CPUS];
 
 /// Fold a completed syscall's handler duration into the current task's
 /// kernel-time accumulator. Called from `kernel_syscall_entry`.
@@ -2550,10 +2720,7 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
     if task == 0 {
         return;
     }
-    let mut g = TASK_KERN_NS.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let e = m.entry(task).or_insert(0);
-    *e = e.saturating_add(delta_ns);
+    task_account_add(&TASK_KERN_NS, task, delta_ns);
 }
 
 /// Timer-trap-safe `(user_ns, kernel_ns)` for `task`. `None` on lock
@@ -2566,16 +2733,8 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
 /// cost, which IS ours.
 #[cfg(feature = "unix-latency-trace")]
 pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
-    let u = TASK_CPU_NS
-        .try_lock()?
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0);
-    let k = TASK_KERN_NS
-        .try_lock()?
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0);
+    let u = task_account_try_get(&TASK_CPU_NS, task)?;
+    let k = task_account_try_get(&TASK_KERN_NS, task)?;
     Some((u, k))
 }
 
@@ -2595,51 +2754,74 @@ pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
     if delta == 0 {
         return;
     }
-    let mut g = TASK_KERN_NS.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let e = m.entry(task).or_insert(0);
-    *e = e.saturating_add(delta);
+    task_account_add(&TASK_KERN_NS, task, delta);
+}
+
+fn open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
+    narf_lib::sync::without_interrupts(|| {
+        // The pause hook can close this span from timer IRQ context. Create
+        // the task's row here, on the normal syscall path, so that close only
+        // updates an existing BTreeMap node and never allocates in the
+        // interrupt handler. Keep IRQs masked from CPU selection through the
+        // span-start store: otherwise a migration in that window could make
+        // the first close on the destination CPU allocate.
+        let cpu = task_account_cpu();
+        let cpu_bit = 1u64 << cpu;
+        if uc
+            .kern_account_ready
+            .load(core::sync::atomic::Ordering::Acquire)
+            & cpu_bit
+            == 0
+            && task != 0
+        {
+            task_account_ensure_on_cpu(&TASK_KERN_NS, cpu, task);
+            uc.kern_account_ready
+                .fetch_or(cpu_bit, core::sync::atomic::Ordering::Release);
+        }
+        uc.kern_span_start_ns.store(
+            narf_scheduler::narf_time::monotonic_ns(),
+            core::sync::atomic::Ordering::Release,
+        );
+    });
 }
 
 /// Open (or re-open) the on-CPU kernel span for the current task.
 pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
-    // The pause hook can close this span from timer IRQ context. Create the
-    // task's row here, on the normal syscall path, so that close only updates
-    // an existing BTreeMap node and never allocates in the interrupt handler.
-    // The readiness load is the only recurring cost after the first syscall.
-    if !uc
-        .kern_account_ready
-        .load(core::sync::atomic::Ordering::Acquire)
-    {
-        let task = current_task_id();
-        if task != 0 {
-            let mut g = TASK_KERN_NS.lock();
-            g.get_or_insert_with(BTreeMap::new).entry(task).or_insert(0);
-            uc.kern_account_ready
-                .store(true, core::sync::atomic::Ordering::Release);
-        }
-    }
-    uc.kern_span_start_ns.store(
-        narf_scheduler::narf_time::monotonic_ns(),
-        core::sync::atomic::Ordering::Release,
-    );
+    open_kernel_span_for(uc, current_task_id());
+}
+
+/// Test hook: open a kernel span for an explicit stand-in task. Kernel-test
+/// functions execute outside a user-task poll, so the production current-task
+/// lookup correctly returns zero there.
+#[doc(hidden)]
+pub fn __test_open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
+    open_kernel_span_for(uc, task);
 }
 
 /// Pause the current user task's active syscall span before the scheduler
 /// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
 /// when a matching resume must re-open the span.
+fn pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
+    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    close_kernel_span(uc, task);
+    true
+}
+
 pub fn pause_current_kernel_span() -> bool {
     let Some(uc) = crate::user_task::current_user_task() else {
         return false;
     };
     // SAFETY: current_user_task returns the poller-pinned context of the
     // current own-stack user continuation.
-    let uc = unsafe { &*uc };
-    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
-        return false;
-    }
-    close_kernel_span(uc, current_task_id());
-    true
+    pause_kernel_span_for(unsafe { &*uc }, current_task_id())
+}
+
+/// Test hook: pause a kernel span for an explicit stand-in task.
+#[doc(hidden)]
+pub fn __test_pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
+    pause_kernel_span_for(uc, task)
 }
 
 /// Resume a syscall span previously paused by `pause_current_kernel_span`.
@@ -2673,11 +2855,7 @@ pub fn current_kernel_span_elapsed_ns() -> u64 {
 
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
 pub fn kern_time_ns_of(task: u64) -> u64 {
-    TASK_KERN_NS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    task_account_get(&TASK_KERN_NS, task)
 }
 
 /// Test hook: clear the current task's accumulated in-syscall (kernel) CPU
@@ -2691,17 +2869,13 @@ pub fn kern_time_ns_of(task: u64) -> u64 {
 /// stand-in `UserTaskCtx` is not.
 #[doc(hidden)]
 pub fn __test_reset_kernel_time_for(task: u64) {
-    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
-        m.remove(&task);
-    }
+    task_account_remove(&TASK_KERN_NS, task);
 }
 
 #[doc(hidden)]
 pub fn __test_reset_kernel_time() {
     let task = current_task_id();
-    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
-        m.remove(&task);
-    }
+    task_account_remove(&TASK_KERN_NS, task);
 }
 
 /// Test hook: account `delta_ns` to an arbitrary task (the production
@@ -2709,41 +2883,40 @@ pub fn __test_reset_kernel_time() {
 /// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
 #[doc(hidden)]
 pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
-    let mut g = TASK_CPU_NS.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let e = m.entry(task).or_insert(0);
-    *e = e.saturating_add(delta_ns);
+    task_account_add(&TASK_CPU_NS, task, delta_ns);
+}
+
+/// Test hook: seed a task's user CPU time on a selected CPU ledger. Models a
+/// task migrating between CPUs without relying on test-runner affinity.
+#[doc(hidden)]
+pub fn __test_account_cpu_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
+    task_account_add_on_cpu(&TASK_CPU_NS, cpu, task, delta_ns);
 }
 
 /// Test hook: charge syscall CPU time to a stand-in task so perf inheritance
 /// tests can exercise the exit snapshot without running a real child syscall.
 #[doc(hidden)]
 pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) {
-    let mut g = TASK_KERN_NS.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    let e = m.entry(task).or_insert(0);
-    *e = e.saturating_add(delta_ns);
+    task_account_add(&TASK_KERN_NS, task, delta_ns);
+}
+
+/// Test hook: seed a task's kernel CPU time on a selected CPU ledger.
+#[doc(hidden)]
+pub fn __test_account_kernel_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
+    task_account_add_on_cpu(&TASK_KERN_NS, cpu, task, delta_ns);
 }
 
 /// Test hook: model the master exit-table sweep after perf has captured a
 /// child's final software-clock contribution.
 #[doc(hidden)]
 pub fn __test_reset_cpu_times_for(task: u64) {
-    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
-        m.remove(&task);
-    }
-    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
-        m.remove(&task);
-    }
+    task_account_remove(&TASK_CPU_NS, task);
+    task_account_remove(&TASK_KERN_NS, task);
 }
 
 /// This task's own accumulated user CPU time (ns).
 pub fn cpu_time_ns_of(task: u64) -> u64 {
-    TASK_CPU_NS
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    task_account_get(&TASK_CPU_NS, task)
 }
 
 /// Accumulated CPU time (ns) of `task`'s reaped children.
@@ -2828,9 +3001,7 @@ pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
         let e = m.entry(parent).or_insert(0);
         *e = e.saturating_add(child_total);
     }
-    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
-        m.remove(&child_tid);
-    }
+    task_account_remove(&TASK_CPU_NS, child_tid);
     if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
         m.remove(&child_tid);
     }
@@ -2891,8 +3062,39 @@ fn task_vm_bytes(pid: u64) -> u64 {
 /// or by a `signalfd` read so a stale payload never attaches to a later
 /// instance.
 type SigqueueMap = BTreeMap<(u64, u32), alloc::collections::VecDeque<(i32, u64, u32)>>;
-static SIGQUEUE_INFO: narf_lib::sync::IrqSafeSpinLock<Option<SigqueueMap>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const SIGQUEUE_BUCKETS: usize = 64;
+
+#[repr(align(64))]
+struct SigqueueBucket {
+    values: narf_lib::sync::IrqSafeSpinLock<Option<SigqueueMap>>,
+}
+
+impl SigqueueBucket {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static SIGQUEUE_INFO: [SigqueueBucket; SIGQUEUE_BUCKETS] =
+    [const { SigqueueBucket::new() }; SIGQUEUE_BUCKETS];
+
+#[inline]
+fn sigqueue_bucket(task: u64) -> usize {
+    task as usize & (SIGQUEUE_BUCKETS - 1)
+}
+
+fn sigqueue_clear() {
+    for bucket in &SIGQUEUE_INFO {
+        *bucket.values.lock() = Some(BTreeMap::new());
+    }
+}
+
+#[doc(hidden)]
+pub fn __test_sigqueue_bucket_index(task: u64) -> usize {
+    sigqueue_bucket(task)
+}
 
 /// First realtime signal at the KERNEL level (libc reserves the first few
 /// for its own use, but queueing is a property of the kernel range).
@@ -2919,7 +3121,7 @@ pub(crate) fn store_sigqueue_info(
     si_value: u64,
     si_pid: u32,
 ) -> bool {
-    let mut g = SIGQUEUE_INFO.lock();
+    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
     if signum >= SIGRT_QUEUE_MIN {
         // Cap check across ALL of the target's queues (the per-process
@@ -2942,7 +3144,7 @@ pub(crate) fn store_sigqueue_info(
 /// Only consulted on the x86_64 own-stack resched path.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn sigqueue_depth(task: u64) -> usize {
-    let g = SIGQUEUE_INFO.lock();
+    let g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     g.as_ref()
         .map(|m| m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum())
         .unwrap_or(0)
@@ -2963,7 +3165,7 @@ pub(crate) const SIGQUEUE_BACKPRESSURE_DEPTH: usize = 4;
 /// `(task, signum)`, if any. FIFO order preserves rt_sigqueueinfo
 /// submission order for RT signals; standard signals hold at most one.
 pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64, u32)> {
-    let mut g = SIGQUEUE_INFO.lock();
+    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     let m = g.as_mut()?;
     let q = m.get_mut(&(task, signum))?;
     let v = q.pop_front();
@@ -2976,7 +3178,8 @@ pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64, u3
 /// True when more queued instances of `(task, signum)` remain after a
 /// `take_sigqueue_info` pop.
 pub(crate) fn sigqueue_more_queued(task: u64, signum: u32) -> bool {
-    SIGQUEUE_INFO
+    SIGQUEUE_INFO[sigqueue_bucket(task)]
+        .values
         .lock()
         .as_ref()
         .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()))
@@ -2990,11 +3193,9 @@ pub(crate) fn rearm_pending_if_queued(task: u64, signum: u32) {
     if !sigqueue_more_queued(task, signum) {
         return;
     }
-    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot |= sig_bit(signum);
-        }
-    }
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        *slot |= sig_bit(signum);
+    });
 }
 
 /// Drop every queued payload for `(task, signum)` — used when the signal
@@ -3002,7 +3203,7 @@ pub(crate) fn rearm_pending_if_queued(task: u64, signum: u32) {
 /// Linux "delivers" each queued ignored instance by discarding it, which
 /// collapses to discarding the whole queue.
 pub(crate) fn purge_sigqueue(task: u64, signum: u32) {
-    if let Some(m) = SIGQUEUE_INFO.lock().as_mut() {
+    if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock().as_mut() {
         m.remove(&(task, signum));
     }
 }
@@ -3020,13 +3221,8 @@ pub(crate) fn sigwait_should_wake(task: u64, set: u64) -> bool {
 }
 
 pub fn is_signal_pending(task_id: u64) -> bool {
-    let pending = {
-        let g = SIGNAL_PENDING.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task_id).copied())
-            .unwrap_or(0)
-    };
-    let mask = signal_mask_of(task_id);
+    let pending = signal_bits_get(&SIGNAL_PENDING, task_id);
+    let mask = signal_bits_get(&SIGNAL_MASK, task_id);
     (pending & !mask) != 0
 }
 
@@ -3039,12 +3235,7 @@ pub fn is_signal_pending(task_id: u64) -> bool {
 /// action. Keep `is_signal_pending` as the raw deliverability probe used by
 /// diagnostics and signal consumption; blocking waits use this filtered form.
 pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
-    let pending = {
-        let g = SIGNAL_PENDING.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task_id).copied())
-            .unwrap_or(0)
-    };
+    let pending = signal_bits_get(&SIGNAL_PENDING, task_id);
     let mut deliverable = pending & !signal_mask_of(task_id);
     while deliverable != 0 {
         let signum = sig_from_bit(deliverable);
@@ -3064,33 +3255,32 @@ pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
     false
 }
 
-static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_MASK: SignalBitsTable =
+    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 /// fork/clone inheritance of the signal mask (Linux `copy_process`
 /// copies `blocked` unconditionally, for threads and forks alike).
 /// Without it a new thread starts with an EMPTY mask and takes
 /// signals its creator had deliberately blocked.
 pub(crate) fn signal_mask_fork(parent: u64, child: u64) {
-    let mut g = SIGNAL_MASK.lock();
-    if let Some(m) = g.as_mut() {
-        // Fork-ordering hazard: `do_clone3`/`sys_fork` spawn the child (making
-        // it runnable) BEFORE this inheritance runs. musl always calls fork/
-        // clone from inside its `__block_all_sigs` window, so `parent`'s LIVE
-        // mask here is the transient all-blocked value — NOT the process's real
-        // mask. The child's own `__restore_sigs` (which runs the instant it is
-        // scheduled) sets the correct pre-fork mask. If we unconditionally
-        // copied `parent`'s mask we would clobber that restore with all-blocked,
-        // leaving the exec'd image with every application signal masked (SIGALRM
-        // handlers never fire — the stress-ng --sigrt hang). So only SEED a
-        // child that has not yet established a mask of its own: a raw clone that
-        // never restores still inherits correctly, while a musl child that has
-        // already restored keeps its authoritative value.
-        if !m.contains_key(&child) {
-            if let Some(mask) = m.get(&parent).copied() {
-                m.insert(child, mask);
-            }
-        }
+    let Some(parent_mask) = signal_bits_get_opt(&SIGNAL_MASK, parent) else {
+        return;
+    };
+    // Fork-ordering hazard: `do_clone3`/`sys_fork` spawn the child (making
+    // it runnable) BEFORE this inheritance runs. musl always calls fork/
+    // clone from inside its `__block_all_sigs` window, so `parent`'s LIVE
+    // mask here is the transient all-blocked value — NOT the process's real
+    // mask. The child's own `__restore_sigs` (which runs the instant it is
+    // scheduled) sets the correct pre-fork mask. If we unconditionally
+    // copied `parent`'s mask we would clobber that restore with all-blocked,
+    // leaving the exec'd image with every application signal masked (SIGALRM
+    // handlers never fire — the stress-ng --sigrt hang). So only SEED a
+    // child that has not yet established a mask of its own: a raw clone that
+    // never restores still inherits correctly, while a musl child that has
+    // already restored keeps its authoritative value.
+    let mut child_values = SIGNAL_MASK[signal_bits_bucket(child)].values.lock();
+    if let Some(map) = child_values.as_mut() {
+        map.entry(child).or_insert(parent_mask);
     }
 }
 
@@ -3203,38 +3393,30 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
-    *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
-    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
-    *SIGNAL_MASK.lock() = Some(BTreeMap::new());
+    signal_bits_clear(&SIGNAL_PENDING);
+    signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
 
 /// Reset the registries — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_signal_reset() {
-    *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
-    *SIGNAL_READABLE_GEN.lock() = Some(BTreeMap::new());
-    *SIGNAL_MASK.lock() = Some(BTreeMap::new());
+    signal_bits_clear(&SIGNAL_PENDING);
+    signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
-    *SIGQUEUE_INFO.lock() = Some(BTreeMap::new());
+    sigqueue_clear();
     *SUSPEND_SAVED_MASK.lock() = Some(BTreeMap::new());
 }
 
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u64 {
-    SIGNAL_PENDING
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    signal_bits_get(&SIGNAL_PENDING, task)
 }
 
 pub fn signal_readable_generation(task: u64) -> u64 {
-    SIGNAL_READABLE_GEN
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    signal_bits_get(&SIGNAL_READABLE_GEN, task)
 }
 
 /// POSIX default action for a signal when no handler is installed.
@@ -4032,22 +4214,17 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
     signal_stopcont_interaction(task, signum);
-    let mut g = SIGNAL_PENDING.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => return,
+    let Some(was_empty) = signal_bits_update(&SIGNAL_PENDING, task, |slot| {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(signum);
+        was_empty
+    }) else {
+        return;
     };
-    let slot = map.entry(task).or_insert(0);
-    let was_empty = *slot == 0;
-    *slot |= sig_bit(signum);
-    drop(g);
     if was_empty {
-        let mut gens = SIGNAL_READABLE_GEN.lock();
-        let generation = gens
-            .get_or_insert_with(BTreeMap::new)
-            .entry(task)
-            .or_insert(0);
-        *generation = generation.wrapping_add(1);
+        signal_bits_update_or_init(&SIGNAL_READABLE_GEN, task, |generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
@@ -4146,9 +4323,10 @@ fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
 /// (e.g. arming an interval timer), where allocation is allowed. No-op
 /// if the entry already exists or the table is uninitialised.
 pub fn ensure_signal_pending_slot(task: u64) {
-    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-        map.entry(task).or_insert(0);
-    }
+    let _ = signal_bits_update(&SIGNAL_PENDING, task, |_| {});
+    // The IRQ raise advances readability on the first pending signal. Seed
+    // that row here too so the IRQ path never allocates.
+    let _ = signal_bits_update(&SIGNAL_READABLE_GEN, task, |_| {});
 }
 
 /// Alloc-free, IRQ-safe variant of `raise_signal_pending`: OR the
@@ -4167,23 +4345,24 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     if signum == 0 || signum > 64 {
         return false;
     }
-    let mut g = SIGNAL_PENDING.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
+    if let Some(was_empty) = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
             let was_empty = *slot == 0;
             *slot |= sig_bit(signum);
-            if was_empty {
-                drop(g);
-                let mut gens = SIGNAL_READABLE_GEN.lock();
-                let generation = gens
-                    .get_or_insert_with(BTreeMap::new)
-                    .entry(task)
-                    .or_insert(0);
+            was_empty
+        })
+    {
+        if was_empty
+            && signal_bits_update_existing(&SIGNAL_READABLE_GEN, task, |generation| {
                 *generation = generation.wrapping_add(1);
-                return true;
-            }
-            return true;
+            })
+            .is_none()
+        {
+            let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+                *slot &= !sig_bit(signum);
+            });
+            return false;
         }
+        return true;
     }
     false
 }
@@ -4299,30 +4478,25 @@ pub fn clear_signal_pending(task: u64, signum: u32) {
     if signum > 64 {
         return;
     }
-    let mut g = SIGNAL_PENDING.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(sig_bit(signum));
-        }
-    }
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        *slot &= !(sig_bit(signum));
+    });
 }
 
 /// Diagnostic: peek the block mask for `task`.
 pub fn signal_mask_of(task: u64) -> u64 {
-    SIGNAL_MASK
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    signal_bits_get(&SIGNAL_MASK, task)
 }
 
 pub(crate) fn set_signal_mask_for_task(task: u64, mask: u64) -> u64 {
-    let mut g = SIGNAL_MASK.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     // SIGKILL/SIGSTOP can never be blocked, whichever install path the
     // mask arrives through (sigsuspend / ppoll / epoll_pwait / sigreturn
     // restore all funnel here) — same strip sys_sigprocmask applies.
-    map.insert(task, mask & !UNBLOCKABLE_MASK).unwrap_or(0)
+    signal_bits_update_or_init(&SIGNAL_MASK, task, |slot| {
+        let old = *slot;
+        *slot = mask & !UNBLOCKABLE_MASK;
+        old
+    })
 }
 
 /// Send `signum` to the single process named by outer pid `pid`.
@@ -4673,30 +4847,50 @@ fn futex_namespace(private: bool) -> u64 {
         .unwrap_or(0)
 }
 
-static FUTEX_WAKE_COUNTERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<FutexKey, u64>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+const FUTEX_BUCKET_COUNT: usize = 64;
 
-fn futex_table_init() {
-    let mut g = FUTEX_WAKE_COUNTERS.lock();
-    if g.is_none() {
-        *g = Some(alloc::collections::BTreeMap::new());
+#[inline]
+fn futex_bucket_index(key: FutexKey) -> usize {
+    // Futex words are normally 4-byte aligned and adjacent words are common,
+    // so mix rather than masking the low address bits directly.
+    let mut x = key.uaddr ^ key.namespace.rotate_left(17);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x as usize & (FUTEX_BUCKET_COUNT - 1)
+}
+
+#[repr(align(64))]
+struct FutexCounterBucket {
+    values: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<FutexKey, u64>>,
+}
+
+impl FutexCounterBucket {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
+        }
     }
 }
 
+static FUTEX_WAKE_COUNTERS: [FutexCounterBucket; FUTEX_BUCKET_COUNT] =
+    [const { FutexCounterBucket::new() }; FUTEX_BUCKET_COUNT];
+
 fn futex_wake_counter_key(key: FutexKey) -> u64 {
-    futex_table_init();
-    let g = FUTEX_WAKE_COUNTERS.lock();
-    g.as_ref().and_then(|m| m.get(&key).copied()).unwrap_or(0)
+    FUTEX_WAKE_COUNTERS[futex_bucket_index(key)]
+        .values
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
 }
 
 pub(crate) fn futex_bump_counter_key(key: FutexKey) {
-    futex_table_init();
-    let mut g = FUTEX_WAKE_COUNTERS.lock();
-    if let Some(m) = g.as_mut() {
-        let slot = m.entry(key).or_insert(0);
-        *slot = slot.wrapping_add(1);
-    }
+    let mut values = FUTEX_WAKE_COUNTERS[futex_bucket_index(key)].values.lock();
+    let slot = values.entry(key).or_insert(0);
+    *slot = slot.wrapping_add(1);
 }
 
 fn futex_wake_counter(uaddr: u64) -> u64 {
@@ -4764,15 +4958,48 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// loop otherwise re-parks every ~1ms (no early wake), so a contended pthread
 /// lock handoff cost ~1ms. Keyed by task id so a re-registering waiter
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
-#[allow(clippy::type_complexity)]
-static FUTEX_WAITERS: narf_lib::sync::IrqSafeSpinLock<
-    Option<
-        alloc::collections::BTreeMap<
-            FutexKey,
-            alloc::collections::BTreeMap<u64, core::task::Waker>,
-        >,
-    >,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+type FutexWaiterSet = alloc::collections::BTreeMap<u64, core::task::Waker>;
+type FutexWaiterMap = alloc::collections::BTreeMap<FutexKey, FutexWaiterSet>;
+
+#[repr(align(64))]
+struct FutexWaitBucket {
+    values: narf_lib::sync::IrqSafeSpinLock<FutexWaiterMap>,
+}
+
+impl FutexWaitBucket {
+    const fn new() -> Self {
+        Self {
+            values: narf_lib::sync::IrqSafeSpinLock::new(FutexWaiterMap::new()),
+        }
+    }
+}
+
+static FUTEX_WAITERS: [FutexWaitBucket; FUTEX_BUCKET_COUNT] =
+    [const { FutexWaitBucket::new() }; FUTEX_BUCKET_COUNT];
+
+#[inline]
+fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
+    &FUTEX_WAITERS[futex_bucket_index(key)]
+}
+
+fn futex_drop_task_waiters(task_id: u64) {
+    for bucket in &FUTEX_WAITERS {
+        bucket.values.lock().retain(|_, waiters| {
+            waiters.remove(&task_id);
+            !waiters.is_empty()
+        });
+    }
+}
+
+fn futex_has_task_waiter(task_id: u64) -> bool {
+    FUTEX_WAITERS.iter().any(|bucket| {
+        bucket
+            .values
+            .lock()
+            .values()
+            .any(|waiters| waiters.contains_key(&task_id))
+    })
+}
 
 /// Register `task_id`'s waker as parked on futex word `uaddr`. Called from
 /// the user-task poll routine while a task blocks in `FUTEX_WAIT`.
@@ -4781,9 +5008,12 @@ pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker)
 }
 
 pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core::task::Waker) {
-    let mut g = FUTEX_WAITERS.lock();
-    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    m.entry(key).or_default().insert(task_id, waker);
+    futex_wait_bucket(key)
+        .values
+        .lock()
+        .entry(key)
+        .or_default()
+        .insert(task_id, waker);
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
@@ -4793,13 +5023,11 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 }
 
 pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
-    let mut g = FUTEX_WAITERS.lock();
-    if let Some(m) = g.as_mut() {
-        if let Some(set) = m.get_mut(&key) {
-            set.remove(&task_id);
-            if set.is_empty() {
-                m.remove(&key);
-            }
+    let mut values = futex_wait_bucket(key).values.lock();
+    if let Some(set) = values.get_mut(&key) {
+        set.remove(&task_id);
+        if set.is_empty() {
+            values.remove(&key);
         }
     }
 }
@@ -4815,11 +5043,8 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
 
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     let drained: alloc::vec::Vec<(u64, core::task::Waker)> = {
-        let mut g = FUTEX_WAITERS.lock();
-        let Some(m) = g.as_mut() else {
-            return 0;
-        };
-        let Some(set) = m.get_mut(&key) else {
+        let mut values = futex_wait_bucket(key).values.lock();
+        let Some(set) = values.get_mut(&key) else {
             return 0;
         };
         // BTreeMap has no pop; collect the first `n` keys then remove them.
@@ -4831,7 +5056,7 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
             }
         }
         if set.is_empty() {
-            m.remove(&key);
+            values.remove(&key);
         }
         out
     };
@@ -4847,10 +5072,9 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
 /// `uaddr2`'s wait queue without firing their wakers (Linux
 /// `futex_requeue`). Returns `(woken, moved)`.
 ///
-/// The queue move happens under the single `FUTEX_WAITERS` table lock
-/// (both per-uaddr queues live in one map under one lock, so there is no
-/// two-queue lock-ordering hazard). After the move — with the table lock
-/// DROPPED — each mover's park state is retargeted to the destination
+/// The queue move holds the source and destination bucket locks in ascending
+/// bucket order. After the move — with both locks DROPPED — each mover's park
+/// state is retargeted to the destination
 /// word: `futex_park_gen` is set to a destination-generation snapshot
 /// taken BEFORE the queue move (so a `FUTEX_WAKE(uaddr2)` racing the move
 /// bumps past the snapshot and the waiter's gen guard fires), then
@@ -4878,6 +5102,41 @@ fn futex_requeue_waiters(
     )
 }
 
+fn futex_take_waiters(
+    values: &mut FutexWaiterMap,
+    key: FutexKey,
+    n: u32,
+) -> alloc::vec::Vec<(u64, core::task::Waker)> {
+    let Some(set) = values.get_mut(&key) else {
+        return alloc::vec::Vec::new();
+    };
+    let take: alloc::vec::Vec<u64> = set.keys().take(n as usize).copied().collect();
+    let mut movers = alloc::vec::Vec::with_capacity(take.len());
+    for tid in take {
+        if let Some(waker) = set.remove(&tid) {
+            movers.push((tid, waker));
+        }
+    }
+    if set.is_empty() {
+        values.remove(&key);
+    }
+    movers
+}
+
+fn futex_insert_waiters(
+    values: &mut FutexWaiterMap,
+    key: FutexKey,
+    movers: alloc::vec::Vec<(u64, core::task::Waker)>,
+) -> alloc::vec::Vec<u64> {
+    let mut tids = alloc::vec::Vec::with_capacity(movers.len());
+    let dst = values.entry(key).or_default();
+    for (tid, waker) in movers {
+        dst.insert(tid, waker);
+        tids.push(tid);
+    }
+    tids
+}
+
 fn futex_requeue_waiters_keyed(
     key: FutexKey,
     key2: FutexKey,
@@ -4895,32 +5154,24 @@ fn futex_requeue_waiters_keyed(
     }
     // Destination-generation snapshot BEFORE the queue move (see above).
     let gen2 = futex_wake_counter_key(key2);
-    let moved: alloc::vec::Vec<u64> = {
-        let mut g = FUTEX_WAITERS.lock();
-        let Some(m) = g.as_mut() else {
-            return (woken, 0);
-        };
-        let Some(set) = m.get_mut(&key) else {
-            return (woken, 0);
-        };
-        let take: alloc::vec::Vec<u64> = set.keys().take(n_move as usize).copied().collect();
-        let mut movers: alloc::vec::Vec<(u64, core::task::Waker)> =
-            alloc::vec::Vec::with_capacity(take.len());
-        for tid in take {
-            if let Some(w) = set.remove(&tid) {
-                movers.push((tid, w));
-            }
-        }
-        if set.is_empty() {
-            m.remove(&key);
-        }
-        let dst = m.entry(key2).or_default();
-        let mut tids = alloc::vec::Vec::with_capacity(movers.len());
-        for (tid, w) in movers {
-            dst.insert(tid, w);
-            tids.push(tid);
-        }
-        tids
+    let source_bucket = futex_bucket_index(key);
+    let destination_bucket = futex_bucket_index(key2);
+    let moved: alloc::vec::Vec<u64> = if source_bucket == destination_bucket {
+        let mut values = FUTEX_WAITERS[source_bucket].values.lock();
+        let movers = futex_take_waiters(&mut values, key, n_move);
+        futex_insert_waiters(&mut values, key2, movers)
+    } else if source_bucket < destination_bucket {
+        // A total bucket order makes opposite-direction concurrent requeues
+        // deadlock-free.
+        let mut source = FUTEX_WAITERS[source_bucket].values.lock();
+        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
+        let movers = futex_take_waiters(&mut source, key, n_move);
+        futex_insert_waiters(&mut destination, key2, movers)
+    } else {
+        let mut destination = FUTEX_WAITERS[destination_bucket].values.lock();
+        let mut source = FUTEX_WAITERS[source_bucket].values.lock();
+        let movers = futex_take_waiters(&mut source, key, n_move);
+        futex_insert_waiters(&mut destination, key2, movers)
     };
     // Retarget each mover's park state OUTSIDE the table lock (the task
     // registry lock in with_user_task_ctx must never nest inside it).
@@ -5000,11 +5251,21 @@ pub fn __test_futex_requeue(uaddr: u64, uaddr2: u64, n_wake: u32, n_move: u32) -
     futex_requeue_waiters(uaddr, uaddr2, n_wake, n_move, 0)
 }
 
+/// Test hook: expose only bucket identity so the requeue smoke can guarantee
+/// it exercises the ordered two-bucket path.
+#[doc(hidden)]
+pub fn __test_futex_bucket_index(namespace: u64, uaddr: u64) -> usize {
+    futex_bucket_index(futex_key(namespace, uaddr))
+}
+
 #[doc(hidden)]
 pub fn __test_futex_waiter_count(uaddr: u64) -> usize {
-    let g = FUTEX_WAITERS.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&futex_key(0, uaddr)).map(|s| s.len()))
+    let key = futex_key(0, uaddr);
+    futex_wait_bucket(key)
+        .values
+        .lock()
+        .get(&key)
+        .map(|set| set.len())
         .unwrap_or(0)
 }
 
@@ -5031,10 +5292,11 @@ pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
 /// `FUTEX_WAKE` — the lost-waiter signature the park census looks for.
 pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool {
     let key = futex_key(namespace, uaddr);
-    FUTEX_WAITERS
+    futex_wait_bucket(key)
+        .values
         .lock()
-        .as_ref()
-        .and_then(|m| m.get(&key).map(|set| set.contains_key(&tid)))
+        .get(&key)
+        .map(|set| set.contains_key(&tid))
         .unwrap_or(false)
 }
 
@@ -5042,10 +5304,11 @@ pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool
 pub fn dbg_futex_state(namespace: u64, uaddr: u64) -> (u64, usize) {
     let key = futex_key(namespace, uaddr);
     let generation = futex_wake_counter_key(key);
-    let waiters = FUTEX_WAITERS
+    let waiters = futex_wait_bucket(key)
+        .values
         .lock()
-        .as_ref()
-        .and_then(|m| m.get(&key).map(|set| set.len()))
+        .get(&key)
+        .map(|set| set.len())
         .unwrap_or(0);
     (generation, waiters)
 }
@@ -5223,15 +5486,16 @@ pub fn sigaltstack_of(task: u64) -> SigAltStack {
 /// return-to-user delivery hook vs a re-executed `rt_sigtimedwait`)
 /// unable to both take the same instance.
 fn sigwait_consume(task: u64, set: u64) -> Option<u32> {
-    let mut g = SIGNAL_PENDING.lock();
-    let slot = g.as_mut()?.get_mut(&task)?;
-    let candidates = *slot & set;
-    if candidates == 0 {
-        return None;
-    }
-    let signum = sig_from_bit(candidates);
-    *slot &= !(sig_bit(signum));
-    Some(signum)
+    signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        let candidates = *slot & set;
+        if candidates == 0 {
+            return None;
+        }
+        let signum = sig_from_bit(candidates);
+        *slot &= !(sig_bit(signum));
+        Some(signum)
+    })
+    .flatten()
 }
 
 // Function-pointer hook: arch trap dispatcher invokes this on
@@ -5246,20 +5510,30 @@ fn sigwait_consume(task: u64, set: u64) -> Option<u32> {
 // doesn't need a direct dep on this crate's signal internals.
 pub type SignalDeliveryHook = fn(&mut dyn TrapContext, u32) -> bool;
 
-static SIGNAL_DELIVERY_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// Installed once during boot and immutable afterward. Trap return consults
+// this slot for every userspace-bound syscall, so a global IRQ-disabling lock
+// here serialized otherwise unrelated CPUs and added interrupt masking to the
+// common no-signal path.
+static SIGNAL_DELIVERY_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the function the arch trap path calls on every
 /// user-bound int-0x80 trap-return. `install_core_syscalls`
 /// auto-installs `default_signal_delivery`.
 pub fn install_signal_delivery_hook(hook: SignalDeliveryHook) {
-    *SIGNAL_DELIVERY_HOOK.lock() = Some(hook);
+    SIGNAL_DELIVERY_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Look up the currently-installed delivery hook, if any. The
 /// arch trap dispatcher calls this on its way back to user.
 pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
-    *SIGNAL_DELIVERY_HOOK.lock()
+    let raw = SIGNAL_DELIVERY_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        None
+    } else {
+        // SAFETY: every non-zero value stored in SIGNAL_DELIVERY_HOOK is a
+        // complete SignalDeliveryHook pointer. Acquire pairs with install.
+        Some(unsafe { core::mem::transmute::<usize, SignalDeliveryHook>(raw) })
+    }
 }
 
 /// Sentinel passed by callers that aren't on a syscall trap path.
@@ -5400,18 +5674,11 @@ pub(crate) fn default_signal_delivery_restricted(
     }
     let task = current_task_id();
 
-    let pending = {
-        let g = SIGNAL_PENDING.lock();
-        match g.as_ref().and_then(|m| m.get(&task).copied()) {
-            Some(p) if p != 0 => p,
-            _ => return false,
-        }
-    };
-    let mask = SIGNAL_MASK
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0);
+    let pending = signal_bits_get(&SIGNAL_PENDING, task);
+    if pending == 0 {
+        return false;
+    }
+    let mask = signal_bits_get(&SIGNAL_MASK, task);
     // `& !1`: bit 0 is the POSIX null signal and is NEVER deliverable. Send
     // paths already refuse to set it (kill/tkill/tgkill/sigqueue treat sig 0
     // as an existence probe), but mask it here too so a stray bit-0 raise can
@@ -5457,11 +5724,9 @@ pub(crate) fn default_signal_delivery_restricted(
             // No user handler installed → POSIX default action.
             // Clear the pending bit before applying the action so a
             // retry trap doesn't re-fire the same signal.
-            if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-                if let Some(slot) = map.get_mut(&task) {
-                    *slot &= !(sig_bit(signum));
-                }
-            }
+            let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+                *slot &= !(sig_bit(signum));
+            });
             match default_signal_action(signum) {
                 DefaultAction::Ignore => {
                     // Silently consumed (existing behaviour). Discard any
@@ -5502,11 +5767,9 @@ pub(crate) fn default_signal_delivery_restricted(
     // stored as `None`, so it never reaches here (the None arm above applies
     // the default action); a SIG_IGN slot is the only `handler <= 1` case.
     if action.handler <= 1 {
-        if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-            if let Some(slot) = map.get_mut(&task) {
-                *slot &= !(sig_bit(signum));
-            }
-        }
+        let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+            *slot &= !(sig_bit(signum));
+        });
         // SIG_IGN consumes every queued RT instance with the bit.
         purge_sigqueue(task, signum);
         return true;
@@ -5547,11 +5810,9 @@ pub(crate) fn default_signal_delivery_restricted(
     // Clear only after the rewrite succeeded — a failed
     // delivery (e.g. arch returns false) should leave pending
     // alone so the next trap retries.
-    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(sig_bit(signum));
-        }
-    }
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        *slot &= !(sig_bit(signum));
+    });
     // RT queueing: this delivery drained ONE queued instance (the take
     // above); if more remain, re-arm the bit so the next return-to-user
     // delivers the next instance with its own si_value.
@@ -5563,22 +5824,13 @@ pub(crate) fn default_signal_delivery_restricted(
     // handler's sigreturn must restore is the PRE-SUSPEND mask, not the
     // temporary suspend mask the wait installed (Linux TIF_RESTORE_SIGMASK).
     {
-        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| {
-            SIGNAL_MASK
-                .lock()
-                .as_ref()
-                .and_then(|m| m.get(&task).copied())
-                .unwrap_or(0)
-        });
+        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| signal_mask_of(task));
         set_sigreturn_saved_mask(task, cur);
     }
     // SA_NODEFER: skip the auto-block. Default: add the delivered
     // signal to the mask so the handler runs without re-entrancy.
     if (action.flags & SA_NODEFER) == 0 {
-        if let Some(map) = SIGNAL_MASK.lock().as_mut() {
-            let slot = map.entry(task).or_insert(0);
-            *slot |= sig_bit(signum);
-        }
+        let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= sig_bit(signum));
     }
     // SA_RESETHAND: one-shot — clear the handler so the next
     // occurrence falls through to the default action. Cleared in the
@@ -5665,19 +5917,27 @@ pub struct SyncFaultInfo {
 /// existing panic / probe-catch path.
 type SyncSignalHook = fn(&mut dyn TrapContext, u64, SyncFaultInfo) -> bool;
 
-static SYNC_SIGNAL_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SyncSignalHook>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// CPU-exception delivery has the same install-once lifetime as the normal
+// trap-return hook. Keep faults on a lock-free lookup path too.
+static SYNC_SIGNAL_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the function the arch trap path calls on user-mode
 /// CPU exceptions. `install_core_syscalls` auto-installs
 /// `default_sync_signal_delivery`.
 pub fn install_sync_signal_hook(hook: SyncSignalHook) {
-    *SYNC_SIGNAL_HOOK.lock() = Some(hook);
+    SYNC_SIGNAL_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Look up the currently-installed sync-signal hook, if any.
 pub fn sync_signal_hook() -> Option<SyncSignalHook> {
-    *SYNC_SIGNAL_HOOK.lock()
+    let raw = SYNC_SIGNAL_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        None
+    } else {
+        // SAFETY: every non-zero value stored in SYNC_SIGNAL_HOOK is a
+        // complete SyncSignalHook pointer. Acquire pairs with install.
+        Some(unsafe { core::mem::transmute::<usize, SyncSignalHook>(raw) })
+    }
 }
 
 /// Default sync-signal hook: map vector → signum, look up the
