@@ -221,6 +221,14 @@ argument = "Removing BuddyZone::free's vestigial overlap scan changes only the c
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The x86_64 trap-entry edit remains inside the existing frame TCB and only normalizes the live direction flag before compiler-generated kernel code executes. It adds no trusted subsystem, authority, domain transition, mapping, or ownership path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The CPU has already saved the interrupted RFLAGS in the trap frame before CLD executes, and IRETQ restores that saved value unchanged. Clearing only the live kernel DF prevents attacker-controlled CPL3 flag state from reversing kernel string operations without changing capability checks, domain tags, saved user state, or return authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The scheduler edit adds accounting callbacks at existing x86_64 stackful switch boundaries inside the already enumerated executor TCB. It does not add a trusted subsystem, change task selection, alter a task's saved domain state, or move any capability or address-space ownership."
 
 [[invariants_preserved]]

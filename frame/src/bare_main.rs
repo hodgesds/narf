@@ -4015,6 +4015,7 @@ fn boot_userspace_init() {
                 ),
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
+                ("df_trap_smoke", narf_verification::NARF_DF_TRAP_SMOKE_ELF),
                 ("sigrcx_smoke", narf_verification::NARF_SIGRCX_SMOKE_ELF),
                 ("pipeblk_smoke", narf_verification::NARF_PIPEBLK_SMOKE_ELF),
                 ("sigrt_smoke", narf_verification::NARF_SIGRT_SMOKE_ELF),

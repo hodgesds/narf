@@ -43,12 +43,12 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
 
     // Temporarily install the new mask, remembering the prior one so the
     // interrupting delivery's sigreturn restores IT (not the temp mask).
-    {
-        let mut g = SIGNAL_MASK.lock();
-        let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        let prior = map.insert(task, mask).unwrap_or(0);
-        set_suspend_saved_mask(task, prior);
-    }
+    let prior = signal_bits_update_or_init(&SIGNAL_MASK, task, |slot| {
+        let prior = *slot;
+        *slot = mask;
+        prior
+    });
+    set_suspend_saved_mask(task, prior);
 
     // Pause until signal.
     sys_pause(ctx);

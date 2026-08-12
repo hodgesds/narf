@@ -262,18 +262,24 @@ kernel_test_in!("userspace", smoke_userspace_signal_delivery);
 // Preemptive-signals wave: the alloc-free IRQ raise path. A signal
 // raised from the timer ISR (e.g. SIGALRM for a CPU-bound task) must
 // never allocate, so `raise_signal_pending_irq` only ORs the bit into a
-// PRE-EXISTING SIGNAL_PENDING entry and reports false otherwise — the
-// arming syscall pre-creates the entry via `ensure_signal_pending_slot`.
+// PRE-EXISTING pending + readability-generation entries and reports false
+// otherwise — the arming syscall pre-creates both via
+// `ensure_signal_pending_slot`.
 #[cfg(not(feature = "user-mode-e2e"))]
 fn smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated() -> TestResult {
     use crate::handlers::{
-        __test_signal_reset, ensure_signal_pending_slot, raise_signal_pending_irq,
+        __test_signal_bucket_index, __test_signal_reset, clear_signal_pending,
+        ensure_signal_pending_slot, raise_signal_pending_irq, signal_readable_generation,
     };
     use crate::{signal_init, signal_pending_of};
 
     signal_init();
     __test_signal_reset();
     let task = 0x5A1A_5A1A_u64;
+    let other = task + 1;
+    if __test_signal_bucket_index(task) == __test_signal_bucket_index(other) {
+        return TestResult::Fail("signal shard smoke tasks share one bucket");
+    }
 
     // No entry yet → raise refuses (allocating an entry is forbidden in
     // IRQ context), sets nothing.
@@ -297,6 +303,34 @@ fn smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated() -> TestResu
         __test_signal_reset();
         return TestResult::Fail("SIGALRM pending bit not set");
     }
+    if signal_readable_generation(task) != 1 {
+        __test_signal_reset();
+        return TestResult::Fail("first IRQ signal did not advance readability generation");
+    }
+
+    // A second bit while already readable does not create a new readiness
+    // transition. Clearing the set and raising again does.
+    if !raise_signal_pending_irq(task, 10) || signal_readable_generation(task) != 1 {
+        __test_signal_reset();
+        return TestResult::Fail("non-empty IRQ raise advanced readability generation");
+    }
+    clear_signal_pending(task, 14);
+    clear_signal_pending(task, 10);
+    if !raise_signal_pending_irq(task, 12) || signal_readable_generation(task) != 2 {
+        __test_signal_reset();
+        return TestResult::Fail("second empty-to-readable transition was not counted");
+    }
+
+    // A different task bucket remains independent.
+    ensure_signal_pending_slot(other);
+    if !raise_signal_pending_irq(other, 10)
+        || signal_pending_of(other) & crate::handlers::sig_bit(10) == 0
+        || signal_readable_generation(other) != 1
+        || signal_pending_of(task) & crate::handlers::sig_bit(10) != 0
+    {
+        __test_signal_reset();
+        return TestResult::Fail("signal state leaked across task shards");
+    }
 
     __test_signal_reset();
     TestResult::Pass
@@ -306,6 +340,205 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated
 );
+
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_wakers_are_sharded_and_isolated() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    static FIRST_WOKE: AtomicBool = AtomicBool::new(false);
+    static SECOND_WOKE: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn clone_raw(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake_raw(data: *const ()) {
+        // SAFETY: each data pointer below references a static AtomicBool.
+        unsafe { &*(data.cast::<AtomicBool>()) }.store(true, Ordering::Release);
+    }
+    unsafe fn wake_by_ref_raw(data: *const ()) {
+        // SAFETY: each data pointer below references a static AtomicBool.
+        unsafe { &*(data.cast::<AtomicBool>()) }.store(true, Ordering::Release);
+    }
+    unsafe fn drop_raw(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+    const FIRST: u64 = 0x5100;
+    const SECOND: u64 = FIRST + 1;
+    if crate::handlers::__test_signal_waker_bucket_index(FIRST)
+        == crate::handlers::__test_signal_waker_bucket_index(SECOND)
+    {
+        return TestResult::Fail("signal waker smoke tasks share one shard");
+    }
+
+    crate::handlers::signal_waker_init();
+    FIRST_WOKE.store(false, Ordering::Relaxed);
+    SECOND_WOKE.store(false, Ordering::Relaxed);
+    // SAFETY: both raw wakers reference static atomics; all vtable operations
+    // preserve that pointer and require no ownership bookkeeping.
+    let first = unsafe {
+        Waker::from_raw(RawWaker::new(
+            (&FIRST_WOKE as *const AtomicBool).cast(),
+            &VTABLE,
+        ))
+    };
+    // SAFETY: same static-atomic RawWaker contract as `first`.
+    let second = unsafe {
+        Waker::from_raw(RawWaker::new(
+            (&SECOND_WOKE as *const AtomicBool).cast(),
+            &VTABLE,
+        ))
+    };
+    crate::handlers::register_signal_waker(FIRST, first);
+    crate::handlers::register_signal_waker(SECOND, second);
+
+    crate::handlers::wake_signal(FIRST);
+    if !FIRST_WOKE.load(Ordering::Acquire) || SECOND_WOKE.load(Ordering::Acquire) {
+        crate::handlers::signal_waker_init();
+        return TestResult::Fail("signal wake crossed task shards");
+    }
+    crate::handlers::wake_signal(SECOND);
+    let second_woke = SECOND_WOKE.load(Ordering::Acquire);
+    crate::handlers::signal_waker_init();
+    if !second_woke {
+        return TestResult::Fail("second signal waker was lost after first shard wake");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_signal_wakers_are_sharded_and_isolated
+);
+
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_sigqueue_is_sharded_fifo_and_isolated() -> TestResult {
+    use crate::handlers::{
+        __test_signal_reset, __test_sigqueue_bucket_index, sigqueue_more_queued,
+        store_sigqueue_info, take_sigqueue_info,
+    };
+
+    const FIRST: u64 = 0x5200;
+    const SECOND: u64 = FIRST + 1;
+    const SIGRT: u32 = 35;
+    if __test_sigqueue_bucket_index(FIRST) == __test_sigqueue_bucket_index(SECOND) {
+        return TestResult::Fail("sigqueue smoke tasks share one shard");
+    }
+
+    __test_signal_reset();
+    if !store_sigqueue_info(FIRST, SIGRT, -1, 0xA1, 101)
+        || !store_sigqueue_info(FIRST, SIGRT, -1, 0xA2, 102)
+        || !store_sigqueue_info(SECOND, SIGRT, -1, 0xB1, 201)
+    {
+        __test_signal_reset();
+        return TestResult::Fail("sigqueue sharding setup hit the queue limit");
+    }
+
+    let first = take_sigqueue_info(FIRST, SIGRT);
+    let first_more = sigqueue_more_queued(FIRST, SIGRT);
+    let second_still_queued = sigqueue_more_queued(SECOND, SIGRT);
+    let second = take_sigqueue_info(FIRST, SIGRT);
+    let other = take_sigqueue_info(SECOND, SIGRT);
+    __test_signal_reset();
+
+    if first != Some((-1, 0xA1, 101))
+        || !first_more
+        || !second_still_queued
+        || second != Some((-1, 0xA2, 102))
+        || other != Some((-1, 0xB1, 201))
+    {
+        return TestResult::Fail("sharded sigqueue lost FIFO order or cross-task isolation");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_sigqueue_is_sharded_fifo_and_isolated
+);
+
+// Trap-return signal hooks are immutable after boot and therefore live in
+// atomic function-pointer slots. Exercise both pointer reconstructions so an
+// architecture where a function pointer cannot round-trip through usize fails
+// in the kernel suite rather than on its first userspace exception.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_hook_slots_round_trip() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLED: AtomicU64 = AtomicU64::new(0);
+
+    fn delivery(ctx: &mut dyn TrapContext, syscall: u32) -> bool {
+        if syscall == 0x51A1 {
+            ctx.set_rip(0xCA11);
+            CALLED.fetch_or(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    fn synchronous(_ctx: &mut dyn TrapContext, vector: u64, fault: crate::SyncFaultInfo) -> bool {
+        if vector == 13 && fault.addr == 0xBAD0 {
+            CALLED.fetch_or(2, Ordering::Relaxed);
+        }
+        true
+    }
+
+    struct HookCtx {
+        rip: u64,
+    }
+
+    impl TrapContext for HookCtx {
+        fn args(&self) -> &SyscallArgs {
+            static ARGS: SyscallArgs = SyscallArgs {
+                arg0: 0,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            };
+            &ARGS
+        }
+        fn set_return(&mut self, _r: SyscallReturn) {}
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            self.rip
+        }
+        fn set_rip(&mut self, rip: u64) {
+            self.rip = rip;
+        }
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+    }
+
+    // Ensure both slots have a restorable production callback even if this
+    // smoke happens to run before another test installs the core table.
+    let mut table = SyscallTable::new();
+    crate::install_core_syscalls(&mut table);
+    let old_delivery = crate::signal_delivery_hook().expect("core delivery hook installed");
+    let old_sync = crate::sync_signal_hook().expect("core sync hook installed");
+
+    CALLED.store(0, Ordering::Relaxed);
+    crate::install_signal_delivery_hook(delivery);
+    crate::install_sync_signal_hook(synchronous);
+    let mut ctx = HookCtx { rip: 0 };
+    let delivered = crate::signal_delivery_hook().is_some_and(|hook| hook(&mut ctx, 0x51A1));
+    let synchronized = crate::sync_signal_hook()
+        .is_some_and(|hook| hook(&mut ctx, 13, crate::SyncFaultInfo { addr: 0xBAD0 }));
+
+    crate::install_signal_delivery_hook(old_delivery);
+    crate::install_sync_signal_hook(old_sync);
+
+    if !delivered || !synchronized || ctx.rip != 0xCA11 || CALLED.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("atomic signal hook slot did not round-trip and execute");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!("userspace", smoke_userspace_signal_hook_slots_round_trip);
 
 // Preemptive-signals wave: the ITIMER_REAL IRQ fast path. A one-shot
 // past its deadline reports due once then disarms; a periodic one

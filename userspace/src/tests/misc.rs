@@ -1486,8 +1486,8 @@ kernel_test_in!(
 /// permanent form of the SMP scheduler-resume strand).
 fn smoke_userspace_futex_requeue_moves_waiters() -> TestResult {
     use crate::handlers::{
-        __test_futex_requeue, __test_futex_waiter_count, futex_gen, futex_register_waiter,
-        futex_wake_waiters_for_test,
+        __test_futex_bucket_index, __test_futex_requeue, __test_futex_waiter_count, futex_gen,
+        futex_register_waiter, futex_wake_waiters_for_test,
     };
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -1525,6 +1525,10 @@ fn smoke_userspace_futex_requeue_moves_waiters() -> TestResult {
     const U1: u64 = 0x5EC0_3000;
     const U2: u64 = 0x5EC0_3004;
 
+    if __test_futex_bucket_index(0, U1) == __test_futex_bucket_index(0, U2) {
+        return TestResult::Fail("requeue smoke no longer exercises two futex buckets");
+    }
+
     let c1 = Arc::new(AtomicU32::new(0));
     let c2 = Arc::new(AtomicU32::new(0));
     futex_register_waiter(U1, 9001, counting_waker(c1.clone()));
@@ -1552,6 +1556,25 @@ fn smoke_userspace_futex_requeue_moves_waiters() -> TestResult {
     // A later wake on the DESTINATION word reaches the moved waiter.
     if futex_wake_waiters_for_test(U2, u32::MAX) != 1 || c2.load(Ordering::Acquire) != 1 {
         return TestResult::Fail("wake on the destination word did not reach the moved waiter");
+    }
+
+    // Also cover the single-lock path when two distinct keys hash to one
+    // bucket; requeue must not try to lock that bucket recursively.
+    const U3: u64 = 0x5EC0_4000;
+    const U4: u64 = 0x5EC0_4044;
+    if __test_futex_bucket_index(0, U3) != __test_futex_bucket_index(0, U4) {
+        return TestResult::Fail("same-bucket requeue constants no longer share a bucket");
+    }
+    let c3 = Arc::new(AtomicU32::new(0));
+    futex_register_waiter(U3, 9003, counting_waker(c3.clone()));
+    if __test_futex_requeue(U3, U4, 0, 1) != (0, 1) {
+        return TestResult::Fail("same-bucket requeue did not move one waiter");
+    }
+    if __test_futex_waiter_count(U3) != 0 || __test_futex_waiter_count(U4) != 1 {
+        return TestResult::Fail("same-bucket waiter queues after requeue are wrong");
+    }
+    if futex_wake_waiters_for_test(U4, 1) != 1 || c3.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("same-bucket destination wake missed moved waiter");
     }
     TestResult::Pass
 }

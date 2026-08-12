@@ -2501,6 +2501,11 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
         ("signal_smoke", "signal-ok"),
+        // An interrupt gate preserves userspace DF. common_trap must clear the
+        // live flag before Rust/REP MOVS while leaving the CPU-pushed RFLAGS
+        // intact for iretq. The smoke sets DF around int80 uname and checks
+        // both the forward kernel copy and restored user flag.
+        ("df_trap_smoke", "df-trap-ok"),
         // Regression for the SYSRET rcx/r11 clobber on syscall-path
         // rt_sigreturn: an async SIGALRM interrupts an asm loop holding
         // sentinels in rcx/r11; the sigreturn must preserve them (full-register

@@ -35,15 +35,9 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         target = tid;
     }
     signal_stopcont_interaction(target, signum);
-    {
-        let mut g = SIGNAL_PENDING.lock();
-        match g.as_mut() {
-            Some(map) => *map.entry(target).or_insert(0) |= sig_bit(signum),
-            None => {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-                return;
-            }
-        }
+    if signal_bits_update(&SIGNAL_PENDING, target, |slot| *slot |= sig_bit(signum)).is_none() {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
     }
     wake_signal(target);
     ctx.set_return(SyscallReturn::ok(0));

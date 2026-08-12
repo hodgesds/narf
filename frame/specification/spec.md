@@ -60,6 +60,10 @@ Rust function that forwards to `interrupts/` or handles synchronous faults.
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
 - A trap handler never allocates.
+- **x86_64 trap entry clears the live direction flag before executing any
+  compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
+  the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel
+  must run with DF=0 so Rust/System-V string operations move forward.
 - `enter_domain` only runs with interrupts disabled and returns with them
   in the same state.
 - **`enter_domain` is not re-entrant into the same domain.** Nested entry
