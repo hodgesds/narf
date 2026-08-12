@@ -2597,10 +2597,32 @@ pub fn __with_tcb_mut<R>(id: u32, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
 
 // ── Public timer-sweep + ICMP-error glue ────────────────────────────
 
+/// Interval-stamp (monotonic cycles) of the last `tick_all` scan, CAS-gated so
+/// exactly one CPU runs the O(all-TCBs) scan per interval.
+static LAST_TICK_ALL_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Sweep every live TCB, ticking the retransmit / delayed-ACK /
 /// persist / keepalive / TIME-WAIT timers. Called once per sleep-
 /// pump iteration; cheap (lock + short walk).
 pub fn tick_all() {
+    // `sleep_pumps::run()` calls this on EVERY executor idle round on EVERY
+    // CPU, so ungated all CPUs concurrently scan and lock every TCB — 16×
+    // redundant work plus cross-CPU lock contention on each connection.
+    // Profiled (after the fire_due wheel-lock fix) as the top busy cost at 256
+    // connections. TCP timers are coarse (RTO / delayed-ACK ~200 ms; persist /
+    // keepalive / TIME-WAIT coarser), so a ~1 ms scan cadence is ample. CAS the
+    // interval stamp so exactly ONE CPU runs the scan per window; the rest of
+    // the CPUs (and the sub-interval re-entries) return immediately.
+    let now = narf_scheduler::narf_time::now_cycles();
+    let interval = narf_scheduler::narf_time::ns_to_cycles(1_000_000); // 1 ms
+    let last = LAST_TICK_ALL_CYCLES.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < interval
+        || LAST_TICK_ALL_CYCLES
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
     let ids: Vec<u32> = {
         let mut ids = Vec::new();
         for shard in TCB_TABLE.iter() {
