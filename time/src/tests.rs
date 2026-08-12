@@ -11,6 +11,69 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// `fire_due` batches its wheel-lock scan (BATCH=16 slots per lock hold). This
+/// registers well over two batches of already-due timers and asserts every one
+/// fires EXACTLY once — the at-most-once + all-fire invariant the batched scan
+/// must preserve across batch boundaries. Uses the running system's real global
+/// wheel, so it only asserts on ITS OWN timers (background sleepers may also
+/// fire) — each of ours must end at a fire count of exactly 1.
+fn smoke_timer_wheel_batched_fire_fires_each_due_once() -> TestResult {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    unsafe fn clone_raw(data: *const ()) -> RawWaker {
+        // SAFETY: `data` is a live Arc<AtomicUsize> pointer; bump its refcount.
+        unsafe { Arc::increment_strong_count(data as *const AtomicUsize) };
+        RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake_raw(data: *const ()) {
+        // SAFETY: `data` came from Arc::into_raw of an Arc<AtomicUsize>; wake-by-
+        // value consumes that refcount.
+        let arc = unsafe { Arc::from_raw(data as *const AtomicUsize) };
+        arc.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn wake_by_ref_raw(data: *const ()) {
+        // SAFETY: caller holds a live Waker, so the Arc<AtomicUsize> is valid.
+        unsafe { &*(data as *const AtomicUsize) }.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn drop_raw(data: *const ()) {
+        // SAFETY: reconstructing consumes the refcount this waker owned.
+        drop(unsafe { Arc::from_raw(data as *const AtomicUsize) });
+    }
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+
+    // >2×BATCH so the scan crosses multiple batch/lock-hold boundaries.
+    const N: usize = 40;
+    let now = crate::now_cycles();
+    let deadline = now.saturating_sub(1); // already due
+    let counters: Vec<Arc<AtomicUsize>> = (0..N).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+    for c in &counters {
+        let raw = Arc::into_raw(c.clone()) as *const ();
+        // SAFETY: `raw` is a live Arc<AtomicUsize>; the vtable balances refs.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) };
+        if crate::timer_wheel::register(deadline, waker).is_err() {
+            return TestResult::Fail("wheel register failed (table full?)");
+        }
+    }
+
+    // Fire everything due as of now.
+    crate::timer_wheel::fire_due(crate::now_cycles());
+
+    for c in &counters {
+        match c.load(Ordering::Relaxed) {
+            1 => {}
+            0 => return TestResult::Fail("a due timer was not fired by batched fire_due"),
+            _ => return TestResult::Fail("a due timer fired more than once (batch cursor bug)"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_timer_wheel_batched_fire_fires_each_due_once);
+
 fn smoke_monotonic_advances() -> TestResult {
     let a = crate::now_cycles();
     for _ in 0..100_000 {

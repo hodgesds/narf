@@ -404,16 +404,38 @@ pub fn fire_due(now_cycles: u64) -> usize {
     //     poller re-arms with deadline ≤ now, wedging the CPU — observed as
     //     accept() never completing in net-smoke.
     // `wake()` runs outside the lock (it re-acquires the wheel on re-register).
+    //
+    // Take WHEEL once per BATCH of scanned slots, not once per slot: the old
+    // per-slot re-lock cost MAX_SLEEPERS (1024) global-lock acquisitions per
+    // call, so on an SMP box every CPU firing due timers serialized on this one
+    // lock — profiled as the dominant cost (58% of samples, the rest idle)
+    // under a 256-connection TCP load. Collect each batch's due wakers into a
+    // small fixed on-stack buffer, drop the lock, then wake. The cursor still
+    // advances forward only, so each due timer fires at most once and a wake
+    // that re-arms into a lower slot is deferred to the next tick (unchanged).
+    // The 16-waker buffer is ~256 B — nowhere near the ~16 KiB full-slot array
+    // the per-task-own-stack path forbids.
+    const BATCH: usize = 16;
     let mut n = 0usize;
-    for i in 0..MAX_SLEEPERS {
-        let waker = {
+    let mut cursor = 0usize;
+    while cursor < MAX_SLEEPERS {
+        let mut batch: [Option<Waker>; BATCH] = [const { None }; BATCH];
+        let mut count = 0usize;
+        {
             let mut w = WHEEL.lock();
-            match w.slots[i].as_ref() {
-                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
-                _ => None,
+            while cursor < MAX_SLEEPERS && count < BATCH {
+                let due = matches!(
+                    w.slots[cursor].as_ref(),
+                    Some(s) if s.deadline_cycles <= now_cycles
+                );
+                if due {
+                    batch[count] = w.slots[cursor].take().map(|s| s.waker);
+                    count += 1;
+                }
+                cursor += 1;
             }
-        };
-        if let Some(wk) = waker {
+        }
+        for wk in batch.into_iter().take(count).flatten() {
             wk.wake();
             n += 1;
         }
