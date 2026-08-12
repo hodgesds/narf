@@ -832,19 +832,20 @@ impl SocketFile {
             // A generic monitor starts at the ring TAIL: Linux
             // `NETLINK_KOBJECT_UEVENT` is not replayed on connect, and replaying
             // boot-time ADDs to libinput can tear down an already-created input
-            // device.  systemd-udevd is the one deliberate exception. NARF's
-            // systemd boot path starts `systemd-udev-trigger` before udevd has
-            // opened its monitor, so those trigger ADDs would otherwise be
-            // irretrievably lost and fstab UUID device units would wait forever.
+            // device.  systemd-udevd and PID 1 are the two deliberate
+            // exceptions. NARF's systemd boot path queues the storage ADDs
+            // before either has opened its monitor; without a bounded replay,
+            // PID 1 never activates the fstab-generated UUID .device unit.
             // Replay only NARF's post-sysfs storage-coldplug window to the
-            // udev daemon. Replaying every early bring-up event is unsafe:
+            // systemd's device manager and udev daemon. Replaying every early
+            // bring-up event is unsafe:
             // some precede their completed kobject and make udevd open a stale
             // DEVPATH. The marker is set immediately before the canonical
             // block ADDs that satisfy fstab UUID dependencies.
-            let reader = if crate::handlers::proc_comm_of_task_matches(
-                crate::handlers::current_task_id(),
-                "systemd-udevd$",
-            ) {
+            let task = crate::handlers::current_task_id();
+            let reader = if crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
+                || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
+            {
                 narf_filesystem::uevent::boot_udevd_replay_reader()
             } else {
                 narf_filesystem::uevent::UeventReader::new()
@@ -5191,10 +5192,10 @@ kernel_test_in!(
     smoke_unregistered_netlink_kernel_send_is_refused
 );
 
-/// systemd-udevd starts after the distro's coldplug trigger in the NARF boot
-/// sequence.  It alone must replay that bounded backlog; generic consumers
-/// (notably libinput) must remain tail-only to avoid duplicate device ADDs.
-fn smoke_udevd_netlink_replays_boot_coldplug_only() -> TestResult {
+/// systemd's device manager and systemd-udevd start after NARF queues the
+/// distro storage coldplug window. Both need that bounded replay; generic
+/// consumers (notably libinput) must remain tail-only.
+fn smoke_systemd_netlink_replays_boot_coldplug_only() -> TestResult {
     use crate::handlers::{current_task_id, set_proc_comm};
 
     narf_filesystem::uevent::__reset_for_test();
@@ -5218,6 +5219,13 @@ fn smoke_udevd_netlink_replays_boot_coldplug_only() -> TestResult {
         _ => None,
     };
 
+    set_proc_comm(task, "systemd");
+    let manager = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let manager_event = match &*manager.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
     set_proc_comm(task, "libinput");
     let generic = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
     let generic_pending = match &*generic.state.lock() {
@@ -5234,6 +5242,11 @@ fn smoke_udevd_netlink_replays_boot_coldplug_only() -> TestResult {
             "systemd-udevd did not receive only the bounded boot coldplug window",
         );
     }
+    if manager_event.as_ref().map(|event| event.devpath.as_str())
+        != Some("/devices/virtual/block/smoke-efi")
+    {
+        return TestResult::Fail("systemd did not receive the bounded boot coldplug window");
+    }
     if generic_pending {
         return TestResult::Fail("generic uevent monitor replayed stale boot events");
     }
@@ -5241,7 +5254,7 @@ fn smoke_udevd_netlink_replays_boot_coldplug_only() -> TestResult {
 }
 kernel_test_in!(
     "userspace/socket",
-    smoke_udevd_netlink_replays_boot_coldplug_only
+    smoke_systemd_netlink_replays_boot_coldplug_only
 );
 
 /// A userspace multicast send must REACH the group's subscribers.
