@@ -7,7 +7,8 @@
 
 use crate::abi_test_support::*;
 use narf_linux_perf_uapi::{
-    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
+    PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_EXCLUDE_KERNEL,
+    PERF_ATTR_FLAG_EXCLUDE_USER, PERF_ATTR_FLAG_FREQ, PERF_ATTR_FLAG_INHERIT,
     PERF_ATTR_FLAG_WATERMARK,
 };
 
@@ -190,22 +191,22 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             }
         }
 
-        let approximate_sw_attr = PerfEventAttr {
+        let task_cpu_clock_attr = PerfEventAttr {
             type_: 1,
-            config: 0, // PERF_COUNT_SW_CPU_CLOCK needs per-target accounting
+            config: 0, // PERF_COUNT_SW_CPU_CLOCK
             ..attr
         };
         match call(
             Syscall::PerfEventOpen.raw(),
             a3(
-                &approximate_sw_attr as *const _ as u64,
+                &task_cpu_clock_attr as *const _ as u64,
                 0,
                 -1i32 as u64,
                 -1i32 as u64,
             ),
         ) {
-            Some(EOPNOTSUPP) => {}
-            _ => return Err("perf_event_open admitted an approximate software event"),
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("perf_event_open rejected exact task CPU clock accounting"),
         }
 
         let exact_cpu_clock_attr = PerfEventAttr {
@@ -1377,6 +1378,108 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_perf_event_open_validation);
+
+fn smoke_abi_perf_inherited_software_clock_survives_thread_exit() -> TestResult {
+    with_setup(|| {
+        const CHILD_TID: u64 = 0x5045_5246_4348;
+        const CHILD_PID: u64 = 0x5045_5246_4350;
+        const CHILD_USER_NS: u64 = 7_000_000;
+        const CHILD_KERNEL_NS: u64 = 3_000_000;
+
+        let mut fds = [0u32; 3];
+        let filters = [
+            0,
+            PERF_ATTR_FLAG_EXCLUDE_KERNEL,
+            PERF_ATTR_FLAG_EXCLUDE_USER,
+        ];
+        let mut before = [0u64; 3];
+        for (index, filter) in filters.into_iter().enumerate() {
+            let attr = PerfEventAttr {
+                type_: 1, // PERF_TYPE_SOFTWARE
+                size: core::mem::size_of::<PerfEventAttr>() as u32,
+                config: 1, // PERF_COUNT_SW_TASK_CLOCK
+                flags: PERF_ATTR_FLAG_INHERIT | filter,
+                ..PerfEventAttr::default()
+            };
+            fds[index] = match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(&attr as *const _ as u64, 0, -1i32 as u64, -1i32 as u64),
+            ) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("inherited task-clock event open failed"),
+            };
+            let mut raw = [0u8; 8];
+            if call(
+                Syscall::Read.raw(),
+                a2(fds[index] as u64, raw.as_mut_ptr() as u64, raw.len() as u64),
+            ) != Some(8)
+            {
+                return Err("initial inherited task-clock read failed");
+            }
+            before[index] = u64::from_ne_bytes(raw);
+        }
+
+        let parent_tid = crate::handlers::current_task_id();
+        let parent_pid = crate::handlers::task_to_pid_raw(parent_tid).unwrap_or(parent_tid);
+        crate::perf_event::on_fork(parent_pid, CHILD_PID, parent_tid, CHILD_TID);
+        // x86's own-stack scheduler records total on-CPU slice time in the
+        // primary ledger; the legacy aarch64 path records user time alone.
+        #[cfg(target_arch = "x86_64")]
+        crate::handlers::__test_account_cpu_ns(
+            CHILD_TID,
+            CHILD_USER_NS.saturating_add(CHILD_KERNEL_NS),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        crate::handlers::__test_account_cpu_ns(CHILD_TID, CHILD_USER_NS);
+        crate::handlers::__test_account_kernel_ns(CHILD_TID, CHILD_KERNEL_NS);
+
+        let mut live = [0u64; 3];
+        for (index, fd) in fds.iter().copied().enumerate() {
+            let mut raw = [0u8; 8];
+            if call(
+                Syscall::Read.raw(),
+                a2(fd as u64, raw.as_mut_ptr() as u64, raw.len() as u64),
+            ) != Some(8)
+            {
+                return Err("live inherited task-clock read failed");
+            }
+            live[index] = u64::from_ne_bytes(raw);
+        }
+        // Linux ignores privilege exclusion modifiers for software task and
+        // CPU clocks: task-clock, task-clock:u, and task-clock:k all count the
+        // same scheduled task time. Hardware events test the filters above.
+        let expected = [CHILD_USER_NS + CHILD_KERNEL_NS; 3];
+        for index in 0..expected.len() {
+            if live[index].saturating_sub(before[index]) != expected[index] {
+                return Err("inherited software task-clock diverged by privilege filter");
+            }
+        }
+
+        // The real observer runs before task-table cleanup. Reproduce both
+        // phases and prove the terminal value remains monotonic afterward.
+        crate::perf_event::on_thread_exit(CHILD_PID, CHILD_TID);
+        crate::handlers::__test_reset_cpu_times_for(CHILD_TID);
+        for (index, fd) in fds.iter().copied().enumerate() {
+            let mut retired = [0u8; 8];
+            if call(
+                Syscall::Read.raw(),
+                a2(fd as u64, retired.as_mut_ptr() as u64, retired.len() as u64),
+            ) != Some(8)
+            {
+                return Err("retired inherited task-clock read failed");
+            }
+            if u64::from_ne_bytes(retired) != live[index] {
+                return Err("inherited task time changed at thread exit");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_perf_inherited_software_clock_survives_thread_exit
+);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {

@@ -7,6 +7,26 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 extern crate alloc;
 
+/// Restore the live bus registry after a smoke temporarily installs
+/// synthetic devices.  Kernel smokes share one process and therefore one
+/// registry; leaking a fake ECAM address makes later MMIO tests order-
+/// dependent and can fault on architectures where that address is unmapped.
+struct RegistryRestore(Option<alloc::vec::Vec<crate::BusDevice>>);
+
+impl RegistryRestore {
+    fn capture() -> Self {
+        Self(Some(crate::devices()))
+    }
+}
+
+impl Drop for RegistryRestore {
+    fn drop(&mut self) {
+        if let Some(devices) = self.0.take() {
+            crate::registry::install(devices);
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_bus_enumerates_pcie() -> TestResult {
     // Walk QEMU q35's PCIe ECAM at its default base. q35 exposes a
@@ -157,6 +177,11 @@ fn smoke_bus_append_devices_grows_registry() -> TestResult {
     use alloc::vec;
     use narf_memory::PhysAddr;
 
+    // `cfg_phys` below is a deliberately synthetic x86 ECAM address. Keep it
+    // scoped to this smoke so a later aarch64 MMIO walker cannot dereference
+    // it (0xb000_1000 + the PCIe extended-cap offset 0x100 was the CI fault).
+    let _restore_registry = RegistryRestore::capture();
+
     let host_dev = BusDevice {
         addr: BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0)),
         id: DeviceId {
@@ -203,7 +228,9 @@ fn smoke_bus_append_devices_grows_registry() -> TestResult {
     }
     // Children must keep the synthetic segment so VMD-domain addrs
     // don't collide with the host PCIe domain.
-    let child = after.iter().find(|d| d.id.vendor == 0x144D).unwrap();
+    let Some(child) = after.iter().find(|d| d.id.vendor == 0x144D) else {
+        return TestResult::Fail("appended child disappeared from registry");
+    };
     if let BusAddr::Pcie(PcieAddr { segment, .. }) = child.addr {
         if segment != 0x8000 {
             return TestResult::Fail("child lost its synthetic segment");
@@ -2470,6 +2497,24 @@ fn smoke_aer_isr_aggregates_counters() -> TestResult {
     // corrupt them).
     use crate::pcie_aer::{aer_isr, AER_CORRECTABLE_COUNT, AER_FATAL_COUNT, AER_NONFATAL_COUNT};
     use core::sync::atomic::Ordering;
+
+    // Establish the live registry here instead of depending on whichever bus
+    // smoke ran immediately before this one. In particular, synthetic x86
+    // ECAM fixtures are not mapped on aarch64.
+    let _restore_registry = RegistryRestore::capture();
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: QEMU q35 exposes this identity-mapped ECAM window.
+        let _ = unsafe { crate::init(crate::x86_64::ECAM_DEFAULT_BASE) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_memory::PhysAddr;
+        // SAFETY: xtask loads QEMU virt's live DTB at this identity-mapped
+        // address; the enumerator only walks firmware-described MMIO windows.
+        let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
+    }
+
     // Snapshot counters, run ISR, verify no decrease.
     let c0 = AER_CORRECTABLE_COUNT.load(Ordering::Relaxed);
     let n0 = AER_NONFATAL_COUNT.load(Ordering::Relaxed);

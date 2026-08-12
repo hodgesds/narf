@@ -178,6 +178,31 @@ impl AddressSpace {
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
 
 impl AddressSpace {
+    /// Remove an exact base-page region.
+    pub fn unmap_region(&self, base: VirtAddr)
+        -> Result<Region, AddressSpaceError>;
+    /// Remove a base-page range while preserving non-overlapping fragments.
+    pub fn punch_fixed(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+}
+
+/// Clear a contiguous x86_64 leaf range under one per-root mutation-lock hold;
+/// each present leaf still receives a local INVLPG and the caller performs the
+/// required later cross-CPU range/full invalidation before backing reuse.
+pub unsafe fn x86_64::paging::unmap_4kb_local_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError>;
+
+Private-region teardown serializes only on the address space's region tables.
+Teardown that overlaps an externally owned `SHARED` alias additionally holds
+the global shared-mapping transaction through leaf removal, cross-CPU TLB
+invalidation, and the external owner's release hook. Classification and table
+mutation are one region-lock critical section, so a racing remap cannot switch
+a private region to `SHARED` between those steps.
+
+impl AddressSpace {
     /// Replace one resident private base page, or the complete hardware leaf
     /// containing a huge-page address, with equivalent backing from a target
     /// NUMA node, preserving bytes and permissions and completing the

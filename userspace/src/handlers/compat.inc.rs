@@ -2603,10 +2603,72 @@ pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
 
 /// Open (or re-open) the on-CPU kernel span for the current task.
 pub fn open_kernel_span(uc: &crate::user_task::UserTaskCtx) {
+    // The pause hook can close this span from timer IRQ context. Create the
+    // task's row here, on the normal syscall path, so that close only updates
+    // an existing BTreeMap node and never allocates in the interrupt handler.
+    // The readiness load is the only recurring cost after the first syscall.
+    if !uc
+        .kern_account_ready
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        let task = current_task_id();
+        if task != 0 {
+            let mut g = TASK_KERN_NS.lock();
+            g.get_or_insert_with(BTreeMap::new).entry(task).or_insert(0);
+            uc.kern_account_ready
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
     uc.kern_span_start_ns.store(
         narf_scheduler::narf_time::monotonic_ns(),
         core::sync::atomic::Ordering::Release,
     );
+}
+
+/// Pause the current user task's active syscall span before the scheduler
+/// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
+/// when a matching resume must re-open the span.
+pub fn pause_current_kernel_span() -> bool {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return false;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // current own-stack user continuation.
+    let uc = unsafe { &*uc };
+    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    close_kernel_span(uc, current_task_id());
+    true
+}
+
+/// Resume a syscall span previously paused by `pause_current_kernel_span`.
+pub fn resume_current_kernel_span() {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // resumed own-stack user continuation.
+    open_kernel_span(unsafe { &*uc });
+}
+
+/// Elapsed time in the current task's still-open syscall span. Adding this to
+/// the folded kernel ledger produces a monotonic live snapshot: close folds
+/// the same interval before clearing the start timestamp.
+pub fn current_kernel_span_elapsed_ns() -> u64 {
+    let Some(uc) = crate::user_task::current_user_task() else {
+        return 0;
+    };
+    // SAFETY: current_user_task returns the poller-pinned context of the
+    // current user continuation.
+    let start = unsafe { &*uc }
+        .kern_span_start_ns
+        .load(core::sync::atomic::Ordering::Acquire);
+    if start == 0 {
+        0
+    } else {
+        narf_scheduler::narf_time::monotonic_ns().saturating_sub(start)
+    }
 }
 
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
@@ -2651,6 +2713,28 @@ pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
     let m = g.get_or_insert_with(BTreeMap::new);
     let e = m.entry(task).or_insert(0);
     *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: charge syscall CPU time to a stand-in task so perf inheritance
+/// tests can exercise the exit snapshot without running a real child syscall.
+#[doc(hidden)]
+pub fn __test_account_kernel_ns(task: u64, delta_ns: u64) {
+    let mut g = TASK_KERN_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: model the master exit-table sweep after perf has captured a
+/// child's final software-clock contribution.
+#[doc(hidden)]
+pub fn __test_reset_cpu_times_for(task: u64) {
+    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
+        m.remove(&task);
+    }
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
+        m.remove(&task);
+    }
 }
 
 /// This task's own accumulated user CPU time (ns).
@@ -4444,6 +4528,49 @@ const FUTEX_PRIVATE: u64 = 0x80;
 const FUTEX_CLOCK_REALTIME: u64 = 0x100;
 const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 
+/// Convert Linux futex's optional `struct timespec *` to NARF's monotonic
+/// deadline. `FUTEX_WAIT` supplies a relative duration; `FUTEX_WAIT_BITSET`
+/// supplies an absolute deadline, using CLOCK_REALTIME only when requested.
+fn futex_timeout_deadline(
+    timeout_ptr: u64,
+    absolute: bool,
+    realtime: bool,
+) -> Result<Option<u64>, i64> {
+    const EFAULT: i64 = 14;
+    const EINVAL: i64 = 22;
+    if timeout_ptr == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0u8; 16];
+    // SAFETY: the syscall supplied a `const struct timespec *`; uaccess
+    // validates the range and SMAP-brackets the fixed-size read.
+    unsafe { copy_from_user(&mut bytes, timeout_ptr) }.map_err(|_| EFAULT)?;
+    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    let nanoseconds = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(EINVAL);
+    }
+    let requested = (seconds as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds as u64);
+    let monotonic_now = narf_scheduler::narf_time::monotonic_ns();
+    if !absolute {
+        return Ok(Some(monotonic_now.saturating_add(requested)));
+    }
+    if !realtime {
+        return Ok(Some(requested));
+    }
+    let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
+    let remaining = i128::from(requested).saturating_sub(wall_now);
+    if remaining <= 0 {
+        Ok(Some(monotonic_now))
+    } else {
+        Ok(Some(
+            monotonic_now.saturating_add(u64::try_from(remaining).unwrap_or(u64::MAX)),
+        ))
+    }
+}
+
 /// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
 /// `nr_wake`/`nr_wake2` = arg2/arg3, `uaddr2` = arg4, `encoded_op` = arg5.
 /// Returns the syscall result (total woken, or a negative errno).
@@ -4532,12 +4659,17 @@ pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
 
 /// Namespace for a futex operation. Private futexes are scoped to the live
 /// AddressSpace Arc; CLONE_VM threads share it, unrelated processes do not.
+#[inline]
+fn futex_namespace_for_address_space(space: &Arc<AddressSpace>) -> u64 {
+    Arc::as_ptr(space) as usize as u64
+}
+
 fn futex_namespace(private: bool) -> u64 {
     if !private {
         return 0;
     }
     current_address_space()
-        .map(|space| alloc::sync::Arc::as_ptr(&space) as usize as u64)
+        .map(|space| futex_namespace_for_address_space(&space))
         .unwrap_or(0)
 }
 
@@ -4852,6 +4984,12 @@ pub(crate) fn futex_park_should_stay(
 #[doc(hidden)]
 pub fn __test_futex_wake_counter(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
+}
+
+/// Test-only accessor for a private futex namespace's wake counter.
+#[doc(hidden)]
+pub fn __test_futex_wake_counter_scoped(namespace: u64, uaddr: u64) -> u64 {
+    futex_wake_counter_key(futex_key(namespace, uaddr))
 }
 
 /// Test-only: register a waiter / requeue / count parked waiters, so the

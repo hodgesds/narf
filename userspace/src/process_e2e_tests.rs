@@ -3440,6 +3440,12 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
 
     // An open span across real work must accumulate.
     crate::handlers::open_kernel_span(uc);
+    if !uc
+        .kern_account_ready
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        return TestResult::Fail("opening a kernel span did not prepare its IRQ-safe ledger row");
+    }
     let spin_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000; // 2 ms
     while narf_scheduler::narf_time::monotonic_ns() < spin_until {
         core::hint::spin_loop();
@@ -3462,6 +3468,45 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
     let after_gap = crate::handlers::kern_time_ns_of(tid);
     if after_gap.saturating_sub(worked) > 1_000_000 {
         return TestResult::Fail("the gap between close and open was billed as CPU time");
+    }
+
+    // Model the scheduler's CPL0 timer-preemption callbacks directly. The
+    // pause must fold the active part of the syscall, while the interval
+    // before resume remains off-CPU and therefore uncharged.
+    crate::user_task::install_current(uc as *const _ as *mut _);
+    let preempt_result = (|| {
+        let current_tid = crate::handlers::current_task_id();
+        if current_tid == 0 {
+            return TestResult::Fail("timer-preemption accounting has no current task id");
+        }
+        let before_pause = crate::handlers::kern_time_ns_of(current_tid);
+        crate::handlers::open_kernel_span(uc);
+        let run_until = narf_scheduler::narf_time::monotonic_ns() + 2_000_000;
+        while narf_scheduler::narf_time::monotonic_ns() < run_until {
+            core::hint::spin_loop();
+        }
+        if !crate::handlers::pause_current_kernel_span() {
+            return TestResult::Fail("timer-preemption pause did not close an active span");
+        }
+        let paused = crate::handlers::kern_time_ns_of(current_tid);
+        if paused <= before_pause {
+            return TestResult::Fail("timer-preemption pause did not fold on-CPU time");
+        }
+        let off_cpu_until = narf_scheduler::narf_time::monotonic_ns() + 5_000_000;
+        while narf_scheduler::narf_time::monotonic_ns() < off_cpu_until {
+            core::hint::spin_loop();
+        }
+        crate::handlers::resume_current_kernel_span();
+        crate::handlers::close_kernel_span(uc, current_tid);
+        let resumed = crate::handlers::kern_time_ns_of(current_tid);
+        if resumed.saturating_sub(paused) > 1_000_000 {
+            return TestResult::Fail("timer-preemption off-CPU gap was billed as kernel time");
+        }
+        TestResult::Pass
+    })();
+    crate::user_task::clear_current();
+    if let TestResult::Fail(reason) = preempt_result {
+        return TestResult::Fail(reason);
     }
 
     crate::handlers::__test_reset_kernel_time_for(tid);
@@ -3818,7 +3863,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
             return TestResult::Fail("AddressSpace::new_for_user");
         }
     };
-    *PROC_PARENT_AS.lock() = Some(parent_as);
+    *PROC_PARENT_AS.lock() = Some(parent_as.clone());
     install_address_space_lookup(lookup_proc_parent_as);
 
     let mut t = SyscallTable::new();
@@ -3890,15 +3935,19 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
         }
     }
 
-    // Snapshot the futex wake counter at ca.child_tid pre-exit.
-    let pre = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+    // pthread_join uses FUTEX_WAIT_PRIVATE, so clear_child_tid must publish
+    // its exit wake in the shared AddressSpace Arc's private namespace.
+    // A namespace-0 wake only appears to work through the timer backstop and
+    // strands under SMP thread churn.
+    let namespace = Arc::as_ptr(&parent_as) as usize as u64;
+    let pre = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
 
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
     // ca.child_tid.
     crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
 
-    let post = crate::handlers::__test_futex_wake_counter(ca.child_tid);
+    let post = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
     if post <= pre {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;

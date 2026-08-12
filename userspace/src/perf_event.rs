@@ -781,13 +781,25 @@ const PERF_SAMPLE_SUPPORTED: u64 = PERF_SAMPLE_IP
     | PERF_SAMPLE_CODE_PAGE_SIZE
     | PERF_SAMPLE_WEIGHT_STRUCT;
 
+struct InheritedTaskState {
+    live: Vec<u64>,
+    /// Software-clock time captured before an inherited task's per-task
+    /// ledgers are swept at exit. Keeping it here makes the event's raw count
+    /// monotonic after the task disappears.
+    retired_software_ns: u64,
+    /// The target task is retired through the same thread-exit path before
+    /// its kernel-time row is removed. Once set, its final contribution lives
+    /// in `retired_software_ns` and must not be read from the task tables.
+    target_software_retired: bool,
+}
+
 struct PerfEventFile {
     attr: PerfEventAttr,
     id: u64,
     target_task: u64,
     target_pid: u64,
     target_cpu: i32,
-    inherited_tasks: IrqSafeSpinLock<Vec<u64>>,
+    inherited_tasks: IrqSafeSpinLock<InheritedTaskState>,
     enabled: AtomicBool,
     scheduling_error: AtomicBool,
     count_base: AtomicU64,
@@ -1026,7 +1038,7 @@ impl PerfEventFile {
     }
 
     fn tracks_task(&self, task: u64) -> bool {
-        self.target_task == task || self.inherited_tasks.lock().contains(&task)
+        self.target_task == task || self.inherited_tasks.lock().live.contains(&task)
     }
 
     fn accepts_sample_from(&self, source_cpu: usize, task: u64) -> bool {
@@ -1040,33 +1052,23 @@ impl PerfEventFile {
         if self.attr.type_ == PERF_TYPE_SOFTWARE {
             return match self.attr.config {
                 PERF_COUNT_SW_CPU_CLOCK => {
-                    let cpu = if self.target_cpu >= 0 {
-                        self.target_cpu as usize
+                    if self.target_task != u64::MAX {
+                        self.task_software_count()
                     } else {
-                        narf_lib::percpu::current_cpu()
-                    };
-                    let user = cpu_user_time_ns(cpu);
-                    let total =
-                        narf_time::monotonic_ns().saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
-                    if !self.counts_kernel() {
-                        user
-                    } else if !self.counts_user() {
-                        total.saturating_sub(user)
-                    } else {
-                        total
+                        let cpu = self.target_cpu as usize;
+                        let user = cpu_user_time_ns(cpu);
+                        let total = narf_time::monotonic_ns()
+                            .saturating_sub(narf_scheduler::cpu_idle_ns(cpu));
+                        if !self.counts_kernel() {
+                            user
+                        } else if !self.counts_user() {
+                            total.saturating_sub(user)
+                        } else {
+                            total
+                        }
                     }
                 }
-                PERF_COUNT_SW_TASK_CLOCK => {
-                    let user = crate::handlers::cpu_time_ns_of(self.target_task);
-                    let kernel = crate::handlers::kern_time_ns_of(self.target_task);
-                    if !self.counts_kernel() {
-                        user
-                    } else if !self.counts_user() {
-                        kernel
-                    } else {
-                        user.saturating_add(kernel)
-                    }
-                }
+                PERF_COUNT_SW_TASK_CLOCK => self.task_software_count(),
                 _ => 0,
             };
         }
@@ -1779,6 +1781,53 @@ impl PerfEventFile {
         }
     }
 
+    fn selected_task_time(&self, task: u64) -> u64 {
+        let current = task == crate::handlers::current_task_id();
+        let slice = crate::handlers::cpu_time_ns_of(task).saturating_add(if current {
+            narf_scheduler::stackful::current_slice_elapsed_ns()
+        } else {
+            0
+        });
+        // Linux software CPU/task clocks count scheduled task time regardless
+        // of exclude_user/exclude_kernel (perf's :u/:k modifiers produce the
+        // same value for these software events). x86's own-stack ledger is
+        // already total time; aarch64's legacy ledger needs its syscall time.
+        #[cfg(target_arch = "x86_64")]
+        return slice;
+        #[cfg(not(target_arch = "x86_64"))]
+        return slice
+            .saturating_add(crate::handlers::kern_time_ns_of(task))
+            .saturating_add(if current {
+                crate::handlers::current_kernel_span_elapsed_ns()
+            } else {
+                0
+            });
+    }
+
+    fn is_task_software_clock(&self) -> bool {
+        self.attr.type_ == PERF_TYPE_SOFTWARE
+            && self.target_task != u64::MAX
+            && matches!(
+                self.attr.config,
+                PERF_COUNT_SW_CPU_CLOCK | PERF_COUNT_SW_TASK_CLOCK
+            )
+    }
+
+    fn task_software_count(&self) -> u64 {
+        // Serialize the live-task snapshot with exit retirement. Otherwise a
+        // concurrent exit could be counted once from its live ledger and once
+        // from the retired total, or disappear between those two reads.
+        let state = self.inherited_tasks.lock();
+        let mut total = state.retired_software_ns;
+        if !state.target_software_retired {
+            total = total.saturating_add(self.selected_task_time(self.target_task));
+        }
+        for task in &state.live {
+            total = total.saturating_add(self.selected_task_time(*task));
+        }
+        total
+    }
+
     /// Consume one genuine sampling overflow from an ioctl refresh budget.
     fn consume_refresh(&self) -> bool {
         let mut limit = self.refresh_limit.load(Ordering::Acquire);
@@ -2173,8 +2222,8 @@ pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_ti
         let inherits_parent = event.tracks_task(parent_tid);
         if inherits_parent && event.attr.flags & PERF_ATTR_FLAG_INHERIT != 0 {
             let mut inherited = event.inherited_tasks.lock();
-            if !inherited.contains(&child_tid) {
-                inherited.push(child_tid);
+            if !inherited.live.contains(&child_tid) {
+                inherited.live.push(child_tid);
             }
         }
         if inherits_parent && event.attr.flags & PERF_ATTR_FLAG_TASK != 0 {
@@ -2222,7 +2271,24 @@ pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
         let Some(event) = weak.upgrade() else {
             return false;
         };
-        event.inherited_tasks.lock().retain(|task| *task != tid);
+        let mut inherited = event.inherited_tasks.lock();
+        if event.is_task_software_clock()
+            && event.target_task == tid
+            && !inherited.target_software_retired
+        {
+            inherited.retired_software_ns = inherited
+                .retired_software_ns
+                .saturating_add(event.selected_task_time(tid));
+            inherited.target_software_retired = true;
+        }
+        if let Some(index) = inherited.live.iter().position(|task| *task == tid) {
+            if event.is_task_software_clock() {
+                inherited.retired_software_ns = inherited
+                    .retired_software_ns
+                    .saturating_add(event.selected_task_time(tid));
+            }
+            inherited.live.swap_remove(index);
+        }
         true
     });
 }
@@ -3637,17 +3703,6 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
-    // CPU_CLOCK is backed by exact per-CPU scheduler accounting: user time
-    // when exclude_kernel is set, otherwise elapsed non-idle time. It is not
-    // task accounting; admitting a pid target would return the whole CPU's
-    // time and fabricate attribution. Task consumers must use TASK_CLOCK.
-    if attr.type_ == PERF_TYPE_SOFTWARE
-        && attr.config == PERF_COUNT_SW_CPU_CLOCK
-        && (pid != -1 || cpu < 0)
-    {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
-        return;
-    }
     let group_leader = if group_fd != -1 {
         let leader =
             fd::with_table(task, |t| t.get(group_fd as u32).map(|e| Arc::clone(&e.ops))).flatten();
@@ -3987,7 +4042,11 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             target_task,
             target_pid,
             target_cpu: cpu,
-            inherited_tasks: IrqSafeSpinLock::new(Vec::new()),
+            inherited_tasks: IrqSafeSpinLock::new(InheritedTaskState {
+                live: Vec::new(),
+                retired_software_ns: 0,
+                target_software_retired: false,
+            }),
             enabled: AtomicBool::new(false),
             scheduling_error: AtomicBool::new(false),
             count_base: AtomicU64::new(0),

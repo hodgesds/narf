@@ -220,6 +220,14 @@ ref = "security-model/specification/spec.md#L39"
 argument = "Removing BuddyZone::free's vestigial overlap scan changes only the complexity of the existing allocator free path. Frame accounting and standard buddy coalescing remain unchanged inside the memory TCB, and no new trusted subsystem or ownership path is introduced."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler edit adds accounting callbacks at existing x86_64 stackful switch boundaries inside the already enumerated executor TCB. It does not add a trusted subsystem, change task selection, alter a task's saved domain state, or move any capability or address-space ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Timer-preemption accounting reads only the current task's scalar timestamps while its continuation is pinned on the current CPU. The pause callback completes before CURRENT_STACKFUL_TASK is cleared, the resume callback runs only after the same continuation is current again, and both use IRQ-safe per-task accounting locks. Normal syscall entry creates the task's BTreeMap row before publishing the active span, so the timer-IRQ close path only updates an existing node and cannot allocate; no user pointer, capability, domain right, or cross-task memory is exposed or modified."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The removed scan neither enforced capability checks nor assigned domain tags; it leaked an overlapping free after an ownership violation had already occurred. The audited address-space and page-table ownership fixes remain in place, while KASAN-capable kernel tests and stress teardown continue to exercise double-free and use-after-free failures."
 
@@ -263,3 +271,7 @@ argument = "The production fix only moves the existing TSS.rsp0 and per-CPU SYSC
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The retarget hook continues to write only the current CPU's existing TSS.rsp0 and PerCpu.kernel_stack_top from a scheduler-owned task stack bound. Installing it for xAPIC restores the same per-task isolation already used by x2APIC and prevents user syscalls from sharing and corrupting the executor stack; capability checks, domain tags, address spaces, and task ownership are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Private base-page teardown skips the external shared-alias transaction only while holding the address-space region tables continuously from SHARED classification through removal. Shared unmap and range punching retain transaction -> huge-region -> regular-region ordering through leaf removal, cross-CPU TLB invalidation, and the backing owner's release hook. A racing map cannot change the classification without the held region lock. The x86_64 range helper changes only lock granularity: it holds the same per-root page-table mutation lock across the batch, performs the same validated walk and local INVLPG for every present leaf, and callers retain the existing cross-CPU flush-before-frame-release ordering. Private COW ownership is unchanged."

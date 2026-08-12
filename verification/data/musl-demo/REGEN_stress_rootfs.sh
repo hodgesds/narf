@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build an Alpine rootfs containing stress-ng for the nightly
+# Build an Alpine rootfs containing stress-ng and perf for the nightly
 # `stress-ng-under-KASAN` CI job (.github/workflows/ci.yml).
 #
 # NARF mounts this ext2 image (QEMU virtio-blk) at /mnt; `chroot_run` chroots
@@ -41,14 +41,14 @@ mkdir -p "$WORK/apk"
 tar -xzf "$WORK/apk.apk" -C "$WORK/apk" 2>/dev/null
 APK="$WORK/apk/sbin/apk.static"
 
-# Install the base userland + stress-ng (community repo) into a rootfs dir.
+# Install the base userland, stress-ng, and the unmodified Alpine perf CLI.
 RD="$WORK/root"
 mkdir -p "$RD/etc/apk"
-echo "installing stress-ng + base userland into rootfs"
+echo "installing stress-ng + perf + base userland into rootfs"
 "$APK" --root "$RD" --arch "$ARCH" --initdb \
     -X "$CDN/$ALPINE/main" -X "$CDN/$ALPINE/community" \
     --allow-untrusted --no-cache \
-    add alpine-baselayout busybox musl stress-ng
+    add alpine-baselayout busybox musl stress-ng perf
 
 # The workload chroot_run runs. Various stressors exercising fork/thread/alloc/
 # mmap/pipe/sock/context-switch churn; each capped so the whole pass fits the CI
@@ -62,10 +62,32 @@ for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
   echo "=== stressor: $s ==="
   /usr/bin/stress-ng $s --timeout "$DUR" --metrics-brief 2>&1 || echo "STRESSOR-RC=$? for [$s]"
 done
+echo "=== perf stat: stress-ng cpu ==="
+PERF_OUT="$(/usr/bin/perf stat -x, -e 'task-clock,task-clock:u,task-clock:k' -- \
+  /usr/bin/stress-ng --cpu 4 --timeout 1s --metrics-brief 2>&1)"
+echo "$PERF_OUT"
+# Linux defines the privilege filters as no-ops for software CPU clocks. The
+# three inherited counts must therefore agree, and a four-worker one-second
+# run must retain substantially more than one final scheduler slice.
+if ! echo "$PERF_OUT" | awk -F, '
+  $3 == "task-clock"   { total = $1 + 0; seen++ }
+  $3 == "task-clock:u" { user = $1 + 0; seen++ }
+  $3 == "task-clock:k" { kern = $1 + 0; seen++ }
+  END {
+    if (seen != 3 || total < 500 || user < 500 || kern < 500) exit 1
+    min = total; if (user < min) min = user; if (kern < min) min = kern
+    max = total; if (user > max) max = user; if (kern > max) max = kern
+    if (max - min > max * 0.02) exit 1
+  }'
+then
+  echo "PERF-CLOCK-MISMATCH"
+  exit 1
+fi
+echo "PERF-STRESS-DONE"
 echo "STRESS-DONE"
 PROBE
 chmod +x "$RD/probe.sh"
 
 # Pack into an ext2 image (256 MiB, 1 KiB blocks).
 mke2fs -q -F -t ext2 -d "$RD" -b 1024 "$OUT" 262144
-echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng $(ls -la "$RD/usr/bin/stress-ng" >/dev/null 2>&1 && echo present || echo MISSING)"
+echo "built $OUT ($(du -h "$OUT" | cut -f1)); stress-ng+perf present"

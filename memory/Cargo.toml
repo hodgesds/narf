@@ -20,6 +20,9 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 [features]
 default = ["linux-compat"]
 
+# Test-only path counters used by the distributed kernel smoke suite.
+kernel-test = []
+
 # Linux-compat surfaces (mprotect with split/merge, madvise, etc.).
 # Enabled by default so modern allocators (jemalloc, mimalloc) and JIT
 # engines (V8) see the standard kernel behaviour rather than the

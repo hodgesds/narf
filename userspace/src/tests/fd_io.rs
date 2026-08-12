@@ -2091,7 +2091,8 @@ kernel_test_in!(
 /// the tracked count for a multi-threaded one.
 fn smoke_userspace_thread_group_live_count() -> TestResult {
     use crate::handlers::{
-        __test_thread_group_live_reset, thread_group_live_count, thread_group_live_inc,
+        __test_thread_group_live_reset, thread_group_live_count, thread_group_live_dec_state,
+        thread_group_live_inc,
     };
     __test_thread_group_live_reset();
     const PID: u64 = 7100;
@@ -2106,6 +2107,17 @@ fn smoke_userspace_thread_group_live_count() -> TestResult {
     if thread_group_live_count(PID) != 3 {
         __test_thread_group_live_reset();
         return TestResult::Fail("tracked group must report its live thread count");
+    }
+    if thread_group_live_dec_state(PID) != (false, true)
+        || thread_group_live_dec_state(PID) != (false, true)
+        || thread_group_live_dec_state(PID) != (true, true)
+    {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("tracked group exit state lost multi-threaded provenance");
+    }
+    if thread_group_live_dec_state(PID + 1) != (true, false) {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("untracked exit must stay on the single-thread fast path");
     }
     __test_thread_group_live_reset();
     TestResult::Pass
