@@ -489,10 +489,11 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
 
-// ── Test 8b: a block device's /sys `uevent` file is readable + carries ──
+// ── Test 8b: a block device's canonical sysfs `uevent` is readable + carries ──
 // SUBSYSTEM/MAJOR/MINOR, which is what `udevadm info` reads to create the
-// /dev node. Guards the block-class `uevent`-attr wiring the coldplug walker
-// depends on. The synthesised netlink message must fold in the MAJOR/MINOR.
+// /dev node. The uevent MUST originate in `/sys/devices/...`; systemd-udevd
+// rejects a `/sys/class/...` DEVPATH as a non-device object. The synthesised
+// netlink message must fold in the MAJOR/MINOR.
 
 #[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
@@ -507,12 +508,13 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
     let result = (|| -> TestResult {
         let root = crate::sysfs::sysfs_root();
         let kobj = root
-            .get_child("class")
-            .and_then(|c| c.get_child("block"))
+            .get_child("devices")
+            .and_then(|d| d.get_child("virtual"))
+            .and_then(|v| v.get_child("block"))
             .and_then(|b| b.get_child("smoke-uevblk0"));
         let kobj = match kobj {
             Some(k) => k,
-            None => return TestResult::Fail("block class device kobject missing"),
+            None => return TestResult::Fail("canonical block device kobject missing"),
         };
         // The `uevent` file must be readable (show closure present).
         let text = match kobj.attr_show("uevent") {
@@ -541,6 +543,9 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
         if ev.subsystem != "block" {
             return TestResult::Fail("block ADD SUBSYSTEM != block");
         }
+        if ev.devpath != "/devices/virtual/block/smoke-uevblk0" {
+            return TestResult::Fail("block ADD did not use the canonical /sys/devices path");
+        }
         let nl = String::from_utf8_lossy(&ev.to_netlink_bytes()).to_string();
         if !nl.contains("MAJOR=") || !nl.contains("MINOR=") {
             return TestResult::Fail("block ADD netlink bytes missing MAJOR/MINOR");
@@ -553,6 +558,85 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_uevent_file_readable);
+
+/// EFI boot queues block ADDs before PID 1 so the daemon can replay the ESP
+/// event even if the early udev trigger service is unavailable.  The queued
+/// event must use the canonical device path libudev accepts.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_block_add_events_are_canonical() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    let snap = narf_block::registry::__snapshot_for_test();
+    narf_block::registry::__reset_for_test();
+    narf_block::registry::register_block_device("smoke-esp-block", FakeBlock::new(512, 16));
+    crate::sysfs::populate_block_class();
+    let mut reader = UeventReader::new();
+    let emitted = crate::sysfs::emit_block_device_add_events();
+    let event = reader
+        .drain(16)
+        .into_iter()
+        .find(|event| event.devpath.ends_with("/smoke-esp-block"));
+    narf_block::registry::__reset_for_test();
+    narf_block::registry::__restore_for_test(snap);
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+
+    match event {
+        Some(event)
+            if emitted >= 1
+                && event.action == UeventAction::Add
+                && event.subsystem == "block"
+                && event.devpath == "/devices/virtual/block/smoke-esp-block" =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("EFI block ADD was not emitted from canonical /sys/devices path"),
+    }
+}
+kernel_test_in!("filesystem", smoke_sysfs_block_add_events_are_canonical);
+
+// A registered partition must not masquerade as a whole disk. udev only runs
+// its filesystem-identification rules (and thus creates UUID device links)
+// for the partition DEVTYPE on real GPT installs.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
+    use narf_block::registry::{
+        PartitionMetadata, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        register_block_device_with_meta,
+    };
+
+    crate::sysfs::__reset_for_test();
+    let snap = __snapshot_for_test();
+    __reset_for_test();
+    register_block_device_with_meta(
+        "smoke-uevpart1",
+        FakeBlock::new(512, 8),
+        Some(PartitionMetadata {
+            gpt_type_guid: String::new(),
+            partlabel: String::new(),
+            partuuid: String::new(),
+            fs_uuid: String::from("7FC5-5A22"),
+        }),
+    );
+    crate::sysfs::populate_block_class();
+    let text = crate::sysfs::sysfs_root()
+        .get_child("devices")
+        .and_then(|devices| devices.get_child("virtual"))
+        .and_then(|virtual_devices| virtual_devices.get_child("block"))
+        .and_then(|block| block.get_child("smoke-uevpart1"))
+        .and_then(|kobj| kobj.attr_show("uevent"));
+    __restore_for_test(snap);
+
+    match text {
+        Some(text) if text.contains("DEVTYPE=partition") => TestResult::Pass,
+        _ => TestResult::Fail("partition block uevent did not carry DEVTYPE=partition"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_block_partition_uevent_marks_partition
+);
 
 // ── Test 9: kobject_emit_uevent helper ────────────────────────────────
 

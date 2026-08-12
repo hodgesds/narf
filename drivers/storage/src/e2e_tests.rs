@@ -1348,8 +1348,10 @@ fn smoke_nvme_gpt_partition_resolves() -> TestResult {
     // Register the partition slice as "nvme0n1p1" with metadata.
     let part_dev: Arc<dyn BlockDeviceSync> = dev.clone();
     let meta = PartitionMetadata {
+        gpt_type_guid: String::new(),
         partlabel: String::from(LABEL),
         partuuid: String::from("11111111-2222-3333-4444-555555555555"),
+        fs_uuid: String::new(),
     };
     register_block_device_with_meta("nvme0n1p1", part_dev, Some(meta));
 
@@ -1427,8 +1429,10 @@ fn smoke_ahci_gpt_partition_resolves() -> TestResult {
 
     let part_dev: Arc<dyn BlockDeviceSync> = dev.clone();
     let meta = PartitionMetadata {
+        gpt_type_guid: String::new(),
         partlabel: String::from(LABEL),
         partuuid: String::from("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"),
+        fs_uuid: String::new(),
     };
     register_block_device_with_meta("sata0p1", part_dev, Some(meta));
 

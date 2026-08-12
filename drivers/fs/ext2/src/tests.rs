@@ -15,6 +15,12 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use super::dir::{ftype, parse_entry};
 use super::group_desc::GroupDesc;
 use super::inode::Inode;
+use super::metadata_csum::{
+    bitmap_checksum, crc32c, directory_block_checksum, extent_block_checksum, group_desc_checksum,
+    inode_checksum, seed, verify_group_desc_checksum, verify_inode_checksum, verify_superblock,
+    write_directory_block_checksum, write_extent_block_checksum, write_group_desc_checksum,
+    write_inode_checksum,
+};
 use super::superblock::Superblock;
 
 // ── Pure-logic smokes ──────────────────────────────────────────────
@@ -63,6 +69,123 @@ fn smoke_ext2_superblock_magic_and_block_size() -> TestResult {
 
     TestResult::Pass
 }
+
+fn smoke_ext4_csum_seed_validates_superblock() -> TestResult {
+    // CRC32C's familiar wire-format test vector includes a final xor; ext4
+    // chains the raw running state, so its equivalent seed convention leaves
+    // the complement here.
+    if crc32c(!0, b"123456789") != 0x1cf9_6d7c {
+        return TestResult::Fail("CRC32C running-state convention mismatch");
+    }
+
+    let mut buf = vec![0u8; 1024];
+    buf[0..4].copy_from_slice(&16u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+    buf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    buf[32..36].copy_from_slice(&64u32.to_le_bytes());
+    buf[40..44].copy_from_slice(&16u32.to_le_bytes());
+    buf[56..58].copy_from_slice(&0xef53u16.to_le_bytes());
+    buf[96..100].copy_from_slice(
+        &(super::superblock::incompat::EXTENTS | super::superblock::incompat::CSUM_SEED)
+            .to_le_bytes(),
+    );
+    buf[100..104].copy_from_slice(&super::superblock::ro_compat::METADATA_CSUM.to_le_bytes());
+    buf[104..120].copy_from_slice(b"narf-ext4-csum!!");
+    buf[624..628].copy_from_slice(&0x4d3c_2b1au32.to_le_bytes());
+
+    let sb = match Superblock::parse(&buf) {
+        Some(sb) => sb,
+        None => return TestResult::Fail("metadata-csum superblock did not parse"),
+    };
+    if !sb.has_metadata_csum() || !sb.uses_csum_seed() || seed(&sb) != 0x4d3c_2b1a {
+        return TestResult::Fail("metadata-csum feature/seed decode mismatch");
+    }
+    // ext4 superblock checksum intentionally ignores csum_seed.
+    let checksum = crc32c(!0, &buf[..0x3fc]);
+    buf[0x3fc..0x400].copy_from_slice(&checksum.to_le_bytes());
+    if !verify_superblock(&sb, &buf) {
+        return TestResult::Fail("valid csum_seed superblock rejected");
+    }
+    buf[120] ^= 1;
+    if verify_superblock(&sb, &buf) {
+        return TestResult::Fail("corrupt csum_seed superblock accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_csum_seed_validates_superblock);
+
+fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
+    let mut sb_bytes = vec![0u8; 1024];
+    sb_bytes[56..58].copy_from_slice(&0xef53u16.to_le_bytes());
+    sb_bytes[96..100].copy_from_slice(&super::superblock::incompat::CSUM_SEED.to_le_bytes());
+    sb_bytes[100..104].copy_from_slice(&super::superblock::ro_compat::METADATA_CSUM.to_le_bytes());
+    sb_bytes[624..628].copy_from_slice(&0x4d3c_2b1au32.to_le_bytes());
+    let sb = match Superblock::parse(&sb_bytes) {
+        Some(sb) => sb,
+        None => return TestResult::Fail("checksummed superblock did not parse"),
+    };
+
+    let mut inode = vec![0x5a; 256];
+    inode[100..104].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    inode[128..130].copy_from_slice(&32u16.to_le_bytes());
+    let before = match inode_checksum(&sb, 42, &inode) {
+        Some(v) => v,
+        None => return TestResult::Fail("inode checksum unavailable"),
+    };
+    if write_inode_checksum(&sb, 42, &mut inode).is_none()
+        || inode_checksum(&sb, 42, &inode) != Some(before)
+        || !verify_inode_checksum(&sb, 42, &inode)
+        || u16::from_le_bytes([inode[124], inode[125]]) != before as u16
+        || u16::from_le_bytes([inode[130], inode[131]]) != (before >> 16) as u16
+    {
+        return TestResult::Fail("inode checksum fields were not written correctly");
+    }
+
+    let mut desc = vec![0x31; 64];
+    let group_before = match group_desc_checksum(&sb, 7, &desc) {
+        Some(v) => v,
+        None => return TestResult::Fail("group descriptor checksum unavailable"),
+    };
+    if write_group_desc_checksum(&sb, 7, &mut desc).is_none()
+        || group_desc_checksum(&sb, 7, &desc) != Some(group_before)
+        || !verify_group_desc_checksum(&sb, 7, &desc)
+    {
+        return TestResult::Fail("group descriptor checksum was not stable");
+    }
+    if bitmap_checksum(&sb, &[0x55; 64]) == bitmap_checksum(&sb, &[0x56; 64]) {
+        return TestResult::Fail("bitmap checksum did not cover bitmap bytes");
+    }
+
+    let mut directory = vec![0u8; 1024];
+    let tail = directory.len() - 12;
+    directory[tail + 4..tail + 6].copy_from_slice(&12u16.to_le_bytes());
+    directory[tail + 7] = 0xde;
+    let dir_before = match directory_block_checksum(&sb, 42, 0x0102_0304, &directory) {
+        Some(v) => v,
+        None => return TestResult::Fail("directory checksum unavailable"),
+    };
+    if write_directory_block_checksum(&sb, 42, 0x0102_0304, &mut directory).is_none()
+        || directory_block_checksum(&sb, 42, 0x0102_0304, &directory) != Some(dir_before)
+    {
+        return TestResult::Fail("directory checksum was not stable");
+    }
+
+    let mut extent = vec![0xa5; 4096];
+    let extent_before = match extent_block_checksum(&sb, 42, 0x0102_0304, &extent) {
+        Some(v) => v,
+        None => return TestResult::Fail("extent checksum unavailable"),
+    };
+    if write_extent_block_checksum(&sb, 42, 0x0102_0304, &mut extent).is_none()
+        || extent_block_checksum(&sb, 42, 0x0102_0304, &extent) != Some(extent_before)
+    {
+        return TestResult::Fail("extent checksum was not stable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields
+);
 
 fn smoke_ext2_dirent_walk_two_entries() -> TestResult {
     // Synthesise a 64-byte directory block with two entries:
@@ -662,6 +785,89 @@ fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
 
     img
 }
+
+/// Turn the small extent fixture into a checksummed ext4 image. This mirrors
+/// the real mount order: feature bits and seed first, then every dependent
+/// inode and group descriptor, then the superblock checksum last.
+fn sign_ext4_metadata_csum_fixture(img: &mut [u8]) -> Result<(), &'static str> {
+    const BS: usize = 1024;
+    const INODE_SIZE: usize = 128;
+    const SB: usize = 1024;
+    const GDT: usize = 2 * BS;
+    const ITABLE: usize = 5 * BS;
+
+    put_u32(
+        img,
+        SB + 96,
+        super::superblock::incompat::EXTENTS | super::superblock::incompat::CSUM_SEED,
+    );
+    put_u32(img, SB + 100, super::superblock::ro_compat::METADATA_CSUM);
+    put_u32(img, SB + 624, 0x4d3c_2b1a);
+    let sb = Superblock::parse(&img[SB..SB + 1024]).ok_or("fixture superblock did not parse")?;
+
+    for inode_no in [2u32, 12] {
+        let index = (inode_no - 1) as usize;
+        let inode = &mut img[ITABLE + index * INODE_SIZE..ITABLE + (index + 1) * INODE_SIZE];
+        write_inode_checksum(&sb, inode_no, inode).ok_or("fixture inode did not checksum")?;
+    }
+    write_group_desc_checksum(&sb, 0, &mut img[GDT..GDT + 32])
+        .ok_or("fixture group descriptor did not checksum")?;
+    let super_checksum = crc32c(!0, &img[SB..SB + 0x3fc]);
+    img[SB + 0x3fc..SB + 0x400].copy_from_slice(&super_checksum.to_le_bytes());
+    Ok(())
+}
+
+fn smoke_ext4_metadata_csum_mount_and_corruption_rejection() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let mut good = build_ext4_extent_image(b"checksummed extent data");
+    if sign_ext4_metadata_csum_fixture(&mut good).is_err() {
+        return TestResult::Fail("could not sign metadata-csum fixture");
+    }
+    let volume = match poll_once(Ext2Volume::mount(
+        RamBlockDevice::from_image(512, good.clone()),
+        DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("checksummed ext4 fixture did not mount"),
+    };
+    if !matches!(poll_once(volume.root().lookup_async("data")), Some(Ok(_))) {
+        return TestResult::Fail("checksummed ext4 fixture did not read inode metadata");
+    }
+
+    let mut bad_group = good.clone();
+    bad_group[2 * 1024 + 8] ^= 1;
+    if !matches!(
+        poll_once(Ext2Volume::mount(
+            RamBlockDevice::from_image(512, bad_group),
+            DomainId::DRIVER_0,
+        )),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("mount accepted a corrupt group descriptor checksum");
+    }
+
+    let mut bad_inode = good;
+    bad_inode[5 * 1024 + 128 + 4] ^= 1; // inode 2's size
+    if !matches!(
+        poll_once(Ext2Volume::mount(
+            RamBlockDevice::from_image(512, bad_inode),
+            DomainId::DRIVER_0,
+        )),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("mount accepted a corrupt root-inode checksum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_metadata_csum_mount_and_corruption_rejection
+);
 
 fn smoke_ext4_mount_extent_round_trip() -> TestResult {
     // End-to-end ext4: mount an EXTENT-based image, enumerate the root,

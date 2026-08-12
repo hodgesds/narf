@@ -32,6 +32,7 @@ use narf_time::now_wall;
 use super::group_desc::GroupDesc;
 use super::inode::Inode;
 use super::journal;
+use super::metadata_csum;
 use super::superblock::{ExtFlavour, Superblock};
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -175,6 +176,10 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// Mount-root metadata must be available to the synchronous `root()`
     /// interface. It is loaded during mount and refreshed by `write_inode`.
     root_inode: IrqSafeSpinLock<Option<Inode>>,
+    /// Metadata-checksummed ext4 can be read safely once its superblock is
+    /// verified, but NARF does not yet regenerate every affected checksum on
+    /// mutation. Keep such volumes read-only rather than corrupting them.
+    read_only: bool,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -319,6 +324,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // `io` drops here, unregistering every pooled buffer.
             return Err(FsError::Unsupported);
         }
+        if !metadata_csum::verify_superblock(&superblock, &sb_bytes) {
+            return Err(FsError::InvalidData);
+        }
+        let read_only = superblock.has_metadata_csum();
 
         // Block group descriptor table starts at the block after
         // the superblock. With a 1-KiB block volume that's block 2;
@@ -341,6 +350,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut group_descs = Vec::with_capacity(group_count);
         for i in 0..group_count {
             let off = i * desc_size;
+            if !metadata_csum::verify_group_desc_checksum(
+                &superblock,
+                i as u32,
+                &bgdt_bytes[off..off + desc_size],
+            ) {
+                return Err(FsError::InvalidData);
+            }
             let gd = GroupDesc::parse_sized(&bgdt_bytes[off..off + desc_size], desc_size)
                 .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
             group_descs.push(gd);
@@ -382,6 +398,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             fill_lock: Mutex::new(()),
             inode_update_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
+            read_only,
         });
         let root_inode = volume.read_inode(super::EXT2_ROOT_INO).await?;
         *volume.root_inode.lock() = Some(root_inode);
@@ -722,6 +739,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
     pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         // Any device write may touch an indirect block (or free/reallocate
         // one), so drop the read cache wholesale to avoid serving stale
         // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
@@ -866,6 +886,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut buf = vec![0u8; inode_size];
         self.read_byte_range(inode_byte_off, &mut buf).await?;
         inode.encode_into(&mut buf);
+        // Keep this self-contained so every existing inode metadata writer
+        // (chmod/chown, truncate, directory links, data writes) inherits the
+        // correct checksum once checksummed ext4 is made writable. The volume
+        // remains read-only today because directory, bitmap, descriptor,
+        // extent, and journal updates are not all transactional yet.
+        let _ = metadata_csum::write_inode_checksum(&self.superblock, inode_no, &mut buf);
         self.write_byte_range(inode_byte_off, &buf).await?;
         if inode_no == super::EXT2_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
@@ -1247,10 +1273,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let table_byte_off = gd.inode_table * bs;
         let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
 
-        // Only need 128 bytes — the rest of the inode (rev-1+ extra
-        // fields) is unused by this driver.
-        let mut buf = vec![0u8; 128];
+        // Read the full inode slot: ext4's checksum covers the extended
+        // fields even though the common inode decoder only consumes its
+        // original 128-byte prefix.
+        let mut buf = vec![0u8; inode_size];
         self.read_byte_range(inode_byte_off, &mut buf).await?;
+        if !metadata_csum::verify_inode_checksum(&self.superblock, inode_no, &buf) {
+            return Err(FsError::InvalidData);
+        }
         Inode::parse(&buf).ok_or(FsError::Io(narf_block::BlockError::IOError))
     }
 

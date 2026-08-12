@@ -253,6 +253,69 @@ pub fn register_initcalls() {
     // Registers a BochsCard with the DRM registry so
     // /sys/class/drm/card<N>/ and /dev/dri/card<N> appear.
     // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
+    narf_init::register(Stage::Late, "virtio-gpu-drm-card", || {
+        if let Some(virtio) = narf_drivers_virtio::gpu_pci::probed_device() {
+            // Make the actual paravirtual GPU the primary DRM device. This
+            // deliberately happens before the bochs fallback below: QEMU's
+            // full profile presents both devices, but a VirGL host must not
+            // make Mesa select the unrelated bochs render node.
+            if virtio.init_scanout().is_err() {
+                // A bound GPU that cannot programme scanout is a real boot
+                // failure, not an absent optional device.  Surface it in the
+                // normal init summary so a black GTK window has a precise
+                // cause without retaining a separate diagnostic service.
+                return InitResult::Error("virtio-gpu scanout initialisation failed");
+            }
+            use drm::card::{
+                Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+            };
+            let mode = virtio.mode();
+            if mode.width == 0 || mode.height == 0 {
+                return InitResult::NotPresent;
+            }
+            let count = drm_registry::count() as u32;
+            let card_name = alloc::format!("card{}", count);
+            let card = drm_devfs_bridge::VirtioGpuCard::new(card_name);
+            let mut kms = Card::new("virtio_gpu", "NARF VirtIO GPU driver", (1, 0, 0));
+            kms.crtcs.push(Crtc {
+                id: 1,
+                mode: Some(Mode {
+                    width: mode.width,
+                    height: mode.height,
+                    refresh_hz: 60,
+                    bpp: 32,
+                }),
+                enabled: mode.enabled,
+                primary_fb: None,
+                x: 0,
+                y: 0,
+            });
+            kms.encoders.push(Encoder {
+                id: 2,
+                encoder_type: EncoderType::Virtual,
+                possible_crtcs: 0x1,
+                possible_clones: 0,
+                crtc_id: Some(1),
+            });
+            kms.connectors.push(Connector {
+                id: 3,
+                connector_type: ConnectorType::Virtual,
+                connector_type_id: 1,
+                status: ConnectorStatus::Connected,
+                encoder_id: Some(2),
+                modes: alloc::vec![Mode {
+                    width: mode.width,
+                    height: mode.height,
+                    refresh_hz: 60,
+                    bpp: 32,
+                }],
+            });
+            let idx = drm_registry::register_drm_card_with_state(alloc::sync::Arc::new(card), kms);
+            let _ = idx;
+            return InitResult::Ok;
+        }
+        InitResult::NotPresent
+    });
     narf_init::register(Stage::Late, "bochs-drm-card", || {
         if narf_graphics_driver::bochs::is_probed() {
             use drm::card::{

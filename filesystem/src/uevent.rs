@@ -208,6 +208,12 @@ impl Ring {
 
 static UEVENT_RING: IrqSafeSpinLock<Ring> = IrqSafeSpinLock::new(Ring::new());
 
+// First sequence number in the deliberately replayable boot-coldplug window.
+// It is set only after the relevant sysfs device model is complete. Earlier
+// bring-up uevents can predate their final kobjects and are not safe to replay
+// to a daemon that starts later in boot.
+static BOOT_UDEVD_REPLAY_START: AtomicUsize = AtomicUsize::new(0);
+
 // ── Public API ────────────────────────────────────────────────────────
 
 /// Emit a uevent into the ring.  Called by `kobject_emit_uevent`.
@@ -245,6 +251,29 @@ pub fn ring_len() -> usize {
 /// The seqnum that the *next* emit will assign.
 pub fn next_seqnum() -> u64 {
     UEVENT_RING.lock().next_seqnum()
+}
+
+/// Begin the bounded boot coldplug window consumed by `systemd-udevd`.
+///
+/// Call this after sysfs population and immediately before the corresponding
+/// ADD events. Normal uevent monitors remain tail-only.
+pub fn begin_boot_udevd_replay() -> u64 {
+    let start = next_seqnum();
+    BOOT_UDEVD_REPLAY_START.store(start as usize, Ordering::Release);
+    start
+}
+
+/// Reader for the bounded boot coldplug window.
+///
+/// If boot did not mark such a window, retain ordinary tail-only netlink
+/// semantics instead of replaying arbitrary early bring-up events.
+pub fn boot_udevd_replay_reader() -> UeventReader {
+    let start = BOOT_UDEVD_REPLAY_START.load(Ordering::Acquire) as u64;
+    if start == 0 {
+        UeventReader::new()
+    } else {
+        UeventReader { next_seqnum: start }
+    }
 }
 
 // ── UeventReader ──────────────────────────────────────────────────────
@@ -351,4 +380,5 @@ pub fn __reset_for_test() {
     let mut ring = UEVENT_RING.lock();
     ring.entries.clear();
     ring.next_seqnum = 1;
+    BOOT_UDEVD_REPLAY_START.store(0, Ordering::Release);
 }

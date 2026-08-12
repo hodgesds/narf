@@ -678,6 +678,72 @@ fn smoke_abi_path_statx_reports_mnt_id() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_reports_mnt_id);
 
+// systemd's `path_is_mount_point()` requests only STATX_TYPE|STATX_INO but
+// still relies on the returned mount ID. statx may return cheap additional
+// fields, and NARF must advertise this one so systemd can distinguish the
+// API-filesystem bind mounts it inherited from ordinary directories.
+fn smoke_abi_path_statx_systemd_mount_probe_includes_mnt_id() -> TestResult {
+    const STATX_TYPE_AND_INO: u32 = 0x0101;
+    const STATX_MNT_ID: u32 = 0x1000;
+    const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        // systemd asks this shape about the API filesystem's *mount root*.
+        let path = b"/p\0";
+        let mut buf = [0u8; 256];
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0x4800, // AT_STATX_SYNC_AS_STAT | AT_NO_AUTOMOUNT
+            arg3: STATX_TYPE_AND_INO as u64,
+            arg4: buf.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Statx.raw(), args) != Some(0) {
+            return Err("systemd-shaped statx probe should succeed");
+        }
+        let mask = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if mask & STATX_MNT_ID == 0 {
+            return Err("systemd-shaped statx probe omitted STATX_MNT_ID");
+        }
+        // struct statx: stx_attributes @ 8, stx_attributes_mask @ 56.
+        let attributes = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let attributes_mask = u64::from_ne_bytes(buf[56..64].try_into().unwrap());
+        if attributes_mask & STATX_ATTR_MOUNT_ROOT == 0 || attributes & STATX_ATTR_MOUNT_ROOT == 0 {
+            return Err("systemd-shaped statx probe omitted STATX_ATTR_MOUNT_ROOT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_statx_systemd_mount_probe_includes_mnt_id
+);
+
+// The MOUNT_ROOT support bit is available for every statx response, but its
+// value must not leak to children inside the mounted filesystem. Otherwise a
+// service manager would treat ordinary paths (for example /proc/sys) as mount
+// points and skip the mount it needs.
+fn smoke_abi_path_statx_mount_root_is_exact() -> TestResult {
+    const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        let mut buf = [0u8; 256];
+        if do_statx(AT_FDCWD, path.as_ptr() as u64, 0, 0x0101, &mut buf) != Some(0) {
+            return Err("statx of mount child should succeed");
+        }
+        let attributes = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let attributes_mask = u64::from_ne_bytes(buf[56..64].try_into().unwrap());
+        if attributes_mask & STATX_ATTR_MOUNT_ROOT == 0 {
+            return Err("statx of mount child omitted MOUNT_ROOT support bit");
+        }
+        if attributes & STATX_ATTR_MOUNT_ROOT != 0 {
+            return Err("statx reported a mount child as a mount root");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_mount_root_is_exact);
+
 // ── lstat: Linux (path_ptr NUL-term, statbuf) → 0 / -1 ──
 
 fn smoke_abi_path_lstat_pos() -> TestResult {

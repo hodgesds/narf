@@ -314,8 +314,10 @@ fn smoke_e2e_gpt_partition_label_partuuid_resolution() -> TestResult {
     //   node=0x555555555555 (BE) → "555555555555"
     // Canonical 8-4-4-4-12 form: "11111111-2222-3333-4444-555555555555".
     let meta = PartitionMetadata {
+        gpt_type_guid: String::new(),
         partlabel: String::from("TESTPART"),
         partuuid: String::from("11111111-2222-3333-4444-555555555555"),
+        fs_uuid: String::new(),
     };
 
     with_clean_registry!(snap, {
@@ -404,8 +406,10 @@ fn smoke_e2e_unregister_cleanup() -> TestResult {
     let dev = FakeBlockDevice::new_1mib();
     let dev_arc = dev.clone() as Arc<dyn BlockDeviceSync>;
     let meta = PartitionMetadata {
+        gpt_type_guid: String::new(),
         partlabel: String::from("TESTPART"),
         partuuid: String::from("aaaa0000-0000-0000-0000-000000000000"),
+        fs_uuid: String::new(),
     };
 
     with_clean_registry!(snap, {
@@ -489,3 +493,53 @@ fn smoke_e2e_block_file_stat_size_and_type() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/e2e", smoke_e2e_block_file_stat_size_and_type);
+
+// ── Smoke 9: ESP selection is GPT-semantic, never name/UUID based ─────
+
+fn smoke_e2e_efi_mount_selects_only_gpt_esp() -> TestResult {
+    use crate::root_mount::{__reset_for_test, try_mount_efi_system_partition, RootMountError};
+    use crate::{bootstrap_mount_authority, FsError};
+    use narf_block::fs_detect::FsType;
+    use narf_block::registry::{
+        __reset_for_test as reset_blocks, __restore_for_test, __snapshot_for_test,
+        register_block_device_with_meta,
+    };
+
+    let snapshot = __snapshot_for_test();
+    reset_blocks();
+    __reset_for_test();
+
+    // Valid minimal FAT32 boot sector. The device's name and FAT volume UUID
+    // are intentionally unrelated to the real VM's `vblk0p1` / `7FC5-5A22`.
+    let device = FakeBlockDevice::new_1mib();
+    {
+        let mut bytes = device.data.lock();
+        bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+        bytes[13] = 8;
+        bytes[16] = 2;
+        bytes[67..71].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        bytes[82..90].copy_from_slice(b"FAT32   ");
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+    }
+    let meta = PartitionMetadata {
+        gpt_type_guid: String::from("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"),
+        partlabel: String::from("not-used-for-selection"),
+        partuuid: String::from("00000000-1111-2222-3333-444444444444"),
+        fs_uuid: String::from("1234-5678"),
+    };
+    register_block_device_with_meta("arbitrary9p7", device, Some(meta));
+
+    // No FAT factory is registered. Getting NoFactory(Fat) proves this path
+    // selected the ESP by GPT type and then required a real FAT mount factory.
+    let result = try_mount_efi_system_partition(&bootstrap_mount_authority());
+    __reset_for_test();
+    reset_blocks();
+    __restore_for_test(snapshot);
+    match result {
+        Err(RootMountError::NoFactory(FsType::Fat)) => TestResult::Pass,
+        Err(RootMountError::FactoryFailed(_, FsError::PermissionDenied)) => TestResult::Pass,
+        _ => TestResult::Fail("EFI mount did not select the GPT ESP FAT partition"),
+    }
+}
+kernel_test_in!("filesystem/e2e", smoke_e2e_efi_mount_selects_only_gpt_esp);

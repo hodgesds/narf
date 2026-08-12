@@ -140,22 +140,22 @@ impl BochsDisplay {
             }
         };
 
-        // Only reprogram if the firmware didn't already configure a
-        // sensible mode. Avoids disturbing UEFI's GOP setup.
-        if (xres, yres, bpp) == (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP) {
-            // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
-            unsafe {
-                let enabled = mmio.read16(VBE_ENABLE) as u32;
-                if enabled & VBE_ENABLE_BIT == 0 {
-                    mmio.write16(VBE_ENABLE, 0);
-                    mmio.write16(VBE_XRES, DEFAULT_WIDTH as u16);
-                    mmio.write16(VBE_YRES, DEFAULT_HEIGHT as u16);
-                    mmio.write16(VBE_BPP, DEFAULT_BPP);
-                    mmio.write16(VBE_VIRT_WIDTH, DEFAULT_WIDTH as u16);
-                    mmio.write16(VBE_VIRT_HEIGHT, DEFAULT_HEIGHT as u16);
-                    mmio.write16(VBE_ENABLE, (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
-                }
-            }
+        // A valid resolution alone does not guarantee that BAR0 is visible:
+        // QEMU may leave a firmware-selected mode enabled without its linear
+        // framebuffer bit set.  Re-apply the chosen mode so VIRT_WIDTH,
+        // VIRT_HEIGHT, and LFB are coherent with the framebuffer view we
+        // export.  This deliberately preserves a sensible firmware geometry
+        // rather than forcing the historical 1024x768 default.
+        //
+        // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
+        unsafe {
+            mmio.write16(VBE_ENABLE, 0);
+            mmio.write16(VBE_XRES, xres as u16);
+            mmio.write16(VBE_YRES, yres as u16);
+            mmio.write16(VBE_BPP, bpp);
+            mmio.write16(VBE_VIRT_WIDTH, xres as u16);
+            mmio.write16(VBE_VIRT_HEIGHT, yres as u16);
+            mmio.write16(VBE_ENABLE, (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
         }
 
         Ok(Self {

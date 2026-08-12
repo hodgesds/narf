@@ -8,7 +8,9 @@ NARF.
 - **Scope:** Read/write access to ext2 volumes, integration with NARF's VFS
   (`narf_filesystem::FsInstance`), persistent inode data/mode/owner metadata,
   directory mutation, symlinks, and cap-bound DMA block I/O via `narf_io` +
-  `narf_block`.
+  `narf_block`. Ext4 volumes with `metadata_csum` / `csum_seed` are accepted
+  after their superblock CRC32C is verified, but mount read-only until every
+  mutable metadata path regenerates the corresponding ext4 checksum.
 - **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
   splitting/rebalancing, extended attributes, `fsck`-style repair, and
   extents-tree writes.
@@ -54,6 +56,10 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.
+- **Checksummed ext4 is never written partially.** A volume carrying
+  `metadata_csum` is mounted read-only after superblock checksum verification;
+  all write paths return `FsError::ReadOnly` until inode, directory, bitmap,
+  group-descriptor, extent, and journal checksum updates are implemented.
 
 ## 5. Architecture notes
 

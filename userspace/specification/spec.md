@@ -48,6 +48,14 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+Linux `statx(2)` returns a stable `STATX_MNT_ID` whenever the resolved path
+has a covering NARF mount, even when the request mask names only basic fields.
+This is a deliberately useful Linux-permitted superset: service managers use
+the mount ID together with type and inode to decide whether inherited API
+filesystems are already mounted. `STATX_ATTR_MOUNT_ROOT` is advertised on
+every response and set exactly when the resolved path is the visible mount
+root, which is the modern systemd API-filesystem mount probe.
+
 Linux `munmap(addr, len)` rejects an unaligned address or zero length and
 rounds a non-page-multiple length upward. It removes only the overlapping
 range, splitting VMAs as needed so a surviving prefix or suffix retains its

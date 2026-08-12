@@ -1416,11 +1416,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }));
     *CONTROLLER.lock() = Some(slot);
     // Register against the unified block-device registry.
-    narf_block::register_block_device(
-        "vblk0",
-        alloc::sync::Arc::new(VirtioBlkBlockSync)
-            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
-    );
+    let parent = alloc::sync::Arc::new(VirtioBlkBlockSync)
+        as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::register_block_device("vblk0", parent.clone());
+    // Make GPT/MBR child devices visible to the root-mount walk. Without
+    // this, a partitioned virtio disk only exposes its whole-disk parent, so
+    // filesystem detection never reaches an ext4 root stored in a partition.
+    // A scan failure is non-fatal: unpartitioned virtio disks remain usable
+    // through the parent device just as before.
+    let _ = narf_block::partition::scan_and_register_partitions(parent, "vblk0");
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vblk0"),
         kind: narf_drivers::BoundKind::Block,

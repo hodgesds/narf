@@ -80,6 +80,11 @@ pub struct MountReport {
     pub fs_type: FsType,
 }
 
+/// CachyOS installs the firmware-visible EFI System Partition directly at
+/// `/boot`; mounting it under `/boot/efi` leaves the fstab `/boot` unit
+/// unsatisfied even though the FAT volume is available.
+pub const EFI_SYSTEM_PARTITION_MOUNTPOINT: &str = "/boot";
+
 /// Errors specific to root-mount selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RootMountError {
@@ -199,6 +204,55 @@ pub fn try_mount_root_with(
         if strict && !saw_candidate {
             return Err(RootMountError::SelectorNoMatch);
         }
+    }
+    Err(last_error.unwrap_or(RootMountError::NoMountable))
+}
+
+/// Mount the GPT EFI System Partition at the installed system's `/boot`.
+///
+/// Selection is deliberately semantic: only a partition whose GPT *type*
+/// GUID is the UEFI ESP GUID is eligible.  The implementation never depends
+/// on names such as `vblk0p1`, labels such as `EFI`, or this test VM's FAT
+/// volume UUID.  An ESP must also prove to be FAT before its registered
+/// factory is invoked.
+pub fn try_mount_efi_system_partition(
+    authority: &narf_capabilities::Cap<crate::MountPoint, narf_capabilities::Grant>,
+) -> Result<MountReport, RootMountError> {
+    let mut last_error = None;
+    for entry in narf_block::block_devices() {
+        if !entry
+            .partition
+            .as_ref()
+            .is_some_and(narf_block::registry::PartitionMetadata::is_efi_system_partition)
+        {
+            continue;
+        }
+        let dev = entry.dev.clone();
+        let detect = match detect_filesystem(&dev) {
+            Ok(Some(FsType::Fat)) => FsType::Fat,
+            Ok(Some(_)) | Ok(None) | Err(_) => continue,
+        };
+        let factory = match lookup_factory(detect) {
+            Some(factory) => factory,
+            None => {
+                last_error = Some(RootMountError::NoFactory(detect));
+                continue;
+            }
+        };
+        let fs = match factory(dev) {
+            Ok(fs) => fs,
+            Err(error) => {
+                last_error = Some(RootMountError::FactoryFailed(detect, error));
+                continue;
+            }
+        };
+        crate::registry()
+            .mount_arc(authority, EFI_SYSTEM_PARTITION_MOUNTPOINT, fs)
+            .map_err(|error| RootMountError::FactoryFailed(detect, error))?;
+        return Ok(MountReport {
+            device_name: String::from(entry.name),
+            fs_type: detect,
+        });
     }
     Err(last_error.unwrap_or(RootMountError::NoMountable))
 }

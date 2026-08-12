@@ -125,6 +125,14 @@ pub fn find_block_device_indexed(
 ) -> Option<(usize, Arc<dyn BlockDeviceSync>)>;
 ```
 
+Registered GPT partitions carry their GPT type GUID, label, and unique GUID
+plus a best-effort filesystem volume UUID parsed from immutable FAT or ext
+identification bytes. `PartitionMetadata::is_efi_system_partition()` identifies
+an EFI System Partition solely by its UEFI GPT type GUID, never by a volatile
+device name, label, or volume UUID.
+`DevFs` uses that metadata to expose `/dev/disk/by-{label,partuuid,uuid}`
+aliases; discovery never validates or mounts the filesystem.
+
 Targeted lookups clone only the matched device `Arc`; they do not allocate an
 owned registry snapshot. The indexed form captures the registration-order index
 and device under the same registry lock so `devfs` can derive a coherent Linux

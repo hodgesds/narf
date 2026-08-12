@@ -292,8 +292,7 @@ pub fn enumerate_block_devices() -> Vec<(alloc::string::String, FileType)> {
 use crate::{DirEntry, DirOps};
 
 /// `/dev/disk/` — a virtual directory with three subdirectories:
-/// `by-label`, `by-uuid` (fs-uuid, unused for now, always empty),
-/// and `by-partuuid`.
+/// `by-label`, `by-uuid` (filesystem UUID), and `by-partuuid`.
 pub struct DevDiskDir;
 
 impl core::fmt::Debug for DevDiskDir {
@@ -410,11 +409,6 @@ impl DirOps for DevDiskByLabel {
 
 /// `/dev/disk/by-uuid/` — filesystem UUID.
 ///
-/// The block registry's `PartitionMetadata` carries `partuuid` (GPT
-/// partition GUID) but not an FS-level UUID (that lives inside the
-/// filesystem superblock, which the partition scanner doesn't read).
-/// This directory is therefore always empty in NARF v1; the entry
-/// exists so tooling that checks for its presence doesn't error.
 pub struct DevDiskByUuid;
 
 impl core::fmt::Debug for DevDiskByUuid {
@@ -427,12 +421,40 @@ impl DirOps for DevDiskByUuid {
     fn ino(&self) -> u64 {
         12
     }
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        None
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        narf_block::block_devices()
+            .into_iter()
+            .find(|r| {
+                r.partition
+                    .as_ref()
+                    .map(|p| !p.fs_uuid.is_empty() && p.fs_uuid.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+            })
+            .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
+        narf_block::block_devices()
+            .into_iter()
+            .filter_map(|r| r.partition.map(|p| p.fs_uuid))
+            .filter(|uuid| !uuid.is_empty())
+            .skip(cursor)
+            .take(max)
+            .map(|uuid| (uuid, FileType::Symlink))
+            .collect()
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> crate::FsFuture<'a, Vec<(alloc::string::String, FileType)>> {
+        let v = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(v) })
     }
 }
 

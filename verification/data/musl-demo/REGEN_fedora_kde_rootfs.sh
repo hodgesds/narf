@@ -129,36 +129,25 @@ fi
 # --------------------------------------------------------------- staging ---
 echo "Staging NARF-specific bits..."
 
-# Raise the user manager's start timeouts.
-#
-# Everything renders in software here (llvmpipe/kms_swrast, QPainter), so
-# Plasma starts far slower than systemd's 90s default assumes.
-# kwin_wayland is Type=dbus: systemd waits for org.kde.KWinWrapper to appear
-# within DefaultTimeoutStartSec, routinely does not get it in time, and stops
-# the unit — at which point Fedora's 10-timeout-abort.conf drop-in
-# (TimeoutStopFailureMode=abort) SIGABRTs it.
-#
-# The unit then reads "signal=ABRT ... Mem peak: 1010.3M", which looks exactly
-# like a crash or an OOM and is NEITHER. kcminit and xdg-desktop-portal were
-# TERM'd by the same mechanism, as ordering victims.
-mkdir -p "$WORK/root/etc/systemd"
-printf '%s\n' \
-  '[Manager]' \
-  'DefaultTimeoutStartSec=600s' \
-  'DefaultTimeoutStopSec=120s' \
-  > "$WORK/root/etc/systemd/user.conf"
+# An incremental work tree may contain the previous diagnostic desktop image.
+# Remove its units, gates, probes, and console overrides before packing so a
+# regenerated image contains only the production startup path.
+rm -f \
+  "$WORK/root/etc/systemd/system/narf-plasma-probe.service" \
+  "$WORK/root/etc/systemd/system/narf-journal-tap.service" \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service" \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-journal-tap.service" \
+  "$WORK/root/etc/systemd/system/graphical.target.d/narf-plasma-gate.conf" \
+  "$WORK/root/etc/systemd/user.conf" \
+  "$WORK/root/usr/local/libexec/narf-plasma-probe" \
+  "$WORK/root/usr/local/libexec/narf-journal-tap" \
+  "$WORK/root/usr/local/libexec/narf-drm-probe" \
+  "$WORK/root/usr/local/libexec/narf-pty-probe"
+for narf_unit in plasma-kwin_wayland.service plasma-plasmashell.service \
+                 plasma-kded6.service plasma-ksmserver.service; do
+  rm -f "$WORK/root/usr/lib/systemd/user/${narf_unit}.d/99-narf-console.conf"
+done
 
-# The PTY probe (see ptyspawn_smoke_x86_64.c) — why the foot terminal renders but shows
-# no prompt. Same build rule as the DRM probe: PIE, never -static.
-if command -v gcc >/dev/null 2>&1; then
-  if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-pty-probe" \
-      "$ROOT/verification/data/musl-demo/ptyspawn_smoke_x86_64.c" 2>/dev/null; then
-    chmod 0755 "$WORK/root/usr/local/libexec/narf-pty-probe"
-    echo "Built narf-pty-probe"
-  else
-    echo "WARNING: narf-pty-probe failed to build"
-  fi
-fi
 # Fedora ships /usr/bin mode 0555. Several diagnostics below swap package
 # binaries for wrappers there, and the unprivileged build user owns the
 # directory but has no write bit. Open it for staging and restore the
@@ -202,6 +191,13 @@ install -d -m 0755 "$WORK/root/etc/systemd/system/graphical.target.wants"
 # boot, consuming a vCPU and adding unrelated PID1/SIGCHLD/timer churn.
 ln -sfn /dev/null "$WORK/root/etc/systemd/system/console-getty.service"
 ln -sfn /dev/null "$WORK/root/etc/systemd/system/getty@tty1.service"
+# AccountsService is only useful for login/account administration.  This image
+# has one fixed desktop user, while the daemon's SQLite state cache currently
+# cannot persist on NARF's ext2 path and emits a distracting disk-I/O error at
+# every graphical boot.  Prevent both its graphical-target pull-in and D-Bus
+# activation; ordinary passwd/NSS account lookup remains available.
+ln -sfn /dev/null "$WORK/root/etc/systemd/system/accounts-daemon.service"
+rm -f "$WORK/root/usr/share/dbus-1/system-services/org.freedesktop.Accounts.service"
 # Everything under /home/narf belongs to uid 1000, which `--map-auto` places
 # on a subuid the invoking user cannot write to from outside the namespace.
 # Stage the per-user config through the same fake-root helper that created
@@ -225,9 +221,6 @@ printf '[KSplash]\nEngine=none\nTheme=None\n' > "$WORK/root/etc/xdg/ksplashrc"
 # name fail immediately instead of installing a guaranteed timeout path.
 rm -f "$WORK/root/usr/share/dbus-1/services/org.kde.KSplash.service"
 
-# Capture the narrow D-Bus gate between KWin startup and plasmashell startup.
-# The monitor runs on the same fresh session bus as Plasma, so serial and
-# reply_serial values can be correlated without syscall-level tracing.
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-plasma-session-monitor.sh" \
   "$WORK/root/usr/local/libexec/narf-plasma-session-monitor"
@@ -237,29 +230,6 @@ install -m 0755 \
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-drm-policy.sh" \
   "$WORK/root/usr/local/libexec/narf-drm-policy"
-
-# The libdrm probe narf-drm-policy runs. Built here rather than shipped as a
-# binary so it tracks the source; linked against the HOST's libdrm headers but
-# resolved at run time against the GUEST's libdrm.so.2, which is the whole
-# point — it reports what the guest's own libdrm concludes about NARF's DRM
-# nodes instead of what we think it should conclude.
-#
-# Non-fatal on purpose: a host without libdrm headers should still be able to
-# regenerate the image. But say so loudly, because narf-drm-policy prints
-# "probe binary MISSING" rather than failing, and a silently absent probe
-# looks exactly like a probe that found nothing.
-if command -v gcc >/dev/null 2>&1 && [ -f /usr/include/xf86drm.h ]; then
-  if gcc -O1 -o "$WORK/root/usr/local/libexec/narf-drm-probe" \
-      "$ROOT/verification/data/musl-demo/drm_device_probe.c" \
-      -I/usr/include/libdrm -ldrm 2>/dev/null; then
-    chmod 0755 "$WORK/root/usr/local/libexec/narf-drm-probe"
-    echo "Built narf-drm-probe (libdrm device probe)"
-  else
-    echo "WARNING: narf-drm-probe failed to build; DRM enumeration probe will be absent"
-  fi
-else
-  echo "WARNING: no gcc or libdrm headers on host; skipping narf-drm-probe"
-fi
 
 # Keep DRM policy setup in its own root service. The `+` executable prefix on
 # an ExecStartPre of a User= service exercises systemd's privileged-command
@@ -277,17 +247,10 @@ printf '%s\n' \
   'StandardError=journal+console' \
   > "$WORK/root/etc/systemd/system/narf-drm-policy.service"
 
-# Preserve the exact generated keymap stream that Xwayland hands to xkbcomp.
-# This is a diagnostic for the current Plasma gate: the image's static XKB
-# corpus compiles correctly offline, while the live compiler reports malformed
-# stdin.  Keep the package binary under a stable private name so incremental
-# image regeneration remains idempotent.
-if [ ! -x "$WORK/root/usr/bin/xkbcomp.narf-real" ]; then
-  mv "$WORK/root/usr/bin/xkbcomp" "$WORK/root/usr/bin/xkbcomp.narf-real"
+# Restore the stock XKB compiler if a previous diagnostic image wrapped it.
+if [ -x "$WORK/root/usr/bin/xkbcomp.narf-real" ]; then
+  mv -f "$WORK/root/usr/bin/xkbcomp.narf-real" "$WORK/root/usr/bin/xkbcomp"
 fi
-install -m 0755 \
-  "$ROOT/verification/data/musl-demo/fedora-xkbcomp-capture.sh" \
-  "$WORK/root/usr/bin/xkbcomp"
 
 # kcminit runs xrdb synchronously during its phase-zero fonts/style setup. If
 # Xwayland has already failed, a permanent X11 round trip must not prevent the
@@ -314,17 +277,11 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-kcminit-wayland-guard.sh" \
   "$WORK/root/usr/bin/kcminit_startup"
 
-# Record whether plasma_session's own ksmserver StartServiceJob ever execs a
-# process. The real binary moves to a private directory but keeps its
-# basename, so /proc/<pid>/comm stays `ksmserver` for the acceptance probe.
-install -d "$WORK/root/usr/local/libexec/ksmserver-real"
-if [ ! -x "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver" ]; then
-  mv "$WORK/root/usr/bin/ksmserver" \
-    "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver"
+# Restore the stock session manager if a previous diagnostic image wrapped it.
+if [ -x "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver" ]; then
+  mv -f "$WORK/root/usr/local/libexec/ksmserver-real/ksmserver" \
+    "$WORK/root/usr/bin/ksmserver"
 fi
-install -m 0755 \
-  "$ROOT/verification/data/musl-demo/fedora-ksmserver-trace.sh" \
-  "$WORK/root/usr/bin/ksmserver"
 
 # Restore the package binary if an older incremental work tree contains the
 # rejected QDBUS_DEBUG wrapper. That diagnostic changed the process identity,
@@ -334,22 +291,9 @@ if [ -e "$WORK/root/usr/bin/plasma_session.narf-real" ]; then
     "$WORK/root/usr/bin/plasma_session"
 fi
 
-# The graphical session is a normal systemd service, deliberately not the
-# legacy narf-start.sh diagnostic wrapper. PID 1 orders it after the system
-# bus, gives it a private user-owned runtime directory, and starts Plasma
-# through a fresh session bus. logind is intentionally not a requirement:
-# Plasma can run without it, and a login-manager compatibility failure must
-# not suppress the graphical compositor. Type=simple also avoids making the
-# session's lifetime depend on systemd's exec-notification handshake while the
-# Linux-compat process startup path is still slower than native Linux.
-# Wants/After user@1000.service: the user manager must be started by PID 1,
-# not by the session at runtime. narf-plasma.service runs as User=narf
-# (uid 1000), and an unprivileged `systemctl start user@1000.service` is
-# refused with "Access denied ... requires interactive authentication"
-# because that path goes through polkit. As a unit dependency root starts
-# it, with no polkit involved. user@.service in turn pulls in
-# user-runtime-dir@1000.service, which creates /run/user/1000 — where the
-# manager publishes the session bus the session then connects to.
+# The session service starts after its two real prerequisites: the user
+# manager/session bus and DRM ownership policy.  They have no ordering edge
+# between them, so PID 1 starts both jobs in parallel.
 #
 # Qt's QML JIT is DISABLED. 7b6ab22b turned it on, reasoning that mprotect's
 # W^X arm returns NeedsCapJit and jit_cap_default_policy() grants a JitCap by
@@ -373,6 +317,11 @@ fi
 # plasmashell is QML-heavy and this sits on its critical path, so running
 # interpreted was costing real startup time for no security benefit.
 #
+# KMS presentation of a VirGL resource is not wired yet, so the compositor's
+# final scanout remains on the proven dumb-buffer/QPainter path for this image.
+# The in-tree Bochs DRM device deliberately exposes only the dumb-buffer
+# scanout ABI. Keep application GL on Mesa's CPU renderer until its
+# virtio-gpu render-node replacement presents real KMS scanout.
 # NOTE: keep comments OUT of the printf argument list below. A `#` inside a
 # line-continued arg list silently swallows every remaining argument, and
 # `bash -n` still passes — so the unit file loses its ExecStart with no error.
@@ -390,22 +339,16 @@ printf '%s\n' \
   'User=narf' \
   'Group=video' \
   'Environment=HOME=/home/narf' \
-  'Environment=XDG_RUNTIME_DIR=/run/narf-plasma' \
+  'Environment=XDG_RUNTIME_DIR=/run/user/1000' \
   'Environment=XDG_SESSION_TYPE=wayland' \
   'Environment=XDG_CURRENT_DESKTOP=KDE' \
   'Environment=XKB_DEFAULT_MODEL=pc105' \
   'Environment=XKB_DEFAULT_LAYOUT=us' \
   'Environment=QT_QPA_PLATFORM=wayland' \
   'Environment=KWIN_DRM_NO_AMS=1' \
-  'Environment=KWIN_COMPOSE=Q' \
   'Environment=KWIN_DRM_DEVICES=/dev/dri/card0' \
-  'Environment=LIBGL_ALWAYS_SOFTWARE=1' \
   'Environment=QV4_FORCE_INTERPRETER=1' \
   'Environment=QT_ENABLE_REGEXP_JIT=0' \
-  'Environment=GALLIUM_DRIVER=llvmpipe' \
-  'Environment=MESA_LOADER_DRIVER_OVERRIDE=kms_swrast' \
-  'RuntimeDirectory=narf-plasma' \
-  'RuntimeDirectoryMode=0700' \
   'ExecStart=/usr/local/libexec/narf-plasma-session-monitor' \
   'StandardOutput=journal+console' \
   'StandardError=journal+console' \
@@ -417,96 +360,6 @@ printf '%s\n' \
   > "$WORK/root/etc/systemd/system/narf-plasma.service"
 ln -sfn ../narf-plasma.service \
   "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma.service"
-
-# Do not confuse Type=simple's successful fork with a working desktop.
-# KillMode=process: the probe leaves a background sampler running past
-# PLASMA-READY — the only window into whether the shell is parked or merely
-# slow — and the default control-group kill would reap it with the oneshot. This
-# oneshot is ordered after the session service and keeps the graphical target
-# pending until both the compositor and shell have remained alive long enough
-# to be observed twice. Its console heartbeats also expose the last surviving
-# process when startup stalls.
-install -m 0755 \
-  "$ROOT/verification/data/musl-demo/fedora-plasma-probe.sh" \
-  "$WORK/root/usr/local/libexec/narf-plasma-probe"
-printf '%s\n' \
-  '[Unit]' \
-  'Description=Verify NARF Plasma processes' \
-  'Wants=narf-plasma.service' \
-  'After=narf-plasma.service' \
-  '' \
-  '[Service]' \
-  'Type=oneshot' \
-  'User=narf' \
-  'ExecStart=/usr/local/libexec/narf-plasma-probe' \
-  'StandardOutput=journal+console' \
-  'StandardError=journal+console' \
-  'TimeoutStartSec=15min' \
-  'KillMode=process' \
-  '' \
-  '[Install]' \
-  'WantedBy=graphical.target' \
-  > "$WORK/root/etc/systemd/system/narf-plasma-probe.service"
-ln -sfn ../narf-plasma-probe.service \
-  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-plasma-probe.service"
-
-# Root-side journal tap. narf-plasma-probe runs as User=narf and therefore
-# CANNOT read /var/log/journal/<id>/user-1000.journal ("Operation not
-# permitted"), which is where every Plasma user unit's output goes — kwin's
-# exit reason included. This service has no User=, so it runs as root and can.
-install -m 0755 \
-  "$ROOT/verification/data/musl-demo/fedora-journal-tap.sh" \
-  "$WORK/root/usr/local/libexec/narf-journal-tap"
-printf '%s\n' \
-  '[Unit]' \
-  'Description=Mirror the uid-1000 journal to the console' \
-  'Wants=systemd-journald.service' \
-  'After=systemd-journald.service' \
-  '' \
-  '[Service]' \
-  'Type=simple' \
-  'ExecStart=/usr/local/libexec/narf-journal-tap' \
-  'StandardOutput=journal+console' \
-  'StandardError=journal+console' \
-  'Restart=always' \
-  'RestartSec=2' \
-  '' \
-  '[Install]' \
-  'WantedBy=graphical.target' \
-  > "$WORK/root/etc/systemd/system/narf-journal-tap.service"
-ln -sfn ../narf-journal-tap.service \
-  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-journal-tap.service"
-# A Wants= symlink lets graphical.target succeed after a failed oneshot.
-# Make the probe a required, ordered start job so graphical.target is proof of
-# PLASMA-READY rather than merely proof that the probe was attempted.
-install -d "$WORK/root/etc/systemd/system/graphical.target.d"
-printf '%s\n' \
-  '[Unit]' \
-  'Requires=narf-plasma-probe.service' \
-  'After=narf-plasma-probe.service' \
-  > "$WORK/root/etc/systemd/system/graphical.target.d/narf-plasma-gate.conf"
-
-# Plasma's components run as systemd USER UNITS, so their stderr goes to the
-# journal and NOTHING about a crash reaches the serial console — which is the
-# only channel this bring-up can read. `journalctl --user` cannot help: it
-# fails with "Operation not permitted" opening
-# /var/log/journal/<id>/user-1000.journal, so the journal is unreadable from
-# inside the guest too.
-#
-# Mirror these units' output to the console. This is what makes a compositor
-# exit diagnosable at all: kwin dying is what tears the session down
-# (plasma-workspace-wayland.target BindsTo plasma-kwin_wayland.service, and
-# graphical-session.target takes every PartOf unit with it), and its reason
-# was previously invisible.
-for narf_unit in plasma-kwin_wayland.service plasma-plasmashell.service \
-                 plasma-kded6.service plasma-ksmserver.service; do
-  install -d "$WORK/root/usr/lib/systemd/user/${narf_unit}.d"
-  printf '%s\n' \
-    '[Service]' \
-    'StandardOutput=journal+console' \
-    'StandardError=journal+console' \
-    > "$WORK/root/usr/lib/systemd/user/${narf_unit}.d/99-narf-console.conf"
-done
 
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \

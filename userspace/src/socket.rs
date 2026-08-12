@@ -829,19 +829,27 @@ impl SocketFile {
             // lives in the fs crate, which can't reach the net readiness layer
             // directly). Idempotent — a plain atomic store.
             narf_filesystem::uevent::set_wake_hook(uevent_wake_hook);
-            // Start at the ring TAIL — a netlink uevent monitor only receives
-            // events broadcast *after* it binds (Linux `NETLINK_KOBJECT_UEVENT`
-            // is not replayed on connect). Replaying the buffered boot-time
-            // "add" events to a late-connecting monitor is actively harmful:
-            // libudev/libinput does NOT de-dup them against its sysfs
-            // enumerate — it re-runs `evdev_device_create` for each replayed
-            // "add", and that second add tears the already-created input device
-            // back down (weston loses all keyboards/pointers ~5s after start).
-            // Existing devices are discovered via `udev_enumerate` (sysfs
-            // scan), not the monitor, so tail-start loses nothing.
-            SocketState::NetlinkUevent {
-                reader: narf_filesystem::uevent::UeventReader::new(),
-            }
+            // A generic monitor starts at the ring TAIL: Linux
+            // `NETLINK_KOBJECT_UEVENT` is not replayed on connect, and replaying
+            // boot-time ADDs to libinput can tear down an already-created input
+            // device.  systemd-udevd is the one deliberate exception. NARF's
+            // systemd boot path starts `systemd-udev-trigger` before udevd has
+            // opened its monitor, so those trigger ADDs would otherwise be
+            // irretrievably lost and fstab UUID device units would wait forever.
+            // Replay only NARF's post-sysfs storage-coldplug window to the
+            // udev daemon. Replaying every early bring-up event is unsafe:
+            // some precede their completed kobject and make udevd open a stale
+            // DEVPATH. The marker is set immediately before the canonical
+            // block ADDs that satisfy fstab UUID dependencies.
+            let reader = if crate::handlers::proc_comm_of_task_matches(
+                crate::handlers::current_task_id(),
+                "systemd-udevd$",
+            ) {
+                narf_filesystem::uevent::boot_udevd_replay_reader()
+            } else {
+                narf_filesystem::uevent::UeventReader::new()
+            };
+            SocketState::NetlinkUevent { reader }
         } else {
             SocketState::Fresh
         };
@@ -5181,6 +5189,59 @@ fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unregistered_netlink_kernel_send_is_refused
+);
+
+/// systemd-udevd starts after the distro's coldplug trigger in the NARF boot
+/// sequence.  It alone must replay that bounded backlog; generic consumers
+/// (notably libinput) must remain tail-only to avoid duplicate device ADDs.
+fn smoke_udevd_netlink_replays_boot_coldplug_only() -> TestResult {
+    use crate::handlers::{current_task_id, set_proc_comm};
+
+    narf_filesystem::uevent::__reset_for_test();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/early/stale"),
+        alloc::string::String::from("early"),
+    );
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/virtual/block/smoke-efi"),
+        alloc::string::String::from("block"),
+    );
+
+    let task = current_task_id();
+    set_proc_comm(task, "systemd-udevd");
+    let udevd = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let udevd_event = match &*udevd.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
+    set_proc_comm(task, "libinput");
+    let generic = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let generic_pending = match &*generic.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.has_pending(),
+        _ => true,
+    };
+
+    narf_filesystem::uevent::__reset_for_test();
+    set_proc_comm(task, "");
+    if udevd_event.as_ref().map(|event| event.devpath.as_str())
+        != Some("/devices/virtual/block/smoke-efi")
+    {
+        return TestResult::Fail(
+            "systemd-udevd did not receive only the bounded boot coldplug window",
+        );
+    }
+    if generic_pending {
+        return TestResult::Fail("generic uevent monitor replayed stale boot events");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_udevd_netlink_replays_boot_coldplug_only
 );
 
 /// A userspace multicast send must REACH the group's subscribers.

@@ -2098,6 +2098,10 @@ pub mod linux_compat {
     pub const STATX_BTIME: u32 = 0x0800;
     pub const STATX_MNT_ID: u32 = 0x1000;
 
+    // Linux 6.6+ uses this attribute for the cheap mount-point probe that
+    // systemd runs before attempting to mount its API filesystems.
+    pub const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+
     // ── Flag bits (fcntl.h AT_*) ─────────────────────────────────
     pub const AT_FDCWD: i32 = -100;
     pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;

@@ -41,7 +41,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     //                                  task cwd so non-AT_FDCWD
     //                                  relative paths fail)
     //   3. otherwise                → fail
-    let (fs_stat, mnt_id) = if empty {
+    let (fs_stat, mnt_id, is_mount_root) = if empty {
         if dirfd < 0 {
             ctx.set_return(fail);
             return;
@@ -59,7 +59,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // distinguish a bind/pivoted root from the real root; absent it,
         // statx_mount_same returns -ENODATA and a service's mount-namespace
         // setup fails with 226/EXIT_NAMESPACE (systemd-udevd et al.).
-        (st, crate::mqueue::fd_mount_id(task, dirfd as u32))
+        // An O_PATH fd does not currently retain a mount-root marker.  Its
+        // mount identity remains available, while pathname statx below
+        // carries STATX_ATTR_MOUNT_ROOT for systemd's mount-point probe.
+        (st, crate::mqueue::fd_mount_id(task, dirfd as u32), false)
     } else {
         let raw = match copy_user_cstr(path_uptr, 4096) {
             Some(s) => s,
@@ -93,7 +96,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // not its target; otherwise follow like plain stat.
         let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
         let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
-        (st, current_mount_id_at(&path_owned))
+        let is_mount_root = current_path_is_mount_root(&path_owned);
+        (st, current_mount_id_at(&path_owned), is_mount_root)
     };
 
     let (s, ino, rdev, uid, gid) = match fs_stat {
@@ -147,8 +151,25 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         | STATX_MTIME
         | STATX_CTIME
         | STATX_MNT_ID;
+    // A mount ID is cheap once path resolution has identified the covering
+    // mount, and Linux is permitted to return fields beyond the request.
+    // systemd intentionally asks only for STATX_TYPE|STATX_INO while deciding
+    // whether API filesystems are already mounted, then requires MNT_ID in
+    // the reply to make that decision. Advertising it only when explicitly
+    // requested made every such probe fail with EUNATCH despite statx(2)
+    // itself succeeding.
+    let mnt_id_mask = if mnt_id.is_some() { STATX_MNT_ID } else { 0 };
+    // Linux advertises STATX_ATTR_MOUNT_ROOT support even when the queried
+    // object is not a mount root, and sets the value bit only for the root of
+    // the visible mount. systemd 258 uses this attribute (rather than an
+    // extra mountinfo scan) for its early API-filesystem mount probe.
     let out = Statx {
         stx_blksize: 4096,
+        stx_attributes: if is_mount_root {
+            STATX_ATTR_MOUNT_ROOT
+        } else {
+            0
+        },
         stx_mode: mode_word,
         stx_size: s.size,
         stx_blocks: s.blocks,
@@ -165,12 +186,14 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
         stx_mnt_id: mnt_id.unwrap_or(0),
-        stx_mask: filled
+        stx_attributes_mask: STATX_ATTR_MOUNT_ROOT,
+        stx_mask: (filled
             & if mask == 0 {
                 filled
             } else {
                 mask | STATX_BASIC_STATS & filled
-            },
+            })
+            | mnt_id_mask,
         ..Default::default()
     };
 

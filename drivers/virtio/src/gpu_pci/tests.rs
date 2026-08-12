@@ -34,6 +34,63 @@ kernel_test_in!(
     smoke_virtio_gpu_virgl_offer_detection
 );
 
+fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
+    use super::cmd::{
+        build_ctx_create, build_resource_create_3d, build_submit_3d, read_hdr, ResourceCreate3D,
+        CTX_CREATE_LEN, RESOURCE_CREATE_3D_LEN, SUBMIT_3D_PREFIX_LEN, VIRTIO_GPU_CMD_CTX_CREATE,
+        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, VIRTIO_GPU_CMD_SUBMIT_3D,
+    };
+
+    let mut ctx = [0u8; CTX_CREATE_LEN];
+    build_ctx_create(&mut ctx, 7, b"narf-virgl");
+    if read_hdr(&ctx).cmd_type != VIRTIO_GPU_CMD_CTX_CREATE || read_hdr(&ctx).ctx_id != 7 {
+        return TestResult::Fail("CTX_CREATE header");
+    }
+    if u32::from_le_bytes(ctx[24..28].try_into().unwrap()) != 10 || &ctx[32..42] != b"narf-virgl" {
+        return TestResult::Fail("CTX_CREATE body");
+    }
+
+    let mut resource = [0u8; RESOURCE_CREATE_3D_LEN];
+    build_resource_create_3d(
+        &mut resource,
+        7,
+        ResourceCreate3D {
+            resource_id: 9,
+            target: 2,
+            format: 3,
+            bind: 4,
+            width: 640,
+            height: 480,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 0,
+        },
+    );
+    if read_hdr(&resource).cmd_type != VIRTIO_GPU_CMD_RESOURCE_CREATE_3D
+        || u32::from_le_bytes(resource[24..28].try_into().unwrap()) != 9
+        || u32::from_le_bytes(resource[40..44].try_into().unwrap()) != 640
+    {
+        return TestResult::Fail("RESOURCE_CREATE_3D wire shape");
+    }
+
+    let commands = [0xA5u8; 12];
+    let mut submit = [0u8; SUBMIT_3D_PREFIX_LEN + 12];
+    build_submit_3d(&mut submit, 7, &commands);
+    if read_hdr(&submit).cmd_type != VIRTIO_GPU_CMD_SUBMIT_3D
+        || u32::from_le_bytes(submit[24..28].try_into().unwrap()) != commands.len() as u32
+        || submit[SUBMIT_3D_PREFIX_LEN..] != commands
+    {
+        return TestResult::Fail("SUBMIT_3D wire shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_virgl_command_wire_shapes
+);
+
 // ── Stage 1: PCI match table ───────────────────────────────────────
 
 fn smoke_virtio_gpu_pci_match_table() -> TestResult {

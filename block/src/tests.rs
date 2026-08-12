@@ -1205,14 +1205,22 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
     bytes[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes()); // entry size
                                                                   // LBA 2: one non-empty entry + one empty entry.
     let e = 1024; // byte offset of LBA 2
-                  // Type GUID — Linux root GUID first 16 bytes.
+                  // Type GUID — UEFI EFI System Partition GUID in GPT's
+                  // mixed-endian on-disk layout. The registry must retain this semantic
+                  // type rather than inferring an ESP from the device name or FAT serial.
     bytes[e..e + 16].copy_from_slice(&[
-        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
-        0xE4,
+        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9,
+        0x3B,
     ]);
     bytes[e + 32..e + 40].copy_from_slice(&100u64.to_le_bytes()); // start
     bytes[e + 40..e + 48].copy_from_slice(&199u64.to_le_bytes()); // end inclusive
                                                                   // Second entry stays all-zero (empty).
+                                                                  // Partition 1 is a FAT32 EFI-like volume. Its serial is stored little
+                                                                  // endian at BPB offset 67 and must become the Linux UUID spelling used
+                                                                  // by `/dev/disk/by-uuid` and systemd's .device units.
+    let fat = 100 * 512;
+    bytes[fat + 67..fat + 71].copy_from_slice(&0x7fc5_5a22u32.to_le_bytes());
+    bytes[fat + 82..fat + 90].copy_from_slice(b"FAT32   ");
 
     let parent = Arc::new(VecBlock {
         data: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(bytes)),
@@ -1220,7 +1228,7 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
     }) as Arc<dyn crate::BlockDeviceSync>;
 
     use crate::registry::{
-        __reset_for_test, __restore_for_test, __snapshot_for_test, find_block_device,
+        __reset_for_test, __restore_for_test, __snapshot_for_test, block_devices, find_block_device,
     };
     // Snapshot + restore the registry so this test doesn't pollute it.
     let snap = __snapshot_for_test();
@@ -1234,9 +1242,19 @@ fn smoke_block_partition_scan_registers_gpt_partitions() -> TestResult {
             return TestResult::Fail("scan errored on valid GPT disk");
         }
     };
+    let fat_uuid = block_devices()
+        .into_iter()
+        .find(|d| d.name == "testdisk0p1")
+        .and_then(|d| d.partition)
+        .map(|p| {
+            let is_esp = p.is_efi_system_partition();
+            (p.fs_uuid, is_esp)
+        });
     let pass = report.is_gpt
         && report.registered == alloc::vec![alloc::string::String::from("testdisk0p1")]
-        && find_block_device("testdisk0p1").is_some();
+        && find_block_device("testdisk0p1").is_some()
+        && fat_uuid.as_ref().map(|(uuid, _)| uuid.as_str()) == Some("7FC5-5A22")
+        && fat_uuid.as_ref().is_some_and(|(_, is_esp)| *is_esp);
 
     __restore_for_test(snap);
     if pass {

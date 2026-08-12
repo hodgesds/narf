@@ -35,6 +35,7 @@ pub mod group_desc;
 pub mod htree;
 pub mod inode;
 pub mod journal;
+pub mod metadata_csum;
 pub mod node;
 pub mod superblock;
 pub mod volume;

@@ -25,6 +25,8 @@
 
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
+use alloc::vec::Vec;
+
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 use narf_graphics::Framebuffer;
@@ -53,10 +55,9 @@ pub const VIRTIO_GPU_PCI_DEVICE_LEGACY: u16 = 0x1010;
 
 /// Device feature bit advertising the VirGL 3D command set.
 ///
-/// We record this offer for diagnostics but deliberately do not negotiate it
-/// until the render-node resource/context/execbuffer UAPI is wired. Setting
-/// the bit early would tell the host that command submission is supported
-/// when the guest can still only drive the 2D scanout path.
+/// Negotiated when the host offers it. The render-node bridge exposes the
+/// matching resource/context/execbuffer ABI; a 2D-only host remains fully
+/// supported and simply keeps this bit clear.
 pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
 
 const fn features_offer_virgl(features: u64) -> bool {
@@ -87,6 +88,7 @@ const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 // Response codes.
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_CAPSET: u32 = 0x1103;
 
 // Pixel format. B8G8R8X8_UNORM matches our `Pixel32` (XRGB).
 const FMT_B8G8R8X8_UNORM: u32 = 1;
@@ -94,21 +96,13 @@ const FMT_B8G8R8X8_UNORM: u32 = 1;
 const MAX_SCANOUTS: usize = 16;
 const HDR_LEN: usize = 24;
 
-/// Scanout dimensions for the M0 splash. Constrained to fit in a
-/// single 4 KiB DMA frame (32 × 32 × 4 bytes = 4096) because
-/// `narf_io::alloc_coherent` is currently page-capped — multi-page
-/// DMA buffers need either a vmap surface or a contiguous-pool
-/// allocator, both follow-ups. The host scanout still runs at the
-/// device's native resolution (typically 1024×768); virtio-gpu
-/// composes our 32×32 resource into the upper-left corner.
-const SCANOUT_W: u32 = 32;
-const SCANOUT_H: u32 = 32;
-
-// The scanout buffer is allocated once at bring-up and never replaced
-// (that stability is what lets `probed_device` hand out `&'static`
-// references and lets `/dev/fb0` alias the frames). It must therefore
-// fit the single page `alloc_coherent` can provide.
-const _: () = assert!((SCANOUT_W * SCANOUT_H * 4) as usize <= 4096);
+/// Maximum primary scanout size. A 4 MiB contiguous DMA allocation covers
+/// QEMU GTK's normal 1280×800 mode; a larger host mode is safely capped to
+/// this size rather than creating a resource whose backing cannot cover it.
+const MAX_SCANOUT_BYTES: usize = 4 * 1024 * 1024;
+const FALLBACK_SCANOUT_W: u32 = 1280;
+const FALLBACK_SCANOUT_H: u32 = 800;
+const _: () = assert!((FALLBACK_SCANOUT_W * FALLBACK_SCANOUT_H * 4) as usize <= MAX_SCANOUT_BYTES);
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DisplayMode {
@@ -127,8 +121,11 @@ pub struct VirtioGpuPci {
     #[allow(dead_code)]
     msix: Option<narf_bus::MsixTable>,
     /// Complete device feature bitmap observed before negotiation. Kept for
-    /// capability diagnostics; only VERSION_1 is currently accepted.
+    /// capability diagnostics.
     offered_features: u64,
+    /// Whether `VIRTIO_GPU_F_VIRGL` was accepted during the immutable feature
+    /// negotiation at bring-up.
+    virgl_enabled: bool,
     ctrl_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _cursor_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _ctrl_layout_buf: DmaBuffer,
@@ -154,6 +151,10 @@ pub struct VirtioGpuPci {
     /// the multi-command sequences (`init_scanout`, `flush`) WITHOUT
     /// masking interrupts while waiting — see [`crate::req_gate`].
     req_gate: AtomicBool,
+    /// Context 1 is created lazily by the render-node bridge. A separate bit
+    /// keeps context creation out of the 2D boot path and makes retries
+    /// idempotent after an early userspace open races driver bring-up.
+    virgl_context_ready: AtomicBool,
 }
 
 impl core::fmt::Debug for VirtioGpuPci {
@@ -163,6 +164,7 @@ impl core::fmt::Debug for VirtioGpuPci {
             .field("ready", &self.is_ready())
             .field("mode", &mode)
             .field("host_offers_virgl", &self.host_offers_virgl())
+            .field("virgl_enabled", &self.virgl_enabled())
             .finish_non_exhaustive()
     }
 }
@@ -193,9 +195,9 @@ impl VirtioGpuPci {
             );
         }
 
-        // Feature negotiation: only VERSION_1. In particular, keep
-        // VIRTIO_GPU_F_VIRGL clear until the guest render-node UAPI can
-        // create resources/contexts and submit command buffers.
+        // Feature negotiation. VERSION_1 is mandatory for the modern PCI
+        // transport. Accept VirGL precisely when the host offered it; all
+        // subsequent 3D operations are gated on the immutable result.
         // SAFETY: same.
         let feats_lo = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
@@ -210,10 +212,18 @@ impl VirtioGpuPci {
         if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
+        let virgl_enabled = features_offer_virgl(feats);
         // SAFETY: same.
         unsafe {
             common.write32(CC_DRIVER_FEATURE_SELECT, 0);
-            common.write32(CC_DRIVER_FEATURE, 0);
+            common.write32(
+                CC_DRIVER_FEATURE,
+                if virgl_enabled {
+                    1u32 << VIRTIO_GPU_F_VIRGL
+                } else {
+                    0
+                },
+            );
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
             common.write8(
@@ -270,24 +280,24 @@ impl VirtioGpuPci {
             irq_vector,
             msix,
             offered_features: feats,
+            virgl_enabled,
             ctrl_q: IrqSafeSpinLock::new(Some(ctrl_q)),
             _cursor_q: IrqSafeSpinLock::new(Some(cursor_q)),
             _ctrl_layout_buf: ctrl_buf,
             _cursor_layout_buf: cursor_buf,
             req_buf,
             resp_buf,
-            // Allocated once here — 32×32×4 fills the page exactly, so
-            // `init_scanout` attaches this buffer instead of swapping in
-            // a fresh one. Keeping the allocation stable is what makes
-            // `scanout_phys()` (and the `&'static` handed out by
-            // `probed_device`) sound for the controller's lifetime.
-            scanout_buf: alloc_coherent(4096, DomainId::DRIVER_0)
+            // Allocated once here and retained for the controller lifetime;
+            // this makes `/dev/fb0` aliases and the `&'static` accessor
+            // stable. Four MiB covers the normal QEMU GTK desktop mode.
+            scanout_buf: alloc_coherent(MAX_SCANOUT_BYTES, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?,
             ctrl_q_notify_off,
             mode: IrqSafeSpinLock::new(DisplayMode::default()),
             ready: AtomicBool::new(false),
             last_err: IrqSafeSpinLock::new(None),
             req_gate: AtomicBool::new(false),
+            virgl_context_ready: AtomicBool::new(false),
         };
 
         Ok(me)
@@ -305,11 +315,197 @@ impl VirtioGpuPci {
     }
 
     /// Whether the virtual GPU is backed by a VirGL-capable host renderer.
-    ///
-    /// This reports the host offer, not a negotiated guest capability. The
-    /// current driver continues to operate in 2D mode even when this is true.
     pub fn host_offers_virgl(&self) -> bool {
         features_offer_virgl(self.offered_features)
+    }
+
+    /// True only when the host offered, and this driver accepted,
+    /// `VIRTIO_GPU_F_VIRGL`. Callers must use this rather than the diagnostic
+    /// [`Self::host_offers_virgl`] predicate before issuing 3D commands.
+    pub fn virgl_enabled(&self) -> bool {
+        self.virgl_enabled
+    }
+
+    /// Create the render-node's VirGL context (context id 1) if needed.
+    ///
+    /// The context is intentionally created lazily: a 2D console boot must
+    /// remain possible on every virtio-gpu host, while Mesa only opens the
+    /// render node after userspace starts. The request gate serialises this
+    /// control transfer with scanout flushes.
+    pub fn ensure_virgl_context(&self) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        if self.virgl_context_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut request = [0u8; cmd::CTX_CREATE_LEN];
+        cmd::build_ctx_create(&mut request, 1, b"narf-virgl");
+        self.write_raw_request(&request);
+        // SAFETY: request/response DMA and controlq were constructed at
+        // bring-up; the gate protects the shared request buffer.
+        unsafe { self.submit(request.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        self.virgl_context_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Create and attach one 3D resource to the render context.
+    ///
+    /// `backing_phys..backing_phys+backing_len` must remain allocated and
+    /// DMA-owned by the caller until it has detached and unref'd the returned
+    /// resource. The DRM render bridge enforces that lifetime with its
+    /// per-open GEM table; this transport layer intentionally has no user
+    /// pointer or handle-table policy.
+    pub fn create_virgl_resource(
+        &self,
+        resource: cmd::ResourceCreate3D,
+        backing_phys: u64,
+        backing_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() || backing_phys == 0 || backing_len == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        self.ensure_virgl_context()?;
+        let _gate = ReqGate::acquire(&self.req_gate);
+
+        let mut create = [0u8; cmd::RESOURCE_CREATE_3D_LEN];
+        cmd::build_resource_create_3d(&mut create, 1, resource);
+        self.write_raw_request(&create);
+        // SAFETY: the request gate serialises controlQ + request DMA use.
+        unsafe { self.submit(create.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        // A 3D resource uses the normal, context-free backing attach
+        // command, then becomes visible to the context through ATTACH.
+        unsafe { self.resource_attach_backing(resource.resource_id, backing_phys, backing_len)? };
+        let mut attach = [0u8; cmd::CTX_RESOURCE_LEN];
+        cmd::build_ctx_resource(
+            &mut attach,
+            cmd::VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+            1,
+            resource.resource_id,
+        );
+        self.write_raw_request(&attach);
+        // SAFETY: same gate and coherent request/response buffers.
+        unsafe { self.submit(attach.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Submit one opaque virgl command stream to the render context.
+    ///
+    /// The stream is bounded by the pre-allocated controlQ request DMA page.
+    /// It is copied before the virtqueue notify, so callers may reuse their
+    /// source buffer as soon as this synchronous method returns.
+    pub fn submit_virgl(&self, commands: &[u8]) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        if commands.len() > self.req_buf.len() - cmd::SUBMIT_3D_PREFIX_LEN {
+            return Err(VirtioPciError::RequestTooLarge);
+        }
+        self.ensure_virgl_context()?;
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
+        // The bound above proves this dynamic-sized slice fits in the fixed
+        // 4 KiB staging buffer without a heap allocation in the hot path.
+        let mut request = [0u8; 4096];
+        cmd::build_submit_3d(&mut request[..request_len], 1, commands);
+        self.write_raw_request(&request[..request_len]);
+        // SAFETY: gate protects the shared request/response buffers.
+        unsafe { self.submit(request_len, HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Synchronise a resource's guest backing into the host VirGL context.
+    pub fn transfer_to_host_virgl(&self, transfer: cmd::Transfer3D) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        self.ensure_virgl_context()?;
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::TRANSFER_3D_LEN];
+        cmd::build_transfer_3d(
+            &mut request,
+            cmd::VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+            1,
+            transfer,
+        );
+        self.write_raw_request(&request);
+        // SAFETY: gate protects the shared controlQ buffers.
+        unsafe { self.submit(request.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Detach and unref a render resource before its DMA backing is freed.
+    /// A failed teardown leaves the caller responsible for retaining the
+    /// backing; freeing it would let the host DMA into recycled memory.
+    pub fn destroy_virgl_resource(&self, resource_id: u32) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() || !self.virgl_context_ready.load(Ordering::Acquire) {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut detach = [0u8; cmd::CTX_RESOURCE_LEN];
+        cmd::build_ctx_resource(
+            &mut detach,
+            cmd::VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+            1,
+            resource_id,
+        );
+        self.write_raw_request(&detach);
+        // SAFETY: gate protects the shared controlQ buffers.
+        unsafe { self.submit(detach.len(), HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        self.write_request(CMD_RESOURCE_UNREF, &resource_id.to_le_bytes());
+        // SAFETY: same request gate and coherent buffers.
+        unsafe { self.submit(HDR_LEN + 4, HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
+    /// Fetch one opaque host capability set for Mesa's virtgpu probe.
+    /// The response is bounded by the existing 4 KiB response DMA buffer.
+    pub fn virgl_capset(
+        &self,
+        capset_id: u32,
+        capset_version: u32,
+    ) -> Result<Vec<u8>, VirtioPciError> {
+        if !self.virgl_enabled() {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::GET_CAPSET_LEN];
+        cmd::build_get_capset(&mut request, capset_id, capset_version);
+        self.write_raw_request(&request);
+        // SAFETY: response DMA is a 4 KiB buffer, serialised by the gate.
+        unsafe { self.submit(request.len(), self.resp_buf.len())? };
+        if self.response_type() != RESP_OK_CAPSET {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let payload_len = self.resp_buf.len() - HDR_LEN;
+        let src = self.resp_buf.phys_addr().raw() + HDR_LEN as u64;
+        let mut out = alloc::vec![0u8; payload_len];
+        // SAFETY: the response descriptor covers `resp_buf.len()` bytes and
+        // the vector owns exactly `payload_len` writable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), payload_len) };
+        Ok(out)
     }
 
     /// Cached scanout mode (a copy — the lock is released before
@@ -352,31 +548,42 @@ impl VirtioGpuPci {
     /// # Safety
     /// Caller holds the request gate.
     unsafe fn init_scanout_inner(&self) -> Result<(), VirtioPciError> {
-        // Query GET_DISPLAY_INFO. We don't actually use the host
-        // resolution — our scanout buffer is fixed at SCANOUT_W ×
-        // SCANOUT_H (32×32) so it fits in one DMA page — but the
-        // probe round-trip proves the controlq is healthy.
+        // Query GET_DISPLAY_INFO and choose a full desktop-sized resource.
+        // Hosts may advertise a mode above our current contiguous scanout
+        // allocation; cap that case to the known-good 1280×800 fallback.
         let mut display_info = [DisplayMode::default(); MAX_SCANOUTS];
         // SAFETY: req/resp buffers are 4 KiB.
         unsafe {
             self.fetch_display_info(&mut display_info)?;
         }
+        let advertised = display_info[0];
+        let (width, height) = if advertised.width != 0
+            && advertised.height != 0
+            && (advertised.width as usize)
+                .saturating_mul(advertised.height as usize)
+                .saturating_mul(4)
+                <= self.scanout_buf.len()
+        {
+            (advertised.width, advertised.height)
+        } else {
+            (FALLBACK_SCANOUT_W, FALLBACK_SCANOUT_H)
+        };
         *self.mode.lock() = DisplayMode {
-            width: SCANOUT_W,
-            height: SCANOUT_H,
-            enabled: display_info[0].enabled,
+            width,
+            height,
+            enabled: advertised.enabled,
         };
 
-        let scanout_bytes = (SCANOUT_W * SCANOUT_H * 4) as usize;
+        let scanout_bytes = (width * height * 4) as usize;
         // SAFETY: queues + buffers prepared.
         unsafe {
-            self.resource_create_2d(1, FMT_B8G8R8X8_UNORM, SCANOUT_W, SCANOUT_H)?;
+            self.resource_create_2d(1, FMT_B8G8R8X8_UNORM, width, height)?;
             self.resource_attach_backing(
                 1,
                 self.scanout_buf.phys_addr().raw(),
                 scanout_bytes as u32,
             )?;
-            self.set_scanout(0, 1, SCANOUT_W, SCANOUT_H)?;
+            self.set_scanout(0, 1, width, height)?;
         }
 
         self.ready.store(true, Ordering::Release);
@@ -404,9 +611,9 @@ impl VirtioGpuPci {
         unsafe {
             Framebuffer::new(
                 self.scanout_buf.phys_addr().raw() as *mut u32,
-                SCANOUT_W,
-                SCANOUT_H,
-                SCANOUT_W,
+                self.mode().width,
+                self.mode().height,
+                self.mode().width,
             )
         }
     }
@@ -419,7 +626,8 @@ impl VirtioGpuPci {
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
             let p = self.scanout_buf.phys_addr().raw() as *mut u32;
-            for i in 0..(SCANOUT_W * SCANOUT_H) as usize {
+            let mode = self.mode();
+            for i in 0..(mode.width * mode.height) as usize {
                 core::ptr::write_volatile(p.add(i), bgra);
             }
             self.flush_inner()
@@ -436,14 +644,15 @@ impl VirtioGpuPci {
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
             let p = self.scanout_buf.phys_addr().raw() as *mut u32;
-            for y in 0..SCANOUT_H as usize {
-                for x in 0..SCANOUT_W as usize {
-                    let in_box = x >= (SCANOUT_W as usize / 2 - 16)
-                        && x < (SCANOUT_W as usize / 2 + 16)
-                        && y >= (SCANOUT_H as usize / 2 - 16)
-                        && y < (SCANOUT_H as usize / 2 + 16);
+            let mode = self.mode();
+            for y in 0..mode.height as usize {
+                for x in 0..mode.width as usize {
+                    let in_box = x >= (mode.width as usize / 2 - 16)
+                        && x < (mode.width as usize / 2 + 16)
+                        && y >= (mode.height as usize / 2 - 16)
+                        && y < (mode.height as usize / 2 + 16);
                     let c = if in_box { 0xFF00FFFFu32 } else { 0xFFFF00FFu32 };
-                    core::ptr::write_volatile(p.add(y * SCANOUT_W as usize + x), c);
+                    core::ptr::write_volatile(p.add(y * mode.width as usize + x), c);
                 }
             }
             self.flush_inner()
@@ -472,8 +681,9 @@ impl VirtioGpuPci {
     unsafe fn flush_inner(&self) -> Result<(), VirtioPciError> {
         // SAFETY: req/resp buffers + queue prepared.
         unsafe {
-            self.transfer_to_host_2d(1, 0, 0, SCANOUT_W, SCANOUT_H)?;
-            self.resource_flush(1, 0, 0, SCANOUT_W, SCANOUT_H)?;
+            let mode = self.mode();
+            self.transfer_to_host_2d(1, 0, 0, mode.width, mode.height)?;
+            self.resource_flush(1, 0, 0, mode.width, mode.height)?;
         }
         Ok(())
     }
@@ -568,6 +778,23 @@ impl VirtioGpuPci {
         }
     }
 
+    /// Copy a complete virtio-gpu wire request into the shared coherent
+    /// request buffer. Used by typed 3D builders which carry a non-zero
+    /// context id in the common header.
+    fn write_raw_request(&self, request: &[u8]) {
+        assert!(request.len() <= self.req_buf.len());
+        // SAFETY: `req_buf` is coherent, kernel-mapped DMA memory and the
+        // caller has bounded `request` to its allocation length. Ordering
+        // against the device is provided by `submit`'s fence before notify.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                request.as_ptr(),
+                self.req_buf.phys_addr().raw() as *mut u8,
+                request.len(),
+            );
+        }
+    }
+
     /// Internal: read the response type word from the start of resp_buf.
     fn response_type(&self) -> u32 {
         let p = self.resp_buf.phys_addr().raw();
@@ -585,8 +812,9 @@ impl VirtioGpuPci {
         unsafe {
             self.submit(HDR_LEN, HDR_LEN + MAX_SCANOUTS * 24)?;
         }
-        if self.response_type() != RESP_OK_DISPLAY_INFO {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
+        let response = self.response_type();
+        if response != RESP_OK_DISPLAY_INFO {
+            return Err(VirtioPciError::UnexpectedResponse(response));
         }
         let p = self.resp_buf.phys_addr().raw();
         for (i, slot) in out.iter_mut().enumerate().take(MAX_SCANOUTS) {
@@ -627,8 +855,9 @@ impl VirtioGpuPci {
         unsafe {
             self.submit(HDR_LEN + 16, HDR_LEN)?;
         }
-        if self.response_type() != RESP_OK_NODATA {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
+        let response = self.response_type();
+        if response != RESP_OK_NODATA {
+            return Err(VirtioPciError::UnexpectedResponse(response));
         }
         Ok(())
     }
@@ -652,8 +881,9 @@ impl VirtioGpuPci {
         unsafe {
             self.submit(HDR_LEN + body.len(), HDR_LEN)?;
         }
-        if self.response_type() != RESP_OK_NODATA {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
+        let response = self.response_type();
+        if response != RESP_OK_NODATA {
+            return Err(VirtioPciError::UnexpectedResponse(response));
         }
         Ok(())
     }
@@ -678,8 +908,9 @@ impl VirtioGpuPci {
         unsafe {
             self.submit(HDR_LEN + body.len(), HDR_LEN)?;
         }
-        if self.response_type() != RESP_OK_NODATA {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
+        let response = self.response_type();
+        if response != RESP_OK_NODATA {
+            return Err(VirtioPciError::UnexpectedResponse(response));
         }
         Ok(())
     }

@@ -55,7 +55,10 @@ pub mod incompat {
     /// What this driver actually knows how to handle. Any bit set
     /// in the superblock that ISN'T in this mask means we refuse to
     /// mount (the volume uses a feature we'd misinterpret).
-    pub const SUPPORTED: u32 = FILETYPE | EXTENTS | SIXTYFOURBIT | FLEX_BG | RECOVER;
+    // `CSUM_SEED` alters only the checksum seed; the mount path validates
+    // that seed and mounts metadata-checksummed volumes read-only until all
+    // metadata writers can regenerate their checksums.
+    pub const SUPPORTED: u32 = FILETYPE | EXTENTS | SIXTYFOURBIT | FLEX_BG | RECOVER | CSUM_SEED;
 }
 
 /// `s_feature_ro_compat` bits — if any unknown bit is set the
@@ -157,6 +160,12 @@ pub struct Superblock {
     /// holds the journal file (typically 8). Used together with
     /// `compat::HAS_JOURNAL` to locate the JBD2 journal for replay.
     pub journal_inum: u32,
+    /// `s_uuid` (offset 104). Used to derive the metadata checksum seed on
+    /// ext4 filesystems that do not set `csum_seed`.
+    pub uuid: [u8; 16],
+    /// `s_checksum_seed` (offset 624). Meaningful only with
+    /// `INCOMPAT_CSUM_SEED`.
+    pub checksum_seed: u32,
 }
 
 /// `s_state` value meaning "filesystem was unmounted cleanly".
@@ -236,6 +245,16 @@ impl Superblock {
         } else {
             0
         };
+        let uuid = if buf.len() >= 120 {
+            buf[104..120].try_into().expect("checked UUID bounds")
+        } else {
+            [0; 16]
+        };
+        let checksum_seed = if buf.len() >= 628 {
+            u32::from_le_bytes([buf[624], buf[625], buf[626], buf[627]])
+        } else {
+            0
+        };
 
         Some(Self {
             inodes_count,
@@ -254,6 +273,8 @@ impl Superblock {
             desc_size,
             state,
             journal_inum,
+            uuid,
+            checksum_seed,
         })
     }
 
@@ -268,6 +289,17 @@ impl Superblock {
     /// bit set AND `s_journal_inum` is non-zero).
     pub fn has_journal(&self) -> bool {
         self.feature_compat & compat::HAS_JOURNAL != 0 && self.journal_inum != 0
+    }
+
+    /// True when ext4 metadata blocks carry CRC32C checksums.
+    pub fn has_metadata_csum(&self) -> bool {
+        self.feature_ro_compat & ro_compat::METADATA_CSUM != 0
+    }
+
+    /// True when ext4 supplies `s_checksum_seed` instead of deriving the
+    /// metadata checksum seed from `s_uuid`.
+    pub fn uses_csum_seed(&self) -> bool {
+        self.feature_incompat & incompat::CSUM_SEED != 0
     }
 
     /// Classify the volume's flavour. Tracks ext-family evolution:

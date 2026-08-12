@@ -2876,6 +2876,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Mount the UEFI EFI System Partition before PID 1 starts.  This
+            // is selected from the GPT ESP type GUID, never from a volatile
+            // device name or an image-specific FAT UUID.  Systemd then sees
+            // the already-mounted fstab target through /proc/self/mountinfo.
+            narf_init::register(narf_init::Stage::Late, "efi-system-partition-mount", || {
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                match narf_filesystem::root_mount::try_mount_efi_system_partition(&auth) {
+                    Ok(report) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: {:?} ESP on {} mounted at \"/boot\"",
+                            report.fs_type,
+                            report.device_name,
+                        );
+                        narf_init::InitResult::Ok
+                    }
+                    Err(narf_filesystem::root_mount::RootMountError::NoMountable) => {
+                        narf_init::InitResult::NotPresent
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: ESP mount failed: {:?}",
+                            error,
+                        );
+                        narf_init::InitResult::Error("EFI System Partition mount failed")
+                    }
+                }
+            });
+
             // Wave-50: secondary mount at /mnt. Walks the block
             // registry, skipping the device root-mount-auto already
             // consumed (FAT-on-nvme0 in QEMU), and mounts the first
@@ -3264,6 +3294,25 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // (get_or_create_child). libudev/libinput enumerate input here.
             narf_init::register(narf_init::Stage::Late, "sysfs-input-class", || {
                 narf_filesystem::sysfs::populate_input_class();
+                narf_init::InitResult::Ok
+            });
+
+            // The early SysFs population happens before PCI probing, so it
+            // cannot see virtio-blk's GPT children. Re-populate the block
+            // class after all drivers have registered; systemd-udevd's
+            // coldplug then sees `/sys/class/block/vblk0p1/uevent` with
+            // DEVTYPE=partition and can satisfy fstab UUID .device units.
+            narf_init::register(narf_init::Stage::Late, "sysfs-block-class", || {
+                narf_filesystem::sysfs::populate_block_class();
+                // Only the finished block projection is replayable. Earlier
+                // bring-up uevents can predate their completed sysfs object.
+                narf_filesystem::uevent::begin_boot_udevd_replay();
+                let events = narf_filesystem::sysfs::emit_block_device_add_events();
+                let _ = writeln!(
+                    console::Writer,
+                    "  sysfs-block-class: queued {} canonical block ADD event(s)",
+                    events,
+                );
                 narf_init::InitResult::Ok
             });
 

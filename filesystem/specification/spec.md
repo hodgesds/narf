@@ -656,6 +656,12 @@ without leaving callers parked indefinitely.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+Block devices have canonical kobjects at
+`/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
+discovery views. Block `add` uevents and `/sys/dev/block/<major>:<minor>`
+links name the canonical device kobject, so systemd-udevd can construct an
+`sd_device`, apply filesystem-identification rules, and satisfy fstab UUID
+mount dependencies.
 The perf discovery projection is
 `/sys/bus/event_source/devices/{cpu,software,narf_trace}`: it publishes PMU type numbers,
 the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
@@ -738,6 +744,19 @@ inodes, directories, symlinks, sparse data blocks, packed fragments, ID
 metadata, xattrs, stable inode identities, statx and statfs are decoded with
 strict `s_bytes_used` and decompression bounds. Every fallible mutation hook
 returns `FsError::ReadOnly`.
+
+### 3.12 EFI System Partition bootstrap mount
+
+`root_mount::try_mount_efi_system_partition()` mounts one FAT filesystem at
+`/boot` for the installed CachyOS system only when its registered GPT partition metadata has the UEFI EFI
+System Partition type GUID. It does not encode a block device name, a partition
+label, or a filesystem UUID. The boot initcall runs after the selected root
+mount and before PID 1 so systemd observes the existing fstab target through
+its mount table. After late block sysfs population, boot marks a bounded replay
+window and queues canonical `/devices/virtual/block/<name>` ADD events. udevd
+replays only that finished projection, not arbitrary earlier bring-up events;
+this lets it create the ESP UUID device unit even if its userspace trigger
+helper is unavailable during early setup.
 
 Zlib and legacy LZ4 images are supported. LZMA, LZO, XZ and Zstandard images
 are rejected at mount with `FsError::Unsupported` until bounded no_std

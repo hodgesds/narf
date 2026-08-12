@@ -527,14 +527,30 @@ fn resolve_gpu_backend(arch: Arch, display: &str, requested: GpuBackend) -> GpuB
 }
 
 fn qemu_display_arg(display: &str, backend: GpuBackend) -> String {
-    if backend == GpuBackend::Virgl
-        && display != "none"
-        && !display.split(',').any(|part| part.starts_with("gl="))
-    {
-        format!("{display},gl=on")
-    } else {
-        display.to_string()
+    let mut options = display.to_string();
+
+    if options == "gtk" || options.starts_with("gtk,") {
+        // The desktop image uses virtio keyboard + tablet devices.  GTK does
+        // not hand host input to those devices until it has grabbed the
+        // window, which otherwise leaves a visible but non-interactive
+        // Wayland desktop until the user knows to press Ctrl-Alt-G.  Grab
+        // automatically as the pointer enters the guest instead.
+        if !options
+            .split(',')
+            .any(|part| part.starts_with("grab-on-hover="))
+        {
+            options.push_str(",grab-on-hover=on");
+        }
     }
+
+    if backend == GpuBackend::Virgl
+        && options != "none"
+        && !options.split(',').any(|part| part.starts_with("gl="))
+    {
+        options.push_str(",gl=on");
+    }
+
+    options
 }
 
 #[cfg(test)]
@@ -566,10 +582,17 @@ mod gpu_backend_tests {
             virtio_gpu_device_arg(args.gpu_backend),
             "virtio-gpu-gl-pci,id=vgpu0,disable-legacy=on,disable-modern=off"
         );
-        assert_eq!(qemu_display_arg("gtk", args.gpu_backend), "gtk,gl=on");
+        assert_eq!(
+            qemu_display_arg("gtk", args.gpu_backend),
+            "gtk,grab-on-hover=on,gl=on"
+        );
         assert_eq!(
             qemu_display_arg("gtk,gl=off", args.gpu_backend),
-            "gtk,gl=off"
+            "gtk,gl=off,grab-on-hover=on"
+        );
+        assert_eq!(
+            qemu_display_arg("gtk,grab-on-hover=off", GpuBackend::Virtio2d),
+            "gtk,grab-on-hover=off"
         );
     }
 }
@@ -821,12 +844,18 @@ impl Arch {
                     // QEMU smoke harness exercises the full
                     // xHCI → HID-boot-keyboard → narf_input pipeline.
                     args.extend_from_slice(&["-device".into(), "usb-kbd,bus=xhci0.0".into()]);
-                    args.extend_from_slice(&[
-                        "-vga".into(),
-                        "none".into(),
-                        "-device".into(),
-                        "bochs-display,id=bochs0".into(),
-                    ]);
+                    args.extend_from_slice(&["-vga".into(), "none".into()]);
+                    // VirGL must be the only display adapter.  Leaving the
+                    // Bochs fallback attached gives KWin two DRM devices;
+                    // its libdrm probe can then associate card0's render
+                    // path with the 1234:1111 fallback instead of the
+                    // 1af4:1050 virtio-gpu transport.
+                    if gpu_backend != GpuBackend::Virgl {
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "bochs-display,id=bochs0".into(),
+                        ]);
+                    }
                     args.extend_from_slice(&[
                         "-audiodev".into(),
                         "none,id=snd0".into(),

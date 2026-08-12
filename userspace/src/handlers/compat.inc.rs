@@ -2036,6 +2036,20 @@ fn current_mount_id_at(path: &str) -> Option<u64> {
     }
 }
 
+/// Whether `path` is the visible root of a mount in the calling task's
+/// namespace. This is deliberately an exact-path lookup: a file *under* a
+/// mount inherits its mount ID, but is not itself a mount root.
+fn current_path_is_mount_root(path: &str) -> bool {
+    let path = if path == "/" {
+        path
+    } else {
+        path.trim_end_matches('/')
+    };
+    current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|mount| mount == path))
+        .unwrap_or_else(|| narf_filesystem::registry().list().iter().any(|mount| mount == path))
+}
+
 pub(crate) fn current_mount_arc(
     authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
     path: &str,

@@ -387,8 +387,10 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
     // Register a partition with a label.
     let dev = FakeBlockDevice::filled(4, 512, 0x55);
     let meta = PartitionMetadata {
+        gpt_type_guid: alloc::string::String::new(),
         partlabel: alloc::string::String::from("NARF_ROOT_TEST"),
         partuuid: alloc::string::String::from("aaaaaaaa-0000-0000-0000-bbbbbbbbbbbb"),
+        fs_uuid: alloc::string::String::new(),
     };
     register_block_device_with_meta("nvme0p1-lbltest", dev, Some(meta));
 
@@ -423,8 +425,10 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
     let snap2 = __snapshot_for_test();
     let dev2 = FakeBlockDevice::filled(4, 512, 0x55);
     let meta2 = PartitionMetadata {
+        gpt_type_guid: alloc::string::String::new(),
         partlabel: alloc::string::String::from("NARF_ROOT_TEST"),
         partuuid: alloc::string::String::new(),
+        fs_uuid: alloc::string::String::new(),
     };
     register_block_device_with_meta("nvme0p1-lbltest2", dev2, Some(meta2));
 
@@ -448,6 +452,53 @@ fn smoke_devfs_block_disk_by_label_lookup() -> TestResult {
 kernel_test_in!(
     "filesystem/devfs_block",
     smoke_devfs_block_disk_by_label_lookup
+);
+
+// systemd turns fstab's `UUID=7FC5-5A22` into a .device job for this path.
+// The EFI partition therefore must be discoverable through DevFs, not merely
+// recorded in the block registry.
+fn smoke_devfs_block_disk_by_uuid_lookup() -> TestResult {
+    use crate::{DevFs, FileType, FsInstance};
+    use narf_block::registry::{
+        PartitionMetadata, __reset_for_test, __restore_for_test, __snapshot_for_test,
+        register_block_device_with_meta,
+    };
+
+    let snap = __snapshot_for_test();
+    __reset_for_test();
+    let meta = PartitionMetadata {
+        gpt_type_guid: alloc::string::String::new(),
+        partlabel: alloc::string::String::new(),
+        partuuid: alloc::string::String::new(),
+        fs_uuid: alloc::string::String::from("7FC5-5A22"),
+    };
+    register_block_device_with_meta(
+        "vblk0p1-uuidtest",
+        FakeBlockDevice::filled(4, 512, 0x55),
+        Some(meta),
+    );
+
+    let root = DevFs::new().root();
+    let result = root
+        .lookup_dir("disk")
+        .and_then(|disk| disk.lookup_dir("by-uuid"))
+        .and_then(|by_uuid| by_uuid.lookup("7fc5-5a22"));
+    __restore_for_test(snap);
+
+    match result {
+        Some(file) if file.stat().mode.file_type == FileType::Symlink => {
+            let mut target = [0u8; 64];
+            match poll_once(file.read(0, &mut target)) {
+                Some(Ok(n)) if &target[..n] == b"../../vblk0p1-uuidtest" => TestResult::Pass,
+                _ => TestResult::Fail("by-uuid symlink has the wrong target"),
+            }
+        }
+        _ => TestResult::Fail("by-uuid did not resolve the FAT volume UUID"),
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_disk_by_uuid_lookup
 );
 
 // ── Test 9: BlockFile::read returns 0 at EOF ─────────────────────────
