@@ -34,6 +34,50 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
         path_str
     } else if dirfd >= 0 {
+        // A detached mount returned by fsmount(2) is a directory fd even
+        // though it intentionally has no pathname.  systemd's credential
+        // setup reopens it with `openat(mfd, ".", O_DIRECTORY|O_CLOEXEC)`
+        // before populating and attaching the credentials tmpfs.  Routing
+        // every relative dirfd through fd_path_for_task rejected that valid
+        // operation as EBADF because detached mounts are pathless.
+        //
+        // Do not generalize this to arbitrary pathless descriptors: a pipe,
+        // socket, or fs-context is not a directory.  A MountObjectFile is
+        // explicitly directory-typed and may be reopened as a new reference
+        // to the same detached mount, exactly like Linux's fd_reopen helper.
+        if path_str == "." {
+            let task = current_task_id();
+            let mount = fd::with_table(task, |t| {
+                t.get(dirfd as u32).and_then(|entry| {
+                    entry
+                        .ops
+                        .mount_object_id()
+                        .map(|_| entry.ops.clone())
+                })
+            })
+            .flatten();
+            if let Some(ops) = mount {
+                let status_flags =
+                    (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
+                let fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
+                    crate::fd::FD_CLOEXEC
+                } else {
+                    0
+                };
+                let reopened = fd::with_table(task, |t| {
+                    t.open(crate::fd::FdEntry {
+                        ops,
+                        offset: 0,
+                        flags: fd_flags,
+                        status_flags,
+                    })
+                });
+                ctx.set_return(SyscallReturn::ok(
+                    reopened.map(|fd| fd as u64).unwrap_or((-1i64) as u64),
+                ));
+                return;
+            }
+        }
         match fd_path_for_task(current_task_id(), dirfd as u32) {
             Some(dir) if dir.starts_with('/') => {
                 alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
