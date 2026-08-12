@@ -606,6 +606,7 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
     };
 
     crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
     let snap = __snapshot_for_test();
     __reset_for_test();
     register_block_device_with_meta(
@@ -619,17 +620,35 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
         }),
     );
     crate::sysfs::populate_block_class();
-    let text = crate::sysfs::sysfs_root()
+    let kobj = crate::sysfs::sysfs_root()
         .get_child("devices")
         .and_then(|devices| devices.get_child("virtual"))
         .and_then(|virtual_devices| virtual_devices.get_child("block"))
-        .and_then(|block| block.get_child("smoke-uevpart1"))
-        .and_then(|kobj| kobj.attr_show("uevent"));
+        .and_then(|block| block.get_child("smoke-uevpart1"));
+    let text = kobj.as_ref().and_then(|kobj| kobj.attr_show("uevent"));
+    let mut reader = UeventReader::new();
+    if let Some(kobj) = &kobj {
+        kobject_emit_uevent(kobj, UeventAction::Add);
+    }
+    let netlink = reader
+        .drain(1)
+        .into_iter()
+        .next()
+        .map(|event| String::from_utf8_lossy(&event.to_netlink_bytes()).to_string());
     __restore_for_test(snap);
 
     match text {
-        Some(text) if text.contains("DEVTYPE=partition") => TestResult::Pass,
-        _ => TestResult::Fail("partition block uevent did not carry DEVTYPE=partition"),
+        Some(text)
+            if text.contains("DEVTYPE=partition")
+                && text.contains("ID_FS_UUID=7FC5-5A22")
+                && text.contains("ID_FS_UUID_ENC=7FC5-5A22")
+                && netlink
+                    .as_deref()
+                    .is_some_and(|event| event.contains("ID_FS_USAGE=filesystem")) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("partition block uevent omitted filesystem identity"),
     }
 }
 #[cfg(feature = "linux-compat")]

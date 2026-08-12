@@ -783,6 +783,23 @@ pub fn populate_block_class() {
         } else {
             "disk"
         };
+        // A filesystem UUID is already discovered while registering a
+        // partition.  Carry it through the ADD event so udev can associate
+        // the existing `/dev/disk/by-uuid/<uuid>` devfs alias with this
+        // device.  In particular, systemd turns fstab's `UUID=...` entries
+        // into device jobs and waits for this identity, rather than merely
+        // probing whether the path happens to be resolvable.
+        let fs_identity = dev
+            .partition
+            .as_ref()
+            .filter(|partition| !partition.fs_uuid.is_empty())
+            .map(|partition| {
+                format!(
+                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\n",
+                    partition.fs_uuid, partition.fs_uuid
+                )
+            })
+            .unwrap_or_default();
 
         // `/sys/class/block/<name>` remains a directory-shaped compatibility
         // view for consumers which enumerate the class directly.  The actual
@@ -808,8 +825,8 @@ pub fn populate_block_class() {
         add_writable_uevent(
             &kobj,
             format!(
-                "MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE={}\n",
-                BLOCK_EXT_MAJOR, minor, name, devtype
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE={}\n{}",
+                BLOCK_EXT_MAJOR, minor, name, devtype, fs_identity
             ),
         );
         kobj.add_symlink("subsystem", "../../../../class/block");
