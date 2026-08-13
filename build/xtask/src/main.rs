@@ -1512,6 +1512,46 @@ fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
     }
 }
 
+/// After a kernel-test run, verify that the btrfs image NARF wrote to on nvme0
+/// (via the boot-time `btrfs-write-smoke`) is still consistent by running host
+/// `btrfs check`. This turns the NARF↔Linux write-interop guarantee into a
+/// CI-enforced invariant. Best-effort: skips when the image is absent (no
+/// kernel-test disk) or `btrfs-progs` is not installed; fails when a present
+/// `btrfs check` reports errors.
+fn verify_btrfs_write_interop() -> Result<()> {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let img = root.join("target").join("narf-nvme-btrfs.img");
+    if !img.exists() {
+        return Ok(());
+    }
+    if std::process::Command::new("btrfs")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
+        return Ok(());
+    }
+    println!("xtask: verifying NARF-written btrfs image with `btrfs check`...");
+    let out = std::process::Command::new("btrfs")
+        .arg("check")
+        .arg(&img)
+        .output()
+        .context("failed to run `btrfs check`")?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() && combined.contains("no error found") {
+        println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
+        Ok(())
+    } else {
+        eprintln!("{combined}");
+        bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
+    }
+}
+
 fn nvme_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     // During a kernel-test run, serve a real laptop-style btrfs image on nvme0
@@ -7941,7 +7981,9 @@ fn main() -> Result<()> {
                     .filter(|f| !f.is_empty() && *f != "kernel-test")
                     .collect::<Vec<_>>()
                     .join(",");
-                boot_smoke_cmd(&args)
+                boot_smoke_cmd(&args)?;
+                // Verify NARF's on-disk btrfs writes are still Linux-consistent.
+                verify_btrfs_write_interop()
             })();
             match prior_append {
                 Some(value) => std::env::set_var("XTASK_QEMU_APPEND", value),
