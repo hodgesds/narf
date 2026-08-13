@@ -1007,6 +1007,104 @@ fn smoke_btrfs_write_emits_csums() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_emits_csums);
 
+/// The data extent an inode's single EXTENT_DATA points at: `(disk_bytenr, len)`.
+fn file_data_extent(
+    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+    ino: u64,
+) -> Option<(u64, u64)> {
+    let (fs_root, _) = vol.fs_tree_root();
+    let items = poll_once(btree::collect_for(
+        vol,
+        fs_root,
+        ino,
+        format::EXTENT_DATA_KEY,
+    ))?
+    .ok()?;
+    let (_k, body) = items.first()?;
+    Some((format::le64(body, 21).ok()?, format::le64(body, 29).ok()?))
+}
+
+/// Whether the extent tree has an `EXTENT_ITEM` for `(logical, length)`.
+fn extent_item_present(
+    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+    logical: u64,
+    length: u64,
+) -> bool {
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok((extent_root, _))) = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    )) else {
+        return false;
+    };
+    let key = BtrfsKey::new(logical, format::EXTENT_ITEM_KEY, length);
+    matches!(
+        poll_once(btree::find_item(vol, extent_root, &key)),
+        Some(Ok(Some(_)))
+    )
+}
+
+/// After a COW write, the extent tree must record the new data extent and have
+/// freed the old one — the accounting that makes the image `btrfs check`-clean
+/// and Linux read-write-mountable. Regression-guards it in the in-kernel suite
+/// (the host `btrfs check` runs only where btrfs-progs is installed).
+fn smoke_btrfs_write_extent_accounting() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let ino = big.ino();
+    let old_extent = match file_data_extent(&vol, ino) {
+        Some(e) => e,
+        None => return TestResult::Fail("could not read big.dat's extent"),
+    };
+    // The old extent is accounted before the write.
+    if !extent_item_present(&vol, old_extent.0, old_extent.1) {
+        return TestResult::Fail("pre-write extent not in extent tree");
+    }
+
+    if !matches!(poll_once(big.write(0, &replacement_big())), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+
+    // Remount and inspect the extent tree.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup failed"),
+    };
+    let new_extent = match file_data_extent(&vol2, big2.ino()) {
+        Some(e) => e,
+        None => return TestResult::Fail("could not read new extent"),
+    };
+    // The write must have moved the extent (genuine COW), recorded the new one,
+    // and freed the old one.
+    if new_extent.0 == old_extent.0 {
+        return TestResult::Fail("extent was not COWed to a new location");
+    }
+    if !extent_item_present(&vol2, new_extent.0, new_extent.1) {
+        return TestResult::Fail("new extent not recorded in extent tree");
+    }
+    if extent_item_present(&vol2, old_extent.0, old_extent.1) {
+        return TestResult::Fail("old extent not freed from extent tree");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same
