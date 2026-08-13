@@ -32,8 +32,10 @@ real laptop's btrfs root looks like.
 - **Hardlinks** (shared inode number + `nlink`) and **special files**
   (char/block device nodes and FIFOs, typed via mode; `rdev` decoded into
   statx `rdev_major`/`rdev_minor`).
-- **COW writes**: overwrite, partial write, append and grow of an uncompressed
-  single-regular-extent file (read-modify-write into one new extent) — see below.
+- **COW writes** (overwrite / partial / append / grow of an uncompressed
+  single-extent file) that are **fully Linux-interoperable**: the resulting
+  filesystem mounts read-write on a real kernel and passes `btrfs check` — see
+  below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
   and `mount -t btrfs`, including `subvolid=N` / `subvol=NAME` (single-component
   name) to root at a specific subvolume. A plain mount honors the on-disk
@@ -53,27 +55,41 @@ than mis-read:
   xattr *writes*; multi-component `subvol=a/b` paths.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
-## Basic COW write — scope and limits
+## COW writes — full Linux interop
 
-`FileOps::write` supports only a **full, same-size overwrite** (offset 0,
-`len == size`) of an existing regular, uncompressed, single-extent file; every
-other write (partial, append, grow/shrink, inline file, compressed, multi-extent)
-returns `ReadOnly` / `Unsupported`.
+`FileOps::write` supports overwrite, partial write, append and grow of an
+existing regular, uncompressed, single-`EXTENT_DATA` file in the default
+subvolume (inline files, compressed or multi-extent files, and nested-subvolume
+writes return `Unsupported` / `ReadOnly`).
 
-The write is genuine copy-on-write: a fresh data extent is allocated above the
-extent-tree high-water mark, the fs tree and root tree are COWed (old nodes left
-byte-for-byte intact on disk), and a new superblock (generation + 1) is written
-last to switch atomically. This driver can therefore remount its own image and
-read the new data back.
+Each write is a genuine copy-on-write **mini-transaction** that produces a
+filesystem a real Linux kernel mounts **read-write** and that `btrfs check`
+reports clean — verified end to end (`NARF writes → host mount -o loop reads +
+writes → btrfs check "no error found" → both files read back`). Per write it:
 
-Deliberate limitations of this "basic" path (it is **not** written for interop
-with a live Linux kernel):
+1. allocates + writes a new data extent and its per-sector CRC32C **data
+   checksums** (CSUM tree updated, old extent's csums removed);
+2. rebuilds the fs leaf (`EXTENT_DATA` repointed/resized, `INODE_ITEM` updated);
+3. rebuilds the **extent tree** leaf — frees the old data extent + old COWed
+   metadata blocks, records the new data extent (`EXTENT_DATA_REF`) and every new
+   metadata block (skinny `METADATA_ITEM` + `TREE_BLOCK_REF`), and fixes the block
+   group's `used`;
+4. rebuilds the root leaf (FS/CSUM/EXTENT `ROOT_ITEM`s repointed, incl.
+   generation);
+5. writes a fresh superblock (generation + 1) last, atomically switching.
 
-- No new-chunk allocation — a full covering chunk yields `NoSpace`.
-- The **extent tree** and **csum tree** are not updated, so the new extent is
-  unaccounted and carries no data checksum. NARF does not verify data checksums
-  on read, so read-back is correct; a Linux kernel that verifies data csums
-  would not.
+Because the extent leaf must record its own new block, this is only tractable
+when the fs/csum/root/extent trees are each a **single leaf** (a fresh small
+image); larger allocations are pre-computed so the transaction is closed-form,
+sidestepping the delayed-ref loop real btrfs uses.
+
+Bounds (all fail loudly): single-leaf trees only, **no node splitting**
+(`NoSpace` on a full leaf), no new-chunk allocation, no space reclaim
+(freed logical addresses aren't reused), and images with a **free-space tree**
+(`space_cache=v2`) or a **64 MiB superblock mirror** are out of scope for writes
+(so the laptop-scale fixture is read-only). The write-interop guarantee is
+CI-enforced: `cargo xtask test` runs host `btrfs check` on the NARF-written image
+when `btrfs-progs` is available.
 
 ## Test fixtures
 
