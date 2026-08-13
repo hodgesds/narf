@@ -795,8 +795,8 @@ pub fn populate_block_class() {
             .filter(|partition| !partition.fs_uuid.is_empty())
             .map(|partition| {
                 format!(
-                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\n",
-                    partition.fs_uuid, partition.fs_uuid
+                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\nDEVLINKS=/dev/disk/by-uuid/{}\n",
+                    partition.fs_uuid, partition.fs_uuid, partition.fs_uuid
                 )
             })
             .unwrap_or_default();
