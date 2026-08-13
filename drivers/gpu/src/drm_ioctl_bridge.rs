@@ -94,6 +94,12 @@ impl VirtGpuRenderState {
     }
 }
 
+impl Default for VirtGpuRenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static NEXT_VIRTGPU_RESOURCE_ID: AtomicU32 = AtomicU32::new(2);
 
 fn read_uapi<T: Copy>(arg: usize) -> Result<T, FsError> {
@@ -216,9 +222,8 @@ pub fn dispatch_virtgpu_render(
             let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
             let (resource_id, _phys, bytes) =
                 state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
-            let end = (req.offset as usize)
-                .checked_add(req.layer_stride.max(req.stride) as usize)
-                .unwrap_or(usize::MAX);
+            let end =
+                (req.offset as usize).saturating_add(req.layer_stride.max(req.stride) as usize);
             if end > bytes || req.w == 0 || req.h == 0 || req.d == 0 {
                 return Err(FsError::InvalidData);
             }
@@ -249,6 +254,9 @@ pub fn dispatch_virtgpu_render(
                 .virgl_capset(req.cap_set_id, req.cap_set_ver)
                 .map_err(|_| FsError::Unsupported)?;
             let n = caps.len().min(req.size as usize);
+            // SAFETY: `req.addr` is non-zero, `n` is bounded by both the
+            // returned capset and the caller's declared buffer size, and
+            // copy_out validates the complete userspace destination range.
             unsafe { copy_out(req.addr as usize, &caps[..n])? };
             req.size = n as u32;
             write_uapi(arg, req)?;
@@ -274,6 +282,9 @@ pub fn dispatch_virtgpu_render(
             // pointer. This makes the resource ownership check independent of
             // virgl command parsing (which belongs to the host renderer).
             if req.num_bo_handles != 0 {
+                // SAFETY: the count is capped at 256 above, multiplication by
+                // four cannot overflow, and copy_in validates the entire
+                // userspace handle-array range before returning owned bytes.
                 let bytes =
                     unsafe { copy_in(req.bo_handles as usize, req.num_bo_handles as usize * 4)? };
                 for chunk in bytes.chunks_exact(4) {
@@ -282,6 +293,9 @@ pub fn dispatch_virtgpu_render(
                     state.find(handle).ok_or(FsError::PermissionDenied)?;
                 }
             }
+            // SAFETY: the command size is non-zero and bounded to the
+            // controlQ request page above; copy_in validates the complete
+            // userspace source range and returns an owned buffer.
             let commands = unsafe { copy_in(req.command as usize, req.size as usize)? };
             let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
             dev.submit_virgl(&commands)

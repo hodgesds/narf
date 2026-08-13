@@ -382,6 +382,9 @@ impl VirtioGpuPci {
         }
         // A 3D resource uses the normal, context-free backing attach
         // command, then becomes visible to the context through ATTACH.
+        // SAFETY: the request gate remains held, the physical range is
+        // non-zero and length-checked above, and the caller's documented GEM
+        // ownership keeps the coherent backing alive until resource teardown.
         unsafe { self.resource_attach_backing(resource.resource_id, backing_phys, backing_len)? };
         let mut attach = [0u8; cmd::CTX_RESOURCE_LEN];
         cmd::build_ctx_resource(
