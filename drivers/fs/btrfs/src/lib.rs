@@ -62,16 +62,44 @@ fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, F
     Ok(volume)
 }
 
-/// `mount -t btrfs <source>` builder. Accepts only read-only-compatible options
-/// (this driver never claims write semantics it doesn't have) and resolves the
-/// source to a registered block device.
-fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
+/// Parse the `mount -t btrfs` option string into an optional subvolume selector.
+/// Accepts read-only-compatible options plus `subvolid=N` / `subvol=NAME`
+/// (single-component name); anything else is `Unsupported`.
+pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsError> {
+    let mut selector = None;
     for option in options.split(',').filter(|s| !s.is_empty()) {
-        if option != "ro" && option != "errors=continue" {
+        if option == "ro" || option == "errors=continue" {
+            continue;
+        } else if let Some(v) = option.strip_prefix("subvolid=") {
+            let id: u64 = v.parse().map_err(|_| FsError::InvalidData)?;
+            selector = Some(volume::Subvol::Id(id));
+        } else if let Some(v) = option.strip_prefix("subvol=") {
+            // Only a single-component name (optionally slash-wrapped) is
+            // supported; a multi-level subvolume path is not.
+            let name = v.trim_matches('/');
+            if name.is_empty() || name.contains('/') {
+                return Err(FsError::Unsupported);
+            }
+            selector = Some(volume::Subvol::Name(alloc::string::String::from(name)));
+        } else {
             return Err(FsError::Unsupported);
         }
     }
+    Ok(selector)
+}
+
+/// `mount -t btrfs <source>` builder. Resolves the source to a registered block
+/// device and honours `subvol=`/`subvolid=`.
+fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
+    let subvol = parse_mount_subvol(options)?;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
-    btrfs_factory(dev)
+    let async_dev = SyncBlock::new(dev);
+    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol(
+        async_dev,
+        DomainId::DRIVER_0,
+        true,
+        subvol,
+    ))?;
+    Ok(volume)
 }

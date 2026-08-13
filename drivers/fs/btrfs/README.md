@@ -25,7 +25,8 @@ implementation (no C is copied).
 - Basic **COW write**: a full, same-size overwrite of an existing uncompressed
   single-regular-extent file — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
-  and `mount -t btrfs`.
+  and `mount -t btrfs`, including `subvolid=N` / `subvol=NAME` (single-component
+  name) to root at a specific subvolume.
 
 ## Not supported (rejected loudly)
 
@@ -38,7 +39,7 @@ than mis-read:
   `num_devices != 1`.
 - Non-CRC32C checksums (xxhash/sha256/blake2).
 - Writes into a nested subvolume (only the default subvolume is writable);
-  xattr *writes*.
+  xattr *writes*; multi-component `subvol=a/b` paths.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## Basic COW write — scope and limits
@@ -70,8 +71,10 @@ with a live Linux kernel):
 `mkfs.btrfs` images (a 16 MiB image is ~90 KiB of non-zero data). Both hold the
 same tree — `hello.txt` (with a `user.narf` xattr), `big.dat`, `subdir/note.txt`,
 `link.txt` (a symlink), and `snap/inside.txt` where `snap` is a nested
-subvolume. The kernel tests reconstruct the full zero-filled image at runtime
-and mount it under a `RamBlockDevice`.
+subvolume. `fixture-manyfiles.img.sparse` is a separate 32 MiB image of 400
+small files whose FS tree spans multiple b-tree levels. The kernel tests
+reconstruct the full zero-filled image at runtime and mount it under a
+`RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:

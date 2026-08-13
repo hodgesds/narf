@@ -24,9 +24,20 @@ use narf_lib::id::DomainId;
 use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
 
+use alloc::string::String;
+
 use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::inode::InodeItem;
+
+/// Selects which subvolume a `mount -t btrfs` request roots at.
+#[derive(Clone, Debug)]
+pub enum Subvol {
+    /// `subvolid=N` — a subvolume root objectid.
+    Id(u64),
+    /// `subvol=NAME` — a single-component name under the default subvolume root.
+    Name(String),
+}
 
 /// Volume-owned scratch DMA buffer, serialised across all block submissions.
 #[derive(Debug)]
@@ -171,6 +182,62 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Mount with checksum verification enabled.
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
         Self::mount_opts(device, domain, true).await
+    }
+
+    /// Mount and, if a subvolume is selected, root the volume at that subvolume
+    /// instead of the default `FS_TREE`.
+    pub async fn mount_subvol(
+        device: Arc<B>,
+        domain: DomainId,
+        verify_checksums: bool,
+        subvol: Option<Subvol>,
+    ) -> Result<Arc<Self>, FsError> {
+        let volume = Self::mount_opts(device, domain, verify_checksums).await?;
+        if let Some(sel) = subvol {
+            volume.switch_to_subvol(&sel).await?;
+        }
+        Ok(volume)
+    }
+
+    /// Re-root the volume at the named/identified subvolume: resolve its tree in
+    /// the root tree and cache its root directory inode. Subsequent `root()`
+    /// calls start there.
+    pub async fn switch_to_subvol(&self, sel: &Subvol) -> Result<(), FsError> {
+        let (root_tree, _) = self.root_tree_root();
+        let subvol_id = match sel {
+            Subvol::Id(n) => *n,
+            Subvol::Name(name) => {
+                // Resolve the name in the default FS_TREE root directory; its
+                // location must be a subvolume ROOT_ITEM.
+                let (fs_root, _) = self.fs_tree_root();
+                let key = BtrfsKey::new(
+                    format::FIRST_FREE_OBJECTID,
+                    format::DIR_ITEM_KEY,
+                    u64::from(crate::checksum::name_hash(name.as_bytes())),
+                );
+                let body = crate::btree::find_item(self, fs_root, &key)
+                    .await?
+                    .ok_or(FsError::NotFound)?;
+                let entry = crate::dir::decode_dir_items(&body)?
+                    .into_iter()
+                    .find(|e| &e.name == name)
+                    .ok_or(FsError::NotFound)?;
+                if entry.location.item_type != format::ROOT_ITEM_KEY {
+                    return Err(FsError::NotFound);
+                }
+                entry.location.objectid
+            }
+        };
+        let (subvol_root, subvol_level) =
+            crate::roots::find_root(self, root_tree, subvol_id).await?;
+        let root_inode = self
+            .load_inode_in(subvol_root, format::FIRST_FREE_OBJECTID)
+            .await?;
+        let mut g = self.state.lock();
+        g.fs_tree_root = subvol_root;
+        g.fs_tree_level = subvol_level;
+        g.root_inode = Some(root_inode);
+        Ok(())
     }
 
     /// Mount, optionally disabling checksum verification (test bring-up only).

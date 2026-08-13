@@ -31,6 +31,9 @@ const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.
 /// Same tree written with `--compress zstd`.
 const FIXTURE_ZSTD_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zstd.img.sparse");
 
+/// 400 small files, forcing the FS b-tree to more than one level.
+const FIXTURE_MANYFILES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-manyfiles.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -1032,3 +1035,111 @@ fn smoke_btrfs_subvolume() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume);
+
+// ── Deep (multi-level) b-tree ──────────────────────────────────────
+
+fn smoke_btrfs_deep_tree() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_MANYFILES_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("manyfiles fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    // Enumerate all 400 entries — exercises the cursor's descent through the
+    // level-1 root node and advance across many leaves.
+    let all = match poll_once(root.enumerate_async(0, 1000)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("enumerate all failed"),
+    };
+    if all.len() != 400 {
+        return TestResult::Fail("expected 400 entries in a multi-level tree");
+    }
+    for want in ["file000.txt", "file200.txt", "file399.txt"] {
+        if !all.iter().any(|(n, _)| n == want) {
+            return TestResult::Fail("a boundary file is missing from the listing");
+        }
+    }
+
+    // Paging via the cursor argument returns disjoint, complete slices.
+    let page0 = poll_once(root.enumerate_async(0, 150)).and_then(|r| r.ok());
+    let page2 = poll_once(root.enumerate_async(300, 150)).and_then(|r| r.ok());
+    match (page0, page2) {
+        (Some(a), Some(b)) if a.len() == 150 && b.len() == 100 => {}
+        _ => return TestResult::Fail("paged enumerate returned wrong counts"),
+    }
+
+    // A file in a far leaf resolves and reads back (deep find_item).
+    let f = match poll_once(root.lookup_async("file399.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of a far-leaf file failed"),
+    };
+    match read_all(&f, 64).as_deref() {
+        Some(b"content-of-file-399\n") => TestResult::Pass,
+        _ => TestResult::Fail("far-leaf file content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_deep_tree);
+
+// ── subvol= / subvolid= mount options ──────────────────────────────
+
+fn smoke_btrfs_mount_subvol_option() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    // Option parsing.
+    match crate::parse_mount_subvol("ro,subvol=snap") {
+        Ok(Some(crate::volume::Subvol::Name(ref n))) if n == "snap" => {}
+        _ => return TestResult::Fail("subvol=snap did not parse"),
+    }
+    match crate::parse_mount_subvol("subvolid=256") {
+        Ok(Some(crate::volume::Subvol::Id(256))) => {}
+        _ => return TestResult::Fail("subvolid=256 did not parse"),
+    }
+    if crate::parse_mount_subvol("subvol=a/b").is_ok() {
+        return TestResult::Fail("multi-level subvol path should be rejected");
+    }
+    if crate::parse_mount_subvol("bogus=1").is_ok() {
+        return TestResult::Fail("unknown option should be rejected");
+    }
+
+    // Mounting with subvol=snap roots the volume inside the subvolume.
+    let dev = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_SPARSE));
+    let sel = Some(crate::volume::Subvol::Name("snap".into()));
+    let vol = match poll_once(BtrfsVolume::mount_subvol(
+        dev,
+        DomainId::DRIVER_0,
+        true,
+        sel,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount subvol=snap failed"),
+    };
+    let entries = match poll_once(vol.root().enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("subvol root enumerate failed"),
+    };
+    // The subvolume root contains inside.txt and NOT the parent's hello.txt.
+    if !entries.iter().any(|(n, _)| n == "inside.txt")
+        || entries.iter().any(|(n, _)| n == "hello.txt")
+    {
+        return TestResult::Fail("subvol root listing is not the subvolume's");
+    }
+
+    // subvolid= reaching the same subvolume works too (snap's id resolved by
+    // switching a default mount, then mounting by that id).
+    let probe = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("probe mount failed"),
+    };
+    if poll_once(probe.switch_to_subvol(&crate::volume::Subvol::Name("snap".into())))
+        .map(|r| r.is_err())
+        .unwrap_or(true)
+    {
+        return TestResult::Fail("switch_to_subvol by name failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_subvol_option);
