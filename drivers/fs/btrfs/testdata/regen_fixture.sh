@@ -14,6 +14,7 @@
 #   fixture-zlib.img.sparse  --compress zlib (exercises the zlib read path)
 #   fixture-zstd.img.sparse  --compress zstd (exercises the zstd read path)
 #   fixture-manyfiles.img.sparse  400 files -> a multi-level FS b-tree
+#   fixture-defaultsubvol.img.sparse  default subvolume set to `def`
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
 # big.dat (12000 B -> regular extents), subdir/note.txt, link.txt (a symlink to
@@ -99,12 +100,26 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgzst" >/dev/null
 sparse_encode "$imgzst" fixture-zstd.img.sparse
 
+# A tiny image whose default subvolume is set to `def` (not FS_TREE), so a plain
+# mount must land inside `def` rather than at the top-level FS_TREE.
+defstage="$(mktemp -d)"
+imgdef="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$defstage" "$imgdef"' EXIT
+mkdir -p "$defstage/def"
+printf 'root file\n' > "$defstage/rootfile.txt"
+printf 'default subvol file\n' > "$defstage/def/dfile.txt"
+truncate -s 16M "$imgdef"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^free-space-tree,^no-holes --subvol default:def --rootdir "$defstage" "$imgdef" >/dev/null
+btrfs check "$imgdef" >/dev/null
+sparse_encode "$imgdef" fixture-defaultsubvol.img.sparse
+
 # A separate tree of 400 small (inline) files, forcing the FS b-tree to grow to
 # more than one level so tests exercise internal-node descent and leaf-to-leaf
 # cursor advance. Needs a 32 MiB image for the extra metadata.
 many="$(mktemp -d)"
 imgmany="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$many" "$imgmany"' EXIT
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$defstage" "$imgdef" "$many" "$imgmany"' EXIT
 python3 -c "
 for i in range(400):
     open('$many/file%03d.txt'%i,'w').write('content-of-file-%03d\n'%i)
@@ -115,4 +130,4 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgmany" >/dev/null
 sparse_encode "$imgmany" fixture-manyfiles.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-manyfiles}.img.sparse"
+echo "regenerated fixture{,-zlib,-zstd,-defaultsubvol,-manyfiles}.img.sparse"

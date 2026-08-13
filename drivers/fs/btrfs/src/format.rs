@@ -43,6 +43,9 @@ pub const ROOT_TREE_OBJECTID: u64 = 1;
 pub const EXTENT_TREE_OBJECTID: u64 = 2;
 pub const CHUNK_TREE_OBJECTID: u64 = 3;
 pub const FS_TREE_OBJECTID: u64 = 5;
+/// Directory objectid inside the root tree that holds the "default" subvolume
+/// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
+pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
 /// First object id available to files/dirs; also the fs-tree root directory.
 pub const FIRST_FREE_OBJECTID: u64 = 256;

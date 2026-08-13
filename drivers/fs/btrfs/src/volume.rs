@@ -350,7 +350,39 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         //    it without I/O.
         let root_inode = self.load_inode(format::FIRST_FREE_OBJECTID).await?;
         self.state.lock().root_inode = Some(root_inode);
+
+        // 4. Honor the on-disk default subvolume, if one is set to a subvolume
+        //    other than FS_TREE (an explicit `subvolid=`/`subvol=` overrides this
+        //    afterwards in `mount_subvol`).
+        if let Some(id) = self.default_subvol_id(root_tree).await? {
+            if id != format::FS_TREE_OBJECTID {
+                self.switch_to_subvol(&Subvol::Id(id)).await?;
+            }
+        }
         Ok(())
+    }
+
+    /// The objectid of the on-disk default subvolume, from the root tree's
+    /// `ROOT_TREE_DIR` "default" `DIR_ITEM`. `None` if unset.
+    async fn default_subvol_id(&self, root_tree: u64) -> Result<Option<u64>, FsError> {
+        let key = BtrfsKey::new(
+            format::ROOT_TREE_DIR_OBJECTID,
+            format::DIR_ITEM_KEY,
+            u64::from(crate::checksum::name_hash(b"default")),
+        );
+        let body = match crate::btree::find_item(self, root_tree, &key).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let entry = crate::dir::decode_dir_items(&body)?
+            .into_iter()
+            .find(|e| e.name == "default");
+        match entry {
+            Some(e) if e.location.item_type == format::ROOT_ITEM_KEY => {
+                Ok(Some(e.location.objectid))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Read and decode the inode item `(ino, INODE_ITEM, 0)` from the default

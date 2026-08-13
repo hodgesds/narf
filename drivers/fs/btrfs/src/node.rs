@@ -316,11 +316,16 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
         Box::pin(async move {
             let block_size = self.sectorsize();
-            let blocks = self.total_bytes() / u64::from(block_size.max(1));
+            let bs = u64::from(block_size.max(1));
+            let blocks = self.total_bytes() / bs;
+            // `bytes_used` from the superblock is the allocated (data+metadata)
+            // total — a reasonable df approximation for free space.
+            let used = self.superblock().bytes_used / bs;
+            let free = blocks.saturating_sub(used);
             Ok(FsStat {
                 blocks,
-                blocks_free: 0,
-                blocks_available: 0,
+                blocks_free: free,
+                blocks_available: free,
                 files: 0,
                 files_free: 0,
                 block_size,

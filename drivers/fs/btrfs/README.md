@@ -29,7 +29,10 @@ implementation (no C is copied).
   single-regular-extent file — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
   and `mount -t btrfs`, including `subvolid=N` / `subvol=NAME` (single-component
-  name) to root at a specific subvolume.
+  name) to root at a specific subvolume. A plain mount honors the on-disk
+  **default subvolume** (`ROOT_TREE_DIR`'s "default" entry).
+- **statfs** reports total/free blocks (free approximated from the superblock's
+  `bytes_used`).
 
 ## Not supported (rejected loudly)
 

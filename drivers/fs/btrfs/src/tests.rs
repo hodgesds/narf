@@ -34,6 +34,10 @@ const FIXTURE_ZSTD_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zstd.img.
 /// 400 small files, forcing the FS b-tree to more than one level.
 const FIXTURE_MANYFILES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-manyfiles.img.sparse");
 
+/// The on-disk default subvolume is `def` (not FS_TREE).
+const FIXTURE_DEFAULTSUBVOL_SPARSE: &[u8] =
+    include_bytes!("../testdata/fixture-defaultsubvol.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -1247,3 +1251,71 @@ fn smoke_btrfs_rdev_decode() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rdev_decode);
+
+// ── Default subvolume + statfs ─────────────────────────────────────
+
+fn smoke_btrfs_default_subvolume() -> TestResult {
+    use narf_filesystem::FsInstance;
+    // A plain mount must honor the on-disk default subvolume: this image's
+    // default is `def`, so the root lists dfile.txt, not the top-level
+    // FS_TREE's rootfile.txt.
+    let vol = match mount_sparse(FIXTURE_DEFAULTSUBVOL_SPARSE) {
+        Ok(v) => v,
+        _ => return TestResult::Fail("defaultsubvol fixture failed to mount"),
+    };
+    let entries = match poll_once(vol.root().enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("root enumerate failed"),
+    };
+    if !entries.iter().any(|(n, _)| n == "dfile.txt")
+        || entries.iter().any(|(n, _)| n == "rootfile.txt")
+    {
+        return TestResult::Fail("plain mount did not land in the default subvolume");
+    }
+    // subvolid=5 explicitly overrides the default and reaches the top-level tree.
+    let dev = narf_block::ram::RamBlockDevice::from_image(
+        512,
+        decode_sparse(FIXTURE_DEFAULTSUBVOL_SPARSE),
+    );
+    let top = match poll_once(BtrfsVolume::mount_subvol(
+        dev,
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount subvolid=5 failed"),
+    };
+    let top_entries = poll_once(top.root().enumerate_async(0, 64)).and_then(|r| r.ok());
+    match top_entries {
+        Some(e) if e.iter().any(|(n, _)| n == "rootfile.txt") => TestResult::Pass,
+        _ => TestResult::Fail("subvolid=5 did not reach the top-level tree"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_default_subvolume);
+
+fn smoke_btrfs_statfs() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let st = match poll_once(vol.statfs()) {
+        Some(Ok(st)) => st,
+        _ => return TestResult::Fail("statfs failed"),
+    };
+    // 16 MiB image, 4096-byte blocks -> 4096 total blocks; some used, some free.
+    if st.block_size != 4096 || st.blocks != 4096 {
+        return TestResult::Fail("statfs block geometry wrong");
+    }
+    if st.blocks_free == 0 || st.blocks_free >= st.blocks {
+        return TestResult::Fail("statfs free-block count implausible");
+    }
+    if st.name_len != 255 {
+        return TestResult::Fail("statfs name_len wrong");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_statfs);
