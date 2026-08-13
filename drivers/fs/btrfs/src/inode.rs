@@ -10,6 +10,7 @@ const OFF_NLINK: usize = 40;
 const OFF_UID: usize = 44;
 const OFF_GID: usize = 48;
 const OFF_MODE: usize = 52;
+const OFF_RDEV: usize = 56;
 const OFF_MTIME_SEC: usize = 136;
 const OFF_MTIME_NSEC: usize = 144;
 /// Minimum decodable inode-item length (through the mtime timespec).
@@ -34,6 +35,8 @@ pub struct InodeItem {
     pub uid: u32,
     pub gid: u32,
     pub nlink: u32,
+    /// Device number for a char/block special file (`0` otherwise).
+    pub rdev: u64,
     pub mtime_sec: i64,
     pub mtime_nsec: u32,
 }
@@ -50,9 +53,19 @@ impl InodeItem {
             uid: le32(body, OFF_UID)?,
             gid: le32(body, OFF_GID)?,
             nlink: le32(body, OFF_NLINK)?,
+            rdev: le64(body, OFF_RDEV)?,
             mtime_sec: le64(body, OFF_MTIME_SEC)? as i64,
             mtime_nsec: le32(body, OFF_MTIME_NSEC)?,
         })
+    }
+
+    /// Decompose `rdev` into `(major, minor)` per the Linux `dev_t` encoding
+    /// (`glibc gnu_dev_major`/`gnu_dev_minor`).
+    pub fn rdev_major_minor(&self) -> (u32, u32) {
+        let d = self.rdev;
+        let major = (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
+        let minor = ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
+        (major, minor)
     }
 
     /// Low 12 permission/special mode bits.

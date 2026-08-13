@@ -22,6 +22,9 @@ implementation (no C is copied).
 - **Nested subvolumes** (read-only): a `ROOT_ITEM` directory entry is resolved
   through the root tree and entered at its own fs tree, so subvolumes and
   snapshots are navigable.
+- **Hardlinks** (shared inode number + `nlink`) and **special files**
+  (char/block device nodes and FIFOs, typed via mode; `rdev` decoded into
+  statx `rdev_major`/`rdev_minor`).
 - Basic **COW write**: a full, same-size overwrite of an existing uncompressed
   single-regular-extent file — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)

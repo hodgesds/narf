@@ -1143,3 +1143,107 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_subvol_option);
+
+// ── Hardlinks ──────────────────────────────────────────────────────
+
+fn smoke_btrfs_hardlink() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+    let orig = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hello.txt failed"),
+    };
+    let link = match poll_once(root.lookup_async("hardlink.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hardlink.txt failed"),
+    };
+    // Both names resolve to the same inode.
+    if orig.ino() == 0 || orig.ino() != link.ino() {
+        return TestResult::Fail("hardlink does not share the inode");
+    }
+    // The shared inode reports a link count of 2.
+    let sx = match poll_once(link.statx_async(0, 0)) {
+        Some(Ok(sx)) => sx,
+        _ => return TestResult::Fail("statx failed"),
+    };
+    if sx.nlink != 2 {
+        return TestResult::Fail("hardlinked inode nlink != 2");
+    }
+    // And the content is identical.
+    match read_all(&link, 64).as_deref() {
+        Some(b"narf\n") => TestResult::Pass,
+        _ => TestResult::Fail("hardlink content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_hardlink);
+
+// ── Special files (device nodes / FIFO) ────────────────────────────
+
+fn smoke_btrfs_special_files() -> TestResult {
+    use narf_filesystem::{FileType, FsInstance};
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    // Enumeration reports the right VFS file types.
+    let entries = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("enumerate failed"),
+    };
+    let ftype = |name: &str| entries.iter().find(|(n, _)| n == name).map(|(_, t)| *t);
+    if ftype("nulldev") != Some(FileType::Special)
+        || ftype("blkdev") != Some(FileType::Block)
+        || ftype("fifo") != Some(FileType::Fifo)
+    {
+        return TestResult::Fail("special-file types wrong in listing");
+    }
+
+    // The char device stats as S_IFCHR. (mkfs.btrfs --rootdir preserves the
+    // node type but stores rdev == 0, so the device numbers themselves are not
+    // asserted here; the rdev decode is covered by a pure test below.)
+    let nulldev = match poll_once(root.lookup_async("nulldev")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup nulldev failed"),
+    };
+    if nulldev.stat().mode.file_type != FileType::Special {
+        return TestResult::Fail("nulldev stat not Special");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_special_files);
+
+fn smoke_btrfs_rdev_decode() -> TestResult {
+    // Linux dev_t decomposition (glibc gnu_dev_major/minor).
+    let mk = |rdev: u64| {
+        let inode = crate::inode::InodeItem {
+            size: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            rdev,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+        };
+        inode.rdev_major_minor()
+    };
+    // Small classic encodings.
+    if mk(0x103) != (1, 3) || mk(0x800) != (8, 0) {
+        return TestResult::Fail("small dev_t decode wrong");
+    }
+    // Minor above 0xff exercises the high-minor path (makedev(1, 256)).
+    if mk(0x10_0100) != (1, 256) {
+        return TestResult::Fail("large-minor dev_t decode wrong");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rdev_decode);

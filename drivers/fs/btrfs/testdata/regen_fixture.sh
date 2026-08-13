@@ -17,8 +17,9 @@
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
 # big.dat (12000 B -> regular extents), subdir/note.txt, link.txt (a symlink to
-# hello.txt), and snap/inside.txt where snap is created as a nested subvolume
-# (its dir entry resolves to a ROOT_ITEM).
+# hello.txt), hardlink.txt (a hard link to hello.txt), nulldev/blkdev/fifo
+# (device + FIFO special files), and snap/inside.txt where snap is created as a
+# nested subvolume (its dir entry resolves to a ROOT_ITEM).
 #
 # Pinned so a future btrfs-progs can't silently drift the layout:
 #   --csum crc32c            driver only supports CRC32C
@@ -44,6 +45,10 @@ python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)
 printf 'nested file\n' > "$stage/subdir/note.txt"
 printf 'inside subvol\n' > "$stage/snap/inside.txt"               # file in the snap subvolume
 ln -s hello.txt "$stage/link.txt"                                  # symlink
+ln "$stage/hello.txt" "$stage/hardlink.txt"                        # hardlink (shares hello.txt's inode)
+mknod "$stage/nulldev" c 1 3                                       # char device 1:3
+mknod "$stage/blkdev" b 8 0                                        # block device 8:0
+mkfifo "$stage/fifo"                                               # FIFO
 setfattr -n user.narf -v hi "$stage/hello.txt"                     # xattr
 
 sparse_encode() { # <image> <dst.sparse>

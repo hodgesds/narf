@@ -172,6 +172,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 seconds: self.inode.mtime_sec,
                 nanoseconds: self.inode.mtime_nsec,
             };
+            let (rdev_major, rdev_minor) = self.inode.rdev_major_minor();
             Ok(FsStatx {
                 mask: STATX_BASIC_STATS,
                 block_size: self.volume().map(|v| v.sectorsize()).unwrap_or(4096),
@@ -186,6 +187,8 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 atime: mtime,
                 ctime: mtime,
                 mtime,
+                rdev_major,
+                rdev_minor,
                 ..FsStatx::default()
             })
         })
