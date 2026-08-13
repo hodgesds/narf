@@ -8,8 +8,8 @@
 //! under the `no-holes` feature — simply the absence of an item over that range;
 //! either way the gap reads as zeros. Preallocated extents also read as zeros.
 //!
-//! zlib- and zstd-compressed extents (inline and regular) are decompressed on
-//! read; LZO is rejected with `Unsupported` rather than returning wrong bytes.
+//! zlib-, zstd- and LZO-compressed extents (inline and regular) are
+//! decompressed on read.
 
 use alloc::vec::Vec;
 
@@ -21,8 +21,9 @@ use crate::format::{self, le64};
 use crate::volume::BtrfsVolume;
 
 /// Decompress a whole compressed extent according to its algorithm. zlib and
-/// zstd are supported; LZO yields `Unsupported`.
-fn decompress(compression: u8, input: &[u8]) -> Result<Vec<u8>, FsError> {
+/// zstd are single streams; LZO is btrfs's sector-segmented framing, which needs
+/// `sectorsize`.
+fn decompress(compression: u8, input: &[u8], sectorsize: usize) -> Result<Vec<u8>, FsError> {
     match compression {
         format::COMPRESS_ZLIB => {
             miniz_oxide::inflate::decompress_to_vec_zlib(input).map_err(|_| FsError::InvalidData)
@@ -37,7 +38,7 @@ fn decompress(compression: u8, input: &[u8]) -> Result<Vec<u8>, FsError> {
                 .map_err(|_| FsError::InvalidData)?;
             Ok(out)
         }
-        format::COMPRESS_LZO => Err(FsError::Unsupported),
+        format::COMPRESS_LZO => crate::lzo::decompress_extent(input, sectorsize),
         _ => Err(FsError::InvalidData),
     }
 }
@@ -134,6 +135,7 @@ pub async fn read_file<B: BlockDevice + 'static>(
         return Ok(0);
     }
     let want = dst.len().min((size - offset) as usize);
+    let sectorsize = vol.sectorsize() as usize;
     let extents = btree::collect_for(vol, tree_root, ino, format::EXTENT_DATA_KEY).await?;
 
     // Zero the window first; extents overwrite what they cover, so any hole
@@ -157,7 +159,7 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 let plain = if compression == format::COMPRESS_NONE {
                     data
                 } else {
-                    decompress(compression, &data)?
+                    decompress(compression, &data, sectorsize)?
                 };
                 for pos in ov_start..ov_end {
                     let src_idx = (pos - file_start) as usize;
@@ -196,7 +198,7 @@ pub async fn read_file<B: BlockDevice + 'static>(
                     let raw = vol
                         .read_logical(disk_bytenr, disk_num_bytes as usize)
                         .await?;
-                    let plain = decompress(compression, &raw)?;
+                    let plain = decompress(compression, &raw, sectorsize)?;
                     for pos in ov_start..ov_end {
                         let src_idx = (extent_offset + (pos - file_start)) as usize;
                         if let Some(&byte) = plain.get(src_idx) {

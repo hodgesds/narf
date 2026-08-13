@@ -31,6 +31,9 @@ const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.
 /// Same tree written with `--compress zstd`.
 const FIXTURE_ZSTD_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zstd.img.sparse");
 
+/// Same tree written with `--compress lzo`.
+const FIXTURE_LZO_SPARSE: &[u8] = include_bytes!("../testdata/fixture-lzo.img.sparse");
+
 /// 400 small files, forcing the FS b-tree to more than one level.
 const FIXTURE_MANYFILES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-manyfiles.img.sparse");
 
@@ -991,6 +994,32 @@ fn smoke_btrfs_zstd_read() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_zstd_read);
+
+fn smoke_btrfs_lzo_read() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_LZO_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("lzo fixture failed to mount"),
+    };
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    // big.dat is a multi-segment LZO extent (3 sectors) — full decode.
+    match read_all(&big, want.len() + 16) {
+        Some(got) if got == want => {}
+        _ => return TestResult::Fail("lzo full read mismatch"),
+    }
+    // A partial read that crosses an LZO segment (sector) boundary.
+    let mut mid = [0u8; 20];
+    match poll_once(big.read(4090, &mut mid)) {
+        Some(Ok(20)) if mid[..] == want[4090..4110] => TestResult::Pass,
+        _ => TestResult::Fail("lzo partial read mismatch"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_lzo_read);
 
 // ── Subvolumes ─────────────────────────────────────────────────────
 

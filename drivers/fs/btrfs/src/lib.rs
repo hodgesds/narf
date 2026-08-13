@@ -31,6 +31,7 @@ pub mod dir;
 pub mod extent;
 pub mod format;
 pub mod inode;
+pub mod lzo;
 pub mod node;
 pub mod roots;
 pub mod volume;
