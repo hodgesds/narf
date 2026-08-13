@@ -1738,16 +1738,29 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
         .iter()
         .enumerate()
         .map(|(index, mount)| {
-            let parent = mounts[..index]
+            // Mounts normally arrive parent-first, but boot-time discovery can
+            // attach a known nested filesystem before its backing root is
+            // available (the ESP at /mnt/boot before the distro root at
+            // /mnt).  Parentage is a property of the finished mount tree, not
+            // attachment order, so consider later ancestors too.  Equal-path
+            // overmounts are the exception: their parent is the preceding
+            // layer in that stack, never a layer attached above them later.
+            let parent = mounts
                 .iter()
-                .filter(|candidate| {
-                    mount.path == candidate.path
-                        || candidate.path == "/"
+                .enumerate()
+                .filter(|(candidate_index, candidate)| {
+                    if *candidate_index == index {
+                        return false;
+                    }
+                    if mount.path == candidate.path {
+                        return *candidate_index < index;
+                    }
+                    candidate.path == "/"
                         || (mount.path.starts_with(candidate.path.as_str())
                             && mount.path.as_bytes().get(candidate.path.len()) == Some(&b'/'))
                 })
-                .max_by_key(|candidate| candidate.path.len())
-                .map(|candidate| candidate.id)
+                .max_by_key(|(candidate_index, candidate)| (candidate.path.len(), *candidate_index))
+                .map(|(_, candidate)| candidate.id)
                 .unwrap_or(0);
             (
                 mount.id,

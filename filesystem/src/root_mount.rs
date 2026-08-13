@@ -85,6 +85,11 @@ pub struct MountReport {
 /// unsatisfied even though the FAT volume is available.
 pub const EFI_SYSTEM_PARTITION_MOUNTPOINT: &str = "/boot";
 
+/// Host-view path corresponding to `/boot` for the distro PID 1 rooted at
+/// `/mnt`.  Keeping this separate from the firmware-facing mount makes the
+/// same ESP visible before systemd evaluates the installed system's fstab.
+pub const INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT: &str = "/mnt/boot";
+
 /// Errors specific to root-mount selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RootMountError {
@@ -208,7 +213,8 @@ pub fn try_mount_root_with(
     Err(last_error.unwrap_or(RootMountError::NoMountable))
 }
 
-/// Mount the GPT EFI System Partition at the installed system's `/boot`.
+/// Mount the GPT EFI System Partition at NARF's `/boot` and the installed
+/// system's `/mnt/boot` (visible as `/boot` to its rooted PID 1).
 ///
 /// Selection is deliberately semantic: only a partition whose GPT *type*
 /// GUID is the UEFI ESP GUID is eligible.  The implementation never depends
@@ -246,9 +252,20 @@ pub fn try_mount_efi_system_partition(
                 continue;
             }
         };
-        crate::registry()
-            .mount_arc(authority, EFI_SYSTEM_PARTITION_MOUNTPOINT, fs)
+        let boot_handle = crate::registry()
+            .mount_arc(authority, EFI_SYSTEM_PARTITION_MOUNTPOINT, fs.clone())
             .map_err(|error| RootMountError::FactoryFailed(detect, error))?;
+        if let Err(error) = crate::registry().mount_arc(
+            authority,
+            INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT,
+            fs,
+        ) {
+            // Do not report a half-mounted ESP.  The handle was minted by the
+            // first attach and remains live here, so rollback is best-effort
+            // only in the face of an internal registry inconsistency.
+            let _ = crate::registry().unmount(&boot_handle, EFI_SYSTEM_PARTITION_MOUNTPOINT);
+            return Err(RootMountError::FactoryFailed(detect, error));
+        }
         return Ok(MountReport {
             device_name: String::from(entry.name),
             fs_type: detect,

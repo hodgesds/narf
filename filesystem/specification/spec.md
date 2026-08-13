@@ -747,16 +747,20 @@ returns `FsError::ReadOnly`.
 
 ### 3.12 EFI System Partition bootstrap mount
 
-`root_mount::try_mount_efi_system_partition()` mounts one FAT filesystem at
-`/boot` for the installed CachyOS system only when its registered GPT partition metadata has the UEFI EFI
-System Partition type GUID. It does not encode a block device name, a partition
-label, or a filesystem UUID. The boot initcall runs after the selected root
-mount and before PID 1 so systemd observes the existing fstab target through
-its mount table. After late block sysfs population, boot marks a bounded replay
-window and queues canonical `/devices/virtual/block/<name>` ADD events. udevd
-replays only that finished projection, not arbitrary earlier bring-up events;
-this lets it create the ESP UUID device unit even if its userspace trigger
-helper is unavailable during early setup.
+`root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
+both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed
+CachyOS PID 1 rooted at `/mnt`. It does so only when the registered GPT
+partition metadata has the UEFI EFI System Partition type GUID; it does not
+encode a block device name, partition label, or filesystem UUID. The nested
+attachment may precede the `/mnt` root attachment during boot, so mountinfo
+derives parentage from the finished tree rather than requiring parent-first
+registration. The boot initcall runs before PID 1 so systemd observes the
+existing fstab target through its mount table. After late block sysfs
+population, boot marks a bounded replay window and queues canonical
+`/devices/virtual/block/<name>` ADD events. udevd replays only that finished
+projection, not arbitrary earlier bring-up events; this lets it create the ESP
+UUID device unit even if its userspace trigger helper is unavailable during
+early setup.
 
 Zlib and legacy LZ4 images are supported. LZMA, LZO, XZ and Zstandard images
 are rejected at mount with `FsError::Unsupported` until bounded no_std

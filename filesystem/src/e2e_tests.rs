@@ -543,3 +543,105 @@ fn smoke_e2e_efi_mount_selects_only_gpt_esp() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/e2e", smoke_e2e_efi_mount_selects_only_gpt_esp);
+
+fn test_fat_factory(
+    _dev: Arc<dyn BlockDeviceSync>,
+) -> Result<Arc<dyn crate::FsInstance>, crate::FsError> {
+    Ok(Arc::new(crate::MemFs::new("test-fat")))
+}
+
+// The distro PID 1 is rooted at /mnt, while firmware-facing NARF paths use
+// /. The ESP therefore has to be visible at both /boot and /mnt/boot. During
+// boot the nested mount is attached before /mnt, so this also pins mountinfo's
+// finished-tree parentage rather than relying on attachment order.
+fn smoke_e2e_efi_mount_visible_inside_installed_root() -> TestResult {
+    use crate::root_mount::{
+        __reset_for_test, register_fs_factory, try_mount_efi_system_partition,
+        EFI_SYSTEM_PARTITION_MOUNTPOINT, INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT,
+    };
+    use crate::{bootstrap_mount_authority, registry, MemFs, MountPoint, Write};
+    use narf_block::fs_detect::FsType;
+    use narf_block::registry::{
+        __reset_for_test as reset_blocks, __restore_for_test, __snapshot_for_test,
+        register_block_device_with_meta,
+    };
+    use narf_capabilities::Cap;
+
+    let snapshot = __snapshot_for_test();
+    reset_blocks();
+    __reset_for_test();
+
+    let device = FakeBlockDevice::new_1mib();
+    {
+        let mut bytes = device.data.lock();
+        bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+        bytes[13] = 8;
+        bytes[16] = 2;
+        bytes[82..90].copy_from_slice(b"FAT32   ");
+        bytes[510] = 0x55;
+        bytes[511] = 0xAA;
+    }
+    register_block_device_with_meta(
+        "semantic-esp",
+        device,
+        Some(PartitionMetadata {
+            gpt_type_guid: String::from("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"),
+            partlabel: String::from("ignored"),
+            partuuid: String::from("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            fs_uuid: String::from("CAFE-BABE"),
+        }),
+    );
+    register_fs_factory(FsType::Fat, test_fat_factory);
+
+    let auth = bootstrap_mount_authority();
+    let mounted = try_mount_efi_system_partition(&auth).is_ok();
+    // Reproduce the real initcall order: the nested ESP is known before the
+    // installed root filesystem is attached at /mnt.
+    let root_handle = registry().mount(&auth, "/mnt", MemFs::new("test-root"));
+
+    let boot_is_fat = registry().resolve_absolute(EFI_SYSTEM_PARTITION_MOUNTPOINT, |fs, _| {
+        fs.name() == "test-fat"
+    }) == Some(true);
+    let rooted_boot_is_fat =
+        registry().resolve_absolute(INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT, |fs, _| {
+            fs.name() == "test-fat"
+        }) == Some(true);
+    let rows = registry().list_mountinfo();
+    let root_id = rows
+        .iter()
+        .rev()
+        .find(|(_, _, path, name)| path == "/mnt" && name == "test-root")
+        .map(|(id, _, _, _)| *id);
+    let rooted_boot_parent = rows
+        .iter()
+        .rev()
+        .find(|(_, _, path, name)| {
+            path == INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT && name == "test-fat"
+        })
+        .map(|(_, parent, _, _)| *parent);
+
+    if let Ok(handle) = root_handle {
+        let _ = registry().unmount(&handle, "/mnt");
+    }
+    let cleanup: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
+    let _ = registry().unmount(&cleanup, INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT);
+    let _ = registry().unmount(&cleanup, EFI_SYSTEM_PARTITION_MOUNTPOINT);
+    __reset_for_test();
+    reset_blocks();
+    __restore_for_test(snapshot);
+
+    if mounted
+        && boot_is_fat
+        && rooted_boot_is_fat
+        && root_id.is_some()
+        && rooted_boot_parent == root_id
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ESP was not visible with correct parentage inside installed root")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e",
+    smoke_e2e_efi_mount_visible_inside_installed_root
+);
