@@ -1471,8 +1471,57 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     img
 }
 
+/// Reconstruct a full disk image from a committed `NARFBTR1` sparse fixture
+/// (see `drivers/fs/btrfs/testdata/regen_fixture.sh`). The output is written as
+/// a sparse file (holes read as zeros), so a 128 MiB logical image costs only
+/// its non-zero payload on disk. Idempotent: skips when the target already has
+/// the right length. No external tools — CI-safe.
+fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let sparse = match std::fs::read(root.join(sparse_rel)) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if sparse.len() < 20 || &sparse[0..8] != b"NARFBTR1" {
+        return;
+    }
+    let total = u64::from_le_bytes(sparse[8..16].try_into().unwrap());
+    if let Ok(m) = std::fs::metadata(out) {
+        if m.len() == total {
+            return;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut f) = std::fs::File::create(out) else {
+        return;
+    };
+    let _ = f.set_len(total);
+    let n_runs = u32::from_le_bytes(sparse[16..20].try_into().unwrap()) as usize;
+    let mut p = 20usize;
+    for _ in 0..n_runs {
+        let off = u64::from_le_bytes(sparse[p..p + 8].try_into().unwrap());
+        let len = u64::from_le_bytes(sparse[p + 8..p + 16].try_into().unwrap()) as usize;
+        p += 16;
+        if f.seek(SeekFrom::Start(off)).is_ok() {
+            let _ = f.write_all(&sparse[p..p + len]);
+        }
+        p += len;
+    }
+}
+
 fn nvme_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    // During a kernel-test run, serve a real laptop-style btrfs image on nvme0
+    // so the boot-time `btrfs-disk-smoke` initcall exercises the driver against
+    // real (QEMU NVMe) hardware. Nothing consumes nvme0's content otherwise.
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        let path = root.join("target").join("narf-nvme-btrfs.img");
+        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-laptop.img.sparse", &path);
+        return path;
+    }
     let path = root.join("target").join("narf-nvme.img");
     if !path.exists() {
         if let Some(parent) = path.parent() {

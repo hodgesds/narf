@@ -20,13 +20,13 @@ extern crate alloc;
 extern crate narf_bluetooth as _;
 extern crate narf_drivers_crypto as _;
 extern crate narf_drivers_fs_9p as _;
+extern crate narf_drivers_fs_btrfs;
 extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat;
 extern crate narf_drivers_fs_iso9660 as _;
 extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_squashfs;
-extern crate narf_drivers_fs_btrfs;
 extern crate narf_drivers_fs_udf as _;
 extern crate narf_drivers_psp as _;
 extern crate narf_edid as _;
@@ -2810,6 +2810,70 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 } else {
                     narf_init::InitResult::NotPresent
                 }
+            });
+
+            // btrfs read smoke: if any registered block device holds a btrfs
+            // filesystem (the kernel-test run attaches a real laptop-style btrfs
+            // image on nvme0), mount its volume via the registered factory and
+            // read a file straight off the hardware — proving the whole
+            // detect -> factory -> mount -> read path works on a real disk, not
+            // just the in-kernel RamBlockDevice tests. NotPresent (harmless) when
+            // no btrfs device is attached, e.g. interactive/distro boots.
+            narf_init::register(narf_init::Stage::Late, "btrfs-disk-smoke", || {
+                use narf_block::fs_detect::{detect_filesystem, FsType};
+                for entry in &narf_block::block_devices() {
+                    let dev = entry.dev.clone();
+                    if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
+                        continue;
+                    }
+                    let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    let fs = match factory(dev) {
+                        Ok(fs) => fs,
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: mount failed on {}: {:?}",
+                                entry.name,
+                                e
+                            );
+                            return narf_init::InitResult::Error("btrfs mount failed");
+                        }
+                    };
+                    let root = fs.root();
+                    // The laptop image's default subvolume is `root`, which holds
+                    // rootfile.txt; read it straight off the disk.
+                    let read = narf_scheduler::block_on(async {
+                        let file = root.lookup_async("rootfile.txt").await?;
+                        let mut buf = [0u8; 64];
+                        let n = file.read(0, &mut buf).await?;
+                        Ok::<_, narf_filesystem::FsError>((buf, n))
+                    });
+                    match read {
+                        Ok((buf, n)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: {} mounted, read rootfile.txt ({} bytes): {:?}",
+                                entry.name,
+                                n,
+                                core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>")
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: {} mounted but read failed: {:?}",
+                                entry.name,
+                                e
+                            );
+                            return narf_init::InitResult::Error("btrfs read failed");
+                        }
+                    }
+                }
+                narf_init::InitResult::NotPresent
             });
 
             // Populate /sys/class/input/event<N> from the live evdev router.
