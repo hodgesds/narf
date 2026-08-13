@@ -946,3 +946,55 @@ fn smoke_uevent_e2e_coldplug_skips_containers() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_skips_containers);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 15 — later device projections preserve the first replay boundary
+//
+// DRM and block sysfs are completed by separate Stage::Late initcalls. The
+// second begin must extend the existing window, not move its start past DRM.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_boot_replay_preserves_earliest_projection() -> TestResult {
+    reset();
+
+    // An incomplete early device must remain outside the bounded replay.
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/early/incomplete".to_string(),
+        "early".to_string(),
+    );
+
+    let drm_start = uevent::begin_boot_udevd_replay();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/platform/narf-drm/card0".to_string(),
+        "drm".to_string(),
+    );
+
+    let block_start = uevent::begin_boot_udevd_replay();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/virtual/block/vblk0p1".to_string(),
+        "block".to_string(),
+    );
+
+    if block_start != drm_start {
+        return TestResult::Fail("later projection advanced the boot replay boundary");
+    }
+    let events = uevent::boot_udevd_replay_reader().drain(8);
+    if events.len() != 2 || events[0].subsystem != "drm" || events[1].subsystem != "block" {
+        return TestResult::Fail("boot replay did not retain DRM followed by block ADD");
+    }
+    if events.iter().any(|event| event.subsystem == "early") {
+        return TestResult::Fail("boot replay included an incomplete early device");
+    }
+
+    reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_boot_replay_preserves_earliest_projection
+);

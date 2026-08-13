@@ -53,8 +53,9 @@ use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
     class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
-    kobject_add_uevent_attr, Kobject,
+    kobject_add_uevent_attr, kobject_emit_uevent, Kobject,
 };
+use narf_filesystem::uevent::UeventAction;
 
 /// DRM major device number.
 ///
@@ -70,8 +71,19 @@ const DRM_MAJOR: u32 = 226;
 /// (drivers/gpu/drm/drm_sysfs.c, drm_drv.c).
 pub fn populate_drm_class() {
     let class_drm = class_register("drm");
+    let cards = crate::drm_registry::cards();
 
-    for card in crate::drm_registry::cards() {
+    // systemd-udevd starts after the Stage::Late device projections have
+    // already been built. Mark the first finished graphical projection as
+    // replayable before queuing its ADDs; later block-device coldplug extends
+    // the same window rather than replacing this boundary. Without the DRM
+    // ADD, 71-seat.rules never records `master-of-seat`, logind reports
+    // seat0.CanGraphical=false, and a display manager waits on a black screen.
+    if !cards.is_empty() {
+        narf_filesystem::uevent::begin_boot_udevd_replay();
+    }
+
+    for card in cards {
         let idx = {
             // Determine the index by looking it up in the registry.
             // The registry stores cards in insertion order so the
@@ -441,6 +453,14 @@ fn populate_card_node(
         render_idx,
         &format!("../../devices/platform/narf-drm/{}", render_name),
     );
+
+    // Parent first, then the two DRM minors, matching Linux device
+    // registration ordering. The card ADD is the load-bearing event for
+    // systemd's 71-seat.rules (`seat` + `master-of-seat`); the parent and
+    // render ADDs make udev's PCI and render-node database views complete.
+    kobject_emit_uevent(&dev_kobj, UeventAction::Add);
+    kobject_emit_uevent(&kobj, UeventAction::Add);
+    kobject_emit_uevent(&render_kobj, UeventAction::Add);
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

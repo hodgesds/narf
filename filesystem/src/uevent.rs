@@ -253,14 +253,25 @@ pub fn next_seqnum() -> u64 {
     UEVENT_RING.lock().next_seqnum()
 }
 
-/// Begin the bounded boot coldplug window consumed by `systemd-udevd`.
+/// Begin (or extend) the bounded boot coldplug window consumed by
+/// `systemd-udevd`.
 ///
-/// Call this after sysfs population and immediately before the corresponding
-/// ADD events. Normal uevent monitors remain tail-only.
+/// Call this after a sysfs device projection is complete and immediately
+/// before its corresponding ADD events. The first caller owns the replay
+/// boundary: later completed projections keep that earlier boundary instead
+/// of moving it forward and silently dropping already-queued devices. Normal
+/// uevent monitors remain tail-only.
 pub fn begin_boot_udevd_replay() -> u64 {
     let start = next_seqnum();
-    BOOT_UDEVD_REPLAY_START.store(start as usize, Ordering::Release);
-    start
+    match BOOT_UDEVD_REPLAY_START.compare_exchange(
+        0,
+        start as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => start,
+        Err(existing) => existing as u64,
+    }
 }
 
 /// Reader for the bounded boot coldplug window.

@@ -65,6 +65,10 @@ virtgpu userspace ABI:
   carrying that card's vendor/device IDs and `DRIVER` identity. This mapping
   is required for libdrm/Mesa device discovery when multiple QEMU displays
   (virtio-gpu plus a Bochs fallback) are present.
+- Once that sysfs projection is complete, the PCI parent, primary node, and
+  render node emit ordered ADD uevents inside the bounded boot replay window.
+  This is the interface by which udev applies the `master-of-seat` tag and
+  logind reports the default seat as graphical to display managers.
 
 ## 4. Invariants & safety properties
 

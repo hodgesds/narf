@@ -1373,6 +1373,59 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_render_node_dev_attr);
 
+// ── Smoke 17b: completed DRM projection is boot-replayable ───────────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::{sysfs, uevent};
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    uevent::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let events = uevent::boot_udevd_replay_reader().drain(8);
+    let card = events
+        .iter()
+        .position(|event| event.devpath.ends_with("/card0"));
+    let render = events
+        .iter()
+        .position(|event| event.devpath.ends_with("/renderD128"));
+    let pci = events
+        .iter()
+        .position(|event| event.devpath.ends_with("/0000:00:04.0"));
+
+    let ok = matches!((pci, card, render), (Some(p), Some(c), Some(r)) if p < c && c < r)
+        && events
+            .iter()
+            .all(|event| event.action == uevent::UeventAction::Add)
+        && card.is_some_and(|index| events[index].subsystem == "drm");
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    uevent::__reset_for_test();
+
+    if !ok {
+        return TestResult::Fail(
+            "boot replay lacks ordered PCI, DRM primary, and render ADD events",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_sysfs_adds_enter_boot_udev_replay
+);
+
 // ── Smoke 18: /dev/dri/card0 resolves through DriDir ─────────────────────
 
 fn smoke_devdri_card0_resolves() -> TestResult {

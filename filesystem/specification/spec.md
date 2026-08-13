@@ -665,6 +665,11 @@ mount dependencies. Partition events with a discovered filesystem UUID carry
 both the existing `DEVLINKS=/dev/disk/by-uuid/<uuid>` path and the matching
 `SYSTEMD_ALIAS`; systemd device units are driven by the udev database rather
 than by probing whether the devfs symlink resolves.
+The bounded boot udev replay begins at the first completed late device
+projection and never advances past already-queued ADD events when another
+projection completes. This lets independently registered DRM and block
+devices share one coldplug window without replaying incomplete early-boot
+kobjects or dropping the graphical master before systemd-udevd starts.
 The perf discovery projection is
 `/sys/bus/event_source/devices/{cpu,software,narf_trace}`: it publishes PMU type numbers,
 the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
