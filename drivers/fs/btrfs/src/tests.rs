@@ -815,27 +815,6 @@ fn smoke_btrfs_write_rejections() -> TestResult {
     };
     let root = vol.root();
 
-    // A size-changing write is refused (ReadOnly guard, before COW).
-    let big = match poll_once(root.lookup_async("big.dat")) {
-        Some(Ok(f)) => f,
-        _ => return TestResult::Fail("lookup big.dat failed"),
-    };
-    let mut too_long = replacement_big();
-    too_long.push(b'!');
-    if !matches!(
-        poll_once(big.write(0, &too_long)),
-        Some(Err(FsError::ReadOnly))
-    ) {
-        return TestResult::Fail("size-changing write should be ReadOnly");
-    }
-    // A non-zero offset write is refused.
-    if !matches!(
-        poll_once(big.write(4, b"xxxx")),
-        Some(Err(FsError::ReadOnly))
-    ) {
-        return TestResult::Fail("offset write should be ReadOnly");
-    }
-
     // Overwriting an inline file is unsupported by the regular-extent COW path.
     let hello = match poll_once(root.lookup_async("hello.txt")) {
         Some(Ok(f)) => f,
@@ -847,10 +826,80 @@ fn smoke_btrfs_write_rejections() -> TestResult {
     ) {
         return TestResult::Fail("inline overwrite should be Unsupported");
     }
+
+    // A write into a nested subvolume is ReadOnly (only the default subvol is
+    // writable).
+    let snap = match poll_once(root.lookup_dir_async("snap")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup snap failed"),
+    };
+    let inside = match poll_once(snap.lookup_async("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup snap/inside.txt failed"),
+    };
+    if !matches!(
+        poll_once(inside.write(0, b"xxxxxxxxxxxxxx")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("subvolume write should be ReadOnly");
+    }
     TestResult::Pass
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_rejections);
+
+fn smoke_btrfs_partial_and_append_write() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+
+    // Partial write in the middle (no size change).
+    let patch = b"PATCHED!";
+    match poll_once(big.write(100, patch)) {
+        Some(Ok(n)) if n == patch.len() => {}
+        _ => return TestResult::Fail("partial write failed"),
+    }
+    // Append past EOF (grows the file).
+    let tail = b"APPENDED-TAIL\n";
+    match poll_once(big.write(12000, tail)) {
+        Some(Ok(n)) if n == tail.len() => {}
+        _ => return TestResult::Fail("append write failed"),
+    }
+
+    // Build the expected content and verify via a fresh remount of the on-disk
+    // image (the COW chain must be self-consistent).
+    let mut want = expected_big();
+    want[100..108].copy_from_slice(patch);
+    want.extend_from_slice(tail); // grew to 12000 + tail
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after write failed"),
+    };
+    let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup big.dat failed"),
+    };
+    // Size grew.
+    if big2.stat().size != want.len() as u64 {
+        return TestResult::Fail("file size did not grow to appended length");
+    }
+    match read_all(&big2, want.len() + 16) {
+        Some(got) if got == want => TestResult::Pass,
+        _ => TestResult::Fail("remounted content mismatch after partial+append"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_partial_and_append_write);
 
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 

@@ -158,25 +158,30 @@ async fn find_keyed<B: BlockDevice + 'static>(
     }
 }
 
-/// Fully overwrite file `ino` (current inode `inode`) with `data` via COW.
-pub async fn cow_overwrite_file<B: BlockDevice + 'static>(
+/// Round `x` up to a multiple of `align` (a power of two).
+fn align_up(x: u64, align: u64) -> u64 {
+    (x + (align - 1)) & !(align - 1)
+}
+
+/// Write `data` at byte `offset` into file `ino` via COW: read-modify-write the
+/// whole file into one new extent, growing the file if the write extends past
+/// its current end. Supports overwrite, partial write, append and grow.
+pub async fn cow_write_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
     inode: &InodeItem,
+    offset: u64,
     data: &[u8],
 ) -> Result<usize, FsError> {
     // ── Preconditions ──────────────────────────────────────────────
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
     }
-    if data.len() as u64 != inode.size {
-        // Only a same-size full overwrite is supported (no grow/shrink).
-        return Err(FsError::Unsupported);
-    }
     let (fs_root, fs_level) = vol.fs_tree_root();
     let (root_tree, _root_level) = vol.root_tree_root();
 
-    // The file must be a single regular, uncompressed extent at offset 0.
+    // The file must be a single regular, uncompressed extent at offset 0 (so the
+    // whole file is one EXTENT_DATA item we can rewrite in place).
     let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
     if extents.len() != 1 {
         return Err(FsError::Unsupported);
@@ -185,17 +190,40 @@ pub async fn cow_overwrite_file<B: BlockDevice + 'static>(
     if ed_key.offset != 0 || ed_body.len() < 53 {
         return Err(FsError::Unsupported);
     }
-    // btrfs_file_extent_item: compression@16, type@20, disk_bytenr@21,
-    // disk_num_bytes@29, extent_offset@37.
+    // btrfs_file_extent_item: ram_bytes@8, compression@16, type@20,
+    // disk_bytenr@21, disk_num_bytes@29, extent_offset@37, num_bytes@45.
     if ed_body[16] != 0 || ed_body[20] != format::FILE_EXTENT_REG {
         return Err(FsError::Unsupported);
     }
     if le64(ed_body, 37)? != 0 {
         return Err(FsError::Unsupported); // points mid-shared-extent: out of scope
     }
-    let disk_num_bytes = le64(ed_body, 29)?;
 
-    // ── 1. Allocate + write the new data extent ────────────────────
+    // ── 1. Read-modify-write the file content into one buffer ──────
+    let old_size = inode.size;
+    let end = offset
+        .checked_add(data.len() as u64)
+        .ok_or(FsError::InvalidData)?;
+    let new_size = old_size.max(end);
+    let sectorsize = u64::from(vol.sectorsize());
+    let disk_len = align_up(new_size, sectorsize).max(sectorsize);
+
+    let mut buf = alloc::vec![0u8; new_size as usize];
+    if old_size > 0 {
+        crate::extent::read_file(
+            vol,
+            fs_root,
+            ino,
+            old_size,
+            0,
+            &mut buf[..old_size as usize],
+        )
+        .await?;
+    }
+    let o = offset as usize;
+    buf[o..o + data.len()].copy_from_slice(data);
+
+    // ── 2. Allocate + write the new data extent ────────────────────
     let extent_tree = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
@@ -203,20 +231,25 @@ pub async fn cow_overwrite_file<B: BlockDevice + 'static>(
     let gen = vol.superblock().generation + 1;
     let mut alloc = BumpAllocator::new(high_water);
 
-    let new_extent = alloc.alloc_data(vol, disk_num_bytes)?;
-    let mut payload = data.to_vec();
-    payload.resize(disk_num_bytes as usize, 0);
+    let new_extent = alloc.alloc_data(vol, disk_len)?;
+    let mut payload = buf;
+    payload.resize(disk_len as usize, 0);
     vol.write_logical(new_extent, &payload).await?;
 
-    // ── 2. COW the fs tree (repoint EXTENT_DATA, bump INODE_ITEM) ───
+    // ── 3. COW the fs tree (repoint + resize EXTENT_DATA, INODE_ITEM) ─
     let mut new_ed = ed_body.clone();
+    new_ed[8..16].copy_from_slice(&disk_len.to_le_bytes()); // ram_bytes
     new_ed[21..29].copy_from_slice(&new_extent.to_le_bytes()); // disk_bytenr
+    new_ed[29..37].copy_from_slice(&disk_len.to_le_bytes()); // disk_num_bytes
     new_ed[37..45].copy_from_slice(&0u64.to_le_bytes()); // extent_offset
+    new_ed[45..53].copy_from_slice(&disk_len.to_le_bytes()); // num_bytes
 
     let (inode_key, inode_body) = find_keyed(vol, fs_root, ino, format::INODE_ITEM_KEY).await?;
     let mut new_inode = inode_body.clone();
     new_inode[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
     new_inode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+    new_inode[16..24].copy_from_slice(&new_size.to_le_bytes()); // size
+    new_inode[24..32].copy_from_slice(&disk_len.to_le_bytes()); // nbytes
 
     let new_fs_root = cow_replace_items(
         vol,

@@ -128,21 +128,15 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            // The basic COW path supports only a full, same-size overwrite of an
-            // existing regular file in the default subvolume (see
-            // `write::cow_overwrite_file`). Anything else — a partial write, an
-            // append, a seek'd write, or a write into a nested subvolume — is
-            // rejected rather than silently corrupting the file.
-            if offset != 0 || buf.len() as u64 != self.inode.size {
-                return Err(FsError::ReadOnly);
-            }
             // Only the default subvolume is writable (a pinned subvolume root
-            // would need its own ROOT_ITEM COW).
+            // would need its own ROOT_ITEM COW). The COW write path itself
+            // (`write::cow_write_file`) handles overwrite / partial / append /
+            // grow of a single-regular-extent file and rejects the rest.
             if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::cow_overwrite_file(&vol, self.ino, &self.inode, buf).await
+            crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
         })
     }
 

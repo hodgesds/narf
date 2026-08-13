@@ -32,8 +32,8 @@ real laptop's btrfs root looks like.
 - **Hardlinks** (shared inode number + `nlink`) and **special files**
   (char/block device nodes and FIFOs, typed via mode; `rdev` decoded into
   statx `rdev_major`/`rdev_minor`).
-- Basic **COW write**: a full, same-size overwrite of an existing uncompressed
-  single-regular-extent file — see below.
+- **COW writes**: overwrite, partial write, append and grow of an uncompressed
+  single-regular-extent file (read-modify-write into one new extent) — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
   and `mount -t btrfs`, including `subvolid=N` / `subvol=NAME` (single-component
   name) to root at a specific subvolume. A plain mount honors the on-disk
