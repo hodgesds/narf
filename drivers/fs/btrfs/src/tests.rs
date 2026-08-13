@@ -984,3 +984,51 @@ fn smoke_btrfs_zstd_read() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_zstd_read);
+
+// ── Subvolumes ─────────────────────────────────────────────────────
+
+fn smoke_btrfs_subvolume() -> TestResult {
+    use narf_filesystem::{FileType, FsInstance};
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    // `snap` is a nested subvolume; it lists as a directory in the parent.
+    let entries = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("root enumerate failed"),
+    };
+    if !entries
+        .iter()
+        .any(|(n, t)| n == "snap" && *t == FileType::Dir)
+    {
+        return TestResult::Fail("snap subvolume not listed as a directory");
+    }
+
+    // Descending crosses into the subvolume's own fs tree (ROOT_ITEM location).
+    let snap = match poll_once(root.lookup_dir_async("snap")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir_async(snap) failed"),
+    };
+    let snap_entries = match poll_once(snap.enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("snap enumerate failed"),
+    };
+    if !snap_entries.iter().any(|(n, _)| n == "inside.txt") {
+        return TestResult::Fail("subvolume missing inside.txt");
+    }
+
+    // And a file inside the subvolume reads back its content.
+    let inside = match poll_once(snap.lookup_async("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup inside.txt failed"),
+    };
+    match read_all(&inside, 64).as_deref() {
+        Some(b"inside subvol\n") => TestResult::Pass,
+        _ => TestResult::Fail("subvolume file content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume);

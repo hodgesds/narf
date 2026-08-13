@@ -25,33 +25,52 @@ use crate::volume::BtrfsVolume;
 /// Linux `STATX_BASIC_STATS` — the fields this driver populates.
 const STATX_BASIC_STATS: u32 = 0x7ff;
 
-/// One btrfs inode presented to the VFS.
+/// One btrfs inode presented to the VFS. A node records the fs tree it lives in:
+/// `None` is the default subvolume (resolved dynamically from the live volume, so
+/// a COW write's new root is observed), `Some(root)` pins a nested subvolume's
+/// fs-tree root reached by descending a `ROOT_ITEM` directory entry.
 #[derive(Debug)]
 pub struct BtrfsNode<B: BlockDevice + 'static> {
     vol: Weak<BtrfsVolume<B>>,
+    tree_root: Option<u64>,
     ino: u64,
     inode: InodeItem,
 }
 
 impl<B: BlockDevice + 'static> BtrfsNode<B> {
-    pub fn new(vol: Weak<BtrfsVolume<B>>, ino: u64, inode: InodeItem) -> Arc<Self> {
-        Arc::new(BtrfsNode { vol, ino, inode })
+    pub fn new(
+        vol: Weak<BtrfsVolume<B>>,
+        tree_root: Option<u64>,
+        ino: u64,
+        inode: InodeItem,
+    ) -> Arc<Self> {
+        Arc::new(BtrfsNode {
+            vol,
+            tree_root,
+            ino,
+            inode,
+        })
     }
 
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
         self.vol.upgrade().ok_or(FsError::NotFound)
     }
 
+    /// The fs-tree root this node reads from: a pinned subvolume root, or the
+    /// live default fs-tree root.
+    fn root(&self, vol: &BtrfsVolume<B>) -> u64 {
+        self.tree_root.unwrap_or_else(|| vol.fs_tree_root().0)
+    }
+
     /// Resolve a name to its directory entry via the CRC32C-hashed `DIR_ITEM`.
     async fn find_child(&self, name: &str) -> Result<BtrfsDirEntry, FsError> {
         let vol = self.volume()?;
-        let (fs_root, _) = vol.fs_tree_root();
         let key = BtrfsKey::new(
             self.ino,
             format::DIR_ITEM_KEY,
             u64::from(name_hash(name.as_bytes())),
         );
-        let body = btree::find_item(&*vol, fs_root, &key)
+        let body = btree::find_item(&*vol, self.root(&vol), &key)
             .await?
             .ok_or(FsError::NotFound)?;
         decode_dir_items(&body)?
@@ -60,22 +79,41 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             .ok_or(FsError::NotFound)
     }
 
-    /// Load a child inode named `entry`, building a node for it.
+    /// Load the node named by `entry`. An `INODE_ITEM` location is an inode in
+    /// this same tree; a `ROOT_ITEM` location is a nested subvolume — resolve its
+    /// tree in the root tree and enter it at its root directory (inode 256).
     async fn load_child(
+        &self,
         vol: &Arc<BtrfsVolume<B>>,
         entry: &BtrfsDirEntry,
     ) -> Result<Arc<BtrfsNode<B>>, FsError> {
-        // Only entries pointing at inodes in this tree are followed; a subvolume
-        // ROOT_ITEM location is out of scope.
-        if !entry.is_inode() {
-            return Err(FsError::NotFound);
+        match entry.location.item_type {
+            format::INODE_ITEM_KEY => {
+                let ino = entry.child_objectid();
+                let child = vol.load_inode_in(self.root(vol), ino).await?;
+                // Inherit this node's tree (default or a pinned subvolume).
+                Ok(BtrfsNode::new(
+                    vol.self_weak.clone(),
+                    self.tree_root,
+                    ino,
+                    child,
+                ))
+            }
+            format::ROOT_ITEM_KEY => {
+                let (root_tree, _) = vol.root_tree_root();
+                let (subvol_root, _lvl) =
+                    crate::roots::find_root(&**vol, root_tree, entry.location.objectid).await?;
+                let ino = format::FIRST_FREE_OBJECTID;
+                let child = vol.load_inode_in(subvol_root, ino).await?;
+                Ok(BtrfsNode::new(
+                    vol.self_weak.clone(),
+                    Some(subvol_root),
+                    ino,
+                    child,
+                ))
+            }
+            _ => Err(FsError::NotFound),
         }
-        let child = vol.load_inode(entry.child_objectid()).await?;
-        Ok(BtrfsNode::new(
-            vol.self_weak.clone(),
-            entry.child_objectid(),
-            child,
-        ))
     }
 }
 
@@ -83,17 +121,24 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let vol = self.volume()?;
-            crate::extent::read_file(&vol, self.ino, self.inode.size, offset, buf).await
+            let root = self.root(&vol);
+            crate::extent::read_file(&vol, root, self.ino, self.inode.size, offset, buf).await
         })
     }
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             // The basic COW path supports only a full, same-size overwrite of an
-            // existing regular file (see `write::cow_overwrite_file`). Anything
-            // else — a partial write, an append, a seek'd write — is rejected
-            // rather than silently corrupting the file.
+            // existing regular file in the default subvolume (see
+            // `write::cow_overwrite_file`). Anything else — a partial write, an
+            // append, a seek'd write, or a write into a nested subvolume — is
+            // rejected rather than silently corrupting the file.
             if offset != 0 || buf.len() as u64 != self.inode.size {
+                return Err(FsError::ReadOnly);
+            }
+            // Only the default subvolume is writable (a pinned subvolume root
+            // would need its own ROOT_ITEM COW).
+            if self.tree_root.is_some() {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
@@ -149,7 +194,6 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let (fs_root, _) = vol.fs_tree_root();
             // XATTR_ITEM shares the DIR_ITEM key scheme: keyed by the CRC32C
             // hash of the attribute name.
             let key = BtrfsKey::new(
@@ -157,7 +201,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 format::XATTR_ITEM_KEY,
                 u64::from(name_hash(name.as_bytes())),
             );
-            let body = btree::find_item(&*vol, fs_root, &key)
+            let body = btree::find_item(&*vol, self.root(&vol), &key)
                 .await?
                 .ok_or(FsError::NotFound)?;
             decode_dir_items(&body)?
@@ -171,9 +215,8 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let (fs_root, _) = vol.fs_tree_root();
-            let items =
-                btree::collect_for(&*vol, fs_root, self.ino, format::XATTR_ITEM_KEY).await?;
+            let root = self.root(&vol);
+            let items = btree::collect_for(&*vol, root, self.ino, format::XATTR_ITEM_KEY).await?;
             // Linux listxattr format: NUL-terminated names concatenated.
             let mut out = Vec::new();
             for (_key, body) in &items {
@@ -204,7 +247,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         Box::pin(async move {
             let vol = self.volume()?;
             let entry = self.find_child(name).await?;
-            let node = Self::load_child(&vol, &entry).await?;
+            let node = self.load_child(&vol, &entry).await?;
             Ok(node as Arc<dyn FileOps>)
         })
     }
@@ -213,7 +256,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         Box::pin(async move {
             let vol = self.volume()?;
             let entry = self.find_child(name).await?;
-            let node = Self::load_child(&vol, &entry).await?;
+            let node = self.load_child(&vol, &entry).await?;
             if !node.inode.is_dir() {
                 return Err(FsError::NotFound);
             }
@@ -228,9 +271,9 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move {
             let vol = self.volume()?;
-            let (fs_root, _) = vol.fs_tree_root();
+            let root = self.root(&vol);
             // DIR_INDEX gives stable readdir order.
-            let items = btree::collect_for(&*vol, fs_root, self.ino, format::DIR_INDEX_KEY).await?;
+            let items = btree::collect_for(&*vol, root, self.ino, format::DIR_INDEX_KEY).await?;
             let mut out = Vec::new();
             for (_key, body) in items.iter().skip(cursor).take(max) {
                 for entry in decode_dir_items(body)? {
@@ -253,8 +296,14 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
 impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     fn root(&self) -> Arc<dyn DirOps> {
         let inode = self.root_inode().expect("btrfs root inode cached at mount");
-        BtrfsNode::new(self.self_weak.clone(), format::FIRST_FREE_OBJECTID, inode)
-            as Arc<dyn DirOps>
+        // `None` = default subvolume, resolved dynamically so a COW write's new
+        // fs-tree root is observed by subsequent reads.
+        BtrfsNode::new(
+            self.self_weak.clone(),
+            None,
+            format::FIRST_FREE_OBJECTID,
+            inode,
+        ) as Arc<dyn DirOps>
     }
 
     fn name(&self) -> &str {

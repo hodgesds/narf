@@ -19,6 +19,9 @@ implementation (no C is copied).
 - **Symlinks** (target read via `FileOps::read`, so the VFS follows them),
   **extended attributes** (`get_xattr` / `list_xattr` over `XATTR_ITEM`), and
   **statx** (size/mode/uid/gid/nlink/ino/mtime).
+- **Nested subvolumes** (read-only): a `ROOT_ITEM` directory entry is resolved
+  through the root tree and entered at its own fs tree, so subvolumes and
+  snapshots are navigable.
 - Basic **COW write**: a full, same-size overwrite of an existing uncompressed
   single-regular-extent file — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
@@ -34,7 +37,8 @@ than mis-read:
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
 - Non-CRC32C checksums (xxhash/sha256/blake2).
-- Subvolumes / snapshots beyond the default `FS_TREE`; xattr *writes*.
+- Writes into a nested subvolume (only the default subvolume is writable);
+  xattr *writes*.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## Basic COW write — scope and limits
@@ -65,8 +69,9 @@ with a live Linux kernel):
 (`--compress zlib`) are committed, compact (`NARFBTR1`) sparse encodings of small
 `mkfs.btrfs` images (a 16 MiB image is ~90 KiB of non-zero data). Both hold the
 same tree — `hello.txt` (with a `user.narf` xattr), `big.dat`, `subdir/note.txt`,
-and `link.txt` (a symlink). The kernel tests reconstruct the full zero-filled
-image at runtime and mount it under a `RamBlockDevice`.
+`link.txt` (a symlink), and `snap/inside.txt` where `snap` is a nested
+subvolume. The kernel tests reconstruct the full zero-filled image at runtime
+and mount it under a `RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:

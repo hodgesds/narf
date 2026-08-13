@@ -286,14 +286,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Ok(())
     }
 
-    /// Read and decode the inode item `(ino, INODE_ITEM, 0)` from the FS tree.
+    /// Read and decode the inode item `(ino, INODE_ITEM, 0)` from the default
+    /// FS tree.
     pub async fn load_inode(&self, ino: u64) -> Result<InodeItem, FsError> {
         let (fs_root, _) = self.fs_tree_root();
-        if fs_root == 0 {
+        self.load_inode_in(fs_root, ino).await
+    }
+
+    /// Read and decode the inode item `(ino, INODE_ITEM, 0)` from the tree
+    /// rooted at logical `tree_root` (a subvolume's fs tree, or the default).
+    pub async fn load_inode_in(&self, tree_root: u64, ino: u64) -> Result<InodeItem, FsError> {
+        if tree_root == 0 {
             return Err(FsError::NotFound);
         }
         let key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
-        let body = crate::btree::find_item(self, fs_root, &key)
+        let body = crate::btree::find_item(self, tree_root, &key)
             .await?
             .ok_or(FsError::NotFound)?;
         InodeItem::decode(&body)

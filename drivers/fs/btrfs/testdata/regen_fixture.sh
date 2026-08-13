@@ -15,8 +15,9 @@
 #   fixture-zstd.img.sparse  --compress zstd (exercises the zstd read path)
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
-# big.dat (12000 B -> regular extents), subdir/note.txt, and link.txt (a
-# symlink to hello.txt).
+# big.dat (12000 B -> regular extents), subdir/note.txt, link.txt (a symlink to
+# hello.txt), and snap/inside.txt where snap is created as a nested subvolume
+# (its dir entry resolves to a ROOT_ITEM).
 #
 # Pinned so a future btrfs-progs can't silently drift the layout:
 #   --csum crc32c            driver only supports CRC32C
@@ -35,11 +36,12 @@ imgz="$(mktemp)"
 imgzst="$(mktemp)"
 trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst"' EXIT
 
-mkdir -p "$stage/subdir"
+mkdir -p "$stage/subdir" "$stage/snap"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
 python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
     > "$stage/big.dat"                                             # 12000 B -> regular extents
 printf 'nested file\n' > "$stage/subdir/note.txt"
+printf 'inside subvol\n' > "$stage/snap/inside.txt"               # file in the snap subvolume
 ln -s hello.txt "$stage/link.txt"                                  # symlink
 setfattr -n user.narf -v hi "$stage/hello.txt"                     # xattr
 
@@ -75,19 +77,19 @@ PY
 
 truncate -s 16M "$img"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
-    -O ^free-space-tree,^no-holes --rootdir "$stage" "$img" >/dev/null
+    -O ^free-space-tree,^no-holes --subvol rw:snap --rootdir "$stage" "$img" >/dev/null
 btrfs check "$img" >/dev/null
 sparse_encode "$img" fixture.img.sparse
 
 truncate -s 16M "$imgz"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
-    -O ^free-space-tree,^no-holes --compress zlib --rootdir "$stage" "$imgz" >/dev/null
+    -O ^free-space-tree,^no-holes --subvol rw:snap --compress zlib --rootdir "$stage" "$imgz" >/dev/null
 btrfs check "$imgz" >/dev/null
 sparse_encode "$imgz" fixture-zlib.img.sparse
 
 truncate -s 16M "$imgzst"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
-    -O ^free-space-tree,^no-holes --compress zstd --rootdir "$stage" "$imgzst" >/dev/null
+    -O ^free-space-tree,^no-holes --subvol rw:snap --compress zstd --rootdir "$stage" "$imgzst" >/dev/null
 btrfs check "$imgzst" >/dev/null
 sparse_encode "$imgzst" fixture-zstd.img.sparse
 

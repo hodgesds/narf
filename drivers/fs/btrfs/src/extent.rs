@@ -17,7 +17,7 @@ use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
 use crate::btree;
-use crate::format::{self, le64, BtrfsKey};
+use crate::format::{self, le64};
 use crate::volume::BtrfsVolume;
 
 /// Decompress a whole compressed extent according to its algorithm. zlib and
@@ -124,6 +124,7 @@ fn decode_extent(body: &[u8]) -> Result<(Extent, u64), FsError> {
 /// `offset`. Short reads signal EOF. Holes and preallocated ranges read as zero.
 pub async fn read_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
+    tree_root: u64,
     ino: u64,
     size: u64,
     offset: u64,
@@ -133,8 +134,7 @@ pub async fn read_file<B: BlockDevice + 'static>(
         return Ok(0);
     }
     let want = dst.len().min((size - offset) as usize);
-    let (fs_root, _) = vol.fs_tree_root();
-    let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
+    let extents = btree::collect_for(vol, tree_root, ino, format::EXTENT_DATA_KEY).await?;
 
     // Zero the window first; extents overwrite what they cover, so any hole
     // (explicit or `no-holes`-implicit) is left as zeros.
@@ -208,25 +208,4 @@ pub async fn read_file<B: BlockDevice + 'static>(
         }
     }
     Ok(want)
-}
-
-/// Whether the file's data uses compression (any `EXTENT_DATA.compression !=
-/// 0`). Used by the write path to refuse compressed files up front.
-pub async fn is_compressed<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    ino: u64,
-) -> Result<bool, FsError> {
-    let (fs_root, _) = vol.fs_tree_root();
-    let start = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, 0);
-    let mut cursor = btree::Cursor::seek(vol, fs_root, &start).await?;
-    while let Some((key, body)) = cursor.current()? {
-        if key.objectid != ino || key.item_type != format::EXTENT_DATA_KEY {
-            break;
-        }
-        if body.len() > OFF_COMPRESSION && body[OFF_COMPRESSION] != 0 {
-            return Ok(true);
-        }
-        cursor.advance().await?;
-    }
-    Ok(false)
 }
