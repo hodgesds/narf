@@ -104,6 +104,7 @@ members = [
     "drivers/fs/udf",
     "drivers/fs/9p",
     "drivers/fs/squashfs",
+    "drivers/fs/btrfs",
     "drivers/media",
     "drivers/video",
     "drivers/backlight",

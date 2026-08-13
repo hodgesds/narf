@@ -1,0 +1,221 @@
+//! VFS nodes: `BtrfsNode` implements both `FileOps` and `DirOps` (a btrfs inode
+//! is one or the other by mode), and `BtrfsVolume` implements `FsInstance`.
+//!
+//! Like the squashfs driver, all real work is async: the sync `lookup`/`iter`
+//! surfaces return empty and the VFS drives `*_async` instead.
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+
+use narf_block::BlockDevice;
+use narf_filesystem::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode, Stat,
+};
+
+use crate::btree;
+use crate::checksum::name_hash;
+use crate::dir::{decode_dir_items, DirEntry as BtrfsDirEntry};
+use crate::format::{self, BtrfsKey};
+use crate::inode::InodeItem;
+use crate::volume::BtrfsVolume;
+
+/// One btrfs inode presented to the VFS.
+#[derive(Debug)]
+pub struct BtrfsNode<B: BlockDevice + 'static> {
+    vol: Weak<BtrfsVolume<B>>,
+    ino: u64,
+    inode: InodeItem,
+}
+
+impl<B: BlockDevice + 'static> BtrfsNode<B> {
+    pub fn new(vol: Weak<BtrfsVolume<B>>, ino: u64, inode: InodeItem) -> Arc<Self> {
+        Arc::new(BtrfsNode { vol, ino, inode })
+    }
+
+    fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
+        self.vol.upgrade().ok_or(FsError::NotFound)
+    }
+
+    /// Resolve a name to its directory entry via the CRC32C-hashed `DIR_ITEM`.
+    async fn find_child(&self, name: &str) -> Result<BtrfsDirEntry, FsError> {
+        let vol = self.volume()?;
+        let (fs_root, _) = vol.fs_tree_root();
+        let key = BtrfsKey::new(
+            self.ino,
+            format::DIR_ITEM_KEY,
+            u64::from(name_hash(name.as_bytes())),
+        );
+        let body = btree::find_item(&*vol, fs_root, &key)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        decode_dir_items(&body)?
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or(FsError::NotFound)
+    }
+
+    /// Load a child inode named `entry`, building a node for it.
+    async fn load_child(
+        vol: &Arc<BtrfsVolume<B>>,
+        entry: &BtrfsDirEntry,
+    ) -> Result<Arc<BtrfsNode<B>>, FsError> {
+        // Only entries pointing at inodes in this tree are followed; a subvolume
+        // ROOT_ITEM location is out of scope.
+        if !entry.is_inode() {
+            return Err(FsError::NotFound);
+        }
+        let child = vol.load_inode(entry.child_objectid()).await?;
+        Ok(BtrfsNode::new(
+            vol.self_weak.clone(),
+            entry.child_objectid(),
+            child,
+        ))
+    }
+}
+
+impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            crate::extent::read_file(&vol, self.ino, self.inode.size, offset, buf).await
+        })
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            // The basic COW path supports only a full, same-size overwrite of an
+            // existing regular file (see `write::cow_overwrite_file`). Anything
+            // else — a partial write, an append, a seek'd write — is rejected
+            // rather than silently corrupting the file.
+            if offset != 0 || buf.len() as u64 != self.inode.size {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::cow_overwrite_file(&vol, self.ino, &self.inode, buf).await
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.inode.size,
+            blocks: self.inode.size.div_ceil(512),
+            mode: Mode {
+                file_type: self.inode.file_type(),
+                perms: self.inode.perms() & 0o777,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (self.inode.uid, self.inode.gid)
+    }
+}
+
+impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        Box::new(core::iter::empty())
+    }
+
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            let entry = self.find_child(name).await?;
+            let node = Self::load_child(&vol, &entry).await?;
+            Ok(node as Arc<dyn FileOps>)
+        })
+    }
+
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            let entry = self.find_child(name).await?;
+            let node = Self::load_child(&vol, &entry).await?;
+            if !node.inode.is_dir() {
+                return Err(FsError::NotFound);
+            }
+            Ok(node as Arc<dyn DirOps>)
+        })
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            let (fs_root, _) = vol.fs_tree_root();
+            // DIR_INDEX gives stable readdir order.
+            let items = btree::collect_for(&*vol, fs_root, self.ino, format::DIR_INDEX_KEY).await?;
+            let mut out = Vec::new();
+            for (_key, body) in items.iter().skip(cursor).take(max) {
+                for entry in decode_dir_items(body)? {
+                    out.push((entry.name.clone(), entry.file_type()));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn dir_mode(&self) -> u16 {
+        self.inode.perms() & 0o777
+    }
+
+    fn dir_owners(&self) -> (u32, u32) {
+        (self.inode.uid, self.inode.gid)
+    }
+}
+
+impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
+    fn root(&self) -> Arc<dyn DirOps> {
+        let inode = self.root_inode().expect("btrfs root inode cached at mount");
+        BtrfsNode::new(self.self_weak.clone(), format::FIRST_FREE_OBJECTID, inode)
+            as Arc<dyn DirOps>
+    }
+
+    fn name(&self) -> &str {
+        "btrfs"
+    }
+
+    fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
+        Box::pin(async move {
+            let block_size = self.sectorsize();
+            let blocks = self.total_bytes() / u64::from(block_size.max(1));
+            Ok(FsStat {
+                blocks,
+                blocks_free: 0,
+                blocks_available: 0,
+                files: 0,
+                files_free: 0,
+                block_size,
+                name_len: 255,
+                fragment_size: block_size,
+            })
+        })
+    }
+
+    fn reconfigure(&self, options: &str) -> Result<(), FsError> {
+        // Read-only volume: accept only `ro`/empty option tokens.
+        for opt in options.split(',').filter(|s| !s.is_empty()) {
+            if opt != "ro" {
+                return Err(FsError::Unsupported);
+            }
+        }
+        Ok(())
+    }
+}
