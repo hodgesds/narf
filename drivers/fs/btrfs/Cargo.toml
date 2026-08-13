@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+ruzstd = { version = "0.8", default-features = false }
 narf-block = { path = "../../../block" }
 narf-capabilities = { path = "../../../capabilities" }
 narf-driver-runtime = { path = "../../runtime" }

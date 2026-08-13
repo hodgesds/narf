@@ -28,6 +28,9 @@ const FIXTURE_SPARSE: &[u8] = include_bytes!("../testdata/fixture.img.sparse");
 /// `big.dat` is a zlib-compressed regular extent.
 const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.sparse");
 
+/// Same tree written with `--compress zstd`.
+const FIXTURE_ZSTD_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zstd.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -957,3 +960,27 @@ fn smoke_btrfs_zlib_read() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_zlib_read);
+
+fn smoke_btrfs_zstd_read() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_ZSTD_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
+    };
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    match read_all(&big, want.len() + 16) {
+        Some(got) if got == want => {}
+        _ => return TestResult::Fail("zstd full read mismatch"),
+    }
+    let mut mid = [0u8; 20];
+    match poll_once(big.read(4090, &mut mid)) {
+        Some(Ok(20)) if mid[..] == want[4090..4110] => TestResult::Pass,
+        _ => TestResult::Fail("zstd partial read mismatch"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_zstd_read);

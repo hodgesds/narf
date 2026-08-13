@@ -8,8 +8,8 @@
 //! under the `no-holes` feature — simply the absence of an item over that range;
 //! either way the gap reads as zeros. Preallocated extents also read as zeros.
 //!
-//! zlib-compressed extents (inline and regular) are decompressed on read; LZO
-//! and zstd are rejected with `Unsupported` rather than returning wrong bytes.
+//! zlib- and zstd-compressed extents (inline and regular) are decompressed on
+//! read; LZO is rejected with `Unsupported` rather than returning wrong bytes.
 
 use alloc::vec::Vec;
 
@@ -20,14 +20,24 @@ use crate::btree;
 use crate::format::{self, le64, BtrfsKey};
 use crate::volume::BtrfsVolume;
 
-/// Decompress a whole compressed extent according to its algorithm. Only zlib
-/// is supported; other algorithms yield `Unsupported`.
+/// Decompress a whole compressed extent according to its algorithm. zlib and
+/// zstd are supported; LZO yields `Unsupported`.
 fn decompress(compression: u8, input: &[u8]) -> Result<Vec<u8>, FsError> {
     match compression {
         format::COMPRESS_ZLIB => {
             miniz_oxide::inflate::decompress_to_vec_zlib(input).map_err(|_| FsError::InvalidData)
         }
-        format::COMPRESS_LZO | format::COMPRESS_ZSTD => Err(FsError::Unsupported),
+        format::COMPRESS_ZSTD => {
+            use ruzstd::io::Read;
+            let mut decoder =
+                ruzstd::decoding::StreamingDecoder::new(input).map_err(|_| FsError::InvalidData)?;
+            let mut out = Vec::new();
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|_| FsError::InvalidData)?;
+            Ok(out)
+        }
+        format::COMPRESS_LZO => Err(FsError::Unsupported),
         _ => Err(FsError::InvalidData),
     }
 }

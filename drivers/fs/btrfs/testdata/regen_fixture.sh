@@ -9,9 +9,10 @@
 # the full zero-filled image at test time — keeping the committed blob and the
 # kernel `.rodata` embed tiny.
 #
-# Two fixtures are produced from the same staging tree:
+# Three fixtures are produced from the same staging tree:
 #   fixture.img.sparse       uncompressed (data reads exercise inline/regular)
 #   fixture-zlib.img.sparse  --compress zlib (exercises the zlib read path)
+#   fixture-zstd.img.sparse  --compress zstd (exercises the zstd read path)
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
 # big.dat (12000 B -> regular extents), subdir/note.txt, and link.txt (a
@@ -31,7 +32,8 @@ cd "$(dirname "$0")"
 stage="$(mktemp -d)"
 img="$(mktemp)"
 imgz="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz"' EXIT
+imgzst="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst"' EXIT
 
 mkdir -p "$stage/subdir"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
@@ -83,4 +85,10 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgz" >/dev/null
 sparse_encode "$imgz" fixture-zlib.img.sparse
 
-echo "regenerated fixture.img.sparse + fixture-zlib.img.sparse"
+truncate -s 16M "$imgzst"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^free-space-tree,^no-holes --compress zstd --rootdir "$stage" "$imgzst" >/dev/null
+btrfs check "$imgzst" >/dev/null
+sparse_encode "$imgzst" fixture-zstd.img.sparse
+
+echo "regenerated fixture.img.sparse + fixture-zlib.img.sparse + fixture-zstd.img.sparse"

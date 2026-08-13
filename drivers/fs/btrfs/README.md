@@ -13,8 +13,9 @@ implementation (no C is copied).
 - Chunk-tree logical→physical mapping (`sys_chunk_array` seed + chunk-tree walk).
 - The default `FS_TREE` subvolume: directory `lookup` (CRC32C name hash) and
   `readdir` (`DIR_INDEX`), inode stat.
-- File reads: **inline**, **regular**, and **zlib-compressed** extents; holes and
-  preallocated ranges read as zeros (both explicit-hole and `no-holes` layouts).
+- File reads: **inline**, **regular**, and **zlib/zstd-compressed** extents; holes
+  and preallocated ranges read as zeros (both explicit-hole and `no-holes`
+  layouts).
 - **Symlinks** (target read via `FileOps::read`, so the VFS follows them),
   **extended attributes** (`get_xattr` / `list_xattr` over `XATTR_ITEM`), and
   **statx** (size/mode/uid/gid/nlink/ino/mtime).
@@ -28,7 +29,7 @@ implementation (no C is copied).
 Each is rejected with a precise `Unsupported` / `NotFound` / `NoSpace` rather
 than mis-read:
 
-- LZO / zstd compression — `EXTENT_DATA.compression` of 2 or 3 (zlib is
+- LZO compression — `EXTENT_DATA.compression == 2` (zlib and zstd are
   supported).
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
