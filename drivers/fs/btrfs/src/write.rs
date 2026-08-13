@@ -1,25 +1,28 @@
-//! Basic copy-on-write file overwrite.
+//! Copy-on-write file writes (overwrite / partial / append / grow).
 //!
-//! Scope (everything else fails loudly): a **full** overwrite of an existing,
-//! uncompressed, single-regular-extent file whose size does not change. The
-//! write is genuine COW — it never mutates live data or metadata in place:
+//! Scope: a regular, uncompressed, single-`EXTENT_DATA` file in the default
+//! subvolume. A write reads the current file, applies the new bytes at any
+//! offset (growing past EOF as needed), and rewrites the whole file as one new
+//! extent. The update is genuine COW — it never mutates live data or metadata in
+//! place:
 //!
 //! 1. a fresh data extent is allocated (above the extent-tree high-water mark)
-//!    and the new bytes are written there;
-//! 2. the fs tree is COWed — the file's `EXTENT_DATA` is repointed at the new
-//!    extent and its `INODE_ITEM` generation bumped — producing a new fs-tree
-//!    root, leaving the old nodes byte-for-byte intact on disk;
-//! 3. the root tree is COWed so its `FS_TREE` `ROOT_ITEM` names the new fs root;
-//! 4. a fresh superblock (generation + 1) is written last, atomically switching
+//!    and the new content is written there;
+//! 2. its per-sector CRC32C **data checksums** are inserted into the CSUM tree
+//!    (so a real Linux kernel, which verifies data csums on read, accepts it);
+//! 3. the fs tree is COWed — the file's `EXTENT_DATA` is repointed/resized and
+//!    its `INODE_ITEM` size/generation updated — producing a new fs-tree root,
+//!    leaving the old nodes byte-for-byte intact on disk;
+//! 4. the root tree is COWed so its `FS_TREE` and `CSUM` `ROOT_ITEM`s name the
+//!    new roots;
+//! 5. a fresh superblock (generation + 1) is written last, atomically switching
 //!    the volume to the new trees.
 //!
-//! Documented limitations of this "basic" path: no new-chunk allocation (a full
-//! chunk yields `NoSpace`); the extent and csum trees are **not** updated, so
-//! the new extent is unaccounted and carries no data checksum. That is
-//! sufficient for this driver to remount the image and read the new data back
-//! (NARF does not verify data checksums), and it preserves btrfs's core COW
-//! invariant (old trees intact until the superblock flips), but it is not
-//! written for interop with a live Linux kernel that verifies data csums.
+//! Remaining gap toward full `btrfs check` cleanliness: the **extent tree** and
+//! **free-space tree** are not yet updated, so the new extent is not accounted
+//! (and the old one not freed). A kernel can *read* the file (data csums are
+//! correct), but the space bookkeeping is incomplete. Bounds: no new-chunk
+//! allocation and no node splitting (a full target leaf yields `NoSpace`).
 
 use alloc::vec::Vec;
 
@@ -140,6 +143,124 @@ async fn cow_replace_items<B: BlockDevice + 'static>(
     Ok(child)
 }
 
+/// On-disk size of one leaf item entry (key + offset + size).
+const LEAF_ITEM_SIZE: usize = format::DISK_KEY_SIZE + 8;
+
+/// Build the path to the leaf where `key` belongs (for insertion). Unlike
+/// [`build_path`], the key need not already exist; the leaf entry's slot is the
+/// insertion point (`lower_bound`).
+async fn build_path_insert<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+    key: &BtrfsKey,
+) -> Result<Path, FsError> {
+    let mut path: Path = Vec::new();
+    let mut node_logical = root;
+    for _ in 0..=8 {
+        let buf = vol.read_node(node_logical).await?;
+        let n = nritems(&buf)? as usize;
+        if level(&buf)? == 0 {
+            let slot = leaf_lower_bound(&buf, n, key)?;
+            path.push((node_logical, buf, slot));
+            return Ok(path);
+        }
+        if n == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let slot = internal_child_slot(&buf, n, key)?;
+        let child = internal_blockptr(&buf, slot)?;
+        path.push((node_logical, buf, slot));
+        node_logical = child;
+    }
+    Err(FsError::InvalidData)
+}
+
+/// Insert `(key, body)` into leaf `buf` at `slot`, shifting the item array and
+/// placing the body at the low end of the data area. `NoSpace` if the leaf is
+/// full (node splitting is not implemented).
+fn leaf_insert(buf: &mut [u8], slot: usize, key: &BtrfsKey, body: &[u8]) -> Result<(), FsError> {
+    let nodesize = buf.len();
+    let n = nritems(buf)? as usize;
+    // Lowest data offset in use (data grows down from the end of the node).
+    let mut min_off = nodesize - HEADER_SIZE;
+    for i in 0..n {
+        let (off, _size) = leaf_item_span(buf, i)?;
+        min_off = min_off.min(off);
+    }
+    let items_end = HEADER_SIZE + n * LEAF_ITEM_SIZE;
+    let data_start = HEADER_SIZE + min_off;
+    let free = data_start
+        .checked_sub(items_end)
+        .ok_or(FsError::InvalidData)?;
+    if free < LEAF_ITEM_SIZE + body.len() {
+        return Err(FsError::NoSpace);
+    }
+
+    // Shift item entries [slot..n) right by one to open a hole at `slot`.
+    let src = HEADER_SIZE + slot * LEAF_ITEM_SIZE;
+    let move_len = (n - slot) * LEAF_ITEM_SIZE;
+    buf.copy_within(src..src + move_len, src + LEAF_ITEM_SIZE);
+
+    // Place the body just below the current data region.
+    let new_off = min_off - body.len();
+    let data_abs = HEADER_SIZE + new_off;
+    buf[data_abs..data_abs + body.len()].copy_from_slice(body);
+
+    // Write the new item entry.
+    let ie = HEADER_SIZE + slot * LEAF_ITEM_SIZE;
+    buf[ie..ie + 8].copy_from_slice(&key.objectid.to_le_bytes());
+    buf[ie + 8] = key.item_type;
+    buf[ie + 9..ie + 17].copy_from_slice(&key.offset.to_le_bytes());
+    buf[ie + 17..ie + 21].copy_from_slice(&(new_off as u32).to_le_bytes());
+    buf[ie + 21..ie + 25].copy_from_slice(&(body.len() as u32).to_le_bytes());
+
+    buf[96..100].copy_from_slice(&((n + 1) as u32).to_le_bytes());
+    Ok(())
+}
+
+/// COW-insert a new `(key, body)` item into the tree at `root`, returning the new
+/// tree-root address. Single-leaf insert (no node split); the parent separator
+/// keys are updated when the insert lands at the front of a subtree.
+async fn cow_insert_item<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+    key: &BtrfsKey,
+    body: &[u8],
+    alloc: &mut BumpAllocator,
+    gen: u64,
+) -> Result<u64, FsError> {
+    let path = build_path_insert(vol, root, key).await?;
+    let leaf_idx = path.len() - 1;
+    let mut leaf = path[leaf_idx].1.clone();
+    let slot = path[leaf_idx].2;
+    let n = nritems(&leaf)? as usize;
+    if slot < n && leaf_item_key(&leaf, slot)? == *key {
+        return Err(FsError::Unsupported); // update, not insert
+    }
+    leaf_insert(&mut leaf, slot, key, body)?;
+
+    let mut propagate = slot == 0;
+    let new_min = leaf_item_key(&leaf, 0)?;
+    let mut child = finalize_node(vol, &mut leaf, alloc, gen).await?;
+    for i in (0..leaf_idx).rev() {
+        let mut node = path[i].1.clone();
+        let pslot = path[i].2;
+        let ptr = HEADER_SIZE + pslot * KEY_PTR_SIZE;
+        node[ptr + format::DISK_KEY_SIZE..ptr + format::DISK_KEY_SIZE + 8]
+            .copy_from_slice(&child.to_le_bytes());
+        node[ptr + format::DISK_KEY_SIZE + 8..ptr + format::DISK_KEY_SIZE + 16]
+            .copy_from_slice(&gen.to_le_bytes());
+        if propagate {
+            node[ptr..ptr + 8].copy_from_slice(&new_min.objectid.to_le_bytes());
+            node[ptr + 8] = new_min.item_type;
+            node[ptr + 9..ptr + 17].copy_from_slice(&new_min.offset.to_le_bytes());
+            propagate = pslot == 0;
+        }
+        child = finalize_node(vol, &mut node, alloc, gen).await?;
+    }
+    Ok(child)
+}
+
 /// Fetch the exact key and body of the sole item matching `(objectid,
 /// item_type)` at or after offset 0 in the tree at `root`.
 async fn find_keyed<B: BlockDevice + 'static>(
@@ -227,7 +348,12 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let extent_tree = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let high_water = extent_high_water(vol, extent_tree).await?;
+    // Seed the allocator above both the extent tree's high-water mark and any
+    // earlier same-session write (the extent tree doesn't yet record our
+    // allocations, so successive writes would otherwise collide).
+    let high_water = extent_high_water(vol, extent_tree)
+        .await?
+        .max(vol.alloc_floor());
     let gen = vol.superblock().generation + 1;
     let mut alloc = BumpAllocator::new(high_water);
 
@@ -235,6 +361,19 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let mut payload = buf;
     payload.resize(disk_len as usize, 0);
     vol.write_logical(new_extent, &payload).await?;
+
+    // ── 2b. Insert data checksums for the new extent (CSUM tree) ───
+    // A real Linux kernel verifies these on every data read, so the write is
+    // not interop-safe without them.
+    let (csum_root, csum_level) =
+        roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID).await?;
+    let csums = crate::csum::compute_csums(&payload, sectorsize as usize);
+    let csum_key = BtrfsKey::new(
+        format::EXTENT_CSUM_OBJECTID,
+        format::EXTENT_CSUM_KEY,
+        new_extent,
+    );
+    let new_csum_root = cow_insert_item(vol, csum_root, &csum_key, &csums, &mut alloc, gen).await?;
 
     // ── 3. COW the fs tree (repoint + resize EXTENT_DATA, INODE_ITEM) ─
     let mut new_ed = ed_body.clone();
@@ -260,20 +399,38 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     )
     .await?;
 
-    // ── 3. COW the root tree (FS_TREE ROOT_ITEM -> new fs root) ─────
-    let (ri_key, ri_body) = find_keyed(
+    // ── 4. COW the root tree: repoint the FS_TREE and CSUM ROOT_ITEMs ─
+    // btrfs_root_item.bytenr@176, .level@238.
+    let (fs_ri_key, fs_ri_body) = find_keyed(
         vol,
         root_tree,
         format::FS_TREE_OBJECTID,
         format::ROOT_ITEM_KEY,
     )
     .await?;
-    let mut new_ri = ri_body.clone();
-    // btrfs_root_item.bytenr@176, .level@238.
-    new_ri[176..184].copy_from_slice(&new_fs_root.to_le_bytes());
-    new_ri[238] = fs_level;
-    let new_root_tree =
-        cow_replace_items(vol, root_tree, &[(ri_key, new_ri)], &mut alloc, gen).await?;
+    let mut new_fs_ri = fs_ri_body.clone();
+    new_fs_ri[176..184].copy_from_slice(&new_fs_root.to_le_bytes());
+    new_fs_ri[238] = fs_level;
+
+    let (cs_ri_key, cs_ri_body) = find_keyed(
+        vol,
+        root_tree,
+        format::CSUM_TREE_OBJECTID,
+        format::ROOT_ITEM_KEY,
+    )
+    .await?;
+    let mut new_cs_ri = cs_ri_body.clone();
+    new_cs_ri[176..184].copy_from_slice(&new_csum_root.to_le_bytes());
+    new_cs_ri[238] = csum_level;
+
+    let new_root_tree = cow_replace_items(
+        vol,
+        root_tree,
+        &[(fs_ri_key, new_fs_ri), (cs_ri_key, new_cs_ri)],
+        &mut alloc,
+        gen,
+    )
+    .await?;
 
     // ── 4. Write the new superblock last (atomic switch) ───────────
     let mut raw = vol.read_raw_superblock().await?;
@@ -288,6 +445,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     vol.write_superblock(&raw).await?;
 
     // ── 5. Publish the new roots into the live volume ──────────────
+    vol.set_alloc_floor(alloc.next());
     vol.commit_roots(new_root_tree, new_fs_root, gen);
     Ok(data.len())
 }

@@ -71,6 +71,10 @@ struct VolState {
     fs_tree_level: u8,
     /// Cached root-directory inode (objectid 256), for the sync `root()` path.
     root_inode: Option<InodeItem>,
+    /// Highest logical address handed out by a write this session. Seeds the
+    /// next write's allocator so successive writes don't collide before the
+    /// extent tree records the allocations. Reset to 0 at mount.
+    alloc_floor: u64,
 }
 
 /// A mounted btrfs filesystem.
@@ -299,6 +303,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 fs_tree_root: 0,
                 fs_tree_level: 0,
                 root_inode: None,
+                alloc_floor: 0,
             }),
         });
 
@@ -408,6 +413,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Cached root-directory inode (available after mount completes).
     pub fn root_inode(&self) -> Option<InodeItem> {
         self.state.lock().root_inode
+    }
+
+    /// The session allocation floor — writes seed their allocator from at least
+    /// this to avoid colliding with earlier same-session writes.
+    pub fn alloc_floor(&self) -> u64 {
+        self.state.lock().alloc_floor
+    }
+
+    /// Raise the session allocation floor after a write.
+    pub fn set_alloc_floor(&self, v: u64) {
+        let mut g = self.state.lock();
+        g.alloc_floor = g.alloc_floor.max(v);
     }
 
     // ── Writes (Phase 7 COW path) ──────────────────────────────────

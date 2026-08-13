@@ -27,6 +27,7 @@ pub mod allocator;
 pub mod btree;
 pub mod checksum;
 pub mod chunk;
+pub mod csum;
 pub mod dir;
 pub mod extent;
 pub mod format;

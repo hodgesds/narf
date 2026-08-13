@@ -47,6 +47,8 @@ pub const FS_TREE_OBJECTID: u64 = 5;
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
+pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
 /// First object id available to files/dirs; also the fs-tree root directory.
 pub const FIRST_FREE_OBJECTID: u64 = 256;
 

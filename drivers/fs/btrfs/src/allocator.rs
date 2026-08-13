@@ -54,6 +54,13 @@ impl BumpAllocator {
         BumpAllocator { next: high_water }
     }
 
+    /// The next logical address the allocator would hand out. Persisted across
+    /// writes so a later write doesn't re-hand-out space the extent tree hasn't
+    /// been told about yet.
+    pub fn next(&self) -> u64 {
+        self.next
+    }
+
     /// Allocate `len` bytes aligned to `align`, verifying the whole range maps
     /// contiguously inside one existing chunk (else `NoSpace`).
     fn alloc<B: BlockDevice + 'static>(

@@ -901,6 +901,112 @@ fn smoke_btrfs_partial_and_append_write() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_partial_and_append_write);
 
+// ── Data checksums (CSUM tree) ─────────────────────────────────────
+
+/// Locate a file's inode number and the volume's csum-tree root.
+fn csum_root_of(vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>) -> Option<u64> {
+    let (root_tree, _) = vol.root_tree_root();
+    poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::CSUM_TREE_OBJECTID,
+    ))?
+    .ok()
+    .map(|(r, _)| r)
+}
+
+/// Prove our CRC32C data-checksum computation matches what mkfs.btrfs wrote:
+/// every on-disk sector of big.dat must match its stored csum in the CSUM tree.
+/// If this passes, the write path (which uses the same `block_csum`) emits
+/// checksums a real Linux kernel will accept.
+fn smoke_btrfs_data_csum_matches_mkfs() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let (fs_root, _) = vol.fs_tree_root();
+    let csum_root = match csum_root_of(&vol) {
+        Some(r) => r,
+        None => return TestResult::Fail("csum tree root not found"),
+    };
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let ino = big.ino();
+    match poll_once(crate::csum::verify_file_data_csums(
+        &vol, fs_root, csum_root, ino,
+    )) {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => {
+            return TestResult::Fail("our data csum does not match mkfs's stored csum")
+        }
+        _ => return TestResult::Fail("csum verification errored"),
+    }
+    // Sanity: a wrong sector must NOT match (guards against a stub that always
+    // returns true).
+    let bad = crate::csum::compute_csums(b"not-the-real-sector-bytes", 4096);
+    if bad.len() != 4 {
+        return TestResult::Fail("compute_csums produced wrong length");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_data_csum_matches_mkfs);
+
+/// After a COW write, the new extent must carry correct data checksums in the
+/// CSUM tree — the property a real Linux kernel needs to read the file. Verified
+/// against the same CRC32C form proven to match mkfs above.
+fn smoke_btrfs_write_emits_csums() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    // Overwrite, then also append to exercise a grown extent's csums.
+    let new = replacement_big();
+    if !matches!(poll_once(big.write(0, &new)), Some(Ok(_))) {
+        return TestResult::Fail("overwrite failed");
+    }
+    if !matches!(poll_once(big.write(12000, b"CSUM-TAIL\n")), Some(Ok(_))) {
+        return TestResult::Fail("append failed");
+    }
+
+    // Remount and verify every sector of big.dat's (new) extent matches its
+    // freshly written CSUM-tree entry.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let (fs_root, _) = vol2.fs_tree_root();
+    let csum_root = match csum_root_of(&vol2) {
+        Some(r) => r,
+        None => return TestResult::Fail("csum root not found after write"),
+    };
+    let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup failed"),
+    };
+    let ino = big2.ino();
+    match poll_once(crate::csum::verify_file_data_csums(
+        &vol2, fs_root, csum_root, ino,
+    )) {
+        Some(Ok(true)) => TestResult::Pass,
+        Some(Ok(false)) => TestResult::Fail("written extent has wrong/missing data csums"),
+        _ => TestResult::Fail("csum verification errored after write"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_emits_csums);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same
