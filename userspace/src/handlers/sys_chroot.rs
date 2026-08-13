@@ -34,13 +34,7 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    root_dir_init_if_needed();
     let task = current_task_id();
-    let mut g = ROOT_DIR_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task, resolved);
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(fail);
-    }
+    task_map_set(&ROOT_DIR_TABLE, task, resolved);
+    ctx.set_return(SyscallReturn::ok(0));
 }

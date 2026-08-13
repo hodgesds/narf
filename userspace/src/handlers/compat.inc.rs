@@ -12,40 +12,97 @@
 // Relative-path resolution + the `*at(2)` family land later;
 // today the kernel just records the string the user supplied.
 
-static CWD_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::string::String>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// ── Per-task sharded map (cwd / chroot-root / brk) ──────────────────
+//
+// These are consulted on hot path-resolution and heap-growth syscalls (every
+// path-taking syscall reads the cwd + chroot prefix; brk reads/writes its top),
+// so a single global lock bounced one cache line between every CPU. Shard
+// 64-way by task id (same transform as the signal / futex tables): a given
+// task always hits one shard, but unrelated tasks on other CPUs no longer
+// contend.
+const TASK_MAP_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct TaskMapShard<V> {
+    map: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, V>>>,
+}
+
+impl<V> TaskMapShard<V> {
+    const fn new() -> Self {
+        Self {
+            map: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+type TaskMapTable<V> = [TaskMapShard<V>; TASK_MAP_SHARDS];
+
+#[inline]
+fn task_map_shard(task: u64) -> usize {
+    task as usize & (TASK_MAP_SHARDS - 1)
+}
+
+fn task_map_init<V>(table: &TaskMapTable<V>) {
+    for s in table {
+        *s.map.lock() = Some(BTreeMap::new());
+    }
+}
+
+fn task_map_get<V: Clone>(table: &TaskMapTable<V>, task: u64) -> Option<V> {
+    table[task_map_shard(task)]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).cloned())
+}
+
+fn task_map_set<V>(table: &TaskMapTable<V>, task: u64, val: V) {
+    table[task_map_shard(task)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task, val);
+}
+
+fn task_map_remove<V>(table: &TaskMapTable<V>, task: u64) {
+    if let Some(m) = table[task_map_shard(task)].map.lock().as_mut() {
+        m.remove(&task);
+    }
+}
+
+/// fork/clone inheritance: copy `parent`'s entry to `child` (which may be in a
+/// different shard). No-op if the parent has no entry.
+fn task_map_fork<V: Clone>(table: &TaskMapTable<V>, parent: u64, child: u64) {
+    if let Some(v) = task_map_get(table, parent) {
+        task_map_set(table, child, v);
+    }
+}
+
+static CWD_TABLE: TaskMapTable<alloc::string::String> =
+    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
 /// Initialise the per-task cwd registry. Boot calls this once
 /// before any user task can issue `Syscall::Chdir` / `Getcwd`.
 pub fn cwd_init() {
-    *CWD_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&CWD_TABLE);
 }
 
 /// Reset the registry — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_cwd_reset() {
-    *CWD_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&CWD_TABLE);
 }
 
 /// fork(2) inheritance: copy `parent`'s cwd to `child`. No-op
-/// if the registry isn't up or the parent has no entry (child
-/// inherits the default `/`).
+/// if the parent has no entry (child inherits the default `/`).
 pub fn cwd_fork(parent: u64, child: u64) {
-    let mut g = CWD_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(v) = map.get(&parent).cloned() {
-            map.insert(child, v);
-        }
-    }
+    task_map_fork(&CWD_TABLE, parent, child);
 }
 
 /// Diagnostic: peek the recorded cwd for `task`. Returns the
 /// default `"/"` if `task` has never called Chdir.
 pub fn cwd_of(task: u64) -> alloc::string::String {
-    let g = CWD_TABLE.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&task).cloned())
-        .unwrap_or_else(|| alloc::string::String::from("/"))
+    task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
 /// Set `task`'s cwd (USER-view, chroot-relative — the same frame chdir stores).
@@ -53,13 +110,7 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
 /// the root swap, so a following relative resolution doesn't double-apply the
 /// new chroot prefix.
 pub(crate) fn set_cwd(task: u64, path: &str) {
-    let mut g = CWD_TABLE.lock();
-    if g.is_none() {
-        *g = Some(alloc::collections::BTreeMap::new());
-    }
-    if let Some(m) = g.as_mut() {
-        m.insert(task, alloc::string::String::from(path));
-    }
+    task_map_set(&CWD_TABLE, task, alloc::string::String::from(path));
 }
 
 /// Collapse `.`/`..`/empty segments into a clean absolute path.
@@ -631,29 +682,23 @@ const _: () = assert!(BRK_DEFAULT_BASE < BRK_ARENA_TOP);
 // never alias (the bug this base was moved to fix).
 const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BASE);
 
-static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static BRK_TABLE: TaskMapTable<u64> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
 /// Initialise the per-task brk registry. Boot calls this once before
 /// any user task can issue `Syscall::Brk`.
 pub fn brk_init() {
-    *BRK_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&BRK_TABLE);
 }
 
 /// fork(2) inheritance: copy `parent`'s brk top to `child`.
 pub fn brk_fork(parent: u64, child: u64) {
-    let mut g = BRK_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(&v) = map.get(&parent) {
-            map.insert(child, v);
-        }
-    }
+    task_map_fork(&BRK_TABLE, parent, child);
 }
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_brk_reset() {
-    *BRK_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&BRK_TABLE);
 }
 
 // ── execve — re-image the current task ─────────────────────────────
@@ -2259,24 +2304,14 @@ pub fn proc_ns_idmap_write(
 // pivot_root reuses the same slot.
 
 #[cfg(feature = "linux-compat")]
-static ROOT_DIR_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
-
-#[cfg(feature = "linux-compat")]
-fn root_dir_init_if_needed() {
-    let mut g = ROOT_DIR_TABLE.lock();
-    if g.is_none() {
-        *g = Some(alloc::collections::BTreeMap::new());
-    }
-}
+static ROOT_DIR_TABLE: TaskMapTable<alloc::string::String> =
+    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
 /// Diagnostic: read the chroot prefix for `task`, or `None` if the
 /// task sees the global root. Used by tests + procfs.
 #[cfg(feature = "linux-compat")]
 pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
-    let g = ROOT_DIR_TABLE.lock();
-    g.as_ref().and_then(|m| m.get(&task).cloned())
+    task_map_get(&ROOT_DIR_TABLE, task)
 }
 
 /// Install the filesystem root for a task before its first instruction.
@@ -2292,13 +2327,8 @@ pub fn install_root_dir(task: u64, root: &str) -> bool {
     }
     let root = root.trim_end_matches('/');
     let root = if root.is_empty() { "/" } else { root };
-    root_dir_init_if_needed();
-    if let Some(entries) = ROOT_DIR_TABLE.lock().as_mut() {
-        entries.insert(task, alloc::string::String::from(root));
-        true
-    } else {
-        false
-    }
+    task_map_set(&ROOT_DIR_TABLE, task, alloc::string::String::from(root));
+    true
 }
 
 #[cfg(not(feature = "linux-compat"))]
@@ -2309,19 +2339,14 @@ pub fn install_root_dir(_task: u64, _root: &str) -> bool {
 /// fork(2) inheritance — child inherits parent's chroot.
 #[cfg(feature = "linux-compat")]
 pub fn root_dir_fork(parent: u64, child: u64) {
-    let mut g = ROOT_DIR_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(v) = map.get(&parent).cloned() {
-            map.insert(child, v);
-        }
-    }
+    task_map_fork(&ROOT_DIR_TABLE, parent, child);
 }
 
 /// Test hook — drop every per-task entry.
 #[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_root_dir_reset() {
-    *ROOT_DIR_TABLE.lock() = Some(alloc::collections::BTreeMap::new());
+    task_map_init(&ROOT_DIR_TABLE);
 }
 
 /// Rewrite `path` under the calling task's chroot, if any. Absolute
@@ -2331,12 +2356,9 @@ pub fn __test_root_dir_reset() {
 #[cfg(feature = "linux-compat")]
 pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     let task = current_task_id();
-    let prefix = {
-        let g = ROOT_DIR_TABLE.lock();
-        match g.as_ref().and_then(|m| m.get(&task).cloned()) {
-            Some(p) => p,
-            None => return alloc::string::String::from(path),
-        }
+    let prefix = match task_map_get(&ROOT_DIR_TABLE, task) {
+        Some(p) => p,
+        None => return alloc::string::String::from(path),
     };
     if !path.starts_with('/') {
         return alloc::string::String::from(path);
@@ -3565,8 +3587,7 @@ pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
     #[cfg(feature = "linux-compat")]
     {
         let tid = proc_pid_to_tid(pid);
-        let g = ROOT_DIR_TABLE.lock();
-        g.as_ref().and_then(|m| m.get(&tid).cloned())
+        task_map_get(&ROOT_DIR_TABLE, tid)
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -3879,10 +3900,7 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     }
     // brk top — pull from the per-task BRK_TABLE, which (like fd/cwd/comm) is
     // keyed by TaskId, so use `tid`, not the outer ProcessId `pid`.
-    let brk_top = {
-        let g = BRK_TABLE.lock();
-        g.as_ref().and_then(|m| m.get(&tid).copied()).unwrap_or(0)
-    };
+    let brk_top = task_map_get(&BRK_TABLE, tid).unwrap_or(0);
     // Stack top — the exclusive high end of the user-stack region.
     // Stage-1 just reports the standard fixed top.
     let stack_top = crate::process::DEFAULT_USER_STACK_TOP;
@@ -4174,8 +4192,7 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
 /// chrooted process can actually re-open.
 #[cfg(feature = "linux-compat")]
 fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
-    let g = ROOT_DIR_TABLE.lock();
-    if let Some(prefix) = g.as_ref().and_then(|m| m.get(&task)) {
+    if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, task) {
         if prefix != "/" {
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {
                 if rest.is_empty() {
@@ -6394,33 +6411,71 @@ pub fn delegate_netfilter_admin_to_socket(
 // deleted the entry while the child still held an fd to the same SocketFile.
 // With a Weak, a surviving fd keeps the entry resolvable and the entry
 // self-invalidates only when the final fd drops (pruned lazily on lookup).
-static SOCKET_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::socket::SocketFile>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+// ── Pointer-keyed Arc side-tables (socket / epoll / timerfd / signalfd /
+// memfd), sharded ──────────────────────────────────────────────────
+//
+// Each recovers a concrete `Arc<T>` from a `dyn FileOps` pointer. They sit on
+// hot syscall paths (`SOCKET_ARCS` on every socket send/recv; `EPOLL_ARCS` on
+// every epoll_wait/ctl), so a single global lock bounced one cache line between
+// every CPU. Shard 64-way by the pointer key (same transform as the signal /
+// futex tables) so unrelated fds no longer contend.
+const ARC_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct ArcShard<T> {
+    map: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<T>>>,
+    >,
+}
+
+impl<T> ArcShard<T> {
+    const fn new() -> Self {
+        Self {
+            map: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+type ArcShardTable<T> = [ArcShard<T>; ARC_SHARDS];
+
+#[inline]
+fn arc_shard_idx(key: usize) -> usize {
+    // Heap allocations are aligned, so the low bits carry no entropy — shift
+    // them out before masking to spread keys across shards.
+    (key >> 4) & (ARC_SHARDS - 1)
+}
+
+fn arc_shard_register<T>(table: &ArcShardTable<T>, arc: &alloc::sync::Arc<T>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = table[arc_shard_idx(key)].map.lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(key, alloc::sync::Arc::downgrade(arc));
+}
+
+/// Resolve a pointer key back to its live `Arc<T>`, pruning a dead `Weak`
+/// entry (the last fd dropped, the allocation may be freed/reused) so the map
+/// can't grow unbounded and a reused address can't resolve to a stale object.
+fn arc_shard_get<T>(table: &ArcShardTable<T>, key: usize) -> Option<alloc::sync::Arc<T>> {
+    let mut g = table[arc_shard_idx(key)].map.lock();
+    let map = g.as_mut()?;
+    match map.get(&key)?.upgrade() {
+        Some(arc) => Some(arc),
+        None => {
+            map.remove(&key);
+            None
+        }
+    }
+}
+
+static SOCKET_ARCS: ArcShardTable<crate::socket::SocketFile> =
+    [const { ArcShard::new() }; ARC_SHARDS];
 
 fn socket_arc_register(arc: &alloc::sync::Arc<crate::socket::SocketFile>) {
-    let key = alloc::sync::Arc::as_ptr(arc) as usize;
-    let mut g = SOCKET_ARCS.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, alloc::sync::Arc::downgrade(arc));
+    arc_shard_register(&SOCKET_ARCS, arc);
 }
 
 fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
-    let mut g = SOCKET_ARCS.lock();
-    let map = g.as_mut()?;
-    match map.get(&(raw as usize)) {
-        Some(weak) => match weak.upgrade() {
-            Some(arc) => Some(arc),
-            None => {
-                // Last fd dropped: the allocation may have been freed (or
-                // reused). Prune the dead entry so the map can't grow without
-                // bound and a reused address can't resolve to a stale socket.
-                map.remove(&(raw as usize));
-                None
-            }
-        },
-        None => None,
-    }
+    arc_shard_get(&SOCKET_ARCS, raw as usize)
 }
 
 fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
@@ -7001,27 +7056,17 @@ const EPOLL_CTL_MOD: u32 = 3;
 
 // EpollFile recovery from FdEntry — same shape as the SocketFile
 // side table since Arc<dyn FileOps> can't be downcast generically.
-static EPOLL_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::EpollFile>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+static EPOLL_ARCS: ArcShardTable<crate::io_mux::EpollFile> =
+    [const { ArcShard::new() }; ARC_SHARDS];
 
 fn epoll_arc_register(arc: &alloc::sync::Arc<crate::io_mux::EpollFile>) {
-    let key = alloc::sync::Arc::as_ptr(arc) as usize;
-    let mut g = EPOLL_ARCS.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, alloc::sync::Arc::downgrade(arc));
+    arc_shard_register(&EPOLL_ARCS, arc);
 }
 
 fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::EpollFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let mut g = EPOLL_ARCS.lock();
-    let map = g.as_mut()?;
-    let arc = map.get(&raw)?.upgrade();
-    if arc.is_none() {
-        map.remove(&raw);
-    }
-    arc
+    arc_shard_get(&EPOLL_ARCS, raw)
 }
 
 // Wave-61: pidfd_open(pid, flags) → fd that signals POLLIN on exit.
@@ -7038,27 +7083,17 @@ fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mu
 // Linux ref: `fs/timerfd.c`:SYSCALL_DEFINE2(timerfd_gettime, …)
 // (GPL-2.0-or-later, kernel.org).
 
-static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::io_mux::TimerFd>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+static TIMERFD_ARCS: ArcShardTable<crate::io_mux::TimerFd> =
+    [const { ArcShard::new() }; ARC_SHARDS];
 
 fn timerfd_arc_register(arc: &alloc::sync::Arc<crate::io_mux::TimerFd>) {
-    let key = alloc::sync::Arc::as_ptr(arc) as usize;
-    let mut g = TIMERFD_ARCS.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, alloc::sync::Arc::downgrade(arc));
+    arc_shard_register(&TIMERFD_ARCS, arc);
 }
 
 fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::TimerFd>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let mut g = TIMERFD_ARCS.lock();
-    let map = g.as_mut()?;
-    let arc = map.get(&raw)?.upgrade();
-    if arc.is_none() {
-        map.remove(&raw);
-    }
-    arc
+    arc_shard_get(&TIMERFD_ARCS, raw)
 }
 
 // ── Wave-70 SignalFdFile side table ────────────────────────────────
@@ -7066,18 +7101,12 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 // pointer-keyed Arc map lets us recover the concrete type from the
 // `dyn FileOps` we stored in the fd table.
 #[cfg(feature = "linux-compat")]
-static SIGNALFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<
-        alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::SignalFdFile>>,
-    >,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNALFD_ARCS: ArcShardTable<crate::linux_compat::SignalFdFile> =
+    [const { ArcShard::new() }; ARC_SHARDS];
 
 #[cfg(feature = "linux-compat")]
 fn signalfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::SignalFdFile>) {
-    let key = alloc::sync::Arc::as_ptr(arc) as usize;
-    let mut g = SIGNALFD_ARCS.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, alloc::sync::Arc::downgrade(arc));
+    arc_shard_register(&SIGNALFD_ARCS, arc);
 }
 
 #[cfg(feature = "linux-compat")]
@@ -7087,13 +7116,7 @@ pub(crate) fn signalfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::SignalFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let mut g = SIGNALFD_ARCS.lock();
-    let map = g.as_mut()?;
-    let arc = map.get(&raw)?.upgrade();
-    if arc.is_none() {
-        map.remove(&raw);
-    }
-    arc
+    arc_shard_get(&SIGNALFD_ARCS, raw)
 }
 
 // ── Installer ──────────────────────────────────────────────────────

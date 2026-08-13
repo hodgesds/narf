@@ -165,51 +165,64 @@ impl UdpSocket {
 // and udp_lib_get_port do the same).  The round-robin counter below
 // distributes datagrams across them.
 
-struct PortTable {
-    /// Sorted vec of (port, Arc<UdpSocket>) pairs, allowing multiple
-    /// sockets per port when SO_REUSEPORT is set.
-    entries: Vec<(u16, Arc<UdpSocket>)>,
-    /// Index into the per-port candidate list, advanced on each
-    /// REUSEPORT delivery (mod candidate_count).
-    #[allow(dead_code)]
-    rr_counter: u32,
-    /// Next ephemeral port to try.
-    ephemeral_cursor: u16,
+// The port table is consulted on EVERY received UDP datagram (`deliver_in`
+// filters by `dst_port`), so a single global lock + O(n) scan serialized all
+// UDP RX across CPUs. Shard the `(port, socket)` entries 64-way by port: a
+// datagram only touches its port's shard, so unrelated ports don't contend and
+// each scan shrinks to that shard. The ephemeral-port cursor is a small
+// separate lock (the alloc path is cold). `rr_counter` was already the separate
+// `RR_COUNTER` atomic.
+const PORT_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct PortShard {
+    entries: IrqSafeSpinLock<Vec<(u16, Arc<UdpSocket>)>>,
 }
 
-impl PortTable {
+impl PortShard {
     const fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            rr_counter: 0,
-            ephemeral_cursor: UDP_EPHEMERAL_MIN,
-        }
-    }
-
-    fn alloc_ephemeral(&mut self, net_ns_id: u64) -> Option<u16> {
-        let start = self.ephemeral_cursor;
-        loop {
-            let port = self.ephemeral_cursor;
-            self.ephemeral_cursor = if self.ephemeral_cursor >= UDP_EPHEMERAL_MAX {
-                UDP_EPHEMERAL_MIN
-            } else {
-                self.ephemeral_cursor + 1
-            };
-            if !self
-                .entries
-                .iter()
-                .any(|(p, socket)| *p == port && socket.net_ns_id == net_ns_id)
-            {
-                return Some(port);
-            }
-            if self.ephemeral_cursor == start {
-                return None; // exhausted
-            }
+            entries: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 }
 
-static PORT_TABLE: IrqSafeSpinLock<PortTable> = IrqSafeSpinLock::new(PortTable::new());
+static PORTS: [PortShard; PORT_SHARDS] = [const { PortShard::new() }; PORT_SHARDS];
+static EPHEMERAL_CURSOR: IrqSafeSpinLock<u16> = IrqSafeSpinLock::new(UDP_EPHEMERAL_MIN);
+
+#[inline]
+fn port_shard(port: u16) -> usize {
+    (port as usize) & (PORT_SHARDS - 1)
+}
+
+/// True if `(port, net_ns_id)` is already bound.
+fn port_taken(port: u16, net_ns_id: u64) -> bool {
+    PORTS[port_shard(port)]
+        .entries
+        .lock()
+        .iter()
+        .any(|(p, socket)| *p == port && socket.net_ns_id == net_ns_id)
+}
+
+/// Allocate a free ephemeral port for `net_ns_id`, advancing the shared cursor.
+fn alloc_ephemeral(net_ns_id: u64) -> Option<u16> {
+    let mut cursor = EPHEMERAL_CURSOR.lock();
+    let start = *cursor;
+    loop {
+        let port = *cursor;
+        *cursor = if *cursor >= UDP_EPHEMERAL_MAX {
+            UDP_EPHEMERAL_MIN
+        } else {
+            *cursor + 1
+        };
+        if !port_taken(port, net_ns_id) {
+            return Some(port);
+        }
+        if *cursor == start {
+            return None; // exhausted
+        }
+    }
+}
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -248,25 +261,21 @@ pub fn udp_bind_in(
     local: SocketAddrV4,
     options: UdpOptions,
 ) -> Result<Arc<UdpSocket>, UdpError> {
-    let mut tbl = PORT_TABLE.lock();
     let port = if local.port == 0 {
-        tbl.alloc_ephemeral(net_ns_id)
-            .ok_or(UdpError::NoEphemeral)?
+        alloc_ephemeral(net_ns_id).ok_or(UdpError::NoEphemeral)?
     } else {
         // Check for collision unless SO_REUSEPORT is set.
-        if !options.reuseport
-            && tbl
-                .entries
-                .iter()
-                .any(|(p, socket)| *p == local.port && socket.net_ns_id == net_ns_id)
-        {
+        if !options.reuseport && port_taken(local.port, net_ns_id) {
             return Err(UdpError::AddrInUse);
         }
         local.port
     };
     let bound = SocketAddrV4::new(local.ip, port);
     let sock = Arc::new(UdpSocket::new(net_ns_id, bound, options));
-    tbl.entries.push((port, sock.clone()));
+    PORTS[port_shard(port)]
+        .entries
+        .lock()
+        .push((port, sock.clone()));
     Ok(sock)
 }
 
@@ -449,16 +458,19 @@ pub fn udp_err_recv(sock: &Arc<UdpSocket>) -> Option<SockError> {
 /// Unregister the socket from the port table and free its port.
 pub fn udp_close(sock: &Arc<UdpSocket>) {
     let port = sock.local.port;
-    let mut tbl = PORT_TABLE.lock();
-    tbl.entries
+    PORTS[port_shard(port)]
+        .entries
+        .lock()
         .retain(|(p, s)| !(*p == port && Arc::ptr_eq(s, sock)));
 }
 
 pub(crate) fn remove_namespace(net_ns_id: u64) {
-    PORT_TABLE
-        .lock()
-        .entries
-        .retain(|(_, socket)| socket.net_ns_id != net_ns_id);
+    for shard in &PORTS {
+        shard
+            .entries
+            .lock()
+            .retain(|(_, socket)| socket.net_ns_id != net_ns_id);
+    }
 }
 
 // ── RX dispatch ────────────────────────────────────────────────────
@@ -492,8 +504,9 @@ pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[
 
     // Collect candidate sockets for this dst_port.
     let candidates: Vec<Arc<UdpSocket>> = {
-        let tbl = PORT_TABLE.lock();
-        tbl.entries
+        PORTS[port_shard(dst_port)]
+            .entries
+            .lock()
             .iter()
             .filter(|(p, socket)| *p == dst_port && socket.net_ns_id == net_ns_id)
             .map(|(_, s)| s.clone())
@@ -555,13 +568,22 @@ pub fn snapshot() -> alloc::vec::Vec<UdpSocketSnapshot> {
 }
 
 pub fn snapshot_in(net_ns_id: u64) -> alloc::vec::Vec<UdpSocketSnapshot> {
-    let tbl = PORT_TABLE.lock();
-    let mut out = alloc::vec::Vec::with_capacity(tbl.entries.len());
-    for (_p, s) in tbl
-        .entries
+    // Clone the matching sockets out of every shard first, then read their
+    // per-socket fields with no shard lock held.
+    let socks: alloc::vec::Vec<Arc<UdpSocket>> = PORTS
         .iter()
-        .filter(|(_, socket)| socket.net_ns_id == net_ns_id)
-    {
+        .flat_map(|shard| {
+            shard
+                .entries
+                .lock()
+                .iter()
+                .filter(|(_, socket)| socket.net_ns_id == net_ns_id)
+                .map(|(_, s)| s.clone())
+                .collect::<alloc::vec::Vec<_>>()
+        })
+        .collect();
+    let mut out = alloc::vec::Vec::with_capacity(socks.len());
+    for s in &socks {
         let peer = *s.peer.lock();
         let (remote_addr, remote_port, state_code) = match peer {
             Some(p) => (p.ip, p.port, 0x01),
@@ -595,8 +617,9 @@ pub fn deliver_icmp_error_in(
     err: SockError,
 ) {
     let candidates: Vec<Arc<UdpSocket>> = {
-        let tbl = PORT_TABLE.lock();
-        tbl.entries
+        PORTS[port_shard(orig_src_port)]
+            .entries
+            .lock()
             .iter()
             .filter(|(p, s)| {
                 *p == orig_src_port && s.net_ns_id == net_ns_id && s.local.ip == orig_src_ip

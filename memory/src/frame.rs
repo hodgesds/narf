@@ -1185,14 +1185,32 @@ pub mod cow {
 
     use crate::PhysAddr;
 
-    static REFCOUNTS: IrqSafeSpinLock<Option<BTreeMap<u64, AtomicU32>>> =
-        IrqSafeSpinLock::new(None);
+    // COW refcounts are consulted on EVERY frame free (`dec_ref`) and every
+    // fork'd shared page (`inc_ref`), so a single global lock bounced one cache
+    // line between every CPU freeing memory. Shard 64-way by phys page number
+    // (same transform as the signal / futex tables); a frame always maps to one
+    // shard, but unrelated frames on other CPUs no longer contend.
+    const REFCOUNT_SHARDS: usize = 64;
 
-    fn ensure() {
-        let mut g = REFCOUNTS.lock();
-        if g.is_none() {
-            *g = Some(BTreeMap::new());
+    #[repr(align(64))]
+    struct RefShard {
+        map: IrqSafeSpinLock<Option<BTreeMap<u64, AtomicU32>>>,
+    }
+
+    impl RefShard {
+        const fn new() -> Self {
+            Self {
+                map: IrqSafeSpinLock::new(None),
+            }
         }
+    }
+
+    static REFCOUNTS: [RefShard; REFCOUNT_SHARDS] = [const { RefShard::new() }; REFCOUNT_SHARDS];
+
+    #[inline]
+    fn ref_shard(phys: u64) -> usize {
+        // Frames are page-aligned; the low 12 bits are always zero.
+        ((phys >> 12) as usize) & (REFCOUNT_SHARDS - 1)
     }
 
     /// Increment the refcount on `phys`. Returns the new count.
@@ -1201,10 +1219,9 @@ pub mod cow {
     /// owner plus the "1" for the new sharer. Subsequent
     /// `inc_ref`s add one each.
     pub fn inc_ref(phys: PhysAddr) -> u32 {
-        ensure();
-        let mut g = REFCOUNTS.lock();
-        let map = g.as_mut().expect("refcounts initialised above");
         let key = phys.raw();
+        let mut g = REFCOUNTS[ref_shard(key)].map.lock();
+        let map = g.get_or_insert_with(BTreeMap::new);
         let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
         // Bump from N to N+1; "first share" promotes the implicit
         // owner from `1` (representing the original sole owner) to
@@ -1217,12 +1234,12 @@ pub mod cow {
     /// 0 — `free_frame` then returns the frame to the bin
     /// directly, matching pre-COW semantics.
     pub fn dec_ref(phys: PhysAddr) -> u32 {
-        let mut g = REFCOUNTS.lock();
+        let key = phys.raw();
+        let mut g = REFCOUNTS[ref_shard(key)].map.lock();
         let map = match g.as_mut() {
             Some(m) => m,
             None => return 0,
         };
-        let key = phys.raw();
         let entry = match map.get(&key) {
             Some(e) => e,
             None => return 0,
@@ -1242,9 +1259,12 @@ pub mod cow {
     /// Read-only peek at a frame's refcount. Returns 0 if the
     /// frame was never registered; otherwise the current count.
     pub fn count(phys: PhysAddr) -> u32 {
-        let g = REFCOUNTS.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&phys.raw()))
+        let key = phys.raw();
+        REFCOUNTS[ref_shard(key)]
+            .map
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&key))
             .map(|c| c.load(Ordering::Acquire))
             .unwrap_or(0)
     }
@@ -1254,7 +1274,9 @@ pub mod cow {
     /// a clean slate.
     #[doc(hidden)]
     pub fn __test_clear() {
-        *REFCOUNTS.lock() = None;
+        for s in &REFCOUNTS {
+            *s.map.lock() = None;
+        }
     }
 }
 

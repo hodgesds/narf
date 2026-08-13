@@ -36,14 +36,6 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let mut g = CWD_TABLE.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    map.insert(task, user_abs);
+    task_map_set(&CWD_TABLE, task, user_abs);
     ctx.set_return(SyscallReturn::ok(0));
 }

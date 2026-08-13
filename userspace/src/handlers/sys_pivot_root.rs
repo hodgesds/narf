@@ -41,12 +41,8 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // equals new_root_resolved for that idiom. Captured before ROOT_DIR_TABLE is
     // updated so it uses the old chroot prefix.
     let cwd_host = resolve_cwd_path(task, ".");
-    let prior_root = {
-        let g = ROOT_DIR_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).cloned())
-            .unwrap_or_else(|| alloc::string::String::from("/"))
-    };
+    let prior_root =
+        task_map_get(&ROOT_DIR_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"));
     // new_root must resolve to an EXISTING DIRECTORY. Use `resolve_dir_absolute`,
     // not `resolve_absolute(|_,_| true)`: the latter matches the root `/` mount
     // as a fallback for ANY absolute path, so a non-existent new_root
@@ -70,21 +66,7 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let auth = narf_filesystem::bootstrap_mount_authority();
     let _ = current_bind_mount(&auth, &prior_root, &put_old_resolved);
     // Install the new root.
-    root_dir_init_if_needed();
-    let inserted = {
-        let mut g = ROOT_DIR_TABLE.lock();
-        match g.as_mut() {
-            Some(m) => {
-                m.insert(task, new_root_resolved.clone());
-                true
-            }
-            None => false,
-        }
-    };
-    if !inserted {
-        ctx.set_return(fail);
-        return;
-    }
+    task_map_set(&ROOT_DIR_TABLE, task, new_root_resolved.clone());
     // The cwd directory is physically unchanged, but the root moved — recompute
     // the cwd in the NEW root's frame. Without this, a following relative
     // resolution (systemd's `umount2(".", MNT_DETACH)` / `mount(".", "/",

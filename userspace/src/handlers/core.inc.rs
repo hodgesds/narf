@@ -2278,16 +2278,12 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
 
 // ── Wave-70 MemFdFile side table ───────────────────────────────────
 #[cfg(feature = "linux-compat")]
-static MEMFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::linux_compat::MemFdFile>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+static MEMFD_ARCS: ArcShardTable<crate::linux_compat::MemFdFile> =
+    [const { ArcShard::new() }; ARC_SHARDS];
 
 #[cfg(feature = "linux-compat")]
 fn memfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::MemFdFile>) {
-    let key = alloc::sync::Arc::as_ptr(arc) as usize;
-    let mut g = MEMFD_ARCS.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, alloc::sync::Arc::downgrade(arc));
+    arc_shard_register(&MEMFD_ARCS, arc);
 }
 
 #[cfg(feature = "linux-compat")]
@@ -2297,13 +2293,7 @@ pub(crate) fn memfd_arc_from_fd(
 ) -> Option<alloc::sync::Arc<crate::linux_compat::MemFdFile>> {
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    let mut g = MEMFD_ARCS.lock();
-    let map = g.as_mut()?;
-    let arc = map.get(&raw)?.upgrade();
-    if arc.is_none() {
-        map.remove(&raw);
-    }
-    arc
+    arc_shard_get(&MEMFD_ARCS, raw)
 }
 
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
@@ -6856,19 +6846,13 @@ fn release_task_tables(tid: u64) {
     }
 
     // Filesystem view.
-    if let Some(m) = CWD_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
+    task_map_remove(&CWD_TABLE, tid);
     #[cfg(feature = "linux-compat")]
-    if let Some(m) = ROOT_DIR_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
+    task_map_remove(&ROOT_DIR_TABLE, tid);
     if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = BRK_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
+    task_map_remove(&BRK_TABLE, tid);
 
     // Memory policy.
     if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {

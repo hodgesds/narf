@@ -6,16 +6,12 @@ pub(crate) fn sys_brk(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     // Snapshot the current break (initialising the slot on first call).
-    let cur = {
-        let mut g = BRK_TABLE.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-        };
-        *map.entry(task).or_insert(BRK_DEFAULT_BASE)
+    let cur = match task_map_get(&BRK_TABLE, task) {
+        Some(v) => v,
+        None => {
+            task_map_set(&BRK_TABLE, task, BRK_DEFAULT_BASE);
+            BRK_DEFAULT_BASE
+        }
     };
 
     // Query path: arg0 == 0 just returns the current break.
@@ -66,11 +62,7 @@ pub(crate) fn sys_brk(ctx: &mut dyn TrapContext) {
                 let _ = as_ref.unmap_region(VirtAddr::new(b));
             }
         }
-        BRK_TABLE
-            .lock()
-            .as_mut()
-            .expect("brk_init")
-            .insert(task, new_break);
+        task_map_set(&BRK_TABLE, task, new_break);
         ctx.set_return(SyscallReturn::ok(new_break));
         return;
     }
@@ -92,11 +84,7 @@ pub(crate) fn sys_brk(ctx: &mut dyn TrapContext) {
     let pages = (new_aligned - cur_aligned) >> 12;
     if pages == 0 {
         // Within-page grow — just record the new break, no PTE work.
-        BRK_TABLE
-            .lock()
-            .as_mut()
-            .expect("brk_init")
-            .insert(task, new_break);
+        task_map_set(&BRK_TABLE, task, new_break);
         ctx.set_return(SyscallReturn::ok(new_break));
         return;
     }
@@ -136,10 +124,6 @@ pub(crate) fn sys_brk(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    BRK_TABLE
-        .lock()
-        .as_mut()
-        .expect("brk_init")
-        .insert(task, new_break);
+    task_map_set(&BRK_TABLE, task, new_break);
     ctx.set_return(SyscallReturn::ok(new_break));
 }

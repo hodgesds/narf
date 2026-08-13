@@ -33,12 +33,6 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // ENOTDIR
         return;
     }
-    let mut g = CWD_TABLE.lock();
-    match g.as_mut() {
-        Some(m) => {
-            m.insert(task, user_abs);
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
-    }
+    task_map_set(&CWD_TABLE, task, user_abs);
+    ctx.set_return(SyscallReturn::ok(0));
 }
