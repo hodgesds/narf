@@ -2843,11 +2843,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                     };
                     let root = fs.root();
-                    // The laptop image's default subvolume is `root`, which holds
-                    // rootfile.txt; read it straight off the disk.
+                    // Read a file straight off the disk.
                     let read = narf_scheduler::block_on(async {
-                        let file = root.lookup_async("rootfile.txt").await?;
-                        let mut buf = [0u8; 64];
+                        let file = root.lookup_async("big.dat").await?;
+                        let mut buf = [0u8; 24];
                         let n = file.read(0, &mut buf).await?;
                         Ok::<_, narf_filesystem::FsError>((buf, n))
                     });
@@ -2855,7 +2854,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         Ok((buf, n)) => {
                             let _ = writeln!(
                                 console::Writer,
-                                "  btrfs-disk-smoke: {} mounted, read rootfile.txt ({} bytes): {:?}",
+                                "  btrfs-disk-smoke: {} mounted, read big.dat ({} bytes): {:?}",
                                 entry.name,
                                 n,
                                 core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>")
@@ -2872,6 +2871,65 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             return narf_init::InitResult::Error("btrfs read failed");
                         }
                     }
+                }
+                narf_init::InitResult::NotPresent
+            });
+
+            // btrfs WRITE smoke: exercise the COW write path against real block
+            // hardware (QEMU NVMe). Write a marker into big.dat, then read it
+            // back through a fresh mount of the on-disk image. Because the write
+            // path now updates data checksums and tree-root generations, the
+            // resulting image is mountable + readable by a real Linux kernel
+            // (verify after the run with: `mount -o ro,loop
+            // target/narf-nvme-btrfs.img /mnt && head -c 17 /mnt/big.dat`).
+            // NotPresent when no btrfs disk is attached, so distro boots are
+            // unaffected.
+            narf_init::register(narf_init::Stage::Late, "btrfs-write-smoke", || {
+                use narf_block::fs_detect::{detect_filesystem, FsType};
+                const MARKER: &[u8] = b"NARF-WROTE-THIS!\n";
+                for entry in &narf_block::block_devices() {
+                    let dev = entry.dev.clone();
+                    if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
+                        continue;
+                    }
+                    let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    let name = entry.name;
+                    let ok = narf_scheduler::block_on(async {
+                        let fs = factory(dev.clone()).map_err(|_| ())?;
+                        let file = fs.root().lookup_async("big.dat").await.map_err(|_| ())?;
+                        file.write(0, MARKER).await.map_err(|_| ())?;
+                        // Re-mount the on-disk image and read the marker back.
+                        let fs2 = factory(dev).map_err(|_| ())?;
+                        let f2 = fs2.root().lookup_async("big.dat").await.map_err(|_| ())?;
+                        let mut buf = [0u8; MARKER.len()];
+                        let n = f2.read(0, &mut buf).await.map_err(|_| ())?;
+                        if n == MARKER.len() && buf == *MARKER {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    });
+                    return match ok {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-write-smoke: wrote + read back big.dat on {}",
+                                name
+                            );
+                            narf_init::InitResult::Ok
+                        }
+                        Err(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-write-smoke: write/read-back failed on {}",
+                                name
+                            );
+                            narf_init::InitResult::Error("btrfs write smoke failed")
+                        }
+                    };
                 }
                 narf_init::InitResult::NotPresent
             });

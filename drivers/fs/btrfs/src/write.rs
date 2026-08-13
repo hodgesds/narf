@@ -18,11 +18,15 @@
 //! 5. a fresh superblock (generation + 1) is written last, atomically switching
 //!    the volume to the new trees.
 //!
-//! Remaining gap toward full `btrfs check` cleanliness: the **extent tree** and
-//! **free-space tree** are not yet updated, so the new extent is not accounted
-//! (and the old one not freed). A kernel can *read* the file (data csums are
-//! correct), but the space bookkeeping is incomplete. Bounds: no new-chunk
-//! allocation and no node splitting (a full target leaf yields `NoSpace`).
+//! A real Linux kernel mounts the resulting image and reads the written file
+//! back with data-checksum verification passing (verified via `mount -o
+//! ro,loop`), for a simple image (no free-space tree, no 64 MiB superblock
+//! mirror). Remaining gap toward full `btrfs check` cleanliness: the **extent
+//! tree** and **free-space tree** are not updated, so the new extent is not
+//! accounted (and the old one not freed); on an image that has a free-space tree
+//! or a superblock mirror, those also need maintaining before it is
+//! kernel-mountable. Bounds: no new-chunk allocation and no node splitting (a
+//! full target leaf yields `NoSpace`).
 
 use alloc::vec::Vec;
 
@@ -373,7 +377,25 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         format::EXTENT_CSUM_KEY,
         new_extent,
     );
-    let new_csum_root = cow_insert_item(vol, csum_root, &csum_key, &csums, &mut alloc, gen).await?;
+    // Upsert: a fresh extent needs a new csum item, but if a prior same-session
+    // remount write reused this logical address (the extent tree isn't updated,
+    // so the allocator can hand out the same space again), replace the existing
+    // same-size csum item instead of inserting a duplicate.
+    let new_csum_root = match cow_replace_items(
+        vol,
+        csum_root,
+        &[(csum_key, csums.clone())],
+        &mut alloc,
+        gen,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(FsError::NotFound) => {
+            cow_insert_item(vol, csum_root, &csum_key, &csums, &mut alloc, gen).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     // ── 3. COW the fs tree (repoint + resize EXTENT_DATA, INODE_ITEM) ─
     let mut new_ed = ed_body.clone();
@@ -400,7 +422,19 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     .await?;
 
     // ── 4. COW the root tree: repoint the FS_TREE and CSUM ROOT_ITEMs ─
-    // btrfs_root_item.bytenr@176, .level@238.
+    // A ROOT_ITEM records the tree's own generation, which the kernel verifies
+    // against the pointed-to node's generation on load. Repointing `bytenr`
+    // without updating `generation`/`generation_v2` makes the kernel fail the
+    // transid verify ("wanted N found gen") and refuse to mount. Fields:
+    // generation@160, bytenr@176, level@238, generation_v2@239.
+    let stamp_root_item = |ri: &mut [u8], bytenr: u64, level: u8| {
+        ri[160..168].copy_from_slice(&gen.to_le_bytes());
+        ri[176..184].copy_from_slice(&bytenr.to_le_bytes());
+        ri[238] = level;
+        if ri.len() >= 247 {
+            ri[239..247].copy_from_slice(&gen.to_le_bytes());
+        }
+    };
     let (fs_ri_key, fs_ri_body) = find_keyed(
         vol,
         root_tree,
@@ -409,8 +443,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     )
     .await?;
     let mut new_fs_ri = fs_ri_body.clone();
-    new_fs_ri[176..184].copy_from_slice(&new_fs_root.to_le_bytes());
-    new_fs_ri[238] = fs_level;
+    stamp_root_item(&mut new_fs_ri, new_fs_root, fs_level);
 
     let (cs_ri_key, cs_ri_body) = find_keyed(
         vol,
@@ -420,8 +453,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     )
     .await?;
     let mut new_cs_ri = cs_ri_body.clone();
-    new_cs_ri[176..184].copy_from_slice(&new_csum_root.to_le_bytes());
-    new_cs_ri[238] = csum_level;
+    stamp_root_item(&mut new_cs_ri, new_csum_root, csum_level);
 
     let new_root_tree = cow_replace_items(
         vol,
