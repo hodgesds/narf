@@ -19,15 +19,19 @@ use crate::format::{self, le16, BtrfsKey};
 /// data_len + name_len + type), before the inline name bytes.
 const DIR_ITEM_HEADER: usize = format::DISK_KEY_SIZE + 8 + 2 + 2 + 1;
 
-/// One decoded directory entry.
+/// One decoded directory entry. The same `btrfs_dir_item` layout backs
+/// `DIR_ITEM`/`DIR_INDEX` and `XATTR_ITEM`; for an xattr, `name` is the
+/// attribute name and `value` is its data (empty for ordinary dir entries).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: String,
     /// Key of the child object (`INODE_ITEM` for files/dirs, `ROOT_ITEM` for a
-    /// subvolume mount point).
+    /// subvolume mount point). Unused for xattrs.
     pub location: BtrfsKey,
     /// `BTRFS_FT_*` directory entry type.
     pub ftype: u8,
+    /// Trailing item data — the attribute value for an `XATTR_ITEM`.
+    pub value: Vec<u8>,
 }
 
 impl DirEntry {
@@ -76,14 +80,20 @@ pub fn decode_dir_items(body: &[u8]) -> Result<Vec<DirEntry>, FsError> {
         let name = core::str::from_utf8(name_bytes)
             .map_err(|_| FsError::InvalidData)?
             .into();
+        // The value (xattr data) follows the name; ordinary dir items have
+        // data_len == 0.
+        let value_end = name_end.checked_add(data_len).ok_or(FsError::InvalidData)?;
+        let value = body
+            .get(name_end..value_end)
+            .ok_or(FsError::InvalidData)?
+            .to_vec();
         entries.push(DirEntry {
             name,
             location,
             ftype,
+            value,
         });
-        // Advance past the name and any inline data (xattr items store data
-        // here; ordinary dir items have data_len == 0).
-        pos = name_end.checked_add(data_len).ok_or(FsError::InvalidData)?;
+        pos = value_end;
     }
     Ok(entries)
 }

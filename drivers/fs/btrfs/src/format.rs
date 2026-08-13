@@ -51,6 +51,7 @@ pub const FIRST_FREE_OBJECTID: u64 = 256;
 
 pub const INODE_ITEM_KEY: u8 = 1;
 pub const INODE_REF_KEY: u8 = 12;
+pub const XATTR_ITEM_KEY: u8 = 24;
 pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
@@ -66,6 +67,13 @@ pub const CHUNK_ITEM_KEY: u8 = 228;
 pub const FILE_EXTENT_INLINE: u8 = 0;
 pub const FILE_EXTENT_REG: u8 = 1;
 pub const FILE_EXTENT_PREALLOC: u8 = 2;
+
+// ── Compression algorithms (`btrfs_file_extent_item.compression`) ──
+
+pub const COMPRESS_NONE: u8 = 0;
+pub const COMPRESS_ZLIB: u8 = 1;
+pub const COMPRESS_LZO: u8 = 2;
+pub const COMPRESS_ZSTD: u8 = 3;
 
 // ── Directory entry `type` byte (`BTRFS_FT_*`) ─────────────────────
 

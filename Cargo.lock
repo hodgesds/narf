@@ -952,6 +952,7 @@ dependencies = [
 name = "narf-drivers-fs-btrfs"
 version = "0.0.0"
 dependencies = [
+ "miniz_oxide",
  "narf-block",
  "narf-capabilities",
  "narf-driver-runtime",

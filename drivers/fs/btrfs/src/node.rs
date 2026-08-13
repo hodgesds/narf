@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
 use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode, Stat,
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, FsStatx,
+    FsStatxTimestamp, Mode, Stat,
 };
 
 use crate::btree;
@@ -20,6 +21,9 @@ use crate::dir::{decode_dir_items, DirEntry as BtrfsDirEntry};
 use crate::format::{self, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::volume::BtrfsVolume;
+
+/// Linux `STATX_BASIC_STATS` — the fields this driver populates.
+const STATX_BASIC_STATS: u32 = 0x7ff;
 
 /// One btrfs inode presented to the VFS.
 #[derive(Debug)]
@@ -115,6 +119,71 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn owners(&self) -> (u32, u32) {
         (self.inode.uid, self.inode.gid)
+    }
+
+    fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
+        Box::pin(async move {
+            let mtime = FsStatxTimestamp {
+                seconds: self.inode.mtime_sec,
+                nanoseconds: self.inode.mtime_nsec,
+            };
+            Ok(FsStatx {
+                mask: STATX_BASIC_STATS,
+                block_size: self.volume().map(|v| v.sectorsize()).unwrap_or(4096),
+                nlink: self.inode.nlink,
+                uid: self.inode.uid,
+                gid: self.inode.gid,
+                mode: (self.inode.mode & 0xffff) as u16,
+                ino: self.ino,
+                size: self.inode.size,
+                blocks: self.inode.size.div_ceil(512),
+                // btrfs stores a single mtime; surface it for atime/ctime too.
+                atime: mtime,
+                ctime: mtime,
+                mtime,
+                ..FsStatx::default()
+            })
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            let (fs_root, _) = vol.fs_tree_root();
+            // XATTR_ITEM shares the DIR_ITEM key scheme: keyed by the CRC32C
+            // hash of the attribute name.
+            let key = BtrfsKey::new(
+                self.ino,
+                format::XATTR_ITEM_KEY,
+                u64::from(name_hash(name.as_bytes())),
+            );
+            let body = btree::find_item(&*vol, fs_root, &key)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            decode_dir_items(&body)?
+                .into_iter()
+                .find(|e| e.name == name)
+                .map(|e| e.value)
+                .ok_or(FsError::NotFound)
+        })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let vol = self.volume()?;
+            let (fs_root, _) = vol.fs_tree_root();
+            let items =
+                btree::collect_for(&*vol, fs_root, self.ino, format::XATTR_ITEM_KEY).await?;
+            // Linux listxattr format: NUL-terminated names concatenated.
+            let mut out = Vec::new();
+            for (_key, body) in &items {
+                for entry in decode_dir_items(body)? {
+                    out.extend_from_slice(entry.name.as_bytes());
+                    out.push(0);
+                }
+            }
+            Ok(out)
+        })
     }
 }
 

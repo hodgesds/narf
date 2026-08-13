@@ -24,6 +24,10 @@ use crate::volume::BtrfsVolume;
 /// `mkfs.btrfs` image with hello.txt / big.dat / subdir/note.txt).
 const FIXTURE_SPARSE: &[u8] = include_bytes!("../testdata/fixture.img.sparse");
 
+/// Same tree as the primary fixture but written with `--compress zlib`, so
+/// `big.dat` is a zlib-compressed regular extent.
+const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -70,12 +74,18 @@ fn poll_once<F: core::future::Future>(mut future: F) -> Option<F::Output> {
     }
 }
 
-/// Mount the primary fixture on a fresh `RamBlockDevice` (512-byte LBAs).
-fn mount_fixture() -> Result<Arc<BtrfsVolume<narf_block::ram::RamBlockDevice>>, FsError> {
+/// Mount a `NARFBTR1` sparse image on a fresh `RamBlockDevice` (512-byte LBAs).
+fn mount_sparse(
+    sparse: &[u8],
+) -> Result<Arc<BtrfsVolume<narf_block::ram::RamBlockDevice>>, FsError> {
     use narf_block::ram::RamBlockDevice;
-    let img = decode_sparse(FIXTURE_SPARSE);
-    let device = RamBlockDevice::from_image(512, img);
+    let device = RamBlockDevice::from_image(512, decode_sparse(sparse));
     poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+/// Mount the primary (uncompressed) fixture.
+fn mount_fixture() -> Result<Arc<BtrfsVolume<narf_block::ram::RamBlockDevice>>, FsError> {
+    mount_sparse(FIXTURE_SPARSE)
 }
 
 // ── Phase 0: checksum ──────────────────────────────────────────────
@@ -817,3 +827,133 @@ fn smoke_btrfs_autodetect_and_mount() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_autodetect_and_mount);
+
+// ── Symlinks ───────────────────────────────────────────────────────
+
+fn smoke_btrfs_symlink() -> TestResult {
+    use narf_filesystem::{FileType, FsInstance};
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let root = vol.root();
+
+    // The symlink shows up as a Symlink in readdir.
+    let entries = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("enumerate failed"),
+    };
+    if !entries
+        .iter()
+        .any(|(n, t)| n == "link.txt" && *t == FileType::Symlink)
+    {
+        return TestResult::Fail("link.txt not listed as a symlink");
+    }
+
+    // Looking it up yields a node whose stat reports Symlink and whose contents
+    // are the link target (this is what the VFS reads to follow the link).
+    let link = match poll_once(root.lookup_async("link.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup link.txt failed"),
+    };
+    if link.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("symlink stat is not Symlink");
+    }
+    match read_all(&link, 256).as_deref() {
+        Some(b"hello.txt") => TestResult::Pass,
+        _ => TestResult::Fail("symlink target content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_symlink);
+
+// ── Extended attributes ────────────────────────────────────────────
+
+fn smoke_btrfs_xattr() -> TestResult {
+    use narf_filesystem::{FsError, FsInstance};
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let hello = match poll_once(vol.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hello.txt failed"),
+    };
+    // The known attribute round-trips.
+    match poll_once(hello.get_xattr("user.narf")) {
+        Some(Ok(v)) if v == b"hi" => {}
+        _ => return TestResult::Fail("get_xattr(user.narf) wrong"),
+    }
+    // A missing attribute is NotFound.
+    if !matches!(
+        poll_once(hello.get_xattr("user.absent")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("missing xattr should be NotFound");
+    }
+    // listxattr contains the NUL-terminated name.
+    match poll_once(hello.list_xattr()) {
+        Some(Ok(list)) if list.windows(10).any(|w| w == b"user.narf\0") => TestResult::Pass,
+        _ => TestResult::Fail("list_xattr missing user.narf"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_xattr);
+
+// ── statx ──────────────────────────────────────────────────────────
+
+fn smoke_btrfs_statx() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let sx = match poll_once(big.statx_async(0, 0)) {
+        Some(Ok(sx)) => sx,
+        _ => return TestResult::Fail("statx_async failed"),
+    };
+    if sx.size != 12000 {
+        return TestResult::Fail("statx size wrong");
+    }
+    if sx.mode & 0o170000 != 0o100000 {
+        return TestResult::Fail("statx mode is not a regular file");
+    }
+    if sx.nlink < 1 || sx.ino == 0 || sx.block_size != 4096 {
+        return TestResult::Fail("statx nlink/ino/blocksize wrong");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_statx);
+
+// ── zlib compression ───────────────────────────────────────────────
+
+fn smoke_btrfs_zlib_read() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_ZLIB_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("zlib fixture failed to mount"),
+    };
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    // Full decode of the zlib-compressed regular extent.
+    match read_all(&big, want.len() + 16) {
+        Some(got) if got == want => {}
+        _ => return TestResult::Fail("zlib full read mismatch"),
+    }
+    // A partial read inside the compressed extent returns the right slice.
+    let mut mid = [0u8; 20];
+    match poll_once(big.read(4090, &mut mid)) {
+        Some(Ok(20)) if mid[..] == want[4090..4110] => TestResult::Pass,
+        _ => TestResult::Fail("zlib partial read mismatch"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_zlib_read);

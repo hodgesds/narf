@@ -9,32 +9,40 @@
 # the full zero-filled image at test time — keeping the committed blob and the
 # kernel `.rodata` embed tiny.
 #
+# Two fixtures are produced from the same staging tree:
+#   fixture.img.sparse       uncompressed (data reads exercise inline/regular)
+#   fixture-zlib.img.sparse  --compress zlib (exercises the zlib read path)
+#
+# Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
+# big.dat (12000 B -> regular extents), subdir/note.txt, and link.txt (a
+# symlink to hello.txt).
+#
 # Pinned so a future btrfs-progs can't silently drift the layout:
 #   --csum crc32c            driver only supports CRC32C
 #   --sectorsize 4096        page-sized sectors
 #   --nodesize 4096          required by mixed mode; keeps the image at 16 MiB
 #   -M                       mixed block groups (small-image layout)
-#   -O ^free-space-tree,^no-holes   primary fixture: explicit hole extents
+#   -O ^free-space-tree,^no-holes   explicit hole extents
 #
 # btrfs-progs pinned at: v6.17.1 (update this line if you regen with a newer one).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 stage="$(mktemp -d)"
-trap 'rm -rf "$stage"' EXIT
+img="$(mktemp)"
+imgz="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz"' EXIT
+
 mkdir -p "$stage/subdir"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
 python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
     > "$stage/big.dat"                                             # 12000 B -> regular extents
 printf 'nested file\n' > "$stage/subdir/note.txt"
+ln -s hello.txt "$stage/link.txt"                                  # symlink
+setfattr -n user.narf -v hi "$stage/hello.txt"                     # xattr
 
-img="$(mktemp)"; trap 'rm -rf "$stage" "$img"' EXIT
-truncate -s 16M "$img"
-mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
-    -O ^free-space-tree,^no-holes --rootdir "$stage" "$img" >/dev/null
-btrfs check "$img" >/dev/null
-
-python3 - "$img" fixture.img.sparse <<'PY'
+sparse_encode() { # <image> <dst.sparse>
+    python3 - "$1" "$2" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 data = open(src, 'rb').read()
@@ -61,4 +69,18 @@ with open(dst, 'wb') as f:
 print("wrote %s: total=%d runs=%d payload=%d"
       % (dst, len(data), len(runs), sum(len(b) for _, b in runs)))
 PY
-echo "regenerated fixture.img.sparse"
+}
+
+truncate -s 16M "$img"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^free-space-tree,^no-holes --rootdir "$stage" "$img" >/dev/null
+btrfs check "$img" >/dev/null
+sparse_encode "$img" fixture.img.sparse
+
+truncate -s 16M "$imgz"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^free-space-tree,^no-holes --compress zlib --rootdir "$stage" "$imgz" >/dev/null
+btrfs check "$imgz" >/dev/null
+sparse_encode "$imgz" fixture-zlib.img.sparse
+
+echo "regenerated fixture.img.sparse + fixture-zlib.img.sparse"

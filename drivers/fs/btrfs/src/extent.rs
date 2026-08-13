@@ -8,8 +8,8 @@
 //! under the `no-holes` feature — simply the absence of an item over that range;
 //! either way the gap reads as zeros. Preallocated extents also read as zeros.
 //!
-//! Compression is out of scope: any item with `compression != 0` is rejected
-//! with `Unsupported` rather than returning wrong bytes.
+//! zlib-compressed extents (inline and regular) are decompressed on read; LZO
+//! and zstd are rejected with `Unsupported` rather than returning wrong bytes.
 
 use alloc::vec::Vec;
 
@@ -20,11 +20,24 @@ use crate::btree;
 use crate::format::{self, le64, BtrfsKey};
 use crate::volume::BtrfsVolume;
 
+/// Decompress a whole compressed extent according to its algorithm. Only zlib
+/// is supported; other algorithms yield `Unsupported`.
+fn decompress(compression: u8, input: &[u8]) -> Result<Vec<u8>, FsError> {
+    match compression {
+        format::COMPRESS_ZLIB => {
+            miniz_oxide::inflate::decompress_to_vec_zlib(input).map_err(|_| FsError::InvalidData)
+        }
+        format::COMPRESS_LZO | format::COMPRESS_ZSTD => Err(FsError::Unsupported),
+        _ => Err(FsError::InvalidData),
+    }
+}
+
 // Field offsets within `struct btrfs_file_extent_item`.
 const OFF_RAM_BYTES: usize = 8;
 const OFF_COMPRESSION: usize = 16;
 const OFF_TYPE: usize = 20;
 const OFF_DISK_BYTENR: usize = 21;
+const OFF_DISK_NUM_BYTES: usize = 29;
 const OFF_EXTENT_OFFSET: usize = 37;
 const OFF_NUM_BYTES: usize = 45;
 /// Body offset where inline data begins (right after `type`).
@@ -42,8 +55,13 @@ enum Extent {
     Regular {
         compression: u8,
         disk_bytenr: u64,
+        /// On-disk (possibly compressed) length of the whole extent.
+        disk_num_bytes: u64,
+        /// Offset into the uncompressed extent where this file range begins.
         extent_offset: u64,
         num_bytes: u64,
+        /// Uncompressed size of the whole extent.
+        ram_bytes: u64,
         prealloc: bool,
     },
 }
@@ -79,8 +97,10 @@ fn decode_extent(body: &[u8]) -> Result<(Extent, u64), FsError> {
                 Extent::Regular {
                     compression,
                     disk_bytenr: le64(body, OFF_DISK_BYTENR)?,
+                    disk_num_bytes: le64(body, OFF_DISK_NUM_BYTES)?,
                     extent_offset: le64(body, OFF_EXTENT_OFFSET)?,
                     num_bytes: le64(body, OFF_NUM_BYTES)?,
+                    ram_bytes,
                     prealloc: etype == format::FILE_EXTENT_PREALLOC,
                 },
                 ram_bytes,
@@ -123,34 +143,57 @@ pub async fn read_file<B: BlockDevice + 'static>(
         }
         match extent {
             Extent::Inline { compression, data } => {
-                if compression != 0 {
-                    return Err(FsError::Unsupported);
-                }
+                // Inline data is stored at file offset 0; decompress if needed.
+                let plain = if compression == format::COMPRESS_NONE {
+                    data
+                } else {
+                    decompress(compression, &data)?
+                };
                 for pos in ov_start..ov_end {
                     let src_idx = (pos - file_start) as usize;
-                    let byte = *data.get(src_idx).ok_or(FsError::InvalidData)?;
+                    let byte = *plain.get(src_idx).ok_or(FsError::InvalidData)?;
                     dst[(pos - offset) as usize] = byte;
                 }
             }
             Extent::Regular {
                 compression,
                 disk_bytenr,
+                disk_num_bytes,
                 extent_offset,
+                ram_bytes,
                 prealloc,
                 ..
             } => {
-                if compression != 0 {
-                    return Err(FsError::Unsupported);
-                }
                 // Holes and preallocated ranges stay zero-filled.
                 if disk_bytenr == 0 || prealloc {
                     continue;
                 }
-                let read_len = (ov_end - ov_start) as usize;
-                let logical = disk_bytenr + extent_offset + (ov_start - file_start);
-                let data = vol.read_logical(logical, read_len).await?;
                 let d0 = (ov_start - offset) as usize;
-                dst[d0..d0 + read_len].copy_from_slice(&data);
+                let read_len = (ov_end - ov_start) as usize;
+                if compression == format::COMPRESS_NONE {
+                    // Read only the bytes the window needs.
+                    let logical = disk_bytenr + extent_offset + (ov_start - file_start);
+                    let data = vol.read_logical(logical, read_len).await?;
+                    dst[d0..d0 + read_len].copy_from_slice(&data);
+                } else {
+                    // Compressed extents are decoded whole, then sliced. The
+                    // compressed payload of length `disk_num_bytes` lives at
+                    // `disk_bytenr`. The inflated stream holds only the real
+                    // data (btrfs does not pad it out to the sector-aligned
+                    // `ram_bytes`), so any index past its end is implicit zero
+                    // padding — dst is already zeroed.
+                    let _ = ram_bytes;
+                    let raw = vol
+                        .read_logical(disk_bytenr, disk_num_bytes as usize)
+                        .await?;
+                    let plain = decompress(compression, &raw)?;
+                    for pos in ov_start..ov_end {
+                        let src_idx = (extent_offset + (pos - file_start)) as usize;
+                        if let Some(&byte) = plain.get(src_idx) {
+                            dst[(pos - offset) as usize] = byte;
+                        }
+                    }
+                }
             }
         }
     }

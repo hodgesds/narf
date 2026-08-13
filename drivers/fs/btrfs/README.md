@@ -13,8 +13,11 @@ implementation (no C is copied).
 - Chunk-tree logical→physical mapping (`sys_chunk_array` seed + chunk-tree walk).
 - The default `FS_TREE` subvolume: directory `lookup` (CRC32C name hash) and
   `readdir` (`DIR_INDEX`), inode stat.
-- File reads: **inline** and **uncompressed regular** extents; holes and
+- File reads: **inline**, **regular**, and **zlib-compressed** extents; holes and
   preallocated ranges read as zeros (both explicit-hole and `no-holes` layouts).
+- **Symlinks** (target read via `FileOps::read`, so the VFS follows them),
+  **extended attributes** (`get_xattr` / `list_xattr` over `XATTR_ITEM`), and
+  **statx** (size/mode/uid/gid/nlink/ino/mtime).
 - Basic **COW write**: a full, same-size overwrite of an existing uncompressed
   single-regular-extent file — see below.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
@@ -25,11 +28,12 @@ implementation (no C is copied).
 Each is rejected with a precise `Unsupported` / `NotFound` / `NoSpace` rather
 than mis-read:
 
-- Compression (zlib/lz4/zstd) — `EXTENT_DATA.compression != 0`.
+- LZO / zstd compression — `EXTENT_DATA.compression` of 2 or 3 (zlib is
+  supported).
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
 - Non-CRC32C checksums (xxhash/sha256/blake2).
-- Subvolumes / snapshots beyond the default `FS_TREE`; xattrs.
+- Subvolumes / snapshots beyond the default `FS_TREE`; xattr *writes*.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## Basic COW write — scope and limits
@@ -56,10 +60,12 @@ with a live Linux kernel):
 
 ## Test fixtures
 
-`testdata/fixture.img.sparse` is a committed, compact (`NARFBTR1`) sparse
-encoding of a small `mkfs.btrfs` image (a 16 MiB image is ~90 KiB of non-zero
-data). The kernel tests reconstruct the full zero-filled image at runtime and
-mount it under a `RamBlockDevice`.
+`testdata/fixture.img.sparse` (uncompressed) and `testdata/fixture-zlib.img.sparse`
+(`--compress zlib`) are committed, compact (`NARFBTR1`) sparse encodings of small
+`mkfs.btrfs` images (a 16 MiB image is ~90 KiB of non-zero data). Both hold the
+same tree — `hello.txt` (with a `user.narf` xattr), `big.dat`, `subdir/note.txt`,
+and `link.txt` (a symlink). The kernel tests reconstruct the full zero-filled
+image at runtime and mount it under a `RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:
