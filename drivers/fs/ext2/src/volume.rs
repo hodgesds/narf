@@ -173,6 +173,11 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// this volume-wide async mutex provides the same lost-update guarantee
     /// until NARF grows a keyed inode cache.
     pub(crate) inode_update_lock: Mutex<()>,
+    /// Serializes bitmap + group-descriptor + superblock counter updates.
+    /// These three writes form one allocation transaction; allowing two
+    /// allocators to interleave can leave a bitmap whose checksum no longer
+    /// matches the descriptor that names it.
+    allocation_lock: Mutex<()>,
     /// Mount-root metadata must be available to the synchronous `root()`
     /// interface. It is loaded during mount and refreshed by `write_inode`.
     root_inode: IrqSafeSpinLock<Option<Inode>>,
@@ -487,6 +492,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             page_cache: Arc::new(PageCache::new()),
             fill_lock: Mutex::new(()),
             inode_update_lock: Mutex::new(()),
+            allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
             read_only,
         });
@@ -1237,7 +1243,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
-        self.verify_bitmap(group, kind, &buf).await?;
+        match self.verify_bitmap(group, kind, &buf).await {
+            Ok(()) => {}
+            // A large ext4 volume can still allocate safely from its other
+            // groups. Quarantine this group rather than mutating metadata
+            // whose checksum does not validate or failing the whole volume.
+            Err(FsError::InvalidData) => return Ok(None),
+            Err(error) => return Err(error),
+        }
         let max = (max_bits as usize).min(bs * 8);
         for bit in (skip_first as usize)..max {
             let byte = bit / 8;
@@ -1297,6 +1310,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// the same (`ext2_new_blocks` re-scans rather than trusting
     /// the descriptor) for robustness against unclean mounts.
     pub async fn alloc_block(&self) -> Result<u64, FsError> {
+        let _allocation = self.allocation_lock.lock().await;
         let bpg = self.superblock.blocks_per_group;
         let first_block = self.superblock.first_data_block;
         for (gi, gd) in self.group_descs.iter().enumerate() {
@@ -1318,6 +1332,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
     /// Free block `block_no` (absolute 1-based).
     pub async fn free_block(&self, block_no: u64) -> Result<(), FsError> {
+        let _allocation = self.allocation_lock.lock().await;
         let bpg = self.superblock.blocks_per_group as u64;
         let first_block = self.superblock.first_data_block as u64;
         if block_no < first_block {
@@ -1336,6 +1351,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Allocate a free inode. Returns the 1-based inode number.
     /// Treats `bg_free_inodes_count` as a hint (see `alloc_block`).
     pub async fn alloc_inode(&self) -> Result<u32, FsError> {
+        let _allocation = self.allocation_lock.lock().await;
         let ipg = self.superblock.inodes_per_group;
         let first_reserved = self.superblock.first_ino();
         for (gi, gd) in self.group_descs.iter().enumerate() {
@@ -1359,6 +1375,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
 
     /// Free inode `inode_no` (1-based).
     pub async fn free_inode(&self, inode_no: u32) -> Result<(), FsError> {
+        let _allocation = self.allocation_lock.lock().await;
         if inode_no == 0 {
             return Ok(());
         }
@@ -1373,6 +1390,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Keep `bg_used_dirs_count` synchronized with directory inode creation
     /// and removal, including its group-descriptor checksum.
     pub async fn note_dir_count_delta(&self, inode_no: u32, delta: i64) -> Result<(), FsError> {
+        let _allocation = self.allocation_lock.lock().await;
         let (group, _) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;

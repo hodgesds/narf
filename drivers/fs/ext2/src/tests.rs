@@ -946,6 +946,41 @@ kernel_test_in!(
     smoke_ext4_metadata_csum_mount_and_corruption_rejection
 );
 
+fn smoke_ext4_metadata_csum_allocator_quarantines_bad_bitmap() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const BS: usize = 1024;
+    let mut image = build_ext4_extent_image(b"checksummed extent data");
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign bitmap-quarantine fixture");
+    }
+    // Corrupt only the block bitmap. Mount validates the superblock, group
+    // descriptor, and inodes; the allocator is responsible for validating a
+    // bitmap immediately before it changes a bit.
+    image[3 * BS + 7] ^= 0x80;
+    let device = RamBlockDevice::from_image(512, image);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("bitmap-quarantine fixture did not mount"),
+    };
+    let before = device.snapshot();
+    if !matches!(poll_once(volume.alloc_block()), Some(Err(FsError::NoSpace))) {
+        return TestResult::Fail("allocator did not quarantine checksum-invalid group");
+    }
+    if device.snapshot() != before {
+        return TestResult::Fail("allocator mutated a checksum-invalid group");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_metadata_csum_allocator_quarantines_bad_bitmap
+);
+
 fn smoke_ext4_metadata_csum_writable_mkdir_survives_remount() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
@@ -1117,9 +1152,14 @@ fn smoke_ext4_metadata_csum_htree_insert_delete_survives_remount() -> TestResult
         _ => return TestResult::Fail("checksummed HTREE fixture did not mount"),
     };
     let root = volume.root();
-    if !matches!(poll_once(root.create("fresh")), Some(Ok(_))) {
-        return TestResult::Fail("checksummed HTREE insertion failed");
+    let fresh = match poll_once(root.create("fresh")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("checksummed HTREE insertion failed"),
+    };
+    if !matches!(poll_once(fresh.write(0, b"journal-header")), Some(Ok(14))) {
+        return TestResult::Fail("checksummed HTREE fresh-file write failed");
     }
+    drop(fresh);
     drop(root);
     drop(volume);
 
@@ -1128,9 +1168,17 @@ fn smoke_ext4_metadata_csum_htree_insert_delete_survives_remount() -> TestResult
         _ => return TestResult::Fail("HTREE checksum validation failed after insertion"),
     };
     let root = remounted.root();
-    if !matches!(poll_once(root.lookup_async("fresh")), Some(Ok(_))) {
-        return TestResult::Fail("HTREE insertion was not durable");
+    let fresh = match poll_once(root.lookup_async("fresh")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("HTREE insertion was not durable"),
+    };
+    let mut payload = [0u8; 14];
+    if !matches!(poll_once(fresh.read(0, &mut payload)), Some(Ok(14)))
+        || &payload != b"journal-header"
+    {
+        return TestResult::Fail("checksummed HTREE fresh-file data was not durable");
     }
+    drop(fresh);
     if !matches!(poll_once(root.unlink("fresh")), Some(Ok(()))) {
         return TestResult::Fail("checksummed HTREE deletion failed");
     }

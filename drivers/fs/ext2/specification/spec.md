@@ -68,6 +68,10 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   keep the volume read-only. One-level HTREE insertion into an existing leaf
   and deletion from existing one-level HTREE leaves are supported; a full
   leaf or multi-level mutation is rejected before mutation.
+- **Allocation metadata is serialized and quarantined by group.** Bitmap,
+  group-descriptor, and superblock-counter updates cannot interleave. A block
+  group whose bitmap checksum fails is skipped without mutation, allowing a
+  large volume to continue allocating from independently valid groups.
 
 ## 5. Architecture notes
 
@@ -82,6 +86,10 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
+- **Damaged-group containment.** Allocation scans treat a checksum-invalid
+  bitmap as unavailable space in that group; targeted frees still fail closed
+  because silently leaking a known allocation is safer than clearing an
+  unverified bitmap bit.
 
 ## 6. Dependencies
 
