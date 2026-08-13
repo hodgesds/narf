@@ -10,12 +10,7 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
-    let cwd = {
-        let g = CWD_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).cloned())
-            .unwrap_or_else(|| alloc::string::String::from("/"))
-    };
+    let cwd = task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"));
     // Need cwd.len() + 1 bytes (string + NUL terminator). POSIX
     // getcwd(3) returns ERANGE here; the syscall shape doesn't
     // surface errno yet so we fold both "no buf" and "buf too
