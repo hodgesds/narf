@@ -6,6 +6,12 @@ authoritative kernel definitions in
 `/usr/src/linux/include/uapi/linux/btrfs_tree.h`; this is an independent Rust
 implementation (no C is copied).
 
+Verified against a **realistic laptop-distro image** (`fixture-laptop`): non-mixed
+block groups, `nodesize 16384`, btrfs-progs default features (free-space-tree /
+`space_cache=v2`, `no-holes`, `extref`, skinny/big metadata), zstd, and a
+Fedora/openSUSE-style `root` (default) + `home` subvolume layout — i.e. what a
+real laptop's btrfs root looks like.
+
 ## Supported
 
 - Single-device volumes, **SINGLE** and **DUP** chunk profiles.

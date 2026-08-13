@@ -41,6 +41,11 @@ const FIXTURE_MANYFILES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-many
 const FIXTURE_DEFAULTSUBVOL_SPARSE: &[u8] =
     include_bytes!("../testdata/fixture-defaultsubvol.img.sparse");
 
+/// A realistic laptop-distro image: 128 MiB, non-mixed, nodesize 16384, zstd,
+/// btrfs-progs default features (free-space-tree, no-holes, extref, skinny/big
+/// metadata), with `root` (default) + `home` subvolumes.
+const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -99,6 +104,89 @@ fn mount_sparse(
 /// Mount the primary (uncompressed) fixture.
 fn mount_fixture() -> Result<Arc<BtrfsVolume<narf_block::ram::RamBlockDevice>>, FsError> {
     mount_sparse(FIXTURE_SPARSE)
+}
+
+/// Parse a `NARFBTR1` sparse image into `(total_size, runs)` WITHOUT
+/// reconstructing the full (potentially large) image.
+fn decode_sparse_runs(sparse: &[u8]) -> (u64, Vec<(u64, Vec<u8>)>) {
+    assert!(
+        sparse.len() >= 20 && &sparse[0..8] == b"NARFBTR1",
+        "bad fixture magic"
+    );
+    let total = u64::from_le_bytes(sparse[8..16].try_into().unwrap());
+    let n_runs = u32::from_le_bytes(sparse[16..20].try_into().unwrap()) as usize;
+    let mut runs = Vec::with_capacity(n_runs);
+    let mut p = 20usize;
+    for _ in 0..n_runs {
+        let off = u64::from_le_bytes(sparse[p..p + 8].try_into().unwrap());
+        let len = u64::from_le_bytes(sparse[p + 8..p + 16].try_into().unwrap()) as usize;
+        p += 16;
+        runs.push((off, sparse[p..p + len].to_vec()));
+        p += len;
+    }
+    (total, runs)
+}
+
+/// A read-only `BlockDeviceSync` presenting a large logical capacity while
+/// storing only the non-zero runs of a sparse image (holes read as zeros). Lets
+/// a 128 MiB laptop image be mounted in-kernel without a 128 MiB allocation.
+#[derive(Debug)]
+struct SparseImageDevice {
+    runs: Vec<(u64, Vec<u8>)>,
+    total: u64,
+    lba_size: u32,
+}
+
+impl narf_block::BlockDeviceSync for SparseImageDevice {
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+    fn capacity(&self) -> u64 {
+        self.total / u64::from(self.lba_size)
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        let start = lba * u64::from(self.lba_size);
+        let len = u64::from(n_blocks) * u64::from(self.lba_size);
+        if start + len > self.total {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        let n = out.len().min(len as usize);
+        out[..n].fill(0);
+        // Overlay any runs covering [start, start+n).
+        for (roff, rbytes) in &self.runs {
+            let rend = roff + rbytes.len() as u64;
+            let ov_start = start.max(*roff);
+            let ov_end = (start + n as u64).min(rend);
+            if ov_start < ov_end {
+                let dst = (ov_start - start) as usize;
+                let src = (ov_start - roff) as usize;
+                let cnt = (ov_end - ov_start) as usize;
+                out[dst..dst + cnt].copy_from_slice(&rbytes[src..src + cnt]);
+            }
+        }
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        Err(narf_block::BlockIoError::DriverError)
+    }
+}
+
+/// Mount a sparse image through the `SyncBlock` adapter (sparse-backed, so a
+/// large logical image costs only its non-zero payload in RAM).
+fn mount_sparse_device(sparse: &[u8]) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let (total, runs) = decode_sparse_runs(sparse);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(SparseImageDevice {
+        runs,
+        total,
+        lba_size: 512,
+    });
+    let async_dev = narf_block::SyncBlock::new(dev);
+    poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
 }
 
 // ── Phase 0: checksum ──────────────────────────────────────────────
@@ -1348,3 +1436,90 @@ fn smoke_btrfs_statfs() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_statfs);
+
+// ── Realistic laptop-distro image ──────────────────────────────────
+
+fn smoke_btrfs_laptop_image() -> TestResult {
+    use narf_filesystem::FsInstance;
+    // Non-mixed, nodesize 16384, default features (free-space-tree present),
+    // zstd, root/home subvolumes — what a real laptop's btrfs looks like.
+    let vol = match mount_sparse_device(FIXTURE_LAPTOP_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop image failed to mount"),
+    };
+    if vol.nodesize() != 16384 {
+        return TestResult::Fail("expected nodesize 16384 (non-mixed geometry)");
+    }
+
+    // A plain mount lands in the default subvolume `root`; it lists root's
+    // contents (rootfile.txt, big.dat, etc/) and NOT the sibling `home` subvol.
+    let root = vol.root();
+    let entries = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("root enumerate failed"),
+    };
+    let has = |n: &str| entries.iter().any(|(name, _)| name == n);
+    if !has("rootfile.txt") || !has("big.dat") || !has("etc") || has("home") {
+        return TestResult::Fail("default subvolume is not `root`");
+    }
+
+    // Read a realistic file through a subdirectory.
+    let etc = match poll_once(root.lookup_dir_async("etc")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup etc failed"),
+    };
+    let osrel = match poll_once(etc.lookup_async("os-release")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup os-release failed"),
+    };
+    match read_all(&osrel, 128) {
+        Some(b) if b.windows(11).any(|w| w == b"NARF Laptop") => {}
+        _ => return TestResult::Fail("os-release content wrong"),
+    }
+
+    // Read a zstd-compressed file at nodesize 16384.
+    let big = match poll_once(root.lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let want = expected_big();
+    match read_all(&big, want.len() + 16) {
+        Some(got) if got == want => {}
+        _ => return TestResult::Fail("laptop big.dat (zstd) read mismatch"),
+    }
+
+    // Reach the `home` subvolume via the top-level tree and read a file in it.
+    let (total, runs) = decode_sparse_runs(FIXTURE_LAPTOP_SPARSE);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(SparseImageDevice {
+        runs,
+        total,
+        lba_size: 512,
+    });
+    let top = match poll_once(BtrfsVolume::mount_subvol(
+        narf_block::SyncBlock::new(dev),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount top-level (subvolid=5) failed"),
+    };
+    let home = match poll_once(top.root().lookup_dir_async("home")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup home subvolume failed"),
+    };
+    let user = match poll_once(home.lookup_dir_async("user")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup home/user failed"),
+    };
+    let notes = match poll_once(user.lookup_async("notes.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup notes.txt failed"),
+    };
+    match read_all(&notes, 64).as_deref() {
+        Some(b"home user file\n") => TestResult::Pass,
+        _ => TestResult::Fail("home subvolume file content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_laptop_image);

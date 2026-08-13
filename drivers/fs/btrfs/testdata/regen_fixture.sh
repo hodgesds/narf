@@ -122,12 +122,33 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgdef" >/dev/null
 sparse_encode "$imgdef" fixture-defaultsubvol.img.sparse
 
+# A realistic *laptop distro* image: non-mixed block groups, nodesize 16384,
+# zstd, and — unlike the other fixtures — btrfs-progs DEFAULT features
+# (free-space-tree / space_cache=v2, no-holes, extref, skinny-metadata,
+# big-metadata), with a Fedora/openSUSE-style subvolume layout (`root` as the
+# default subvolume, `home` as a second subvolume). Proves the driver reads what
+# a real laptop's btrfs root looks like. Non-mixed btrfs has a ~128 MiB floor.
+labstage="$(mktemp -d)"
+imglab="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
+mkdir -p "$labstage/root/etc" "$labstage/home/user"
+printf 'NAME="NARF Laptop"\nID=narf\n' > "$labstage/root/etc/os-release"
+printf 'root subvol file\n' > "$labstage/root/rootfile.txt"
+python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
+    > "$labstage/root/big.dat"
+printf 'home user file\n' > "$labstage/home/user/notes.txt"
+truncate -s 128M "$imglab"
+mkfs.btrfs --csum crc32c --nodesize 16384 --sectorsize 4096 --compress zstd \
+    --subvol default:root --subvol rw:home --rootdir "$labstage" "$imglab" >/dev/null
+btrfs check "$imglab" >/dev/null
+sparse_encode "$imglab" fixture-laptop.img.sparse
+
 # A separate tree of 400 small (inline) files, forcing the FS b-tree to grow to
 # more than one level so tests exercise internal-node descent and leaf-to-leaf
 # cursor advance. Needs a 32 MiB image for the extra metadata.
 many="$(mktemp -d)"
 imgmany="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef" "$many" "$imgmany"' EXIT
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
 python3 -c "
 for i in range(400):
     open('$many/file%03d.txt'%i,'w').write('content-of-file-%03d\n'%i)
@@ -138,4 +159,4 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgmany" >/dev/null
 sparse_encode "$imgmany" fixture-manyfiles.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-defaultsubvol,-manyfiles}.img.sparse"
+echo "regenerated fixture{,-zlib,-zstd,-lzo,-defaultsubvol,-manyfiles,-laptop}.img.sparse"
