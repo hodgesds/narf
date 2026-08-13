@@ -11,10 +11,11 @@ NARF.
   `narf_block`. Ext4 volumes with `metadata_csum` / `csum_seed` are accepted
   after their superblock CRC32C is verified. Clean volumes whose write-side
   feature set is supported mount read/write; inode, classic-directory,
-  bitmap, group-descriptor, and primary-superblock mutations regenerate the
-  corresponding CRC32C before returning.
+  bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
+  the corresponding CRC32C before returning.
 - **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
-  splitting/rebalancing, extended attributes, `fsck`-style repair, and
+  splitting/rebalancing and multi-level insertion, extended attributes,
+  `fsck`-style repair, and
   extents-tree writes.
 
 ## 2. Assumptions
@@ -60,11 +61,13 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   snapshot.
 - **Checksummed ext4 fails closed.** A volume carrying
   `metadata_csum` verifies its superblock, group descriptors, inodes, and each
-  bitmap or classic-directory block before mutation. Writers install dependent
-  bitmap/directory checksums first, then the group-descriptor/superblock
-  checksum that names them. Unknown read-only-compatible features, a dirty JBD2
-  log, a non-empty orphan file, and checksum-enabled HTREE mutation keep the
-  volume read-only or reject the individual operation.
+  bitmap, classic-directory leaf, or HTREE index block before mutation. Writers
+  install dependent bitmap/directory checksums first, then the
+  group-descriptor/superblock checksum that names them. Unknown
+  read-only-compatible features, a dirty JBD2 log, and a non-empty orphan file
+  keep the volume read-only. One-level HTREE insertion into an existing leaf
+  and deletion from existing one-level HTREE leaves are supported; a full
+  leaf or multi-level mutation is rejected before mutation.
 
 ## 5. Architecture notes
 
@@ -72,7 +75,9 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Write scope.** Legacy direct/indirect block allocation, inode metadata,
   classic directory mutation, checksum-aware bitmaps/descriptors, and writes
   inside an already mapped extent persist. Extent-tree growth/truncation,
-  checksum-enabled HTREE mutation, and dirty-journal commit remain unsupported.
+  HTREE leaf splitting/multi-level insertion, and dirty-journal commit remain
+  unsupported. Existing one-level HTREE leaves accept checksum-safe insertion
+  and deletion without changing the index.
   If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
   `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;

@@ -176,6 +176,9 @@ pub struct Superblock {
     /// `s_checksum_seed` (offset 624). Meaningful only with
     /// `INCOMPAT_CSUM_SEED`.
     pub checksum_seed: u32,
+    /// `s_hash_seed` (offset 236). The four-word secret used by ext3/4
+    /// HTREE directory name hashes.
+    pub hash_seed: [u32; 4],
     /// `s_want_extra_isize` (offset 350). Fresh ext4 inodes reserve this many
     /// bytes beyond the original 128-byte body for checksum/timestamp fields.
     pub want_extra_isize: u16,
@@ -271,6 +274,14 @@ impl Superblock {
         } else {
             0
         };
+        let hash_seed = if buf.len() >= 252 {
+            core::array::from_fn(|i| {
+                let off = 236 + i * 4;
+                u32::from_le_bytes(buf[off..off + 4].try_into().expect("checked hash seed"))
+            })
+        } else {
+            [0; 4]
+        };
         let want_extra_isize = if buf.len() >= 352 {
             u16::from_le_bytes([buf[350], buf[351]])
         } else {
@@ -301,6 +312,7 @@ impl Superblock {
             journal_inum,
             uuid,
             checksum_seed,
+            hash_seed,
             want_extra_isize,
             orphan_file_inum,
         })

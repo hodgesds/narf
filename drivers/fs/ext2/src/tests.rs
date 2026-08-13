@@ -17,9 +17,10 @@ use super::group_desc::GroupDesc;
 use super::inode::Inode;
 use super::metadata_csum::{
     bitmap_checksum, crc32c, directory_block_checksum, extent_block_checksum, group_desc_checksum,
-    inode_checksum, seed, verify_group_desc_checksum, verify_inode_checksum, verify_superblock,
-    write_bitmap_checksum, write_directory_block_checksum, write_extent_block_checksum,
-    write_group_desc_checksum, write_inode_checksum, write_superblock_checksum,
+    htree_block_checksum, inode_checksum, seed, verify_group_desc_checksum,
+    verify_htree_block_checksum, verify_inode_checksum, verify_superblock, write_bitmap_checksum,
+    write_directory_block_checksum, write_extent_block_checksum, write_group_desc_checksum,
+    write_htree_block_checksum, write_inode_checksum, write_superblock_checksum,
 };
 use super::superblock::Superblock;
 
@@ -175,6 +176,43 @@ fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
         || directory_block_checksum(&sb, 42, 0x0102_0304, &directory) != Some(dir_before)
     {
         return TestResult::Fail("directory checksum was not stable");
+    }
+
+    // One-level HTREE root: entry zero's hash word is the count/limit
+    // overlay, and its block word immediately follows it.
+    let mut htree = vec![0u8; 1024];
+    htree[0..4].copy_from_slice(&42u32.to_le_bytes());
+    htree[4..6].copy_from_slice(&12u16.to_le_bytes());
+    htree[6] = 1;
+    htree[7] = ftype::DIR;
+    htree[8] = b'.';
+    htree[12..16].copy_from_slice(&2u32.to_le_bytes());
+    htree[16..18].copy_from_slice(&(1024u16 - 12).to_le_bytes());
+    htree[18] = 2;
+    htree[19] = ftype::DIR;
+    htree[20..22].copy_from_slice(b"..");
+    htree[28] = super::htree::hash_version::TEA;
+    htree[29] = 8;
+    let limit = ((1024 - 32 - 8) / 8) as u16;
+    htree[32..34].copy_from_slice(&limit.to_le_bytes());
+    htree[34..36].copy_from_slice(&2u16.to_le_bytes());
+    htree[36..40].copy_from_slice(&1u32.to_le_bytes());
+    htree[40..44].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    htree[44..48].copy_from_slice(&2u32.to_le_bytes());
+    let dx_tail = 32 + limit as usize * 8;
+    let before = match htree_block_checksum(&sb, 42, 0x0102_0304, &htree) {
+        Some(checksum) => checksum,
+        None => return TestResult::Fail("HTREE checksum unavailable"),
+    };
+    if write_htree_block_checksum(&sb, 42, 0x0102_0304, &mut htree).is_none()
+        || !verify_htree_block_checksum(&sb, 42, 0x0102_0304, &htree)
+        || u32::from_le_bytes(htree[dx_tail + 4..dx_tail + 8].try_into().unwrap()) != before
+    {
+        return TestResult::Fail("HTREE checksum writer did not round-trip");
+    }
+    htree[40] ^= 1;
+    if verify_htree_block_checksum(&sb, 42, 0x0102_0304, &htree) {
+        return TestResult::Fail("HTREE checksum accepted a changed index entry");
     }
 
     let mut extent = vec![0xa5; 4096];
@@ -948,6 +986,176 @@ fn smoke_ext4_metadata_csum_writable_mkdir_survives_remount() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_metadata_csum_writable_mkdir_survives_remount
+);
+
+/// Build a two-block, one-level HTREE root on top of the compact ext4
+/// fixture. Logical block zero is the checksummed index root and logical block
+/// one is a classic checksummed leaf containing the original entries.
+fn build_ext4_metadata_csum_htree_fixture() -> Result<Vec<u8>, &'static str> {
+    const BS: usize = 1024;
+    const SB: usize = BS;
+    const GDT: usize = 2 * BS;
+    const ITABLE: usize = 5 * BS;
+    const INODE_SIZE: usize = 128;
+    const ROOT_INODE: usize = ITABLE + INODE_SIZE;
+    const FILE_INODE: usize = ITABLE + 11 * INODE_SIZE;
+
+    let mut image = build_ext4_extent_image(b"htree-data");
+
+    // Move the regular file from block 10 to 11 so blocks 9..10 can be the
+    // root directory's contiguous two-block extent.
+    image.copy_within(10 * BS..11 * BS, 11 * BS);
+    image[10 * BS..11 * BS].fill(0);
+    put_u32(&mut image, FILE_INODE + 60, 11);
+    image[3 * BS + 1] |= 1 << 3; // block 11 is allocated
+
+    put_u32(&mut image, ROOT_INODE + 4, (2 * BS) as u32);
+    put_u32(&mut image, ROOT_INODE + 28, (2 * BS / 512) as u32);
+    put_u32(
+        &mut image,
+        ROOT_INODE + 32,
+        super::inode::I_FLAGS_EXTENTS | super::inode::I_FLAGS_INDEX,
+    );
+    put_u16(&mut image, ROOT_INODE + 56, 2); // extent length
+
+    // Preserve the original linear directory as HTREE leaf block 1.
+    image.copy_within(9 * BS..10 * BS, 10 * BS);
+    put_u16(&mut image, 10 * BS + 24 + 4, (BS - 24 - 12) as u16);
+    let leaf_tail = 11 * BS - 12;
+    put_u32(&mut image, leaf_tail, 0);
+    put_u16(&mut image, leaf_tail + 4, 12);
+    image[leaf_tail + 6] = 0;
+    image[leaf_tail + 7] = 0xde;
+    put_u32(&mut image, leaf_tail + 8, 0);
+
+    // Build the HTREE root. Entry zero's hash word is the `(limit, count)`
+    // overlay; its block word points at logical directory block 1.
+    let root = &mut image[9 * BS..10 * BS];
+    root.fill(0);
+    put_u32(root, 0, 2);
+    put_u16(root, 4, 12);
+    root[6] = 1;
+    root[7] = ftype::DIR;
+    root[8] = b'.';
+    put_u32(root, 12, 2);
+    put_u16(root, 16, (BS - 12) as u16);
+    root[18] = 2;
+    root[19] = ftype::DIR;
+    root[20..22].copy_from_slice(b"..");
+    root[28] = super::htree::hash_version::TEA;
+    root[29] = 8;
+    let limit = ((BS - 32 - 8) / 8) as u16;
+    put_u16(root, 32, limit);
+    put_u16(root, 34, 1);
+    put_u32(root, 36, 1);
+    let dx_tail = 32 + limit as usize * 8;
+    put_u32(root, dx_tail, 0);
+    put_u32(root, dx_tail + 4, 0);
+
+    put_u32(&mut image, SB + 92, super::superblock::compat::DIR_INDEX);
+    put_u32(
+        &mut image,
+        SB + 96,
+        super::superblock::incompat::EXTENTS | super::superblock::incompat::CSUM_SEED,
+    );
+    put_u32(
+        &mut image,
+        SB + 100,
+        super::superblock::ro_compat::METADATA_CSUM,
+    );
+    for (i, word) in [1u32, 2, 3, 4].iter().enumerate() {
+        put_u32(&mut image, SB + 236 + i * 4, *word);
+    }
+    put_u32(&mut image, SB + 624, 0x4d3c_2b1a);
+    put_u32(&mut image, SB + 12, 52); // 64 total - blocks 0..=11
+    put_u32(&mut image, SB + 16, 29);
+    put_u16(&mut image, GDT + 12, 52);
+    put_u16(&mut image, GDT + 14, 29);
+
+    let sb = Superblock::parse(&image[SB..SB + 1024]).ok_or("HTREE superblock parse")?;
+    if sb.hash_seed != [1, 2, 3, 4] {
+        return Err("HTREE hash seed did not parse");
+    }
+    write_directory_block_checksum(&sb, 2, 0, &mut image[10 * BS..11 * BS])
+        .ok_or("HTREE leaf checksum")?;
+    write_htree_block_checksum(&sb, 2, 0, &mut image[9 * BS..10 * BS])
+        .ok_or("HTREE root checksum")?;
+    let block_bitmap = image[3 * BS..3 * BS + 8].to_vec();
+    let inode_bitmap = image[4 * BS..4 * BS + 4].to_vec();
+    write_bitmap_checksum(&sb, &mut image[GDT..GDT + 32], &block_bitmap, false)
+        .ok_or("HTREE block bitmap checksum")?;
+    write_bitmap_checksum(&sb, &mut image[GDT..GDT + 32], &inode_bitmap, true)
+        .ok_or("HTREE inode bitmap checksum")?;
+    for inode_no in [2u32, 12] {
+        let index = (inode_no - 1) as usize;
+        write_inode_checksum(
+            &sb,
+            inode_no,
+            &mut image[ITABLE + index * INODE_SIZE..ITABLE + (index + 1) * INODE_SIZE],
+        )
+        .ok_or("HTREE inode checksum")?;
+    }
+    write_group_desc_checksum(&sb, 0, &mut image[GDT..GDT + 32]).ok_or("HTREE group checksum")?;
+    write_superblock_checksum(&sb, &mut image[SB..SB + 1024]).ok_or("HTREE superblock checksum")?;
+    Ok(image)
+}
+
+fn smoke_ext4_metadata_csum_htree_insert_delete_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let image = match build_ext4_metadata_csum_htree_fixture() {
+        Ok(image) => image,
+        Err(error) => return TestResult::Fail(error),
+    };
+    let device = RamBlockDevice::from_image(512, image);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("checksummed HTREE fixture did not mount"),
+    };
+    let root = volume.root();
+    if !matches!(poll_once(root.create("fresh")), Some(Ok(_))) {
+        return TestResult::Fail("checksummed HTREE insertion failed");
+    }
+    drop(root);
+    drop(volume);
+
+    let remounted = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("HTREE checksum validation failed after insertion"),
+    };
+    let root = remounted.root();
+    if !matches!(poll_once(root.lookup_async("fresh")), Some(Ok(_))) {
+        return TestResult::Fail("HTREE insertion was not durable");
+    }
+    if !matches!(poll_once(root.unlink("fresh")), Some(Ok(()))) {
+        return TestResult::Fail("checksummed HTREE deletion failed");
+    }
+    drop(root);
+    drop(remounted);
+
+    let remounted = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("HTREE checksum validation failed after deletion"),
+    };
+    let root = remounted.root();
+    if !matches!(
+        poll_once(root.lookup_async("fresh")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("HTREE deletion was not durable");
+    }
+    if !matches!(poll_once(root.lookup_async("data")), Some(Ok(_))) {
+        return TestResult::Fail("HTREE mutation damaged an unrelated leaf entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_metadata_csum_htree_insert_delete_survives_remount
 );
 
 fn smoke_ext4_mount_extent_round_trip() -> TestResult {
@@ -2532,9 +2740,10 @@ fn smoke_ext2_htree_root_decode() -> TestResult {
     block[6] = 1;
     block[7] = ftype::DIR;
     block[8] = b'.';
-    // ".." entry — 12 bytes (covers up to dx_root_info).
+    // ".." entry spans the remainder of the block; HTREE metadata is hidden
+    // inside its otherwise-unused body from legacy directory walkers.
     block[12..16].copy_from_slice(&2u32.to_le_bytes());
-    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    block[16..18].copy_from_slice(&(1024u16 - 12).to_le_bytes());
     block[18] = 2;
     block[19] = ftype::DIR;
     block[20] = b'.';
@@ -2547,7 +2756,6 @@ fn smoke_ext2_htree_root_decode() -> TestResult {
     block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&10u16.to_le_bytes());
     block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&3u16.to_le_bytes());
     // 3 entries: (0, 5), (0xA000_0000, 6), (0xC000_0000, 7).
-    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8].copy_from_slice(&5u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
         .copy_from_slice(&0xA000_0000u32.to_le_bytes());
@@ -2594,7 +2802,7 @@ fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
     block[7] = ftype::DIR;
     block[8] = b'.';
     block[12..16].copy_from_slice(&2u32.to_le_bytes());
-    block[16..18].copy_from_slice(&12u16.to_le_bytes());
+    block[16..18].copy_from_slice(&(1024u16 - 12).to_le_bytes());
     block[18] = 2;
     block[19] = ftype::DIR;
     block[20] = b'.';
@@ -2604,7 +2812,6 @@ fn smoke_ext2_htree_lookup_chooses_correct_bucket() -> TestResult {
     block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&10u16.to_le_bytes());
     block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&3u16.to_le_bytes());
     // Sorted entries: (0, 5), (0x4000_0000, 6), (0x8000_0000, 7).
-    block[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8].copy_from_slice(&5u32.to_le_bytes());
     block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
         .copy_from_slice(&0x4000_0000u32.to_le_bytes());
@@ -2938,12 +3145,11 @@ fn smoke_ext2_htree_index_node_insert_sorted() -> TestResult {
     let bs = 1024usize;
     let mut node = vec![0u8; bs];
 
-    // Initialise head: limit = (bs - 12) / 8, count = 1 (sentinel entry 0).
-    let limit = ((bs - DX_NODE_ENTRIES_OFF) / 8) as u16;
+    // Initialise head: leave eight bytes for the dx checksum tail.
+    let limit = ((bs - DX_NODE_ENTRIES_OFF - 8) / 8) as u16;
     node[DX_NODE_HEAD_OFF..DX_NODE_HEAD_OFF + 2].copy_from_slice(&limit.to_le_bytes());
     node[DX_NODE_HEAD_OFF + 2..DX_NODE_HEAD_OFF + 4].copy_from_slice(&1u16.to_le_bytes());
     // Entry 0: hash=0, block=1 (catch-all).
-    node[DX_NODE_ENTRIES_OFF..DX_NODE_ENTRIES_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
     node[DX_NODE_ENTRIES_OFF + 4..DX_NODE_ENTRIES_OFF + 8].copy_from_slice(&1u32.to_le_bytes());
 
     // Insert (hash=300, block=3), (hash=100, block=2), (hash=200, block=4).
@@ -2959,8 +3165,9 @@ fn smoke_ext2_htree_index_node_insert_sorted() -> TestResult {
     }
     // Verify sorted order: entries at indices 0..4 should have
     // hashes 0, 100, 200, 300.
-    let expected_hashes = [0u32, 100, 200, 300];
+    let expected_hashes = [100u32, 200, 300];
     for (i, &eh) in expected_hashes.iter().enumerate() {
+        let i = i + 1; // entry zero's hash word is the count/limit header
         let off = DX_NODE_ENTRIES_OFF + i * 8;
         let h = u32::from_le_bytes([node[off], node[off + 1], node[off + 2], node[off + 3]]);
         if h != eh {

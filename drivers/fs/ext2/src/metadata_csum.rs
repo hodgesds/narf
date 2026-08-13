@@ -338,6 +338,104 @@ pub fn verify_directory_block_checksum(
     provided == calculated
 }
 
+/// Locate the `(count, limit)` header and checksum tail in an HTREE root or
+/// interior node. The count/limit header occupies the first half of the
+/// otherwise-unused first `dx_entry`, exactly as ext4 lays it out.
+fn htree_checksum_layout(block: &[u8]) -> Option<(usize, usize, usize)> {
+    if block.len() < 40 {
+        return None;
+    }
+    let first_rec_len = u16::from_le_bytes(block[4..6].try_into().ok()?) as usize;
+    let count_offset = if first_rec_len == block.len() {
+        // Interior dx_node: fake dirent followed by count/limit at byte 8.
+        8
+    } else if first_rec_len == 12 {
+        // dx_root: `.` then a `..` record spanning the rest of the block.
+        let second_rec_len = u16::from_le_bytes(block[16..18].try_into().ok()?) as usize;
+        if second_rec_len != block.len() - 12 || block[24..28] != [0; 4] || block[29] != 8 {
+            return None;
+        }
+        32
+    } else {
+        return None;
+    };
+    let limit = u16::from_le_bytes(block[count_offset..count_offset + 2].try_into().ok()?) as usize;
+    let count =
+        u16::from_le_bytes(block[count_offset + 2..count_offset + 4].try_into().ok()?) as usize;
+    if count == 0 || count > limit {
+        return None;
+    }
+    let tail = count_offset.checked_add(limit.checked_mul(8)?)?;
+    if tail.checked_add(8)? > block.len() {
+        return None;
+    }
+    Some((count_offset, count, tail))
+}
+
+/// Calculate an ext4 HTREE root/interior checksum. Only populated index
+/// entries participate; the fixed-capacity gap between `count` and `limit`
+/// does not. The eight-byte `dx_tail` contributes its reserved zero word and
+/// a logically-zero checksum word.
+pub fn htree_block_checksum(
+    sb: &Superblock,
+    inode_no: u32,
+    inode_generation: u32,
+    block: &[u8],
+) -> Option<u32> {
+    if !sb.has_metadata_csum() {
+        return None;
+    }
+    let (count_offset, count, tail) = htree_checksum_layout(block)?;
+    let protected_end = count_offset.checked_add(count.checked_mul(8)?)?;
+    let mut state = crc32c(seed(sb), &inode_no.to_le_bytes());
+    state = crc32c(state, &inode_generation.to_le_bytes());
+    state = crc32c(state, &block[..protected_end]);
+    state = crc32c(state, &block[tail..tail + 4]);
+    Some(crc32c(state, &[0; 4]))
+}
+
+/// Install the checksum carried by an HTREE `dx_tail`.
+pub fn write_htree_block_checksum(
+    sb: &Superblock,
+    inode_no: u32,
+    inode_generation: u32,
+    block: &mut [u8],
+) -> Option<()> {
+    let (_, _, tail) = htree_checksum_layout(block)?;
+    if block[tail..tail + 4] != [0; 4] {
+        return None;
+    }
+    let checksum = htree_block_checksum(sb, inode_no, inode_generation, block)?;
+    block[tail + 4..tail + 8].copy_from_slice(&checksum.to_le_bytes());
+    Some(())
+}
+
+/// Verify the checksum carried by an HTREE `dx_tail`.
+pub fn verify_htree_block_checksum(
+    sb: &Superblock,
+    inode_no: u32,
+    inode_generation: u32,
+    block: &[u8],
+) -> bool {
+    if !sb.has_metadata_csum() {
+        return true;
+    }
+    let Some((_, _, tail)) = htree_checksum_layout(block) else {
+        return false;
+    };
+    if block[tail..tail + 4] != [0; 4] {
+        return false;
+    }
+    let Some(calculated) = htree_block_checksum(sb, inode_no, inode_generation, block) else {
+        return false;
+    };
+    u32::from_le_bytes(
+        block[tail + 4..tail + 8]
+            .try_into()
+            .expect("dx checksum bounds"),
+    ) == calculated
+}
+
 /// Calculate the checksum for a non-root extent-tree block. The final four
 /// bytes carry the checksum and are excluded from the protected extent-node
 /// bytes.
