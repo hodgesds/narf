@@ -3495,10 +3495,22 @@ fn smoke_kernel_time_accumulates_on_cpu_only() -> TestResult {
         while narf_scheduler::narf_time::monotonic_ns() < off_cpu_until {
             core::hint::spin_loop();
         }
+        // Re-open then immediately close a span. A span bills its own wall time
+        // (close_now - open_now), so the newly-opened span must NOT retroactively
+        // charge the 5 ms off-CPU gap that preceded it. Compare the billed delta
+        // against THIS bracket's measured wall time rather than a fixed ceiling:
+        // if a real timer preemption lands between open and close (this test runs
+        // amid thousands of others on an SMP host), it inflates the bracket wall
+        // time and the billed time equally, so the check stays stable — while a
+        // genuinely-billed off-CPU gap (~5 ms, far beyond the tiny bracket) still
+        // fails.
+        let open_at = narf_scheduler::narf_time::monotonic_ns();
         crate::handlers::__test_open_kernel_span_for(uc, tid);
         crate::handlers::close_kernel_span(uc, tid);
+        let close_at = narf_scheduler::narf_time::monotonic_ns();
         let resumed = crate::handlers::kern_time_ns_of(tid);
-        if resumed.saturating_sub(paused) > 1_000_000 {
+        let bracket_wall = close_at.saturating_sub(open_at);
+        if resumed.saturating_sub(paused) > bracket_wall + 1_000_000 {
             return TestResult::Fail("timer-preemption off-CPU gap was billed as kernel time");
         }
         TestResult::Pass
