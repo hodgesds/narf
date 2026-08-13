@@ -9,8 +9,10 @@ NARF.
   (`narf_filesystem::FsInstance`), persistent inode data/mode/owner metadata,
   directory mutation, symlinks, and cap-bound DMA block I/O via `narf_io` +
   `narf_block`. Ext4 volumes with `metadata_csum` / `csum_seed` are accepted
-  after their superblock CRC32C is verified, but mount read-only until every
-  mutable metadata path regenerates the corresponding ext4 checksum.
+  after their superblock CRC32C is verified. Clean volumes whose write-side
+  feature set is supported mount read/write; inode, classic-directory,
+  bitmap, group-descriptor, and primary-superblock mutations regenerate the
+  corresponding CRC32C before returning.
 - **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
   splitting/rebalancing, extended attributes, `fsck`-style repair, and
   extents-tree writes.
@@ -56,16 +58,23 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.
-- **Checksummed ext4 is never written partially.** A volume carrying
-  `metadata_csum` is mounted read-only after superblock checksum verification;
-  all write paths return `FsError::ReadOnly` until inode, directory, bitmap,
-  group-descriptor, extent, and journal checksum updates are implemented.
+- **Checksummed ext4 fails closed.** A volume carrying
+  `metadata_csum` verifies its superblock, group descriptors, inodes, and each
+  bitmap or classic-directory block before mutation. Writers install dependent
+  bitmap/directory checksums first, then the group-descriptor/superblock
+  checksum that names them. Unknown read-only-compatible features, a dirty JBD2
+  log, a non-empty orphan file, and checksum-enabled HTREE mutation keep the
+  volume read-only or reject the individual operation.
 
 ## 5. Architecture notes
 
 - **Async-First:** All I/O is async on the `BlockDevice` trait.
-- **Write scope.** Legacy direct/indirect block writes and inode/directory
-  metadata persist. Extents-tree and journal writes remain unsupported.
+- **Write scope.** Legacy direct/indirect block allocation, inode metadata,
+  classic directory mutation, checksum-aware bitmaps/descriptors, and writes
+  inside an already mapped extent persist. Extent-tree growth/truncation,
+  checksum-enabled HTREE mutation, and dirty-journal commit remain unsupported.
+  If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
+  `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
 

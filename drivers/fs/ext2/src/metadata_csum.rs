@@ -72,6 +72,20 @@ pub fn verify_superblock(sb: &Superblock, bytes: &[u8]) -> bool {
     crc32c(!0, &bytes[..SUPERBLOCK_CHECKSUM_OFFSET]) == stored
 }
 
+/// Recompute `s_checksum` after mutating the primary superblock.
+pub fn write_superblock_checksum(sb: &Superblock, bytes: &mut [u8]) -> Option<()> {
+    if !sb.has_metadata_csum() {
+        return Some(());
+    }
+    if bytes.len() < SUPERBLOCK_CHECKSUM_OFFSET + 4 {
+        return None;
+    }
+    let checksum = crc32c(!0, &bytes[..SUPERBLOCK_CHECKSUM_OFFSET]);
+    bytes[SUPERBLOCK_CHECKSUM_OFFSET..SUPERBLOCK_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&checksum.to_le_bytes());
+    Some(())
+}
+
 /// Calculate the full checksum for one on-disk inode.
 ///
 /// The inode number and generation make a copied inode record fail checksum
@@ -203,6 +217,58 @@ pub fn bitmap_checksum(sb: &Superblock, bitmap: &[u8]) -> Option<u32> {
     Some(crc32c(seed(sb), bitmap))
 }
 
+/// Install a block- or inode-bitmap checksum in its group descriptor.
+///
+/// `bitmap` must contain exactly the meaningful bitmap bytes
+/// (`blocks_per_group / 8` or `inodes_per_group / 8`), not necessarily the
+/// whole filesystem block. ext4 stores the low half in every descriptor and
+/// the high half in a 64-byte descriptor.
+pub fn write_bitmap_checksum(
+    sb: &Superblock,
+    desc: &mut [u8],
+    bitmap: &[u8],
+    inode_bitmap: bool,
+) -> Option<()> {
+    let checksum = bitmap_checksum(sb, bitmap)?;
+    let lo_off = if inode_bitmap { 0x1a } else { 0x18 };
+    let hi_off = if inode_bitmap { 0x3a } else { 0x38 };
+    if desc.len() < lo_off + 2 {
+        return None;
+    }
+    desc[lo_off..lo_off + 2].copy_from_slice(&(checksum as u16).to_le_bytes());
+    if desc.len() >= hi_off + 2 {
+        desc[hi_off..hi_off + 2].copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+    }
+    Some(())
+}
+
+/// Verify a bitmap checksum stored in a group descriptor.
+pub fn verify_bitmap_checksum(
+    sb: &Superblock,
+    desc: &[u8],
+    bitmap: &[u8],
+    inode_bitmap: bool,
+) -> bool {
+    if !sb.has_metadata_csum() {
+        return true;
+    }
+    let Some(calculated) = bitmap_checksum(sb, bitmap) else {
+        return false;
+    };
+    let lo_off = if inode_bitmap { 0x1a } else { 0x18 };
+    let hi_off = if inode_bitmap { 0x3a } else { 0x38 };
+    if desc.len() < lo_off + 2 {
+        return false;
+    }
+    let mut provided = u16::from_le_bytes([desc[lo_off], desc[lo_off + 1]]) as u32;
+    if desc.len() >= hi_off + 2 {
+        provided |= (u16::from_le_bytes([desc[hi_off], desc[hi_off + 1]]) as u32) << 16;
+        provided == calculated
+    } else {
+        provided == calculated as u16 as u32
+    }
+}
+
 /// Calculate a classic (non-HTREE) directory block checksum. The trailing
 /// 12-byte fake dirent belongs to the checksum carrier and is excluded from
 /// the byte range being protected.
@@ -239,6 +305,37 @@ pub fn write_directory_block_checksum(
     let checksum = directory_block_checksum(sb, inode_no, inode_generation, block)?;
     block[tail + 8..tail + 12].copy_from_slice(&checksum.to_le_bytes());
     Some(())
+}
+
+/// Verify the checksum carried by a classic directory leaf tail.
+pub fn verify_directory_block_checksum(
+    sb: &Superblock,
+    inode_no: u32,
+    inode_generation: u32,
+    block: &[u8],
+) -> bool {
+    if !sb.has_metadata_csum() {
+        return true;
+    }
+    let Some(tail) = block.len().checked_sub(12) else {
+        return false;
+    };
+    if block[tail..tail + 4] != [0; 4]
+        || block[tail + 4..tail + 6] != 12u16.to_le_bytes()
+        || block[tail + 6] != 0
+        || block[tail + 7] != 0xde
+    {
+        return false;
+    }
+    let Some(calculated) = directory_block_checksum(sb, inode_no, inode_generation, block) else {
+        return false;
+    };
+    let provided = u32::from_le_bytes(
+        block[tail + 8..tail + 12]
+            .try_into()
+            .expect("directory checksum slice is four bytes"),
+    );
+    provided == calculated
 }
 
 /// Calculate the checksum for a non-root extent-tree block. The final four

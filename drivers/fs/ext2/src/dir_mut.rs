@@ -24,6 +24,7 @@ use narf_filesystem::FsError;
 use super::dir::{ftype, splice};
 use super::htree::{self, DxRoot};
 use super::inode::{Inode, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use super::metadata_csum;
 use super::superblock::compat;
 use super::volume::Ext2Volume;
 
@@ -38,6 +39,58 @@ fn ftype_for_mode(mode: u16) -> u8 {
 }
 
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
+    fn add_directory_checksum_tail(&self, block: &mut [u8]) -> Result<(), FsError> {
+        if !self.superblock.has_metadata_csum() {
+            return Ok(());
+        }
+        let tail = block.len().checked_sub(12).ok_or(FsError::InvalidData)?;
+        block[tail..tail + 4].fill(0);
+        block[tail + 4..tail + 6].copy_from_slice(&12u16.to_le_bytes());
+        block[tail + 6] = 0;
+        block[tail + 7] = 0xde;
+        block[tail + 8..tail + 12].fill(0);
+        Ok(())
+    }
+
+    fn verify_directory_block_for_write(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        block: &[u8],
+    ) -> Result<(), FsError> {
+        if metadata_csum::verify_directory_block_checksum(
+            &self.superblock,
+            inode_no,
+            inode.generation,
+            block,
+        ) {
+            Ok(())
+        } else {
+            Err(FsError::InvalidData)
+        }
+    }
+
+    async fn write_directory_block(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        physical: u64,
+        block: &mut [u8],
+    ) -> Result<(), FsError> {
+        if metadata_csum::write_directory_block_checksum(
+            &self.superblock,
+            inode_no,
+            inode.generation,
+            block,
+        )
+        .is_none()
+            && self.superblock.has_metadata_csum()
+        {
+            return Err(FsError::InvalidData);
+        }
+        self.write_block(physical, block).await
+    }
+
     /// Read every directory data block of `parent_inode` into a
     /// flat `Vec<u8>`. Length equals `parent_inode.size`.
     pub(crate) async fn read_dir_bytes(&self, parent_inode: &Inode) -> Result<Vec<u8>, FsError> {
@@ -116,6 +169,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if name.is_empty() || name.len() > 255 {
             return Err(FsError::InvalidPath);
         }
+        // HTREE root/interior nodes use an eight-byte dx checksum tail rather
+        // than the classic twelve-byte dirent tail. Until that writer lands,
+        // refuse their mutation instead of installing the wrong checksum.
+        if self.superblock.has_metadata_csum() && parent_inode.is_htree() {
+            return Err(FsError::Unsupported);
+        }
         let bs = self.block_size();
         let blocks = (parent_inode.size as usize).div_ceil(bs);
         let file_type = ftype_for_mode(target_mode);
@@ -135,9 +194,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             let mut blockbuf = vec![0u8; bs];
             self.read_block(phys, &mut blockbuf).await?;
+            self.verify_directory_block_for_write(parent_inode_no, parent_inode, &blockbuf)?;
             match splice::insert_entry(&mut blockbuf, target_inode_no, name, file_type) {
                 splice::InsertResult::Ok { .. } => {
-                    self.write_block(phys, &blockbuf).await?;
+                    self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
+                        .await?;
                     return Ok(());
                 }
                 splice::InsertResult::Exists => {
@@ -176,9 +237,22 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                             self.write_block(new_phys as u64, &zeros).await?;
 
                             // Write repacked halves.
-                            self.write_block(phys, &split.old_block_data).await?;
-                            self.write_block(new_phys as u64, &split.new_block_data)
-                                .await?;
+                            let mut old_data = split.old_block_data;
+                            let mut new_data = split.new_block_data;
+                            self.write_directory_block(
+                                parent_inode_no,
+                                parent_inode,
+                                phys,
+                                &mut old_data,
+                            )
+                            .await?;
+                            self.write_directory_block(
+                                parent_inode_no,
+                                parent_inode,
+                                new_phys as u64,
+                                &mut new_data,
+                            )
+                            .await?;
 
                             // Update the root-node index with the new
                             // (split_hash, new_phys) entry. Only the
@@ -193,7 +267,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                                     new_phys,
                                 )
                                 .ok(); // IndexFull: we still wrote the blocks; new entry is just unreachable until a deeper split is done
-                                self.write_block(root_phys, &root_buf).await?;
+                                self.write_directory_block(
+                                    parent_inode_no,
+                                    parent_inode,
+                                    root_phys,
+                                    &mut root_buf,
+                                )
+                                .await?;
                             }
                             // Bump i_blocks for the new physical block.
                             parent_inode.blocks =
@@ -209,21 +289,33 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                             let h = htree::name_hash(name, dx_root.hash_version, &seed);
                             let target_buf = if h.hash >= split.split_hash {
                                 // Upper half (the new block).
-                                let mut nb = split.new_block_data.clone();
+                                let mut nb = new_data.clone();
                                 if let splice::InsertResult::Ok { .. } =
                                     splice::insert_entry(&mut nb, target_inode_no, name, file_type)
                                 {
-                                    self.write_block(new_phys as u64, &nb).await?;
+                                    self.write_directory_block(
+                                        parent_inode_no,
+                                        parent_inode,
+                                        new_phys as u64,
+                                        &mut nb,
+                                    )
+                                    .await?;
                                     return Ok(());
                                 }
                                 nb
                             } else {
                                 // Lower half (old block).
-                                let mut ob = split.old_block_data.clone();
+                                let mut ob = old_data.clone();
                                 if let splice::InsertResult::Ok { .. } =
                                     splice::insert_entry(&mut ob, target_inode_no, name, file_type)
                                 {
-                                    self.write_block(phys, &ob).await?;
+                                    self.write_directory_block(
+                                        parent_inode_no,
+                                        parent_inode,
+                                        phys,
+                                        &mut ob,
+                                    )
+                                    .await?;
                                     return Ok(());
                                 }
                                 ob
@@ -247,13 +339,19 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let phys = self.map_block_alloc(parent_inode, new_logical).await?;
         let mut blockbuf = vec![0u8; bs];
         // Single record filling the whole block.
-        let rec_len = bs as u16;
+        let rec_len = if self.superblock.has_metadata_csum() {
+            self.add_directory_checksum_tail(&mut blockbuf)?;
+            (bs - 12) as u16
+        } else {
+            bs as u16
+        };
         blockbuf[0..4].copy_from_slice(&target_inode_no.to_le_bytes());
         blockbuf[4..6].copy_from_slice(&rec_len.to_le_bytes());
         blockbuf[6] = name.len() as u8;
         blockbuf[7] = file_type;
         blockbuf[8..8 + name.len()].copy_from_slice(name);
-        self.write_block(phys, &blockbuf).await?;
+        self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
+            .await?;
         // Update parent inode bookkeeping.
         parent_inode.size += bs as u32;
         // i_blocks is in 512-byte sectors.
@@ -268,10 +366,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// can drop the link count.
     pub(crate) async fn dir_delete(
         &self,
-        _parent_inode_no: u32,
+        parent_inode_no: u32,
         parent_inode: &mut Inode,
         name: &[u8],
     ) -> Result<(u32, u8), FsError> {
+        if self.superblock.has_metadata_csum() && parent_inode.is_htree() {
+            return Err(FsError::Unsupported);
+        }
         let bs = self.block_size();
         let blocks = (parent_inode.size as usize).div_ceil(bs);
         for i in 0..blocks {
@@ -281,6 +382,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             let mut blockbuf = vec![0u8; bs];
             self.read_block(phys, &mut blockbuf).await?;
+            self.verify_directory_block_for_write(parent_inode_no, parent_inode, &blockbuf)?;
             // Scan for the entry.
             let mut off = 0usize;
             while off + 8 <= blockbuf.len() {
@@ -302,7 +404,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 {
                     splice::delete_entry(&mut blockbuf, off)
                         .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-                    self.write_block(phys, &blockbuf).await?;
+                    self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
+                        .await?;
                     return Ok((inode, file_type));
                 }
                 off += rec_len;
@@ -324,7 +427,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut new_inode = Inode::new_regular(mode);
         new_inode.atime = now;
         new_inode.touch_ctime_mtime(now);
-        self.write_inode(new_ino, &new_inode).await?;
+        self.write_new_inode(new_ino, &new_inode).await?;
         // Splice the dirent into the parent.
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -382,13 +485,22 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Write "." + ".." into the data block.
         let mut blockbuf = vec![0u8; bs];
         splice::make_empty_dir(&mut blockbuf, new_ino, parent_inode_no);
-        if let Err(e) = self.write_block(data_block, &blockbuf).await {
+        if self.superblock.has_metadata_csum() {
+            let dotdot = super::dir::rec_len_for(1) as usize;
+            let rec_len = (bs - dotdot - 12) as u16;
+            blockbuf[dotdot + 4..dotdot + 6].copy_from_slice(&rec_len.to_le_bytes());
+            self.add_directory_checksum_tail(&mut blockbuf)?;
+        }
+        if let Err(e) = self
+            .write_directory_block(new_ino, &new_inode, data_block, &mut blockbuf)
+            .await
+        {
             let _ = self.free_block(data_block).await;
             let _ = self.free_inode(new_ino).await;
             return Err(e);
         }
         // Persist the new dir inode.
-        self.write_inode(new_ino, &new_inode).await?;
+        self.write_new_inode(new_ino, &new_inode).await?;
         // Splice into the parent.
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -414,6 +526,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         parent_inode.links_count = parent_inode.links_count.saturating_add(1);
         parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
+        self.note_dir_count_delta(new_ino, 1).await?;
         Ok(new_ino)
     }
 
@@ -491,6 +604,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.truncate_inode(&mut target).await?;
         target.links_count = 0;
         self.write_inode(target_ino, &target).await?;
+        self.note_dir_count_delta(target_ino, -1).await?;
         self.free_inode(target_ino).await?;
         parent_inode.links_count = parent_inode.links_count.saturating_sub(1);
         parent_inode.touch_ctime_mtime(now);
@@ -667,7 +781,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 if dot_rec_len + 4 <= blockbuf.len() {
                     blockbuf[dot_rec_len..dot_rec_len + 4]
                         .copy_from_slice(&new_parent_inode_no.to_le_bytes());
-                    self.write_block(phys, &blockbuf).await?;
+                    self.write_directory_block(target_ino, &target_now, phys, &mut blockbuf)
+                        .await?;
                 }
             }
             self.write_inode(target_ino, &target_now).await?;
@@ -729,7 +844,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             new_inode.block[0] = data_block as u32;
             new_inode.blocks = bs as u32 / 512;
         }
-        self.write_inode(new_ino, &new_inode).await?;
+        self.write_new_inode(new_ino, &new_inode).await?;
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
             let _ = self.free_inode(new_ino).await;

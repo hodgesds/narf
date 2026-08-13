@@ -18,8 +18,8 @@ use super::inode::Inode;
 use super::metadata_csum::{
     bitmap_checksum, crc32c, directory_block_checksum, extent_block_checksum, group_desc_checksum,
     inode_checksum, seed, verify_group_desc_checksum, verify_inode_checksum, verify_superblock,
-    write_directory_block_checksum, write_extent_block_checksum, write_group_desc_checksum,
-    write_inode_checksum,
+    write_bitmap_checksum, write_directory_block_checksum, write_extent_block_checksum,
+    write_group_desc_checksum, write_inode_checksum, write_superblock_checksum,
 };
 use super::superblock::Superblock;
 
@@ -152,8 +152,15 @@ fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
     {
         return TestResult::Fail("group descriptor checksum was not stable");
     }
-    if bitmap_checksum(&sb, &[0x55; 64]) == bitmap_checksum(&sb, &[0x56; 64]) {
+    let bitmap = [0x55; 64];
+    if bitmap_checksum(&sb, &bitmap) == bitmap_checksum(&sb, &[0x56; 64]) {
         return TestResult::Fail("bitmap checksum did not cover bitmap bytes");
+    }
+    if write_bitmap_checksum(&sb, &mut desc, &bitmap, false).is_none()
+        || u16::from_le_bytes([desc[0x18], desc[0x19]])
+            != bitmap_checksum(&sb, &bitmap).expect("metadata checksum enabled") as u16
+    {
+        return TestResult::Fail("bitmap checksum was not written to descriptor");
     }
 
     let mut directory = vec![0u8; 1024];
@@ -179,6 +186,12 @@ fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
         || extent_block_checksum(&sb, 42, 0x0102_0304, &extent) != Some(extent_before)
     {
         return TestResult::Fail("extent checksum was not stable");
+    }
+    let mut superblock = sb_bytes;
+    if write_superblock_checksum(&sb, &mut superblock).is_none()
+        || !verify_superblock(&sb, &superblock)
+    {
+        return TestResult::Fail("superblock checksum writer did not round-trip");
     }
     TestResult::Pass
 }
@@ -805,6 +818,32 @@ fn sign_ext4_metadata_csum_fixture(img: &mut [u8]) -> Result<(), &'static str> {
     put_u32(img, SB + 624, 0x4d3c_2b1a);
     let sb = Superblock::parse(&img[SB..SB + 1024]).ok_or("fixture superblock did not parse")?;
 
+    // The fixture uses blocks 0..=10 and inodes 1, 2, and 12.
+    put_u32(img, SB + 12, 53);
+    put_u32(img, SB + 16, 29);
+    put_u16(img, GDT + 12, 53);
+    put_u16(img, GDT + 14, 29);
+
+    // metadata_csum classic directories reserve the last 12 bytes for the
+    // checksum carrier. Shorten the final "data" dirent to end at the tail.
+    let root_dir = 9 * BS;
+    put_u16(img, root_dir + 24 + 4, (BS - 24 - 12) as u16);
+    let tail = root_dir + BS - 12;
+    put_u32(img, tail, 0);
+    put_u16(img, tail + 4, 12);
+    img[tail + 6] = 0;
+    img[tail + 7] = 0xde;
+    put_u32(img, tail + 8, 0);
+    write_directory_block_checksum(&sb, 2, 0, &mut img[root_dir..root_dir + BS])
+        .ok_or("fixture root directory did not checksum")?;
+
+    let block_bitmap = img[3 * BS..3 * BS + 8].to_vec();
+    let inode_bitmap = img[4 * BS..4 * BS + 4].to_vec();
+    write_bitmap_checksum(&sb, &mut img[GDT..GDT + 32], &block_bitmap, false)
+        .ok_or("fixture block bitmap did not checksum")?;
+    write_bitmap_checksum(&sb, &mut img[GDT..GDT + 32], &inode_bitmap, true)
+        .ok_or("fixture inode bitmap did not checksum")?;
+
     for inode_no in [2u32, 12] {
         let index = (inode_no - 1) as usize;
         let inode = &mut img[ITABLE + index * INODE_SIZE..ITABLE + (index + 1) * INODE_SIZE];
@@ -812,8 +851,8 @@ fn sign_ext4_metadata_csum_fixture(img: &mut [u8]) -> Result<(), &'static str> {
     }
     write_group_desc_checksum(&sb, 0, &mut img[GDT..GDT + 32])
         .ok_or("fixture group descriptor did not checksum")?;
-    let super_checksum = crc32c(!0, &img[SB..SB + 0x3fc]);
-    img[SB + 0x3fc..SB + 0x400].copy_from_slice(&super_checksum.to_le_bytes());
+    write_superblock_checksum(&sb, &mut img[SB..SB + 1024])
+        .ok_or("fixture superblock did not checksum")?;
     Ok(())
 }
 
@@ -867,6 +906,48 @@ fn smoke_ext4_metadata_csum_mount_and_corruption_rejection() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext4_metadata_csum_mount_and_corruption_rejection
+);
+
+fn smoke_ext4_metadata_csum_writable_mkdir_survives_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let mut image = build_ext4_extent_image(b"checksummed extent data");
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign writable metadata-csum fixture");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("writable metadata-csum fixture did not mount"),
+    };
+    let root = volume.root();
+    if !matches!(poll_once(root.mkdir("linger")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir failed on clean metadata-csum volume");
+    }
+    drop(root);
+    drop(volume);
+
+    let remounted = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => {
+            return TestResult::Fail("metadata-csum volume failed checksum validation after mkdir")
+        }
+    };
+    if !matches!(
+        poll_once(remounted.root().lookup_dir_async("linger")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("created directory was not readable after remount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_metadata_csum_writable_mkdir_survives_remount
 );
 
 fn smoke_ext4_mount_extent_round_trip() -> TestResult {

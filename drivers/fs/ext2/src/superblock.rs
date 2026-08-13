@@ -26,6 +26,7 @@ pub mod compat {
     pub const EXT_ATTR: u32 = 0x0008;
     pub const RESIZE_INODE: u32 = 0x0010;
     pub const DIR_INDEX: u32 = 0x0020;
+    pub const ORPHAN_FILE: u32 = 0x1000;
 }
 
 /// `s_feature_incompat` bits — if any unknown bit is set the
@@ -77,6 +78,15 @@ pub mod ro_compat {
     pub const READONLY: u32 = 0x1000;
     pub const PROJECT: u32 = 0x2000;
     pub const VERITY: u32 = 0x8000;
+    /// The orphan file contains entries that must be replayed before a writer
+    /// can safely reuse inodes or blocks.
+    pub const ORPHAN_PRESENT: u32 = 0x1_0000;
+
+    /// Features whose write-side layout this driver preserves. `GDT_CSUM`
+    /// alone still uses CRC16, which is not implemented; metadata_csum
+    /// supersedes it with CRC32C and is checked separately below.
+    pub const WRITE_SUPPORTED: u32 =
+        SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
 }
 
 /// What flavour of the ext family a superblock represents. Driver
@@ -166,6 +176,12 @@ pub struct Superblock {
     /// `s_checksum_seed` (offset 624). Meaningful only with
     /// `INCOMPAT_CSUM_SEED`.
     pub checksum_seed: u32,
+    /// `s_want_extra_isize` (offset 350). Fresh ext4 inodes reserve this many
+    /// bytes beyond the original 128-byte body for checksum/timestamp fields.
+    pub want_extra_isize: u16,
+    /// `s_orphan_file_inum` (offset 640), when `COMPAT_ORPHAN_FILE`
+    /// is enabled.
+    pub orphan_file_inum: u32,
 }
 
 /// `s_state` value meaning "filesystem was unmounted cleanly".
@@ -255,6 +271,16 @@ impl Superblock {
         } else {
             0
         };
+        let want_extra_isize = if buf.len() >= 352 {
+            u16::from_le_bytes([buf[350], buf[351]])
+        } else {
+            0
+        };
+        let orphan_file_inum = if buf.len() >= 644 {
+            u32::from_le_bytes([buf[640], buf[641], buf[642], buf[643]])
+        } else {
+            0
+        };
 
         Some(Self {
             inodes_count,
@@ -275,6 +301,8 @@ impl Superblock {
             journal_inum,
             uuid,
             checksum_seed,
+            want_extra_isize,
+            orphan_file_inum,
         })
     }
 
@@ -300,6 +328,22 @@ impl Superblock {
     /// metadata checksum seed from `s_uuid`.
     pub fn uses_csum_seed(&self) -> bool {
         self.feature_incompat & incompat::CSUM_SEED != 0
+    }
+
+    /// Whether all feature flags and dynamic recovery state permit direct
+    /// metadata writes by this driver.
+    ///
+    /// NARF does not yet commit JBD2 transactions, replay the orphan file, or
+    /// generate legacy `gdt_csum` CRC16 values. Such volumes remain readable
+    /// but are mounted read-only until Linux/e2fsck leaves them clean or the
+    /// missing writer is implemented.
+    pub fn write_features_supported(&self) -> bool {
+        let unknown_ro = self.feature_ro_compat & !ro_compat::WRITE_SUPPORTED;
+        let needs_journal_recovery = self.feature_incompat & incompat::RECOVER != 0;
+        let needs_orphan_recovery = self.feature_ro_compat & ro_compat::ORPHAN_PRESENT != 0;
+        let legacy_gdt_csum =
+            self.feature_ro_compat & ro_compat::GDT_CSUM != 0 && !self.has_metadata_csum();
+        unknown_ro == 0 && !needs_journal_recovery && !needs_orphan_recovery && !legacy_gdt_csum
     }
 
     /// Classify the volume's flavour. Tracks ext-family evolution:
@@ -367,7 +411,7 @@ impl Superblock {
     /// Number of block groups in the volume — ceil(blocks_count /
     /// blocks_per_group).
     pub fn block_group_count(&self) -> u32 {
-        self.blocks_count.div_ceil(self.blocks_per_group)
+        self.total_blocks().div_ceil(self.blocks_per_group as u64) as u32
     }
 
     /// Bytes per inode — for rev-0 volumes this is fixed at 128;

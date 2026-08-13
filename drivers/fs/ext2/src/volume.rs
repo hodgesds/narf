@@ -176,10 +176,17 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// Mount-root metadata must be available to the synchronous `root()`
     /// interface. It is loaded during mount and refreshed by `write_inode`.
     root_inode: IrqSafeSpinLock<Option<Inode>>,
-    /// Metadata-checksummed ext4 can be read safely once its superblock is
-    /// verified, but NARF does not yet regenerate every affected checksum on
-    /// mutation. Keep such volumes read-only rather than corrupting them.
+    /// Set when a feature or dynamic recovery flag lacks a safe write path.
+    /// Clean metadata_csum/csum_seed volumes are writable: inode, directory,
+    /// bitmap, group-descriptor, and primary-superblock writers regenerate
+    /// their dependent checksums before returning.
     read_only: bool,
+}
+
+#[derive(Copy, Clone)]
+enum BitmapKind {
+    Block,
+    Inode,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -261,6 +268,63 @@ async fn device_read_into<B: BlockDevice>(
     Ok(())
 }
 
+/// Mount-time byte writer using the already-registered scratch pool. This is
+/// intentionally limited to pre-construction recovery updates, when no other
+/// volume operation can contend for `io.pool[0]`.
+async fn write_byte_range_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    byte_off: u64,
+    src: &[u8],
+) -> Result<(), FsError> {
+    let lbs = io.lbs;
+    let scratch = io
+        .pool
+        .first()
+        .ok_or(FsError::Io(narf_block::BlockError::IOError))?;
+    let mut cursor = 0usize;
+    while cursor < src.len() {
+        let absolute = byte_off + cursor as u64;
+        let lba = absolute / lbs as u64;
+        let in_lba = (absolute % lbs as u64) as usize;
+        let take = (src.len() - cursor).min(lbs - in_lba);
+        let mut sector = vec![0u8; lbs];
+        if in_lba != 0 || take != lbs {
+            device_read_into(
+                device,
+                lbs,
+                io.scratch_bytes,
+                scratch,
+                lba * lbs as u64,
+                &mut sector,
+            )
+            .await?;
+        }
+        sector[in_lba..in_lba + take].copy_from_slice(&src[cursor..cursor + take]);
+        {
+            let dma = resolve_cap(scratch)
+                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+            // SAFETY: mount owns this scratch entry exclusively and the DMA
+            // allocation is at least one logical sector.
+            let dst = unsafe { core::slice::from_raw_parts_mut(dma.as_mut_ptr(), lbs) };
+            dst.copy_from_slice(&sector);
+        }
+        let request = BlockRequest {
+            op: BlockOp::Write { fua: true },
+            lba,
+            blocks: 1,
+            buffer: scratch
+                .derive::<Read>()
+                .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        device.submit(request).await.result.map_err(FsError::Io)?;
+        cursor += take;
+    }
+    Ok(())
+}
+
 /// Free-function variant of `Ext2Volume::read_byte_range_into`
 /// usable from other free helpers.
 async fn read_byte_range_into_static<B: BlockDevice>(
@@ -309,7 +373,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut sb_bytes = vec![0u8; 1024];
         Self::read_byte_range_into(&*device, &io, 1024, &mut sb_bytes).await?;
 
-        let superblock = match Superblock::parse(&sb_bytes) {
+        let mut superblock = match Superblock::parse(&sb_bytes) {
             Some(s) => s,
             None => {
                 // `io` drops here, unregistering every pooled buffer.
@@ -327,8 +391,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if !metadata_csum::verify_superblock(&superblock, &sb_bytes) {
             return Err(FsError::InvalidData);
         }
-        let read_only = superblock.has_metadata_csum();
-
         // Block group descriptor table starts at the block after
         // the superblock. With a 1-KiB block volume that's block 2;
         // with a 2-KiB or 4-KiB block volume it's block 1. The
@@ -372,18 +434,46 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut journal_overrides: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         if superblock.flavour() != ExtFlavour::Ext2
             && superblock.has_journal()
-            && !superblock.is_clean()
+            && (!superblock.is_clean()
+                || superblock.feature_incompat & super::superblock::incompat::RECOVER != 0)
         {
             // Best-effort replay: failure is non-fatal for an RO
             // mount (we just fall back to the on-disk state — same
             // as ext2 was before journal support). The override
             // map only narrows reads, never invents data.
-            if let Ok(map) =
+            if let Ok((map, journal_clean)) =
                 Self::replay_journal_at_mount(&*device, &io, &superblock, &group_descs).await
             {
                 journal_overrides = map;
+                // A clean JBD2 superblock means there is nothing to replay;
+                // a stale main-superblock RECOVER bit can be cleared safely.
+                // Persist that repair now so this and subsequent mounts can
+                // enable checksum-aware direct writes. Dirty journals remain
+                // override-only/read-only until verified persistent replay is
+                // implemented for every JBD2 feature combination.
+                let orphan_clean = if journal_clean
+                    && superblock.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT
+                        != 0
+                {
+                    Self::orphan_file_is_empty_at_mount(&*device, &io, &superblock, &group_descs)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if journal_clean && orphan_clean {
+                    superblock.feature_incompat &= !super::superblock::incompat::RECOVER;
+                    superblock.feature_ro_compat &= !super::superblock::ro_compat::ORPHAN_PRESENT;
+                    sb_bytes[96..100].copy_from_slice(&superblock.feature_incompat.to_le_bytes());
+                    sb_bytes[100..104].copy_from_slice(&superblock.feature_ro_compat.to_le_bytes());
+                    metadata_csum::write_superblock_checksum(&superblock, &mut sb_bytes)
+                        .ok_or(FsError::InvalidData)?;
+                    write_byte_range_static(&*device, &io, 1024, &sb_bytes).await?;
+                }
             }
         }
+
+        let read_only = !superblock.write_features_supported();
 
         let volume = Arc::new_cyclic(|self_weak| Ext2Volume {
             device,
@@ -427,11 +517,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         io: &VolumeIo,
         sb: &Superblock,
         group_descs: &[GroupDesc],
-    ) -> Result<BTreeMap<u64, Vec<u8>>, FsError> {
+    ) -> Result<(BTreeMap<u64, Vec<u8>>, bool), FsError> {
         let bs = sb.block_size() as usize;
         let inode_no = sb.journal_inum;
         if inode_no == 0 {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), true));
         }
         // Read the journal inode directly (avoid building a temporary
         // Ext2Volume just for this — we already have `device`,
@@ -457,7 +547,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let journal_bytes = inode.size as u64;
         let n_blocks = (journal_bytes / bs as u64) as u32;
         if n_blocks == 0 {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), true));
         }
 
         // Eagerly fetch every journal block into memory. JBD2 journals
@@ -480,9 +570,81 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             journal_image.push(buf);
         }
 
+        let journal_clean = journal_image
+            .first()
+            .and_then(|bytes| journal::JournalSuperblock::parse(bytes))
+            .is_some_and(|journal_sb| journal_sb.is_clean());
         let report = journal::replay_journal(n_blocks, |i| journal_image.get(i as usize).cloned())
             .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-        Ok(report.blocks_to_write)
+        Ok((report.blocks_to_write, journal_clean))
+    }
+
+    /// Verify that every slot in ext4's orphan file is empty. Only then may a
+    /// stale `ORPHAN_PRESENT` bit be cleared without deleting or truncating a
+    /// live orphan inode.
+    async fn orphan_file_is_empty_at_mount(
+        device: &B,
+        io: &VolumeIo,
+        sb: &Superblock,
+        group_descs: &[GroupDesc],
+    ) -> Result<bool, FsError> {
+        if sb.feature_ro_compat & super::superblock::ro_compat::ORPHAN_PRESENT == 0 {
+            return Ok(true);
+        }
+        if sb.feature_compat & super::superblock::compat::ORPHAN_FILE == 0
+            || sb.orphan_file_inum == 0
+        {
+            return Ok(false);
+        }
+        let inode_no = sb.orphan_file_inum;
+        let zero = inode_no.checked_sub(1).ok_or(FsError::InvalidData)?;
+        let group = zero / sb.inodes_per_group;
+        let index = zero % sb.inodes_per_group;
+        let gd = group_descs
+            .get(group as usize)
+            .ok_or(FsError::InvalidData)?;
+        let inode_size = sb.inode_size_bytes();
+        let bs = sb.block_size() as usize;
+        let inode_off = gd.inode_table * bs as u64 + index as u64 * inode_size as u64;
+        let mut inode_bytes = vec![0u8; inode_size];
+        read_byte_range_into_static(device, io, inode_off, &mut inode_bytes).await?;
+        if !metadata_csum::verify_inode_checksum(sb, inode_no, &inode_bytes) {
+            return Err(FsError::InvalidData);
+        }
+        let inode = Inode::parse(&inode_bytes).ok_or(FsError::InvalidData)?;
+        let blocks = (inode.size as usize).div_ceil(bs);
+        if blocks > 512 {
+            return Err(FsError::InvalidData);
+        }
+        let mut inode_seed =
+            metadata_csum::crc32c(metadata_csum::seed(sb), &inode_no.to_le_bytes());
+        inode_seed = metadata_csum::crc32c(inode_seed, &inode.generation.to_le_bytes());
+        for logical in 0..blocks {
+            let physical =
+                Self::map_block_static(device, io, sb, group_descs, &inode, logical as u64).await?;
+            if physical == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let mut block = vec![0u8; bs];
+            read_byte_range_into_static(device, io, physical * bs as u64, &mut block).await?;
+            if block[bs - 8..bs - 4] != 0x0b10_ca04u32.to_le_bytes() {
+                return Err(FsError::InvalidData);
+            }
+            let provided = u32::from_le_bytes(
+                block[bs - 4..]
+                    .try_into()
+                    .expect("orphan checksum is four bytes"),
+            );
+            let state = metadata_csum::crc32c(inode_seed, &physical.to_le_bytes());
+            let calculated = metadata_csum::crc32c(state, &block[..bs - 8]);
+            if provided != calculated {
+                return Err(FsError::InvalidData);
+            }
+            if block[..bs - 8].chunks_exact(4).any(|entry| entry != [0; 4]) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Static block-map walk usable before the `Arc<Ext2Volume>`
@@ -496,7 +658,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &Inode,
         logical: u64,
     ) -> Result<u64, FsError> {
-        if sb.uses_extents() {
+        if sb.uses_extents() && inode.uses_extents() {
             // Mirror map_block_extents but read child blocks via
             // the static helper.
             use super::extent::{lookup_in_node, LookupOutcome};
@@ -875,6 +1037,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// the rev-1+ extra-fields tail by read-modify-writing the full
     /// `inode_size_bytes()` slot.
     pub async fn write_inode(&self, inode_no: u32, inode: &Inode) -> Result<(), FsError> {
+        self.write_inode_slot(inode_no, inode, false).await
+    }
+
+    /// Initialize a newly allocated inode slot without inheriting stale ACL,
+    /// xattr, deletion-time, or project-id fields from its former owner.
+    pub async fn write_new_inode(&self, inode_no: u32, inode: &Inode) -> Result<(), FsError> {
+        self.write_inode_slot(inode_no, inode, true).await
+    }
+
+    async fn write_inode_slot(
+        &self,
+        inode_no: u32,
+        inode: &Inode,
+        fresh: bool,
+    ) -> Result<(), FsError> {
         let (group, index) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
@@ -884,13 +1061,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let table_byte_off = gd.inode_table * bs;
         let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
         let mut buf = vec![0u8; inode_size];
-        self.read_byte_range(inode_byte_off, &mut buf).await?;
+        if fresh {
+            if inode_size >= 130 {
+                let extra = self
+                    .superblock
+                    .want_extra_isize
+                    .min((inode_size - 128) as u16);
+                buf[128..130].copy_from_slice(&extra.to_le_bytes());
+            }
+        } else {
+            self.read_byte_range(inode_byte_off, &mut buf).await?;
+        }
         inode.encode_into(&mut buf);
-        // Keep this self-contained so every existing inode metadata writer
-        // (chmod/chown, truncate, directory links, data writes) inherits the
-        // correct checksum once checksummed ext4 is made writable. The volume
-        // remains read-only today because directory, bitmap, descriptor,
-        // extent, and journal updates are not all transactional yet.
+        // Keep this self-contained so every inode metadata writer
+        // (chmod/chown, truncate, directory links, and data writes) inherits
+        // the correct checksum.
         let _ = metadata_csum::write_inode_checksum(&self.superblock, inode_no, &mut buf);
         self.write_byte_range(inode_byte_off, &buf).await?;
         if inode_no == super::EXT2_ROOT_INO {
@@ -908,8 +1093,143 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// inode bitmap on the first scanned block — Linux does this
     /// implicitly because inode 0 is unused and inode 1 may be
     /// reserved).
+    async fn group_desc_bytes(&self, group: usize) -> Result<(u64, Vec<u8>), FsError> {
+        if group >= self.group_descs.len() {
+            return Err(FsError::Io(narf_block::BlockError::InvalidRange));
+        }
+        let desc_size = self.superblock.effective_desc_size();
+        let table = (self.superblock.first_data_block + 1) as u64 * self.block_size() as u64;
+        let offset = table + (group * desc_size) as u64;
+        let mut bytes = vec![0u8; desc_size];
+        self.read_byte_range(offset, &mut bytes).await?;
+        if !metadata_csum::verify_group_desc_checksum(&self.superblock, group as u32, &bytes) {
+            return Err(FsError::InvalidData);
+        }
+        Ok((offset, bytes))
+    }
+
+    fn bitmap_bytes(&self, kind: BitmapKind) -> usize {
+        let bits = match kind {
+            BitmapKind::Block => self.superblock.blocks_per_group,
+            BitmapKind::Inode => self.superblock.inodes_per_group,
+        };
+        (bits as usize).div_ceil(8)
+    }
+
+    async fn verify_bitmap(
+        &self,
+        group: usize,
+        kind: BitmapKind,
+        bitmap: &[u8],
+    ) -> Result<(), FsError> {
+        let (_, desc) = self.group_desc_bytes(group).await?;
+        let meaningful = self.bitmap_bytes(kind).min(bitmap.len());
+        if !metadata_csum::verify_bitmap_checksum(
+            &self.superblock,
+            &desc,
+            &bitmap[..meaningful],
+            matches!(kind, BitmapKind::Inode),
+        ) {
+            return Err(FsError::InvalidData);
+        }
+        Ok(())
+    }
+
+    async fn update_group_desc(
+        &self,
+        group: usize,
+        blocks: i64,
+        inodes: i64,
+        dirs: i64,
+        bitmap: Option<(BitmapKind, &[u8])>,
+    ) -> Result<(), FsError> {
+        let (offset, mut desc) = self.group_desc_bytes(group).await?;
+        for (lo_off, hi_off, delta) in
+            [(12usize, 44usize, blocks), (14, 46, inodes), (16, 48, dirs)]
+        {
+            if delta == 0 {
+                continue;
+            }
+            let lo = u16::from_le_bytes([desc[lo_off], desc[lo_off + 1]]) as i64;
+            let has_hi = desc.len() >= hi_off + 2;
+            let hi = if has_hi {
+                u16::from_le_bytes([desc[hi_off], desc[hi_off + 1]]) as i64
+            } else {
+                0
+            };
+            let current = (hi << 16) | lo;
+            // Historic ext2 fixtures and damaged-but-mountable volumes can
+            // carry stale zero counters even when the bitmap is authoritative.
+            // Preserve the existing scan-the-bitmap recovery policy and clamp
+            // the accounting field instead of rejecting a valid allocation.
+            let updated = current.saturating_add(delta).max(0) as u64;
+            desc[lo_off..lo_off + 2].copy_from_slice(&(updated as u16).to_le_bytes());
+            if has_hi {
+                desc[hi_off..hi_off + 2].copy_from_slice(&((updated >> 16) as u16).to_le_bytes());
+            }
+        }
+        if let Some((kind, bytes)) = bitmap {
+            let meaningful = self.bitmap_bytes(kind).min(bytes.len());
+            if metadata_csum::write_bitmap_checksum(
+                &self.superblock,
+                &mut desc,
+                &bytes[..meaningful],
+                matches!(kind, BitmapKind::Inode),
+            )
+            .is_none()
+                && self.superblock.has_metadata_csum()
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        if metadata_csum::write_group_desc_checksum(&self.superblock, group as u32, &mut desc)
+            .is_none()
+            && self.superblock.has_metadata_csum()
+        {
+            return Err(FsError::InvalidData);
+        }
+        self.write_byte_range(offset, &desc).await
+    }
+
+    async fn update_superblock_counters(&self, blocks: i64, inodes: i64) -> Result<(), FsError> {
+        if blocks == 0 && inodes == 0 {
+            return Ok(());
+        }
+        let mut bytes = vec![0u8; 1024];
+        self.read_byte_range(1024, &mut bytes).await?;
+        for (lo_off, hi_off, delta) in [(12usize, Some(344usize), blocks), (16, None, inodes)] {
+            if delta == 0 {
+                continue;
+            }
+            let lo = u32::from_le_bytes(
+                bytes[lo_off..lo_off + 4]
+                    .try_into()
+                    .expect("superblock counter is four bytes"),
+            ) as i64;
+            let hi = hi_off.map_or(0, |off| {
+                u32::from_le_bytes(
+                    bytes[off..off + 4]
+                        .try_into()
+                        .expect("superblock high counter is four bytes"),
+                ) as i64
+            });
+            let current = (hi << 32) | lo;
+            let updated = current.saturating_add(delta).max(0) as u64;
+            bytes[lo_off..lo_off + 4].copy_from_slice(&(updated as u32).to_le_bytes());
+            if let Some(off) = hi_off {
+                bytes[off..off + 4].copy_from_slice(&((updated >> 32) as u32).to_le_bytes());
+            }
+        }
+        if metadata_csum::write_superblock_checksum(&self.superblock, &mut bytes).is_none() {
+            return Err(FsError::InvalidData);
+        }
+        self.write_byte_range(1024, &bytes).await
+    }
+
     async fn alloc_in_bitmap_block(
         &self,
+        group: usize,
+        kind: BitmapKind,
         bm_block: u64,
         max_bits: u32,
         skip_first: u32,
@@ -917,6 +1237,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
+        self.verify_bitmap(group, kind, &buf).await?;
         let max = (max_bits as usize).min(bs * 8);
         for bit in (skip_first as usize)..max {
             let byte = bit / 8;
@@ -924,6 +1245,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             if (buf[byte] >> bit_in_byte) & 1 == 0 {
                 buf[byte] |= 1 << bit_in_byte;
                 self.write_block(bm_block, &buf).await?;
+                let (blocks, inodes) = match kind {
+                    BitmapKind::Block => (-1, 0),
+                    BitmapKind::Inode => (0, -1),
+                };
+                self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)))
+                    .await?;
+                self.update_superblock_counters(blocks, inodes).await?;
                 return Ok(Some(bit as u32));
             }
         }
@@ -931,15 +1259,29 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     }
 
     /// Clear bit `bit_index` in bitmap block `bm_block`.
-    async fn free_in_bitmap_block(&self, bm_block: u64, bit_index: u32) -> Result<(), FsError> {
+    async fn free_in_bitmap_block(
+        &self,
+        group: usize,
+        kind: BitmapKind,
+        bm_block: u64,
+        bit_index: u32,
+    ) -> Result<(), FsError> {
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(bm_block, &mut buf).await?;
+        self.verify_bitmap(group, kind, &buf).await?;
         let byte = (bit_index / 8) as usize;
         let bit_in_byte = (bit_index % 8) as u8;
-        if byte < buf.len() {
+        if byte < buf.len() && buf[byte] & (1u8 << bit_in_byte) != 0 {
             buf[byte] &= !(1u8 << bit_in_byte);
             self.write_block(bm_block, &buf).await?;
+            let (blocks, inodes) = match kind {
+                BitmapKind::Block => (1, 0),
+                BitmapKind::Inode => (0, 1),
+            };
+            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)))
+                .await?;
+            self.update_superblock_counters(blocks, inodes).await?;
         }
         Ok(())
     }
@@ -962,10 +1304,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // first_data_block. Bit 0 of group `g`'s bitmap maps
             // to absolute block `first_data_block + g*blocks_per_group`.
             let group_first = first_block as u64 + gi as u64 * bpg as u64;
-            let group_last = (group_first + bpg as u64).min(self.superblock.blocks_count as u64);
+            let group_last = (group_first + bpg as u64).min(self.superblock.total_blocks());
             let bits_in_group = (group_last - group_first) as u32;
             if let Some(bit) = self
-                .alloc_in_bitmap_block(gd.block_bitmap, bits_in_group, 0)
+                .alloc_in_bitmap_block(gi, BitmapKind::Block, gd.block_bitmap, bits_in_group, 0)
                 .await?
             {
                 return Ok(group_first + bit as u64);
@@ -987,7 +1329,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         let bm_block = self.group_descs[group].block_bitmap;
-        self.free_in_bitmap_block(bm_block, bit).await
+        self.free_in_bitmap_block(group, BitmapKind::Block, bm_block, bit)
+            .await
     }
 
     /// Allocate a free inode. Returns the 1-based inode number.
@@ -1005,7 +1348,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 0
             };
             if let Some(bit) = self
-                .alloc_in_bitmap_block(gd.inode_bitmap, ipg, skip)
+                .alloc_in_bitmap_block(gi, BitmapKind::Inode, gd.inode_bitmap, ipg, skip)
                 .await?
             {
                 return Ok((gi as u32) * ipg + bit + 1);
@@ -1023,7 +1366,18 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
         let bm_block = self.group_descs[group as usize].inode_bitmap;
-        self.free_in_bitmap_block(bm_block, index).await
+        self.free_in_bitmap_block(group as usize, BitmapKind::Inode, bm_block, index)
+            .await
+    }
+
+    /// Keep `bg_used_dirs_count` synchronized with directory inode creation
+    /// and removal, including its group-descriptor checksum.
+    pub async fn note_dir_count_delta(&self, inode_no: u32, delta: i64) -> Result<(), FsError> {
+        let (group, _) = self
+            .inode_group_and_index(inode_no)
+            .ok_or(FsError::NotFound)?;
+        self.update_group_desc(group as usize, 0, 0, delta, None)
+            .await
     }
 
     /// Map a logical block index to a physical block, allocating
@@ -1034,9 +1388,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Only the legacy (non-extents) path is supported on the write
     /// side — ext4 extents trees stay read-only for now.
     pub async fn map_block_alloc(&self, inode: &mut Inode, logical: u64) -> Result<u64, FsError> {
-        if self.superblock.uses_extents() {
-            // Refuse extents-tree writes — implementing a write-side
-            // walker is multi-thousand lines on top of this.
+        if self.superblock.uses_extents() && inode.uses_extents() {
+            // Existing mapped extents can be overwritten without changing
+            // the tree. Growing into a hole still needs extent insertion.
+            let mapped = self.map_block(inode, logical).await?;
+            if mapped != 0 {
+                return Ok(mapped);
+            }
             return Err(FsError::Unsupported);
         }
         let p = self.pointers_per_block() as u64;
@@ -1045,33 +1403,44 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let double_max = single_max + p * p;
         let triple_max = double_max + p * p * p;
         let bs = self.block_size();
+        let sectors_per_block = (bs / 512) as u32;
         if logical < direct_max {
             let slot = &mut inode.block[logical as usize];
             if *slot == 0 {
                 let b = self.alloc_block().await? as u32;
                 *slot = b;
+                inode.blocks = inode.blocks.saturating_add(sectors_per_block);
                 let zeros = vec![0u8; bs];
                 self.write_block(b as u64, &zeros).await?;
             }
             return Ok(*slot as u64);
         }
         if logical < single_max {
+            let mut allocated = 0u32;
             let slot = &mut inode.block[super::inode::SINGLE_IND_IDX];
             if *slot == 0 {
                 let b = self.alloc_block().await? as u32;
                 *slot = b;
+                allocated += 1;
                 let zeros = vec![0u8; bs];
                 self.write_block(b as u64, &zeros).await?;
             }
             let ind = *slot;
             let idx = logical - direct_max;
-            return self.alloc_indirect_slot(ind as u64, idx).await;
+            let (block, made) = self.alloc_indirect_slot(ind as u64, idx).await?;
+            allocated += made as u32;
+            inode.blocks = inode
+                .blocks
+                .saturating_add(allocated.saturating_mul(sectors_per_block));
+            return Ok(block);
         }
         if logical < double_max {
+            let mut allocated = 0u32;
             let slot = &mut inode.block[super::inode::DOUBLE_IND_IDX];
             if *slot == 0 {
                 let b = self.alloc_block().await? as u32;
                 *slot = b;
+                allocated += 1;
                 let zeros = vec![0u8; bs];
                 self.write_block(b as u64, &zeros).await?;
             }
@@ -1079,14 +1448,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let l = logical - single_max;
             let l1 = l / p;
             let l0 = l % p;
-            let mid = self.alloc_indirect_slot(dbl as u64, l1).await?;
-            return self.alloc_indirect_slot(mid, l0).await;
+            let (mid, made_mid) = self.alloc_indirect_slot(dbl as u64, l1).await?;
+            let (block, made_block) = self.alloc_indirect_slot(mid, l0).await?;
+            allocated += made_mid as u32 + made_block as u32;
+            inode.blocks = inode
+                .blocks
+                .saturating_add(allocated.saturating_mul(sectors_per_block));
+            return Ok(block);
         }
         if logical < triple_max {
+            let mut allocated = 0u32;
             let slot = &mut inode.block[super::inode::TRIPLE_IND_IDX];
             if *slot == 0 {
                 let b = self.alloc_block().await? as u32;
                 *slot = b;
+                allocated += 1;
                 let zeros = vec![0u8; bs];
                 self.write_block(b as u64, &zeros).await?;
             }
@@ -1095,9 +1471,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let l2 = l / (p * p);
             let l1 = (l / p) % p;
             let l0 = l % p;
-            let mid = self.alloc_indirect_slot(tri as u64, l2).await?;
-            let leaf = self.alloc_indirect_slot(mid, l1).await?;
-            return self.alloc_indirect_slot(leaf, l0).await;
+            let (mid, made_mid) = self.alloc_indirect_slot(tri as u64, l2).await?;
+            let (leaf, made_leaf) = self.alloc_indirect_slot(mid, l1).await?;
+            let (block, made_block) = self.alloc_indirect_slot(leaf, l0).await?;
+            allocated += made_mid as u32 + made_leaf as u32 + made_block as u32;
+            inode.blocks = inode
+                .blocks
+                .saturating_add(allocated.saturating_mul(sectors_per_block));
+            return Ok(block);
         }
         Err(FsError::Io(narf_block::BlockError::InvalidRange))
     }
@@ -1105,7 +1486,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Read pointer `idx` from indirect block `ind_block`. If zero,
     /// allocate a fresh data block, write the pointer back, and
     /// return the new block number.
-    async fn alloc_indirect_slot(&self, ind_block: u64, idx: u64) -> Result<u64, FsError> {
+    async fn alloc_indirect_slot(&self, ind_block: u64, idx: u64) -> Result<(u64, bool), FsError> {
         let bs = self.block_size();
         let p = self.pointers_per_block() as u64;
         if idx >= p {
@@ -1116,21 +1497,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let off = (idx as usize) * 4;
         let cur = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         if cur != 0 {
-            return Ok(cur as u64);
+            return Ok((cur as u64, false));
         }
         let new = self.alloc_block().await? as u32;
         buf[off..off + 4].copy_from_slice(&new.to_le_bytes());
         self.write_block(ind_block, &buf).await?;
         let zeros = vec![0u8; bs];
         self.write_block(new as u64, &zeros).await?;
-        Ok(new as u64)
+        Ok((new as u64, true))
     }
 
     /// Free every block an inode owns (direct, indirect, double-indirect, and
     /// triple-indirect), zeroing the inode's `block[]` field. Caller persists
     /// the inode.
     pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
-        if self.superblock.uses_extents() {
+        if self.superblock.uses_extents() && inode.uses_extents() {
             return Err(FsError::Unsupported);
         }
         let bs = self.block_size();
@@ -1232,9 +1613,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         offset: u64,
         src: &[u8],
     ) -> Result<usize, FsError> {
-        if self.superblock.uses_extents() {
-            return Err(FsError::Unsupported);
-        }
         let bs = self.block_size() as u64;
         let mut total = 0usize;
         let mut remaining = src.len();
@@ -1292,7 +1670,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// tree root; ext2/3 walks the legacy 12-direct + 3-indirect
     /// pointer chain.
     pub async fn map_block(&self, inode: &Inode, logical: u64) -> Result<u64, FsError> {
-        if self.superblock.uses_extents() {
+        if self.superblock.uses_extents() && inode.uses_extents() {
             return self.map_block_extents(inode, logical).await;
         }
         // Legacy ext2/3 indirect-block walk.
