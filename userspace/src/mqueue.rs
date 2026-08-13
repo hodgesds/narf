@@ -77,9 +77,9 @@ fn read_i64(buf: &[u8]) -> i64 {
 fn namespace_id(task: u64) -> u64 {
     #[cfg(feature = "container")]
     {
-        return crate::namespaces::current_ipc_ns(task)
+        crate::namespaces::current_ipc_ns(task)
             .map(|namespace| namespace.id())
-            .unwrap_or(0);
+            .unwrap_or(0)
     }
     #[cfg(not(feature = "container"))]
     {
