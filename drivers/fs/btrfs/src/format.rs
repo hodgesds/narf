@@ -65,6 +65,7 @@ pub const ROOT_ITEM_KEY: u8 = 132;
 pub const EXTENT_ITEM_KEY: u8 = 168;
 /// Skinny-metadata tree-block extent record; length is `nodesize`.
 pub const METADATA_ITEM_KEY: u8 = 169;
+pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
 // ── File-extent item types (`btrfs_file_extent_item.type`) ─────────
