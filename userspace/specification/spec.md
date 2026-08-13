@@ -512,6 +512,14 @@ fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
 compatibility code so address-space regions do not gain a filesystem
 dependency.
 
+Generic filesystem mappings that cannot expose page-cache frames retain one
+canonical fallback page per open-file description and file offset, plus an
+exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that
+snapshot, write each changed canonical page once even when it has overlapping
+aliases, and advance the snapshot only after the full page write succeeds.
+Clean pages perform no filesystem write; the comparison is byte-exact rather
+than hash-based so collision cannot suppress persistence.
+
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the
 socket creator's network namespace. It rejects other netlink protocols,
