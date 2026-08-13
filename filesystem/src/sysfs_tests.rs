@@ -643,9 +643,11 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
                 && text.contains("ID_FS_UUID=7FC5-5A22")
                 && text.contains("ID_FS_UUID_ENC=7FC5-5A22")
                 && text.contains("DEVLINKS=/dev/disk/by-uuid/7FC5-5A22")
-                && netlink
-                    .as_deref()
-                    .is_some_and(|event| event.contains("ID_FS_USAGE=filesystem")) =>
+                && text.contains("SYSTEMD_ALIAS=/dev/disk/by-uuid/7FC5-5A22")
+                && netlink.as_deref().is_some_and(|event| {
+                    event.contains("ID_FS_USAGE=filesystem")
+                        && event.contains("SYSTEMD_ALIAS=/dev/disk/by-uuid/7FC5-5A22")
+                }) =>
         {
             TestResult::Pass
         }

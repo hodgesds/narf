@@ -784,19 +784,22 @@ pub fn populate_block_class() {
             "disk"
         };
         // A filesystem UUID is already discovered while registering a
-        // partition.  Carry it through the ADD event so udev can associate
-        // the existing `/dev/disk/by-uuid/<uuid>` devfs alias with this
-        // device.  In particular, systemd turns fstab's `UUID=...` entries
-        // into device jobs and waits for this identity, rather than merely
-        // probing whether the path happens to be resolvable.
+        // partition. Carry it through the ADD event so udev can associate the
+        // existing `/dev/disk/by-uuid/<uuid>` devfs alias with this device.
+        // SYSTEMD_ALIAS is required as well: device units are synthesized
+        // from the udev database, not by stat'ing an already-resolvable devfs
+        // symlink, so DEVLINKS alone does not satisfy fstab's UUID job.
         let fs_identity = dev
             .partition
             .as_ref()
             .filter(|partition| !partition.fs_uuid.is_empty())
             .map(|partition| {
                 format!(
-                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\nDEVLINKS=/dev/disk/by-uuid/{}\n",
-                    partition.fs_uuid, partition.fs_uuid, partition.fs_uuid
+                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\nDEVLINKS=/dev/disk/by-uuid/{}\nSYSTEMD_ALIAS=/dev/disk/by-uuid/{}\n",
+                    partition.fs_uuid,
+                    partition.fs_uuid,
+                    partition.fs_uuid,
+                    partition.fs_uuid
                 )
             })
             .unwrap_or_default();
