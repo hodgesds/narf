@@ -400,6 +400,147 @@ fn smoke_abi_signal_signalfd_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_neg);
 
+// ── pidfd_send_signal(2) siginfo payload ────────────────────────────
+//
+// With a non-NULL `info`, `pidfd_send_signal` is `rt_sigqueueinfo(2)`
+// addressed by pidfd: the caller's `siginfo_t` travels with the signal and
+// has to survive all the way to the target's `signalfd` read. systemd's
+// `pidref_sigqueue()` is precisely this call (SI_QUEUE + `si_pid =
+// getpid()`), and a udev worker's `on_sigusr1` drops any SIGUSR1 whose
+// `ssi_pid` is not its manager — so discarding the payload strands every
+// worker in `udev_watch_end()` and leaves `/run/udev/data` empty.
+
+/// x86_64 `siginfo_t` prefix in the layout userspace fills for sigqueue:
+/// si_signo@0, si_errno@4, si_code@8, si_pid@16, si_uid@20, si_value@24.
+fn sigqueue_siginfo(signum: u32, si_code: i32, si_pid: u32, si_value: u64) -> [u8; 32] {
+    let mut si = [0u8; 32];
+    si[0..4].copy_from_slice(&signum.to_le_bytes());
+    si[8..12].copy_from_slice(&si_code.to_le_bytes());
+    si[16..20].copy_from_slice(&si_pid.to_le_bytes());
+    si[20..24].copy_from_slice(&1000u32.to_le_bytes()); // si_uid
+    si[24..32].copy_from_slice(&si_value.to_le_bytes());
+    si
+}
+
+/// A signalfd watching exactly `signum` (sigset_t puts signal N at bit N-1).
+fn signalfd_watching(signum: u32) -> Result<u64, &'static str> {
+    let mask = (1u64 << (signum - 1)).to_le_bytes();
+    match call(
+        Syscall::Signalfd.raw(),
+        a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("signalfd(-1, &mask, 8, 0) did not return a fd"),
+    }
+}
+
+/// A pidfd for the harness task, whose `pidfd_send_signal` target is the
+/// same task the signalfd above belongs to.
+fn pidfd_for_self() -> Result<u64, &'static str> {
+    match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("pidfd_open(self) setup failed"),
+    }
+}
+
+fn smoke_abi_signal_pidfd_send_signal_delivers_siginfo() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SI_QUEUE: i32 = -1;
+        const SENDER_PID: u32 = 4242;
+        const SIVAL: u64 = 7;
+
+        let sfd = signalfd_watching(SIGUSR1)?;
+        let pidfd = pidfd_for_self()?;
+        let si = sigqueue_siginfo(SIGUSR1, SI_QUEUE, SENDER_PID, SIVAL);
+        if call(
+            Syscall::PidfdSendSignal.raw(),
+            a3(pidfd, SIGUSR1 as u64, si.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("pidfd_send_signal(SIGUSR1, &info) did not return 0");
+        }
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one signalfd_siginfo record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // ssi_code@8 and ssi_pid@12 are the two fields systemd reads via
+        // si_code_from_process() + its manager-pid comparison.
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != SI_QUEUE {
+            return Err("pidfd_send_signal dropped si_code (ssi_code != SI_QUEUE)");
+        }
+        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != SENDER_PID {
+            return Err("pidfd_send_signal dropped si_pid (ssi_pid != sender)");
+        }
+        // ssi_int@44 / ssi_ptr@48 carry sigqueue's sival payload.
+        if u64::from_le_bytes(rec[48..56].try_into().unwrap()) != SIVAL {
+            return Err("pidfd_send_signal dropped si_value (ssi_ptr)");
+        }
+        if u32::from_le_bytes(rec[44..48].try_into().unwrap()) != SIVAL as u32 {
+            return Err("pidfd_send_signal dropped si_value (ssi_int)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pidfd_send_signal_delivers_siginfo
+);
+
+fn smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+
+        let sfd = signalfd_watching(SIGUSR1)?;
+        let pidfd = pidfd_for_self()?;
+        if call(
+            Syscall::PidfdSendSignal.raw(),
+            a3(pidfd, SIGUSR1 as u64, 0, 0),
+        ) != Some(0)
+        {
+            return Err("pidfd_send_signal(SIGUSR1, NULL) did not return 0");
+        }
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one signalfd_siginfo record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // LINUX-GAP: a payload-less send is `kill(2)` shape, and Linux
+        // synthesizes si_code = SI_USER (0) with si_pid/si_uid naming the
+        // SENDER. NARF's kill-family paths queue no siginfo at all, so
+        // ssi_pid reads 0 — indistinguishable from "sent by the kernel".
+        // Pinned here so the divergence goes red when it is closed, rather
+        // than drifting silently: the whole class (kill/tkill/tgkill and
+        // this NULL-info arm) has to move together.
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != 0 {
+            return Err("payload-less pidfd_send_signal should report ssi_code 0");
+        }
+        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != 0 {
+            return Err("payload-less pidfd_send_signal should report ssi_pid 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload
+);
+
 // ── Sigprocmask ─────────────────────────────────────────────────────
 // sys_sigprocmask(how, set, oldset, sigsetsize): sigsetsize!=8 → ok(-1);
 // unknown how → ok(-1); else updates the per-task mask → ok(0).
