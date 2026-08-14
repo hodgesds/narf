@@ -611,7 +611,6 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
                 objectid: ino,
             }],
             data_used_delta: disk_len as i64 - old_data_len as i64,
-            data_span_start: Some(e_data),
         },
     )
     .await?;
@@ -668,9 +667,6 @@ struct Txn {
     new_data: Vec<DataRef>,
     /// Net change to the block group's data `used` byte count.
     data_used_delta: i64,
-    /// Start of the freshly-allocated data span (the free-space tree marks the
-    /// whole `[start, alloc.next())` run used); `None` for a metadata-only edit.
-    data_span_start: Option<u64>,
 }
 
 /// Pack `items` (key-ordered) into a leaf buffer built on `header` (a
@@ -841,11 +837,6 @@ async fn commit_txn<B: BlockDevice + 'static>(
         .map(|_| alloc.alloc_node(vol))
         .transpose()?;
 
-    // The free-space tree marks the whole contiguous new run used: data (if any)
-    // sits below the freshly allocated metadata.
-    let span_start = txn.data_span_start.unwrap_or(fs_nodes[0].0);
-    let span_end = alloc.next();
-
     // Freed metadata `(block, level)` and new metadata `(block, owner, level)`
     // across every copied tree. A skinny METADATA_ITEM's key offset is the block's
     // level. The fs tree contributes many of each; the others one each (level 0).
@@ -898,32 +889,46 @@ async fn commit_txn<B: BlockDevice + 'static>(
             &ext_item_meta(gen, owner),
         )?;
     }
-    // Block-group `used` tracks both the data delta and the *net* metadata change
-    // (a split adds nodes, so it is no longer 1:1). Apply to the block group that
-    // holds the freshly-allocated run (mixed block groups: data + metadata share).
-    let meta_used_delta = (new_meta.len() as i64 - freed_meta.len() as i64) * nodesize as i64;
-    let total_used_delta = txn.data_used_delta + meta_used_delta;
-    if total_used_delta != 0 {
-        block_group_add_used(&mut txn.ext.leaf, span_start, total_used_delta)?;
+    // Block-group `used` is charged *per block group*: once the filesystem spans
+    // more than one chunk, freed and newly-allocated blocks can land in different
+    // groups, so a single lumped delta would corrupt both groups' `used`. Each
+    // block / data extent lies wholly within one group.
+    for &(new, _, _) in &new_meta {
+        block_group_add_used(&mut txn.ext.leaf, new, nodesize as i64)?;
+    }
+    for &(old, _) in &freed_meta {
+        block_group_add_used(&mut txn.ext.leaf, old, -(nodesize as i64))?;
+    }
+    for d in &txn.new_data {
+        block_group_add_used(&mut txn.ext.leaf, d.bytenr, d.len as i64)?;
+    }
+    for &(bytenr, len) in &txn.freed_data {
+        block_group_add_used(&mut txn.ext.leaf, bytenr, -(len as i64))?;
     }
     stamp_node(&mut txn.ext.leaf, n_ext, gen);
 
-    // ── Free-space tree (extent mode): mark the new allocation used, free old ─
+    // Superblock `bytes_used` moves by the net data + metadata change.
+    let meta_used_delta = (new_meta.len() as i64 - freed_meta.len() as i64) * nodesize as i64;
+    let total_used_delta = txn.data_used_delta + meta_used_delta;
+
+    // ── Free-space tree (extent mode): mark each new block/extent used in its
+    //    own group, and return each freed one to its group's free space ───────
     if let Some(fst) = txn.fst.as_mut() {
-        let (bg_start, bg_len) =
-            block_group_of(&txn.ext.leaf, span_start)?.ok_or(FsError::InvalidData)?;
-        fst_mark_used(
-            &mut fst.leaf,
-            bg_start,
-            bg_len,
-            span_start,
-            span_end - span_start,
-        )?;
+        for &(new, _, _) in &new_meta {
+            let (s, l) = block_group_of(&txn.ext.leaf, new)?.ok_or(FsError::InvalidData)?;
+            fst_mark_used(&mut fst.leaf, s, l, new, nodesize)?;
+        }
+        for d in &txn.new_data {
+            let (s, l) = block_group_of(&txn.ext.leaf, d.bytenr)?.ok_or(FsError::InvalidData)?;
+            fst_mark_used(&mut fst.leaf, s, l, d.bytenr, d.len)?;
+        }
         for &(old, _) in &freed_meta {
-            fst_mark_free(&mut fst.leaf, bg_start, bg_len, old, nodesize)?;
+            let (s, l) = block_group_of(&txn.ext.leaf, old)?.ok_or(FsError::InvalidData)?;
+            fst_mark_free(&mut fst.leaf, s, l, old, nodesize)?;
         }
         for &(bytenr, len) in &txn.freed_data {
-            fst_mark_free(&mut fst.leaf, bg_start, bg_len, bytenr, len)?;
+            let (s, l) = block_group_of(&txn.ext.leaf, bytenr)?.ok_or(FsError::InvalidData)?;
+            fst_mark_free(&mut fst.leaf, s, l, bytenr, len)?;
         }
         stamp_node(&mut fst.leaf, n_fst.unwrap(), gen);
     }
@@ -1351,7 +1356,6 @@ async fn create_node<B: BlockDevice + 'static>(
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            data_span_start: None,
         },
     )
     .await?;
@@ -1651,7 +1655,6 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            data_span_start: None,
         },
     )
     .await?;
@@ -1820,7 +1823,6 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            data_span_start: None,
         },
     )
     .await?;
@@ -2089,7 +2091,6 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            data_span_start: None,
         },
     )
     .await?;
@@ -2392,7 +2393,6 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            data_span_start: None,
         },
     )
     .await?;
@@ -2559,7 +2559,6 @@ pub async fn link_node<B: BlockDevice + 'static>(
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            data_span_start: None,
         },
     )
     .await?;
@@ -2642,7 +2641,6 @@ where
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            data_span_start: None,
         },
     )
     .await

@@ -122,10 +122,11 @@ through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
 tree in one COW mini-transaction — so a real kernel mounts the grown image
 read-write with the extra space and `btrfs check` reports it clean. The new
 chunk-tree leaf is kept in the system chunk so it stays reachable via
-`sys_chunk_array` at mount. It is a standalone operation (not yet auto-triggered
-from the write allocator's `NoSpace`), and writing an allocation that *crosses*
-the new chunk boundary needs per-block-group `used` accounting the single-chunk
-write path doesn't yet do.
+`sys_chunk_array` at mount. Block-group `used` and free-space accounting are
+charged **per block group**, so ordinary writes work correctly across the new
+chunk boundary once the filesystem spans more than one chunk. It is currently a
+standalone operation (not yet auto-triggered from the write allocator's
+`NoSpace`).
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
 free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds

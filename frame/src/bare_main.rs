@@ -2898,6 +2898,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                     let name = entry.name;
                     let ok = narf_scheduler::block_on(async {
+                        // Grow the filesystem by one chunk up front, so every
+                        // mutation below runs on a two-chunk image and exercises
+                        // per-block-group accounting (validated by host `btrfs
+                        // check`).
+                        {
+                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
+                                narf_block::SyncBlock::new(dev.clone()),
+                                narf_lib::id::DomainId::DRIVER_0,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                .await
+                                .map_err(|_| ())?;
+                        }
                         let fs = factory(dev.clone()).map_err(|_| ())?;
                         let root = fs.root();
                         let file = root.lookup_async("big.dat").await.map_err(|_| ())?;
@@ -2969,21 +2984,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         for i in 0..24u32 {
                             let name = alloc::format!("narf-split-{i:03}");
                             root.create(&name).await.map_err(|_| ())?;
-                        }
-                        // Grow the filesystem by one chunk (a fresh concrete mount;
-                        // its chunk/device/extent/block-group/free-space accounting
-                        // is validated on-disk by the post-boot host `btrfs check`).
-                        drop(fs);
-                        {
-                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
-                                narf_block::SyncBlock::new(dev.clone()),
-                                narf_lib::id::DomainId::DRIVER_0,
-                            )
-                            .await
-                            .map_err(|_| ())?;
-                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
-                                .await
-                                .map_err(|_| ())?;
                         }
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
