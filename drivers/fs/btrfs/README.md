@@ -106,17 +106,18 @@ writes → btrfs check "no error found" → both files read back`). Per write it
    generation);
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
-**Every tree may be multi-leaf** — the fs, extent, csum, root and free-space trees
+**Every tree may be any height** — the fs, extent, csum, root and free-space trees
 are each read into one logical leaf, edited, then re-packed into as many real
-`nodesize` leaves as needed under an internal root, so a file / directory / extent
-/ checksum set can outgrow a single leaf, as it does on a laptop-scale root
-(`btrfs check` validates the split trees). The extent tree records its own new
-blocks (a self-reference), so how many leaves it and the free-space tree need
-depends on the block count they produce; the commit resolves this with a **fixed
-point** over the leaf counts — re-handing-out node addresses from the same base
-each round until they stabilise, then writing only the converged set. This
-replaces the delayed-ref loop real btrfs uses and keeps the transaction
-closed-form.
+`nodesize` leaves as needed, with internal nodes stacked over them level by level
+up to a single root of arbitrary height (`BTRFS_MAX_LEVEL` = 8), so a file /
+directory / extent / checksum set can outgrow a single leaf — or a single internal
+node — as it does on a laptop-scale root (`btrfs check` validates the split
+trees). The extent tree records its own new blocks (a self-reference), so how many
+leaves it and the free-space tree need depends on the block count they produce;
+the commit resolves this with a **fixed point** over the leaf counts — re-handing-
+out node addresses from the same base each round until they stabilise, then
+writing only the converged set. This replaces the delayed-ref loop real btrfs uses
+and keeps the transaction closed-form.
 
 **Chunk growth** (`write::grow_add_chunk`) allocates one new mixed
 (DATA|METADATA, SINGLE) chunk at the end of the device, threading the change
@@ -155,13 +156,16 @@ filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
-Bounds (all fail loudly): each tree grows to at most **two levels** (a third →
-`NoSpace`), and a `FREE_SPACE_BITMAP` block group is out of scope. The
-write-interop guarantee is
-CI-enforced: `cargo xtask test` runs host `btrfs check` on the NARF-written image
-when `btrfs-progs` is available — on a plain image, a `space_cache=v2` image
-(including a multi-level fs tree), and a **96 MiB image carrying the 64 MiB
-superblock mirror whose extent tree it splits multi-leaf and then grows a chunk
+Bounds (all fail loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels, and
+a `FREE_SPACE_BITMAP` block group is out of scope. Trees taller than two levels
+are exercised in-kernel (`smoke_btrfs_tall_tree` writes and reads back a
+three-level fs tree); host `btrfs check` in CI covers up to two levels — a
+taller tree has the identical on-disk node format, just stacked. The write-interop
+guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check` on the
+NARF-written image when `btrfs-progs` is available — on a plain image, a
+`space_cache=v2` image (including a multi-level fs tree), and a **96 MiB image
+carrying the 64 MiB superblock mirror whose extent tree it splits multi-leaf and
+then grows a chunk
 on top of**.
 
 ## Test fixtures

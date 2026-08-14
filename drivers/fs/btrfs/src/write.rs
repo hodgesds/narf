@@ -41,19 +41,20 @@
 //! errors — verified end to end on both a plain image and a `space_cache=v2`
 //! (free-space-tree) image.
 //!
-//! **Every tree may be multi-leaf** (fs, extent, csum, root, dev, chunk,
+//! **Every tree may be any height** (fs, extent, csum, root, dev, chunk,
 //! free-space): it is read into one logical leaf, edited, then re-packed into as
-//! many real leaves as needed under an internal root (`commit_txn` /
-//! [`grow_add_chunk`] via [`pack_tree_at`]), so a file / directory / extent /
-//! checksum set can outgrow a single leaf — as it does on a laptop-scale root —
+//! many real leaves as needed and internal nodes stacked over them up to a single
+//! root of arbitrary level (`commit_txn` / [`grow_add_chunk`] via
+//! [`pack_tree_at`]), so a file / directory / extent / checksum set can outgrow a
+//! single leaf — or a single internal node — as it does on a laptop-scale root,
 //! and chunk growth works even when those trees have already split (its new
 //! chunk-tree blocks stay in the system chunk). On an image with a free-space
 //! tree, **space is reclaimed**: the allocator ([`Allocator`]) carves new extents
 //! / nodes from the tree's free ranges (skipping system block groups), so blocks
-//! freed by earlier transactions are reused instead of leaked. Bounds: each tree
-//! grows to at most two levels (a third → `NoSpace`); extent-mode free-space
-//! tracking only (a `FREE_SPACE_BITMAP` block group is out of scope). Every
-//! superblock copy is updated in lockstep, so
+//! freed by earlier transactions are reused instead of leaked. Bounds: trees grow
+//! to at most `BTRFS_MAX_LEVEL` (8) levels; extent-mode free-space tracking only
+//! (a `FREE_SPACE_BITMAP` block group is out of scope). Every superblock copy is
+//! updated in lockstep, so
 //! images large enough to carry the 64 MiB / 256 GiB mirrors stay `btrfs
 //! check`-clean, and a grown chunk is placed clear of the mirror bands
 //! (`chunk_span_avoiding_supers`).
@@ -704,17 +705,41 @@ fn group_items<B: BlockDevice + 'static>(
     Ok(groups)
 }
 
-/// Number of blocks a tree of `groups` leaves occupies: the leaves plus, when
-/// there is more than one, a level-1 internal root above them.
-fn tree_node_count(groups: &[(usize, usize)]) -> usize {
-    groups.len() + usize::from(groups.len() > 1)
+/// btrfs caps tree height (`BTRFS_MAX_LEVEL`): leaves are level 0, the root at
+/// most level 7.
+const MAX_TREE_LEVEL: usize = 7;
+
+/// Child pointers that fit in one internal node.
+fn node_fanout(nodesize: usize) -> usize {
+    (nodesize - HEADER_SIZE) / KEY_PTR_SIZE
 }
 
-/// Pack `logical`'s items into real `nodesize` leaves at the pre-assigned `addrs`
-/// (`addrs.len() == tree_node_count(groups)`: one per leaf, then the internal root
-/// if any), stamping every node's bytenr/generation/CRC32C. Returns the new nodes
-/// `(addr, bytes)`, the tree root address, and its level (0 or 1). A tree needing
-/// a third level is out of scope (`NoSpace`).
+/// Node count at each level of a tree with `leaves` leaves, bottom-up:
+/// `[leaves, ceil(leaves/f), …, 1]` (a single leaf is `[1]` — a leaf is its own
+/// root). The tree is exactly `levels.len()` levels tall.
+pub(crate) fn tree_levels(leaves: usize, nodesize: usize) -> Vec<usize> {
+    let f = node_fanout(nodesize).max(1);
+    let mut levels = alloc::vec![leaves.max(1)];
+    while *levels.last().unwrap() > 1 {
+        let n = *levels.last().unwrap();
+        levels.push(n.div_ceil(f));
+    }
+    levels
+}
+
+/// Total blocks a tree of `leaves` leaves occupies (leaves + every internal node
+/// up to the root).
+pub(crate) fn tree_block_count(leaves: usize, nodesize: usize) -> usize {
+    tree_levels(leaves, nodesize).iter().sum()
+}
+
+/// Pack `logical`'s items into real `nodesize` leaves at the pre-assigned `addrs`,
+/// then build internal nodes over them level by level up to a single root —
+/// producing a tree of **any height**. `addrs` is consumed bottom-up (all leaves,
+/// then all level-1 nodes, …, then the root), matching [`tree_levels`] /
+/// [`collect_tree_meta`]. Every node's bytenr/generation/CRC32C is stamped.
+/// Returns the new nodes `(addr, bytes)`, the root address, and its level. A tree
+/// taller than `BTRFS_MAX_LEVEL` is out of scope (`NoSpace`).
 #[allow(clippy::type_complexity)]
 fn pack_tree_at<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
@@ -724,13 +749,21 @@ fn pack_tree_at<B: BlockDevice + 'static>(
     gen: u64,
 ) -> Result<(Vec<(u64, Vec<u8>)>, u64, u8), FsError> {
     let nodesize = vol.nodesize();
-    if addrs.len() != tree_node_count(groups) {
+    let levels = tree_levels(groups.len(), nodesize);
+    if levels.len() > MAX_TREE_LEVEL + 1 {
+        return Err(FsError::NoSpace);
+    }
+    if addrs.len() != levels.iter().sum() {
         return Err(FsError::InvalidData);
     }
     let mut nodes = Vec::new();
-    let mut leaf_ptrs: Vec<(BtrfsKey, u64)> = Vec::new();
-    for (gi, &(s, e)) in groups.iter().enumerate() {
-        let addr = addrs[gi];
+    let mut ai = 0usize;
+
+    // Level 0: the leaves. Each pointer up carries the leaf's first key.
+    let mut child_ptrs: Vec<(BtrfsKey, u64)> = Vec::new();
+    for &(s, e) in groups.iter() {
+        let addr = addrs[ai];
+        ai += 1;
         let refs: Vec<(BtrfsKey, &[u8])> = (s..e)
             .map(|i| Ok((leaf_item_key(logical, i)?, leaf_item_data(logical, i)?)))
             .collect::<Result<_, FsError>>()?;
@@ -741,34 +774,40 @@ fn pack_tree_at<B: BlockDevice + 'static>(
         } else {
             BtrfsKey::new(0, 0, 0)
         };
-        leaf_ptrs.push((first, addr));
+        child_ptrs.push((first, addr));
         nodes.push((addr, leaf));
     }
 
-    if leaf_ptrs.len() == 1 {
-        return Ok((nodes, leaf_ptrs[0].1, 0));
+    // Internal levels 1.. : group the level below into `fanout`-wide nodes. Level
+    // `k`'s node carries `key_ptr`s (first key + blockptr + generation) to its
+    // children, and its header records the level.
+    let fanout = node_fanout(nodesize);
+    for (k, &count) in levels.iter().enumerate().skip(1) {
+        let mut next: Vec<(BtrfsKey, u64)> = Vec::with_capacity(count);
+        for chunk in child_ptrs.chunks(fanout) {
+            let addr = addrs[ai];
+            ai += 1;
+            let mut node = alloc::vec![0u8; nodesize];
+            node[0..HEADER_SIZE].copy_from_slice(&logical[0..HEADER_SIZE]);
+            node[100] = k as u8; // level
+            node[96..100].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+            for (i, (key, caddr)) in chunk.iter().enumerate() {
+                let kp = HEADER_SIZE + i * KEY_PTR_SIZE;
+                node[kp..kp + 8].copy_from_slice(&key.objectid.to_le_bytes());
+                node[kp + 8] = key.item_type;
+                node[kp + 9..kp + 17].copy_from_slice(&key.offset.to_le_bytes());
+                node[kp + 17..kp + 25].copy_from_slice(&caddr.to_le_bytes());
+                node[kp + 25..kp + 33].copy_from_slice(&gen.to_le_bytes()); // key-ptr gen
+            }
+            stamp_node(&mut node, addr, gen);
+            next.push((chunk[0].0, addr));
+            nodes.push((addr, node));
+        }
+        child_ptrs = next;
     }
 
-    // Build a level-1 internal root over the leaves.
-    if HEADER_SIZE + leaf_ptrs.len() * KEY_PTR_SIZE > nodesize {
-        return Err(FsError::NoSpace); // would need a third level
-    }
-    let root_addr = addrs[groups.len()];
-    let mut root = alloc::vec![0u8; nodesize];
-    root[0..HEADER_SIZE].copy_from_slice(&logical[0..HEADER_SIZE]);
-    root[100] = 1; // level 1 (internal)
-    root[96..100].copy_from_slice(&(leaf_ptrs.len() as u32).to_le_bytes());
-    for (i, (key, addr)) in leaf_ptrs.iter().enumerate() {
-        let kp = HEADER_SIZE + i * KEY_PTR_SIZE;
-        root[kp..kp + 8].copy_from_slice(&key.objectid.to_le_bytes());
-        root[kp + 8] = key.item_type;
-        root[kp + 9..kp + 17].copy_from_slice(&key.offset.to_le_bytes());
-        root[kp + 17..kp + 25].copy_from_slice(&addr.to_le_bytes());
-        root[kp + 25..kp + 33].copy_from_slice(&gen.to_le_bytes()); // key-ptr generation
-    }
-    stamp_node(&mut root, root_addr, gen);
-    nodes.push((root_addr, root));
-    Ok((nodes, root_addr, 1))
+    let root_level = (levels.len() - 1) as u8;
+    Ok((nodes, child_ptrs[0].1, root_level))
 }
 
 /// Allocate `n` tree nodes, returning their addresses in allocation order.
@@ -780,15 +819,11 @@ fn alloc_nodes<B: BlockDevice + 'static>(
     (0..n).map(|_| alloc.alloc_node(vol)).collect()
 }
 
-/// A tree's new root `(addr, level)` given its packed leaves' addresses and
-/// groups: the internal root (last address, level 1) when it has more than one
-/// leaf, else the single leaf (level 0).
-fn tree_root_addr(addrs: &[u64], groups: &[(usize, usize)]) -> (u64, u8) {
-    if groups.len() > 1 {
-        (addrs[groups.len()], 1)
-    } else {
-        (addrs[0], 0)
-    }
+/// A tree's new root `(addr, level)` given its packed nodes' addresses (laid out
+/// bottom-up) and its leaf count: the root is the last address, at the top level.
+fn tree_root_addr(addrs: &[u64], leaves: usize, nodesize: usize) -> (u64, u8) {
+    let levels = tree_levels(leaves, nodesize);
+    (*addrs.last().unwrap(), (levels.len() - 1) as u8)
 }
 
 /// Bump `cursor` by `n` node-sized blocks within `[.., limit)`, returning their
@@ -806,15 +841,22 @@ fn take_nodes(cursor: &mut u64, limit: u64, n: usize, nodesize: u64) -> Result<V
     Ok(v)
 }
 
-/// Append `(addr, owner, level)` for each block of a tree with `leaves` leaves
-/// (level 0) plus, when `leaves > 1`, its internal root (level 1) — matching the
-/// `addrs` layout `alloc_nodes` produced for it.
-fn collect_tree_meta(addrs: &[u64], leaves: usize, owner: u64, out: &mut Vec<(u64, u64, u8)>) {
-    for &a in &addrs[..leaves] {
-        out.push((a, owner, 0));
-    }
-    if leaves > 1 {
-        out.push((addrs[leaves], owner, 1));
+/// Append `(addr, owner, level)` for each block of a tree with `leaves` leaves,
+/// bottom-up (all leaves at level 0, then each higher level) — matching the
+/// `addrs` layout [`pack_tree_at`] consumes and [`tree_levels`] describes.
+fn collect_tree_meta(
+    addrs: &[u64],
+    leaves: usize,
+    nodesize: usize,
+    owner: u64,
+    out: &mut Vec<(u64, u64, u8)>,
+) {
+    let mut idx = 0usize;
+    for (level, &count) in tree_levels(leaves, nodesize).iter().enumerate() {
+        for _ in 0..count {
+            out.push((addrs[idx], owner, level as u8));
+            idx += 1;
+        }
     }
 }
 
@@ -957,9 +999,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
     // ── Metadata fixed point over the extent/free-space leaf counts ────
     let base = alloc.snapshot();
-    let fs_nc = tree_node_count(&fs_groups);
-    let csum_nc = csum_groups.as_ref().map_or(0, |g| tree_node_count(g));
-    let root_nc = tree_node_count(&root_groups);
+    let ns = vol.nodesize();
+    let fs_nc = tree_block_count(fs_groups.len(), ns);
+    let csum_nc = csum_groups
+        .as_ref()
+        .map_or(0, |g| tree_block_count(g.len(), ns));
+    let root_nc = tree_block_count(root_groups.len(), ns);
     let mut ext_leaves = 1usize;
     let mut fst_leaves = usize::from(fst_base.is_some());
 
@@ -982,12 +1027,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
         let fs_addrs = alloc_nodes(&mut alloc, vol, fs_nc)?;
         let csum_addrs = alloc_nodes(&mut alloc, vol, csum_nc)?;
         let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
-        let ext_addrs = alloc_nodes(&mut alloc, vol, ext_leaves + usize::from(ext_leaves > 1))?;
+        let ext_addrs = alloc_nodes(&mut alloc, vol, tree_block_count(ext_leaves, ns))?;
         let fst_addrs = alloc_nodes(
             &mut alloc,
             vol,
             if fst_leaves > 0 {
-                fst_leaves + usize::from(fst_leaves > 1)
+                tree_block_count(fst_leaves, ns)
             } else {
                 0
             },
@@ -998,6 +1043,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         collect_tree_meta(
             &fs_addrs,
             fs_groups.len(),
+            ns,
             format::FS_TREE_OBJECTID,
             &mut new_meta,
         );
@@ -1005,6 +1051,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
             collect_tree_meta(
                 &csum_addrs,
                 g.len(),
+                ns,
                 format::CSUM_TREE_OBJECTID,
                 &mut new_meta,
             );
@@ -1012,12 +1059,14 @@ async fn commit_txn<B: BlockDevice + 'static>(
         collect_tree_meta(
             &root_addrs,
             root_groups.len(),
+            ns,
             format::ROOT_TREE_OBJECTID,
             &mut new_meta,
         );
         collect_tree_meta(
             &ext_addrs,
             ext_leaves,
+            ns,
             format::EXTENT_TREE_OBJECTID,
             &mut new_meta,
         );
@@ -1025,6 +1074,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
             collect_tree_meta(
                 &fst_addrs,
                 fst_leaves,
+                ns,
                 format::FREE_SPACE_TREE_OBJECTID,
                 &mut new_meta,
             );
@@ -1117,13 +1167,8 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM to its new root ──
     // ROOT_ITEM fields: generation@160, bytenr@176, level@238, generation_v2@239.
-    let tree_root = |addrs: &[u64], groups: &[(usize, usize)]| -> (u64, u8) {
-        if groups.len() > 1 {
-            (addrs[groups.len()], 1)
-        } else {
-            (addrs[0], 0)
-        }
-    };
+    let tree_root =
+        |addrs: &[u64], groups: &[(usize, usize)]| tree_root_addr(addrs, groups.len(), ns);
     let (fs_root_addr, fs_level) = tree_root(&fs_addrs, &fs_groups);
     let (ext_root_addr, ext_level) = tree_root(&ext_addrs, &ext_groups);
     let (root_root_addr, _root_level) = tree_root(&root_addrs, &root_groups);
@@ -2679,6 +2724,7 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     let new_logical = logical_hw;
     let gen = sb.generation + 1;
     let nodesize = vol.nodesize() as u64;
+    let ns = vol.nodesize();
 
     // System-chunk arena for the new chunk-tree blocks: past the highest live
     // metadata block already in the system group.
@@ -2763,9 +2809,9 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     let chunk_groups = group_items(vol, &chunk_logical)?;
     let dev_groups = group_items(vol, &dev_logical)?;
     let root_groups = group_items(vol, &root_logical)?;
-    let chunk_nc = tree_node_count(&chunk_groups);
-    let dev_nc = tree_node_count(&dev_groups);
-    let root_nc = tree_node_count(&root_groups);
+    let chunk_nc = tree_block_count(chunk_groups.len(), ns);
+    let dev_nc = tree_block_count(dev_groups.len(), ns);
+    let root_nc = tree_block_count(root_groups.len(), ns);
 
     // Every old block across every COWed tree is returned to free space.
     let mut freed_meta: Vec<(u64, u8)> = chunk_old;
@@ -2822,30 +2868,35 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         collect_tree_meta(
             &chunk_addrs,
             chunk_groups.len(),
+            ns,
             format::CHUNK_TREE_OBJECTID,
             &mut new_meta,
         );
         collect_tree_meta(
             &dev_addrs,
             dev_groups.len(),
+            ns,
             format::DEV_TREE_OBJECTID,
             &mut new_meta,
         );
         collect_tree_meta(
             &ext_addrs,
             ext_leaves,
+            ns,
             format::EXTENT_TREE_OBJECTID,
             &mut new_meta,
         );
         collect_tree_meta(
             &root_addrs,
             root_groups.len(),
+            ns,
             format::ROOT_TREE_OBJECTID,
             &mut new_meta,
         );
         collect_tree_meta(
             &fst_addrs,
             fst_leaves,
+            ns,
             format::FREE_SPACE_TREE_OBJECTID,
             &mut new_meta,
         );
@@ -2930,11 +2981,11 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     }
 
     // ── Root tree: repoint the device/extent/free-space ROOT_ITEMs ─────
-    let (chunk_root_addr, _) = tree_root_addr(&chunk_addrs, &chunk_groups);
-    let (dev_root_addr, dev_lvl) = tree_root_addr(&dev_addrs, &dev_groups);
-    let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, &ext_groups);
-    let (root_root_addr, _) = tree_root_addr(&root_addrs, &root_groups);
-    let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, &fst_groups);
+    let (chunk_root_addr, _) = tree_root_addr(&chunk_addrs, chunk_groups.len(), ns);
+    let (dev_root_addr, dev_lvl) = tree_root_addr(&dev_addrs, dev_groups.len(), ns);
+    let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, ext_groups.len(), ns);
+    let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+    let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, fst_groups.len(), ns);
     for (owner, new, lvl) in [
         (format::DEV_TREE_OBJECTID, dev_root_addr, dev_lvl),
         (format::EXTENT_TREE_OBJECTID, ext_root_addr, ext_lvl),

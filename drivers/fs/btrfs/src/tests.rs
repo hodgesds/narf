@@ -2385,21 +2385,22 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_avoids_supers);
 /// extent tree's self-reference (it records its own new blocks) with a fixed
 /// point. Proven by the on-disk root levels rising above 0 and every file reading
 /// back across the split trees after a remount.
+/// On-disk root level of the tree with the given objectid (leaves are 0).
+fn tree_level<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    objectid: u64,
+) -> Option<u8> {
+    let root_tree = vol.root_tree_root().0;
+    poll_once(crate::roots::find_root(vol, root_tree, objectid))?
+        .ok()
+        .map(|(_, level)| level)
+}
+
 fn smoke_btrfs_multileaf_trees() -> TestResult {
     use narf_filesystem::FsInstance;
 
     const N: u32 = 90;
     const SZ: usize = 65536; // 16 sectors: a large csum item per file
-
-    fn tree_level<B: narf_block::BlockDevice + 'static>(
-        vol: &BtrfsVolume<B>,
-        objectid: u64,
-    ) -> Option<u8> {
-        let root_tree = vol.root_tree_root().0;
-        poll_once(crate::roots::find_root(vol, root_tree, objectid))?
-            .ok()
-            .map(|(_, level)| level)
-    }
 
     let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
     let vol = match mount_writable(dev.clone()) {
@@ -2461,6 +2462,86 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multileaf_trees);
+
+/// The tree-height math: leaves pack into internal nodes `fanout`-wide, and a tree
+/// grows past two levels once the leaves overflow a single internal node.
+fn smoke_btrfs_tree_levels() -> TestResult {
+    use crate::write::{tree_block_count, tree_levels};
+    // nodesize 4096: fanout = (4096 - 101) / 33 = 121 child pointers per node.
+    let cases: &[(usize, &[usize])] = &[
+        (1, &[1]),                    // a lone leaf is its own root (1 physical level)
+        (2, &[2, 1]),                 // 2-level: leaves under one internal root
+        (121, &[121, 1]),             // still 2-level — exactly one internal node's worth
+        (122, &[122, 2, 1]),          // 3-level: leaves overflow one internal node
+        (14642, &[14642, 122, 2, 1]), // 4-level (> 121^2 leaves)
+    ];
+    for &(leaves, want) in cases {
+        if tree_levels(leaves, 4096) != want {
+            return TestResult::Fail("tree_levels wrong");
+        }
+    }
+    // Block count is the sum over levels.
+    if tree_block_count(122, 4096) != 125 {
+        return TestResult::Fail("tree_block_count wrong");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_levels);
+
+/// A tree taller than two levels: creating enough symlinks — each with a large
+/// inline target, so roughly one fills a leaf — overflows a single internal node,
+/// forcing the fs tree to a **third level** (root level 2). The COW write path
+/// builds that tree, and every target reads back after a remount.
+fn smoke_btrfs_tall_tree() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    // ~1 leaf per symlink; > 121 of them overflow one internal node.
+    const N: u32 = 135;
+    let target = |i: u32| alloc::format!("{i:0>3500}");
+
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture failed to mount"),
+    };
+    for i in 0..N {
+        let name = alloc::format!("l{i:03}");
+        if !matches!(
+            poll_once(vol.root().symlink(&name, &target(i))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("symlink failed");
+        }
+    }
+
+    // The fs tree must have grown past two levels (root level 2).
+    match tree_level(&vol, format::FS_TREE_OBJECTID) {
+        Some(2) => {}
+        Some(_) => return TestResult::Fail("fs tree is not three levels tall"),
+        None => return TestResult::Fail("fs tree root not found"),
+    }
+
+    // Remount and read every symlink target back through the three-level tree.
+    let vol2 = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    for i in 0..N {
+        let name = alloc::format!("l{i:03}");
+        let want = target(i);
+        match poll_once(vol2.root().lookup_async(&name)) {
+            Some(Ok(f)) => match read_all(&f, want.len() + 16) {
+                Some(got) if got == want.as_bytes() => {}
+                _ => return TestResult::Fail("symlink target wrong after remount"),
+            },
+            _ => return TestResult::Fail("symlink missing after remount"),
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tall_tree);
 
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
