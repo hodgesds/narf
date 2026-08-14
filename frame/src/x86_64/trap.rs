@@ -489,6 +489,21 @@ mod stall_wd {
                 TrapWriter,
                 "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} contended_irq_lock={contended_lock:#x} -> {verdict}"
             );
+            // The counts above say a halted CPU has runnable work; only the
+            // per-slot state says which slot and why it is not running. An
+            // awake slot with `allowed=false` is circulating on a queue whose
+            // CPU its affinity mask excludes (watch `requeues`); an awake slot
+            // with `allowed=true` and flat `pops` is one the executor stopped
+            // visiting. Bounded by `DBG_READY_SLOTS_MAX` — this is a trap onto
+            // a synchronous console.
+            for (tid, awake_flag, home, aff, allowed, pops, requeues) in
+                narf_scheduler::dbg_ready_slots(cpu)
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "STALL-WD   ready cpu={cpu} tid={tid} awake={awake_flag} home_cpu={home} aff={aff:#x} allowed={allowed} pops={pops} notawake_requeues={requeues}"
+                );
+            }
         }
         // Wheel + per-task park states: shows a task parked with an expired
         // (or absurdly far) deadline and whether a deliverable signal is
