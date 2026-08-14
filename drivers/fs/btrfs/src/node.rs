@@ -25,6 +25,16 @@ use crate::volume::BtrfsVolume;
 /// Linux `STATX_BASIC_STATS` — the fields this driver populates.
 const STATX_BASIC_STATS: u32 = 0x7ff;
 
+/// Convert a packed userspace `dev_t` (as `mknod` delivers it) to the raw kernel
+/// `dev_t` btrfs stores on disk — Linux `new_decode_dev` followed by `MKDEV`
+/// (`(major << 20) | minor`). Keeps NARF-created device nodes readable by a real
+/// kernel with the right major/minor.
+fn glibc_to_kernel_dev(dev: u64) -> u64 {
+    let major = (dev >> 8) & 0xfff;
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xf_ff00);
+    (major << 20) | (minor & 0xf_ffff)
+}
+
 /// One btrfs inode presented to the VFS. A node records the fs tree it lives in:
 /// `None` is the default subvolume (resolved dynamically from the live volume, so
 /// a COW write's new root is observed), `Some(root)` pins a nested subvolume's
@@ -332,6 +342,64 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let vol = self.volume()?;
             crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+        })
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            let (ino, inode) = crate::write::symlink_node(&vol, self.ino, name, target).await?;
+            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+        })
+    }
+
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            // Map the VFS file type to the mode's `S_IF*` bits and the on-disk
+            // `BTRFS_FT_*` directory-entry type. Default permission bits are 0644
+            // (udev sets the final mode afterwards).
+            let (mode, ft) = match file_type {
+                FileType::Special => (0o020644, format::FT_CHRDEV), // S_IFCHR
+                FileType::Block => (0o060644, format::FT_BLKDEV),   // S_IFBLK
+                FileType::Fifo => (0o010644, format::FT_FIFO),      // S_IFIFO
+                _ => return Err(FsError::Unsupported),
+            };
+            // `rdev` arrives as the packed userspace `dev_t`; btrfs stores the raw
+            // kernel `dev_t`. FIFOs carry no device number.
+            let kdev = if rdev == 0 {
+                0
+            } else {
+                glibc_to_kernel_dev(rdev)
+            };
+            let vol = self.volume()?;
+            let (ino, inode) =
+                crate::write::mknod_node(&vol, self.ino, name, mode, ft, kdev).await?;
+            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+        })
+    }
+
+    fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            // S_IFSOCK | perms; no device number.
+            let mode = 0o140000 | u32::from(perms & 0o7777);
+            let (ino, inode) =
+                crate::write::mknod_node(&vol, self.ino, name, mode, format::FT_SOCK, 0).await?;
+            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }
 

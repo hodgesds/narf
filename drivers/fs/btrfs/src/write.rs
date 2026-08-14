@@ -827,6 +827,7 @@ fn inode_item(
     gen: u64,
     mode: u32,
     size: u64,
+    nbytes: u64,
     nlink: u32,
     uid: u32,
     gid: u32,
@@ -838,7 +839,7 @@ fn inode_item(
     v[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
     v[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
     v[16..24].copy_from_slice(&size.to_le_bytes()); // size
-                                                    // nbytes@24 = 0 (empty file / no data)
+    v[24..32].copy_from_slice(&nbytes.to_le_bytes()); // nbytes
     v[40..44].copy_from_slice(&nlink.to_le_bytes());
     v[44..48].copy_from_slice(&uid.to_le_bytes());
     v[48..52].copy_from_slice(&gid.to_le_bytes());
@@ -924,6 +925,16 @@ fn next_dir_index(fs_leaf: &[u8], dir_ino: u64) -> Result<u64, FsError> {
     Ok(max + 1)
 }
 
+/// What kind of inode [`create_node`] materialises: mode + directory-entry type,
+/// an optional device number (`mknod`), and optional inline content (a symlink
+/// target, stored as one inline `EXTENT_DATA`).
+struct NewNode<'a> {
+    mode: u32,
+    ftype: u8,
+    rdev: u64,
+    inline: Option<&'a [u8]>,
+}
+
 /// Create an empty regular file `name` in directory `parent_ino` (default
 /// subvolume). Returns the new inode number and its freshly-built [`InodeItem`].
 pub async fn create_file<B: BlockDevice + 'static>(
@@ -931,7 +942,18 @@ pub async fn create_file<B: BlockDevice + 'static>(
     parent_ino: u64,
     name: &str,
 ) -> Result<(u64, InodeItem), FsError> {
-    create_node(vol, parent_ino, name, 0o100644, format::FT_REG_FILE).await
+    create_node(
+        vol,
+        parent_ino,
+        name,
+        NewNode {
+            mode: 0o100644,
+            ftype: format::FT_REG_FILE,
+            rdev: 0,
+            inline: None,
+        },
+    )
+    .await
 }
 
 /// Create an empty subdirectory `name` in directory `parent_ino` (default
@@ -943,18 +965,79 @@ pub async fn mkdir_dir<B: BlockDevice + 'static>(
     parent_ino: u64,
     name: &str,
 ) -> Result<(u64, InodeItem), FsError> {
-    create_node(vol, parent_ino, name, 0o040755, format::FT_DIR).await
+    create_node(
+        vol,
+        parent_ino,
+        name,
+        NewNode {
+            mode: 0o040755,
+            ftype: format::FT_DIR,
+            rdev: 0,
+            inline: None,
+        },
+    )
+    .await
 }
 
-/// Create a new empty inode (`mode`/`ftype` pick file vs directory) named `name`
-/// in directory `parent_ino` (default subvolume) via a COW mini-transaction.
-/// Single-leaf trees only (like all mutations here).
-async fn create_node<B: BlockDevice + 'static>(
+/// Create a symlink `name` → `target` in directory `parent_ino` (default
+/// subvolume). The target is stored as one uncompressed inline `EXTENT_DATA`,
+/// exactly like `btrfs_symlink` (inode `size`/`nbytes`/`ram_bytes` all the target
+/// length). Targets `>= sectorsize` are out of scope (`Unsupported`).
+pub async fn symlink_node<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+    target: &str,
+) -> Result<(u64, InodeItem), FsError> {
+    if target.is_empty() || target.len() >= vol.sectorsize() as usize {
+        return Err(FsError::Unsupported);
+    }
+    create_node(
+        vol,
+        parent_ino,
+        name,
+        NewNode {
+            mode: 0o120777, // S_IFLNK | 0777
+            ftype: format::FT_SYMLINK,
+            rdev: 0,
+            inline: Some(target.as_bytes()),
+        },
+    )
+    .await
+}
+
+/// Create a special file `name` (char/block device, FIFO or socket) in directory
+/// `parent_ino` (default subvolume). `mode` carries the `S_IF*` type bits; `rdev`
+/// is the Linux `dev_t` (0 for FIFO/socket).
+pub async fn mknod_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
     name: &str,
     mode: u32,
     ftype: u8,
+    rdev: u64,
+) -> Result<(u64, InodeItem), FsError> {
+    create_node(
+        vol,
+        parent_ino,
+        name,
+        NewNode {
+            mode,
+            ftype,
+            rdev,
+            inline: None,
+        },
+    )
+    .await
+}
+
+/// Create a new inode named `name` in directory `parent_ino` (default subvolume)
+/// via a COW mini-transaction. Single-leaf trees only (like all mutations here).
+async fn create_node<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+    spec: NewNode<'_>,
 ) -> Result<(u64, InodeItem), FsError> {
     let name_bytes = name.as_bytes();
     if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
@@ -1043,8 +1126,14 @@ async fn create_node<B: BlockDevice + 'static>(
     leaf_replace_inplace(&mut fs_leaf, pslot, &pinode)?;
 
     // Insert the new inode's items: INODE_ITEM, INODE_REF (→ parent), and the
-    // parent's DIR_ITEM (name lookup) + DIR_INDEX (readdir order).
-    let ii = inode_item(gen, mode, 0, 1, 0, 0, 0, ptime_sec, ptime_nsec);
+    // parent's DIR_ITEM (name lookup) + DIR_INDEX (readdir order). Inline content
+    // (a symlink target) sets the inode size/nbytes and adds an EXTENT_DATA.
+    // An inline symlink's data lives in the item, so `nbytes` equals `size`;
+    // empty files/dirs/device nodes own no bytes.
+    let size = spec.inline.map(|d| d.len() as u64).unwrap_or(0);
+    let ii = inode_item(
+        gen, spec.mode, size, size, 1, 0, 0, spec.rdev, ptime_sec, ptime_nsec,
+    );
     leaf_insert_sorted(
         &mut fs_leaf,
         &BtrfsKey::new(new_ino, format::INODE_ITEM_KEY, 0),
@@ -1056,13 +1145,20 @@ async fn create_node<B: BlockDevice + 'static>(
         &BtrfsKey::new(new_ino, format::INODE_REF_KEY, parent_ino),
         &iref,
     )?;
-    let di = dir_item_body(new_ino, gen, ftype, name_bytes);
+    let di = dir_item_body(new_ino, gen, spec.ftype, name_bytes);
     leaf_insert_sorted(&mut fs_leaf, &dir_item_key, &di)?;
     leaf_insert_sorted(
         &mut fs_leaf,
         &BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
         &di,
     )?;
+    if let Some(data) = spec.inline {
+        leaf_insert_sorted(
+            &mut fs_leaf,
+            &BtrfsKey::new(new_ino, format::EXTENT_DATA_KEY, 0),
+            &file_extent_inline(gen, data),
+        )?;
+    }
 
     commit_txn(
         vol,
@@ -1083,16 +1179,29 @@ async fn create_node<B: BlockDevice + 'static>(
     .await?;
 
     let inode = InodeItem {
-        size: 0,
-        mode,
+        size,
+        mode: spec.mode,
         uid: 0,
         gid: 0,
         nlink: 1,
-        rdev: 0,
+        rdev: spec.rdev,
         mtime_sec: ptime_sec,
         mtime_nsec: ptime_nsec,
     };
     Ok((new_ino, inode))
+}
+
+/// Build an inline `btrfs_file_extent_item` (type INLINE) holding `data`: a
+/// 21-byte header (`generation`, `ram_bytes = data.len()`, compression/encryption
+/// /other_encoding 0, type) followed by the raw bytes. Used for symlink targets.
+fn file_extent_inline(gen: u64, data: &[u8]) -> Vec<u8> {
+    let mut v = alloc::vec![0u8; 21 + data.len()];
+    v[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
+    v[8..16].copy_from_slice(&(data.len() as u64).to_le_bytes()); // ram_bytes
+                                                                  // compression@16 / encryption@17 / other_encoding@18 = 0
+    v[20] = format::FILE_EXTENT_INLINE; // type
+    v[21..].copy_from_slice(data);
+    v
 }
 
 /// Parse a `btrfs_inode_ref` item body (a run of `{__le64 index; __le16

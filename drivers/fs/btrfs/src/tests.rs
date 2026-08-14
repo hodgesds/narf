@@ -1598,6 +1598,85 @@ kernel_test_in!(
     smoke_btrfs_rename_dir_and_reject_overwrite
 );
 
+/// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
+/// reads back and whose type is `Symlink` after a remount — exactly how the VFS
+/// follows it.
+fn smoke_btrfs_symlink_create() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let target = "../some/where/big.dat";
+    if !matches!(poll_once(vol.root().symlink("mylink", target)), Some(Ok(_))) {
+        return TestResult::Fail("symlink failed");
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after symlink failed"),
+    };
+    let root2 = vol2.root();
+    if !dir_names(&root2).iter().any(|n| n == "mylink") {
+        return TestResult::Fail("symlink not listed");
+    }
+    let link = match poll_once(root2.lookup_async("mylink")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of symlink failed"),
+    };
+    if link.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("created node is not a symlink");
+    }
+    match read_all(&link, target.len() + 16).as_deref() {
+        Some(got) if got == target.as_bytes() => TestResult::Pass,
+        _ => TestResult::Fail("symlink target content wrong"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_symlink_create);
+
+/// `mknod` creates a char device node that stats as `Special` with the right
+/// `st_rdev` after a remount.
+fn smoke_btrfs_mknod_device() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    // Linux dev_t for char device 1:3 (/dev/null), compact encoding.
+    let rdev = (1u64 << 8) | 3;
+    if !matches!(
+        poll_once(vol.root().mknod("mychar", FileType::Special, rdev)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("mknod failed");
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after mknod failed"),
+    };
+    let dev = match poll_once(vol2.root().lookup_async("mychar")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of device node failed"),
+    };
+    if dev.stat().mode.file_type != FileType::Special {
+        return TestResult::Fail("mknod'd node is not a char device");
+    }
+    match poll_once(dev.statx_async(0, 0x7ff)) {
+        Some(Ok(sx)) if sx.rdev_major == 1 && sx.rdev_minor == 3 => TestResult::Pass,
+        _ => TestResult::Fail("device rdev wrong after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mknod_device);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same
@@ -2088,7 +2167,7 @@ fn smoke_btrfs_special_files() -> TestResult {
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_special_files);
 
 fn smoke_btrfs_rdev_decode() -> TestResult {
-    // Linux dev_t decomposition (glibc gnu_dev_major/minor).
+    // btrfs stores the raw kernel dev_t: MKDEV(major, minor) = (major << 20) | minor.
     let mk = |rdev: u64| {
         let inode = crate::inode::InodeItem {
             size: 0,
@@ -2102,11 +2181,12 @@ fn smoke_btrfs_rdev_decode() -> TestResult {
         };
         inode.rdev_major_minor()
     };
-    // Small classic encodings.
-    if mk(0x103) != (1, 3) || mk(0x800) != (8, 0) {
+    // MKDEV(1, 3) and MKDEV(8, 16) — what a real kernel writes for /dev/null and
+    // a scsi disk partition.
+    if mk(0x10_0003) != (1, 3) || mk(0x80_0010) != (8, 16) {
         return TestResult::Fail("small dev_t decode wrong");
     }
-    // Minor above 0xff exercises the high-minor path (makedev(1, 256)).
+    // Minor above 0xff: MKDEV(1, 256).
     if mk(0x10_0100) != (1, 256) {
         return TestResult::Fail("large-minor dev_t decode wrong");
     }

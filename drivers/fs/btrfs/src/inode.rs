@@ -59,13 +59,13 @@ impl InodeItem {
         })
     }
 
-    /// Decompose `rdev` into `(major, minor)` per the Linux `dev_t` encoding
-    /// (`glibc gnu_dev_major`/`gnu_dev_minor`).
+    /// Decompose `rdev` into `(major, minor)`. btrfs stores the **raw kernel
+    /// `dev_t`** (`MKDEV(major, minor) == (major << 20) | minor`, `MINORBITS ==
+    /// 20`) — `btrfs_set_inode_rdev(item, inode->i_rdev)` with no re-encoding —
+    /// not the packed userspace `dev_t`.
     pub fn rdev_major_minor(&self) -> (u32, u32) {
         let d = self.rdev;
-        let major = (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
-        let minor = ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
-        (major, minor)
+        ((d >> 20) as u32, (d & 0xf_ffff) as u32)
     }
 
     /// Low 12 permission/special mode bits.
