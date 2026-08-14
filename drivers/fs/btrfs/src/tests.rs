@@ -1213,6 +1213,90 @@ fn smoke_btrfs_write_extent_accounting() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
 
+/// The superblock's `bytes_used` field.
+fn super_bytes_used(dev: &WritableSparseDevice) -> u64 {
+    let raw = read_super_at(dev, format::SUPERBLOCK_OFFSET);
+    format::le64(&raw, 120).unwrap_or(u64::MAX)
+}
+
+/// Sum of every `BLOCK_GROUP_ITEM.used` in the extent tree — the value the
+/// superblock's `bytes_used` must equal.
+fn sum_block_group_used<B: narf_block::BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Option<u64> {
+    let (root_tree, _) = vol.root_tree_root();
+    let (ext_root, _) = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    ))?
+    .ok()?;
+    let mut cursor =
+        poll_once(btree::Cursor::seek(vol, ext_root, &BtrfsKey::new(0, 0, 0)))?.ok()?;
+    let mut total = 0u64;
+    while let Some((key, body)) = cursor.current().ok()? {
+        if key.item_type == format::BLOCK_GROUP_ITEM_KEY {
+            total += format::le64(body, 0).ok()?;
+        }
+        poll_once(cursor.advance())?.ok()?;
+    }
+    Some(total)
+}
+
+/// The superblock's `bytes_used` must always equal the sum of every block
+/// group's `used`. The extent tree is path-COWed while csum/root/free-space are
+/// whole-repacked, so a per-block accounting slip (double-charged reuse, a
+/// dropped delta) silently desyncs the counter — exactly what a host `btrfs
+/// check` flags as "super bytes used … mismatches actual used". This guards it
+/// across a multi-extent overwrite, a create, and an unlink, including a grow.
+fn smoke_btrfs_bytes_used_matches_block_groups() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+
+    // A mix of mutations that exercise both commit paths and a chunk grow.
+    let f = match poll_once(vol.root().create("accounting.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let payload = alloc::vec![0xa5u8; 300 * 1024]; // multi-extent
+    if !matches!(poll_once(f.write(0, &payload)), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+    if !matches!(poll_once(f.write(0, &payload[..64 * 1024])), Some(Ok(_))) {
+        return TestResult::Fail("overwrite failed");
+    }
+    if !matches!(poll_once(crate::write::grow_add_chunk(&vol)), Some(Ok(()))) {
+        return TestResult::Fail("grow failed");
+    }
+    if !matches!(poll_once(vol.root().create("tiny.txt")), Some(Ok(_))) {
+        return TestResult::Fail("post-grow create failed");
+    }
+    if !matches!(poll_once(vol.root().unlink("accounting.dat")), Some(Ok(()))) {
+        return TestResult::Fail("unlink failed");
+    }
+
+    let vol2 = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    let summed = match sum_block_group_used(&vol2) {
+        Some(t) => t,
+        None => return TestResult::Fail("could not sum block groups"),
+    };
+    if super_bytes_used(&device) != summed {
+        return TestResult::Fail("super bytes_used desynced from block groups");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_bytes_used_matches_block_groups
+);
+
 // ── Free-space tree (space_cache=v2) write maintenance ─────────────
 
 /// Every `FREE_SPACE_EXTENT` `(start, len)` in the volume's free-space tree.
