@@ -4832,3 +4832,198 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("userspace/process", smoke_process_coredump_e2e);
+
+// ── waitid(2) blocking-path smokes ────────────────────────────────────
+//
+// The CachyOS bring-up wedge that motivated these: the park census
+// repeatedly caught a parent parked in `waitid(pid, WEXITED)` whose child
+// was already `TASK_ZOMBIE`, with the whole boot stalled behind it
+// (systemd's first transaction, then journald, then systemd-remount-fs).
+// Two orderings can produce that, and they fail for different reasons, so
+// both are pinned here:
+//
+//   (A) the child exits BEFORE the parent calls waitid — the reap has to
+//       come off `PENDING_EXITS` on the fast path and never park at all;
+//   (B) the parent registers its wait-child waker BEFORE the child exits —
+//       `on_child_exit` has to fire that waker, or the park is unbounded.
+//
+// (B) is the one with no backstop: `own_stack_wait_child` arms no timer,
+// so a wake that never arrives is a permanent strand (and it does not tick
+// `dbg_park_checks` either, which is exactly why the census could not tell
+// a stranded waiter from a healthy idle one).
+//
+// Linux ref: kernel/exit.c::do_wait / do_notify_parent.
+
+/// waitid siginfo_t field offsets on LP64: si_signo@0, si_code@8,
+/// si_pid@16, si_status@24. Mirrors `encode_waitid_siginfo`.
+fn waitid_siginfo_fields(si: &[u8; 128]) -> (i32, i32, i32, i32) {
+    (
+        i32::from_ne_bytes(si[0..4].try_into().unwrap()), // si_signo
+        i32::from_ne_bytes(si[8..12].try_into().unwrap()), // si_code
+        i32::from_ne_bytes(si[16..20].try_into().unwrap()), // si_pid
+        i32::from_ne_bytes(si[24..28].try_into().unwrap()), // si_status
+    )
+}
+
+fn smoke_waitid_blocking_reaps_child_that_already_exited() -> TestResult {
+    // Kernel-test fixture: passes kernel stack pointers as stand-in user
+    // buffers, so the scoped opt-in is what keeps `validate_user_range`
+    // strict for real syscalls. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    const PARENT: u64 = 0xF0_51;
+    const CHILD: u64 = 0xC0_51;
+    const P_PID: u64 = 1;
+    const WEXITED: u64 = 4;
+    const SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Child exits FIRST, with a non-zero exit code so si_status is not
+    // confusable with a zeroed siginfo_t.
+    crate::handlers::stage_pending_termination(CHILD, 3 << 8);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
+
+    // Blocking waitid(P_PID, CHILD, &info, WEXITED, NULL) — no WNOHANG.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut si = [0u8; 128];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: P_PID,
+            arg1: CHILD,
+            arg2: si.as_mut_ptr() as u64,
+            arg3: WEXITED,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Waitid.raw(), &mut ctx);
+
+    let verdict = (|| {
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+            // -ECHILD here is the wedge: waitid could not see an exit that
+            // is already queued, so a real parent would have parked instead.
+            Some(r) if r.status == SyscallReturn::OK => {
+                return Err("waitid on an already-exited child did not return 0")
+            }
+            _ => return Err("waitid returned a non-OK NARF status"),
+        }
+        let (signo, code, pid, status) = waitid_siginfo_fields(&si);
+        if signo != SIGCHLD {
+            return Err("waitid siginfo si_signo was not SIGCHLD");
+        }
+        if code != CLD_EXITED {
+            return Err("waitid siginfo si_code was not CLD_EXITED");
+        }
+        if pid as u64 != CHILD {
+            return Err("waitid siginfo si_pid did not name the reaped child");
+        }
+        if status != 3 {
+            return Err("waitid siginfo si_status did not carry the exit code");
+        }
+        Ok(())
+    })();
+
+    teardown_process_state();
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_waitid_blocking_reaps_child_that_already_exited
+);
+
+/// Waker that records whether it was woken, so a test can assert the
+/// child-exit path actually fired the parent's registered waker rather
+/// than merely queueing the exit somewhere.
+mod wake_probe {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    pub static WOKEN: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    unsafe fn wake_fn(_p: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
+    unsafe fn drop_fn(_p: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_fn, drop_fn);
+
+    pub fn waker() -> Waker {
+        WOKEN.store(false, Ordering::Release);
+        // SAFETY: the vtable's fns ignore the data pointer entirely and
+        // only touch the static above, so a dangling `null` payload is
+        // never dereferenced.
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+}
+
+fn smoke_waitid_child_exit_wakes_parked_parent() -> TestResult {
+    const PARENT: u64 = 0xF0_52;
+    const CHILD: u64 = 0xC0_52;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Parent is parked: its waker is registered and no exit is queued yet.
+    // This is the ordering with no timer backstop — if `on_child_exit`
+    // does not fire this waker, the parent never runs again.
+    crate::user_task::register_wait_child_waker(PARENT, wake_probe::waker());
+
+    let verdict = (|| {
+        let mut status = 0i32;
+        if crate::user_task::call_wait_child_check(PARENT, -1, 0, &mut status) != 0 {
+            return Err("precondition: nothing should be reapable before the child exits");
+        }
+        if wake_probe::WOKEN.load(Ordering::Acquire) {
+            return Err("precondition: the waker fired before any child exited");
+        }
+
+        // Child exits while the parent is parked.
+        crate::handlers::stage_pending_termination(CHILD, 5 << 8);
+        crate::user_task::notify_task_exited(CHILD, CHILD);
+
+        if !wake_probe::WOKEN.load(Ordering::Acquire) {
+            return Err("child exit did not wake the parent parked in waitid/wait4");
+        }
+        // The wake is only useful if the re-check now finds the child: a
+        // waker that fires onto an empty queue re-parks immediately.
+        let mut status = 0i32;
+        let reaped = crate::user_task::call_wait_child_check(PARENT, -1, 0, &mut status);
+        if reaped as u64 != CHILD {
+            return Err("post-wake re-check did not report the exited child");
+        }
+        if status != 5 << 8 {
+            return Err("post-wake re-check reported the wrong wstatus");
+        }
+        Ok(())
+    })();
+
+    crate::user_task::drop_wait_child_waker(PARENT);
+    teardown_process_state();
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_waitid_child_exit_wakes_parked_parent
+);
