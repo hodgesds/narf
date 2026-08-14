@@ -1213,6 +1213,81 @@ fn smoke_btrfs_write_extent_accounting() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
 
+/// A tree-log written by `write_log` must be replayed into the fs tree on the
+/// next mount and then cleared — btrfs crash recovery. Records a modified
+/// INODE_ITEM for a file into a log (leaving the fs tree untouched), then a
+/// remount must merge it (the file's mtime changes) and zero `super.log_root`.
+fn smoke_btrfs_tree_log_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let f = match poll_once(vol.root().create("logged.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = f.ino();
+
+    // Read the committed INODE_ITEM and log a copy with a distinctive mtime,
+    // WITHOUT touching the fs tree — as a crashed fsync would leave it.
+    let (fs_root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+    let mut body = match poll_once(btree::find_item(&vol, fs_root, &key)) {
+        Some(Ok(Some(b))) => b,
+        _ => return TestResult::Fail("could not read inode item"),
+    };
+    const MARK: u64 = 0x0011_2233_4455;
+    body[136..144].copy_from_slice(&MARK.to_le_bytes()); // mtime seconds
+    if !matches!(
+        poll_once(crate::write::write_log(&vol, &[(key, body)])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("write_log failed");
+    }
+    // The log is pending (fs tree unchanged: the live mtime is still 0).
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(0) == 0 {
+        return TestResult::Fail("super.log_root not set after write_log");
+    }
+    if poll_once(f.statx_async(0, 0x7ff))
+        .and_then(|r| r.ok())
+        .map(|s| s.mtime.seconds)
+        == Some(MARK as i64)
+    {
+        return TestResult::Fail("log leaked into the fs tree before replay");
+    }
+
+    // Remount: replay must merge the logged inode and clear the log pointer.
+    let vol2 = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount (replay) failed"),
+    };
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(1) != 0 {
+        return TestResult::Fail("super.log_root not cleared after replay");
+    }
+    let f2 = match poll_once(vol2.root().lookup_async("logged.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("file missing after replay"),
+    };
+    match poll_once(f2.statx_async(0, 0x7ff)) {
+        Some(Ok(sx)) if sx.mtime.seconds == MARK as i64 => {}
+        _ => return TestResult::Fail("logged mtime not applied by replay"),
+    }
+    // A subsequent remount finds no log (idempotent) and the state persists.
+    let vol3 = match mount_writable(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("second remount failed"),
+    };
+    match poll_once(vol3.root().lookup_async("logged.txt")) {
+        Some(Ok(_)) => TestResult::Pass,
+        _ => TestResult::Fail("file lost after replay persisted"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_log_replay);
+
 /// Every block (root + internals + leaves) the fs tree currently occupies.
 fn fs_tree_blocks<B: narf_block::BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,

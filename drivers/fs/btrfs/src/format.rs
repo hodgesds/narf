@@ -67,6 +67,9 @@ pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 /// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
 pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
+/// The tree-log tree (`BTRFS_TREE_LOG_OBJECTID`, -7): the fsync log root, and the
+/// objectid of the log-root tree that maps each subvolume to its log.
+pub const TREE_LOG_OBJECTID: u64 = (-7i64) as u64;
 /// First object id available to files/dirs; also the fs-tree root directory.
 pub const FIRST_FREE_OBJECTID: u64 = 256;
 /// Highest object id available to files/dirs (`BTRFS_LAST_FREE_OBJECTID`, -256);
@@ -200,6 +203,9 @@ const OFF_MAGIC: usize = 64;
 const OFF_GENERATION: usize = 72;
 const OFF_ROOT: usize = 80;
 const OFF_CHUNK_ROOT: usize = 88;
+pub const OFF_LOG_ROOT: usize = 96;
+pub const OFF_LOG_ROOT_TRANSID: usize = 104;
+pub const OFF_LOG_ROOT_LEVEL: usize = 200;
 const OFF_TOTAL_BYTES: usize = 112;
 const OFF_BYTES_USED: usize = 120;
 const OFF_NUM_DEVICES: usize = 136;
@@ -222,6 +228,11 @@ pub struct Superblock {
     pub root: u64,
     /// Logical address of the chunk-tree root node.
     pub chunk_root: u64,
+    /// Logical address of the log-root tree, or 0 when no fsync log is pending.
+    /// A non-zero value means the volume was left with an unreplayed tree-log.
+    pub log_root: u64,
+    /// Level of the log-root tree node at [`log_root`](Self::log_root).
+    pub log_root_level: u8,
     pub total_bytes: u64,
     pub bytes_used: u64,
     pub num_devices: u64,
@@ -284,6 +295,8 @@ impl Superblock {
             generation: le64(buf, OFF_GENERATION)?,
             root: le64(buf, OFF_ROOT)?,
             chunk_root: le64(buf, OFF_CHUNK_ROOT)?,
+            log_root: le64(buf, OFF_LOG_ROOT)?,
+            log_root_level: *buf.get(OFF_LOG_ROOT_LEVEL).ok_or(FsError::InvalidData)?,
             total_bytes: le64(buf, OFF_TOTAL_BYTES)?,
             bytes_used: le64(buf, OFF_BYTES_USED)?,
             num_devices,

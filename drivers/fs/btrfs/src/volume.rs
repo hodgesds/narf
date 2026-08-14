@@ -351,6 +351,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             g.fs_tree_level = fs_level;
         }
 
+        // 2b. Replay a pending fsync tree-log (crash recovery) before anything
+        //     reads the fs tree. The replay commits into the fs tree and publishes
+        //     the recovered roots via `commit_roots`, so later steps see them.
+        crate::write::replay_log(self).await?;
+
         // 3. Cache the root-directory inode so the synchronous `root()` path has
         //    it without I/O.
         let root_inode = self.load_inode(format::FIRST_FREE_OBJECTID).await?;
@@ -504,6 +509,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.read_physical(format::SUPERBLOCK_OFFSET, &mut raw)
             .await?;
         Ok(raw)
+    }
+
+    /// Clear the cached superblock's log-root pointer after a tree-log has been
+    /// replayed and the on-disk pointer zeroed.
+    pub fn clear_log_root(&self) {
+        let mut g = self.state.lock();
+        g.superblock.log_root = 0;
+        g.superblock.log_root_level = 0;
     }
 
     /// After a COW commit, publish the new roots into the live volume so

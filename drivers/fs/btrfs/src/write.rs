@@ -81,6 +81,8 @@ use crate::volume::BtrfsVolume;
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;
 const HDR_GENERATION: usize = 80;
+/// Node header `owner` field (the objectid of the tree the node belongs to).
+const HDR_OWNER: usize = 88;
 
 /// On-disk size of one leaf item entry (key + offset + size).
 const LEAF_ITEM_SIZE: usize = format::DISK_KEY_SIZE + 8;
@@ -3288,6 +3290,146 @@ pub async fn remove_xattr_item<B: BlockDevice + 'static>(
 
     let alloc = Allocator::build(vol).await?;
     commit_fs_edits(vol, gen, alloc, &[edit], Vec::new(), Vec::new()).await
+}
+
+// ── Tree-log (fsync) ───────────────────────────────────────────────
+
+/// On-disk size of a `struct btrfs_root_item`.
+const ROOT_ITEM_SIZE: usize = 439;
+
+/// A minimal `btrfs_root_item` naming the tree rooted at `(bytenr, level)` at
+/// generation `gen`. Only the fields log replay reads (bytenr @176, level @238)
+/// plus the generations and a positive refs count are set; the rest stay zero.
+fn log_root_item(gen: u64, bytenr: u64, level: u8) -> Vec<u8> {
+    let mut v = alloc::vec![0u8; ROOT_ITEM_SIZE];
+    v[160..168].copy_from_slice(&gen.to_le_bytes()); // generation
+    v[176..184].copy_from_slice(&bytenr.to_le_bytes()); // bytenr
+    v[216..220].copy_from_slice(&1u32.to_le_bytes()); // refs
+    v[238] = level; // level
+    v[239..247].copy_from_slice(&gen.to_le_bytes()); // generation_v2
+    v
+}
+
+/// Pack `items` (key-ordered) into a tree whose node headers record `owner`,
+/// allocate its blocks from `alloc`, and write them. Returns `(root, level)`.
+async fn write_owned_tree<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    alloc: &mut Allocator,
+    gen: u64,
+    owner: u64,
+    items: &[(BtrfsKey, Vec<u8>)],
+) -> Result<(u64, u8), FsError> {
+    // A header template stamped with the tree's owner; capacity holds every item.
+    let mut header = vol.read_node(vol.fs_tree_root().0).await?[..HEADER_SIZE].to_vec();
+    header[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&owner.to_le_bytes());
+    let body_total: usize = items.iter().map(|(_, b)| b.len()).sum();
+    let capacity = HEADER_SIZE + items.len() * LEAF_ITEM_SIZE + body_total + HEADER_SIZE;
+    let refs: Vec<(BtrfsKey, &[u8])> = items.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+    let leaf = pack_leaf(&header, &refs, capacity);
+    let groups = group_items(vol, &leaf)?;
+    let addrs = alloc_nodes(alloc, vol, tree_block_count(groups.len(), vol.nodesize()))?;
+    let (nodes, root, level) = pack_tree_at(vol, &leaf, &groups, &addrs, gen)?;
+    for (addr, buf) in &nodes {
+        vol.write_logical(*addr, buf).await?;
+    }
+    Ok((root, level))
+}
+
+/// Write a tree-log recording `items` for the default subvolume and point the
+/// superblock at it **without** committing them to the fs tree — the fsync fast
+/// path a subsequent mount replays ([`replay_log`]). `items` are fs-tree items
+/// (keyed the same) to merge into the fs tree on replay.
+///
+/// The log's blocks come from currently-free space (like real btrfs's pinned log
+/// extents) and are deliberately *not* recorded in the extent/free-space trees, so
+/// this must be followed by a mount+replay — or a full commit that clears the log —
+/// before any other allocation could reuse that space.
+pub async fn write_log<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    items: &[(BtrfsKey, Vec<u8>)],
+) -> Result<(), FsError> {
+    let gen = vol.superblock().generation + 1;
+    let mut alloc = Allocator::build(vol).await?;
+
+    // The subvolume's log tree, then the log-root tree mapping FS_TREE -> it.
+    let (log_root, log_level) =
+        write_owned_tree(vol, &mut alloc, gen, format::TREE_LOG_OBJECTID, items).await?;
+    let root_key = BtrfsKey::new(
+        format::TREE_LOG_OBJECTID,
+        format::ROOT_ITEM_KEY,
+        format::FS_TREE_OBJECTID,
+    );
+    let root_items = [(root_key, log_root_item(gen, log_root, log_level))];
+    let (log_root_tree, log_root_tree_level) =
+        write_owned_tree(vol, &mut alloc, gen, format::TREE_LOG_OBJECTID, &root_items).await?;
+
+    // Point the superblock at the log-root tree. The committed generation is left
+    // unchanged: the log is an overlay on it, applied at mount.
+    let mut raw = vol.read_raw_superblock().await?;
+    raw[format::OFF_LOG_ROOT..format::OFF_LOG_ROOT + 8]
+        .copy_from_slice(&log_root_tree.to_le_bytes());
+    raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
+        .copy_from_slice(&gen.to_le_bytes());
+    raw[format::OFF_LOG_ROOT_LEVEL] = log_root_tree_level;
+    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
+    raw[0..4].copy_from_slice(&csum.to_le_bytes());
+    vol.flush().await;
+    vol.write_superblock(&raw).await?;
+    Ok(())
+}
+
+/// If the superblock names an unreplayed tree-log, merge it into the fs tree and
+/// clear the pointer — btrfs crash recovery, run once at mount. Returns whether a
+/// log was replayed.
+///
+/// Items are applied **additively** (each `Upsert`ed into the fs tree), covering
+/// the fsync-after-write / -create case. Log-only deletion ranges (`DIR_LOG_*`)
+/// are not synthesised, so a log that also encoded unlinks would replay its
+/// additions only — a documented scope limit, sufficient for NARF-written logs and
+/// the common append case.
+pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<bool, FsError> {
+    let sb = vol.superblock();
+    if sb.log_root == 0 {
+        return Ok(false);
+    }
+    // The log-root tree maps FS_TREE -> its log tree (root_item bytenr @176).
+    let root_key = BtrfsKey::new(
+        format::TREE_LOG_OBJECTID,
+        format::ROOT_ITEM_KEY,
+        format::FS_TREE_OBJECTID,
+    );
+    let ri = btree::find_item(vol, sb.log_root, &root_key)
+        .await?
+        .ok_or(FsError::InvalidData)?;
+    let fs_log_root = le64(&ri, 176)?;
+
+    // Read every logged item first (the commit below may reuse the log's blocks),
+    // then merge them into the fs tree in one path-COW commit.
+    let mut edits = Vec::new();
+    let mut cursor = btree::Cursor::seek(vol, fs_log_root, &BtrfsKey::new(0, 0, 0)).await?;
+    while let Some((k, body)) = cursor.current()? {
+        edits.push(Edit::Upsert(k, body.to_vec()));
+        cursor.advance().await?;
+    }
+    if !edits.is_empty() {
+        let gen = sb.generation + 1;
+        let alloc = Allocator::build(vol).await?;
+        commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
+    }
+
+    // Clear the log pointer so the recovered state is authoritative on the next
+    // mount (the commit above rewrote the super but left `log_root` intact).
+    let mut raw = vol.read_raw_superblock().await?;
+    raw[format::OFF_LOG_ROOT..format::OFF_LOG_ROOT + 8].copy_from_slice(&0u64.to_le_bytes());
+    raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
+        .copy_from_slice(&0u64.to_le_bytes());
+    raw[format::OFF_LOG_ROOT_LEVEL] = 0;
+    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
+    raw[0..4].copy_from_slice(&csum.to_le_bytes());
+    vol.flush().await;
+    vol.write_superblock(&raw).await?;
+    vol.clear_log_root();
+    Ok(true)
 }
 
 /// Grow the filesystem by allocating one new mixed (DATA|METADATA, SINGLE) chunk

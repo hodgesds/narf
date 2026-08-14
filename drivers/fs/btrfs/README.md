@@ -167,6 +167,21 @@ filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
+**fsync / tree-log.** Every mutation is a synchronous commit — it flips the
+superblock to a new generation and flushes the device before returning — so a
+file's data is durable the moment `write` returns and `FileOps::fsync` only
+re-issues a device-flush barrier (there is no deferred transaction to force out).
+The **tree-log** is therefore used for crash *recovery*, not deferred durability:
+`replay_log` runs once at mount, and if the superblock names an unreplayed log
+(`log_root != 0`, as a crash between an fsync and the next commit leaves it) it
+merges the log's items into the fs tree in one path-COW commit and zeroes the
+pointer. `write_log` produces such a log — the subvolume's log tree plus the
+`log_root` tree mapping `FS_TREE → log`, in currently-free space (like btrfs's
+pinned log extents, deliberately not recorded in the extent/free-space trees) —
+so the write+replay round-trip is exercised in-kernel
+(`smoke_btrfs_tree_log_replay`). Replay is additive (each logged item is upserted);
+log-only deletion ranges are a documented scope limit.
+
 Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and
 reads back a three-level fs tree); host `btrfs check` in CI covers up to two
