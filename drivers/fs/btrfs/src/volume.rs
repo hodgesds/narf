@@ -449,14 +449,47 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.write_physical(physical, src).await
     }
 
-    /// Overwrite the primary superblock (at 64 KiB) with `raw` (a full 4096-byte
-    /// block whose checksum the caller has already recomputed) and flush.
+    /// Overwrite every superblock copy with `raw` (a full 4096-byte block whose
+    /// `bytenr`/checksum are those of the primary at 64 KiB) and flush.
+    ///
+    /// btrfs keeps up to three copies (`btrfs_sb_offset`): the primary at 64 KiB,
+    /// then mirrors at 64 MiB and 256 GiB, each written only when it fits within
+    /// the filesystem. Every copy records its own physical offset in `bytenr@48`
+    /// (so its checksum differs), and a real kernel picks the copy with the
+    /// newest generation — so all copies must advance together on each commit or
+    /// `btrfs check` reports a mismatch. The primary is written last, after its
+    /// mirrors are durable, so a torn write can never leave the newest primary
+    /// pointing at trees an out-of-date mirror would supersede on recovery.
     pub async fn write_superblock(&self, raw: &[u8]) -> Result<(), FsError> {
         if raw.len() != format::SUPERBLOCK_SIZE {
             return Err(FsError::InvalidData);
         }
-        self.write_physical(format::SUPERBLOCK_OFFSET, raw).await?;
-        self.device.flush().await;
+        let limit = self.total_bytes.min(self.device_capacity);
+        // Mirrors first (highest offset to lowest), primary (offset 0) last.
+        for &offset in format::SUPERBLOCK_MIRROR_OFFSETS.iter().rev() {
+            if offset != format::SUPERBLOCK_OFFSET
+                && offset + format::SUPERBLOCK_SIZE as u64 > limit
+            {
+                continue; // this mirror doesn't fit in the filesystem
+            }
+            let mut copy;
+            let block: &[u8] = if offset == format::SUPERBLOCK_OFFSET {
+                raw
+            } else {
+                copy = raw.to_vec();
+                let b = format::SUPERBLOCK_BYTENR_OFFSET;
+                copy[b..b + 8].copy_from_slice(&offset.to_le_bytes());
+                let csum =
+                    crate::checksum::block_csum(&copy[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
+                copy[0..4].copy_from_slice(&csum.to_le_bytes());
+                for byte in &mut copy[4..format::CSUM_SIZE] {
+                    *byte = 0;
+                }
+                &copy
+            };
+            self.write_physical(offset, block).await?;
+            self.device.flush().await; // each copy durable before the next
+        }
         Ok(())
     }
 

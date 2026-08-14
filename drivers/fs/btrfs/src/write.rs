@@ -47,10 +47,12 @@
 //! (`commit_txn` / [`build_fs_tree`]), so a directory or file set can outgrow a
 //! single leaf. Bounds: the fs tree grows to at most two levels (a third →
 //! `NoSpace`); the csum/extent/root/free-space trees must each still be a single
-//! leaf (they stay small unless data extents proliferate); no new-chunk
-//! allocation; no space reclaim (freed logical addresses aren't reused); extent-
-//! mode free-space tracking only (a `FREE_SPACE_BITMAP` block group is out of
-//! scope); and a 64 MiB superblock mirror is out of scope.
+//! leaf (they stay small unless data extents proliferate); no space reclaim
+//! (freed logical addresses aren't reused); extent-mode free-space tracking only
+//! (a `FREE_SPACE_BITMAP` block group is out of scope). Every superblock copy is
+//! updated in lockstep, so images large enough to carry the 64 MiB / 256 GiB
+//! mirrors stay `btrfs check`-clean, and a grown chunk is placed clear of the
+//! mirror bands (`chunk_span_avoiding_supers`).
 
 use alloc::vec::Vec;
 
@@ -415,6 +417,30 @@ fn fst_mark_free(
 /// Round `x` up to a multiple of `align` (a power of two).
 fn align_up(x: u64, align: u64) -> u64 {
     (x + (align - 1)) & !(align - 1)
+}
+
+/// One stripe reserved around each superblock mirror so a chunk never overlaps it.
+const SUPER_MIRROR_BAND: u64 = 65536;
+
+/// A superblock mirror is written straight to its physical device offset, so a
+/// data/metadata chunk must never cover one. Given a physical `start` (the
+/// device high-water) and the device's `avail_end`, return `(start, max_len)`:
+/// `start` bumped past any mirror band it lands in, and `max_len` capped so
+/// `[start, start+max_len)` stops before the next mirror band. The mirror then
+/// sits in unallocated device space (the primary at 64 KiB precedes any chunk).
+pub(crate) fn chunk_span_avoiding_supers(mut start: u64, avail_end: u64) -> (u64, u64) {
+    for &m in format::SUPERBLOCK_MIRROR_OFFSETS.iter() {
+        if m != format::SUPERBLOCK_OFFSET && start >= m && start < m + SUPER_MIRROR_BAND {
+            start = m + SUPER_MIRROR_BAND;
+        }
+    }
+    let mut end = avail_end;
+    for &m in format::SUPERBLOCK_MIRROR_OFFSETS.iter() {
+        if m != format::SUPERBLOCK_OFFSET && m >= start && m < end {
+            end = m;
+        }
+    }
+    (start, end.saturating_sub(start))
 }
 
 /// Write `data` at byte `offset` into file `ino` via COW: read-modify-write the
@@ -2807,16 +2833,16 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         chunk_tree_uuid.copy_from_slice(&body[32..48]);
     }
 
-    // ── Size the new chunk to what remains on the device ───────────────
+    // ── Size the new chunk to what remains on the device, skipping the
+    //    reserved band around any 64 MiB / 256 GiB superblock mirror ─────
     const STRIPE_LEN: u64 = 65536;
     const MAX_CHUNK: u64 = 8 * 1024 * 1024;
-    let avail = sb.total_bytes.saturating_sub(physical_hw);
+    let (new_physical, avail) = chunk_span_avoiding_supers(physical_hw, sb.total_bytes);
     let chunk_size = (avail.min(MAX_CHUNK) / STRIPE_LEN) * STRIPE_LEN;
     if chunk_size < STRIPE_LEN {
         return Err(FsError::NoSpace); // device full
     }
     let new_logical = logical_hw;
-    let new_physical = physical_hw;
     let gen = sb.generation + 1;
     let nodesize = vol.nodesize() as u64;
 

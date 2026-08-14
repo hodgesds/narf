@@ -16,6 +16,16 @@ pub const BTRFS_MAGIC: u64 = 0x4D5F_5366_5248_425F;
 /// Primary superblock lives 64 KiB into the device (`BTRFS_SUPER_INFO_OFFSET`).
 pub const SUPERBLOCK_OFFSET: u64 = 65536;
 
+/// Physical device offsets of every superblock copy, in mirror order
+/// (`btrfs_sb_offset`): the primary at 64 KiB, then mirrors at 64 MiB and
+/// 256 GiB. A copy is written only when it fits within the device; each copy
+/// records its own offset in `bytenr@48` and carries its own checksum.
+pub const SUPERBLOCK_MIRROR_OFFSETS: [u64; 3] = [65536, 64 << 20, 256 << 30];
+
+/// Offset of the `bytenr` field (this copy's own physical address) within the
+/// superblock. Differs per mirror, so each copy's checksum differs too.
+pub const SUPERBLOCK_BYTENR_OFFSET: usize = 48;
+
 /// On-disk superblock size, padded to 4096 bytes.
 pub const SUPERBLOCK_SIZE: usize = 4096;
 

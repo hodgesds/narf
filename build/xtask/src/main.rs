@@ -1558,12 +1558,14 @@ fn nvme_image_path() -> PathBuf {
     // real (QEMU NVMe) hardware. Nothing consumes nvme0's content otherwise.
     if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
         let path = root.join("target").join("narf-nvme-btrfs.img");
-        // A 16 MiB btrfs image with a free-space tree (`space_cache=v2`) so the
-        // boot-time btrfs read/write smokes exercise the driver — including the
-        // free-space-tree maintenance in the COW write path — on real NVMe
-        // hardware, and the written image stays mountable + `btrfs check`-clean
-        // for a real Linux kernel (verify with `mount -o loop` + `btrfs check`).
-        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-fst.img.sparse", &path);
+        // A 96 MiB btrfs image with a free-space tree (`space_cache=v2`) AND a
+        // second superblock copy (the 64 MiB mirror) so the boot-time btrfs
+        // read/write smokes exercise the driver — free-space-tree maintenance,
+        // chunk growth, and updating every superblock mirror in lockstep — on
+        // real NVMe hardware, and the written image stays mountable +
+        // `btrfs check`-clean for a real Linux kernel (which cross-checks all
+        // superblock copies). Verify manually with `mount -o loop` + `btrfs check`.
+        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-mirror.img.sparse", &path);
         return path;
     }
     let path = root.join("target").join("narf-nvme.img");

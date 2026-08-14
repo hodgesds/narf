@@ -50,6 +50,10 @@ const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.
 /// (`space_cache=v2`); exercises the write path's free-space-tree maintenance.
 const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sparse");
 
+/// A 96 MiB mixed + free-space-tree image, large enough that mkfs wrote a second
+/// superblock copy (the 64 MiB mirror); exercises writing all mirrors in lockstep.
+const FIXTURE_MIRROR_SPARSE: &[u8] = include_bytes!("../testdata/fixture-mirror.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -190,6 +194,97 @@ fn mount_sparse_device(sparse: &[u8]) -> Result<Arc<BtrfsVolume<narf_block::Sync
         lba_size: 512,
     });
     let async_dev = narf_block::SyncBlock::new(dev);
+    poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+/// A *writable* sparse-backed device: a large logical capacity whose non-zero
+/// base runs read as the fixture, with an in-memory per-LBA write overlay. Lets a
+/// ≥64 MiB image be mounted read-write in-kernel without a full-size allocation
+/// (only the fixture payload plus written blocks cost RAM). Shared via `Arc`, so
+/// a remount over the same device observes prior writes.
+#[derive(Debug)]
+struct WritableSparseDevice {
+    runs: Vec<(u64, Vec<u8>)>,
+    total: u64,
+    lba_size: u32,
+    overlay: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, Vec<u8>>>,
+}
+
+impl narf_block::BlockDeviceSync for WritableSparseDevice {
+    fn lba_size(&self) -> u32 {
+        self.lba_size
+    }
+    fn capacity(&self) -> u64 {
+        self.total / u64::from(self.lba_size)
+    }
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
+        let bs = u64::from(self.lba_size);
+        let start = lba * bs;
+        let len = u64::from(n_blocks) * bs;
+        if start + len > self.total {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let n = out.len().min(len as usize);
+        out[..n].fill(0);
+        // Base image runs first…
+        for (roff, rbytes) in &self.runs {
+            let rend = roff + rbytes.len() as u64;
+            let ov_start = start.max(*roff);
+            let ov_end = (start + n as u64).min(rend);
+            if ov_start < ov_end {
+                let dst = (ov_start - start) as usize;
+                let src = (ov_start - roff) as usize;
+                let cnt = (ov_end - ov_start) as usize;
+                out[dst..dst + cnt].copy_from_slice(&rbytes[src..src + cnt]);
+            }
+        }
+        // …then any written blocks on top.
+        let overlay = self.overlay.lock();
+        for i in 0..n_blocks as u64 {
+            if let Some(block) = overlay.get(&(lba + i)) {
+                let dst = (i * bs) as usize;
+                out[dst..dst + self.lba_size as usize].copy_from_slice(block);
+            }
+        }
+        Ok(())
+    }
+    fn write(&self, lba: u64, n: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
+        let bs = self.lba_size as usize;
+        if data.len() < n as usize * bs {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        if (lba + u64::from(n)) * u64::from(self.lba_size) > self.total {
+            return Err(narf_block::BlockIoError::OutOfRange);
+        }
+        let mut overlay = self.overlay.lock();
+        for i in 0..n as usize {
+            overlay.insert(lba + i as u64, data[i * bs..(i + 1) * bs].to_vec());
+        }
+        Ok(())
+    }
+}
+
+/// Build a writable sparse-backed device from a `NARFBTR1` fixture (shared `Arc`).
+fn writable_sparse(sparse: &[u8]) -> Arc<WritableSparseDevice> {
+    let (total, runs) = decode_sparse_runs(sparse);
+    Arc::new(WritableSparseDevice {
+        runs,
+        total,
+        lba_size: 512,
+        overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
+    })
+}
+
+/// Mount a writable sparse-backed device (fresh `SyncBlock` over `dev`).
+fn mount_writable(
+    dev: Arc<WritableSparseDevice>,
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_dev = narf_block::SyncBlock::new(dev as Arc<dyn narf_block::BlockDeviceSync>);
     poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
 }
 
@@ -2175,6 +2270,111 @@ fn smoke_btrfs_autogrow() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_autogrow);
+
+/// Read the 4096-byte superblock copy at physical byte `offset` from a device.
+fn read_super_at(dev: &WritableSparseDevice, offset: u64) -> Vec<u8> {
+    use narf_block::BlockDeviceSync;
+    let mut buf = alloc::vec![0u8; format::SUPERBLOCK_SIZE];
+    let lba = offset / u64::from(dev.lba_size());
+    let n = (format::SUPERBLOCK_SIZE / dev.lba_size() as usize) as u16;
+    dev.read(lba, n, &mut buf).unwrap();
+    buf
+}
+
+/// A COW write updates EVERY superblock copy in lockstep: on a ≥64 MiB image
+/// (mkfs wrote the 64 MiB mirror), after a write both the primary and the mirror
+/// carry the new generation and root, each with its own `bytenr` and a valid
+/// checksum — the invariant `btrfs check` enforces so a real kernel never
+/// recovers from a stale mirror.
+fn smoke_btrfs_superblock_mirror() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture failed to mount"),
+    };
+    let gen_before = vol.superblock().generation;
+
+    // Overwrite big.dat so a COW commit flips the superblock(s).
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let payload = replacement_big();
+    match poll_once(big.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("write failed"),
+    }
+
+    // Inspect both on-disk superblock copies directly.
+    let primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    let mirror = read_super_at(&dev, 64 << 20);
+    let field = |sb: &[u8], off: usize| u64::from_le_bytes(sb[off..off + 8].try_into().unwrap());
+    // Each copy records its own physical location in bytenr@48.
+    if field(&primary, 48) != format::SUPERBLOCK_OFFSET {
+        return TestResult::Fail("primary bytenr wrong");
+    }
+    if field(&mirror, 48) != 64 << 20 {
+        return TestResult::Fail("mirror bytenr wrong");
+    }
+    // Both advanced to the same new generation…
+    let g = field(&primary, 72);
+    if g <= gen_before || field(&mirror, 72) != g {
+        return TestResult::Fail("mirror generation did not track the primary");
+    }
+    // …and name the same root tree.
+    if field(&primary, 80) != field(&mirror, 80) {
+        return TestResult::Fail("mirror root does not match primary");
+    }
+    // Each copy carries a valid (independently computed) checksum.
+    for sb in [&primary, &mirror] {
+        let stored = u32::from_le_bytes(sb[0..4].try_into().unwrap());
+        if checksum::block_csum(&sb[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]) != stored {
+            return TestResult::Fail("superblock copy checksum invalid");
+        }
+    }
+
+    // Remount over the same device: the write is durable and readable.
+    let vol2 = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => match read_all(&f, payload.len() + 16) {
+            Some(got) if got == payload => TestResult::Pass,
+            _ => TestResult::Fail("content wrong after remount"),
+        },
+        _ => TestResult::Fail("big.dat missing after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_mirror);
+
+/// A new chunk never overlaps a superblock mirror: the span helper caps a chunk
+/// that would cross the 64 MiB mirror, and bumps a start landing inside its band.
+fn smoke_btrfs_chunk_avoids_supers() -> TestResult {
+    const M64: u64 = 64 << 20;
+    const BAND: u64 = 65536;
+    // A chunk starting well below the mirror is capped to end at the mirror.
+    let (start, len) = crate::write::chunk_span_avoiding_supers(8 << 20, 96 << 20);
+    if start != 8 << 20 || start + len != M64 {
+        return TestResult::Fail("chunk not capped before the 64 MiB mirror");
+    }
+    // A start inside the reserved band is bumped past it.
+    let (start, len) = crate::write::chunk_span_avoiding_supers(M64, 96 << 20);
+    if start != M64 + BAND || start + len != 96 << 20 {
+        return TestResult::Fail("start not bumped past the mirror band");
+    }
+    // Above the last relevant mirror, the whole remaining span is available.
+    let (start, len) = crate::write::chunk_span_avoiding_supers(70 << 20, 96 << 20);
+    if start != 70 << 20 || len != 26 << 20 {
+        return TestResult::Fail("span above the mirror is wrong");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_avoids_supers);
 
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS

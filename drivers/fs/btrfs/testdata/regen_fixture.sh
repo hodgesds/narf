@@ -180,4 +180,21 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgmany" >/dev/null
 sparse_encode "$imgmany" fixture-manyfiles.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop}.img.sparse"
+# A 96 MiB image large enough that mkfs writes a SECOND superblock copy (the
+# 64 MiB mirror; the 256 GiB one still doesn't fit). Small feature set (mixed
+# block groups, nodesize 4096, free-space tree, no compression) so the COW write
+# path applies — this exercises writing all superblock mirrors in lockstep and
+# leaves room past 64 MiB to grow a chunk without overlapping the mirror.
+mirrstage="$(mktemp -d)"
+imgmirr="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab" "$mirrstage" "$imgmirr"' EXIT
+printf 'narf\n' > "$mirrstage/hello.txt"
+python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
+    > "$mirrstage/big.dat"
+truncate -s 96M "$imgmirr"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^no-holes --rootdir "$mirrstage" "$imgmirr" >/dev/null
+btrfs check "$imgmirr" >/dev/null
+sparse_encode "$imgmirr" fixture-mirror.img.sparse
+
+echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror}.img.sparse"

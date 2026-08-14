@@ -130,15 +130,24 @@ chunk boundary once the filesystem spans more than one chunk. Chunk growth is
 transparently keep succeeding until the device itself is full.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
-free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds
-(all fail loudly): the fs tree grows to at most **two levels** (a third →
-`NoSpace`); the csum/extent/root/free-space trees stay single-leaf; no new-chunk
-allocation; no space reclaim (freed logical addresses aren't reused); a
-`FREE_SPACE_BITMAP` block group is out of scope; and a **64 MiB superblock
-mirror** is out of scope for writes (so the 128 MiB laptop-scale fixture is
-read-only). The write-interop guarantee is CI-enforced: `cargo xtask test` runs
-host `btrfs check` on the NARF-written image when `btrfs-progs` is available — on
-both a plain and a `space_cache=v2` image, including a multi-level fs tree.
+free-space tree leaf is maintained in lockstep (extent-mode tracking only).
+
+Every **superblock copy** is rewritten on each commit: btrfs keeps up to three
+(the primary at 64 KiB, then mirrors at 64 MiB and 256 GiB), and a real kernel
+recovers from whichever copy has the newest generation — so on a device large
+enough to carry a mirror, all copies must advance together or `btrfs check`
+reports a mismatch. `write_superblock` writes each copy that fits within the
+filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
+placed clear of the reserved band around each mirror so writing a mirror never
+overlaps chunk data. A ≥64 MiB image is therefore fully writable.
+
+Bounds (all fail loudly): the fs tree grows to at most **two levels** (a third →
+`NoSpace`); the csum/extent/root/free-space trees stay single-leaf; no space
+reclaim (freed logical addresses aren't reused); and a `FREE_SPACE_BITMAP` block
+group is out of scope. The write-interop guarantee is CI-enforced: `cargo xtask
+test` runs host `btrfs check` on the NARF-written image when `btrfs-progs` is
+available — on a plain image, a `space_cache=v2` image (including a multi-level fs
+tree), and a **96 MiB image carrying the 64 MiB superblock mirror**.
 
 ## Test fixtures
 
@@ -151,8 +160,12 @@ subvolume. `fixture-manyfiles.img.sparse` is a separate 32 MiB image of 400
 small files whose FS tree spans multiple b-tree levels.
 `fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
 a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
-tree maintenance. The kernel tests reconstruct the full zero-filled image at
-runtime and mount it under a `RamBlockDevice`.
+tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-
+tree image — large enough that mkfs wrote the **64 MiB superblock mirror** — used
+to exercise updating every superblock copy in lockstep (mounted read-write over a
+writable sparse-backed device so it costs only its payload in RAM). The kernel
+tests reconstruct the full zero-filled image at runtime and mount it under a
+`RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:
