@@ -61,6 +61,15 @@ impl BumpAllocator {
         self.next
     }
 
+    /// Rewind the cursor to `to` (must not precede any already-committed
+    /// allocation). Used by the commit's metadata fixed point to re-hand-out the
+    /// same tree-node addresses deterministically each iteration until the
+    /// extent/free-space trees' leaf counts stabilise; only the final iteration's
+    /// addresses are written.
+    pub fn reset(&mut self, to: u64) {
+        self.next = to;
+    }
+
     /// Allocate `len` bytes aligned to `align`, verifying the whole range maps
     /// contiguously inside one existing chunk (else `NoSpace`).
     fn alloc<B: BlockDevice + 'static>(

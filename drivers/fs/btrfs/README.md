@@ -106,14 +106,17 @@ writes → btrfs check "no error found" → both files read back`). Per write it
    generation);
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
-The **fs tree may be multi-level**: it is read into one logical leaf, edited, then
-re-packed into as many real `nodesize` leaves as needed under an internal root, so
-a directory or file set can outgrow a single leaf (`btrfs check` validates the
-split tree). Because the extent leaf must record its own new block and the
-csum/root/extent/free-space trees are edited in place, those must each still be a
-**single leaf** (true for a fresh image until many *data* extents accumulate);
-allocations are pre-computed so the transaction stays closed-form, sidestepping
-the delayed-ref loop real btrfs uses.
+**Every tree may be multi-leaf** — the fs, extent, csum, root and free-space trees
+are each read into one logical leaf, edited, then re-packed into as many real
+`nodesize` leaves as needed under an internal root, so a file / directory / extent
+/ checksum set can outgrow a single leaf, as it does on a laptop-scale root
+(`btrfs check` validates the split trees). The extent tree records its own new
+blocks (a self-reference), so how many leaves it and the free-space tree need
+depends on the block count they produce; the commit resolves this with a **fixed
+point** over the leaf counts — re-handing-out node addresses from the same base
+each round until they stabilise, then writing only the converged set. This
+replaces the delayed-ref loop real btrfs uses and keeps the transaction
+closed-form.
 
 **Chunk growth** (`write::grow_add_chunk`) allocates one new mixed
 (DATA|METADATA, SINGLE) chunk at the end of the device, threading the change
@@ -141,13 +144,16 @@ filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
-Bounds (all fail loudly): the fs tree grows to at most **two levels** (a third →
-`NoSpace`); the csum/extent/root/free-space trees stay single-leaf; no space
-reclaim (freed logical addresses aren't reused); and a `FREE_SPACE_BITMAP` block
-group is out of scope. The write-interop guarantee is CI-enforced: `cargo xtask
-test` runs host `btrfs check` on the NARF-written image when `btrfs-progs` is
-available — on a plain image, a `space_cache=v2` image (including a multi-level fs
-tree), and a **96 MiB image carrying the 64 MiB superblock mirror**.
+Bounds (all fail loudly): each tree grows to at most **two levels** (a third →
+`NoSpace`); no space reclaim (freed logical addresses aren't reused); a
+`FREE_SPACE_BITMAP` block group is out of scope; and **chunk growth still requires
+single-leaf** chunk/dev/extent/root/free-space trees, so a filesystem must be
+grown before those split (a large fs has ample space and rarely needs to grow —
+under sustained churn on a *small* image, grow it early). The write-interop
+guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check` on the
+NARF-written image when `btrfs-progs` is available — on a plain image, a
+`space_cache=v2` image (including a multi-level fs tree), and a **96 MiB image
+carrying the 64 MiB superblock mirror whose extent tree it splits multi-leaf**.
 
 ## Test fixtures
 

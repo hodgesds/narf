@@ -2,24 +2,23 @@
 //! and namespace operations (`create` / `unlink`) in the default subvolume.
 //!
 //! All mutations share one closed-form COW mini-transaction ([`commit_txn`]):
-//! given the fully-edited fs (and, for data changes, csum) leaves, it frees the
-//! old blocks of every copied tree, records the new ones in the extent tree,
-//! maintains the free-space tree, repoints the affected `ROOT_ITEM`s, writes
-//! every node, and flips the superblock last. All touched trees must be single
-//! leaves so every new block can be pre-allocated up front (the extent leaf then
-//! records its own new block), sidestepping the delayed-ref loop real btrfs uses.
+//! given the fully-edited fs leaf, it reads the extent/csum/root/free-space
+//! trees, frees the old blocks of every copied tree, records the new ones in the
+//! extent tree, maintains the free-space tree, repoints the affected `ROOT_ITEM`s,
+//! writes every node, and flips the superblock last. **Every** tree may be
+//! multi-leaf: each is re-packed into as many real leaves as it needs under an
+//! internal root. The extent tree records its own new blocks (a self-reference),
+//! so how many leaves it and the free-space tree need depends on the block count
+//! they produce — [`commit_txn`] resolves this with a fixed point over the leaf
+//! counts, re-handing-out node addresses from the same base each round until they
+//! stabilise. This replaces the delayed-ref loop real btrfs uses.
 //!
 //! Scope: a regular, uncompressed file that is empty (e.g. freshly `create`d) or
-//! a single `EXTENT_DATA` at offset 0, in the default subvolume, on a volume
-//! whose fs/csum/root/extent (and free-space, if present) trees are each a single
-//! leaf (typical of a freshly-made small image). A write reads the current file,
-//! applies the new bytes at any offset (growing past EOF as needed), and rewrites
-//! the whole file as one new extent (inserting the first one for an empty file),
-//! as a genuine copy-on-write mini-transaction that never mutates live data or
-//! metadata in place. Because these trees are single leaves, every new block is
-//! pre-allocated up front, letting the extent leaf record its own new block —
-//! sidestepping the self-referential allocation loop full btrfs handles with
-//! delayed refs. Per write it:
+//! a single `EXTENT_DATA` at offset 0, in the default subvolume. A write reads the
+//! current file, applies the new bytes at any offset (growing past EOF as needed),
+//! and rewrites the whole file as one new extent (inserting the first one for an
+//! empty file), as a genuine copy-on-write mini-transaction that never mutates
+//! live data or metadata in place. Per write it:
 //!
 //! 1. allocates + writes the new data extent, and its per-sector CRC32C **data
 //!    checksums** (updated in the CSUM tree; the old extent's csums removed);
@@ -42,14 +41,17 @@
 //! errors — verified end to end on both a plain image and a `space_cache=v2`
 //! (free-space-tree) image.
 //!
-//! The **fs tree may be multi-level**: it is read into one logical leaf, edited,
-//! then re-packed into as many real leaves as needed under an internal root
-//! (`commit_txn` / [`build_fs_tree`]), so a directory or file set can outgrow a
-//! single leaf. Bounds: the fs tree grows to at most two levels (a third →
-//! `NoSpace`); the csum/extent/root/free-space trees must each still be a single
-//! leaf (they stay small unless data extents proliferate); no space reclaim
-//! (freed logical addresses aren't reused); extent-mode free-space tracking only
-//! (a `FREE_SPACE_BITMAP` block group is out of scope). Every superblock copy is
+//! **Every tree may be multi-leaf** (fs, extent, csum, root, free-space): it is
+//! read into one logical leaf, edited, then re-packed into as many real leaves as
+//! needed under an internal root (`commit_txn` / [`pack_tree_at`]), so a file /
+//! directory / extent / checksum set can outgrow a single leaf — as it does on a
+//! laptop-scale root. Bounds: each tree grows to at most two levels (a third →
+//! `NoSpace`); no space reclaim (freed logical addresses aren't reused); extent-
+//! mode free-space tracking only (a `FREE_SPACE_BITMAP` block group is out of
+//! scope); and chunk growth ([`grow_add_chunk`]) still requires single-leaf
+//! chunk/dev/extent/root/free-space trees, so a filesystem must be grown before
+//! those split (a large fs has ample space and rarely needs to grow). Every
+//! superblock copy is
 //! updated in lockstep, so images large enough to carry the 64 MiB / 256 GiB
 //! mirrors stay `btrfs check`-clean, and a grown chunk is placed clear of the
 //! mirror bands (`chunk_span_avoiding_supers`).
@@ -457,7 +459,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
     }
-    let (fs_root, fs_level) = vol.fs_tree_root();
+    let (fs_root, _fs_level) = vol.fs_tree_root();
     let (root_tree, _root_level) = vol.root_tree_root();
 
     // A zero-byte write changes nothing.
@@ -514,47 +516,17 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let o = offset as usize;
     buf[o..o + data.len()].copy_from_slice(data);
 
-    // ── 2. Set up the mini-transaction (single-leaf trees only) ────
-    // Full extent-tree accounting is only tractable here when the fs, csum,
-    // root and extent trees are each a single leaf: we can then pre-allocate
-    // every new node and build them all — including the extent leaf's item for
-    // its own new block — in one pass, sidestepping the self-referential
-    // allocation loop that real btrfs handles with delayed refs.
-    let old_fs = fs_root;
-    let old_root = root_tree;
-    let (old_csum, _csum_level) =
-        roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID).await?;
+    // ── 2. Set up the mini-transaction ─────────────────────────────
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    // The free-space tree (space_cache=v2) is optional; maintain it when present.
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
     let old_data = existing.map(|(d, _)| d); // disk_bytenr of the freed extent
     let old_data_len = existing.map(|(_, l)| l).unwrap_or(0); // disk_num_bytes
 
-    // The fs tree may be multi-level; read it as one logical leaf. The other
-    // trees must each be a single leaf (they stay small for a fresh image).
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let mut csum_leaf = vol.read_node(old_csum).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let fst_leaf = match old_fst {
-        Some(fst) => Some(vol.read_node(fst).await?),
-        None => None,
-    };
-    for leaf in [&csum_leaf, &root_leaf, &ext_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported); // single-leaf csum/extent/root only
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    // The fs tree may be multi-level; read it as one logical leaf and edit it.
+    // commit_txn reads and re-packs every other tree (extent/csum/root/free-space)
+    // itself, so those may be multi-leaf too.
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     let gen = vol.superblock().generation + 1;
     let high_water = extent_high_water(vol, old_ext)
@@ -564,7 +536,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     // Reserve + write the data extent; commit_txn allocates the metadata nodes.
     let e_data = alloc.alloc_data(vol, disk_len)?;
 
-    // ── 3. Write the data extent + its checksums ───────────────────
+    // ── 3. Write the data extent + compute its checksums ───────────
     let mut payload = buf;
     payload.resize(disk_len as usize, 0);
     vol.write_logical(e_data, &payload).await?;
@@ -589,35 +561,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     new_inode[24..32].copy_from_slice(&disk_len.to_le_bytes()); // nbytes
     leaf_replace_inplace(&mut fs_leaf, inode_slot, &new_inode)?;
 
-    // ── 5. Build the new csum leaf: drop the old extent's csums, add new ─
-    // The old data extent is being freed, so its csum item must go too, else
-    // `btrfs check` reports "csum exists but there is no extent record". An empty
-    // file has no old extent to uncharge.
-    if let Some(old_data) = old_data {
-        if old_data != e_data {
-            let old_csum_key = BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                old_data,
-            );
-            if let Some(slot) = leaf_find(&csum_leaf, &old_csum_key)? {
-                leaf_delete(&mut csum_leaf, slot)?;
-            }
-        }
-    }
-    let csum_key = BtrfsKey::new(
-        format::EXTENT_CSUM_OBJECTID,
-        format::EXTENT_CSUM_KEY,
-        e_data,
-    );
-    if let Some(slot) = leaf_find(&csum_leaf, &csum_key)? {
-        leaf_replace_inplace(&mut csum_leaf, slot, &csums)?;
-    } else {
-        leaf_insert_sorted(&mut csum_leaf, &csum_key, &csums)?;
-    }
-
-    // ── 6-8. Commit: extent/free-space/root trees + superblock flip ─
-    let _ = fs_level;
+    // ── 5. Commit: extent/csum/free-space/root trees + superblock flip ─
     commit_txn(
         vol,
         gen,
@@ -625,16 +569,13 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum: Some(CowLeaf::new(csum_leaf, old_csum)),
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: old_data.map(|d| (d, old_data_len)).into_iter().collect(),
             new_data: alloc::vec![DataRef {
                 bytenr: e_data,
                 len: disk_len,
                 ref_root: format::FS_TREE_OBJECTID,
                 objectid: ino,
+                csums,
             }],
             data_used_delta: disk_len as i64 - old_data_len as i64,
         },
@@ -648,48 +589,32 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
 /// On-disk size of one internal `struct btrfs_key_ptr` (key + blockptr + gen).
 const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
 
-/// A single-leaf tree copied-on-write: its fully-edited leaf and the old block it
-/// replaces. Its new address is allocated by `commit_txn`.
-struct CowLeaf {
-    leaf: Vec<u8>,
-    old: u64,
-}
-
-impl CowLeaf {
-    fn new(leaf: Vec<u8>, old: u64) -> Self {
-        CowLeaf { leaf, old }
-    }
-}
-
 /// A data extent recorded into the extent tree as an `EXTENT_ITEM` +
-/// `EXTENT_DATA_REF{root, objectid, offset=0, count=1}`.
+/// `EXTENT_DATA_REF{root, objectid, offset=0, count=1}`, with the per-sector
+/// CRC32C `csums` the csum tree records for it.
 struct DataRef {
     bytenr: u64,
     len: u64,
     ref_root: u64,
     objectid: u64,
+    csums: Vec<u8>,
 }
 
-/// The trees a single mutation copies-on-write, plus the data-extent bookkeeping
-/// the extent/free-space trees must reflect. The fs tree is supplied as one
-/// *logical* leaf (`fs_content`, its first `HEADER_SIZE` bytes a valid fs header
-/// template) that `commit_txn` re-packs into one or more real leaves under an
-/// internal root when it overflows `nodesize`; the csum/extent/root/free-space
-/// trees stay single leaves. `commit_txn` allocates every new metadata block,
-/// edits the extent/free-space/root leaves, stamps every node, and flips the
-/// superblock.
+/// One mutation's fs-tree edit plus the data-extent bookkeeping the
+/// extent/free-space/csum trees must reflect. The fs tree is supplied fully
+/// edited as one *logical* leaf (`fs_content`, its first `HEADER_SIZE` bytes a
+/// valid fs header template). `commit_txn` reads the extent/csum/root/free-space
+/// trees itself, applies the data + metadata deltas, re-packs **every** tree into
+/// as many real leaves as it needs under an internal root, allocates every new
+/// block, stamps them, and flips the superblock.
 struct Txn {
     /// The fs tree's full item set as one (possibly oversized) logical leaf.
     fs_content: Vec<u8>,
     /// Every old fs-tree block (root + internals + leaves) with its level, to free.
     fs_old_blocks: Vec<(u64, u8)>,
-    csum: Option<CowLeaf>,
-    ext: CowLeaf,
-    root: CowLeaf,
-    fst: Option<CowLeaf>,
-    /// Data extents whose `EXTENT_ITEM` is removed (bytenr, disk length).
+    /// Data extents whose `EXTENT_ITEM` + csums are removed (bytenr, disk length).
     freed_data: Vec<(u64, u64)>,
-    /// Data extents whose `EXTENT_ITEM` is added.
+    /// Data extents whose `EXTENT_ITEM` + csums are added.
     new_data: Vec<DataRef>,
     /// Net change to the block group's data `used` byte count.
     data_used_delta: i64,
@@ -755,55 +680,72 @@ async fn read_fs_oversized<B: BlockDevice + 'static>(
     Ok((pack_leaf(&header, &refs, capacity), old_blocks))
 }
 
-/// Re-pack a logical fs leaf into real `nodesize` leaves under an internal root
-/// when it overflows one leaf. Allocates each new block. Returns the new nodes
-/// `(addr, bytes)` (unstamped), the fs-tree root address, and its level (0 or 1).
-/// A tree that would need a third level is out of scope (`NoSpace`).
-#[allow(clippy::type_complexity)]
-fn build_fs_tree<B: BlockDevice + 'static>(
+/// Greedily group a logical leaf's items into runs that each fit one `nodesize`
+/// leaf, returned as `[start, end)` index ranges (one per real leaf). An empty
+/// tree yields a single empty leaf `[(0, 0)]`. Errors if one item exceeds a node.
+fn group_items<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     logical: &[u8],
-    alloc: &mut BumpAllocator,
-) -> Result<(Vec<(u64, Vec<u8>)>, u64, u8), FsError> {
-    let nodesize = vol.nodesize();
-    let leaf_cap = nodesize - HEADER_SIZE;
+) -> Result<Vec<(usize, usize)>, FsError> {
+    let leaf_cap = vol.nodesize() - HEADER_SIZE;
     let n = nritems(logical)? as usize;
-
-    // Greedily group items into leaves that each fit one node.
-    let mut groups: Vec<Vec<(BtrfsKey, Vec<u8>)>> = Vec::new();
-    let mut cur: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
     let mut used = 0usize;
     for i in 0..n {
-        let key = leaf_item_key(logical, i)?;
-        let body = leaf_item_data(logical, i)?.to_vec();
-        let need = LEAF_ITEM_SIZE + body.len();
+        let (_off, size) = leaf_item_span(logical, i)?;
+        let need = LEAF_ITEM_SIZE + size;
         if need > leaf_cap {
             return Err(FsError::Unsupported); // a single item bigger than a node
         }
-        if used + need > leaf_cap && !cur.is_empty() {
-            groups.push(core::mem::take(&mut cur));
+        if used + need > leaf_cap && i > start {
+            groups.push((start, i));
+            start = i;
             used = 0;
         }
         used += need;
-        cur.push((key, body));
     }
-    if !cur.is_empty() {
-        groups.push(cur);
-    }
-    if groups.is_empty() {
-        groups.push(Vec::new()); // an empty tree keeps one empty leaf
-    }
+    groups.push((start, n)); // final (possibly empty) leaf
+    Ok(groups)
+}
 
+/// Number of blocks a tree of `groups` leaves occupies: the leaves plus, when
+/// there is more than one, a level-1 internal root above them.
+fn tree_node_count(groups: &[(usize, usize)]) -> usize {
+    groups.len() + usize::from(groups.len() > 1)
+}
+
+/// Pack `logical`'s items into real `nodesize` leaves at the pre-assigned `addrs`
+/// (`addrs.len() == tree_node_count(groups)`: one per leaf, then the internal root
+/// if any), stamping every node's bytenr/generation/CRC32C. Returns the new nodes
+/// `(addr, bytes)`, the tree root address, and its level (0 or 1). A tree needing
+/// a third level is out of scope (`NoSpace`).
+#[allow(clippy::type_complexity)]
+fn pack_tree_at<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    logical: &[u8],
+    groups: &[(usize, usize)],
+    addrs: &[u64],
+    gen: u64,
+) -> Result<(Vec<(u64, Vec<u8>)>, u64, u8), FsError> {
+    let nodesize = vol.nodesize();
+    if addrs.len() != tree_node_count(groups) {
+        return Err(FsError::InvalidData);
+    }
     let mut nodes = Vec::new();
     let mut leaf_ptrs: Vec<(BtrfsKey, u64)> = Vec::new();
-    for group in &groups {
-        let addr = alloc.alloc_node(vol)?;
-        let refs: Vec<(BtrfsKey, &[u8])> = group.iter().map(|(k, b)| (*k, b.as_slice())).collect();
-        let leaf = pack_leaf(logical, &refs, nodesize);
-        let first = group
-            .first()
-            .map(|(k, _)| *k)
-            .unwrap_or(BtrfsKey::new(0, 0, 0));
+    for (gi, &(s, e)) in groups.iter().enumerate() {
+        let addr = addrs[gi];
+        let refs: Vec<(BtrfsKey, &[u8])> = (s..e)
+            .map(|i| Ok((leaf_item_key(logical, i)?, leaf_item_data(logical, i)?)))
+            .collect::<Result<_, FsError>>()?;
+        let mut leaf = pack_leaf(logical, &refs, nodesize);
+        stamp_node(&mut leaf, addr, gen);
+        let first = if e > s {
+            leaf_item_key(logical, s)?
+        } else {
+            BtrfsKey::new(0, 0, 0)
+        };
         leaf_ptrs.push((first, addr));
         nodes.push((addr, leaf));
     }
@@ -816,7 +758,7 @@ fn build_fs_tree<B: BlockDevice + 'static>(
     if HEADER_SIZE + leaf_ptrs.len() * KEY_PTR_SIZE > nodesize {
         return Err(FsError::NoSpace); // would need a third level
     }
-    let root_addr = alloc.alloc_node(vol)?;
+    let root_addr = addrs[groups.len()];
     let mut root = alloc::vec![0u8; nodesize];
     root[0..HEADER_SIZE].copy_from_slice(&logical[0..HEADER_SIZE]);
     root[100] = 1; // level 1 (internal)
@@ -827,140 +769,343 @@ fn build_fs_tree<B: BlockDevice + 'static>(
         root[kp + 8] = key.item_type;
         root[kp + 9..kp + 17].copy_from_slice(&key.offset.to_le_bytes());
         root[kp + 17..kp + 25].copy_from_slice(&addr.to_le_bytes());
-        // generation@25 is stamped with the txn gen below.
+        root[kp + 25..kp + 33].copy_from_slice(&gen.to_le_bytes()); // key-ptr generation
     }
+    stamp_node(&mut root, root_addr, gen);
     nodes.push((root_addr, root));
     Ok((nodes, root_addr, 1))
 }
 
-/// Finalize a mutation: rebuild the fs tree (splitting into multiple leaves under
-/// an internal root when it overflows), allocate every new metadata block, rebuild
-/// the extent tree (free every old block + freed data extents, record the new
-/// blocks + new data extents, fix the block group's `used`), maintain the
-/// free-space tree, repoint the copied trees' `ROOT_ITEM`s, stamp and write every
-/// node, then flip the superblock last so the old trees stay intact until the
-/// atomic switch. `alloc` arrives with any data extents already reserved.
+/// Allocate `n` tree nodes, returning their addresses in allocation order.
+fn alloc_nodes<B: BlockDevice + 'static>(
+    alloc: &mut BumpAllocator,
+    vol: &BtrfsVolume<B>,
+    n: usize,
+) -> Result<Vec<u64>, FsError> {
+    (0..n).map(|_| alloc.alloc_node(vol)).collect()
+}
+
+/// Append `(addr, owner, level)` for each block of a tree with `leaves` leaves
+/// (level 0) plus, when `leaves > 1`, its internal root (level 1) — matching the
+/// `addrs` layout `alloc_nodes` produced for it.
+fn collect_tree_meta(addrs: &[u64], leaves: usize, owner: u64, out: &mut Vec<(u64, u64, u8)>) {
+    for &a in &addrs[..leaves] {
+        out.push((a, owner, 0));
+    }
+    if leaves > 1 {
+        out.push((addrs[leaves], owner, 1));
+    }
+}
+
+/// Finalize a mutation: read the extent/csum/root/free-space trees, apply this
+/// mutation's data + metadata deltas, re-pack **every** tree (fs included) into as
+/// many real leaves as it needs under an internal root, allocate every new block,
+/// stamp and write them, then flip the superblock last so the old trees stay
+/// intact until the atomic switch. `alloc` arrives with any data extents already
+/// reserved and written.
+///
+/// The extent tree records its own new blocks, so how many leaves it (and the
+/// free-space tree) needs depends on how many blocks the transaction allocates —
+/// which depends on those leaf counts. `commit_txn` resolves this with a **fixed
+/// point**: it re-hands-out every tree-node address from the same base each
+/// iteration (`BumpAllocator::reset`), rebuilds the extent/free-space content, and
+/// repeats until their leaf counts stabilise; only the converged addresses are
+/// written. This replaces the delayed-ref loop real btrfs uses. Fixed set of
+/// block groups (no chunk allocation here — the caller grows and retries on
+/// `NoSpace`).
 async fn commit_txn<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
     mut alloc: BumpAllocator,
-    mut txn: Txn,
+    txn: Txn,
 ) -> Result<(), FsError> {
     let nodesize = vol.nodesize() as u64;
+    let (root_tree, _) = vol.root_tree_root();
 
-    // ── Rebuild the fs tree, then allocate the other trees' new blocks ─
-    let (fs_nodes, fs_root_addr, fs_level) = build_fs_tree(vol, &txn.fs_content, &mut alloc)?;
-    let n_csum = txn
-        .csum
-        .as_ref()
-        .map(|_| alloc.alloc_node(vol))
-        .transpose()?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = txn
-        .fst
-        .as_ref()
-        .map(|_| alloc.alloc_node(vol))
-        .transpose()?;
+    // The csum tree is only COWed when data extents change (a metadata-only op
+    // leaves it untouched). The free-space tree is optional (space_cache=v2).
+    let touch_csum = !txn.new_data.is_empty() || !txn.freed_data.is_empty();
+    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+        .await?
+        .0;
+    let old_csum = match touch_csum {
+        true => Some(
+            roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
+                .await?
+                .0,
+        ),
+        false => None,
+    };
+    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
+        .await
+        .ok()
+        .map(|(r, _)| r);
 
-    // Freed metadata `(block, level)` and new metadata `(block, owner, level)`
-    // across every copied tree. A skinny METADATA_ITEM's key offset is the block's
-    // level. The fs tree contributes many of each; the others one each (level 0).
-    let mut freed_meta: Vec<(u64, u8)> = txn.fs_old_blocks.clone();
-    freed_meta.push((txn.ext.old, 0));
-    freed_meta.push((txn.root.old, 0));
-    let mut new_meta: Vec<(u64, u64, u8)> = fs_nodes
-        .iter()
-        .map(|(a, b)| Ok((*a, format::FS_TREE_OBJECTID, level(b)?)))
-        .collect::<Result<_, FsError>>()?;
-    new_meta.push((n_ext, format::EXTENT_TREE_OBJECTID, 0));
-    new_meta.push((n_root, format::ROOT_TREE_OBJECTID, 0));
-    if let (Some(c), Some(n)) = (&txn.csum, n_csum) {
-        freed_meta.push((c.old, 0));
-        new_meta.push((n, format::CSUM_TREE_OBJECTID, 0));
-    }
-    if let (Some(f), Some(n)) = (&txn.fst, n_fst) {
-        freed_meta.push((f.old, 0));
-        new_meta.push((n, format::FREE_SPACE_TREE_OBJECTID, 0));
-    }
+    // Read every COWed tree (besides fs, which arrives edited) as one oversized
+    // logical leaf plus its old blocks. The trees may be any height.
+    let (mut ext_logical, ext_old) = read_fs_oversized(vol, old_ext).await?;
+    let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
+    let (csum_logical, csum_old) = match old_csum {
+        Some(c) => {
+            let (l, o) = read_fs_oversized(vol, c).await?;
+            (Some(l), o)
+        }
+        None => (None, Vec::new()),
+    };
+    let (fst_base, fst_old) = match old_fst {
+        Some(f) => {
+            let (l, o) = read_fs_oversized(vol, f).await?;
+            (Some(l), o)
+        }
+        None => (None, Vec::new()),
+    };
 
-    // ── Extent tree: free old blocks + freed data, record new blocks + data ─
+    // ── csum tree: drop freed extents' csums, add new extents' csums ───
+    let csum_logical = match csum_logical {
+        Some(mut cl) => {
+            for &(bytenr, _) in &txn.freed_data {
+                let k = BtrfsKey::new(
+                    format::EXTENT_CSUM_OBJECTID,
+                    format::EXTENT_CSUM_KEY,
+                    bytenr,
+                );
+                if let Some(s) = leaf_find(&cl, &k)? {
+                    leaf_delete(&mut cl, s)?;
+                }
+            }
+            for d in &txn.new_data {
+                let k = BtrfsKey::new(
+                    format::EXTENT_CSUM_OBJECTID,
+                    format::EXTENT_CSUM_KEY,
+                    d.bytenr,
+                );
+                leaf_insert_sorted(&mut cl, &k, &d.csums)?;
+            }
+            Some(cl)
+        }
+        None => None,
+    };
+
+    // ── extent tree: apply the data deltas (independent of block count) ─
     for &(bytenr, len) in &txn.freed_data {
         if let Some(slot) = leaf_find(
-            &txn.ext.leaf,
+            &ext_logical,
             &BtrfsKey::new(bytenr, format::EXTENT_ITEM_KEY, len),
         )? {
-            leaf_delete(&mut txn.ext.leaf, slot)?;
-        }
-    }
-    for &(old, lvl) in &freed_meta {
-        if let Some(slot) = leaf_find(
-            &txn.ext.leaf,
-            &BtrfsKey::new(old, format::METADATA_ITEM_KEY, u64::from(lvl)),
-        )? {
-            leaf_delete(&mut txn.ext.leaf, slot)?;
+            leaf_delete(&mut ext_logical, slot)?;
         }
     }
     for d in &txn.new_data {
         leaf_insert_sorted(
-            &mut txn.ext.leaf,
+            &mut ext_logical,
             &BtrfsKey::new(d.bytenr, format::EXTENT_ITEM_KEY, d.len),
             &ext_item_data(gen, d.ref_root, d.objectid),
         )?;
     }
-    for &(new, owner, lvl) in &new_meta {
-        leaf_insert_sorted(
-            &mut txn.ext.leaf,
-            &BtrfsKey::new(new, format::METADATA_ITEM_KEY, u64::from(lvl)),
-            &ext_item_meta(gen, owner),
+
+    // ── free-space tree: apply the data deltas (block groups live in ext) ─
+    let fst_base = match fst_base {
+        Some(mut fl) => {
+            for d in &txn.new_data {
+                let (s, l) = block_group_of(&ext_logical, d.bytenr)?.ok_or(FsError::InvalidData)?;
+                fst_mark_used(&mut fl, s, l, d.bytenr, d.len)?;
+            }
+            for &(bytenr, len) in &txn.freed_data {
+                let (s, l) = block_group_of(&ext_logical, bytenr)?.ok_or(FsError::InvalidData)?;
+                fst_mark_free(&mut fl, s, l, bytenr, len)?;
+            }
+            Some(fl)
+        }
+        None => None,
+    };
+
+    // Fixed groupings: fs/csum content and the root tree's size are settled.
+    let fs_groups = group_items(vol, &txn.fs_content)?;
+    let csum_groups = csum_logical
+        .as_ref()
+        .map(|c| group_items(vol, c))
+        .transpose()?;
+    let root_groups = group_items(vol, &root_logical)?;
+
+    // Every old block across every COWed tree is returned to free space.
+    let mut freed_meta: Vec<(u64, u8)> = txn.fs_old_blocks.clone();
+    freed_meta.extend(ext_old);
+    freed_meta.extend(root_old);
+    freed_meta.extend(csum_old);
+    freed_meta.extend(fst_old);
+
+    // ── Metadata fixed point over the extent/free-space leaf counts ────
+    let base = alloc.next();
+    let fs_nc = tree_node_count(&fs_groups);
+    let csum_nc = csum_groups.as_ref().map_or(0, |g| tree_node_count(g));
+    let root_nc = tree_node_count(&root_groups);
+    let mut ext_leaves = 1usize;
+    let mut fst_leaves = usize::from(fst_base.is_some());
+
+    struct Converged {
+        fs_addrs: Vec<u64>,
+        csum_addrs: Vec<u64>,
+        root_addrs: Vec<u64>,
+        ext_addrs: Vec<u64>,
+        fst_addrs: Vec<u64>,
+        new_meta: Vec<(u64, u64, u8)>,
+        ext_final: Vec<u8>,
+        ext_groups: Vec<(usize, usize)>,
+        fst_final: Option<Vec<u8>>,
+        fst_groups: Option<Vec<(usize, usize)>>,
+    }
+    let mut converged: Option<Converged> = None;
+
+    for _ in 0..8 {
+        alloc.reset(base);
+        let fs_addrs = alloc_nodes(&mut alloc, vol, fs_nc)?;
+        let csum_addrs = alloc_nodes(&mut alloc, vol, csum_nc)?;
+        let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
+        let ext_addrs = alloc_nodes(&mut alloc, vol, ext_leaves + usize::from(ext_leaves > 1))?;
+        let fst_addrs = alloc_nodes(
+            &mut alloc,
+            vol,
+            if fst_leaves > 0 {
+                fst_leaves + usize::from(fst_leaves > 1)
+            } else {
+                0
+            },
         )?;
+
+        // Every new metadata block, in the same order alloc_nodes handed them out.
+        let mut new_meta: Vec<(u64, u64, u8)> = Vec::new();
+        collect_tree_meta(
+            &fs_addrs,
+            fs_groups.len(),
+            format::FS_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        if let Some(g) = &csum_groups {
+            collect_tree_meta(
+                &csum_addrs,
+                g.len(),
+                format::CSUM_TREE_OBJECTID,
+                &mut new_meta,
+            );
+        }
+        collect_tree_meta(
+            &root_addrs,
+            root_groups.len(),
+            format::ROOT_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        collect_tree_meta(
+            &ext_addrs,
+            ext_leaves,
+            format::EXTENT_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        if fst_leaves > 0 {
+            collect_tree_meta(
+                &fst_addrs,
+                fst_leaves,
+                format::FREE_SPACE_TREE_OBJECTID,
+                &mut new_meta,
+            );
+        }
+
+        // Extent tree with this iteration's metadata items.
+        let mut ext_final = ext_logical.clone();
+        for &(blk, lvl) in &freed_meta {
+            if let Some(s) = leaf_find(
+                &ext_final,
+                &BtrfsKey::new(blk, format::METADATA_ITEM_KEY, u64::from(lvl)),
+            )? {
+                leaf_delete(&mut ext_final, s)?;
+            }
+        }
+        for &(addr, owner, lvl) in &new_meta {
+            leaf_insert_sorted(
+                &mut ext_final,
+                &BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(lvl)),
+                &ext_item_meta(gen, owner),
+            )?;
+        }
+        let ext_groups = group_items(vol, &ext_final)?;
+
+        // Free-space tree with this iteration's used/freed blocks.
+        let (fst_final, fst_groups) = match &fst_base {
+            Some(fb) => {
+                let mut ff = fb.clone();
+                for &(addr, _, _) in &new_meta {
+                    let (s, l) = block_group_of(&ext_final, addr)?.ok_or(FsError::InvalidData)?;
+                    fst_mark_used(&mut ff, s, l, addr, nodesize)?;
+                }
+                for &(blk, _) in &freed_meta {
+                    let (s, l) = block_group_of(&ext_final, blk)?.ok_or(FsError::InvalidData)?;
+                    fst_mark_free(&mut ff, s, l, blk, nodesize)?;
+                }
+                let g = group_items(vol, &ff)?;
+                (Some(ff), Some(g))
+            }
+            None => (None, None),
+        };
+
+        let ext_lv = ext_groups.len();
+        let fst_lv = fst_groups.as_ref().map_or(0, |g| g.len());
+        if ext_lv == ext_leaves && fst_lv == fst_leaves {
+            converged = Some(Converged {
+                fs_addrs,
+                csum_addrs,
+                root_addrs,
+                ext_addrs,
+                fst_addrs,
+                new_meta,
+                ext_final,
+                ext_groups,
+                fst_final,
+                fst_groups,
+            });
+            break;
+        }
+        ext_leaves = ext_lv;
+        fst_leaves = fst_lv;
     }
-    // Block-group `used` is charged *per block group*: once the filesystem spans
-    // more than one chunk, freed and newly-allocated blocks can land in different
-    // groups, so a single lumped delta would corrupt both groups' `used`. Each
-    // block / data extent lies wholly within one group.
-    for &(new, _, _) in &new_meta {
-        block_group_add_used(&mut txn.ext.leaf, new, nodesize as i64)?;
+    let Converged {
+        fs_addrs,
+        csum_addrs,
+        root_addrs,
+        ext_addrs,
+        fst_addrs,
+        new_meta,
+        mut ext_final,
+        ext_groups,
+        fst_final,
+        fst_groups,
+    } = converged.ok_or(FsError::NoSpace)?;
+
+    // ── Block-group `used`: charge each block/extent to its own group ──
+    // (Values only — this doesn't change any tree's item count or leaf layout.)
+    for &(addr, _, _) in &new_meta {
+        block_group_add_used(&mut ext_final, addr, nodesize as i64)?;
     }
-    for &(old, _) in &freed_meta {
-        block_group_add_used(&mut txn.ext.leaf, old, -(nodesize as i64))?;
+    for &(blk, _) in &freed_meta {
+        block_group_add_used(&mut ext_final, blk, -(nodesize as i64))?;
     }
     for d in &txn.new_data {
-        block_group_add_used(&mut txn.ext.leaf, d.bytenr, d.len as i64)?;
+        block_group_add_used(&mut ext_final, d.bytenr, d.len as i64)?;
     }
     for &(bytenr, len) in &txn.freed_data {
-        block_group_add_used(&mut txn.ext.leaf, bytenr, -(len as i64))?;
-    }
-    stamp_node(&mut txn.ext.leaf, n_ext, gen);
-
-    // Superblock `bytes_used` moves by the net data + metadata change.
-    let meta_used_delta = (new_meta.len() as i64 - freed_meta.len() as i64) * nodesize as i64;
-    let total_used_delta = txn.data_used_delta + meta_used_delta;
-
-    // ── Free-space tree (extent mode): mark each new block/extent used in its
-    //    own group, and return each freed one to its group's free space ───────
-    if let Some(fst) = txn.fst.as_mut() {
-        for &(new, _, _) in &new_meta {
-            let (s, l) = block_group_of(&txn.ext.leaf, new)?.ok_or(FsError::InvalidData)?;
-            fst_mark_used(&mut fst.leaf, s, l, new, nodesize)?;
-        }
-        for d in &txn.new_data {
-            let (s, l) = block_group_of(&txn.ext.leaf, d.bytenr)?.ok_or(FsError::InvalidData)?;
-            fst_mark_used(&mut fst.leaf, s, l, d.bytenr, d.len)?;
-        }
-        for &(old, _) in &freed_meta {
-            let (s, l) = block_group_of(&txn.ext.leaf, old)?.ok_or(FsError::InvalidData)?;
-            fst_mark_free(&mut fst.leaf, s, l, old, nodesize)?;
-        }
-        for &(bytenr, len) in &txn.freed_data {
-            let (s, l) = block_group_of(&txn.ext.leaf, bytenr)?.ok_or(FsError::InvalidData)?;
-            fst_mark_free(&mut fst.leaf, s, l, bytenr, len)?;
-        }
-        stamp_node(&mut fst.leaf, n_fst.unwrap(), gen);
+        block_group_add_used(&mut ext_final, bytenr, -(len as i64))?;
     }
 
-    // ── Root tree: repoint each copied tree's ROOT_ITEM (not the root tree) ─
+    // ── Root tree: repoint each COWed tree's ROOT_ITEM to its new root ──
     // ROOT_ITEM fields: generation@160, bytenr@176, level@238, generation_v2@239.
+    let tree_root = |addrs: &[u64], groups: &[(usize, usize)]| -> (u64, u8) {
+        if groups.len() > 1 {
+            (addrs[groups.len()], 1)
+        } else {
+            (addrs[0], 0)
+        }
+    };
+    let (fs_root_addr, fs_level) = tree_root(&fs_addrs, &fs_groups);
+    let (ext_root_addr, ext_level) = tree_root(&ext_addrs, &ext_groups);
+    let (root_root_addr, _root_level) = tree_root(&root_addrs, &root_groups);
     let stamp_root_item = |ri: &mut [u8], bytenr: u64, tree_level: u8| {
         ri[160..168].copy_from_slice(&gen.to_le_bytes());
         ri[176..184].copy_from_slice(&bytenr.to_le_bytes());
@@ -970,56 +1115,47 @@ async fn commit_txn<B: BlockDevice + 'static>(
         }
     };
     let mut root_updates = alloc::vec![(format::FS_TREE_OBJECTID, fs_root_addr, fs_level)];
-    root_updates.push((format::EXTENT_TREE_OBJECTID, n_ext, 0));
-    if let Some(n) = n_csum {
-        root_updates.push((format::CSUM_TREE_OBJECTID, n, 0));
+    root_updates.push((format::EXTENT_TREE_OBJECTID, ext_root_addr, ext_level));
+    if let (Some(g), Some(c)) = (&csum_groups, csum_logical.as_ref()) {
+        let (a, l) = tree_root(&csum_addrs, g);
+        let _ = c;
+        root_updates.push((format::CSUM_TREE_OBJECTID, a, l));
     }
-    if let Some(n) = n_fst {
-        root_updates.push((format::FREE_SPACE_TREE_OBJECTID, n, 0));
+    if let (Some(g), Some(_)) = (&fst_groups, fst_final.as_ref()) {
+        let (a, l) = tree_root(&fst_addrs, g);
+        root_updates.push((format::FREE_SPACE_TREE_OBJECTID, a, l));
     }
     for &(owner, new, lvl) in &root_updates {
-        let slot = leaf_find_by_type(&txn.root.leaf, owner, format::ROOT_ITEM_KEY)?
+        let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
-        let mut ri = leaf_item_data(&txn.root.leaf, slot)?.to_vec();
+        let mut ri = leaf_item_data(&root_logical, slot)?.to_vec();
         stamp_root_item(&mut ri, new, lvl);
-        leaf_replace_inplace(&mut txn.root.leaf, slot, &ri)?;
-    }
-    stamp_node(&mut txn.root.leaf, n_root, gen);
-
-    // ── Stamp the fs nodes (and the caller-edited csum leaf) ───────
-    let mut fs_nodes = fs_nodes;
-    for (addr, buf) in fs_nodes.iter_mut() {
-        // An internal node's key-ptr generations are stamped with this txn's gen.
-        if level(buf)? > 0 {
-            let n = nritems(buf)? as usize;
-            for i in 0..n {
-                let g = HEADER_SIZE + i * KEY_PTR_SIZE + format::DISK_KEY_SIZE + 8;
-                buf[g..g + 8].copy_from_slice(&gen.to_le_bytes());
-            }
-        }
-        stamp_node(buf, *addr, gen);
-    }
-    if let (Some(c), Some(n)) = (txn.csum.as_mut(), n_csum) {
-        stamp_node(&mut c.leaf, n, gen);
+        leaf_replace_inplace(&mut root_logical, slot, &ri)?;
     }
 
-    // ── Write every new node, then flip the superblock last ────────
-    for (addr, buf) in &fs_nodes {
+    // ── Pack every tree into its real leaves (stamped), then write them ─
+    let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
+    nodes.extend(pack_tree_at(vol, &txn.fs_content, &fs_groups, &fs_addrs, gen)?.0);
+    if let (Some(c), Some(g)) = (&csum_logical, &csum_groups) {
+        nodes.extend(pack_tree_at(vol, c, g, &csum_addrs, gen)?.0);
+    }
+    nodes.extend(pack_tree_at(vol, &ext_final, &ext_groups, &ext_addrs, gen)?.0);
+    nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
+    if let (Some(f), Some(g)) = (&fst_final, &fst_groups) {
+        nodes.extend(pack_tree_at(vol, f, g, &fst_addrs, gen)?.0);
+    }
+    for (addr, buf) in &nodes {
         vol.write_logical(*addr, buf).await?;
     }
-    if let (Some(c), Some(n)) = (&txn.csum, n_csum) {
-        vol.write_logical(n, &c.leaf).await?;
-    }
-    vol.write_logical(n_ext, &txn.ext.leaf).await?;
-    vol.write_logical(n_root, &txn.root.leaf).await?;
-    if let (Some(f), Some(n)) = (&txn.fst, n_fst) {
-        vol.write_logical(n, &f.leaf).await?;
-    }
+
+    // Superblock `bytes_used` moves by the net data + metadata change.
+    let meta_used_delta = (new_meta.len() as i64 - freed_meta.len() as i64) * nodesize as i64;
+    let total_used_delta = txn.data_used_delta + meta_used_delta;
 
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
-    raw[80..88].copy_from_slice(&n_root.to_le_bytes()); // root
-                                                        // Keep the superblock's `bytes_used@120` in step with the block groups' `used`.
+    raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
+                                                                // Keep the superblock's `bytes_used@120` in step with the block groups' `used`.
     let bytes_used = (le64(&raw, 120)? as i64 + total_used_delta) as u64;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
     let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
@@ -1031,7 +1167,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     vol.write_superblock(&raw).await?;
 
     vol.set_alloc_floor(alloc.next());
-    vol.commit_roots(n_root, fs_root_addr, gen);
+    vol.commit_roots(root_root_addr, fs_root_addr, gen);
     Ok(())
 }
 
@@ -1260,36 +1396,12 @@ async fn create_node<B: BlockDevice + 'static>(
         return Err(FsError::InvalidData);
     }
 
-    let (fs_root, fs_level) = vol.fs_tree_root();
+    let (fs_root, _fs_level) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let _ = fs_level;
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported); // single-leaf extent/root only
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // The name's `DIR_ITEM` key must be free: an existing key means either the
     // name already exists (the VFS pre-checks, so this is defensive) or a hash
@@ -1375,10 +1487,6 @@ async fn create_node<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
@@ -1485,33 +1593,10 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the name to a single, non-colliding directory entry.
     let dir_item_key = BtrfsKey::new(
@@ -1587,31 +1672,6 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         .max(vol.alloc_floor());
     // commit_txn allocates every new metadata block (fs nodes may split).
     let alloc = BumpAllocator::new(high_water);
-    // The csum tree is only copied when there are data checksums to remove.
-
-    // Edit the csum leaf: drop each freed extent's checksum item.
-    let csum = if !freed_data.is_empty() {
-        let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
-            .await?
-            .0;
-        let mut csum_leaf = vol.read_node(old_csum).await?;
-        if level(&csum_leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-        for &(bytenr, _) in &freed_data {
-            let key = BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                bytenr,
-            );
-            if let Some(slot) = leaf_find(&csum_leaf, &key)? {
-                leaf_delete(&mut csum_leaf, slot)?;
-            }
-        }
-        Some(CowLeaf::new(csum_leaf, old_csum))
-    } else {
-        None
-    };
 
     // A surviving inode keeps its INODE_ITEM with `nlink` decremented (in place).
     if !last_link {
@@ -1674,10 +1734,6 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
@@ -1708,33 +1764,10 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the name to a single, non-colliding directory entry.
     let dir_item_key = BtrfsKey::new(
@@ -1842,10 +1875,6 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
@@ -1886,33 +1915,10 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source to a single, non-colliding entry.
     let old_di_key = BtrfsKey::new(
@@ -2021,31 +2027,6 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         .max(vol.alloc_floor());
     // commit_txn allocates every new metadata block (fs nodes may split).
     let alloc = BumpAllocator::new(high_water);
-    // The csum tree is only copied when an overwritten file's checksums go away.
-
-    // Edit the csum leaf: drop the overwritten file's data checksums.
-    let csum = if !freed_data.is_empty() {
-        let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
-            .await?
-            .0;
-        let mut csum_leaf = vol.read_node(old_csum).await?;
-        if level(&csum_leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-        for &(bytenr, _) in &freed_data {
-            let key = BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                bytenr,
-            );
-            if let Some(slot) = leaf_find(&csum_leaf, &key)? {
-                leaf_delete(&mut csum_leaf, slot)?;
-            }
-        }
-        Some(CowLeaf::new(csum_leaf, old_csum))
-    } else {
-        None
-    };
 
     // Adjust the parent dir `i_size` (each name counts twice: DIR_ITEM +
     // DIR_INDEX); bump transid + sequence. A plain rename swaps old→new name; an
@@ -2110,10 +2091,6 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
@@ -2186,33 +2163,10 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source in the old parent.
     let old_di_key = BtrfsKey::new(
@@ -2324,29 +2278,6 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     // commit_txn allocates every new metadata block (fs nodes may split).
     let alloc = BumpAllocator::new(high_water);
 
-    let csum = if !freed_data.is_empty() {
-        let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
-            .await?
-            .0;
-        let mut csum_leaf = vol.read_node(old_csum).await?;
-        if level(&csum_leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-        for &(bytenr, _) in &freed_data {
-            let key = BtrfsKey::new(
-                format::EXTENT_CSUM_OBJECTID,
-                format::EXTENT_CSUM_KEY,
-                bytenr,
-            );
-            if let Some(slot) = leaf_find(&csum_leaf, &key)? {
-                leaf_delete(&mut csum_leaf, slot)?;
-            }
-        }
-        Some(CowLeaf::new(csum_leaf, old_csum))
-    } else {
-        None
-    };
-
     // Update both parents' `i_size` in place (same-size replace, no slot shift):
     // the old parent loses the source name; the new parent gains it (net zero on
     // an overwrite, whose equal-length target name is reused). Bump transid+seq.
@@ -2412,10 +2343,6 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
@@ -2453,33 +2380,10 @@ pub async fn link_node<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source; hard links to directories are forbidden.
     let old_di_key = BtrfsKey::new(
@@ -2578,10 +2482,6 @@ pub async fn link_node<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
@@ -2607,8 +2507,8 @@ fn xattr_entry(gen: u64, name: &[u8], value: &[u8]) -> Vec<u8> {
 }
 
 /// Run a metadata-only mutation of the fs leaf (no data extents, no checksums) as
-/// a COW mini-transaction: read the fs/extent/root/free-space leaves, hand the fs
-/// leaf and the new generation to `edit`, then commit. Single-leaf trees only.
+/// a COW mini-transaction: read the fs tree as one logical leaf, hand it and the
+/// new generation to `edit`, then commit (which reads/re-packs the other trees).
 async fn commit_fs_edit<B, F>(vol: &BtrfsVolume<B>, edit: F) -> Result<(), FsError>
 where
     B: BlockDevice + 'static,
@@ -2616,33 +2516,10 @@ where
 {
     let (fs_root, _) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
-    let old_fs = fs_root;
-    let old_root = root_tree;
     let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
         .await?
         .0;
-    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
-        .await
-        .ok()
-        .map(|(r, _)| r);
-
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
-    let ext_leaf = vol.read_node(old_ext).await?;
-    let root_leaf = vol.read_node(old_root).await?;
-    let fst_leaf = match old_fst {
-        Some(f) => Some(vol.read_node(f).await?),
-        None => None,
-    };
-    for leaf in [&ext_leaf, &root_leaf] {
-        if level(leaf)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
-    if let Some(fl) = &fst_leaf {
-        if level(fl)? != 0 {
-            return Err(FsError::Unsupported);
-        }
-    }
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     let gen = vol.superblock().generation + 1;
     let high_water = extent_high_water(vol, old_ext)
@@ -2660,10 +2537,6 @@ where
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext),
-            root: CowLeaf::new(root_leaf, old_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
@@ -2795,7 +2668,10 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     let mut fst_leaf = vol.read_node(old_fst).await?;
     for leaf in [&chunk_leaf, &dev_leaf, &ext_leaf, &root_leaf, &fst_leaf] {
         if level(leaf)? != 0 {
-            return Err(FsError::Unsupported); // single-leaf trees only
+            // Chunk growth still edits the chunk/dev/extent/root/free-space trees
+            // as single leaves. A caller that has already split those (a large,
+            // busy filesystem) must grow earlier, while they are single-leaf.
+            return Err(FsError::Unsupported);
         }
     }
 

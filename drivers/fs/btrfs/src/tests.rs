@@ -2376,6 +2376,88 @@ fn smoke_btrfs_chunk_avoids_supers() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_avoids_supers);
 
+/// The extent, csum and free-space trees are no longer limited to a single leaf:
+/// creating many files each with a multi-sector data extent overflows them, and
+/// the COW commit re-packs each into leaves under an internal root — resolving the
+/// extent tree's self-reference (it records its own new blocks) with a fixed
+/// point. Proven by the on-disk root levels rising above 0 and every file reading
+/// back across the split trees after a remount.
+fn smoke_btrfs_multileaf_trees() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    const N: u32 = 70;
+    const SZ: usize = 32768; // 8 sectors: a large csum item per file
+
+    fn tree_level<B: narf_block::BlockDevice + 'static>(
+        vol: &BtrfsVolume<B>,
+        objectid: u64,
+    ) -> Option<u8> {
+        let root_tree = vol.root_tree_root().0;
+        poll_once(crate::roots::find_root(vol, root_tree, objectid))?
+            .ok()
+            .map(|(_, level)| level)
+    }
+
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("mirror fixture failed to mount"),
+    };
+
+    // Add chunks up front, while the extent/free-space trees are still single
+    // leaves (chunk growth requires that), so the churn below — which never reuses
+    // freed space and COWs whole trees — has room to split those trees without
+    // needing a further grow. Grow until the device is (nearly) full.
+    let mut grew = 0u32;
+    while grew < 6 && matches!(poll_once(crate::write::grow_add_chunk(&vol)), Some(Ok(()))) {
+        grew += 1;
+    }
+    if grew == 0 {
+        return TestResult::Fail("pre-grow made no progress");
+    }
+
+    // Each file gets a distinct byte pattern so cross-file corruption is caught.
+    for i in 0..N {
+        let name = alloc::format!("d{i:03}.dat");
+        let f = match poll_once(vol.root().create(&name)) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create failed under multi-leaf churn"),
+        };
+        let payload = alloc::vec![i as u8; SZ];
+        match poll_once(f.write(0, &payload)) {
+            Some(Ok(n)) if n == SZ => {}
+            _ => return TestResult::Fail("write failed under multi-leaf churn"),
+        }
+    }
+
+    // Both the extent and csum trees must have outgrown a single leaf.
+    if tree_level(&vol, format::EXTENT_TREE_OBJECTID) != Some(1) {
+        return TestResult::Fail("extent tree did not become multi-leaf");
+    }
+    if tree_level(&vol, format::CSUM_TREE_OBJECTID) != Some(1) {
+        return TestResult::Fail("csum tree did not become multi-leaf");
+    }
+
+    // Remount and read every file back through the now-split trees.
+    let vol2 = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    for i in 0..N {
+        let name = alloc::format!("d{i:03}.dat");
+        match poll_once(vol2.root().lookup_async(&name)) {
+            Some(Ok(f)) => match read_all(&f, SZ + 16) {
+                Some(got) if got.len() == SZ && got.iter().all(|&b| b == i as u8) => {}
+                _ => return TestResult::Fail("file content wrong after remount"),
+            },
+            _ => return TestResult::Fail("file missing after remount"),
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multileaf_trees);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

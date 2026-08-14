@@ -2898,9 +2898,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                     let name = entry.name;
                     let ok = narf_scheduler::block_on(async {
-                        // Grow the filesystem by one chunk up front, so every
-                        // mutation below runs on a two-chunk image and exercises
-                        // per-block-group accounting (validated by host `btrfs
+                        // Grow the filesystem by a few chunks up front, while its
+                        // extent/free-space trees are still single leaves (chunk
+                        // growth requires that). This exercises per-block-group
+                        // accounting and leaves room for the multi-leaf churn below —
+                        // which never reuses freed space — to split the extent tree
+                        // without needing a further grow (validated by host `btrfs
                         // check`).
                         {
                             let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
@@ -2909,9 +2912,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             )
                             .await
                             .map_err(|_| ())?;
-                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
-                                .await
-                                .map_err(|_| ())?;
+                            for _ in 0..3 {
+                                narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                    .await
+                                    .map_err(|_| ())?;
+                            }
                         }
                         let fs = factory(dev.clone()).map_err(|_| ())?;
                         let root = fs.root();
@@ -2978,12 +2983,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         xf.set_xattr("user.narf", b"kilroy", 0)
                             .await
                             .map_err(|_| ())?;
-                        // Create enough files that the fs tree overflows one leaf
-                        // and splits into a multi-level tree (validated on-disk by
-                        // the post-boot host `btrfs check`).
-                        for i in 0..24u32 {
+                        // Create enough files — each with its own data extent — that
+                        // not only the fs tree but also the EXTENT and CSUM trees
+                        // overflow one leaf and split under an internal root. This
+                        // exercises the multi-leaf commit path (extent-tree
+                        // self-reference resolved by a fixed point) on-disk, validated
+                        // by the post-boot host `btrfs check`.
+                        for i in 0..64u32 {
                             let name = alloc::format!("narf-split-{i:03}");
-                            root.create(&name).await.map_err(|_| ())?;
+                            let f = root.create(&name).await.map_err(|_| ())?;
+                            // A multi-sector payload so each file's csum item is large
+                            // enough that 64 of them overflow a single csum leaf.
+                            let payload = alloc::vec![i as u8 ^ 0x5a; 8192];
+                            f.write(0, &payload).await.map_err(|_| ())?;
                         }
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
@@ -3005,8 +3017,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let mut lbuf = [0u8; 16];
                         let ln = link.read(0, &mut lbuf).await.map_err(|_| ())?;
                         root2.lookup_async("narf-null").await.map_err(|_| ())?;
-                        // The last file created after the fs tree split is present.
-                        root2.lookup_async("narf-split-023").await.map_err(|_| ())?;
+                        // The last data file created after the trees split is present
+                        // and its data extent reads back through the split trees.
+                        let sf = root2.lookup_async("narf-split-063").await.map_err(|_| ())?;
+                        let mut sbuf = [0u8; 8192];
+                        let sn = sf.read(0, &mut sbuf).await.map_err(|_| ())?;
+                        if sn != 8192 || sbuf.iter().any(|&b| b != (63u8 ^ 0x5a)) {
+                            return Err(());
+                        }
                         // The moved file left the root and landed in narf-dir.
                         let ndir2 = root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
                         ndir2.lookup_async("narf-moved.txt").await.map_err(|_| ())?;
