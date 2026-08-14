@@ -925,12 +925,36 @@ fn next_dir_index(fs_leaf: &[u8], dir_ino: u64) -> Result<u64, FsError> {
 }
 
 /// Create an empty regular file `name` in directory `parent_ino` (default
-/// subvolume) via a COW mini-transaction. Returns the new inode number and its
-/// freshly-built [`InodeItem`]. Single-leaf trees only (like all writes here).
+/// subvolume). Returns the new inode number and its freshly-built [`InodeItem`].
 pub async fn create_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
     name: &str,
+) -> Result<(u64, InodeItem), FsError> {
+    create_node(vol, parent_ino, name, 0o100644, format::FT_REG_FILE).await
+}
+
+/// Create an empty subdirectory `name` in directory `parent_ino` (default
+/// subvolume). Returns the new inode number and its [`InodeItem`]. btrfs
+/// directories carry `nlink == 1` (subdirectories are not counted), so the
+/// parent's link count is unchanged — only its `i_size` grows.
+pub async fn mkdir_dir<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+) -> Result<(u64, InodeItem), FsError> {
+    create_node(vol, parent_ino, name, 0o040755, format::FT_DIR).await
+}
+
+/// Create a new empty inode (`mode`/`ftype` pick file vs directory) named `name`
+/// in directory `parent_ino` (default subvolume) via a COW mini-transaction.
+/// Single-leaf trees only (like all mutations here).
+async fn create_node<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+    mode: u32,
+    ftype: u8,
 ) -> Result<(u64, InodeItem), FsError> {
     let name_bytes = name.as_bytes();
     if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
@@ -1020,7 +1044,6 @@ pub async fn create_file<B: BlockDevice + 'static>(
 
     // Insert the new inode's items: INODE_ITEM, INODE_REF (→ parent), and the
     // parent's DIR_ITEM (name lookup) + DIR_INDEX (readdir order).
-    let mode = 0o100644u32; // regular file, rw-r--r--
     let ii = inode_item(gen, mode, 0, 1, 0, 0, 0, ptime_sec, ptime_nsec);
     leaf_insert_sorted(
         &mut fs_leaf,
@@ -1033,7 +1056,7 @@ pub async fn create_file<B: BlockDevice + 'static>(
         &BtrfsKey::new(new_ino, format::INODE_REF_KEY, parent_ino),
         &iref,
     )?;
-    let di = dir_item_body(new_ino, gen, format::FT_REG_FILE, name_bytes);
+    let di = dir_item_body(new_ino, gen, ftype, name_bytes);
     leaf_insert_sorted(&mut fs_leaf, &dir_item_key, &di)?;
     leaf_insert_sorted(
         &mut fs_leaf,
@@ -1312,6 +1335,182 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
+            alloc_span,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Remove the empty subdirectory `name` from directory `parent_ino` (default
+/// subvolume) via a COW mini-transaction.
+///
+/// Scope (else the noted error): the child must be a directory (`InvalidData`
+/// otherwise — use `unlink`), reached by a single `INODE_REF` and a
+/// non-colliding `DIR_ITEM`, and **empty** — any `DIR_ITEM`/`DIR_INDEX` child
+/// makes it `Busy`, any other item (e.g. an xattr) makes it `Unsupported`.
+/// btrfs directories carry `nlink == 1`, so the parent's link count is unchanged
+/// (only its `i_size` shrinks).
+pub async fn rmdir_dir<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+) -> Result<(), FsError> {
+    let name_bytes = name.as_bytes();
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(FsError::InvalidData);
+    }
+
+    let (fs_root, _) = vol.fs_tree_root();
+    let (root_tree, _) = vol.root_tree_root();
+    let old_fs = fs_root;
+    let old_root = root_tree;
+    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+        .await?
+        .0;
+    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
+        .await
+        .ok()
+        .map(|(r, _)| r);
+
+    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let ext_leaf = vol.read_node(old_ext).await?;
+    let root_leaf = vol.read_node(old_root).await?;
+    let fst_leaf = match old_fst {
+        Some(f) => Some(vol.read_node(f).await?),
+        None => None,
+    };
+    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+        if level(leaf)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+    if let Some(fl) = &fst_leaf {
+        if level(fl)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+
+    // Resolve the name to a single, non-colliding directory entry.
+    let dir_item_key = BtrfsKey::new(
+        parent_ino,
+        format::DIR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+    let di_slot = leaf_find(&fs_leaf, &dir_item_key)?.ok_or(FsError::NotFound)?;
+    let di_entries = decode_dir_items(leaf_item_data(&fs_leaf, di_slot)?)?;
+    if di_entries.len() != 1 {
+        return Err(FsError::Unsupported);
+    }
+    let entry = &di_entries[0];
+    if entry.name != name {
+        return Err(FsError::NotFound);
+    }
+    if entry.location.item_type != format::INODE_ITEM_KEY {
+        return Err(FsError::Unsupported); // subvolume mount point
+    }
+    if entry.ftype != format::FT_DIR {
+        return Err(FsError::InvalidData); // not a directory: use unlink
+    }
+    let child_ino = entry.location.objectid;
+
+    let ci_slot = leaf_find(
+        &fs_leaf,
+        &BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+    )?
+    .ok_or(FsError::NotFound)?;
+    if !InodeItem::decode(leaf_item_data(&fs_leaf, ci_slot)?)?.is_dir() {
+        return Err(FsError::InvalidData);
+    }
+
+    // The directory must be empty: it may own only its INODE_ITEM and the single
+    // INODE_REF back to the parent. A DIR_ITEM/DIR_INDEX child means non-empty
+    // (`Busy`); anything else (an xattr) is out of scope (`Unsupported`).
+    let n = nritems(&fs_leaf)? as usize;
+    for i in 0..n {
+        let k = leaf_item_key(&fs_leaf, i)?;
+        if k.objectid != child_ino {
+            continue;
+        }
+        match k.item_type {
+            format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
+            format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => return Err(FsError::Busy),
+            _ => return Err(FsError::Unsupported),
+        }
+    }
+
+    // The child's INODE_REF back to this dir gives the DIR_INDEX offset.
+    let ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino);
+    let ref_slot = leaf_find(&fs_leaf, &ref_key)?.ok_or(FsError::NotFound)?;
+    let (dir_index, single_ref) = inode_ref_index(leaf_item_data(&fs_leaf, ref_slot)?, name_bytes)?;
+    if !single_ref {
+        return Err(FsError::Unsupported);
+    }
+
+    let gen = vol.superblock().generation + 1;
+    let high_water = extent_high_water(vol, old_ext)
+        .await?
+        .max(vol.alloc_floor());
+    let mut alloc = BumpAllocator::new(high_water);
+    let n_fs = alloc.alloc_node(vol)?;
+    let n_ext = alloc.alloc_node(vol)?;
+    let n_root = alloc.alloc_node(vol)?;
+    let n_fst = if old_fst.is_some() {
+        Some(alloc.alloc_node(vol)?)
+    } else {
+        None
+    };
+    let alloc_span = (n_fs, alloc.next());
+
+    // Shrink the parent dir inode by this entry's name (counted twice); bump
+    // transid + sequence. The parent's nlink is unchanged (btrfs dirs, nlink 1).
+    let pslot = leaf_find(
+        &fs_leaf,
+        &BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0),
+    )?
+    .ok_or(FsError::NotFound)?;
+    let mut pinode = leaf_item_data(&fs_leaf, pslot)?.to_vec();
+    let psize = le64(&pinode, 16)?;
+    pinode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+    pinode[16..24].copy_from_slice(
+        &psize
+            .saturating_sub(2 * name_bytes.len() as u64)
+            .to_le_bytes(),
+    );
+    let pseq = le64(&pinode, 72)?;
+    pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
+    leaf_replace_inplace(&mut fs_leaf, pslot, &pinode)?;
+
+    // Delete the child's INODE_ITEM + INODE_REF and the parent's DIR_ITEM +
+    // DIR_INDEX. Re-find each key because a delete shifts later slots.
+    let to_delete = [
+        BtrfsKey::new(
+            parent_ino,
+            format::DIR_ITEM_KEY,
+            u64::from(name_hash(name_bytes)),
+        ),
+        BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index),
+        BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino),
+        BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+    ];
+    for key in &to_delete {
+        let slot = leaf_find(&fs_leaf, key)?.ok_or(FsError::NotFound)?;
+        leaf_delete(&mut fs_leaf, slot)?;
+    }
+
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            csum: None,
+            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
+            root: CowLeaf::new(root_leaf, old_root, n_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            freed_data: Vec::new(),
+            new_data: Vec::new(),
+            data_used_delta: 0,
             alloc_span,
         },
     )

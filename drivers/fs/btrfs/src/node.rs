@@ -304,6 +304,27 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         })
     }
 
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            let (ino, inode) = crate::write::mkdir_dir(&vol, self.ino, name).await?;
+            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn DirOps>)
+        })
+    }
+
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::rmdir_dir(&vol, self.ino, name).await
+        })
+    }
+
     fn dir_mode(&self) -> u16 {
         self.inode.perms() & 0o777
     }

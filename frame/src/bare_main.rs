@@ -2910,8 +2910,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         created.write(0, MARKER).await.map_err(|_| ())?;
                         root.create("narf-scratch.tmp").await.map_err(|_| ())?;
                         root.unlink("narf-scratch.tmp").await.map_err(|_| ())?;
+                        // Directories: one that persists, one created then removed.
+                        root.mkdir("narf-dir").await.map_err(|_| ())?;
+                        root.mkdir("narf-tmpdir").await.map_err(|_| ())?;
+                        root.rmdir("narf-tmpdir").await.map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
-                        // the created file's content, and the scratch file's removal.
+                        // the created file's content, the scratch file's removal, the
+                        // persistent directory, and the removed directory.
                         let fs2 = factory(dev).map_err(|_| ())?;
                         let root2 = fs2.root();
                         let f2 = root2.lookup_async("big.dat").await.map_err(|_| ())?;
@@ -2923,7 +2928,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             .map_err(|_| ())?;
                         let mut cbuf = [0u8; MARKER.len()];
                         let cn = cf.read(0, &mut cbuf).await.map_err(|_| ())?;
-                        if root2.lookup_async("narf-scratch.tmp").await.is_ok() {
+                        root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        if root2.lookup_async("narf-scratch.tmp").await.is_ok()
+                            || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
+                        {
                             return Err(());
                         }
                         if n == MARKER.len()

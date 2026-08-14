@@ -1407,6 +1407,108 @@ fn smoke_btrfs_unlink_file_with_data() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unlink_file_with_data);
 
+/// `mkdir` creates a real, navigable, empty directory (nlink 1, listed by the
+/// parent), and `rmdir` removes it — both surviving a remount. Runs on the
+/// `space_cache=v2` fixture (host `btrfs check` in the boot smoke guards on-disk
+/// validity).
+fn smoke_btrfs_mkdir_and_rmdir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    if !matches!(poll_once(vol.root().mkdir("sub")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir failed");
+    }
+
+    // Remount: the directory must be durable, navigable and empty.
+    let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after mkdir failed"),
+    };
+    let root2 = vol2.root();
+    if !dir_names(&root2).iter().any(|n| n == "sub") {
+        return TestResult::Fail("mkdir'd directory not listed");
+    }
+    match poll_once(root2.lookup_dir_async("sub")) {
+        Some(Ok(d)) => {
+            if !dir_names(&d).is_empty() {
+                return TestResult::Fail("new directory is not empty");
+            }
+        }
+        _ => return TestResult::Fail("mkdir'd directory not navigable"),
+    }
+
+    // Remove it and confirm the removal persists.
+    match poll_once(root2.rmdir("sub")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("rmdir failed"),
+    }
+    let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after rmdir failed"),
+    };
+    let root3 = vol3.root();
+    if poll_once(root3.lookup_dir_async("sub")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("directory still present after rmdir");
+    }
+    for want in ["hello.txt", "big.dat"] {
+        if !dir_names(&root3).iter().any(|n| n == want) {
+            return TestResult::Fail("rmdir collaterally removed an entry");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mkdir_and_rmdir);
+
+/// `rmdir` of a non-empty directory is refused (`Busy`), and a file created
+/// inside a `mkdir`'d directory is navigable after a remount (nested write).
+fn smoke_btrfs_rmdir_nonempty_rejected() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let sub = match poll_once(vol.root().mkdir("full")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    if !matches!(poll_once(sub.create("inside.txt")), Some(Ok(_))) {
+        return TestResult::Fail("create inside new directory failed");
+    }
+    // rmdir must refuse a non-empty directory.
+    if !matches!(
+        poll_once(vol.root().rmdir("full")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("rmdir of non-empty directory was not refused");
+    }
+
+    // Remount: the directory and its child are intact.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(vol2.root().lookup_dir_async("full")) {
+        Some(Ok(d)) => {
+            if !dir_names(&d).iter().any(|n| n == "inside.txt") {
+                return TestResult::Fail("nested file missing after remount");
+            }
+        }
+        _ => return TestResult::Fail("directory missing after remount"),
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rmdir_nonempty_rejected);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same

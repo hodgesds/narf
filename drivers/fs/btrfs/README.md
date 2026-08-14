@@ -36,10 +36,11 @@ real laptop's btrfs root looks like.
   single-extent file) that are **fully Linux-interoperable**: the resulting
   filesystem mounts read-write on a real kernel and passes `btrfs check` — see
   below.
-- **Namespace mutations**: `create` (a new empty regular file) and `unlink` (of
-  an unshared regular file, freeing its data extent + checksums), each a COW
-  mini-transaction that keeps the directory `i_size`, back-refs, extent tree and
-  free-space tree consistent — Linux-interoperable and `btrfs check`-clean.
+- **Namespace mutations**: `create` (new empty regular file), `unlink` (of an
+  unshared regular file, freeing its data extent + checksums), `mkdir` (new empty
+  directory) and `rmdir` (of an empty directory), each a COW mini-transaction
+  that keeps the directory `i_size`, back-refs, extent tree and free-space tree
+  consistent — Linux-interoperable and `btrfs check`-clean.
 - Both mount entry points: root auto-mount factory (`fs_detect` → `FsType::Btrfs`)
   and `mount -t btrfs`, including `subvolid=N` / `subvol=NAME` (single-component
   name) to root at a specific subvolume. A plain mount honors the on-disk
@@ -57,9 +58,9 @@ than mis-read:
 - Non-CRC32C checksums (xxhash/sha256/blake2).
 - Writes into a nested subvolume (only the default subvolume is writable);
   xattr *writes*; multi-component `subvol=a/b` paths.
-- `mkdir` / `rmdir` / `rename` / `symlink` / `mknod` / hard-link creation, and
-  `unlink` of a directory, a hardlinked inode (`nlink > 1`), or a name in a
-  hash-colliding `DIR_ITEM`.
+- `rename` / `symlink` / `mknod` / hard-link creation; `unlink` of a hardlinked
+  inode (`nlink > 1`) or a name in a hash-colliding `DIR_ITEM`; `rmdir` of a
+  directory carrying xattrs.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## COW writes — full Linux interop
@@ -68,10 +69,13 @@ than mis-read:
 uncompressed file in the default subvolume that is either **empty** (e.g. freshly
 `create`d — the write allocates its first data extent) or a single-`EXTENT_DATA`
 file (inline, compressed or multi-extent files, and nested-subvolume writes
-return `Unsupported` / `ReadOnly`). `DirOps::create` / `DirOps::unlink` add and
-remove regular files in the default subvolume through the same transaction
-(`unlink` frees the file's data extent + checksums when its last link goes away),
-so `create` + `write` compose into a real new file.
+return `Unsupported` / `ReadOnly`). `DirOps::create` / `unlink` / `mkdir` /
+`rmdir` add and remove regular files and empty directories in the default
+subvolume through the same transaction (`unlink` frees the file's data extent +
+checksums when its last link goes away; `rmdir` refuses a non-empty directory
+with `Busy`), so `create` + `write` compose into a real new file and `mkdir` +
+`create` into a populated subdirectory. btrfs directories carry `nlink == 1`
+(subdirectories are not counted), matching the on-disk convention.
 
 Each write is a genuine copy-on-write **mini-transaction** that produces a
 filesystem a real Linux kernel mounts **read-write** and that `btrfs check`
