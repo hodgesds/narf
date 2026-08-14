@@ -106,20 +106,25 @@ writes → btrfs check "no error found" → both files read back`). Per write it
    generation);
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
-Because the extent leaf must record its own new block, this is only tractable
-when the fs/csum/root/extent (and free-space, if present) trees are each a
-**single leaf** (a fresh small image); larger allocations are pre-computed so the
-transaction is closed-form, sidestepping the delayed-ref loop real btrfs uses.
+The **fs tree may be multi-level**: it is read into one logical leaf, edited, then
+re-packed into as many real `nodesize` leaves as needed under an internal root, so
+a directory or file set can outgrow a single leaf (`btrfs check` validates the
+split tree). Because the extent leaf must record its own new block and the
+csum/root/extent/free-space trees are edited in place, those must each still be a
+**single leaf** (true for a fresh image until many *data* extents accumulate);
+allocations are pre-computed so the transaction stays closed-form, sidestepping
+the delayed-ref loop real btrfs uses.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
 free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds
-(all fail loudly): single-leaf trees only, **no node splitting** (`NoSpace` on a
-full leaf), no new-chunk allocation, no space reclaim (freed logical addresses
-aren't reused), a `FREE_SPACE_BITMAP` block group is out of scope, and a **64 MiB
-superblock mirror** is out of scope for writes (so the 128 MiB laptop-scale
-fixture is read-only). The write-interop guarantee is CI-enforced: `cargo xtask
-test` runs host `btrfs check` on the NARF-written image when `btrfs-progs` is
-available — on both a plain and a `space_cache=v2` image.
+(all fail loudly): the fs tree grows to at most **two levels** (a third →
+`NoSpace`); the csum/extent/root/free-space trees stay single-leaf; no new-chunk
+allocation; no space reclaim (freed logical addresses aren't reused); a
+`FREE_SPACE_BITMAP` block group is out of scope; and a **64 MiB superblock
+mirror** is out of scope for writes (so the 128 MiB laptop-scale fixture is
+read-only). The write-interop guarantee is CI-enforced: `cargo xtask test` runs
+host `btrfs check` on the NARF-written image when `btrfs-progs` is available — on
+both a plain and a `space_cache=v2` image, including a multi-level fs tree.
 
 ## Test fixtures
 

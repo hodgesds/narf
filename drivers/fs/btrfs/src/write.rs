@@ -40,11 +40,17 @@
 //! Result: a real Linux kernel mounts the image read-write, reads the written
 //! file (data-checksum verified) AND writes to it, and `btrfs check` reports no
 //! errors — verified end to end on both a plain image and a `space_cache=v2`
-//! (free-space-tree) image. Bounds: single-leaf trees only (multi-level
-//! → `Unsupported`), no node splitting (`NoSpace` on a full leaf), no new-chunk
-//! allocation, no space reclaim (freed logical addresses aren't reused), extent-
+//! (free-space-tree) image.
+//!
+//! The **fs tree may be multi-level**: it is read into one logical leaf, edited,
+//! then re-packed into as many real leaves as needed under an internal root
+//! (`commit_txn` / [`build_fs_tree`]), so a directory or file set can outgrow a
+//! single leaf. Bounds: the fs tree grows to at most two levels (a third →
+//! `NoSpace`); the csum/extent/root/free-space trees must each still be a single
+//! leaf (they stay small unless data extents proliferate); no new-chunk
+//! allocation; no space reclaim (freed logical addresses aren't reused); extent-
 //! mode free-space tracking only (a `FREE_SPACE_BITMAP` block group is out of
-//! scope), and a 64 MiB superblock mirror is out of scope.
+//! scope); and a 64 MiB superblock mirror is out of scope.
 
 use alloc::vec::Vec;
 
@@ -503,7 +509,9 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let old_data = existing.map(|(d, _)| d); // disk_bytenr of the freed extent
     let old_data_len = existing.map(|(_, l)| l).unwrap_or(0); // disk_num_bytes
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    // The fs tree may be multi-level; read it as one logical leaf. The other
+    // trees must each be a single leaf (they stay small for a fresh image).
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let mut csum_leaf = vol.read_node(old_csum).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
@@ -511,9 +519,9 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         Some(fst) => Some(vol.read_node(fst).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &csum_leaf, &root_leaf, &ext_leaf] {
+    for leaf in [&csum_leaf, &root_leaf, &ext_leaf] {
         if level(leaf)? != 0 {
-            return Err(FsError::Unsupported); // multi-level trees not supported
+            return Err(FsError::Unsupported); // single-leaf csum/extent/root only
         }
     }
     if let Some(fl) = &fst_leaf {
@@ -527,21 +535,8 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         .await?
         .max(vol.alloc_floor());
     let mut alloc = BumpAllocator::new(high_water);
-
-    // Pre-allocate every new block up front so cross-references resolve.
+    // Reserve + write the data extent; commit_txn allocates the metadata nodes.
     let e_data = alloc.alloc_data(vol, disk_len)?;
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_csum = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    // The whole new allocation is contiguous (bump allocator); its span is what
-    // the free-space tree must mark used.
-    let alloc_end = alloc.next();
 
     // ── 3. Write the data extent + its checksums ───────────────────
     let mut payload = buf;
@@ -602,11 +597,12 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
-            csum: Some(CowLeaf::new(csum_leaf, old_csum, n_csum)),
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            fs_content: fs_leaf,
+            fs_old_blocks,
+            csum: Some(CowLeaf::new(csum_leaf, old_csum)),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: old_data.map(|d| (d, old_data_len)).into_iter().collect(),
             new_data: alloc::vec![DataRef {
                 bytenr: e_data,
@@ -615,7 +611,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
                 objectid: ino,
             }],
             data_used_delta: disk_len as i64 - old_data_len as i64,
-            alloc_span: (e_data, alloc_end),
+            data_span_start: Some(e_data),
         },
     )
     .await?;
@@ -624,17 +620,19 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
 
 // ── Shared COW mini-transaction ────────────────────────────────────
 
-/// One tree copied-on-write in a mini-transaction: its fully-edited leaf and the
-/// old (freed) / new (pre-allocated) block addresses.
+/// On-disk size of one internal `struct btrfs_key_ptr` (key + blockptr + gen).
+const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
+
+/// A single-leaf tree copied-on-write: its fully-edited leaf and the old block it
+/// replaces. Its new address is allocated by `commit_txn`.
 struct CowLeaf {
     leaf: Vec<u8>,
     old: u64,
-    new: u64,
 }
 
 impl CowLeaf {
-    fn new(leaf: Vec<u8>, old: u64, new: u64) -> Self {
-        CowLeaf { leaf, old, new }
+    fn new(leaf: Vec<u8>, old: u64) -> Self {
+        CowLeaf { leaf, old }
     }
 }
 
@@ -648,11 +646,18 @@ struct DataRef {
 }
 
 /// The trees a single mutation copies-on-write, plus the data-extent bookkeeping
-/// the extent/free-space trees must reflect. The caller supplies the fully-edited
-/// fs (and, for data changes, csum) leaves; `commit_txn` owns editing the extent,
-/// free-space and root leaves, stamping every node, and flipping the superblock.
+/// the extent/free-space trees must reflect. The fs tree is supplied as one
+/// *logical* leaf (`fs_content`, its first `HEADER_SIZE` bytes a valid fs header
+/// template) that `commit_txn` re-packs into one or more real leaves under an
+/// internal root when it overflows `nodesize`; the csum/extent/root/free-space
+/// trees stay single leaves. `commit_txn` allocates every new metadata block,
+/// edits the extent/free-space/root leaves, stamps every node, and flips the
+/// superblock.
 struct Txn {
-    fs: CowLeaf,
+    /// The fs tree's full item set as one (possibly oversized) logical leaf.
+    fs_content: Vec<u8>,
+    /// Every old fs-tree block (root + internals + leaves) with its level, to free.
+    fs_old_blocks: Vec<(u64, u8)>,
     csum: Option<CowLeaf>,
     ext: CowLeaf,
     root: CowLeaf,
@@ -661,37 +666,205 @@ struct Txn {
     freed_data: Vec<(u64, u64)>,
     /// Data extents whose `EXTENT_ITEM` is added.
     new_data: Vec<DataRef>,
-    /// Net change to the data block group's `used` byte count.
+    /// Net change to the block group's data `used` byte count.
     data_used_delta: i64,
-    /// The contiguous `[start, end)` span of freshly allocated blocks to mark
-    /// used in the free-space tree.
-    alloc_span: (u64, u64),
+    /// Start of the freshly-allocated data span (the free-space tree marks the
+    /// whole `[start, alloc.next())` run used); `None` for a metadata-only edit.
+    data_span_start: Option<u64>,
 }
 
-/// Finalize a mutation: rebuild the extent tree (free every copied tree's old
-/// block + freed data extents, record the new blocks + new data extents, fix the
-/// block group's `used`), maintain the free-space tree, repoint the copied trees'
-/// `ROOT_ITEM`s, stamp and write every node, then flip the superblock last so the
-/// old trees stay intact until the atomic switch.
+/// Pack `items` (key-ordered) into a leaf buffer built on `header` (a
+/// `HEADER_SIZE`-byte fs-node header template), sized to `capacity` bytes so
+/// later `leaf_insert`s have room. Item entries grow from the front, bodies from
+/// the back — the on-disk leaf layout.
+fn pack_leaf(header: &[u8], items: &[(BtrfsKey, &[u8])], capacity: usize) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; capacity];
+    buf[0..HEADER_SIZE].copy_from_slice(&header[0..HEADER_SIZE]);
+    buf[100] = 0; // level 0 (leaf)
+    buf[96..100].copy_from_slice(&(items.len() as u32).to_le_bytes());
+    let mut data_end = capacity - HEADER_SIZE; // data grows down from the end
+    for (i, (key, body)) in items.iter().enumerate() {
+        let off = data_end - body.len();
+        buf[HEADER_SIZE + off..HEADER_SIZE + off + body.len()].copy_from_slice(body);
+        let ie = HEADER_SIZE + i * LEAF_ITEM_SIZE;
+        buf[ie..ie + 8].copy_from_slice(&key.objectid.to_le_bytes());
+        buf[ie + 8] = key.item_type;
+        buf[ie + 9..ie + 17].copy_from_slice(&key.offset.to_le_bytes());
+        buf[ie + 17..ie + 21].copy_from_slice(&(off as u32).to_le_bytes());
+        buf[ie + 21..ie + 25].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        data_end = off;
+    }
+    buf
+}
+
+/// Read every item of the fs tree rooted at `fs_root` (any height) into one
+/// oversized logical leaf (with headroom for a mutation's inserts) plus the list
+/// of every block the tree currently occupies (all freed on rewrite).
+async fn read_fs_oversized<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+) -> Result<(Vec<u8>, Vec<(u64, u8)>), FsError> {
+    // Collect all leaf items in key order.
+    let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(0, 0, 0)).await?;
+    let mut items: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    while let Some((k, data)) = cursor.current()? {
+        items.push((k, data.to_vec()));
+        cursor.advance().await?;
+    }
+    // Collect every block in the tree (root + internals + leaves) with its level
+    // (a skinny METADATA_ITEM key encodes the block's level in its offset).
+    let mut old_blocks: Vec<(u64, u8)> = Vec::new();
+    let mut stack = alloc::vec![fs_root];
+    while let Some(addr) = stack.pop() {
+        let node = vol.read_node(addr).await?;
+        let lvl = level(&node)?;
+        old_blocks.push((addr, lvl));
+        if lvl > 0 {
+            for i in 0..nritems(&node)? as usize {
+                stack.push(btree::internal_blockptr(&node, i)?);
+            }
+        }
+    }
+    // Size the logical leaf to the items plus generous headroom for inserts.
+    let header = vol.read_node(fs_root).await?;
+    let body_total: usize = items.iter().map(|(_, b)| b.len()).sum();
+    let capacity = HEADER_SIZE + items.len() * LEAF_ITEM_SIZE + body_total + 64 * 1024;
+    let refs: Vec<(BtrfsKey, &[u8])> = items.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+    Ok((pack_leaf(&header, &refs, capacity), old_blocks))
+}
+
+/// Re-pack a logical fs leaf into real `nodesize` leaves under an internal root
+/// when it overflows one leaf. Allocates each new block. Returns the new nodes
+/// `(addr, bytes)` (unstamped), the fs-tree root address, and its level (0 or 1).
+/// A tree that would need a third level is out of scope (`NoSpace`).
+#[allow(clippy::type_complexity)]
+fn build_fs_tree<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    logical: &[u8],
+    alloc: &mut BumpAllocator,
+) -> Result<(Vec<(u64, Vec<u8>)>, u64, u8), FsError> {
+    let nodesize = vol.nodesize();
+    let leaf_cap = nodesize - HEADER_SIZE;
+    let n = nritems(logical)? as usize;
+
+    // Greedily group items into leaves that each fit one node.
+    let mut groups: Vec<Vec<(BtrfsKey, Vec<u8>)>> = Vec::new();
+    let mut cur: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    let mut used = 0usize;
+    for i in 0..n {
+        let key = leaf_item_key(logical, i)?;
+        let body = leaf_item_data(logical, i)?.to_vec();
+        let need = LEAF_ITEM_SIZE + body.len();
+        if need > leaf_cap {
+            return Err(FsError::Unsupported); // a single item bigger than a node
+        }
+        if used + need > leaf_cap && !cur.is_empty() {
+            groups.push(core::mem::take(&mut cur));
+            used = 0;
+        }
+        used += need;
+        cur.push((key, body));
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    if groups.is_empty() {
+        groups.push(Vec::new()); // an empty tree keeps one empty leaf
+    }
+
+    let mut nodes = Vec::new();
+    let mut leaf_ptrs: Vec<(BtrfsKey, u64)> = Vec::new();
+    for group in &groups {
+        let addr = alloc.alloc_node(vol)?;
+        let refs: Vec<(BtrfsKey, &[u8])> = group.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+        let leaf = pack_leaf(logical, &refs, nodesize);
+        let first = group
+            .first()
+            .map(|(k, _)| *k)
+            .unwrap_or(BtrfsKey::new(0, 0, 0));
+        leaf_ptrs.push((first, addr));
+        nodes.push((addr, leaf));
+    }
+
+    if leaf_ptrs.len() == 1 {
+        return Ok((nodes, leaf_ptrs[0].1, 0));
+    }
+
+    // Build a level-1 internal root over the leaves.
+    if HEADER_SIZE + leaf_ptrs.len() * KEY_PTR_SIZE > nodesize {
+        return Err(FsError::NoSpace); // would need a third level
+    }
+    let root_addr = alloc.alloc_node(vol)?;
+    let mut root = alloc::vec![0u8; nodesize];
+    root[0..HEADER_SIZE].copy_from_slice(&logical[0..HEADER_SIZE]);
+    root[100] = 1; // level 1 (internal)
+    root[96..100].copy_from_slice(&(leaf_ptrs.len() as u32).to_le_bytes());
+    for (i, (key, addr)) in leaf_ptrs.iter().enumerate() {
+        let kp = HEADER_SIZE + i * KEY_PTR_SIZE;
+        root[kp..kp + 8].copy_from_slice(&key.objectid.to_le_bytes());
+        root[kp + 8] = key.item_type;
+        root[kp + 9..kp + 17].copy_from_slice(&key.offset.to_le_bytes());
+        root[kp + 17..kp + 25].copy_from_slice(&addr.to_le_bytes());
+        // generation@25 is stamped with the txn gen below.
+    }
+    nodes.push((root_addr, root));
+    Ok((nodes, root_addr, 1))
+}
+
+/// Finalize a mutation: rebuild the fs tree (splitting into multiple leaves under
+/// an internal root when it overflows), allocate every new metadata block, rebuild
+/// the extent tree (free every old block + freed data extents, record the new
+/// blocks + new data extents, fix the block group's `used`), maintain the
+/// free-space tree, repoint the copied trees' `ROOT_ITEM`s, stamp and write every
+/// node, then flip the superblock last so the old trees stay intact until the
+/// atomic switch. `alloc` arrives with any data extents already reserved.
 async fn commit_txn<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
-    alloc: BumpAllocator,
+    mut alloc: BumpAllocator,
     mut txn: Txn,
 ) -> Result<(), FsError> {
-    // Every copied tree: (owner root objectid, old block, new block). The extent
-    // tree frees each old block and records each new block; the root tree repoints
-    // each (except the root tree itself, which the superblock names).
-    let mut cowed = alloc::vec![
-        (format::FS_TREE_OBJECTID, txn.fs.old, txn.fs.new),
-        (format::EXTENT_TREE_OBJECTID, txn.ext.old, txn.ext.new),
-        (format::ROOT_TREE_OBJECTID, txn.root.old, txn.root.new),
-    ];
-    if let Some(c) = &txn.csum {
-        cowed.push((format::CSUM_TREE_OBJECTID, c.old, c.new));
+    let nodesize = vol.nodesize() as u64;
+
+    // ── Rebuild the fs tree, then allocate the other trees' new blocks ─
+    let (fs_nodes, fs_root_addr, fs_level) = build_fs_tree(vol, &txn.fs_content, &mut alloc)?;
+    let n_csum = txn
+        .csum
+        .as_ref()
+        .map(|_| alloc.alloc_node(vol))
+        .transpose()?;
+    let n_ext = alloc.alloc_node(vol)?;
+    let n_root = alloc.alloc_node(vol)?;
+    let n_fst = txn
+        .fst
+        .as_ref()
+        .map(|_| alloc.alloc_node(vol))
+        .transpose()?;
+
+    // The free-space tree marks the whole contiguous new run used: data (if any)
+    // sits below the freshly allocated metadata.
+    let span_start = txn.data_span_start.unwrap_or(fs_nodes[0].0);
+    let span_end = alloc.next();
+
+    // Freed metadata `(block, level)` and new metadata `(block, owner, level)`
+    // across every copied tree. A skinny METADATA_ITEM's key offset is the block's
+    // level. The fs tree contributes many of each; the others one each (level 0).
+    let mut freed_meta: Vec<(u64, u8)> = txn.fs_old_blocks.clone();
+    freed_meta.push((txn.ext.old, 0));
+    freed_meta.push((txn.root.old, 0));
+    let mut new_meta: Vec<(u64, u64, u8)> = fs_nodes
+        .iter()
+        .map(|(a, b)| Ok((*a, format::FS_TREE_OBJECTID, level(b)?)))
+        .collect::<Result<_, FsError>>()?;
+    new_meta.push((n_ext, format::EXTENT_TREE_OBJECTID, 0));
+    new_meta.push((n_root, format::ROOT_TREE_OBJECTID, 0));
+    if let (Some(c), Some(n)) = (&txn.csum, n_csum) {
+        freed_meta.push((c.old, 0));
+        new_meta.push((n, format::CSUM_TREE_OBJECTID, 0));
     }
-    if let Some(f) = &txn.fst {
-        cowed.push((format::FREE_SPACE_TREE_OBJECTID, f.old, f.new));
+    if let (Some(f), Some(n)) = (&txn.fst, n_fst) {
+        freed_meta.push((f.old, 0));
+        new_meta.push((n, format::FREE_SPACE_TREE_OBJECTID, 0));
     }
 
     // ── Extent tree: free old blocks + freed data, record new blocks + data ─
@@ -703,10 +876,10 @@ async fn commit_txn<B: BlockDevice + 'static>(
             leaf_delete(&mut txn.ext.leaf, slot)?;
         }
     }
-    for &(_, old, _) in &cowed {
+    for &(old, lvl) in &freed_meta {
         if let Some(slot) = leaf_find(
             &txn.ext.leaf,
-            &BtrfsKey::new(old, format::METADATA_ITEM_KEY, 0),
+            &BtrfsKey::new(old, format::METADATA_ITEM_KEY, u64::from(lvl)),
         )? {
             leaf_delete(&mut txn.ext.leaf, slot)?;
         }
@@ -718,93 +891,105 @@ async fn commit_txn<B: BlockDevice + 'static>(
             &ext_item_data(gen, d.ref_root, d.objectid),
         )?;
     }
-    for &(owner, _, new) in &cowed {
+    for &(new, owner, lvl) in &new_meta {
         leaf_insert_sorted(
             &mut txn.ext.leaf,
-            &BtrfsKey::new(new, format::METADATA_ITEM_KEY, 0),
+            &BtrfsKey::new(new, format::METADATA_ITEM_KEY, u64::from(lvl)),
             &ext_item_meta(gen, owner),
         )?;
     }
-    // Metadata `used` is net-zero (N blocks freed, N allocated); only the data
-    // extents move the needle. Apply to the block group holding the data.
-    if txn.data_used_delta != 0 {
-        let data_addr = txn
-            .new_data
-            .first()
-            .map(|d| d.bytenr)
-            .or_else(|| txn.freed_data.first().map(|f| f.0))
-            .ok_or(FsError::InvalidData)?;
-        block_group_add_used(&mut txn.ext.leaf, data_addr, txn.data_used_delta)?;
+    // Block-group `used` tracks both the data delta and the *net* metadata change
+    // (a split adds nodes, so it is no longer 1:1). Apply to the block group that
+    // holds the freshly-allocated run (mixed block groups: data + metadata share).
+    let meta_used_delta = (new_meta.len() as i64 - freed_meta.len() as i64) * nodesize as i64;
+    let total_used_delta = txn.data_used_delta + meta_used_delta;
+    if total_used_delta != 0 {
+        block_group_add_used(&mut txn.ext.leaf, span_start, total_used_delta)?;
     }
-    stamp_node(&mut txn.ext.leaf, txn.ext.new, gen);
+    stamp_node(&mut txn.ext.leaf, n_ext, gen);
 
     // ── Free-space tree (extent mode): mark the new allocation used, free old ─
     if let Some(fst) = txn.fst.as_mut() {
         let (bg_start, bg_len) =
-            block_group_of(&txn.ext.leaf, txn.alloc_span.0)?.ok_or(FsError::InvalidData)?;
+            block_group_of(&txn.ext.leaf, span_start)?.ok_or(FsError::InvalidData)?;
         fst_mark_used(
             &mut fst.leaf,
             bg_start,
             bg_len,
-            txn.alloc_span.0,
-            txn.alloc_span.1 - txn.alloc_span.0,
+            span_start,
+            span_end - span_start,
         )?;
-        let nodesize = vol.nodesize() as u64;
-        for &(_, old, _) in &cowed {
+        for &(old, _) in &freed_meta {
             fst_mark_free(&mut fst.leaf, bg_start, bg_len, old, nodesize)?;
         }
         for &(bytenr, len) in &txn.freed_data {
             fst_mark_free(&mut fst.leaf, bg_start, bg_len, bytenr, len)?;
         }
-        stamp_node(&mut fst.leaf, fst.new, gen);
+        stamp_node(&mut fst.leaf, n_fst.unwrap(), gen);
     }
 
     // ── Root tree: repoint each copied tree's ROOT_ITEM (not the root tree) ─
     // ROOT_ITEM fields: generation@160, bytenr@176, level@238, generation_v2@239.
-    let stamp_root_item = |ri: &mut [u8], bytenr: u64| {
+    let stamp_root_item = |ri: &mut [u8], bytenr: u64, tree_level: u8| {
         ri[160..168].copy_from_slice(&gen.to_le_bytes());
         ri[176..184].copy_from_slice(&bytenr.to_le_bytes());
-        ri[238] = 0; // all target trees are single leaves (level 0)
+        ri[238] = tree_level;
         if ri.len() >= 247 {
             ri[239..247].copy_from_slice(&gen.to_le_bytes());
         }
     };
-    for &(owner, _, new) in &cowed {
-        if owner == format::ROOT_TREE_OBJECTID {
-            continue;
-        }
+    let mut root_updates = alloc::vec![(format::FS_TREE_OBJECTID, fs_root_addr, fs_level)];
+    root_updates.push((format::EXTENT_TREE_OBJECTID, n_ext, 0));
+    if let Some(n) = n_csum {
+        root_updates.push((format::CSUM_TREE_OBJECTID, n, 0));
+    }
+    if let Some(n) = n_fst {
+        root_updates.push((format::FREE_SPACE_TREE_OBJECTID, n, 0));
+    }
+    for &(owner, new, lvl) in &root_updates {
         let slot = leaf_find_by_type(&txn.root.leaf, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
         let mut ri = leaf_item_data(&txn.root.leaf, slot)?.to_vec();
-        stamp_root_item(&mut ri, new);
+        stamp_root_item(&mut ri, new, lvl);
         leaf_replace_inplace(&mut txn.root.leaf, slot, &ri)?;
     }
-    stamp_node(&mut txn.root.leaf, txn.root.new, gen);
+    stamp_node(&mut txn.root.leaf, n_root, gen);
 
-    // ── Stamp the caller-edited fs (and csum) leaves ───────────────
-    stamp_node(&mut txn.fs.leaf, txn.fs.new, gen);
-    if let Some(c) = txn.csum.as_mut() {
-        stamp_node(&mut c.leaf, c.new, gen);
+    // ── Stamp the fs nodes (and the caller-edited csum leaf) ───────
+    let mut fs_nodes = fs_nodes;
+    for (addr, buf) in fs_nodes.iter_mut() {
+        // An internal node's key-ptr generations are stamped with this txn's gen.
+        if level(buf)? > 0 {
+            let n = nritems(buf)? as usize;
+            for i in 0..n {
+                let g = HEADER_SIZE + i * KEY_PTR_SIZE + format::DISK_KEY_SIZE + 8;
+                buf[g..g + 8].copy_from_slice(&gen.to_le_bytes());
+            }
+        }
+        stamp_node(buf, *addr, gen);
+    }
+    if let (Some(c), Some(n)) = (txn.csum.as_mut(), n_csum) {
+        stamp_node(&mut c.leaf, n, gen);
     }
 
     // ── Write every new node, then flip the superblock last ────────
-    vol.write_logical(txn.fs.new, &txn.fs.leaf).await?;
-    if let Some(c) = &txn.csum {
-        vol.write_logical(c.new, &c.leaf).await?;
+    for (addr, buf) in &fs_nodes {
+        vol.write_logical(*addr, buf).await?;
     }
-    vol.write_logical(txn.ext.new, &txn.ext.leaf).await?;
-    vol.write_logical(txn.root.new, &txn.root.leaf).await?;
-    if let Some(f) = &txn.fst {
-        vol.write_logical(f.new, &f.leaf).await?;
+    if let (Some(c), Some(n)) = (&txn.csum, n_csum) {
+        vol.write_logical(n, &c.leaf).await?;
+    }
+    vol.write_logical(n_ext, &txn.ext.leaf).await?;
+    vol.write_logical(n_root, &txn.root.leaf).await?;
+    if let (Some(f), Some(n)) = (&txn.fst, n_fst) {
+        vol.write_logical(n, &f.leaf).await?;
     }
 
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
-    raw[80..88].copy_from_slice(&txn.root.new.to_le_bytes()); // root
-                                                              // Keep the superblock's `bytes_used@120` in step with the block group's
-                                                              // `used`: metadata is COW-replaced 1:1 (net zero), so only the data delta
-                                                              // moves it. A stale value trips `btrfs check`'s "super bytes used mismatch".
-    let bytes_used = (le64(&raw, 120)? as i64 + txn.data_used_delta) as u64;
+    raw[80..88].copy_from_slice(&n_root.to_le_bytes()); // root
+                                                        // Keep the superblock's `bytes_used@120` in step with the block groups' `used`.
+    let bytes_used = (le64(&raw, 120)? as i64 + total_used_delta) as u64;
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
     let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
     raw[0..4].copy_from_slice(&csum.to_le_bytes());
@@ -815,7 +1000,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     vol.write_superblock(&raw).await?;
 
     vol.set_alloc_floor(alloc.next());
-    vol.commit_roots(txn.root.new, txn.fs.new, gen);
+    vol.commit_roots(n_root, fs_root_addr, gen);
     Ok(())
 }
 
@@ -1057,16 +1242,16 @@ async fn create_node<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
-            return Err(FsError::Unsupported); // multi-level trees not supported
+            return Err(FsError::Unsupported); // single-leaf extent/root only
         }
     }
     if let Some(fl) = &fst_leaf {
@@ -1094,16 +1279,8 @@ async fn create_node<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
 
     // Update the parent dir inode: btrfs directory `i_size` is the sum of entry
     // name lengths, so grow it by this name; bump transid + sequence. Borrow the
@@ -1165,15 +1342,16 @@ async fn create_node<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -1287,14 +1465,14 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -1377,25 +1555,12 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
     // The csum tree is only copied when there are data checksums to remove.
-    let n_csum = if freed_data.is_empty() {
-        None
-    } else {
-        Some(alloc.alloc_node(vol)?)
-    };
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
 
     // Edit the csum leaf: drop each freed extent's checksum item.
-    let csum = if let Some(n_csum) = n_csum {
+    let csum = if !freed_data.is_empty() {
         let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
             .await?
             .0;
@@ -1413,7 +1578,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
                 leaf_delete(&mut csum_leaf, slot)?;
             }
         }
-        Some(CowLeaf::new(csum_leaf, old_csum, n_csum))
+        Some(CowLeaf::new(csum_leaf, old_csum))
     } else {
         None
     };
@@ -1477,15 +1642,16 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -1523,14 +1689,14 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -1601,16 +1767,8 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
 
     // Shrink the parent dir inode by this entry's name (counted twice); bump
     // transid + sequence. The parent's nlink is unchanged (btrfs dirs, nlink 1).
@@ -1653,15 +1811,16 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -1709,14 +1868,14 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -1832,25 +1991,12 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
     // The csum tree is only copied when an overwritten file's checksums go away.
-    let n_csum = if freed_data.is_empty() {
-        None
-    } else {
-        Some(alloc.alloc_node(vol)?)
-    };
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
 
     // Edit the csum leaf: drop the overwritten file's data checksums.
-    let csum = if let Some(n_csum) = n_csum {
+    let csum = if !freed_data.is_empty() {
         let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
             .await?
             .0;
@@ -1868,7 +2014,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
                 leaf_delete(&mut csum_leaf, slot)?;
             }
         }
-        Some(CowLeaf::new(csum_leaf, old_csum, n_csum))
+        Some(CowLeaf::new(csum_leaf, old_csum))
     } else {
         None
     };
@@ -1934,15 +2080,16 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -2022,14 +2169,14 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -2147,23 +2294,10 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_csum = if freed_data.is_empty() {
-        None
-    } else {
-        Some(alloc.alloc_node(vol)?)
-    };
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
 
-    let csum = if let Some(n_csum) = n_csum {
+    let csum = if !freed_data.is_empty() {
         let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
             .await?
             .0;
@@ -2181,7 +2315,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
                 leaf_delete(&mut csum_leaf, slot)?;
             }
         }
-        Some(CowLeaf::new(csum_leaf, old_csum, n_csum))
+        Some(CowLeaf::new(csum_leaf, old_csum))
     } else {
         None
     };
@@ -2249,15 +2383,16 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data,
             new_data: Vec::new(),
             data_used_delta: -(freed_bytes as i64),
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -2302,14 +2437,14 @@ pub async fn link_node<B: BlockDevice + 'static>(
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -2359,16 +2494,8 @@ pub async fn link_node<B: BlockDevice + 'static>(
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
 
     // Bump the linked inode's nlink (in place); stamp its transid.
     let ci_slot = leaf_find(
@@ -2423,15 +2550,16 @@ pub async fn link_node<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await?;
@@ -2473,14 +2601,14 @@ where
         .ok()
         .map(|(r, _)| r);
 
-    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, old_fs).await?;
     let ext_leaf = vol.read_node(old_ext).await?;
     let root_leaf = vol.read_node(old_root).await?;
     let fst_leaf = match old_fst {
         Some(f) => Some(vol.read_node(f).await?),
         None => None,
     };
-    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+    for leaf in [&ext_leaf, &root_leaf] {
         if level(leaf)? != 0 {
             return Err(FsError::Unsupported);
         }
@@ -2495,16 +2623,8 @@ where
     let high_water = extent_high_water(vol, old_ext)
         .await?
         .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
-    let n_fs = alloc.alloc_node(vol)?;
-    let n_ext = alloc.alloc_node(vol)?;
-    let n_root = alloc.alloc_node(vol)?;
-    let n_fst = if old_fst.is_some() {
-        Some(alloc.alloc_node(vol)?)
-    } else {
-        None
-    };
-    let alloc_span = (n_fs, alloc.next());
+    // commit_txn allocates every new metadata block (fs nodes may split).
+    let alloc = BumpAllocator::new(high_water);
 
     edit(&mut fs_leaf, gen)?;
 
@@ -2513,15 +2633,16 @@ where
         gen,
         alloc,
         Txn {
-            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            fs_content: fs_leaf,
+            fs_old_blocks,
             csum: None,
-            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
-            root: CowLeaf::new(root_leaf, old_root, n_root),
-            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            ext: CowLeaf::new(ext_leaf, old_ext),
+            root: CowLeaf::new(root_leaf, old_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap())),
             freed_data: Vec::new(),
             new_data: Vec::new(),
             data_used_delta: 0,
-            alloc_span,
+            data_span_start: None,
         },
     )
     .await

@@ -2020,6 +2020,62 @@ fn smoke_btrfs_xattr_write() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_xattr_write);
 
+/// Creating enough files overflows a single leaf, so the fs tree splits into
+/// multiple leaves under an internal root (level 1). Every file survives a
+/// remount, the tree is genuinely multi-level, and further mutations (unlink)
+/// still work on the split tree.
+fn smoke_btrfs_leaf_split() -> TestResult {
+    use alloc::format;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    const N: usize = 30;
+    for i in 0..N {
+        let name = format!("split-{i:04}.txt");
+        if !matches!(poll_once(vol.root().create(&name)), Some(Ok(_))) {
+            return TestResult::Fail("create failed before the leaf split completed");
+        }
+    }
+
+    // Remount: the fs tree must now be multi-level and hold every file.
+    let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after split failed"),
+    };
+    if vol2.fs_tree_root().1 == 0 {
+        return TestResult::Fail("fs tree did not split to a higher level");
+    }
+    let names = dir_names(&vol2.root());
+    for i in 0..N {
+        if !names.iter().any(|n| n == &format!("split-{i:04}.txt")) {
+            return TestResult::Fail("a file was lost across the leaf split");
+        }
+    }
+    // The originals are intact and a mutation still works on the split tree.
+    if !names.iter().any(|n| n == "hello.txt") || !names.iter().any(|n| n == "big.dat") {
+        return TestResult::Fail("pre-existing entries lost across the split");
+    }
+    match poll_once(vol2.root().unlink("split-0000.txt")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("unlink on the split tree failed"),
+    }
+    let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after split-tree unlink failed"),
+    };
+    if poll_once(vol3.root().lookup_async("split-0000.txt")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("unlinked file present on the split tree");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_leaf_split);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

@@ -2963,6 +2963,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         xf.set_xattr("user.narf", b"kilroy", 0)
                             .await
                             .map_err(|_| ())?;
+                        // Create enough files that the fs tree overflows one leaf
+                        // and splits into a multi-level tree (validated on-disk by
+                        // the post-boot host `btrfs check`).
+                        for i in 0..24u32 {
+                            let name = alloc::format!("narf-split-{i:03}");
+                            root.create(&name).await.map_err(|_| ())?;
+                        }
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink
@@ -2983,6 +2990,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let mut lbuf = [0u8; 16];
                         let ln = link.read(0, &mut lbuf).await.map_err(|_| ())?;
                         root2.lookup_async("narf-null").await.map_err(|_| ())?;
+                        // The last file created after the fs tree split is present.
+                        root2.lookup_async("narf-split-023").await.map_err(|_| ())?;
                         // The moved file left the root and landed in narf-dir.
                         let ndir2 = root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
                         ndir2.lookup_async("narf-moved.txt").await.map_err(|_| ())?;
