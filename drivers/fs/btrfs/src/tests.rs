@@ -2076,6 +2076,59 @@ fn smoke_btrfs_leaf_split() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_leaf_split);
 
+/// Growing the filesystem allocates a new chunk at the end of the device: the
+/// image stays mountable and readable, and files can be created into the new
+/// space, surviving a remount.
+fn smoke_btrfs_grow_add_chunk() -> TestResult {
+    use alloc::format;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    match poll_once(crate::write::grow_add_chunk(&vol)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("grow_add_chunk failed"),
+    }
+    // Create a few files after the grow (their metadata/data can land in the new
+    // chunk) and confirm everything is durable + readable across a remount.
+    for i in 0..4 {
+        if !matches!(
+            poll_once(vol.root().create(&format!("grown-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("create after grow failed");
+        }
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after grow failed"),
+    };
+    // Pre-existing content is intact…
+    match poll_once(vol2.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => {
+            if read_all(&f, 16).as_deref() != Some(b"narf\n") {
+                return TestResult::Fail("hello.txt content wrong after grow");
+            }
+        }
+        _ => return TestResult::Fail("hello.txt missing after grow"),
+    }
+    // …and the new files are present.
+    let names = dir_names(&vol2.root());
+    for i in 0..4 {
+        if !names.iter().any(|n| n == &format!("grown-{i}.txt")) {
+            return TestResult::Fail("a post-grow file was lost");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_grow_add_chunk);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

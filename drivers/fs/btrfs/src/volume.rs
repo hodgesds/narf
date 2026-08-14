@@ -481,6 +481,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.superblock.generation = new_generation;
         g.fs_tree_root = new_fs_root;
     }
+
+    /// Register a freshly-allocated chunk's `logical→physical` mapping so writes
+    /// and reads can reach it (used by the chunk-growth path).
+    pub fn add_chunk_mapping(&self, logical: u64, length: u64, devid: u64, physical: u64) {
+        self.state
+            .lock()
+            .chunk_map
+            .add_entry(logical, length, devid, physical);
+    }
+
+    /// After a chunk-growth commit, publish the new chunk-tree + root-tree roots
+    /// and generation into the live superblock.
+    pub fn commit_chunk_root(&self, new_chunk_root: u64, new_root_tree: u64, new_generation: u64) {
+        let mut g = self.state.lock();
+        g.superblock.chunk_root = new_chunk_root;
+        g.superblock.root = new_root_tree;
+        g.superblock.generation = new_generation;
+    }
 }
 
 /// Write `src` at physical byte offset `offset`, one logical block at a time,

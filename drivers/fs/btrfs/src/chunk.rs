@@ -57,6 +57,27 @@ impl ChunkMap {
         self.entries.is_empty()
     }
 
+    /// Register a freshly-allocated chunk mapping (the chunk-growth path adds one
+    /// SINGLE-profile chunk on one device).
+    pub fn add_entry(&mut self, logical_start: u64, length: u64, devid: u64, physical: u64) {
+        self.entries.push(ChunkMapEntry {
+            logical_start,
+            length,
+            devid,
+            physical,
+        });
+    }
+
+    /// The highest `logical_start + length` across all mapped chunks — the next
+    /// free logical address for a new chunk.
+    pub fn logical_end(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|e| e.logical_start.saturating_add(e.length))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Translate a logical address to a physical device offset. Returns
     /// `NotFound` if no chunk covers it.
     pub fn map_logical(&self, logical: u64) -> Result<u64, FsError> {

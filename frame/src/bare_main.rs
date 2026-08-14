@@ -2970,6 +2970,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             let name = alloc::format!("narf-split-{i:03}");
                             root.create(&name).await.map_err(|_| ())?;
                         }
+                        // Grow the filesystem by one chunk (a fresh concrete mount;
+                        // its chunk/device/extent/block-group/free-space accounting
+                        // is validated on-disk by the post-boot host `btrfs check`).
+                        drop(fs);
+                        {
+                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
+                                narf_block::SyncBlock::new(dev.clone()),
+                                narf_lib::id::DomainId::DRIVER_0,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                .await
+                                .map_err(|_| ())?;
+                        }
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink

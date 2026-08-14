@@ -47,6 +47,12 @@ pub const FS_TREE_OBJECTID: u64 = 5;
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// Device tree (holds `DEV_ITEM` + `DEV_EXTENT`).
+pub const DEV_TREE_OBJECTID: u64 = 4;
+/// Objectid every `DEV_ITEM`/`DEV_EXTENT` shares (`BTRFS_DEV_ITEMS_OBJECTID`).
+pub const DEV_ITEMS_OBJECTID: u64 = 1;
+/// Objectid every chunk lives under (`BTRFS_FIRST_CHUNK_TREE_OBJECTID`).
+pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// Free-space tree (`space_cache=v2`).
 pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 /// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
@@ -71,6 +77,8 @@ pub const EXTENT_ITEM_KEY: u8 = 168;
 /// Skinny-metadata tree-block extent record; length is `nodesize`.
 pub const METADATA_ITEM_KEY: u8 = 169;
 pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
+pub const DEV_EXTENT_KEY: u8 = 204;
+pub const DEV_ITEM_KEY: u8 = 216;
 pub const FREE_SPACE_INFO_KEY: u8 = 198;
 pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const FREE_SPACE_BITMAP_KEY: u8 = 200;

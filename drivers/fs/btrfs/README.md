@@ -115,6 +115,18 @@ csum/root/extent/free-space trees are edited in place, those must each still be 
 allocations are pre-computed so the transaction stays closed-form, sidestepping
 the delayed-ref loop real btrfs uses.
 
+**Chunk growth** (`write::grow_add_chunk`) allocates one new mixed
+(DATA|METADATA, SINGLE) chunk at the end of the device, threading the change
+through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
+`DEV_EXTENT`), extent tree (new `BLOCK_GROUP_ITEM`), free-space tree, and root
+tree in one COW mini-transaction — so a real kernel mounts the grown image
+read-write with the extra space and `btrfs check` reports it clean. The new
+chunk-tree leaf is kept in the system chunk so it stays reachable via
+`sys_chunk_array` at mount. It is a standalone operation (not yet auto-triggered
+from the write allocator's `NoSpace`), and writing an allocation that *crosses*
+the new chunk boundary needs per-block-group `used` accounting the single-chunk
+write path doesn't yet do.
+
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
 free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds
 (all fail loudly): the fs tree grows to at most **two levels** (a third →
