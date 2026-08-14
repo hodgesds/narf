@@ -47,6 +47,8 @@ pub const FS_TREE_OBJECTID: u64 = 5;
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// Free-space tree (`space_cache=v2`).
+pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 /// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
 pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
 /// First object id available to files/dirs; also the fs-tree root directory.
@@ -66,6 +68,9 @@ pub const EXTENT_ITEM_KEY: u8 = 168;
 /// Skinny-metadata tree-block extent record; length is `nodesize`.
 pub const METADATA_ITEM_KEY: u8 = 169;
 pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
+pub const FREE_SPACE_INFO_KEY: u8 = 198;
+pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
+pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
 // ── File-extent item types (`btrfs_file_extent_item.type`) ─────────

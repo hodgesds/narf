@@ -74,22 +74,27 @@ writes → btrfs check "no error found" → both files read back`). Per write it
    metadata blocks, records the new data extent (`EXTENT_DATA_REF`) and every new
    metadata block (skinny `METADATA_ITEM` + `TREE_BLOCK_REF`), and fixes the block
    group's `used`;
-4. rebuilds the root leaf (FS/CSUM/EXTENT `ROOT_ITEM`s repointed, incl.
+4. on a `space_cache=v2` image, rebuilds the **free-space tree** leaf — marks the
+   new extent's range used and returns the freed blocks to free space, merging
+   with neighbours but never across a block-group boundary;
+5. rebuilds the root leaf (FS/CSUM/EXTENT/FREE_SPACE `ROOT_ITEM`s repointed, incl.
    generation);
-5. writes a fresh superblock (generation + 1) last, atomically switching.
+6. writes a fresh superblock (generation + 1) last, atomically switching.
 
 Because the extent leaf must record its own new block, this is only tractable
-when the fs/csum/root/extent trees are each a **single leaf** (a fresh small
-image); larger allocations are pre-computed so the transaction is closed-form,
-sidestepping the delayed-ref loop real btrfs uses.
+when the fs/csum/root/extent (and free-space, if present) trees are each a
+**single leaf** (a fresh small image); larger allocations are pre-computed so the
+transaction is closed-form, sidestepping the delayed-ref loop real btrfs uses.
 
-Bounds (all fail loudly): single-leaf trees only, **no node splitting**
-(`NoSpace` on a full leaf), no new-chunk allocation, no space reclaim
-(freed logical addresses aren't reused), and images with a **free-space tree**
-(`space_cache=v2`) or a **64 MiB superblock mirror** are out of scope for writes
-(so the laptop-scale fixture is read-only). The write-interop guarantee is
-CI-enforced: `cargo xtask test` runs host `btrfs check` on the NARF-written image
-when `btrfs-progs` is available.
+Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
+free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds
+(all fail loudly): single-leaf trees only, **no node splitting** (`NoSpace` on a
+full leaf), no new-chunk allocation, no space reclaim (freed logical addresses
+aren't reused), a `FREE_SPACE_BITMAP` block group is out of scope, and a **64 MiB
+superblock mirror** is out of scope for writes (so the 128 MiB laptop-scale
+fixture is read-only). The write-interop guarantee is CI-enforced: `cargo xtask
+test` runs host `btrfs check` on the NARF-written image when `btrfs-progs` is
+available — on both a plain and a `space_cache=v2` image.
 
 ## Test fixtures
 
@@ -99,9 +104,11 @@ when `btrfs-progs` is available.
 same tree — `hello.txt` (with a `user.narf` xattr), `big.dat`, `subdir/note.txt`,
 `link.txt` (a symlink), and `snap/inside.txt` where `snap` is a nested
 subvolume. `fixture-manyfiles.img.sparse` is a separate 32 MiB image of 400
-small files whose FS tree spans multiple b-tree levels. The kernel tests
-reconstruct the full zero-filled image at runtime and mount it under a
-`RamBlockDevice`.
+small files whose FS tree spans multiple b-tree levels.
+`fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
+a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
+tree maintenance. The kernel tests reconstruct the full zero-filled image at
+runtime and mount it under a `RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:

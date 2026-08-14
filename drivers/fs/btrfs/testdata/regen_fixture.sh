@@ -16,6 +16,9 @@
 #   fixture-lzo.img.sparse   --compress lzo (exercises the LZO read path)
 #   fixture-manyfiles.img.sparse  400 files -> a multi-level FS b-tree
 #   fixture-defaultsubvol.img.sparse  default subvolume set to `def`
+#   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
+#                            (space_cache=v2); exercises the write path's
+#                            free-space-tree maintenance
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
 # big.dat (12000 B -> regular extents), subdir/note.txt, link.txt (a symlink to
@@ -108,11 +111,29 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imglzo" >/dev/null
 sparse_encode "$imglzo" fixture-lzo.img.sparse
 
+# Same small mixed layout as the base fixture but WITH the free-space tree
+# (space_cache=v2) enabled (btrfs-progs default; only `^no-holes` is overridden).
+# A minimal staging tree (hello.txt + big.dat, no subvolumes/specials) keeps the
+# fs/csum/extent/root/free-space trees each a single leaf so the COW write path —
+# including its free-space-tree maintenance — is exercised, and the NARF-written
+# image stays `btrfs check`-clean for a real Linux kernel.
+imgfst="$(mktemp)"
+fststage="$(mktemp -d)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage"' EXIT
+printf 'narf\n' > "$fststage/hello.txt"
+python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
+    > "$fststage/big.dat"
+truncate -s 16M "$imgfst"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^no-holes --rootdir "$fststage" "$imgfst" >/dev/null
+btrfs check "$imgfst" >/dev/null
+sparse_encode "$imgfst" fixture-fst.img.sparse
+
 # A tiny image whose default subvolume is set to `def` (not FS_TREE), so a plain
 # mount must land inside `def` rather than at the top-level FS_TREE.
 defstage="$(mktemp -d)"
 imgdef="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef"' EXIT
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage" "$defstage" "$imgdef"' EXIT
 mkdir -p "$defstage/def"
 printf 'root file\n' > "$defstage/rootfile.txt"
 printf 'default subvol file\n' > "$defstage/def/dfile.txt"
@@ -130,7 +151,7 @@ sparse_encode "$imgdef" fixture-defaultsubvol.img.sparse
 # a real laptop's btrfs root looks like. Non-mixed btrfs has a ~128 MiB floor.
 labstage="$(mktemp -d)"
 imglab="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
 mkdir -p "$labstage/root/etc" "$labstage/home/user"
 printf 'NAME="NARF Laptop"\nID=narf\n' > "$labstage/root/etc/os-release"
 printf 'root subvol file\n' > "$labstage/root/rootfile.txt"
@@ -148,7 +169,7 @@ sparse_encode "$imglab" fixture-laptop.img.sparse
 # cursor advance. Needs a 32 MiB image for the extra metadata.
 many="$(mktemp -d)"
 imgmany="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab"' EXIT
 python3 -c "
 for i in range(400):
     open('$many/file%03d.txt'%i,'w').write('content-of-file-%03d\n'%i)
@@ -159,4 +180,4 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgmany" >/dev/null
 sparse_encode "$imgmany" fixture-manyfiles.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-defaultsubvol,-manyfiles,-laptop}.img.sparse"
+echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop}.img.sparse"

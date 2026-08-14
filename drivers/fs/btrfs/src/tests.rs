@@ -46,6 +46,10 @@ const FIXTURE_DEFAULTSUBVOL_SPARSE: &[u8] =
 /// metadata), with `root` (default) + `home` subvolumes.
 const FIXTURE_LAPTOP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-laptop.img.sparse");
 
+/// Same small mixed layout as the primary fixture but WITH a free-space tree
+/// (`space_cache=v2`); exercises the write path's free-space-tree maintenance.
+const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -1104,6 +1108,110 @@ fn smoke_btrfs_write_extent_accounting() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
+
+// ── Free-space tree (space_cache=v2) write maintenance ─────────────
+
+/// Every `FREE_SPACE_EXTENT` `(start, len)` in the volume's free-space tree.
+/// The fixture's block groups are small enough to be tracked in extent mode
+/// (no `FREE_SPACE_BITMAP` items), which is the only mode the write path emits.
+fn fst_free_extents(vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>) -> Option<Vec<(u64, u64)>> {
+    let (root_tree, _) = vol.root_tree_root();
+    let (fst_root, _) = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::FREE_SPACE_TREE_OBJECTID,
+    ))?
+    .ok()?;
+    let start = BtrfsKey::new(0, format::FREE_SPACE_EXTENT_KEY, 0);
+    let mut cursor = poll_once(btree::Cursor::seek(vol, fst_root, &start))?.ok()?;
+    let mut out = Vec::new();
+    while let Some((key, _)) = cursor.current().ok()? {
+        if key.item_type == format::FREE_SPACE_EXTENT_KEY {
+            out.push((key.objectid, key.offset));
+        }
+        poll_once(cursor.advance())?.ok()?;
+    }
+    Some(out)
+}
+
+/// Whether `[start, start+len)` lies entirely within a single free extent.
+fn fst_range_is_free(free: &[(u64, u64)], start: u64, len: u64) -> bool {
+    free.iter()
+        .any(|&(s, l)| s <= start && start.saturating_add(len) <= s.saturating_add(l))
+}
+
+/// After a COW write on a `space_cache=v2` image, the free-space tree must track
+/// the allocation: the new data extent's range is no longer free, and the old
+/// extent's range is freed. This is what keeps the free-space tree valid so a
+/// real Linux kernel mounts the image read-write without rebuilding it (host
+/// `btrfs check` regression-guards the same property where btrfs-progs exists).
+fn smoke_btrfs_write_fst_maintenance() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let ino = big.ino();
+    let old_extent = match file_data_extent(&vol, ino) {
+        Some(e) => e,
+        None => return TestResult::Fail("could not read big.dat's extent"),
+    };
+    // Pre-write: the old extent's range is allocated (not free) in the FST.
+    let pre_free = match fst_free_extents(&vol) {
+        Some(f) => f,
+        None => return TestResult::Fail("free-space tree not found (is this a v2 image?)"),
+    };
+    if fst_range_is_free(&pre_free, old_extent.0, old_extent.1) {
+        return TestResult::Fail("live extent marked free in FST before write");
+    }
+
+    if !matches!(poll_once(big.write(0, &replacement_big())), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+
+    // Remount from disk and inspect the free-space tree.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after write failed"),
+    };
+    let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup failed"),
+    };
+    let new_extent = match file_data_extent(&vol2, big2.ino()) {
+        Some(e) => e,
+        None => return TestResult::Fail("could not read new extent"),
+    };
+    if new_extent.0 == old_extent.0 {
+        return TestResult::Fail("extent was not COWed to a new location");
+    }
+    let post_free = match fst_free_extents(&vol2) {
+        Some(f) => f,
+        None => return TestResult::Fail("free-space tree missing after write"),
+    };
+    // The new extent is now allocated (carved out of a free extent)…
+    if fst_range_is_free(&post_free, new_extent.0, new_extent.1) {
+        return TestResult::Fail("new extent still marked free in FST");
+    }
+    // …and the old extent's range has been returned to the free-space tree.
+    if !fst_range_is_free(&post_free, old_extent.0, old_extent.1) {
+        return TestResult::Fail("old extent not freed in FST");
+    }
+    // Content round-trips through the FST-maintaining write path.
+    match read_all(&big2, replacement_big().len() + 16) {
+        Some(got) if got == replacement_big() => TestResult::Pass,
+        _ => TestResult::Fail("content mismatch after FST write"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_fst_maintenance);
 
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
