@@ -2224,11 +2224,13 @@ fn smoke_btrfs_grow_add_chunk() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_grow_add_chunk);
 
-/// Sustained space pressure auto-grows the filesystem: repeatedly overwriting a
-/// file (the bump allocator never reuses freed space) exhausts the initial
-/// chunks, and `FileOps::write` transparently grows the filesystem and retries.
-/// Every write succeeds, the chunk count rises, and the final content is durable.
-fn smoke_btrfs_autogrow() -> TestResult {
+/// Space reclaim: on an image with a free-space tree, repeatedly overwriting a
+/// file reuses the space freed by the previous overwrite (each write allocates a
+/// fresh extent + COWs whole trees, then frees the old blocks), so the free pool
+/// stays roughly constant and the filesystem does **not** grow — proving freed
+/// logical addresses are reclaimed rather than leaked. Every write succeeds and
+/// the final content is durable across a remount.
+fn smoke_btrfs_space_reclaim() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
 
@@ -2243,33 +2245,34 @@ fn smoke_btrfs_autogrow() -> TestResult {
         _ => return TestResult::Fail("lookup big.dat failed"),
     };
     let payload = replacement_big();
-    // ~150 overwrites (~32 KB churn each) runs past the ~3 MB of initial data
-    // chunks, forcing at least one auto-grow, with headroom before the device end.
+    // Far more churn (~32 KB each) than the initial data chunk holds: without
+    // reclaim this exhausted the chunk and forced a grow; with reclaim the freed
+    // space is reused every time, so no grow is needed.
     for _ in 0..150 {
         match poll_once(big.write(0, &payload)) {
             Some(Ok(n)) if n == payload.len() => {}
             _ => return TestResult::Fail("a write failed under space pressure"),
         }
     }
-    if vol.chunk_map_len() <= chunks_before {
-        return TestResult::Fail("filesystem did not auto-grow");
+    if vol.chunk_map_len() != chunks_before {
+        return TestResult::Fail("filesystem grew despite reclaimable free space");
     }
 
-    // The content is durable across a remount of the grown image.
+    // The content is durable across a remount.
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
-        _ => return TestResult::Fail("remount after auto-grow failed"),
+        _ => return TestResult::Fail("remount failed"),
     };
     match poll_once(vol2.root().lookup_async("big.dat")) {
         Some(Ok(f)) => match read_all(&f, payload.len() + 16) {
             Some(got) if got == payload => TestResult::Pass,
-            _ => TestResult::Fail("content wrong after auto-grow"),
+            _ => TestResult::Fail("content wrong after reclaim churn"),
         },
-        _ => TestResult::Fail("big.dat missing after auto-grow"),
+        _ => TestResult::Fail("big.dat missing after reclaim churn"),
     }
 }
 
-kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_autogrow);
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_space_reclaim);
 
 /// Read the 4096-byte superblock copy at physical byte `offset` from a device.
 fn read_super_at(dev: &WritableSparseDevice, offset: u64) -> Vec<u8> {
@@ -2403,13 +2406,11 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("mirror fixture failed to mount"),
     };
-    let chunks_before = vol.chunk_map_len();
-
-    // No pre-grow: the churn below never reuses freed space and COWs whole trees,
-    // so it exhausts the initial chunk and triggers `grow_add_chunk` *after* the
-    // extent/free-space trees have split — exercising chunk growth on a multi-leaf
-    // filesystem. Each file gets a distinct byte pattern so cross-file corruption
-    // is caught.
+    // Create N distinct files, each with a multi-sector data extent, so the
+    // EXTENT and CSUM trees both overflow a single leaf. Freed metadata is
+    // reclaimed each write, so the live data (all N extents) fits the initial
+    // chunk without a grow. Each file gets a distinct byte pattern so cross-file
+    // corruption is caught.
     for i in 0..N {
         let name = alloc::format!("d{i:03}.dat");
         let f = match poll_once(vol.root().create(&name)) {
@@ -2423,18 +2424,22 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
         }
     }
 
-    // The churn must have both split the trees and grown the filesystem — i.e.
-    // at least one grow ran with the extent/free-space trees already multi-leaf.
-    if vol.chunk_map_len() <= chunks_before {
-        return TestResult::Fail("filesystem did not grow under multi-leaf churn");
-    }
-
     // Both the extent and csum trees must have outgrown a single leaf.
     if tree_level(&vol, format::EXTENT_TREE_OBJECTID) != Some(1) {
         return TestResult::Fail("extent tree did not become multi-leaf");
     }
     if tree_level(&vol, format::CSUM_TREE_OBJECTID) != Some(1) {
         return TestResult::Fail("csum tree did not become multi-leaf");
+    }
+
+    // Grow the filesystem now that its trees are multi-leaf — chunk growth must
+    // work on a multi-leaf filesystem.
+    let chunks_before = vol.chunk_map_len();
+    if !matches!(poll_once(crate::write::grow_add_chunk(&vol)), Some(Ok(()))) {
+        return TestResult::Fail("grow_add_chunk failed on a multi-leaf filesystem");
+    }
+    if vol.chunk_map_len() <= chunks_before {
+        return TestResult::Fail("multi-leaf grow did not add a chunk");
     }
 
     // Remount and read every file back through the now-split trees.

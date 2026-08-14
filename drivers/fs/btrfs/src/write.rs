@@ -47,10 +47,13 @@
 //! [`grow_add_chunk`] via [`pack_tree_at`]), so a file / directory / extent /
 //! checksum set can outgrow a single leaf — as it does on a laptop-scale root —
 //! and chunk growth works even when those trees have already split (its new
-//! chunk-tree blocks stay in the system chunk). Bounds: each tree grows to at most
-//! two levels (a third → `NoSpace`); no space reclaim (freed logical addresses
-//! aren't reused); extent-mode free-space tracking only (a `FREE_SPACE_BITMAP`
-//! block group is out of scope). Every superblock copy is updated in lockstep, so
+//! chunk-tree blocks stay in the system chunk). On an image with a free-space
+//! tree, **space is reclaimed**: the allocator ([`Allocator`]) carves new extents
+//! / nodes from the tree's free ranges (skipping system block groups), so blocks
+//! freed by earlier transactions are reused instead of leaked. Bounds: each tree
+//! grows to at most two levels (a third → `NoSpace`); extent-mode free-space
+//! tracking only (a `FREE_SPACE_BITMAP` block group is out of scope). Every
+//! superblock copy is updated in lockstep, so
 //! images large enough to carry the 64 MiB / 256 GiB mirrors stay `btrfs
 //! check`-clean, and a grown chunk is placed clear of the mirror bands
 //! (`chunk_span_avoiding_supers`).
@@ -60,7 +63,7 @@ use alloc::vec::Vec;
 use narf_block::BlockDevice;
 use narf_filesystem::FsError;
 
-use crate::allocator::{extent_high_water, BumpAllocator};
+use crate::allocator::Allocator;
 use crate::btree::{
     self, leaf_item_data, leaf_item_key, leaf_item_span, leaf_lower_bound, level, nritems,
     HEADER_SIZE,
@@ -459,7 +462,6 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
     let (fs_root, _fs_level) = vol.fs_tree_root();
-    let (root_tree, _root_level) = vol.root_tree_root();
 
     // A zero-byte write changes nothing.
     if data.is_empty() {
@@ -516,9 +518,6 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     buf[o..o + data.len()].copy_from_slice(data);
 
     // ── 2. Set up the mini-transaction ─────────────────────────────
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let old_data = existing.map(|(d, _)| d); // disk_bytenr of the freed extent
     let old_data_len = existing.map(|(_, l)| l).unwrap_or(0); // disk_num_bytes
 
@@ -528,10 +527,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    let mut alloc = BumpAllocator::new(high_water);
+    let mut alloc = Allocator::build(vol).await?;
     // Reserve + write the data extent; commit_txn allocates the metadata nodes.
     let e_data = alloc.alloc_data(vol, disk_len)?;
 
@@ -777,7 +773,7 @@ fn pack_tree_at<B: BlockDevice + 'static>(
 
 /// Allocate `n` tree nodes, returning their addresses in allocation order.
 fn alloc_nodes<B: BlockDevice + 'static>(
-    alloc: &mut BumpAllocator,
+    alloc: &mut Allocator,
     vol: &BtrfsVolume<B>,
     n: usize,
 ) -> Result<Vec<u64>, FsError> {
@@ -833,7 +829,7 @@ fn collect_tree_meta(addrs: &[u64], leaves: usize, owner: u64, out: &mut Vec<(u6
 /// free-space tree) needs depends on how many blocks the transaction allocates —
 /// which depends on those leaf counts. `commit_txn` resolves this with a **fixed
 /// point**: it re-hands-out every tree-node address from the same base each
-/// iteration (`BumpAllocator::reset`), rebuilds the extent/free-space content, and
+/// iteration (`Allocator::restore`), rebuilds the extent/free-space content, and
 /// repeats until their leaf counts stabilise; only the converged addresses are
 /// written. This replaces the delayed-ref loop real btrfs uses. Fixed set of
 /// block groups (no chunk allocation here — the caller grows and retries on
@@ -841,7 +837,7 @@ fn collect_tree_meta(addrs: &[u64], leaves: usize, owner: u64, out: &mut Vec<(u6
 async fn commit_txn<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
-    mut alloc: BumpAllocator,
+    mut alloc: Allocator,
     txn: Txn,
 ) -> Result<(), FsError> {
     let nodesize = vol.nodesize() as u64;
@@ -960,7 +956,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     freed_meta.extend(fst_old);
 
     // ── Metadata fixed point over the extent/free-space leaf counts ────
-    let base = alloc.next();
+    let base = alloc.snapshot();
     let fs_nc = tree_node_count(&fs_groups);
     let csum_nc = csum_groups.as_ref().map_or(0, |g| tree_node_count(g));
     let root_nc = tree_node_count(&root_groups);
@@ -982,7 +978,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let mut converged: Option<Converged> = None;
 
     for _ in 0..8 {
-        alloc.reset(base);
+        alloc.restore(&base);
         let fs_addrs = alloc_nodes(&mut alloc, vol, fs_nc)?;
         let csum_addrs = alloc_nodes(&mut alloc, vol, csum_nc)?;
         let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
@@ -1191,7 +1187,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
     vol.flush().await; // data + metadata durable before the superblock flip
     vol.write_superblock(&raw).await?;
 
-    vol.set_alloc_floor(alloc.next());
+    if let Some(f) = alloc.floor() {
+        vol.set_alloc_floor(f);
+    }
     vol.commit_roots(root_root_addr, fs_root_addr, gen);
     Ok(())
 }
@@ -1422,10 +1420,6 @@ async fn create_node<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _fs_level) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // The name's `DIR_ITEM` key must be free: an existing key means either the
@@ -1444,11 +1438,7 @@ async fn create_node<B: BlockDevice + 'static>(
     let new_ino = next_inode_number(&fs_leaf)?;
     let new_index = next_dir_index(&fs_leaf, parent_ino)?;
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // Update the parent dir inode: btrfs directory `i_size` is the sum of entry
     // name lengths, so grow it by this name; bump transid + sequence. Borrow the
@@ -1617,10 +1607,6 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the name to a single, non-colliding directory entry.
@@ -1692,11 +1678,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     let freed_bytes: u64 = freed_data.iter().map(|&(_, l)| l).sum();
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // A surviving inode keeps its INODE_ITEM with `nlink` decremented (in place).
     if !last_link {
@@ -1788,10 +1770,6 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the name to a single, non-colliding directory entry.
@@ -1851,11 +1829,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     }
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // Shrink the parent dir inode by this entry's name (counted twice); bump
     // transid + sequence. The parent's nlink is unchanged (btrfs dirs, nlink 1).
@@ -1939,10 +1913,6 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source to a single, non-colliding entry.
@@ -2047,11 +2017,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let new_index = next_dir_index(&fs_leaf, parent_ino)?;
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // Adjust the parent dir `i_size` (each name counts twice: DIR_ITEM +
     // DIR_INDEX); bump transid + sequence. A plain rename swaps old→new name; an
@@ -2187,10 +2153,6 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source in the old parent.
@@ -2297,11 +2259,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     let new_index = next_dir_index(&fs_leaf, new_parent)?;
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // Update both parents' `i_size` in place (same-size replace, no slot shift):
     // the old parent loses the source name; the new parent gains it (net zero on
@@ -2404,10 +2362,6 @@ pub async fn link_node<B: BlockDevice + 'static>(
     }
 
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     // Resolve the source; hard links to directories are forbidden.
@@ -2446,11 +2400,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
 
     let new_index = next_dir_index(&fs_leaf, target_parent)?;
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     // Bump the linked inode's nlink (in place); stamp its transid.
     let ci_slot = leaf_find(
@@ -2540,18 +2490,10 @@ where
     F: FnOnce(&mut Vec<u8>, u64) -> Result<(), FsError>,
 {
     let (fs_root, _) = vol.fs_tree_root();
-    let (root_tree, _) = vol.root_tree_root();
-    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
-        .await?
-        .0;
     let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
 
     let gen = vol.superblock().generation + 1;
-    let high_water = extent_high_water(vol, old_ext)
-        .await?
-        .max(vol.alloc_floor());
-    // commit_txn allocates every new metadata block (fs nodes may split).
-    let alloc = BumpAllocator::new(high_water);
+    let alloc = Allocator::build(vol).await?;
 
     edit(&mut fs_leaf, gen)?;
 

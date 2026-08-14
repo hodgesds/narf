@@ -137,7 +137,14 @@ growth is **auto-triggered**: when a mutation's allocation runs out of chunk spa
 transparently keep succeeding until the device itself is full.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
-free-space tree leaf is maintained in lockstep (extent-mode tracking only).
+free-space tree is maintained in lockstep (extent-mode tracking only). On such an
+image **space is reclaimed** — the allocator carves each new data extent / tree
+node from the free-space tree's free ranges (first-fit, lowest address first,
+skipping *system* block groups, which are reserved for the chunk tree), so blocks
+freed by earlier transactions are reused instead of leaked. Blocks freed by the
+*current* transaction are not yet in the tree, so they stay unavailable until it
+commits — preserving COW. (Without a free-space tree the allocator falls back to
+appending past the extent-tree high-water; freed space is then not reused.)
 
 Every **superblock copy** is rewritten on each commit: btrfs keeps up to three
 (the primary at 64 KiB, then mirrors at 64 MiB and 256 GiB), and a real kernel
@@ -149,8 +156,8 @@ placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
 Bounds (all fail loudly): each tree grows to at most **two levels** (a third →
-`NoSpace`); no space reclaim (freed logical addresses aren't reused); and a
-`FREE_SPACE_BITMAP` block group is out of scope. The write-interop guarantee is
+`NoSpace`), and a `FREE_SPACE_BITMAP` block group is out of scope. The
+write-interop guarantee is
 CI-enforced: `cargo xtask test` runs host `btrfs check` on the NARF-written image
 when `btrfs-progs` is available — on a plain image, a `space_cache=v2` image
 (including a multi-level fs tree), and a **96 MiB image carrying the 64 MiB
