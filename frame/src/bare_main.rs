@@ -2946,6 +2946,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         root.link("narf-renamed.txt", "narf-hardlink.txt")
                             .await
                             .map_err(|_| ())?;
+                        // Hard-link then unlink one name: the survivor drops to
+                        // nlink 1 and keeps the inode (hardlink-aware unlink).
+                        let hlt = root.create("narf-hltest.txt").await.map_err(|_| ())?;
+                        hlt.write(0, MARKER).await.map_err(|_| ())?;
+                        root.link("narf-hltest.txt", "narf-hlalias.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        root.unlink("narf-hltest.txt").await.map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink
@@ -2976,13 +2984,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             .map_err(|_| ())?;
                         let mut hbuf = [0u8; MARKER.len()];
                         let hn = hl.read(0, &mut hbuf).await.map_err(|_| ())?;
+                        // The hard-link-unlink survivor still holds the content.
+                        let alias = root2
+                            .lookup_async("narf-hlalias.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        let mut abuf = [0u8; MARKER.len()];
+                        let an = alias.read(0, &mut abuf).await.map_err(|_| ())?;
                         if root2.lookup_async("narf-scratch.tmp").await.is_ok()
                             || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
                             || root2.lookup_async("narf-created.txt").await.is_ok()
                             || root2.lookup_async("narf-mover.txt").await.is_ok()
+                            || root2.lookup_async("narf-hltest.txt").await.is_ok()
                             || &lbuf[..ln] != b"narf-renamed.txt"
                             || hn != MARKER.len()
                             || hbuf != *MARKER
+                            || an != MARKER.len()
+                            || abuf != *MARKER
                         {
                             return Err(());
                         }

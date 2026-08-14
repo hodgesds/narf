@@ -1230,13 +1230,41 @@ fn inode_ref_index(body: &[u8], name: &[u8]) -> Result<(u64, bool), FsError> {
     Ok((found.ok_or(FsError::NotFound)?, count == 1))
 }
 
+/// Remove the entry naming `name` from a `btrfs_inode_ref` item body, returning
+/// its `index` (the `DIR_INDEX` offset) and the remaining entries concatenated
+/// (empty when it was the only entry — the item should then be deleted).
+fn inode_ref_remove(body: &[u8], name: &[u8]) -> Result<(u64, Vec<u8>), FsError> {
+    let mut pos = 0usize;
+    let mut found: Option<u64> = None;
+    let mut remaining = Vec::new();
+    while pos < body.len() {
+        if body.len() - pos < 10 {
+            return Err(FsError::InvalidData);
+        }
+        let index = le64(body, pos)?;
+        let nl = format::le16(body, pos + 8)? as usize;
+        let ns = pos + 10;
+        let ne = ns.checked_add(nl).ok_or(FsError::InvalidData)?;
+        let nm = body.get(ns..ne).ok_or(FsError::InvalidData)?;
+        if nm == name && found.is_none() {
+            found = Some(index);
+        } else {
+            remaining.extend_from_slice(&body[pos..ne]);
+        }
+        pos = ne;
+    }
+    Ok((found.ok_or(FsError::NotFound)?, remaining))
+}
+
 /// Remove the entry `name` from directory `parent_ino` (default subvolume) via a
-/// COW mini-transaction, freeing the child inode when its last link goes away.
+/// COW mini-transaction. On the inode's **last** link the inode is freed (its
+/// `INODE_ITEM` + `EXTENT_DATA` removed, its regular data extents + checksums
+/// released); a still-linked inode keeps its data and just loses this name and one
+/// `INODE_REF` entry, its `nlink` decremented.
 ///
-/// Scope (else `Unsupported`): a regular file with `nlink == 1` reached by a
-/// single `INODE_REF` and a non-colliding `DIR_ITEM`. Its data extents (regular,
-/// exclusively owned) and their checksums are freed. Directories (use `rmdir`),
-/// hardlinked inodes, subvolume mounts, and hash collisions are rejected.
+/// Scope (else `Unsupported`): a regular file reached by a non-colliding
+/// `DIR_ITEM`. Directories (use `rmdir`), subvolume mounts, and hash collisions
+/// are rejected.
 pub async fn unlink_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -1300,7 +1328,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     }
     let child_ino = entry.location.objectid;
 
-    // Load the child inode; only an unshared regular file is in scope.
+    // Load the child inode; directories use rmdir.
     let ci_slot = leaf_find(
         &fs_leaf,
         &BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
@@ -1310,23 +1338,21 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     if cinode.is_dir() {
         return Err(FsError::InvalidData);
     }
-    if cinode.nlink != 1 {
-        return Err(FsError::Unsupported); // hardlinked: ref-body editing out of scope
-    }
+    let last_link = cinode.nlink <= 1;
 
-    // The child's INODE_REF back to this dir gives the DIR_INDEX offset.
+    // Locate this name's INODE_REF entry: its DIR_INDEX offset + the entries that
+    // survive removing it (empty when it was the inode's only ref in this dir).
     let ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino);
     let ref_slot = leaf_find(&fs_leaf, &ref_key)?.ok_or(FsError::NotFound)?;
-    let (dir_index, single_ref) = inode_ref_index(leaf_item_data(&fs_leaf, ref_slot)?, name_bytes)?;
-    if !single_ref {
-        return Err(FsError::Unsupported);
-    }
+    let (dir_index, ref_remaining) =
+        inode_ref_remove(leaf_item_data(&fs_leaf, ref_slot)?, name_bytes)?;
 
-    // Gather the child's regular data extents (to free) and its EXTENT_DATA keys
-    // (to delete). Inline extents and holes own no separate disk block.
+    // On the last link, gather the inode's regular data extents (to free) and its
+    // EXTENT_DATA keys (to delete). A still-linked inode keeps its data; inline
+    // extents and holes own no separate disk block.
     let mut freed_data: Vec<(u64, u64)> = Vec::new();
     let mut ed_offsets: Vec<u64> = Vec::new();
-    {
+    if last_link {
         let n = nritems(&fs_leaf)? as usize;
         for i in 0..n {
             let k = leaf_item_key(&fs_leaf, i)?;
@@ -1392,6 +1418,14 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         None
     };
 
+    // A surviving inode keeps its INODE_ITEM with `nlink` decremented (in place).
+    if !last_link {
+        let mut ci = leaf_item_data(&fs_leaf, ci_slot)?.to_vec();
+        ci[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+        ci[40..44].copy_from_slice(&(cinode.nlink - 1).to_le_bytes());
+        leaf_replace_inplace(&mut fs_leaf, ci_slot, &ci)?;
+    }
+
     // Shrink the parent dir inode by this entry's name length; bump transid+seq.
     let pslot = leaf_find(
         &fs_leaf,
@@ -1411,24 +1445,31 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
     leaf_replace_inplace(&mut fs_leaf, pslot, &pinode)?;
 
-    // Delete every item belonging to the removed name. Re-find each key because a
-    // delete shifts later slots.
+    // Delete this name's DIR_ITEM + DIR_INDEX; on the last link also the
+    // INODE_ITEM + EXTENT_DATA. Drop the whole INODE_REF item only when no entry
+    // for this parent survives. Re-find each key (a delete shifts later slots).
     let mut to_delete = alloc::vec![
-        BtrfsKey::new(
-            parent_ino,
-            format::DIR_ITEM_KEY,
-            u64::from(name_hash(name_bytes))
-        ),
+        dir_item_key,
         BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index),
-        BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino),
-        BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
     ];
-    for off in ed_offsets {
-        to_delete.push(BtrfsKey::new(child_ino, format::EXTENT_DATA_KEY, off));
+    if ref_remaining.is_empty() {
+        to_delete.push(ref_key);
+    }
+    if last_link {
+        to_delete.push(BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0));
+        for off in ed_offsets {
+            to_delete.push(BtrfsKey::new(child_ino, format::EXTENT_DATA_KEY, off));
+        }
     }
     for key in &to_delete {
         let slot = leaf_find(&fs_leaf, key)?.ok_or(FsError::NotFound)?;
         leaf_delete(&mut fs_leaf, slot)?;
+    }
+    // A surviving inode with other links here keeps a shrunken INODE_REF item.
+    if !ref_remaining.is_empty() {
+        let slot = leaf_find(&fs_leaf, &ref_key)?.ok_or(FsError::NotFound)?;
+        leaf_delete(&mut fs_leaf, slot)?;
+        leaf_insert_sorted(&mut fs_leaf, &ref_key, &ref_remaining)?;
     }
 
     commit_txn(

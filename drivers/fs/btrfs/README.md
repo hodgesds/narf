@@ -36,8 +36,9 @@ real laptop's btrfs root looks like.
   single-extent file) that are **fully Linux-interoperable**: the resulting
   filesystem mounts read-write on a real kernel and passes `btrfs check` — see
   below.
-- **Namespace mutations**: `create` (new empty regular file), `unlink` (of an
-  unshared regular file, freeing its data extent + checksums), `mkdir` (new empty
+- **Namespace mutations**: `create` (new empty regular file), `unlink` (freeing a
+  file's data extent + checksums on its last link, else just decrementing
+  `nlink`), `mkdir` (new empty
   directory), `rmdir` (of an empty directory), `rename` (same- or
   cross-directory, of a file or directory, atomically replacing an existing target
   — freeing a clobbered file's data + checksums, and refusing to move a directory
@@ -65,9 +66,8 @@ than mis-read:
 - Writes into a nested subvolume (only the default subvolume is writable);
   xattr *writes*; multi-component `subvol=a/b` paths.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
-  or a `rename` that overwrites a hardlinked or non-empty-directory target;
-  `unlink` of a hardlinked inode (`nlink > 1`) or a name in a hash-colliding
-  `DIR_ITEM`; `rmdir` of a directory carrying xattrs.
+  or a `rename` that overwrites a hardlinked or non-empty-directory target; any
+  name in a hash-colliding `DIR_ITEM`; `rmdir` of a directory carrying xattrs.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## COW writes — full Linux interop

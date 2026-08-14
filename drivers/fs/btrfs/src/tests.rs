@@ -1860,6 +1860,86 @@ kernel_test_in!(
     smoke_btrfs_link_cross_dir_and_reject_dir
 );
 
+/// Unlinking one name of a hard-linked file drops `nlink` to 1 and keeps the
+/// inode + data (the other name still reads it); unlinking the last name then
+/// frees the data extent.
+fn smoke_btrfs_unlink_hardlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let a = match poll_once(vol.root().create("a.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let payload = b"two names, one inode\n";
+    if !matches!(poll_once(a.write(0, payload)), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+    if !matches!(poll_once(vol.root().link("a.txt", "b.txt")), Some(Ok(()))) {
+        return TestResult::Fail("link failed");
+    }
+    // The shared data extent, recorded before any unlink.
+    let extent = match poll_once(vol.root().lookup_async("a.txt")) {
+        Some(Ok(f)) => file_data_extent(&vol, f.ino()),
+        _ => None,
+    };
+
+    // Unlink one of the two names.
+    if !matches!(poll_once(vol.root().unlink("a.txt")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of first link failed");
+    }
+    let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_async("a.txt")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("unlinked name still present");
+    }
+    let b = match poll_once(root2.lookup_async("b.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("surviving link missing"),
+    };
+    if read_all(&b, payload.len() + 8).as_deref() != Some(&payload[..]) {
+        return TestResult::Fail("surviving link lost its content");
+    }
+    match poll_once(b.statx_async(0, 0x7ff)) {
+        Some(Ok(sx)) if sx.nlink == 1 => {}
+        _ => return TestResult::Fail("nlink did not drop to 1"),
+    }
+    // The data extent survives while a link remains.
+    if let Some((bytenr, len)) = extent {
+        if !extent_item_present(&vol2, bytenr, len) {
+            return TestResult::Fail("data extent freed while still linked");
+        }
+    }
+
+    // Unlink the last name — now the data must be freed.
+    if !matches!(poll_once(root2.unlink("b.txt")), Some(Ok(()))) {
+        return TestResult::Fail("unlink of last link failed");
+    }
+    let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after last unlink failed"),
+    };
+    if poll_once(vol3.root().lookup_async("b.txt")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("last name still present");
+    }
+    if let Some((bytenr, len)) = extent {
+        if extent_item_present(&vol3, bytenr, len) {
+            return TestResult::Fail("data extent not freed after last unlink");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unlink_hardlink);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.
