@@ -60,6 +60,7 @@
 //! check`-clean, and a grown chunk is placed clear of the mirror bands
 //! (`chunk_span_avoiding_supers`).
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
@@ -67,8 +68,8 @@ use narf_filesystem::FsError;
 
 use crate::allocator::Allocator;
 use crate::btree::{
-    self, leaf_item_data, leaf_item_key, leaf_item_span, leaf_lower_bound, level, nritems,
-    HEADER_SIZE,
+    self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
+    leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
 };
 use crate::checksum::{block_csum, name_hash};
 use crate::dir::decode_dir_items;
@@ -202,7 +203,7 @@ fn leaf_insert_sorted(buf: &mut [u8], key: &BtrfsKey, body: &[u8]) -> Result<(),
 
 /// Stamp a node buffer with `addr`/`gen`/CRC32C in place (no allocation, no
 /// write) — used by the pre-allocated mini-transaction.
-fn stamp_node(buf: &mut [u8], addr: u64, gen: u64) {
+pub(crate) fn stamp_node(buf: &mut [u8], addr: u64, gen: u64) {
     buf[HDR_BYTENR..HDR_BYTENR + 8].copy_from_slice(&addr.to_le_bytes());
     buf[HDR_GENERATION..HDR_GENERATION + 8].copy_from_slice(&gen.to_le_bytes());
     let csum = block_csum(&buf[format::CSUM_SIZE..]);
@@ -914,6 +915,245 @@ pub(crate) fn cow_leaf_delete(
         items.remove(i);
     }
     regroup_leaves(leaf, &items, nodesize)
+}
+
+// ── Path copy-on-write engine (Stage 2) ────────────────────────────
+//
+// Applies a batch of key edits to one b-tree, COWing only the root-to-leaf paths
+// they touch and re-tiling any node an edit overflows (or empties). Nodes are
+// held in a per-transaction cache: a node COWed earlier in the batch is edited
+// again in place rather than re-allocated, and a node allocated then superseded
+// within the batch is dropped rather than recorded as freed. Cost is
+// O(edits · log N), not O(tree size).
+
+/// One ancestor recorded on a path-COW descent: `(addr, level, key-ptrs, slot)`.
+type PathEntry = (u64, u8, Vec<(BtrfsKey, u64)>, usize);
+
+/// One key edit for [`PathCow`].
+pub(crate) enum Edit {
+    /// Insert `key`, or replace its body if present.
+    Upsert(BtrfsKey, Vec<u8>),
+    /// Remove `key` if present.
+    Delete(BtrfsKey),
+}
+
+impl Edit {
+    fn key(&self) -> &BtrfsKey {
+        match self {
+            Edit::Upsert(k, _) | Edit::Delete(k) => k,
+        }
+    }
+}
+
+/// The result of path-COWing a tree: its new root, the new blocks to write
+/// (unstamped) with their levels, and the committed blocks it freed.
+pub(crate) struct CowOut {
+    pub root_addr: u64,
+    pub root_level: u8,
+    pub nodes: Vec<(u64, Vec<u8>, u8)>, // (addr, buf, level)
+    pub freed: Vec<(u64, u8)>,          // (addr, level) — committed blocks only
+}
+
+/// Path-COW working state for one tree within one transaction.
+pub(crate) struct PathCow<'a, B: BlockDevice + 'static> {
+    vol: &'a BtrfsVolume<B>,
+    gen: u64,
+    nodesize: usize,
+    header: Vec<u8>,
+    /// New blocks made this txn (addr → (buf, level)); superseded by later edits.
+    pending: BTreeMap<u64, (Vec<u8>, u8)>,
+    /// Committed (pre-txn) blocks this batch frees.
+    freed: Vec<(u64, u8)>,
+    root: u64,
+    root_level: u8,
+}
+
+impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
+    /// Start a path-COW of the tree rooted at `(root, root_level)`. Reads the root
+    /// once for a header template.
+    pub(crate) async fn new(
+        vol: &'a BtrfsVolume<B>,
+        gen: u64,
+        root: u64,
+        root_level: u8,
+    ) -> Result<Self, FsError> {
+        let header = vol.read_node(root).await?[..HEADER_SIZE].to_vec();
+        Ok(PathCow {
+            vol,
+            gen,
+            nodesize: vol.nodesize(),
+            header,
+            pending: BTreeMap::new(),
+            freed: Vec::new(),
+            root,
+            root_level,
+        })
+    }
+
+    /// Read a node — from this txn's cache if COWed, else from disk.
+    async fn read(&self, addr: u64) -> Result<Vec<u8>, FsError> {
+        match self.pending.get(&addr) {
+            Some((buf, _)) => Ok(buf.clone()),
+            None => self.vol.read_node(addr).await,
+        }
+    }
+
+    /// Retire the block at `addr`: if it was made this txn, drop it (never
+    /// committed); otherwise record it as a freed committed block.
+    fn retire(&mut self, addr: u64, level: u8) {
+        if self.pending.remove(&addr).is_none() {
+            self.freed.push((addr, level));
+        }
+    }
+
+    /// Allocate + cache a new node, returning its address.
+    fn store(&mut self, alloc: &mut Allocator, buf: Vec<u8>, level: u8) -> Result<u64, FsError> {
+        let addr = alloc.alloc_node(self.vol)?;
+        self.pending.insert(addr, (buf, level));
+        Ok(addr)
+    }
+
+    /// First key of a leaf/internal node buffer (for the pointer to it).
+    fn first_key(buf: &[u8]) -> Result<BtrfsKey, FsError> {
+        if nritems(buf)? == 0 {
+            return Ok(BtrfsKey::new(0, 0, 0));
+        }
+        if level(buf)? == 0 {
+            leaf_item_key(buf, 0)
+        } else {
+            internal_key(buf, 0)
+        }
+    }
+
+    /// Store each re-tiled node and return the `(first_key, addr)` pointers to
+    /// them (empty when `bufs` is a single empty leaf — the child is removed).
+    fn store_all(
+        &mut self,
+        alloc: &mut Allocator,
+        bufs: Vec<Vec<u8>>,
+        level: u8,
+    ) -> Result<Vec<(BtrfsKey, u64)>, FsError> {
+        if bufs.len() == 1 && nritems(&bufs[0])? == 0 && (self.root_level > 0 || level > 0) {
+            return Ok(Vec::new()); // an emptied non-root node: drop it
+        }
+        let mut ptrs = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            let key = Self::first_key(&buf)?;
+            let addr = self.store(alloc, buf, level)?;
+            ptrs.push((key, addr));
+        }
+        Ok(ptrs)
+    }
+
+    /// Apply one edit, updating the working root.
+    async fn apply_one(&mut self, alloc: &mut Allocator, edit: &Edit) -> Result<(), FsError> {
+        // Descend to the target leaf, recording each internal node's pointer list
+        // and the child slot taken.
+        let target = *edit.key();
+        // Each ancestor on the descent: (addr, level, its key-ptrs, child slot).
+        let mut path: Vec<PathEntry> = Vec::new();
+        let mut addr = self.root;
+        let leaf = loop {
+            let buf = self.read(addr).await?;
+            if level(&buf)? == 0 {
+                break buf;
+            }
+            let n = nritems(&buf)? as usize;
+            let slot = internal_child_slot(&buf, n, &target)?;
+            let ptrs: Vec<(BtrfsKey, u64)> = (0..n)
+                .map(|i| Ok((internal_key(&buf, i)?, internal_blockptr(&buf, i)?)))
+                .collect::<Result<_, FsError>>()?;
+            let lvl = level(&buf)?;
+            let child = ptrs[slot].1;
+            path.push((addr, lvl, ptrs, slot));
+            addr = child;
+        };
+
+        // Edit + re-tile the leaf.
+        let leaf_addr = addr;
+        let new_leaves = match edit {
+            Edit::Upsert(k, body) => cow_leaf_upsert(&leaf, k, body, self.nodesize)?,
+            Edit::Delete(k) => cow_leaf_delete(&leaf, k, self.nodesize)?,
+        };
+        self.retire(leaf_addr, 0);
+        let mut cur_ptrs = self.store_all(alloc, new_leaves, 0)?;
+        let mut ptr_level = 0u8;
+
+        // Propagate the replacement pointer(s) up the path, re-tiling as needed.
+        while let Some((paddr, plevel, mut ptrs, slot)) = path.pop() {
+            self.retire(paddr, plevel);
+            ptrs.splice(slot..=slot, cur_ptrs.iter().copied());
+            if ptrs.is_empty() {
+                cur_ptrs = Vec::new();
+                continue;
+            }
+            let bufs = regroup_internal(&self.header, &ptrs, self.nodesize, plevel, self.gen);
+            cur_ptrs = self.store_all(alloc, bufs, plevel)?;
+            ptr_level = plevel;
+        }
+
+        // Settle the new root: one node stays the root; several need a new root
+        // above them (height grows); none means the tree emptied.
+        let (mut root, mut root_level) = match cur_ptrs.len() {
+            0 => {
+                let empty = pack_leaf(&self.header, &[], self.nodesize);
+                (self.store(alloc, empty, 0)?, 0)
+            }
+            1 => (cur_ptrs[0].1, ptr_level),
+            _ => {
+                if usize::from(ptr_level) + 1 > MAX_TREE_LEVEL {
+                    return Err(FsError::NoSpace);
+                }
+                let buf = pack_internal(
+                    &self.header,
+                    &cur_ptrs,
+                    self.nodesize,
+                    ptr_level + 1,
+                    self.gen,
+                );
+                (self.store(alloc, buf, ptr_level + 1)?, ptr_level + 1)
+            }
+        };
+
+        // Collapse a degenerate spine (an internal root with a single child).
+        while root_level > 0 {
+            let buf = self.read(root).await?;
+            if nritems(&buf)? != 1 {
+                break;
+            }
+            let child = internal_blockptr(&buf, 0)?;
+            self.retire(root, root_level);
+            root = child;
+            root_level -= 1;
+        }
+
+        self.root = root;
+        self.root_level = root_level;
+        Ok(())
+    }
+
+    /// Apply all `edits`, then finalize: returns the new root + the new/freed
+    /// blocks. `alloc` allocates every new node (before the metadata fixed point).
+    pub(crate) async fn apply(
+        mut self,
+        alloc: &mut Allocator,
+        edits: &[Edit],
+    ) -> Result<CowOut, FsError> {
+        for edit in edits {
+            self.apply_one(alloc, edit).await?;
+        }
+        let nodes: Vec<(u64, Vec<u8>, u8)> = self
+            .pending
+            .into_iter()
+            .map(|(a, (b, l))| (a, b, l))
+            .collect();
+        Ok(CowOut {
+            root_addr: self.root,
+            root_level: self.root_level,
+            nodes,
+            freed: self.freed,
+        })
+    }
 }
 
 /// Read every item of the fs tree rooted at `fs_root` (any height) into one

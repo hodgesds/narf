@@ -2839,6 +2839,103 @@ fn smoke_btrfs_cow_node_split() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_cow_node_split);
 
+/// The path-COW engine applied to a real multi-level fs tree: a batch of
+/// upserts + deletes produces a tree that, read back through a cursor, contains
+/// exactly the expected items (edits applied, everything else untouched) — while
+/// COWing only the touched paths (far fewer new blocks than the tree has).
+fn smoke_btrfs_path_cow_engine() -> TestResult {
+    use crate::write::{Edit, PathCow};
+
+    // Read every (key, body) of the tree rooted at `root`, in key order.
+    fn collect_all(
+        vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+        root: u64,
+    ) -> Option<Vec<(BtrfsKey, Vec<u8>)>> {
+        let mut cursor =
+            poll_once(btree::Cursor::seek(vol, root, &BtrfsKey::new(0, 0, 0)))?.ok()?;
+        let mut out = Vec::new();
+        while let Some((k, b)) = cursor.current().ok()? {
+            out.push((k, b.to_vec()));
+            poll_once(cursor.advance())?.ok()?;
+        }
+        Some(out)
+    }
+
+    let vol = match mount_sparse(FIXTURE_MANYFILES_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("manyfiles fixture failed to mount"),
+    };
+    let (fs_root, fs_level) = vol.fs_tree_root();
+    if fs_level == 0 {
+        return TestResult::Fail("fixture fs tree is not multi-level");
+    }
+
+    let orig = match collect_all(&vol, fs_root) {
+        Some(v) => v,
+        None => return TestResult::Fail("could not read original tree"),
+    };
+
+    // Build a batch: 30 fresh upserts (objectids far above any existing) and 10
+    // deletes of existing keys. Track the expected item set in parallel.
+    let mut expected = orig.clone();
+    let mut edits: Vec<Edit> = Vec::new();
+    for i in 0..30u64 {
+        let k = BtrfsKey::new(1_000_000 + i, format::INODE_ITEM_KEY, 0);
+        let body = alloc::vec![i as u8; 40 + (i as usize % 20)];
+        edits.push(Edit::Upsert(k, body.clone()));
+        match expected.binary_search_by(|(ek, _)| ek.cmp(&k)) {
+            Ok(p) => expected[p].1 = body,
+            Err(p) => expected.insert(p, (k, body)),
+        }
+    }
+    for (k, _) in orig.iter().step_by(37).take(10) {
+        edits.push(Edit::Delete(*k));
+        if let Ok(p) = expected.binary_search_by(|(ek, _)| ek.cmp(k)) {
+            expected.remove(p);
+        }
+    }
+
+    let gen = vol.superblock().generation + 1;
+    let result = poll_once(async {
+        let mut alloc = crate::allocator::Allocator::build(&vol).await?;
+        let cow = PathCow::new(&vol, gen, fs_root, fs_level).await?;
+        let out = cow.apply(&mut alloc, &edits).await?;
+        // Stamp + write the new nodes so the tree is readable from its new root.
+        for (addr, buf, _lvl) in &out.nodes {
+            let mut b = buf.clone();
+            crate::write::stamp_node(&mut b, *addr, gen);
+            vol.write_logical(*addr, &b).await?;
+        }
+        Ok::<_, FsError>((
+            out.root_addr,
+            out.nodes.len(),
+            out.freed.len(),
+            out.root_level,
+        ))
+    });
+    let (new_root, new_blocks, freed, new_level) = match result {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("path-COW engine errored"),
+    };
+
+    // Only the touched paths were COWed: far fewer new blocks than the whole tree,
+    // some old path blocks were freed, and the tree stayed multi-level.
+    if new_blocks >= orig.len() / 4 {
+        return TestResult::Fail("path-COW rewrote too much of the tree");
+    }
+    if freed == 0 || new_level == 0 {
+        return TestResult::Fail("path-COW freed nothing or collapsed the tree");
+    }
+
+    match collect_all(&vol, new_root) {
+        Some(got) if got == expected => TestResult::Pass,
+        Some(_) => TestResult::Fail("path-COW tree contents do not match expected"),
+        None => TestResult::Fail("could not read path-COW tree"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_path_cow_engine);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.
