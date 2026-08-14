@@ -918,16 +918,21 @@ fn smoke_btrfs_write_rejections() -> TestResult {
     };
     let root = vol.root();
 
-    // Overwriting an inline file is unsupported by the regular-extent COW path.
-    let hello = match poll_once(root.lookup_async("hello.txt")) {
+    // Overwriting a **compressed** extent is unsupported (freeing/rewriting it
+    // wholesale is out of scope) — the zstd fixture's big.dat is compressed.
+    let zvol = match mount_sparse(FIXTURE_ZSTD_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
+    };
+    let zbig = match poll_once(zvol.root().lookup_async("big.dat")) {
         Some(Ok(f)) => f,
-        _ => return TestResult::Fail("lookup hello.txt failed"),
+        _ => return TestResult::Fail("lookup zstd big.dat failed"),
     };
     if !matches!(
-        poll_once(hello.write(0, b"narf\n")),
+        poll_once(zbig.write(0, b"clobber")),
         Some(Err(FsError::Unsupported))
     ) {
-        return TestResult::Fail("inline overwrite should be Unsupported");
+        return TestResult::Fail("compressed overwrite should be Unsupported");
     }
 
     // A write into a nested subvolume is ReadOnly (only the default subvol is
@@ -2628,6 +2633,126 @@ fn smoke_btrfs_free_space_bitmap() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_free_space_bitmap);
+
+/// Number of `EXTENT_DATA` items (extents) a file occupies.
+fn file_extent_count(vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>, ino: u64) -> usize {
+    let (fs_root, _) = vol.fs_tree_root();
+    poll_once(btree::collect_for(
+        vol,
+        fs_root,
+        ino,
+        format::EXTENT_DATA_KEY,
+    ))
+    .and_then(|r| r.ok())
+    .map_or(0, |items| items.len())
+}
+
+/// A file larger than one extent: the write path tiles it into several data
+/// extents, and a later write reads that multi-extent file back, frees every old
+/// extent, and re-tiles it — all durable across remounts.
+fn smoke_btrfs_multi_extent_write() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const SZ: usize = 512 * 1024; // > MAX_WRITE_EXTENT (128 KiB) → 4 extents
+    let make = |seed: u8| -> Vec<u8> {
+        (0..SZ)
+            .map(|i| (i as u8) ^ (i >> 8) as u8 ^ seed)
+            .collect::<Vec<u8>>()
+    };
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+
+    let f = match poll_once(vol.root().create("multi.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = f.ino();
+    let p1 = make(0x11);
+    match poll_once(f.write(0, &p1)) {
+        Some(Ok(n)) if n == SZ => {}
+        _ => return TestResult::Fail("first (large) write failed"),
+    }
+    if file_extent_count(&vol, ino) < 2 {
+        return TestResult::Fail("large write did not tile into multiple extents");
+    }
+
+    // Remount: the multi-extent file reads back.
+    let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let f2 = match poll_once(vol2.root().lookup_async("multi.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after remount failed"),
+    };
+    if read_all(&f2, SZ + 16).as_deref() != Some(p1.as_slice()) {
+        return TestResult::Fail("multi-extent content wrong after remount");
+    }
+
+    // Overwrite the (now multi-extent) file: reads all extents, frees them, re-tiles.
+    let p2 = make(0x22);
+    match poll_once(f2.write(0, &p2)) {
+        Some(Ok(n)) if n == SZ => {}
+        _ => return TestResult::Fail("overwrite of multi-extent file failed"),
+    }
+
+    // Remount again: the new content reads back.
+    let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("second remount failed"),
+    };
+    match poll_once(vol3.root().lookup_async("multi.dat")) {
+        Some(Ok(f)) => match read_all(&f, SZ + 16) {
+            Some(got) if got == p2 => TestResult::Pass,
+            _ => TestResult::Fail("content wrong after multi-extent overwrite"),
+        },
+        _ => TestResult::Fail("multi.dat missing after overwrite"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multi_extent_write);
+
+/// Overwriting a small **inline** file (its data stored in the `EXTENT_DATA` item)
+/// now works: the write reads the inline content and re-tiles it as a regular
+/// extent. The new content is durable across a remount.
+fn smoke_btrfs_inline_overwrite() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let hello = match poll_once(vol.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hello.txt failed"),
+    };
+    let new = b"REPLACED-inline-with-a-regular-extent";
+    match poll_once(hello.write(0, new)) {
+        Some(Ok(n)) if n == new.len() => {}
+        _ => return TestResult::Fail("inline overwrite failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    match poll_once(vol2.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => match read_all(&f, new.len() + 16) {
+            Some(got) if got == new => TestResult::Pass,
+            _ => TestResult::Fail("content wrong after inline overwrite"),
+        },
+        _ => TestResult::Fail("hello.txt missing after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_inline_overwrite);
 
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS

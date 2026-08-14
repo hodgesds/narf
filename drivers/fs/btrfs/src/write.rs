@@ -13,14 +13,14 @@
 //! counts, re-handing-out node addresses from the same base each round until they
 //! stabilise. This replaces the delayed-ref loop real btrfs uses.
 //!
-//! Scope: a regular, uncompressed file that is empty (e.g. freshly `create`d) or
-//! a single `EXTENT_DATA` at offset 0, in the default subvolume. A write reads the
-//! current file, applies the new bytes at any offset (growing past EOF as needed),
-//! and rewrites the whole file as one new extent (inserting the first one for an
-//! empty file), as a genuine copy-on-write mini-transaction that never mutates
-//! live data or metadata in place. Per write it:
+//! Scope: a regular file in the default subvolume with any number of existing
+//! extents (each exclusively owned + uncompressed, or a hole/inline). A write
+//! reads the current file, applies the new bytes at any offset (growing past EOF
+//! as needed), then re-tiles the whole content into fresh data extents of at most
+//! 128 KiB, freeing the old ones — a genuine copy-on-write mini-transaction that
+//! never mutates live data or metadata in place. Per write it:
 //!
-//! 1. allocates + writes the new data extent, and its per-sector CRC32C **data
+//! 1. allocates + writes the new data extents, and their per-sector CRC32C **data
 //!    checksums** (updated in the CSUM tree; the old extent's csums removed);
 //! 2. rebuilds the fs leaf (`EXTENT_DATA` repointed/resized, `INODE_ITEM`
 //!    size/generation updated);
@@ -231,8 +231,10 @@ fn ext_item_meta(gen: u64, owner_root: u64) -> Vec<u8> {
 }
 
 /// `EXTENT_ITEM` body for a data extent (53 bytes): `btrfs_extent_item{refs=1,
-/// gen,flags=DATA}` + inline `EXTENT_DATA_REF{root, objectid, offset=0, count=1}`.
-fn ext_item_data(gen: u64, root: u64, objectid: u64) -> Vec<u8> {
+/// gen,flags=DATA}` + inline `EXTENT_DATA_REF{root, objectid, offset, count=1}`.
+/// `offset` is the extent's file position (the `EXTENT_DATA` key offset minus its
+/// `extent_offset`) — the value `btrfs check` recomputes for the back-reference.
+fn ext_item_data(gen: u64, root: u64, objectid: u64, offset: u64) -> Vec<u8> {
     let mut v = alloc::vec![0u8; 53];
     v[0..8].copy_from_slice(&1u64.to_le_bytes());
     v[8..16].copy_from_slice(&gen.to_le_bytes());
@@ -240,7 +242,7 @@ fn ext_item_data(gen: u64, root: u64, objectid: u64) -> Vec<u8> {
     v[24] = EXTENT_DATA_REF_KEY;
     v[25..33].copy_from_slice(&root.to_le_bytes()); // ref root
     v[33..41].copy_from_slice(&objectid.to_le_bytes()); // ref objectid (inode)
-    v[41..49].copy_from_slice(&0u64.to_le_bytes()); // ref offset
+    v[41..49].copy_from_slice(&offset.to_le_bytes()); // ref offset (file position)
     v[49..53].copy_from_slice(&1u32.to_le_bytes()); // ref count
     v
 }
@@ -576,9 +578,21 @@ pub(crate) fn chunk_span_avoiding_supers(mut start: u64, avail_end: u64) -> (u64
     (start, end.saturating_sub(start))
 }
 
+/// Largest data extent a single write emits; a bigger file is tiled into several.
+/// Matches btrfs's preference for bounded, contiguous data extents.
+const MAX_WRITE_EXTENT: u64 = 128 * 1024;
+
 /// Write `data` at byte `offset` into file `ino` via COW: read-modify-write the
-/// whole file into one new extent, growing the file if the write extends past
-/// its current end. Supports overwrite, partial write, append and grow.
+/// whole file, then re-tile it into fresh data extents (each at most
+/// [`MAX_WRITE_EXTENT`]), freeing the old ones. Supports overwrite, partial write,
+/// append and grow of a file with **any number** of existing extents.
+///
+/// The whole file is rewritten each time (so a small write to a large file still
+/// costs the file's size); incremental extent splitting is a later optimization.
+/// Each existing extent must be exclusively owned and uncompressed (regular or
+/// prealloc, `extent_offset == 0`, covering its whole disk extent) or a hole /
+/// inline extent — a shared, partial or compressed extent is out of scope
+/// (`Unsupported`), since freeing it wholesale would be wrong.
 pub async fn cow_write_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
@@ -586,50 +600,53 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     offset: u64,
     data: &[u8],
 ) -> Result<usize, FsError> {
-    // ── Preconditions ──────────────────────────────────────────────
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
     }
     let (fs_root, _fs_level) = vol.fs_tree_root();
-
-    // A zero-byte write changes nothing.
     if data.is_empty() {
         return Ok(0);
     }
 
-    // The file must be either empty (no EXTENT_DATA — e.g. freshly `create`d) or
-    // a single regular, uncompressed extent at offset 0, so its content is one
-    // EXTENT_DATA item we can rewrite (or, for an empty file, first insert)
-    // wholesale. `existing` is the old `(disk_bytenr, disk_num_bytes)` to free.
+    // ── Classify the existing extents: the disk extents to free, and the old
+    //    EXTENT_DATA keys to delete. Reject anything not exclusively owned. ──
     let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
-    let existing: Option<(u64, u64)> = match extents.len() {
-        0 => None,
-        1 => {
-            let (ed_key, ed_body) = &extents[0];
-            // btrfs_file_extent_item: ram_bytes@8, compression@16, type@20,
-            // disk_bytenr@21, disk_num_bytes@29, extent_offset@37, num_bytes@45.
-            if ed_key.offset != 0 || ed_body.len() < 53 {
-                return Err(FsError::Unsupported);
-            }
-            if ed_body[16] != 0 || ed_body[20] != format::FILE_EXTENT_REG {
-                return Err(FsError::Unsupported);
-            }
-            if le64(ed_body, 37)? != 0 {
-                return Err(FsError::Unsupported); // points mid-shared-extent: out of scope
-            }
-            Some((le64(ed_body, 21)?, le64(ed_body, 29)?))
+    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    for (_key, body) in &extents {
+        // btrfs_file_extent_item: compression@16, type@20, disk_bytenr@21,
+        // disk_num_bytes@29, extent_offset@37, num_bytes@45.
+        if body.len() < 21 {
+            return Err(FsError::InvalidData);
         }
-        _ => return Err(FsError::Unsupported),
-    };
+        if body[20] == format::FILE_EXTENT_INLINE {
+            continue; // data lives in the item; no disk extent to free
+        }
+        if body.len() < 53 {
+            return Err(FsError::InvalidData);
+        }
+        if body[16] != 0 {
+            return Err(FsError::Unsupported); // compressed: out of scope
+        }
+        let disk_bytenr = le64(body, 21)?;
+        if disk_bytenr == 0 {
+            continue; // a hole: no disk extent
+        }
+        let disk_num = le64(body, 29)?;
+        if le64(body, 37)? != 0 || le64(body, 45)? != disk_num {
+            return Err(FsError::Unsupported); // partial / shared reference
+        }
+        freed_data.push((disk_bytenr, disk_num));
+    }
+    let old_data_total: u64 = freed_data.iter().map(|&(_, l)| l).sum();
 
-    // ── 1. Read-modify-write the file content into one buffer ──────
+    // ── Read-modify-write the whole file into one buffer ───────────
     let old_size = inode.size;
     let end = offset
         .checked_add(data.len() as u64)
         .ok_or(FsError::InvalidData)?;
     let new_size = old_size.max(end);
     let sectorsize = u64::from(vol.sectorsize());
-    let disk_len = align_up(new_size, sectorsize).max(sectorsize);
+    let disk_total = align_up(new_size, sectorsize).max(sectorsize);
 
     let mut buf = alloc::vec![0u8; new_size as usize];
     if old_size > 0 {
@@ -646,46 +663,59 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let o = offset as usize;
     buf[o..o + data.len()].copy_from_slice(data);
 
-    // ── 2. Set up the mini-transaction ─────────────────────────────
-    let old_data = existing.map(|(d, _)| d); // disk_bytenr of the freed extent
-    let old_data_len = existing.map(|(_, l)| l).unwrap_or(0); // disk_num_bytes
-
-    // The fs tree may be multi-level; read it as one logical leaf and edit it.
-    // commit_txn reads and re-packs every other tree (extent/csum/root/free-space)
-    // itself, so those may be multi-leaf too.
-    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
-
     let gen = vol.superblock().generation + 1;
     let mut alloc = Allocator::build(vol).await?;
-    // Reserve + write the data extent; commit_txn allocates the metadata nodes.
-    let e_data = alloc.alloc_data(vol, disk_len)?;
 
-    // ── 3. Write the data extent + compute its checksums ───────────
-    let mut payload = buf;
-    payload.resize(disk_len as usize, 0);
-    vol.write_logical(e_data, &payload).await?;
-    let csums = crate::csum::compute_csums(&payload, sectorsize as usize);
-
-    // ── 4. Build the new fs leaf (point EXTENT_DATA at the new extent, update
-    //       INODE). Replace the existing item, or insert one for an empty file.
-    let new_ed = file_extent_reg(gen, e_data, disk_len);
-    let ed_key = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, 0);
-    if let Some(slot) = leaf_find(&fs_leaf, &ed_key)? {
-        leaf_replace_inplace(&mut fs_leaf, slot, &new_ed)?;
-    } else {
-        leaf_insert_sorted(&mut fs_leaf, &ed_key, &new_ed)?;
+    // ── Tile the content into fresh extents; write each + its checksums ─
+    let mut new_data: Vec<DataRef> = Vec::new();
+    let mut new_eds: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    let mut file_off = 0u64;
+    while file_off < disk_total {
+        let ext_len = (disk_total - file_off).min(MAX_WRITE_EXTENT);
+        let e_data = alloc.alloc_data(vol, ext_len)?;
+        let mut payload = alloc::vec![0u8; ext_len as usize];
+        let copy_end = (file_off + ext_len).min(new_size);
+        if file_off < new_size {
+            let (s, e) = (file_off as usize, copy_end as usize);
+            payload[..e - s].copy_from_slice(&buf[s..e]);
+        }
+        vol.write_logical(e_data, &payload).await?;
+        let csums = crate::csum::compute_csums(&payload, sectorsize as usize);
+        new_data.push(DataRef {
+            bytenr: e_data,
+            len: ext_len,
+            ref_root: format::FS_TREE_OBJECTID,
+            objectid: ino,
+            offset: file_off,
+            csums,
+        });
+        new_eds.push((
+            BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
+            file_extent_reg(gen, e_data, ext_len),
+        ));
+        file_off += ext_len;
     }
 
+    // ── Rebuild the fs leaf: drop every old EXTENT_DATA, add the new tiling,
+    //    update the inode (size + nbytes). ──────────────────────────
+    let (mut fs_leaf, fs_old_blocks) = read_fs_oversized(vol, fs_root).await?;
+    for (key, _) in &extents {
+        if let Some(slot) = leaf_find(&fs_leaf, key)? {
+            leaf_delete(&mut fs_leaf, slot)?;
+        }
+    }
+    for (key, body) in &new_eds {
+        leaf_insert_sorted(&mut fs_leaf, key, body)?;
+    }
     let inode_slot = leaf_find(&fs_leaf, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))?
         .ok_or(FsError::NotFound)?;
     let mut new_inode = leaf_item_data(&fs_leaf, inode_slot)?.to_vec();
     new_inode[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
     new_inode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
     new_inode[16..24].copy_from_slice(&new_size.to_le_bytes()); // size
-    new_inode[24..32].copy_from_slice(&disk_len.to_le_bytes()); // nbytes
+    new_inode[24..32].copy_from_slice(&disk_total.to_le_bytes()); // nbytes
     leaf_replace_inplace(&mut fs_leaf, inode_slot, &new_inode)?;
 
-    // ── 5. Commit: extent/csum/free-space/root trees + superblock flip ─
     commit_txn(
         vol,
         gen,
@@ -693,15 +723,9 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         Txn {
             fs_content: fs_leaf,
             fs_old_blocks,
-            freed_data: old_data.map(|d| (d, old_data_len)).into_iter().collect(),
-            new_data: alloc::vec![DataRef {
-                bytenr: e_data,
-                len: disk_len,
-                ref_root: format::FS_TREE_OBJECTID,
-                objectid: ino,
-                csums,
-            }],
-            data_used_delta: disk_len as i64 - old_data_len as i64,
+            freed_data,
+            new_data,
+            data_used_delta: disk_total as i64 - old_data_total as i64,
         },
     )
     .await?;
@@ -714,13 +738,15 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
 const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
 
 /// A data extent recorded into the extent tree as an `EXTENT_ITEM` +
-/// `EXTENT_DATA_REF{root, objectid, offset=0, count=1}`, with the per-sector
-/// CRC32C `csums` the csum tree records for it.
+/// `EXTENT_DATA_REF{root, objectid, offset, count=1}`, with the per-sector
+/// CRC32C `csums` the csum tree records for it. `offset` is the extent's position
+/// in the file (its `EXTENT_DATA` key offset).
 struct DataRef {
     bytenr: u64,
     len: u64,
     ref_root: u64,
     objectid: u64,
+    offset: u64,
     csums: Vec<u8>,
 }
 
@@ -1090,7 +1116,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         leaf_insert_sorted(
             &mut ext_logical,
             &BtrfsKey::new(d.bytenr, format::EXTENT_ITEM_KEY, d.len),
-            &ext_item_data(gen, d.ref_root, d.objectid),
+            &ext_item_data(gen, d.ref_root, d.objectid, d.offset),
         )?;
     }
 

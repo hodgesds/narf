@@ -2928,6 +2928,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // check`).
                         let created = root.create("narf-created.txt").await.map_err(|_| ())?;
                         created.write(0, MARKER).await.map_err(|_| ())?;
+                        // A file larger than one data extent (MAX_WRITE_EXTENT is
+                        // 128 KiB), tiled into several extents and then overwritten
+                        // — validated on-disk by the post-boot host `btrfs check`.
+                        let big2 = root.create("narf-multi.dat").await.map_err(|_| ())?;
+                        let mut wide = alloc::vec![0u8; 300 * 1024];
+                        for (i, b) in wide.iter_mut().enumerate() {
+                            *b = (i as u8) ^ (i >> 8) as u8;
+                        }
+                        big2.write(0, &wide).await.map_err(|_| ())?;
+                        wide[0] ^= 0xff; // change it, then rewrite the whole file
+                        big2.write(0, &wide).await.map_err(|_| ())?;
                         // A victim file that the rename atomically replaces (its
                         // data extent + csum are freed) — the QSaveFile pattern.
                         let victim = root.create("narf-renamed.txt").await.map_err(|_| ())?;
@@ -3037,6 +3048,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let mut sbuf = [0u8; 8192];
                         let sn = sf.read(0, &mut sbuf).await.map_err(|_| ())?;
                         if sn != 8192 || sbuf.iter().any(|&b| b != (63u8 ^ 0x5a)) {
+                            return Err(());
+                        }
+                        // The multi-extent file reads back its rewritten content.
+                        let mf = root2.lookup_async("narf-multi.dat").await.map_err(|_| ())?;
+                        let mut mbuf = [0u8; 4096];
+                        mf.read(0, &mut mbuf).await.map_err(|_| ())?;
+                        if mbuf[0] != 0xff || mbuf[1] != 1u8 {
                             return Err(());
                         }
                         // The moved file left the root and landed in narf-dir.

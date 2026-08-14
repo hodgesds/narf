@@ -33,10 +33,11 @@ real laptop's btrfs root looks like.
 - **Hardlinks** (shared inode number + `nlink`) and **special files**
   (char/block device nodes and FIFOs, typed via mode; `rdev` decoded into
   statx `rdev_major`/`rdev_minor`).
-- **COW writes** (overwrite / partial / append / grow of an uncompressed
-  single-extent file) that are **fully Linux-interoperable**: the resulting
-  filesystem mounts read-write on a real kernel and passes `btrfs check` — see
-  below.
+- **COW writes** (overwrite / partial / append / grow of a file with **any number
+  of extents** — tiled into ≤128 KiB data extents — including small inline files,
+  re-tiled as regular extents) that are **fully Linux-interoperable**: the
+  resulting filesystem mounts read-write on a real kernel and passes `btrfs check`
+  — see below.
 - **Namespace mutations**: `create` (new empty regular file), `unlink` (freeing a
   file's data extent + checksums on its last link, else just decrementing
   `nlink`), `mkdir` (new empty
@@ -73,11 +74,16 @@ than mis-read:
 
 ## COW writes — full Linux interop
 
-`FileOps::write` supports overwrite, partial write, append and grow of a regular,
-uncompressed file in the default subvolume that is either **empty** (e.g. freshly
-`create`d — the write allocates its first data extent) or a single-`EXTENT_DATA`
-file (inline, compressed or multi-extent files, and nested-subvolume writes
-return `Unsupported` / `ReadOnly`). `DirOps::create` / `unlink` / `mkdir` /
+`FileOps::write` supports overwrite, partial write, append and grow of a regular
+file in the default subvolume with **any number of existing extents** (an empty
+freshly-`create`d file, a small **inline** file, or a multi-extent file). Each
+write reads the whole file, applies the new bytes, then re-tiles the content into
+fresh data extents of at most 128 KiB and frees the old ones — so a file of any
+size is writable. (The whole file is rewritten each time; incremental extent
+splitting is a later optimization.) Each existing extent must be exclusively owned
+and uncompressed, or a hole/inline — a **compressed** or **shared/partial** extent,
+and a **nested-subvolume** write, return `Unsupported` / `ReadOnly`.
+`DirOps::create` / `unlink` / `mkdir` /
 `rmdir` / `rename` add, remove and re-key regular files and empty directories in
 the default subvolume through the same transaction (`unlink` frees the file's
 data extent + checksums when its last link goes away; `rmdir` refuses a non-empty
