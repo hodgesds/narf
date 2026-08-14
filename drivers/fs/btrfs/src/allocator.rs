@@ -52,21 +52,43 @@ pub async fn extent_high_water<B: BlockDevice + 'static>(
     Ok(high)
 }
 
-/// Read the free-space tree's `FREE_SPACE_EXTENT` items as `(start, len)` ranges.
+/// Read the free-space tree's free `(start, len)` ranges, from both the
+/// `FREE_SPACE_EXTENT` items of extent-mode block groups and the
+/// `FREE_SPACE_BITMAP` items of bitmap-mode ones (a set bit = one free sector).
+/// Bitmap runs are emitted per bitmap item (not coalesced across bitmap
+/// boundaries), which never merges across a block-group boundary.
 async fn read_free_extents<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     fst_root: u64,
 ) -> Result<Vec<(u64, u64)>, FsError> {
-    let mut cursor = Cursor::seek(
-        vol,
-        fst_root,
-        &BtrfsKey::new(0, format::FREE_SPACE_EXTENT_KEY, 0),
-    )
-    .await?;
+    let ss = u64::from(vol.sectorsize());
+    let mut cursor = Cursor::seek(vol, fst_root, &BtrfsKey::new(0, 0, 0)).await?;
     let mut out = Vec::new();
-    while let Some((key, _)) = cursor.current()? {
-        if key.item_type == format::FREE_SPACE_EXTENT_KEY {
-            out.push((key.objectid, key.offset));
+    while let Some((key, body)) = cursor.current()? {
+        match key.item_type {
+            format::FREE_SPACE_EXTENT_KEY => out.push((key.objectid, key.offset)),
+            format::FREE_SPACE_BITMAP_KEY => {
+                // Emit a range for each maximal run of set (free) bits.
+                let nbits = (key.offset / ss) as usize;
+                let mut run_start: Option<u64> = None;
+                for bit in 0..nbits {
+                    let free = body
+                        .get(bit / 8)
+                        .is_some_and(|b| b & (1u8 << (bit % 8)) != 0);
+                    match (free, run_start) {
+                        (true, None) => run_start = Some(key.objectid + bit as u64 * ss),
+                        (false, Some(s)) => {
+                            out.push((s, key.objectid + bit as u64 * ss - s));
+                            run_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = run_start {
+                    out.push((s, key.objectid + nbits as u64 * ss - s));
+                }
+            }
+            _ => {}
         }
         cursor.advance().await?;
     }

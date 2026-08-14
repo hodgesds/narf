@@ -54,6 +54,10 @@ const FIXTURE_FST_SPARSE: &[u8] = include_bytes!("../testdata/fixture-fst.img.sp
 /// superblock copy (the 64 MiB mirror); exercises writing all mirrors in lockstep.
 const FIXTURE_MIRROR_SPARSE: &[u8] = include_bytes!("../testdata/fixture-mirror.img.sparse");
 
+/// Like the mirror fixture but with one data block group fragmented so its free
+/// space is a `FREE_SPACE_BITMAP` (not extent items); exercises the bitmap path.
+const FIXTURE_BITMAP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-bitmap.img.sparse");
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -2542,6 +2546,88 @@ fn smoke_btrfs_tall_tree() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tall_tree);
+
+/// Whether any block group tracks its free space with a bitmap
+/// (`FREE_SPACE_INFO.flags & USING_BITMAPS`).
+fn fst_has_bitmap_bg<B: narf_block::BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> bool {
+    let root_tree = vol.root_tree_root().0;
+    let fst_root = match poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::FREE_SPACE_TREE_OBJECTID,
+    )) {
+        Some(Ok((r, _))) => r,
+        _ => return false,
+    };
+    let mut cursor = match poll_once(btree::Cursor::seek(vol, fst_root, &BtrfsKey::new(0, 0, 0))) {
+        Some(Ok(c)) => c,
+        _ => return false,
+    };
+    while let Ok(Some((key, body))) = cursor.current() {
+        if key.item_type == format::FREE_SPACE_INFO_KEY && body.len() >= 8 {
+            let flags = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            if flags & 1 != 0 {
+                return true;
+            }
+        }
+        if !matches!(poll_once(cursor.advance()), Some(Ok(()))) {
+            break;
+        }
+    }
+    false
+}
+
+/// A block group whose free space is a `FREE_SPACE_BITMAP` (not extent items):
+/// the allocator decodes the bitmap into free ranges and the COW write path
+/// clears/sets bits (rather than splitting/merging extents). Writing into and
+/// overwriting files repeatedly reclaims from and returns to the bitmap group;
+/// the content is durable and the group stays bitmap-tracked.
+fn smoke_btrfs_free_space_bitmap() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_BITMAP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("bitmap fixture failed to mount"),
+    };
+    if !fst_has_bitmap_bg(&vol) {
+        return TestResult::Fail("fixture has no bitmap-tracked block group");
+    }
+
+    // Create a file and rewrite it several times: each write allocates a fresh
+    // extent + COWs whole trees from the (fragmented) free space and frees the
+    // old blocks — driving bitmap set/clear both ways.
+    let f = match poll_once(vol.root().create("bmtest")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    for round in 0..20u8 {
+        let payload = alloc::vec![round ^ 0xa5; 4096];
+        match poll_once(f.write(0, &payload)) {
+            Some(Ok(4096)) => {}
+            _ => return TestResult::Fail("write into bitmap group failed"),
+        }
+    }
+
+    // The final content is durable across a remount, read back through the FST.
+    let want = alloc::vec![19u8 ^ 0xa5; 4096];
+    let vol2 = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount failed"),
+    };
+    if !fst_has_bitmap_bg(&vol2) {
+        return TestResult::Fail("bitmap group lost across the writes");
+    }
+    match poll_once(vol2.root().lookup_async("bmtest")) {
+        Some(Ok(f)) => match read_all(&f, want.len() + 16) {
+            Some(got) if got == want => TestResult::Pass,
+            _ => TestResult::Fail("content wrong after bitmap-group writes"),
+        },
+        _ => TestResult::Fail("bmtest missing after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_free_space_bitmap);
 
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS

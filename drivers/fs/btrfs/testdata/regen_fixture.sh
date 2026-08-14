@@ -197,4 +197,31 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
 btrfs check "$imgmirr" >/dev/null
 sparse_encode "$imgmirr" fixture-mirror.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror}.img.sparse"
+# Like fixture-mirror (96 MiB mixed + free-space tree, hello.txt + big.dat), but
+# with one data block group deliberately **fragmented** so its free space is
+# tracked with a `FREE_SPACE_BITMAP` (`btrfs` converts to bitmaps once a group has
+# many free extents) instead of `FREE_SPACE_EXTENT`s. Exercises the write path's
+# bitmap read/set/recount. Needs a loop mount to fragment (root); `fstrim`
+# discards the freed blocks so the sparse blob stays small.
+imgbm="$(mktemp)"
+bmmnt="$(mktemp -d)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgfst" "$fststage" "$defstage" "$imgdef" "$many" "$imgmany" "$labstage" "$imglab" "$mirrstage" "$imgmirr" "$imgbm"; umount "$bmmnt" 2>/dev/null; rmdir "$bmmnt" 2>/dev/null' EXIT
+truncate -s 96M "$imgbm"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M -O ^no-holes "$imgbm" >/dev/null
+mount -o loop "$imgbm" "$bmmnt"
+printf 'narf\n' > "$bmmnt/hello.txt"
+python3 -c "open('$bmmnt/big.dat','w').write(''.join('L%04d\n'%i for i in range(2000)))"
+python3 -c "
+import os
+for i in range(160): open('$bmmnt/f%04d'%i,'wb').write(bytes([(i*7)&0xff])*4096)
+os.sync()
+for i in range(0,160,2): os.remove('$bmmnt/f%04d'%i)  # alternating -> fragmented free space
+os.sync()
+"
+sync; fstrim "$bmmnt"; sync; umount "$bmmnt"
+btrfs check "$imgbm" >/dev/null
+btrfs inspect-internal dump-tree -t FREE_SPACE "$imgbm" | grep -q FREE_SPACE_BITMAP \
+    || { echo "fixture-bitmap has no FREE_SPACE_BITMAP" >&2; exit 1; }
+sparse_encode "$imgbm" fixture-bitmap.img.sparse
+
+echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror,-bitmap}.img.sparse"

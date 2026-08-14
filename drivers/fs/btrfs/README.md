@@ -138,14 +138,19 @@ growth is **auto-triggered**: when a mutation's allocation runs out of chunk spa
 transparently keep succeeding until the device itself is full.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
-free-space tree is maintained in lockstep (extent-mode tracking only). On such an
-image **space is reclaimed** — the allocator carves each new data extent / tree
-node from the free-space tree's free ranges (first-fit, lowest address first,
-skipping *system* block groups, which are reserved for the chunk tree), so blocks
-freed by earlier transactions are reused instead of leaked. Blocks freed by the
-*current* transaction are not yet in the tree, so they stay unavailable until it
-commits — preserving COW. (Without a free-space tree the allocator falls back to
-appending past the extent-tree high-water; freed space is then not reused.)
+free-space tree is maintained in lockstep. A block group tracks its free space in
+whichever form it already uses — **`FREE_SPACE_EXTENT`** items (one per free
+range), or a **`FREE_SPACE_BITMAP`** (one bit per sector, set = free) once btrfs
+has converted it because it grew fragmented. Writes into a bitmap group toggle its
+bits and recompute the group's `extent_count`; the allocator decodes a bitmap into
+free ranges the same as extent items. On such an image **space is reclaimed** —
+the allocator carves each new data extent / tree node from the free-space tree's
+free ranges (first-fit, lowest address first, skipping *system* block groups,
+which are reserved for the chunk tree), so blocks freed by earlier transactions
+are reused instead of leaked. Blocks freed by the *current* transaction are not
+yet in the tree, so they stay unavailable until it commits — preserving COW.
+(Without a free-space tree the allocator falls back to appending past the
+extent-tree high-water; freed space is then not reused.)
 
 Every **superblock copy** is rewritten on each commit: btrfs keeps up to three
 (the primary at 64 KiB, then mirrors at 64 MiB and 256 GiB), and a real kernel
@@ -156,17 +161,15 @@ filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
-Bounds (all fail loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels, and
-a `FREE_SPACE_BITMAP` block group is out of scope. Trees taller than two levels
-are exercised in-kernel (`smoke_btrfs_tall_tree` writes and reads back a
-three-level fs tree); host `btrfs check` in CI covers up to two levels — a
-taller tree has the identical on-disk node format, just stacked. The write-interop
-guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check` on the
-NARF-written image when `btrfs-progs` is available — on a plain image, a
+Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
+taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and
+reads back a three-level fs tree); host `btrfs check` in CI covers up to two
+levels — a taller tree has the identical on-disk node format, just stacked. The
+write-interop guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check`
+on the NARF-written image when `btrfs-progs` is available — on a plain image, a
 `space_cache=v2` image (including a multi-level fs tree), and a **96 MiB image
-carrying the 64 MiB superblock mirror whose extent tree it splits multi-leaf and
-then grows a chunk
-on top of**.
+carrying the 64 MiB superblock mirror, a bitmap-tracked block group, and an extent
+tree it splits multi-leaf and then grows a chunk on top of**.
 
 ## Test fixtures
 
@@ -182,9 +185,12 @@ a **free-space tree** (`space_cache=v2`), exercising the write path's free-space
 tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-
 tree image — large enough that mkfs wrote the **64 MiB superblock mirror** — used
 to exercise updating every superblock copy in lockstep (mounted read-write over a
-writable sparse-backed device so it costs only its payload in RAM). The kernel
-tests reconstruct the full zero-filled image at runtime and mount it under a
-`RamBlockDevice`.
+writable sparse-backed device so it costs only its payload in RAM).
+`fixture-bitmap.img.sparse` is the same 96 MiB layout with one data block group
+deliberately **fragmented** (via a loop mount) so its free space is a
+`FREE_SPACE_BITMAP`; it is also the boot smoke's NVMe image, so host `btrfs check`
+validates the bitmap path end to end. The kernel tests reconstruct the full
+zero-filled image at runtime and mount it under a `RamBlockDevice`.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:
