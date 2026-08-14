@@ -2942,6 +2942,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         root.rename_to("narf-mover.txt", &*ndir, "narf-moved.txt", 0)
                             .await
                             .map_err(|_| ())?;
+                        // A hard link aliasing narf-renamed.txt (nlink becomes 2).
+                        root.link("narf-renamed.txt", "narf-hardlink.txt")
+                            .await
+                            .map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink
@@ -2965,11 +2969,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // The moved file left the root and landed in narf-dir.
                         let ndir2 = root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
                         ndir2.lookup_async("narf-moved.txt").await.map_err(|_| ())?;
+                        // The hard link aliases the renamed file's content.
+                        let hl = root2
+                            .lookup_async("narf-hardlink.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        let mut hbuf = [0u8; MARKER.len()];
+                        let hn = hl.read(0, &mut hbuf).await.map_err(|_| ())?;
                         if root2.lookup_async("narf-scratch.tmp").await.is_ok()
                             || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
                             || root2.lookup_async("narf-created.txt").await.is_ok()
                             || root2.lookup_async("narf-mover.txt").await.is_ok()
                             || &lbuf[..ln] != b"narf-renamed.txt"
+                            || hn != MARKER.len()
+                            || hbuf != *MARKER
                         {
                             return Err(());
                         }

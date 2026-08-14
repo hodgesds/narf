@@ -381,6 +381,42 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         })
     }
 
+    fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::link_node(&vol, self.ino, self.ino, old_name, new_name).await
+        })
+    }
+
+    fn link_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let dest = new_dir
+                .as_any()
+                .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
+                .ok_or(FsError::CrossDevice)?;
+            if dest.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            let dest_vol = dest.volume()?;
+            if !Arc::ptr_eq(&vol, &dest_vol) {
+                return Err(FsError::CrossDevice);
+            }
+            crate::write::link_node(&vol, self.ino, dest.ino, old_name, new_name).await
+        })
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }

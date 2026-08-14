@@ -1742,6 +1742,124 @@ kernel_test_in!(
     smoke_btrfs_rename_cross_dir_loop_rejected
 );
 
+/// A same-directory hard link: both names resolve to the same inode with the same
+/// content, and the inode's `nlink` is 2 after a remount.
+fn smoke_btrfs_link_same_dir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let orig = match poll_once(vol.root().create("orig.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let payload = b"shared inode content\n";
+    if !matches!(poll_once(orig.write(0, payload)), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+    match poll_once(vol.root().link("orig.txt", "hard.txt")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("link failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let root2 = vol2.root();
+    let a = match poll_once(root2.lookup_async("orig.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("orig.txt missing"),
+    };
+    let b = match poll_once(root2.lookup_async("hard.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("hard.txt missing"),
+    };
+    if a.ino() != b.ino() {
+        return TestResult::Fail("hard link is a different inode");
+    }
+    if read_all(&a, payload.len() + 8).as_deref() != Some(&payload[..])
+        || read_all(&b, payload.len() + 8).as_deref() != Some(&payload[..])
+    {
+        return TestResult::Fail("linked names read different content");
+    }
+    match poll_once(a.statx_async(0, 0x7ff)) {
+        Some(Ok(sx)) if sx.nlink == 2 => TestResult::Pass,
+        _ => TestResult::Fail("nlink is not 2 after hard link"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_link_same_dir);
+
+/// A cross-directory hard link aliases the same inode into another directory, and
+/// hard-linking a directory is refused (`EPERM`).
+fn smoke_btrfs_link_cross_dir_and_reject_dir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    if !matches!(poll_once(root.mkdir("d")), Some(Ok(_)))
+        || !matches!(poll_once(root.create("f.txt")), Some(Ok(_)))
+    {
+        return TestResult::Fail("setup failed");
+    }
+    // Hard-linking a directory is EPERM.
+    if !matches!(
+        poll_once(root.link("d", "d2")),
+        Some(Err(FsError::PermissionDenied))
+    ) {
+        return TestResult::Fail("hard link to directory was not refused");
+    }
+    // Cross-directory hard link f.txt → d/g.txt.
+    let d = match poll_once(root.lookup_dir_async("d")) {
+        Some(Ok(x)) => x,
+        _ => return TestResult::Fail("lookup d failed"),
+    };
+    match poll_once(root.link_to("f.txt", &*d, "g.txt")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("cross-dir link failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let root2 = vol2.root();
+    let f2 = match poll_once(root2.lookup_async("f.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("f.txt missing"),
+    };
+    let d2 = match poll_once(root2.lookup_dir_async("d")) {
+        Some(Ok(x)) => x,
+        _ => return TestResult::Fail("d missing"),
+    };
+    let g2 = match poll_once(d2.lookup_async("g.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("d/g.txt missing"),
+    };
+    if f2.ino() != g2.ino() {
+        return TestResult::Fail("cross-dir link is a different inode");
+    }
+    match poll_once(f2.statx_async(0, 0x7ff)) {
+        Some(Ok(sx)) if sx.nlink == 2 => TestResult::Pass,
+        _ => TestResult::Fail("nlink is not 2 after cross-dir link"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_link_cross_dir_and_reject_dir
+);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.
