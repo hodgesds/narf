@@ -2754,6 +2754,91 @@ fn smoke_btrfs_inline_overwrite() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_inline_overwrite);
 
+/// Path-COW node primitives (the write-engine foundation): upserting past a
+/// node's capacity re-tiles it into several valid, key-ordered leaves losing no
+/// item; deleting removes one; and internal-node key-ptrs re-tile the same way.
+fn smoke_btrfs_cow_node_split() -> TestResult {
+    use crate::write::{cow_leaf_delete, cow_leaf_upsert, regroup_internal};
+    const NS: usize = 4096;
+    let mk = |oid: u64| BtrfsKey::new(oid, 1, 0);
+    let body = alloc::vec![0x77u8; 900]; // ~4 such items fill a 4 KiB leaf
+
+    // Upsert items into an empty leaf until it splits.
+    let mut leaf = alloc::vec![0u8; NS]; // level 0, 0 items
+    let mut split: Vec<Vec<u8>> = Vec::new();
+    let mut inserted = 0u64;
+    for i in 0..12u64 {
+        let out = match cow_leaf_upsert(&leaf, &mk(i), &body, NS) {
+            Ok(o) => o,
+            Err(_) => return TestResult::Fail("cow_leaf_upsert errored"),
+        };
+        inserted = i + 1;
+        if out.len() > 1 {
+            split = out;
+            break;
+        }
+        leaf = out.into_iter().next().unwrap();
+    }
+    if split.len() < 2 {
+        return TestResult::Fail("leaf never split");
+    }
+    // Every item survived, all leaves are level 0, and keys are globally ordered.
+    let mut keys: Vec<BtrfsKey> = Vec::new();
+    for lf in &split {
+        if btree::level(lf).unwrap_or(9) != 0 {
+            return TestResult::Fail("split produced a non-leaf");
+        }
+        for j in 0..btree::nritems(lf).unwrap_or(0) as usize {
+            keys.push(match btree::leaf_item_key(lf, j) {
+                Ok(k) => k,
+                Err(_) => return TestResult::Fail("bad key in split leaf"),
+            });
+        }
+    }
+    if keys.len() as u64 != inserted {
+        return TestResult::Fail("items lost across the split");
+    }
+    if keys.windows(2).any(|w| w[0] >= w[1]) {
+        return TestResult::Fail("keys not ordered across the split");
+    }
+
+    // Deleting removes exactly one item.
+    let before = btree::nritems(&split[0]).unwrap_or(0) as usize;
+    let target = match btree::leaf_item_key(&split[0], 0) {
+        Ok(k) => k,
+        Err(_) => return TestResult::Fail("first key read failed"),
+    };
+    let after = match cow_leaf_delete(&split[0], &target, NS) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("cow_leaf_delete errored"),
+    };
+    let remaining: usize = after
+        .iter()
+        .map(|lf| btree::nritems(lf).unwrap_or(0) as usize)
+        .sum();
+    if remaining != before - 1 {
+        return TestResult::Fail("delete did not remove exactly one item");
+    }
+
+    // Internal-node key-ptrs re-tile past the fanout into ordered level-1 nodes.
+    let ptrs: Vec<(BtrfsKey, u64)> = (0..130u64).map(|i| (mk(i), 0x1000 + i)).collect();
+    let header = alloc::vec![0u8; NS];
+    let nodes = regroup_internal(&header, &ptrs, NS, 1, 7);
+    if nodes.len() < 2 {
+        return TestResult::Fail("internal node never split");
+    }
+    let total: usize = nodes
+        .iter()
+        .map(|nd| btree::nritems(nd).unwrap_or(0) as usize)
+        .sum();
+    if total != 130 || nodes.iter().any(|nd| btree::level(nd).unwrap_or(0) != 1) {
+        return TestResult::Fail("internal re-tiling lost pointers or level");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_cow_node_split);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

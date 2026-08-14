@@ -794,6 +794,128 @@ fn pack_leaf(header: &[u8], items: &[(BtrfsKey, &[u8])], capacity: usize) -> Vec
     buf
 }
 
+// ── Path copy-on-write node primitives (Stage 1) ───────────────────
+//
+// These re-tile the contents of ONE node that a path-COW edit touched into as
+// many `nodesize` nodes as they need (a node that overflows an edit is split,
+// possibly into several). They are pure — addresses and CRC32C stamps are
+// assigned by the walk that COWs the path (Stage 2). Re-tiling reuses the same
+// greedy grouping the whole-tree builder uses, so a produced node is always a
+// valid, bounds-respecting node, for any item sizes.
+
+/// Pack one internal node over `ptrs` (`(first_key, child_addr)`) at `level`,
+/// with each key-ptr's generation set to `gen`. Unstamped (no bytenr/CRC32C).
+fn pack_internal(
+    header: &[u8],
+    ptrs: &[(BtrfsKey, u64)],
+    nodesize: usize,
+    level: u8,
+    gen: u64,
+) -> Vec<u8> {
+    let mut buf = alloc::vec![0u8; nodesize];
+    buf[0..HEADER_SIZE].copy_from_slice(&header[0..HEADER_SIZE]);
+    buf[100] = level;
+    buf[96..100].copy_from_slice(&(ptrs.len() as u32).to_le_bytes());
+    for (i, (key, addr)) in ptrs.iter().enumerate() {
+        let kp = HEADER_SIZE + i * KEY_PTR_SIZE;
+        buf[kp..kp + 8].copy_from_slice(&key.objectid.to_le_bytes());
+        buf[kp + 8] = key.item_type;
+        buf[kp + 9..kp + 17].copy_from_slice(&key.offset.to_le_bytes());
+        buf[kp + 17..kp + 25].copy_from_slice(&addr.to_le_bytes());
+        buf[kp + 25..kp + 33].copy_from_slice(&gen.to_le_bytes());
+    }
+    buf
+}
+
+/// Re-tile `items` (key-ordered) into one or more leaves, greedily filling each
+/// to `nodesize`. Returns the leaf buffers (unstamped); at least one, even for an
+/// empty item set. `Unsupported` if a single item can't fit a node.
+fn regroup_leaves(
+    header: &[u8],
+    items: &[(BtrfsKey, Vec<u8>)],
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
+    let cap = nodesize - HEADER_SIZE;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for i in 0..items.len() {
+        let need = LEAF_ITEM_SIZE + items[i].1.len();
+        if need > cap {
+            return Err(FsError::Unsupported);
+        }
+        if used + need > cap && i > start {
+            let refs: Vec<(BtrfsKey, &[u8])> = items[start..i]
+                .iter()
+                .map(|(k, b)| (*k, b.as_slice()))
+                .collect();
+            out.push(pack_leaf(header, &refs, nodesize));
+            start = i;
+            used = 0;
+        }
+        used += need;
+    }
+    let refs: Vec<(BtrfsKey, &[u8])> = items[start..]
+        .iter()
+        .map(|(k, b)| (*k, b.as_slice()))
+        .collect();
+    out.push(pack_leaf(header, &refs, nodesize));
+    Ok(out)
+}
+
+/// Re-tile `ptrs` (key-ordered `(first_key, child_addr)`) into one or more
+/// internal nodes at `level`, greedily filling each. Returns the node buffers.
+pub(crate) fn regroup_internal(
+    header: &[u8],
+    ptrs: &[(BtrfsKey, u64)],
+    nodesize: usize,
+    level: u8,
+    gen: u64,
+) -> Vec<Vec<u8>> {
+    let fanout = node_fanout(nodesize).max(1);
+    ptrs.chunks(fanout)
+        .map(|c| pack_internal(header, c, nodesize, level, gen))
+        .collect()
+}
+
+/// Collect a leaf's `(key, body)` items.
+fn leaf_items(leaf: &[u8]) -> Result<Vec<(BtrfsKey, Vec<u8>)>, FsError> {
+    let n = nritems(leaf)? as usize;
+    (0..n)
+        .map(|i| Ok((leaf_item_key(leaf, i)?, leaf_item_data(leaf, i)?.to_vec())))
+        .collect()
+}
+
+/// Upsert `(key, body)` into `leaf`, returning the re-tiled replacement leaves
+/// (one, or several if the edit overflowed the node).
+pub(crate) fn cow_leaf_upsert(
+    leaf: &[u8],
+    key: &BtrfsKey,
+    body: &[u8],
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
+    let mut items = leaf_items(leaf)?;
+    match items.binary_search_by(|(k, _)| k.cmp(key)) {
+        Ok(i) => items[i].1 = body.to_vec(),
+        Err(i) => items.insert(i, (*key, body.to_vec())),
+    }
+    regroup_leaves(leaf, &items, nodesize)
+}
+
+/// Delete `key` from `leaf` (if present), returning the re-tiled replacement
+/// leaves (always at least one, possibly empty).
+pub(crate) fn cow_leaf_delete(
+    leaf: &[u8],
+    key: &BtrfsKey,
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
+    let mut items = leaf_items(leaf)?;
+    if let Ok(i) = items.binary_search_by(|(k, _)| k.cmp(key)) {
+        items.remove(i);
+    }
+    regroup_leaves(leaf, &items, nodesize)
+}
+
 /// Read every item of the fs tree rooted at `fs_root` (any height) into one
 /// oversized logical leaf (with headroom for a mutation's inserts) plus the list
 /// of every block the tree currently occupies (all freed on rewrite).
