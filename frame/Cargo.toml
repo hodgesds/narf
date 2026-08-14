@@ -53,6 +53,7 @@ narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660" }
 narf-drivers-fs-udf   = { path = "../drivers/fs/udf" }
 narf-drivers-fs-9p    = { path = "../drivers/fs/9p" }
 narf-drivers-fs-squashfs = { path = "../drivers/fs/squashfs" }
+narf-drivers-fs-btrfs = { path = "../drivers/fs/btrfs" }
 narf-input           = { path = "../input" }
 narf-input-driver    = { path = "../drivers/input" }
 narf-graphics        = { path = "../graphics" }

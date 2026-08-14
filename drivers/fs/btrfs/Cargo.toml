@@ -1,0 +1,29 @@
+[package]
+name = "narf-drivers-fs-btrfs"
+description = "Partial read-only + basic-COW btrfs filesystem driver."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "narf_drivers_fs_btrfs"
+path = "src/lib.rs"
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+ruzstd = { version = "0.8", default-features = false }
+narf-block = { path = "../../../block" }
+narf-capabilities = { path = "../../../capabilities" }
+narf-driver-runtime = { path = "../../runtime" }
+narf-filesystem = { path = "../../../filesystem" }
+narf-init = { path = "../../../init" }
+narf-io = { path = "../../../io" }
+narf-kernel-test = { path = "../../../verification/kernel-test" }
+narf-lib = { path = "../../../lib" }
+narf-memory = { path = "../../../memory" }
+narf-scheduler = { path = "../../../scheduler" }
+
+[lints]
+workspace = true

@@ -949,6 +949,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-fs-btrfs"
+version = "0.0.0"
+dependencies = [
+ "miniz_oxide",
+ "narf-block",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-filesystem",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "ruzstd",
+]
+
+[[package]]
 name = "narf-drivers-fs-exfat"
 version = "0.0.0"
 dependencies = [
@@ -1687,6 +1705,7 @@ dependencies = [
  "narf-drivers-crypto",
  "narf-drivers-fingerprint",
  "narf-drivers-fs-9p",
+ "narf-drivers-fs-btrfs",
  "narf-drivers-fs-exfat",
  "narf-drivers-fs-ext2",
  "narf-drivers-fs-ext4",
@@ -2351,6 +2370,12 @@ checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
 ]
+
+[[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
 
 [[package]]
 name = "semver"

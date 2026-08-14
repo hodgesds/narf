@@ -1471,8 +1471,105 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     img
 }
 
+/// Reconstruct a full disk image from a committed `NARFBTR1` sparse fixture
+/// (see `drivers/fs/btrfs/testdata/regen_fixture.sh`). The output is written as
+/// a sparse file (holes read as zeros), so a 128 MiB logical image costs only
+/// its non-zero payload on disk. Idempotent: skips when the target already has
+/// the right length. No external tools — CI-safe.
+fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let sparse = match std::fs::read(root.join(sparse_rel)) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if sparse.len() < 20 || &sparse[0..8] != b"NARFBTR1" {
+        return;
+    }
+    let total = u64::from_le_bytes(sparse[8..16].try_into().unwrap());
+    // Always rebuild to a pristine image: the btrfs boot smoke *mutates* this
+    // disk (write + create/unlink), so a size check can't tell a clean fixture
+    // from an already-modified one. Reconstruction is cheap (a ~110 KiB sparse
+    // payload into a sparse-backed 16 MiB file).
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut f) = std::fs::File::create(out) else {
+        return;
+    };
+    let _ = f.set_len(total);
+    let n_runs = u32::from_le_bytes(sparse[16..20].try_into().unwrap()) as usize;
+    let mut p = 20usize;
+    for _ in 0..n_runs {
+        let off = u64::from_le_bytes(sparse[p..p + 8].try_into().unwrap());
+        let len = u64::from_le_bytes(sparse[p + 8..p + 16].try_into().unwrap()) as usize;
+        p += 16;
+        if f.seek(SeekFrom::Start(off)).is_ok() {
+            let _ = f.write_all(&sparse[p..p + len]);
+        }
+        p += len;
+    }
+}
+
+/// After a kernel-test run, verify that the btrfs image NARF wrote to on nvme0
+/// (via the boot-time `btrfs-write-smoke`) is still consistent by running host
+/// `btrfs check`. This turns the NARF↔Linux write-interop guarantee into a
+/// CI-enforced invariant. Best-effort: skips when the image is absent (no
+/// kernel-test disk) or `btrfs-progs` is not installed; fails when a present
+/// `btrfs check` reports errors.
+fn verify_btrfs_write_interop() -> Result<()> {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let img = root.join("target").join("narf-nvme-btrfs.img");
+    if !img.exists() {
+        return Ok(());
+    }
+    if std::process::Command::new("btrfs")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("xtask: skipping btrfs write-interop check (btrfs-progs not found)");
+        return Ok(());
+    }
+    println!("xtask: verifying NARF-written btrfs image with `btrfs check`...");
+    let out = std::process::Command::new("btrfs")
+        .arg("check")
+        .arg(&img)
+        .output()
+        .context("failed to run `btrfs check`")?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() && combined.contains("no error found") {
+        println!("xtask: btrfs write-interop OK — NARF-written image is `btrfs check` clean");
+        Ok(())
+    } else {
+        eprintln!("{combined}");
+        bail!("`btrfs check` reported errors on the NARF-written image (write-interop regression)");
+    }
+}
+
 fn nvme_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    // During a kernel-test run, serve a real laptop-style btrfs image on nvme0
+    // so the boot-time `btrfs-disk-smoke` initcall exercises the driver against
+    // real (QEMU NVMe) hardware. Nothing consumes nvme0's content otherwise.
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        let path = root.join("target").join("narf-nvme-btrfs.img");
+        // A 96 MiB btrfs image with a free-space tree (`space_cache=v2`), a second
+        // superblock copy (the 64 MiB mirror), AND a deliberately-fragmented data
+        // block group whose free space is tracked with a `FREE_SPACE_BITMAP`. So
+        // the boot-time btrfs read/write smokes exercise the driver across the
+        // board — free-space-tree maintenance in both extent and bitmap form,
+        // chunk growth, and updating every superblock mirror in lockstep — on real
+        // NVMe hardware, and the written image stays mountable + `btrfs check`-clean
+        // for a real Linux kernel. Verify manually with `mount -o loop` + `btrfs
+        // check`.
+        reconstruct_sparse_fixture("drivers/fs/btrfs/testdata/fixture-bitmap.img.sparse", &path);
+        return path;
+    }
     let path = root.join("target").join("narf-nvme.img");
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -7888,7 +7985,9 @@ fn main() -> Result<()> {
                     .filter(|f| !f.is_empty() && *f != "kernel-test")
                     .collect::<Vec<_>>()
                     .join(",");
-                boot_smoke_cmd(&args)
+                boot_smoke_cmd(&args)?;
+                // Verify NARF's on-disk btrfs writes are still Linux-consistent.
+                verify_btrfs_write_interop()
             })();
             match prior_append {
                 Some(value) => std::env::set_var("XTASK_QEMU_APPEND", value),

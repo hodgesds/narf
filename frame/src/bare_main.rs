@@ -20,6 +20,7 @@ extern crate alloc;
 extern crate narf_bluetooth as _;
 extern crate narf_drivers_crypto as _;
 extern crate narf_drivers_fs_9p as _;
+extern crate narf_drivers_fs_btrfs;
 extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_ext2;
 extern crate narf_drivers_fs_fat;
@@ -2277,6 +2278,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_fs_ext4::register_initcalls();
             narf_drivers_fs_fat::register_initcalls();
             narf_drivers_fs_squashfs::register_initcalls();
+            narf_drivers_fs_btrfs::register_initcalls();
             narf_drivers_platform::register_initcalls();
             // Bridge: ACPI power-button events (delivered by the
             // SCI dispatcher in narf-drivers-platform::ec) into
@@ -2808,6 +2810,318 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 } else {
                     narf_init::InitResult::NotPresent
                 }
+            });
+
+            // btrfs read smoke: if any registered block device holds a btrfs
+            // filesystem (the kernel-test run attaches a real laptop-style btrfs
+            // image on nvme0), mount its volume via the registered factory and
+            // read a file straight off the hardware — proving the whole
+            // detect -> factory -> mount -> read path works on a real disk, not
+            // just the in-kernel RamBlockDevice tests. NotPresent (harmless) when
+            // no btrfs device is attached, e.g. interactive/distro boots.
+            narf_init::register(narf_init::Stage::Late, "btrfs-disk-smoke", || {
+                use narf_block::fs_detect::{detect_filesystem, FsType};
+                for entry in &narf_block::block_devices() {
+                    let dev = entry.dev.clone();
+                    if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
+                        continue;
+                    }
+                    let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    let fs = match factory(dev) {
+                        Ok(fs) => fs,
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: mount failed on {}: {:?}",
+                                entry.name,
+                                e
+                            );
+                            return narf_init::InitResult::Error("btrfs mount failed");
+                        }
+                    };
+                    let root = fs.root();
+                    // Read a file straight off the disk.
+                    let read = narf_scheduler::block_on(async {
+                        let file = root.lookup_async("big.dat").await?;
+                        let mut buf = [0u8; 24];
+                        let n = file.read(0, &mut buf).await?;
+                        Ok::<_, narf_filesystem::FsError>((buf, n))
+                    });
+                    match read {
+                        Ok((buf, n)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: {} mounted, read big.dat ({} bytes): {:?}",
+                                entry.name,
+                                n,
+                                core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>")
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-disk-smoke: {} mounted but read failed: {:?}",
+                                entry.name,
+                                e
+                            );
+                            return narf_init::InitResult::Error("btrfs read failed");
+                        }
+                    }
+                }
+                narf_init::InitResult::NotPresent
+            });
+
+            // btrfs WRITE smoke: exercise the COW write path against real block
+            // hardware (QEMU NVMe). Write a marker into big.dat, then read it
+            // back through a fresh mount of the on-disk image. Because the write
+            // path now updates data checksums and tree-root generations, the
+            // resulting image is mountable + readable by a real Linux kernel
+            // (verify after the run with: `mount -o ro,loop
+            // target/narf-nvme-btrfs.img /mnt && head -c 17 /mnt/big.dat`).
+            // NotPresent when no btrfs disk is attached, so distro boots are
+            // unaffected.
+            narf_init::register(narf_init::Stage::Late, "btrfs-write-smoke", || {
+                use narf_block::fs_detect::{detect_filesystem, FsType};
+                const MARKER: &[u8] = b"NARF-WROTE-THIS!\n";
+                for entry in &narf_block::block_devices() {
+                    let dev = entry.dev.clone();
+                    if !matches!(detect_filesystem(&dev), Ok(Some(FsType::Btrfs))) {
+                        continue;
+                    }
+                    let factory = match narf_filesystem::root_mount::lookup_factory(FsType::Btrfs) {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    let name = entry.name;
+                    let ok = narf_scheduler::block_on(async {
+                        // Grow the filesystem by a few chunks up front, while its
+                        // extent/free-space trees are still single leaves (chunk
+                        // growth requires that). This exercises per-block-group
+                        // accounting and leaves room for the multi-leaf churn below —
+                        // which never reuses freed space — to split the extent tree
+                        // without needing a further grow (validated by host `btrfs
+                        // check`).
+                        {
+                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
+                                narf_block::SyncBlock::new(dev.clone()),
+                                narf_lib::id::DomainId::DRIVER_0,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            for _ in 0..3 {
+                                narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                    .await
+                                    .map_err(|_| ())?;
+                            }
+                        }
+                        let fs = factory(dev.clone()).map_err(|_| ())?;
+                        let root = fs.root();
+                        let file = root.lookup_async("big.dat").await.map_err(|_| ())?;
+                        file.write(0, MARKER).await.map_err(|_| ())?;
+                        // Namespace mutations: create a file and write to it (its
+                        // first data extent), plus a scratch file created then
+                        // unlinked (all validated by the post-boot host `btrfs
+                        // check`).
+                        let created = root.create("narf-created.txt").await.map_err(|_| ())?;
+                        created.write(0, MARKER).await.map_err(|_| ())?;
+                        // A file larger than one data extent (MAX_WRITE_EXTENT is
+                        // 128 KiB), tiled into several extents and then overwritten
+                        // — validated on-disk by the post-boot host `btrfs check`.
+                        let big2 = root.create("narf-multi.dat").await.map_err(|_| ())?;
+                        let mut wide = alloc::vec![0u8; 300 * 1024];
+                        for (i, b) in wide.iter_mut().enumerate() {
+                            *b = (i as u8) ^ (i >> 8) as u8;
+                        }
+                        big2.write(0, &wide).await.map_err(|_| ())?;
+                        wide[0] ^= 0xff; // change it, then rewrite the whole file
+                        big2.write(0, &wide).await.map_err(|_| ())?;
+                        // A victim file that the rename atomically replaces (its
+                        // data extent + csum are freed) — the QSaveFile pattern.
+                        let victim = root.create("narf-renamed.txt").await.map_err(|_| ())?;
+                        victim
+                            .write(0, b"OLD-VICTIM-DATA!!")
+                            .await
+                            .map_err(|_| ())?;
+                        root.rename("narf-created.txt", "narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        root.create("narf-scratch.tmp").await.map_err(|_| ())?;
+                        root.unlink("narf-scratch.tmp").await.map_err(|_| ())?;
+                        // Directories: one that persists, one created then removed.
+                        root.mkdir("narf-dir").await.map_err(|_| ())?;
+                        root.mkdir("narf-tmpdir").await.map_err(|_| ())?;
+                        root.rmdir("narf-tmpdir").await.map_err(|_| ())?;
+                        // A symlink and a char device node (/dev/null, 1:3).
+                        root.symlink("narf-link", "narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        root.mknod(
+                            "narf-null",
+                            narf_filesystem::FileType::Special,
+                            (1u64 << 8) | 3,
+                        )
+                        .await
+                        .map_err(|_| ())?;
+                        // Cross-directory move: a file created at the root is moved
+                        // into narf-dir under a new name.
+                        root.create("narf-mover.txt").await.map_err(|_| ())?;
+                        let ndir = root.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        root.rename_to("narf-mover.txt", &*ndir, "narf-moved.txt", 0)
+                            .await
+                            .map_err(|_| ())?;
+                        // A hard link aliasing narf-renamed.txt (nlink becomes 2).
+                        root.link("narf-renamed.txt", "narf-hardlink.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        // Hard-link then unlink one name: the survivor drops to
+                        // nlink 1 and keeps the inode (hardlink-aware unlink).
+                        let hlt = root.create("narf-hltest.txt").await.map_err(|_| ())?;
+                        hlt.write(0, MARKER).await.map_err(|_| ())?;
+                        root.link("narf-hltest.txt", "narf-hlalias.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        root.unlink("narf-hltest.txt").await.map_err(|_| ())?;
+                        // An extended attribute on an existing file (no new inode,
+                        // to spare this small fixture's single leaf).
+                        let xf = root
+                            .lookup_async("narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        xf.set_xattr("user.narf", b"kilroy", 0)
+                            .await
+                            .map_err(|_| ())?;
+                        // Create enough files — each with its own data extent — that
+                        // not only the fs tree but also the EXTENT and CSUM trees
+                        // overflow one leaf and split under an internal root. This
+                        // exercises the multi-leaf commit path (extent-tree
+                        // self-reference resolved by a fixed point) on-disk, validated
+                        // by the post-boot host `btrfs check`.
+                        for i in 0..64u32 {
+                            let name = alloc::format!("narf-split-{i:03}");
+                            let f = root.create(&name).await.map_err(|_| ())?;
+                            // A multi-sector payload so each file's csum item is large
+                            // enough that 64 of them overflow a single csum leaf.
+                            let payload = alloc::vec![i as u8 ^ 0x5a; 8192];
+                            f.write(0, &payload).await.map_err(|_| ())?;
+                        }
+                        // The extent tree is now multi-leaf; grow the filesystem once
+                        // more to exercise chunk growth on a multi-leaf filesystem
+                        // (validated on-disk by the post-boot host `btrfs check`).
+                        {
+                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
+                                narf_block::SyncBlock::new(dev.clone()),
+                                narf_lib::id::DomainId::DRIVER_0,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                .await
+                                .map_err(|_| ())?;
+                        }
+                        // Re-mount the on-disk image and verify the marker read-back,
+                        // the renamed file's content, the scratch file's removal, the
+                        // persistent directory, the removed directory, the symlink
+                        // target, the device node, and the cross-directory move.
+                        let fs2 = factory(dev).map_err(|_| ())?;
+                        let root2 = fs2.root();
+                        let f2 = root2.lookup_async("big.dat").await.map_err(|_| ())?;
+                        let mut buf = [0u8; MARKER.len()];
+                        let n = f2.read(0, &mut buf).await.map_err(|_| ())?;
+                        let cf = root2
+                            .lookup_async("narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        let mut cbuf = [0u8; MARKER.len()];
+                        let cn = cf.read(0, &mut cbuf).await.map_err(|_| ())?;
+                        root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        let link = root2.lookup_async("narf-link").await.map_err(|_| ())?;
+                        let mut lbuf = [0u8; 16];
+                        let ln = link.read(0, &mut lbuf).await.map_err(|_| ())?;
+                        root2.lookup_async("narf-null").await.map_err(|_| ())?;
+                        // The last data file created after the trees split is present
+                        // and its data extent reads back through the split trees.
+                        let sf = root2.lookup_async("narf-split-063").await.map_err(|_| ())?;
+                        let mut sbuf = [0u8; 8192];
+                        let sn = sf.read(0, &mut sbuf).await.map_err(|_| ())?;
+                        if sn != 8192 || sbuf.iter().any(|&b| b != (63u8 ^ 0x5a)) {
+                            return Err(());
+                        }
+                        // The multi-extent file reads back its rewritten content.
+                        let mf = root2.lookup_async("narf-multi.dat").await.map_err(|_| ())?;
+                        let mut mbuf = [0u8; 4096];
+                        mf.read(0, &mut mbuf).await.map_err(|_| ())?;
+                        if mbuf[0] != 0xff || mbuf[1] != 1u8 {
+                            return Err(());
+                        }
+                        // The moved file left the root and landed in narf-dir.
+                        let ndir2 = root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        ndir2.lookup_async("narf-moved.txt").await.map_err(|_| ())?;
+                        // The hard link aliases the renamed file's content.
+                        let hl = root2
+                            .lookup_async("narf-hardlink.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        let mut hbuf = [0u8; MARKER.len()];
+                        let hn = hl.read(0, &mut hbuf).await.map_err(|_| ())?;
+                        // The hard-link-unlink survivor still holds the content.
+                        let alias = root2
+                            .lookup_async("narf-hlalias.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        let mut abuf = [0u8; MARKER.len()];
+                        let an = alias.read(0, &mut abuf).await.map_err(|_| ())?;
+                        // The extended attribute reads back.
+                        let xv = cf.get_xattr("user.narf").await.map_err(|_| ())?;
+                        if xv != b"kilroy" {
+                            return Err(());
+                        }
+                        if root2.lookup_async("narf-scratch.tmp").await.is_ok()
+                            || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
+                            || root2.lookup_async("narf-created.txt").await.is_ok()
+                            || root2.lookup_async("narf-mover.txt").await.is_ok()
+                            || root2.lookup_async("narf-hltest.txt").await.is_ok()
+                            || &lbuf[..ln] != b"narf-renamed.txt"
+                            || hn != MARKER.len()
+                            || hbuf != *MARKER
+                            || an != MARKER.len()
+                            || abuf != *MARKER
+                        {
+                            return Err(());
+                        }
+                        if n == MARKER.len()
+                            && buf == *MARKER
+                            && cn == MARKER.len()
+                            && cbuf == *MARKER
+                        {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    });
+                    return match ok {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-write-smoke: big.dat write + create/unlink on {}",
+                                name
+                            );
+                            narf_init::InitResult::Ok
+                        }
+                        Err(()) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  btrfs-write-smoke: write/read-back failed on {}",
+                                name
+                            );
+                            narf_init::InitResult::Error("btrfs write smoke failed")
+                        }
+                    };
+                }
+                narf_init::InitResult::NotPresent
             });
 
             // Populate /sys/class/input/event<N> from the live evdev router.
