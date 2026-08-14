@@ -124,9 +124,10 @@ read-write with the extra space and `btrfs check` reports it clean. The new
 chunk-tree leaf is kept in the system chunk so it stays reachable via
 `sys_chunk_array` at mount. Block-group `used` and free-space accounting are
 charged **per block group**, so ordinary writes work correctly across the new
-chunk boundary once the filesystem spans more than one chunk. It is currently a
-standalone operation (not yet auto-triggered from the write allocator's
-`NoSpace`).
+chunk boundary once the filesystem spans more than one chunk. Chunk growth is
+**auto-triggered**: when a mutation's allocation runs out of chunk space
+(`NoSpace`), the write path grows the filesystem by a chunk and retries, so writes
+transparently keep succeeding until the device itself is full.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
 free-space tree leaf is maintained in lockstep (extent-mode tracking only). Bounds

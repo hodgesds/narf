@@ -35,6 +35,23 @@ fn glibc_to_kernel_dev(dev: u64) -> u64 {
     (major << 20) | (minor & 0xf_ffff)
 }
 
+/// Run an allocating mutation `$op` (a `Result`-valued `.await` expression); if it
+/// fails with `NoSpace`, grow the filesystem by one chunk and retry.
+/// `grow_add_chunk` returns `NoSpace` once the device is truly full, which then
+/// propagates. Bounded so a persistently-failing op can't loop forever.
+macro_rules! autogrow {
+    ($vol:expr, $op:expr) => {{
+        let mut r = $op;
+        let mut tries = 0u32;
+        while tries < 4 && matches!(r, Err(FsError::NoSpace)) {
+            crate::write::grow_add_chunk(&$vol).await?;
+            tries += 1;
+            r = $op;
+        }
+        r
+    }};
+}
+
 /// One btrfs inode presented to the VFS. A node records the fs tree it lives in:
 /// `None` is the default subvolume (resolved dynamically from the live volume, so
 /// a COW write's new root is observed), `Some(root)` pins a nested subvolume's
@@ -146,7 +163,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
+            autogrow!(
+                vol,
+                crate::write::cow_write_file(&vol, self.ino, &self.inode, offset, buf).await
+            )
         })
     }
 
@@ -204,7 +224,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::set_xattr_item(&vol, self.ino, name, value, flags).await
+            autogrow!(
+                vol,
+                crate::write::set_xattr_item(&vol, self.ino, name, value, flags).await
+            )
         })
     }
 
@@ -214,7 +237,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::remove_xattr_item(&vol, self.ino, name).await
+            autogrow!(
+                vol,
+                crate::write::remove_xattr_item(&vol, self.ino, name).await
+            )
         })
     }
 
@@ -319,7 +345,8 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            let (ino, inode) = crate::write::create_file(&vol, self.ino, name).await?;
+            let (ino, inode) =
+                autogrow!(vol, crate::write::create_file(&vol, self.ino, name).await)?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }
@@ -330,7 +357,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::unlink_file(&vol, self.ino, name).await
+            autogrow!(vol, crate::write::unlink_file(&vol, self.ino, name).await)
         })
     }
 
@@ -340,7 +367,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            let (ino, inode) = crate::write::mkdir_dir(&vol, self.ino, name).await?;
+            let (ino, inode) = autogrow!(vol, crate::write::mkdir_dir(&vol, self.ino, name).await)?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn DirOps>)
         })
     }
@@ -351,7 +378,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::rmdir_dir(&vol, self.ino, name).await
+            autogrow!(vol, crate::write::rmdir_dir(&vol, self.ino, name).await)
         })
     }
 
@@ -361,7 +388,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+            autogrow!(
+                vol,
+                crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+            )
         })
     }
 
@@ -394,9 +424,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::CrossDevice);
             }
             if dest.ino == self.ino {
-                crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+                autogrow!(
+                    vol,
+                    crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+                )
             } else {
-                crate::write::rename_cross_dir(&vol, self.ino, dest.ino, old_name, new_name).await
+                autogrow!(
+                    vol,
+                    crate::write::rename_cross_dir(&vol, self.ino, dest.ino, old_name, new_name)
+                        .await
+                )
             }
         })
     }
@@ -407,7 +444,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            crate::write::link_node(&vol, self.ino, self.ino, old_name, new_name).await
+            autogrow!(
+                vol,
+                crate::write::link_node(&vol, self.ino, self.ino, old_name, new_name).await
+            )
         })
     }
 
@@ -433,7 +473,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             if !Arc::ptr_eq(&vol, &dest_vol) {
                 return Err(FsError::CrossDevice);
             }
-            crate::write::link_node(&vol, self.ino, dest.ino, old_name, new_name).await
+            autogrow!(
+                vol,
+                crate::write::link_node(&vol, self.ino, dest.ino, old_name, new_name).await
+            )
         })
     }
 
@@ -447,7 +490,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            let (ino, inode) = crate::write::symlink_node(&vol, self.ino, name, target).await?;
+            let (ino, inode) = autogrow!(
+                vol,
+                crate::write::symlink_node(&vol, self.ino, name, target).await
+            )?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }
@@ -479,8 +525,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
                 glibc_to_kernel_dev(rdev)
             };
             let vol = self.volume()?;
-            let (ino, inode) =
-                crate::write::mknod_node(&vol, self.ino, name, mode, ft, kdev).await?;
+            let (ino, inode) = autogrow!(
+                vol,
+                crate::write::mknod_node(&vol, self.ino, name, mode, ft, kdev).await
+            )?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }
@@ -493,8 +541,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             let vol = self.volume()?;
             // S_IFSOCK | perms; no device number.
             let mode = 0o140000 | u32::from(perms & 0o7777);
-            let (ino, inode) =
-                crate::write::mknod_node(&vol, self.ino, name, mode, format::FT_SOCK, 0).await?;
+            let (ino, inode) = autogrow!(
+                vol,
+                crate::write::mknod_node(&vol, self.ino, name, mode, format::FT_SOCK, 0).await
+            )?;
             Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
         })
     }

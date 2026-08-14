@@ -2129,6 +2129,53 @@ fn smoke_btrfs_grow_add_chunk() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_grow_add_chunk);
 
+/// Sustained space pressure auto-grows the filesystem: repeatedly overwriting a
+/// file (the bump allocator never reuses freed space) exhausts the initial
+/// chunks, and `FileOps::write` transparently grows the filesystem and retries.
+/// Every write succeeds, the chunk count rises, and the final content is durable.
+fn smoke_btrfs_autogrow() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let chunks_before = vol.chunk_map_len();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let payload = replacement_big();
+    // ~150 overwrites (~32 KB churn each) runs past the ~3 MB of initial data
+    // chunks, forcing at least one auto-grow, with headroom before the device end.
+    for _ in 0..150 {
+        match poll_once(big.write(0, &payload)) {
+            Some(Ok(n)) if n == payload.len() => {}
+            _ => return TestResult::Fail("a write failed under space pressure"),
+        }
+    }
+    if vol.chunk_map_len() <= chunks_before {
+        return TestResult::Fail("filesystem did not auto-grow");
+    }
+
+    // The content is durable across a remount of the grown image.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after auto-grow failed"),
+    };
+    match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => match read_all(&f, payload.len() + 16) {
+            Some(got) if got == payload => TestResult::Pass,
+            _ => TestResult::Fail("content wrong after auto-grow"),
+        },
+        _ => TestResult::Fail("big.dat missing after auto-grow"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_autogrow);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

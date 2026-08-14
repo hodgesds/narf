@@ -72,8 +72,13 @@ impl BumpAllocator {
         let start = align_up(self.next, align);
         let size = align_up(len, align).max(align);
         // Both ends must map, and physically contiguously — i.e. within one chunk.
-        let phys_start = vol.map_logical(start)?;
-        let phys_end = vol.map_logical(start + size - 1)?;
+        // An unmapped address (the cursor ran past the last chunk) is out of
+        // space, not a lookup error, so it must surface as `NoSpace` — that is
+        // what lets a caller grow the filesystem and retry.
+        let phys_start = vol.map_logical(start).map_err(|_| FsError::NoSpace)?;
+        let phys_end = vol
+            .map_logical(start + size - 1)
+            .map_err(|_| FsError::NoSpace)?;
         if phys_end != phys_start + size - 1 {
             return Err(FsError::NoSpace);
         }
