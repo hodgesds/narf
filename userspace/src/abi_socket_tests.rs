@@ -19,6 +19,7 @@ const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 const O_NONBLOCK: i64 = 0o4000;
 const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
@@ -383,6 +384,55 @@ fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_empty_eagain);
+
+fn smoke_abi_socket_accept4_uses_shared_nonblock_state() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-accept4-shared-nonblock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)) != Some(0) {
+            return Err("listen failed");
+        }
+
+        // F_SETFL updates the SocketFile's shared open-file-description state
+        // and the descriptor snapshot. Simulate an inherited/remapped fd whose
+        // snapshot was rebuilt without status flags, as systemd socket
+        // activation exposed during the CachyOS boot.
+        if call(Syscall::Fcntl.raw(), a2(srv, F_SETFL, O_NONBLOCK as u64)) != Some(0) {
+            return Err("F_SETFL(O_NONBLOCK) failed");
+        }
+        let cleared = fd::with_table(FAKE_TASK, |table| {
+            table.get_mut(srv as u32).map(|entry| {
+                entry.status_flags &= !(O_NONBLOCK as u32);
+            })
+        })
+        .flatten()
+        .is_some();
+        if !cleared {
+            return Err("listener fd disappeared");
+        }
+        if !crate::handlers::__test_socket_listener_nonblock(srv as u32) {
+            return Err("accept4 ignored shared SocketFile O_NONBLOCK state");
+        }
+
+        let r =
+            call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, 0)).ok_or("accept4 status not Ok")?;
+        if r != EAGAIN {
+            return Err("empty inherited nonblocking listener did not return -EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_accept4_uses_shared_nonblock_state
+);
 
 // ───────────────────────────── SocketPair ─────────────────────────────
 

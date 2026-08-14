@@ -6538,6 +6538,33 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
     Some(crate::socket::SockAddr { family, body })
 }
 
+/// Return the listener's shared open-file-description `O_NONBLOCK` state.
+///
+/// `SocketFile` is shared across dup, exec remapping, and SCM_RIGHTS while an
+/// `FdEntry` is only a descriptor-slot snapshot. Prefer the shared state so a
+/// transferred systemd activation socket cannot accidentally become blocking;
+/// retain the slot bit as a compatibility fallback for older construction
+/// paths that populated only `FdEntry::status_flags`.
+fn socket_listener_nonblock(
+    task: u64,
+    fd: u32,
+    socket: &crate::socket::SocketFile,
+) -> bool {
+    socket.is_nonblock()
+        || fd::with_table(task, |table| {
+            table
+                .get(fd)
+                .is_some_and(|entry| entry.status_flags & crate::fd::O_NONBLOCK != 0)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn __test_socket_listener_nonblock(fd: u32) -> bool {
+    let task = current_task_id();
+    current_socket(fd)
+        .is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
+}
+
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -6611,12 +6638,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             // so the `syscall` instruction re-executes on resume (no
             // return value set), looping in-kernel until `Accepted`.
             let task = current_task_id();
-            let listen_nonblock = fd::with_table(task, |t| {
-                t.get(fd)
-                    .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
-            })
-            .flatten()
-            .unwrap_or(false);
+            let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
                 ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
                 return;
