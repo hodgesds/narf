@@ -123,12 +123,16 @@ closed-form.
 through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
 `DEV_EXTENT`), extent tree (new `BLOCK_GROUP_ITEM`), free-space tree, and root
 tree in one COW mini-transaction — so a real kernel mounts the grown image
-read-write with the extra space and `btrfs check` reports it clean. The new
-chunk-tree leaf is kept in the system chunk so it stays reachable via
-`sys_chunk_array` at mount. Block-group `used` and free-space accounting are
-charged **per block group**, so ordinary writes work correctly across the new
-chunk boundary once the filesystem spans more than one chunk. Chunk growth is
-**auto-triggered**: when a mutation's allocation runs out of chunk space
+read-write with the extra space and `btrfs check` reports it clean. It uses the
+same multi-leaf machinery as `commit_txn`, so it works **even when the
+chunk/dev/extent/root/free-space trees are already multi-leaf** (a large or
+heavily-churned filesystem): the new chunk-tree blocks are placed in the **system
+chunk** (kept reachable via `sys_chunk_array` at mount) while the dev/extent/root/
+free-space blocks go at the start of the new chunk, and the extent/free-space leaf
+counts are resolved by the same fixed point. Block-group `used` and free-space
+accounting are charged **per block group**, so ordinary writes work correctly
+across the new chunk boundary once the filesystem spans more than one chunk. Chunk
+growth is **auto-triggered**: when a mutation's allocation runs out of chunk space
 (`NoSpace`), the write path grows the filesystem by a chunk and retries, so writes
 transparently keep succeeding until the device itself is full.
 
@@ -145,15 +149,13 @@ placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. A ≥64 MiB image is therefore fully writable.
 
 Bounds (all fail loudly): each tree grows to at most **two levels** (a third →
-`NoSpace`); no space reclaim (freed logical addresses aren't reused); a
-`FREE_SPACE_BITMAP` block group is out of scope; and **chunk growth still requires
-single-leaf** chunk/dev/extent/root/free-space trees, so a filesystem must be
-grown before those split (a large fs has ample space and rarely needs to grow —
-under sustained churn on a *small* image, grow it early). The write-interop
-guarantee is CI-enforced: `cargo xtask test` runs host `btrfs check` on the
-NARF-written image when `btrfs-progs` is available — on a plain image, a
-`space_cache=v2` image (including a multi-level fs tree), and a **96 MiB image
-carrying the 64 MiB superblock mirror whose extent tree it splits multi-leaf**.
+`NoSpace`); no space reclaim (freed logical addresses aren't reused); and a
+`FREE_SPACE_BITMAP` block group is out of scope. The write-interop guarantee is
+CI-enforced: `cargo xtask test` runs host `btrfs check` on the NARF-written image
+when `btrfs-progs` is available — on a plain image, a `space_cache=v2` image
+(including a multi-level fs tree), and a **96 MiB image carrying the 64 MiB
+superblock mirror whose extent tree it splits multi-leaf and then grows a chunk
+on top of**.
 
 ## Test fixtures
 

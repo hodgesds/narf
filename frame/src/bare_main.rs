@@ -2997,6 +2997,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             let payload = alloc::vec![i as u8 ^ 0x5a; 8192];
                             f.write(0, &payload).await.map_err(|_| ())?;
                         }
+                        // The extent tree is now multi-leaf; grow the filesystem once
+                        // more to exercise chunk growth on a multi-leaf filesystem
+                        // (validated on-disk by the post-boot host `btrfs check`).
+                        {
+                            let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
+                                narf_block::SyncBlock::new(dev.clone()),
+                                narf_lib::id::DomainId::DRIVER_0,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            narf_drivers_fs_btrfs::write::grow_add_chunk(&gvol)
+                                .await
+                                .map_err(|_| ())?;
+                        }
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink

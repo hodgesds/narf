@@ -2385,8 +2385,8 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_avoids_supers);
 fn smoke_btrfs_multileaf_trees() -> TestResult {
     use narf_filesystem::FsInstance;
 
-    const N: u32 = 70;
-    const SZ: usize = 32768; // 8 sectors: a large csum item per file
+    const N: u32 = 90;
+    const SZ: usize = 65536; // 16 sectors: a large csum item per file
 
     fn tree_level<B: narf_block::BlockDevice + 'static>(
         vol: &BtrfsVolume<B>,
@@ -2403,20 +2403,13 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("mirror fixture failed to mount"),
     };
+    let chunks_before = vol.chunk_map_len();
 
-    // Add chunks up front, while the extent/free-space trees are still single
-    // leaves (chunk growth requires that), so the churn below — which never reuses
-    // freed space and COWs whole trees — has room to split those trees without
-    // needing a further grow. Grow until the device is (nearly) full.
-    let mut grew = 0u32;
-    while grew < 6 && matches!(poll_once(crate::write::grow_add_chunk(&vol)), Some(Ok(()))) {
-        grew += 1;
-    }
-    if grew == 0 {
-        return TestResult::Fail("pre-grow made no progress");
-    }
-
-    // Each file gets a distinct byte pattern so cross-file corruption is caught.
+    // No pre-grow: the churn below never reuses freed space and COWs whole trees,
+    // so it exhausts the initial chunk and triggers `grow_add_chunk` *after* the
+    // extent/free-space trees have split — exercising chunk growth on a multi-leaf
+    // filesystem. Each file gets a distinct byte pattern so cross-file corruption
+    // is caught.
     for i in 0..N {
         let name = alloc::format!("d{i:03}.dat");
         let f = match poll_once(vol.root().create(&name)) {
@@ -2428,6 +2421,12 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
             Some(Ok(n)) if n == SZ => {}
             _ => return TestResult::Fail("write failed under multi-leaf churn"),
         }
+    }
+
+    // The churn must have both split the trees and grown the filesystem — i.e.
+    // at least one grow ran with the extent/free-space trees already multi-leaf.
+    if vol.chunk_map_len() <= chunks_before {
+        return TestResult::Fail("filesystem did not grow under multi-leaf churn");
     }
 
     // Both the extent and csum trees must have outgrown a single leaf.

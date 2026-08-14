@@ -41,20 +41,19 @@
 //! errors — verified end to end on both a plain image and a `space_cache=v2`
 //! (free-space-tree) image.
 //!
-//! **Every tree may be multi-leaf** (fs, extent, csum, root, free-space): it is
-//! read into one logical leaf, edited, then re-packed into as many real leaves as
-//! needed under an internal root (`commit_txn` / [`pack_tree_at`]), so a file /
-//! directory / extent / checksum set can outgrow a single leaf — as it does on a
-//! laptop-scale root. Bounds: each tree grows to at most two levels (a third →
-//! `NoSpace`); no space reclaim (freed logical addresses aren't reused); extent-
-//! mode free-space tracking only (a `FREE_SPACE_BITMAP` block group is out of
-//! scope); and chunk growth ([`grow_add_chunk`]) still requires single-leaf
-//! chunk/dev/extent/root/free-space trees, so a filesystem must be grown before
-//! those split (a large fs has ample space and rarely needs to grow). Every
-//! superblock copy is
-//! updated in lockstep, so images large enough to carry the 64 MiB / 256 GiB
-//! mirrors stay `btrfs check`-clean, and a grown chunk is placed clear of the
-//! mirror bands (`chunk_span_avoiding_supers`).
+//! **Every tree may be multi-leaf** (fs, extent, csum, root, dev, chunk,
+//! free-space): it is read into one logical leaf, edited, then re-packed into as
+//! many real leaves as needed under an internal root (`commit_txn` /
+//! [`grow_add_chunk`] via [`pack_tree_at`]), so a file / directory / extent /
+//! checksum set can outgrow a single leaf — as it does on a laptop-scale root —
+//! and chunk growth works even when those trees have already split (its new
+//! chunk-tree blocks stay in the system chunk). Bounds: each tree grows to at most
+//! two levels (a third → `NoSpace`); no space reclaim (freed logical addresses
+//! aren't reused); extent-mode free-space tracking only (a `FREE_SPACE_BITMAP`
+//! block group is out of scope). Every superblock copy is updated in lockstep, so
+//! images large enough to carry the 64 MiB / 256 GiB mirrors stay `btrfs
+//! check`-clean, and a grown chunk is placed clear of the mirror bands
+//! (`chunk_span_avoiding_supers`).
 
 use alloc::vec::Vec;
 
@@ -783,6 +782,32 @@ fn alloc_nodes<B: BlockDevice + 'static>(
     n: usize,
 ) -> Result<Vec<u64>, FsError> {
     (0..n).map(|_| alloc.alloc_node(vol)).collect()
+}
+
+/// A tree's new root `(addr, level)` given its packed leaves' addresses and
+/// groups: the internal root (last address, level 1) when it has more than one
+/// leaf, else the single leaf (level 0).
+fn tree_root_addr(addrs: &[u64], groups: &[(usize, usize)]) -> (u64, u8) {
+    if groups.len() > 1 {
+        (addrs[groups.len()], 1)
+    } else {
+        (addrs[0], 0)
+    }
+}
+
+/// Bump `cursor` by `n` node-sized blocks within `[.., limit)`, returning their
+/// addresses (`NoSpace` if the arena is exhausted). Used by chunk growth to hand
+/// out blocks from the system chunk and from the new chunk.
+fn take_nodes(cursor: &mut u64, limit: u64, n: usize, nodesize: u64) -> Result<Vec<u64>, FsError> {
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        if cursor.saturating_add(nodesize) > limit {
+            return Err(FsError::NoSpace);
+        }
+        v.push(*cursor);
+        *cursor += nodesize;
+    }
+    Ok(v)
 }
 
 /// Append `(addr, owner, level)` for each block of a tree with `leaves` leaves
@@ -2638,19 +2663,22 @@ pub async fn remove_xattr_item<B: BlockDevice + 'static>(
 /// at the end of the device, creating its block group, and threading the change
 /// through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
 /// `DEV_EXTENT`), extent tree (new `BLOCK_GROUP_ITEM`), free-space tree (the new
-/// block group's free space), and root tree — one COW mini-transaction. The new
-/// chunk's first nodes hold this transaction's own new metadata blocks (so it can
-/// be written even when the old chunks are full), and the rest is free space a
-/// later write can allocate from.
+/// block group's free space), and root tree — one COW mini-transaction.
 ///
-/// Single-leaf chunk/device/extent/root/free-space trees only (a fresh image);
-/// requires a free-space tree. `NoSpace` when the device has no room for another
-/// stripe.
+/// Every one of those trees may be **multi-leaf**: each is read as one logical
+/// leaf, edited, then re-packed into as many real leaves as it needs under an
+/// internal root ([`pack_tree_at`]). New chunk-tree blocks are placed in the
+/// **system chunk** (the chunk tree is read from `sys_chunk_array` before any
+/// other chunk is mapped, so it must stay reachable there); the dev/extent/root/
+/// free-space blocks are placed at the **start of the new chunk**, so the commit
+/// is writable even when the old chunks are full, and the rest of the new chunk is
+/// free space. Because the extent tree records its own new blocks, the extent and
+/// free-space leaf counts are resolved by the same fixed point [`commit_txn`]
+/// uses. `NoSpace` when the device (or system chunk) has no room.
 pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), FsError> {
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
     let old_chunk = sb.chunk_root;
-    let old_root = root_tree;
     let old_dev = roots::find_root(vol, root_tree, format::DEV_TREE_OBJECTID)
         .await?
         .0;
@@ -2661,34 +2689,24 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         .await?
         .0;
 
-    let mut chunk_leaf = vol.read_node(old_chunk).await?;
-    let mut dev_leaf = vol.read_node(old_dev).await?;
-    let mut ext_leaf = vol.read_node(old_ext).await?;
-    let mut root_leaf = vol.read_node(old_root).await?;
-    let mut fst_leaf = vol.read_node(old_fst).await?;
-    for leaf in [&chunk_leaf, &dev_leaf, &ext_leaf, &root_leaf, &fst_leaf] {
-        if level(leaf)? != 0 {
-            // Chunk growth still edits the chunk/dev/extent/root/free-space trees
-            // as single leaves. A caller that has already split those (a large,
-            // busy filesystem) must grow earlier, while they are single-leaf.
-            return Err(FsError::Unsupported);
-        }
-    }
+    // Read every tree this grow COWs as one oversized logical leaf (any height).
+    let (mut chunk_logical, chunk_old) = read_fs_oversized(vol, old_chunk).await?;
+    let (mut dev_logical, dev_old) = read_fs_oversized(vol, old_dev).await?;
+    let (ext_base0, ext_old) = read_fs_oversized(vol, old_ext).await?;
+    let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
+    let (fst_base0, fst_old) = read_fs_oversized(vol, old_fst).await?;
 
     // ── Locate the logical/physical high-water and a template chunk item ─
     let mut logical_hw = 0u64;
     let mut template: Option<Vec<u8>> = None; // an 80-byte DATA|METADATA CHUNK_ITEM
-    let n = nritems(&chunk_leaf)? as usize;
-    for i in 0..n {
-        let k = leaf_item_key(&chunk_leaf, i)?;
+    for i in 0..nritems(&chunk_logical)? as usize {
+        let k = leaf_item_key(&chunk_logical, i)?;
         if k.item_type != format::CHUNK_ITEM_KEY {
             continue;
         }
-        let body = leaf_item_data(&chunk_leaf, i)?;
-        let length = le64(body, 0)?;
-        logical_hw = logical_hw.max(k.offset.saturating_add(length));
-        let flags = le64(body, 24)?;
-        if flags & format::BLOCK_GROUP_DATA != 0 && body.len() >= 80 {
+        let body = leaf_item_data(&chunk_logical, i)?;
+        logical_hw = logical_hw.max(k.offset.saturating_add(le64(body, 0)?));
+        if le64(body, 24)? & format::BLOCK_GROUP_DATA != 0 && body.len() >= 80 {
             template = Some(body.to_vec());
         }
     }
@@ -2697,15 +2715,13 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     // Physical high-water + a chunk_tree_uuid template from the device extents.
     let mut physical_hw = 0u64;
     let mut chunk_tree_uuid = [0u8; 16];
-    let dn = nritems(&dev_leaf)? as usize;
-    for i in 0..dn {
-        let k = leaf_item_key(&dev_leaf, i)?;
+    for i in 0..nritems(&dev_logical)? as usize {
+        let k = leaf_item_key(&dev_logical, i)?;
         if k.item_type != format::DEV_EXTENT_KEY {
             continue;
         }
-        let body = leaf_item_data(&dev_leaf, i)?;
-        let length = le64(body, 24)?;
-        physical_hw = physical_hw.max(k.offset.saturating_add(length));
+        let body = leaf_item_data(&dev_logical, i)?;
+        physical_hw = physical_hw.max(k.offset.saturating_add(le64(body, 24)?));
         chunk_tree_uuid.copy_from_slice(&body[32..48]);
     }
 
@@ -2722,15 +2738,13 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     let gen = sb.generation + 1;
     let nodesize = vol.nodesize() as u64;
 
-    // The new chunk-tree leaf must stay reachable via `sys_chunk_array` at mount
-    // (the chunk tree is read before any other chunk is mapped), so it is placed
-    // in the *system* chunk. The rest of this txn's new metadata goes at the start
-    // of the new chunk (so the commit is writable even with the old chunks full).
-    let (sys_start, sys_len) = block_group_of(&ext_leaf, old_chunk)?.ok_or(FsError::InvalidData)?;
+    // System-chunk arena for the new chunk-tree blocks: past the highest live
+    // metadata block already in the system group.
+    let (sys_start, sys_len) =
+        block_group_of(&ext_base0, old_chunk)?.ok_or(FsError::InvalidData)?;
     let mut sys_hw = sys_start;
-    let en = nritems(&ext_leaf)? as usize;
-    for i in 0..en {
-        let k = leaf_item_key(&ext_leaf, i)?;
+    for i in 0..nritems(&ext_base0)? as usize {
+        let k = leaf_item_key(&ext_base0, i)?;
         if k.item_type == format::METADATA_ITEM_KEY
             && k.objectid >= sys_start
             && k.objectid < sys_start + sys_len
@@ -2738,22 +2752,15 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
             sys_hw = sys_hw.max(k.objectid + nodesize);
         }
     }
-    if sys_hw + nodesize > sys_start + sys_len {
-        return Err(FsError::NoSpace); // system chunk full
-    }
-    let n_chunk = sys_hw;
-    let n_dev = new_logical;
-    let n_ext = new_logical + nodesize;
-    let n_root = new_logical + 2 * nodesize;
-    let n_fst = new_logical + 3 * nodesize;
-    let newbg_meta = 4 * nodesize; // metadata blocks this txn places in the new group
+    let sys_limit = sys_start + sys_len;
+    let new_limit = new_logical + chunk_size;
 
     // ── Chunk tree: new CHUNK_ITEM + bump the DEV_ITEM's bytes_used ─────
     let mut chunk_item = template.clone();
     chunk_item[0..8].copy_from_slice(&chunk_size.to_le_bytes()); // length
     chunk_item[56..64].copy_from_slice(&new_physical.to_le_bytes()); // stripe 0 physical
     leaf_insert_sorted(
-        &mut chunk_leaf,
+        &mut chunk_logical,
         &BtrfsKey::new(
             format::FIRST_CHUNK_TREE_OBJECTID,
             format::CHUNK_ITEM_KEY,
@@ -2762,15 +2769,14 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         &chunk_item,
     )?;
     let di_slot = leaf_find(
-        &chunk_leaf,
+        &chunk_logical,
         &BtrfsKey::new(format::DEV_ITEMS_OBJECTID, format::DEV_ITEM_KEY, 1),
     )?
     .ok_or(FsError::InvalidData)?;
-    let mut dev_item = leaf_item_data(&chunk_leaf, di_slot)?.to_vec();
+    let mut dev_item = leaf_item_data(&chunk_logical, di_slot)?.to_vec();
     let dev_used = le64(&dev_item, 16)? + chunk_size;
     dev_item[16..24].copy_from_slice(&dev_used.to_le_bytes());
-    leaf_replace_inplace(&mut chunk_leaf, di_slot, &dev_item)?;
-    stamp_node(&mut chunk_leaf, n_chunk, gen);
+    leaf_replace_inplace(&mut chunk_logical, di_slot, &dev_item)?;
 
     // ── Device tree: new DEV_EXTENT for the physical range ─────────────
     let mut dev_extent = alloc::vec![0u8; 48];
@@ -2780,7 +2786,7 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     dev_extent[24..32].copy_from_slice(&chunk_size.to_le_bytes());
     dev_extent[32..48].copy_from_slice(&chunk_tree_uuid);
     leaf_insert_sorted(
-        &mut dev_leaf,
+        &mut dev_logical,
         &BtrfsKey::new(
             format::DEV_ITEMS_OBJECTID,
             format::DEV_EXTENT_KEY,
@@ -2788,103 +2794,239 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         ),
         &dev_extent,
     )?;
-    stamp_node(&mut dev_leaf, n_dev, gen);
 
-    // ── Extent tree: new BLOCK_GROUP_ITEM, record new metadata, free old ─
+    // ── Extent tree base: add the new BLOCK_GROUP_ITEM (used charged later) ─
+    let mut ext_base = ext_base0;
     let mut bg = alloc::vec![0u8; 24];
-    // used starts at 0; the per-block accounting below charges the four metadata
-    // blocks this txn places in the new group.
     bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes()); // chunk_objectid
     bg[16..24]
         .copy_from_slice(&(format::BLOCK_GROUP_DATA | format::BLOCK_GROUP_METADATA).to_le_bytes());
     leaf_insert_sorted(
-        &mut ext_leaf,
+        &mut ext_base,
         &BtrfsKey::new(new_logical, format::BLOCK_GROUP_ITEM_KEY, chunk_size),
         &bg,
     )?;
-    let cowed = [
-        (old_chunk, n_chunk, format::CHUNK_TREE_OBJECTID),
-        (old_dev, n_dev, format::DEV_TREE_OBJECTID),
-        (old_ext, n_ext, format::EXTENT_TREE_OBJECTID),
-        (old_root, n_root, format::ROOT_TREE_OBJECTID),
-        (old_fst, n_fst, format::FREE_SPACE_TREE_OBJECTID),
-    ];
-    for (old, _, _) in cowed {
-        if let Some(slot) = leaf_find(&ext_leaf, &BtrfsKey::new(old, format::METADATA_ITEM_KEY, 0))?
-        {
-            leaf_delete(&mut ext_leaf, slot)?;
-        }
-        block_group_add_used(&mut ext_leaf, old, -(nodesize as i64))?; // leaves its group
-    }
-    for (_, new, owner) in cowed {
-        leaf_insert_sorted(
-            &mut ext_leaf,
-            &BtrfsKey::new(new, format::METADATA_ITEM_KEY, 0),
-            &ext_item_meta(gen, owner),
-        )?;
-        block_group_add_used(&mut ext_leaf, new, nodesize as i64)?; // charged to its group
-    }
-    stamp_node(&mut ext_leaf, n_ext, gen);
 
-    // ── Free-space tree: the new block group's free space + freed old blocks ─
-    // FREE_SPACE_INFO for the new group (extent mode, one free extent).
+    // ── Free-space tree base: FREE_SPACE_INFO for the new group ────────
+    let mut fst_base = fst_base0;
     let mut info = alloc::vec![0u8; 8];
-    info[0..4].copy_from_slice(&1u32.to_le_bytes()); // extent_count
+    info[0..4].copy_from_slice(&1u32.to_le_bytes()); // extent_count (one free run)
     leaf_insert_sorted(
-        &mut fst_leaf,
+        &mut fst_base,
         &BtrfsKey::new(new_logical, format::FREE_SPACE_INFO_KEY, chunk_size),
         &info,
     )?;
-    // The new group's free run is everything past this txn's four metadata blocks.
-    leaf_insert_sorted(
-        &mut fst_leaf,
-        &BtrfsKey::new(
-            new_logical + newbg_meta,
-            format::FREE_SPACE_EXTENT_KEY,
-            chunk_size - newbg_meta,
-        ),
-        &[],
-    )?;
-    // Carve the new chunk-tree leaf out of the system group's free space.
-    fst_mark_used(&mut fst_leaf, sys_start, sys_len, n_chunk, nodesize)?;
-    // Return each freed old block to its old block group's free space.
-    for (old, _, _) in cowed {
-        let (bg_start, bg_len) = block_group_of(&ext_leaf, old)?.ok_or(FsError::InvalidData)?;
-        fst_mark_free(&mut fst_leaf, bg_start, bg_len, old, nodesize)?;
+
+    // Fixed groupings: chunk/dev content and the root tree's size are settled.
+    let chunk_groups = group_items(vol, &chunk_logical)?;
+    let dev_groups = group_items(vol, &dev_logical)?;
+    let root_groups = group_items(vol, &root_logical)?;
+    let chunk_nc = tree_node_count(&chunk_groups);
+    let dev_nc = tree_node_count(&dev_groups);
+    let root_nc = tree_node_count(&root_groups);
+
+    // Every old block across every COWed tree is returned to free space.
+    let mut freed_meta: Vec<(u64, u8)> = chunk_old;
+    freed_meta.extend(dev_old);
+    freed_meta.extend(ext_old);
+    freed_meta.extend(root_old);
+    freed_meta.extend(fst_old);
+
+    // ── Fixed point over the extent/free-space leaf counts ─────────────
+    // Chunk-tree blocks come from the system arena; dev/ext/root/free-space from
+    // the new chunk. The new group's used prefix (hence its free run) grows with
+    // the extent/free-space leaf counts, so they are resolved together.
+    #[allow(clippy::type_complexity)]
+    struct Grown {
+        chunk_addrs: Vec<u64>,
+        dev_addrs: Vec<u64>,
+        ext_addrs: Vec<u64>,
+        root_addrs: Vec<u64>,
+        fst_addrs: Vec<u64>,
+        new_meta: Vec<(u64, u64, u8)>,
+        ext_final: Vec<u8>,
+        ext_groups: Vec<(usize, usize)>,
+        fst_final: Vec<u8>,
+        fst_groups: Vec<(usize, usize)>,
     }
-    stamp_node(&mut fst_leaf, n_fst, gen);
+    let mut grown: Option<Grown> = None;
+    let mut ext_leaves = 1usize;
+    let mut fst_leaves = 1usize;
+
+    for _ in 0..8 {
+        let mut sc = sys_hw;
+        let mut nc = new_logical;
+        let chunk_addrs = take_nodes(&mut sc, sys_limit, chunk_nc, nodesize)?;
+        let dev_addrs = take_nodes(&mut nc, new_limit, dev_nc, nodesize)?;
+        let ext_addrs = take_nodes(
+            &mut nc,
+            new_limit,
+            ext_leaves + usize::from(ext_leaves > 1),
+            nodesize,
+        )?;
+        let root_addrs = take_nodes(&mut nc, new_limit, root_nc, nodesize)?;
+        let fst_addrs = take_nodes(
+            &mut nc,
+            new_limit,
+            fst_leaves + usize::from(fst_leaves > 1),
+            nodesize,
+        )?;
+        // The new group's used prefix = every new block placed in the new chunk.
+        let newbg_used = (dev_addrs.len() + ext_addrs.len() + root_addrs.len() + fst_addrs.len())
+            as u64
+            * nodesize;
+
+        let mut new_meta: Vec<(u64, u64, u8)> = Vec::new();
+        collect_tree_meta(
+            &chunk_addrs,
+            chunk_groups.len(),
+            format::CHUNK_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        collect_tree_meta(
+            &dev_addrs,
+            dev_groups.len(),
+            format::DEV_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        collect_tree_meta(
+            &ext_addrs,
+            ext_leaves,
+            format::EXTENT_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        collect_tree_meta(
+            &root_addrs,
+            root_groups.len(),
+            format::ROOT_TREE_OBJECTID,
+            &mut new_meta,
+        );
+        collect_tree_meta(
+            &fst_addrs,
+            fst_leaves,
+            format::FREE_SPACE_TREE_OBJECTID,
+            &mut new_meta,
+        );
+
+        // Extent tree with this iteration's metadata items.
+        let mut ext_final = ext_base.clone();
+        for &(blk, lvl) in &freed_meta {
+            if let Some(s) = leaf_find(
+                &ext_final,
+                &BtrfsKey::new(blk, format::METADATA_ITEM_KEY, u64::from(lvl)),
+            )? {
+                leaf_delete(&mut ext_final, s)?;
+            }
+        }
+        for &(addr, owner, lvl) in &new_meta {
+            leaf_insert_sorted(
+                &mut ext_final,
+                &BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(lvl)),
+                &ext_item_meta(gen, owner),
+            )?;
+        }
+        let ext_groups = group_items(vol, &ext_final)?;
+
+        // Free-space tree: the new group's free run, the carved system blocks,
+        // and every freed old block returned to its group.
+        let mut fst_final = fst_base.clone();
+        leaf_insert_sorted(
+            &mut fst_final,
+            &BtrfsKey::new(
+                new_logical + newbg_used,
+                format::FREE_SPACE_EXTENT_KEY,
+                chunk_size - newbg_used,
+            ),
+            &[],
+        )?;
+        for &a in &chunk_addrs {
+            fst_mark_used(&mut fst_final, sys_start, sys_len, a, nodesize)?;
+        }
+        for &(blk, _) in &freed_meta {
+            let (s, l) = block_group_of(&ext_final, blk)?.ok_or(FsError::InvalidData)?;
+            fst_mark_free(&mut fst_final, s, l, blk, nodesize)?;
+        }
+        let fst_groups = group_items(vol, &fst_final)?;
+
+        if ext_groups.len() == ext_leaves && fst_groups.len() == fst_leaves {
+            grown = Some(Grown {
+                chunk_addrs,
+                dev_addrs,
+                ext_addrs,
+                root_addrs,
+                fst_addrs,
+                new_meta,
+                ext_final,
+                ext_groups,
+                fst_final,
+                fst_groups,
+            });
+            break;
+        }
+        ext_leaves = ext_groups.len();
+        fst_leaves = fst_groups.len();
+    }
+    let Grown {
+        chunk_addrs,
+        dev_addrs,
+        ext_addrs,
+        root_addrs,
+        fst_addrs,
+        new_meta,
+        mut ext_final,
+        ext_groups,
+        fst_final,
+        fst_groups,
+    } = grown.ok_or(FsError::NoSpace)?;
+
+    // ── Block-group `used`: charge each new block, uncharge each freed one ──
+    for &(addr, _, _) in &new_meta {
+        block_group_add_used(&mut ext_final, addr, nodesize as i64)?;
+    }
+    for &(blk, _) in &freed_meta {
+        block_group_add_used(&mut ext_final, blk, -(nodesize as i64))?;
+    }
 
     // ── Root tree: repoint the device/extent/free-space ROOT_ITEMs ─────
-    for (owner, new) in [
-        (format::DEV_TREE_OBJECTID, n_dev),
-        (format::EXTENT_TREE_OBJECTID, n_ext),
-        (format::FREE_SPACE_TREE_OBJECTID, n_fst),
+    let (chunk_root_addr, _) = tree_root_addr(&chunk_addrs, &chunk_groups);
+    let (dev_root_addr, dev_lvl) = tree_root_addr(&dev_addrs, &dev_groups);
+    let (ext_root_addr, ext_lvl) = tree_root_addr(&ext_addrs, &ext_groups);
+    let (root_root_addr, _) = tree_root_addr(&root_addrs, &root_groups);
+    let (fst_root_addr, fst_lvl) = tree_root_addr(&fst_addrs, &fst_groups);
+    for (owner, new, lvl) in [
+        (format::DEV_TREE_OBJECTID, dev_root_addr, dev_lvl),
+        (format::EXTENT_TREE_OBJECTID, ext_root_addr, ext_lvl),
+        (format::FREE_SPACE_TREE_OBJECTID, fst_root_addr, fst_lvl),
     ] {
-        let slot = leaf_find_by_type(&root_leaf, owner, format::ROOT_ITEM_KEY)?
+        let slot = leaf_find_by_type(&root_logical, owner, format::ROOT_ITEM_KEY)?
             .ok_or(FsError::NotFound)?;
-        let mut ri = leaf_item_data(&root_leaf, slot)?.to_vec();
+        let mut ri = leaf_item_data(&root_logical, slot)?.to_vec();
         ri[160..168].copy_from_slice(&gen.to_le_bytes());
         ri[176..184].copy_from_slice(&new.to_le_bytes());
-        ri[238] = 0;
+        ri[238] = lvl;
         if ri.len() >= 247 {
             ri[239..247].copy_from_slice(&gen.to_le_bytes());
         }
-        leaf_replace_inplace(&mut root_leaf, slot, &ri)?;
+        leaf_replace_inplace(&mut root_logical, slot, &ri)?;
     }
-    stamp_node(&mut root_leaf, n_root, gen);
 
-    // ── Publish the chunk mapping, write nodes, flip the superblock ────
+    // ── Pack every tree, publish the chunk mapping, write, flip the super ──
+    let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
+    nodes.extend(pack_tree_at(vol, &chunk_logical, &chunk_groups, &chunk_addrs, gen)?.0);
+    nodes.extend(pack_tree_at(vol, &dev_logical, &dev_groups, &dev_addrs, gen)?.0);
+    nodes.extend(pack_tree_at(vol, &ext_final, &ext_groups, &ext_addrs, gen)?.0);
+    nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
+    nodes.extend(pack_tree_at(vol, &fst_final, &fst_groups, &fst_addrs, gen)?.0);
+
     vol.add_chunk_mapping(new_logical, chunk_size, 1, new_physical);
-    vol.write_logical(n_chunk, &chunk_leaf).await?;
-    vol.write_logical(n_dev, &dev_leaf).await?;
-    vol.write_logical(n_ext, &ext_leaf).await?;
-    vol.write_logical(n_root, &root_leaf).await?;
-    vol.write_logical(n_fst, &fst_leaf).await?;
+    for (addr, buf) in &nodes {
+        vol.write_logical(*addr, buf).await?;
+    }
 
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
-    raw[80..88].copy_from_slice(&n_root.to_le_bytes()); // root
-    raw[88..96].copy_from_slice(&n_chunk.to_le_bytes()); // chunk_root
+    raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
+    raw[88..96].copy_from_slice(&chunk_root_addr.to_le_bytes()); // chunk_root
     raw[164..172].copy_from_slice(&gen.to_le_bytes()); // chunk_root_generation
                                                        // Embedded dev_item.bytes_used (dev_item@201, bytes_used@+16).
     raw[217..225].copy_from_slice(&dev_used.to_le_bytes());
@@ -2895,6 +3037,6 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     }
     vol.flush().await;
     vol.write_superblock(&raw).await?;
-    vol.commit_chunk_root(n_chunk, n_root, gen);
+    vol.commit_chunk_root(chunk_root_addr, root_root_addr, gen);
     Ok(())
 }
