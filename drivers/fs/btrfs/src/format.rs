@@ -53,6 +53,9 @@ pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
 /// First object id available to files/dirs; also the fs-tree root directory.
 pub const FIRST_FREE_OBJECTID: u64 = 256;
+/// Highest object id available to files/dirs (`BTRFS_LAST_FREE_OBJECTID`, -256);
+/// object ids above this are reserved. Bounds the inode-number search.
+pub const LAST_FREE_OBJECTID: u64 = (-256i64) as u64;
 
 // ── Item (key) types ───────────────────────────────────────────────
 

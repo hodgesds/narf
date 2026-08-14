@@ -1487,11 +1487,10 @@ fn reconstruct_sparse_fixture(sparse_rel: &str, out: &Path) {
         return;
     }
     let total = u64::from_le_bytes(sparse[8..16].try_into().unwrap());
-    if let Ok(m) = std::fs::metadata(out) {
-        if m.len() == total {
-            return;
-        }
-    }
+    // Always rebuild to a pristine image: the btrfs boot smoke *mutates* this
+    // disk (write + create/unlink), so a size check can't tell a clean fixture
+    // from an already-modified one. Reconstruction is cheap (a ~110 KiB sparse
+    // payload into a sparse-backed 16 MiB file).
     if let Some(parent) = out.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

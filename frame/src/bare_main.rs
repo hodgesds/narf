@@ -2899,13 +2899,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     let name = entry.name;
                     let ok = narf_scheduler::block_on(async {
                         let fs = factory(dev.clone()).map_err(|_| ())?;
-                        let file = fs.root().lookup_async("big.dat").await.map_err(|_| ())?;
+                        let root = fs.root();
+                        let file = root.lookup_async("big.dat").await.map_err(|_| ())?;
                         file.write(0, MARKER).await.map_err(|_| ())?;
-                        // Re-mount the on-disk image and read the marker back.
+                        // Namespace mutations: create a file that persists, plus a
+                        // scratch file that is created then unlinked (both validated
+                        // structurally by the post-boot host `btrfs check`).
+                        root.create("narf-created.txt").await.map_err(|_| ())?;
+                        root.create("narf-scratch.tmp").await.map_err(|_| ())?;
+                        root.unlink("narf-scratch.tmp").await.map_err(|_| ())?;
+                        // Re-mount the on-disk image and verify the marker read-back,
+                        // the created file's presence, and the scratch file's removal.
                         let fs2 = factory(dev).map_err(|_| ())?;
-                        let f2 = fs2.root().lookup_async("big.dat").await.map_err(|_| ())?;
+                        let root2 = fs2.root();
+                        let f2 = root2.lookup_async("big.dat").await.map_err(|_| ())?;
                         let mut buf = [0u8; MARKER.len()];
                         let n = f2.read(0, &mut buf).await.map_err(|_| ())?;
+                        root2
+                            .lookup_async("narf-created.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        if root2.lookup_async("narf-scratch.tmp").await.is_ok() {
+                            return Err(());
+                        }
                         if n == MARKER.len() && buf == *MARKER {
                             Ok(())
                         } else {
@@ -2916,7 +2932,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         Ok(()) => {
                             let _ = writeln!(
                                 console::Writer,
-                                "  btrfs-write-smoke: wrote + read back big.dat on {}",
+                                "  btrfs-write-smoke: big.dat write + create/unlink on {}",
                                 name
                             );
                             narf_init::InitResult::Ok

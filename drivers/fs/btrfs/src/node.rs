@@ -281,6 +281,29 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         })
     }
 
+    fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            // Only the default subvolume is writable (a pinned subvolume would
+            // need its own ROOT_ITEM COW).
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            let (ino, inode) = crate::write::create_file(&vol, self.ino, name).await?;
+            Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, inode) as Arc<dyn FileOps>)
+        })
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::unlink_file(&vol, self.ino, name).await
+        })
+    }
+
     fn dir_mode(&self) -> u16 {
         self.inode.perms() & 0o777
     }

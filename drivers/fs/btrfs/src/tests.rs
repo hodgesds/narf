@@ -1213,6 +1213,158 @@ fn smoke_btrfs_write_fst_maintenance() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_fst_maintenance);
 
+// ── Namespace mutations (create / unlink) ──────────────────────────
+
+/// Sorted entry names of a directory (via `enumerate_async`).
+fn dir_names(dir: &Arc<dyn narf_filesystem::DirOps>) -> Vec<alloc::string::String> {
+    match poll_once(dir.enumerate_async(0, 1024)) {
+        Some(Ok(e)) => e.into_iter().map(|(n, _)| n).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `create` inserts a new empty regular file whose inode, back-ref and directory
+/// entries land on disk: it survives a remount, `lookup`s, `enumerate`s, and
+/// `stat`s as a zero-length file — while the pre-existing entries are untouched.
+/// Runs on the `space_cache=v2` fixture so create also maintains the free-space
+/// tree (host `btrfs check` in the boot smoke guards on-disk validity).
+fn smoke_btrfs_create_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let created = match poll_once(vol.root().create("newfile.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if created.stat().size != 0 {
+        return TestResult::Fail("new file is not empty");
+    }
+
+    // Remount from disk: the create must be durable and self-consistent.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after create failed"),
+    };
+    let root2 = vol2.root();
+    let names = dir_names(&root2);
+    for want in ["newfile.txt", "hello.txt", "big.dat"] {
+        if !names.iter().any(|n| n == want) {
+            return TestResult::Fail("listing missing an expected entry after create");
+        }
+    }
+    match poll_once(root2.lookup_async("newfile.txt")) {
+        Some(Ok(f)) => {
+            if f.stat().size != 0 || f.stat().mode.file_type != narf_filesystem::FileType::File {
+                return TestResult::Fail("remounted new file wrong size/type");
+            }
+        }
+        _ => return TestResult::Fail("remount lookup of new file failed"),
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_create_file);
+
+/// A create then unlink round-trips: the file is gone after unlink (remounted),
+/// the pre-existing entries remain, and the volume still mounts cleanly.
+fn smoke_btrfs_create_then_unlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    if !matches!(poll_once(vol.root().create("scratch.tmp")), Some(Ok(_))) {
+        return TestResult::Fail("create failed");
+    }
+    match poll_once(vol.root().unlink("scratch.tmp")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("unlink failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after unlink failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_async("scratch.tmp")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("unlinked file still present after remount");
+    }
+    let names = dir_names(&root2);
+    for want in ["hello.txt", "big.dat"] {
+        if !names.iter().any(|n| n == want) {
+            return TestResult::Fail("unlink collaterally removed an entry");
+        }
+    }
+    if names.iter().any(|n| n == "scratch.tmp") {
+        return TestResult::Fail("unlinked name still listed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_create_then_unlink);
+
+/// Unlinking a file that owns a data extent frees the extent and its checksum:
+/// after remount the name and its `EXTENT_ITEM` are gone, while a sibling file is
+/// still readable. Uses the plain (no free-space-tree) fixture, so this also
+/// covers the non-FST unlink path.
+fn smoke_btrfs_unlink_file_with_data() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat failed"),
+    };
+    let extent = match file_data_extent(&vol, big.ino()) {
+        Some(e) => e,
+        None => return TestResult::Fail("could not read big.dat's extent"),
+    };
+    if !extent_item_present(&vol, extent.0, extent.1) {
+        return TestResult::Fail("pre-unlink extent not in extent tree");
+    }
+
+    match poll_once(vol.root().unlink("big.dat")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("unlink big.dat failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after unlink failed"),
+    };
+    // big.dat is gone…
+    if poll_once(vol2.root().lookup_async("big.dat")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("big.dat still present after unlink");
+    }
+    // …its data extent is freed from the extent tree…
+    if extent_item_present(&vol2, extent.0, extent.1) {
+        return TestResult::Fail("freed data extent still in extent tree");
+    }
+    // …and a sibling file still reads correctly.
+    match poll_once(vol2.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => match read_all(&f, 64) {
+            Some(got) if got == b"narf\n" => TestResult::Pass,
+            _ => TestResult::Fail("sibling hello.txt content wrong after unlink"),
+        },
+        _ => TestResult::Fail("sibling hello.txt lookup failed after unlink"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unlink_file_with_data);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same
