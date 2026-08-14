@@ -2954,6 +2954,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             .await
                             .map_err(|_| ())?;
                         root.unlink("narf-hltest.txt").await.map_err(|_| ())?;
+                        // An extended attribute on an existing file (no new inode,
+                        // to spare this small fixture's single leaf).
+                        let xf = root
+                            .lookup_async("narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
+                        xf.set_xattr("user.narf", b"kilroy", 0)
+                            .await
+                            .map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink
@@ -2991,6 +3000,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             .map_err(|_| ())?;
                         let mut abuf = [0u8; MARKER.len()];
                         let an = alias.read(0, &mut abuf).await.map_err(|_| ())?;
+                        // The extended attribute reads back.
+                        let xv = cf.get_xattr("user.narf").await.map_err(|_| ())?;
+                        if xv != b"kilroy" {
+                            return Err(());
+                        }
                         if root2.lookup_async("narf-scratch.tmp").await.is_ok()
                             || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
                             || root2.lookup_async("narf-created.txt").await.is_ok()

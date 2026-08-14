@@ -2437,3 +2437,181 @@ pub async fn link_node<B: BlockDevice + 'static>(
     .await?;
     Ok(())
 }
+
+/// Build an `XATTR_ITEM`'s `btrfs_dir_item` body: a zeroed location key, transid,
+/// `data_len = value.len()`, `name_len`, the `BTRFS_FT_XATTR` type byte, then the
+/// attribute name followed by its value.
+fn xattr_entry(gen: u64, name: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut v = alloc::vec![0u8; 30 + name.len() + value.len()];
+    // location disk_key @0..17 = 0 (unused for xattrs)
+    v[17..25].copy_from_slice(&gen.to_le_bytes()); // transid
+    v[25..27].copy_from_slice(&(value.len() as u16).to_le_bytes()); // data_len
+    v[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes()); // name_len
+    v[29] = format::FT_XATTR; // type
+    v[30..30 + name.len()].copy_from_slice(name);
+    v[30 + name.len()..].copy_from_slice(value);
+    v
+}
+
+/// Run a metadata-only mutation of the fs leaf (no data extents, no checksums) as
+/// a COW mini-transaction: read the fs/extent/root/free-space leaves, hand the fs
+/// leaf and the new generation to `edit`, then commit. Single-leaf trees only.
+async fn commit_fs_edit<B, F>(vol: &BtrfsVolume<B>, edit: F) -> Result<(), FsError>
+where
+    B: BlockDevice + 'static,
+    F: FnOnce(&mut Vec<u8>, u64) -> Result<(), FsError>,
+{
+    let (fs_root, _) = vol.fs_tree_root();
+    let (root_tree, _) = vol.root_tree_root();
+    let old_fs = fs_root;
+    let old_root = root_tree;
+    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+        .await?
+        .0;
+    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
+        .await
+        .ok()
+        .map(|(r, _)| r);
+
+    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let ext_leaf = vol.read_node(old_ext).await?;
+    let root_leaf = vol.read_node(old_root).await?;
+    let fst_leaf = match old_fst {
+        Some(f) => Some(vol.read_node(f).await?),
+        None => None,
+    };
+    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+        if level(leaf)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+    if let Some(fl) = &fst_leaf {
+        if level(fl)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+
+    let gen = vol.superblock().generation + 1;
+    let high_water = extent_high_water(vol, old_ext)
+        .await?
+        .max(vol.alloc_floor());
+    let mut alloc = BumpAllocator::new(high_water);
+    let n_fs = alloc.alloc_node(vol)?;
+    let n_ext = alloc.alloc_node(vol)?;
+    let n_root = alloc.alloc_node(vol)?;
+    let n_fst = if old_fst.is_some() {
+        Some(alloc.alloc_node(vol)?)
+    } else {
+        None
+    };
+    let alloc_span = (n_fs, alloc.next());
+
+    edit(&mut fs_leaf, gen)?;
+
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            csum: None,
+            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
+            root: CowLeaf::new(root_leaf, old_root, n_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            freed_data: Vec::new(),
+            new_data: Vec::new(),
+            data_used_delta: 0,
+            alloc_span,
+        },
+    )
+    .await
+}
+
+/// Set (create or replace) extended attribute `name` = `value` on inode `ino`
+/// (default subvolume). `flags` honours Linux `XATTR_CREATE` (1) / `XATTR_REPLACE`
+/// (2). Attributes sharing a name hash coexist in one `XATTR_ITEM` body, so the
+/// item is rebuilt preserving the others.
+pub async fn set_xattr_item<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    name: &str,
+    value: &[u8],
+    flags: u32,
+) -> Result<(), FsError> {
+    let name_bytes = name.as_bytes();
+    if name.is_empty() || name_bytes.len() > 255 {
+        return Err(FsError::InvalidData);
+    }
+    const XATTR_CREATE: u32 = 1;
+    const XATTR_REPLACE: u32 = 2;
+    let key = BtrfsKey::new(
+        ino,
+        format::XATTR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+
+    commit_fs_edit(vol, move |fs_leaf, gen| {
+        let existing = leaf_find(fs_leaf, &key)?;
+        let mut body = Vec::new();
+        let mut had_name = false;
+        if let Some(slot) = existing {
+            for e in decode_dir_items(leaf_item_data(fs_leaf, slot)?)? {
+                if e.name == name {
+                    had_name = true; // dropped here, re-added with the new value below
+                } else {
+                    body.extend_from_slice(&xattr_entry(gen, e.name.as_bytes(), &e.value));
+                }
+            }
+        }
+        if flags & XATTR_CREATE != 0 && had_name {
+            return Err(FsError::InvalidData); // exists, CREATE requested (EEXIST)
+        }
+        if flags & XATTR_REPLACE != 0 && !had_name {
+            return Err(FsError::NotFound); // absent, REPLACE requested (ENODATA)
+        }
+        body.extend_from_slice(&xattr_entry(gen, name_bytes, value));
+        if let Some(slot) = existing {
+            leaf_delete(fs_leaf, slot)?;
+        }
+        leaf_insert_sorted(fs_leaf, &key, &body)
+    })
+    .await
+}
+
+/// Remove extended attribute `name` from inode `ino` (default subvolume). Deletes
+/// the `XATTR_ITEM`, or rebuilds it without this name when others share its hash.
+pub async fn remove_xattr_item<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    name: &str,
+) -> Result<(), FsError> {
+    let name_bytes = name.as_bytes();
+    if name.is_empty() {
+        return Err(FsError::InvalidData);
+    }
+    let key = BtrfsKey::new(
+        ino,
+        format::XATTR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+
+    commit_fs_edit(vol, move |fs_leaf, gen| {
+        let slot = leaf_find(fs_leaf, &key)?.ok_or(FsError::NotFound)?;
+        let entries = decode_dir_items(leaf_item_data(fs_leaf, slot)?)?;
+        if !entries.iter().any(|e| e.name == name) {
+            return Err(FsError::NotFound); // ENODATA
+        }
+        let mut body = Vec::new();
+        for e in &entries {
+            if e.name != name {
+                body.extend_from_slice(&xattr_entry(gen, e.name.as_bytes(), &e.value));
+            }
+        }
+        leaf_delete(fs_leaf, slot)?;
+        if !body.is_empty() {
+            leaf_insert_sorted(fs_leaf, &key, &body)?;
+        }
+        Ok(())
+    })
+    .await
+}

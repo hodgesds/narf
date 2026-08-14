@@ -1940,6 +1940,86 @@ fn smoke_btrfs_unlink_hardlink() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_unlink_hardlink);
 
+/// Extended-attribute writes: `set_xattr` creates and replaces attributes that
+/// read back (and survive a remount), `list_xattr` enumerates them, and
+/// `remove_xattr` deletes one while leaving the others.
+fn smoke_btrfs_xattr_write() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let f = match poll_once(vol.root().create("x.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(
+        poll_once(f.set_xattr("user.color", b"blue", 0)),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once(f.set_xattr("user.size", b"large", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("set_xattr failed");
+    }
+
+    // Remount: both attributes are durable and read back.
+    let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let f2 = match poll_once(vol2.root().lookup_async("x.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after remount failed"),
+    };
+    if poll_once(f2.get_xattr("user.color")).map(|r| r.ok()) != Some(Some(b"blue".to_vec()))
+        || poll_once(f2.get_xattr("user.size")).map(|r| r.ok()) != Some(Some(b"large".to_vec()))
+    {
+        return TestResult::Fail("xattr values wrong after remount");
+    }
+    // list_xattr enumerates both names (NUL-terminated).
+    let names = match poll_once(f2.list_xattr()) {
+        Some(Ok(b)) => b,
+        _ => return TestResult::Fail("list_xattr failed"),
+    };
+    let has = |n: &[u8]| names.windows(n.len()).any(|w| w == n);
+    if !has(b"user.color\0") || !has(b"user.size\0") {
+        return TestResult::Fail("list_xattr missing a name");
+    }
+
+    // Replace one value, remove the other.
+    if !matches!(
+        poll_once(f2.set_xattr("user.color", b"red", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("replace xattr failed");
+    }
+    if !matches!(poll_once(f2.remove_xattr("user.size")), Some(Ok(()))) {
+        return TestResult::Fail("remove_xattr failed");
+    }
+
+    let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after edits failed"),
+    };
+    let f3 = match poll_once(vol3.root().lookup_async("x.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after edits failed"),
+    };
+    if poll_once(f3.get_xattr("user.color")).map(|r| r.ok()) != Some(Some(b"red".to_vec())) {
+        return TestResult::Fail("replaced value not persisted");
+    }
+    if poll_once(f3.get_xattr("user.size")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("removed xattr still present");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_xattr_write);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.

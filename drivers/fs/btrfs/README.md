@@ -24,8 +24,9 @@ real laptop's btrfs root looks like.
   sector-segmented framing); holes and preallocated ranges read as zeros (both
   explicit-hole and `no-holes` layouts).
 - **Symlinks** (target read via `FileOps::read`, so the VFS follows them),
-  **extended attributes** (`get_xattr` / `list_xattr` over `XATTR_ITEM`), and
-  **statx** (size/mode/uid/gid/nlink/ino/mtime).
+  **extended attributes** (read via `get_xattr` / `list_xattr` and written via
+  `set_xattr` / `remove_xattr` over `XATTR_ITEM`, honouring
+  `XATTR_CREATE`/`XATTR_REPLACE`), and **statx** (size/mode/uid/gid/nlink/ino/mtime).
 - **Nested subvolumes** (read-only): a `ROOT_ITEM` directory entry is resolved
   through the root tree and entered at its own fs tree, so subvolumes and
   snapshots are navigable.
@@ -64,7 +65,7 @@ than mis-read:
   `num_devices != 1`.
 - Non-CRC32C checksums (xxhash/sha256/blake2).
 - Writes into a nested subvolume (only the default subvolume is writable);
-  xattr *writes*; multi-component `subvol=a/b` paths.
+  multi-component `subvol=a/b` paths.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a hardlinked or non-empty-directory target; any
   name in a hash-colliding `DIR_ITEM`; `rmdir` of a directory carrying xattrs.

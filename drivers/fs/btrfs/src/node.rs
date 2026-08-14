@@ -198,6 +198,26 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::set_xattr_item(&vol, self.ino, name, value, flags).await
+        })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::remove_xattr_item(&vol, self.ino, name).await
+        })
+    }
+
     fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let vol = self.volume()?;

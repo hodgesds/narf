@@ -98,6 +98,8 @@ pub const FT_BLKDEV: u8 = 4;
 pub const FT_FIFO: u8 = 5;
 pub const FT_SOCK: u8 = 6;
 pub const FT_SYMLINK: u8 = 7;
+/// `BTRFS_FT_XATTR` — the `type` byte an `XATTR_ITEM`'s `btrfs_dir_item` carries.
+pub const FT_XATTR: u8 = 8;
 
 // ── Block-group / chunk `type` flags (`BTRFS_BLOCK_GROUP_*`) ────────
 
