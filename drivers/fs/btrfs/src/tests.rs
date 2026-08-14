@@ -2821,9 +2821,9 @@ fn smoke_btrfs_cow_node_split() -> TestResult {
     }
 
     // Internal-node key-ptrs re-tile past the fanout into ordered level-1 nodes.
-    let ptrs: Vec<(BtrfsKey, u64)> = (0..130u64).map(|i| (mk(i), 0x1000 + i)).collect();
+    let ptrs: Vec<(BtrfsKey, u64, u64)> = (0..130u64).map(|i| (mk(i), 0x1000 + i, 7)).collect();
     let header = alloc::vec![0u8; NS];
-    let nodes = regroup_internal(&header, &ptrs, NS, 1, 7);
+    let nodes = regroup_internal(&header, &ptrs, NS, 1);
     if nodes.len() < 2 {
         return TestResult::Fail("internal node never split");
     }
