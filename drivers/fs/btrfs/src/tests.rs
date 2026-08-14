@@ -1270,6 +1270,48 @@ fn smoke_btrfs_create_file() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_create_file);
 
+/// A `create`d empty file is then writable: the write allocates the file's first
+/// data extent (inserting a fresh `EXTENT_DATA`), and after a remount the content
+/// and size read back. Proves `create` + `write` compose end to end.
+fn smoke_btrfs_write_created_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let created = match poll_once(vol.root().create("written.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let payload = b"hello from a freshly created btrfs file\n";
+    match poll_once(created.write(0, payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("write to created file failed"),
+    }
+
+    // Remount from disk: the created file's new extent must be durable.
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after write-to-created failed"),
+    };
+    let f2 = match poll_once(vol2.root().lookup_async("written.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup of created file failed"),
+    };
+    if f2.stat().size != payload.len() as u64 {
+        return TestResult::Fail("created file size wrong after write");
+    }
+    match read_all(&f2, payload.len() + 16) {
+        Some(got) if got == payload => TestResult::Pass,
+        _ => TestResult::Fail("created file content mismatch after remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_created_file);
+
 /// A create then unlink round-trips: the file is gone after unlink (remounted),
 /// the pre-existing entries remain, and the volume still mounts cleanly.
 fn smoke_btrfs_create_then_unlink() -> TestResult {

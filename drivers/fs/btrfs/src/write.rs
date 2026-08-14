@@ -9,16 +9,17 @@
 //! leaves so every new block can be pre-allocated up front (the extent leaf then
 //! records its own new block), sidestepping the delayed-ref loop real btrfs uses.
 //!
-//! Scope: a regular, uncompressed, single-`EXTENT_DATA` file in the default
-//! subvolume, on a volume whose fs/csum/root/extent (and free-space, if present)
-//! trees are each a single leaf (typical of a freshly-made small image). A write
-//! reads the current file, applies the new bytes at any offset (growing past EOF
-//! as needed), and rewrites the whole file as one new extent, as a genuine
-//! copy-on-write mini-transaction that never mutates live data or metadata in
-//! place. Because these trees are single leaves, every new block is pre-allocated
-//! up front, letting the extent
-//! leaf record its own new block — sidestepping the self-referential allocation
-//! loop that full btrfs handles with delayed refs. Per write it:
+//! Scope: a regular, uncompressed file that is empty (e.g. freshly `create`d) or
+//! a single `EXTENT_DATA` at offset 0, in the default subvolume, on a volume
+//! whose fs/csum/root/extent (and free-space, if present) trees are each a single
+//! leaf (typical of a freshly-made small image). A write reads the current file,
+//! applies the new bytes at any offset (growing past EOF as needed), and rewrites
+//! the whole file as one new extent (inserting the first one for an empty file),
+//! as a genuine copy-on-write mini-transaction that never mutates live data or
+//! metadata in place. Because these trees are single leaves, every new block is
+//! pre-allocated up front, letting the extent leaf record its own new block —
+//! sidestepping the self-referential allocation loop full btrfs handles with
+//! delayed refs. Per write it:
 //!
 //! 1. allocates + writes the new data extent, and its per-sector CRC32C **data
 //!    checksums** (updated in the CSUM tree; the old extent's csums removed);
@@ -427,24 +428,35 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let (fs_root, fs_level) = vol.fs_tree_root();
     let (root_tree, _root_level) = vol.root_tree_root();
 
-    // The file must be a single regular, uncompressed extent at offset 0 (so the
-    // whole file is one EXTENT_DATA item we can rewrite in place).
+    // A zero-byte write changes nothing.
+    if data.is_empty() {
+        return Ok(0);
+    }
+
+    // The file must be either empty (no EXTENT_DATA — e.g. freshly `create`d) or
+    // a single regular, uncompressed extent at offset 0, so its content is one
+    // EXTENT_DATA item we can rewrite (or, for an empty file, first insert)
+    // wholesale. `existing` is the old `(disk_bytenr, disk_num_bytes)` to free.
     let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
-    if extents.len() != 1 {
-        return Err(FsError::Unsupported);
-    }
-    let (ed_key, ed_body) = &extents[0];
-    if ed_key.offset != 0 || ed_body.len() < 53 {
-        return Err(FsError::Unsupported);
-    }
-    // btrfs_file_extent_item: ram_bytes@8, compression@16, type@20,
-    // disk_bytenr@21, disk_num_bytes@29, extent_offset@37, num_bytes@45.
-    if ed_body[16] != 0 || ed_body[20] != format::FILE_EXTENT_REG {
-        return Err(FsError::Unsupported);
-    }
-    if le64(ed_body, 37)? != 0 {
-        return Err(FsError::Unsupported); // points mid-shared-extent: out of scope
-    }
+    let existing: Option<(u64, u64)> = match extents.len() {
+        0 => None,
+        1 => {
+            let (ed_key, ed_body) = &extents[0];
+            // btrfs_file_extent_item: ram_bytes@8, compression@16, type@20,
+            // disk_bytenr@21, disk_num_bytes@29, extent_offset@37, num_bytes@45.
+            if ed_key.offset != 0 || ed_body.len() < 53 {
+                return Err(FsError::Unsupported);
+            }
+            if ed_body[16] != 0 || ed_body[20] != format::FILE_EXTENT_REG {
+                return Err(FsError::Unsupported);
+            }
+            if le64(ed_body, 37)? != 0 {
+                return Err(FsError::Unsupported); // points mid-shared-extent: out of scope
+            }
+            Some((le64(ed_body, 21)?, le64(ed_body, 29)?))
+        }
+        _ => return Err(FsError::Unsupported),
+    };
 
     // ── 1. Read-modify-write the file content into one buffer ──────
     let old_size = inode.size;
@@ -488,8 +500,8 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         .await
         .ok()
         .map(|(r, _)| r);
-    let old_data = le64(ed_body, 21)?; // disk_bytenr
-    let old_data_len = le64(ed_body, 29)?; // disk_num_bytes
+    let old_data = existing.map(|(d, _)| d); // disk_bytenr of the freed extent
+    let old_data_len = existing.map(|(_, l)| l).unwrap_or(0); // disk_num_bytes
 
     let mut fs_leaf = vol.read_node(old_fs).await?;
     let mut csum_leaf = vol.read_node(old_csum).await?;
@@ -537,15 +549,15 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     vol.write_logical(e_data, &payload).await?;
     let csums = crate::csum::compute_csums(&payload, sectorsize as usize);
 
-    // ── 4. Build the new fs leaf (repoint EXTENT_DATA, update INODE) ─
-    let mut new_ed = ed_body.clone();
-    new_ed[8..16].copy_from_slice(&disk_len.to_le_bytes()); // ram_bytes
-    new_ed[21..29].copy_from_slice(&e_data.to_le_bytes()); // disk_bytenr
-    new_ed[29..37].copy_from_slice(&disk_len.to_le_bytes()); // disk_num_bytes
-    new_ed[37..45].copy_from_slice(&0u64.to_le_bytes()); // extent_offset
-    new_ed[45..53].copy_from_slice(&disk_len.to_le_bytes()); // num_bytes
-    let ed_slot = leaf_find(&fs_leaf, ed_key)?.ok_or(FsError::NotFound)?;
-    leaf_replace_inplace(&mut fs_leaf, ed_slot, &new_ed)?;
+    // ── 4. Build the new fs leaf (point EXTENT_DATA at the new extent, update
+    //       INODE). Replace the existing item, or insert one for an empty file.
+    let new_ed = file_extent_reg(gen, e_data, disk_len);
+    let ed_key = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, 0);
+    if let Some(slot) = leaf_find(&fs_leaf, &ed_key)? {
+        leaf_replace_inplace(&mut fs_leaf, slot, &new_ed)?;
+    } else {
+        leaf_insert_sorted(&mut fs_leaf, &ed_key, &new_ed)?;
+    }
 
     let inode_slot = leaf_find(&fs_leaf, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))?
         .ok_or(FsError::NotFound)?;
@@ -558,15 +570,18 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
 
     // ── 5. Build the new csum leaf: drop the old extent's csums, add new ─
     // The old data extent is being freed, so its csum item must go too, else
-    // `btrfs check` reports "csum exists but there is no extent record".
-    let old_csum_key = BtrfsKey::new(
-        format::EXTENT_CSUM_OBJECTID,
-        format::EXTENT_CSUM_KEY,
-        old_data,
-    );
-    if old_data != e_data {
-        if let Some(slot) = leaf_find(&csum_leaf, &old_csum_key)? {
-            leaf_delete(&mut csum_leaf, slot)?;
+    // `btrfs check` reports "csum exists but there is no extent record". An empty
+    // file has no old extent to uncharge.
+    if let Some(old_data) = old_data {
+        if old_data != e_data {
+            let old_csum_key = BtrfsKey::new(
+                format::EXTENT_CSUM_OBJECTID,
+                format::EXTENT_CSUM_KEY,
+                old_data,
+            );
+            if let Some(slot) = leaf_find(&csum_leaf, &old_csum_key)? {
+                leaf_delete(&mut csum_leaf, slot)?;
+            }
         }
     }
     let csum_key = BtrfsKey::new(
@@ -592,7 +607,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
             root: CowLeaf::new(root_leaf, old_root, n_root),
             fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
-            freed_data: alloc::vec![(old_data, old_data_len)],
+            freed_data: old_data.map(|d| (d, old_data_len)).into_iter().collect(),
             new_data: alloc::vec![DataRef {
                 bytenr: e_data,
                 len: disk_len,
@@ -786,6 +801,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let mut raw = vol.read_raw_superblock().await?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&txn.root.new.to_le_bytes()); // root
+                                                              // Keep the superblock's `bytes_used@120` in step with the block group's
+                                                              // `used`: metadata is COW-replaced 1:1 (net zero), so only the data delta
+                                                              // moves it. A stale value trips `btrfs check`'s "super bytes used mismatch".
+    let bytes_used = (le64(&raw, 120)? as i64 + txn.data_used_delta) as u64;
+    raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
     let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
     raw[0..4].copy_from_slice(&csum.to_le_bytes());
     for b in &mut raw[4..format::CSUM_SIZE] {
@@ -855,6 +875,21 @@ fn dir_item_body(child_ino: u64, gen: u64, ft: u8, name: &[u8]) -> Vec<u8> {
     v[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes()); // name_len
     v[29] = ft; // type
     v[30..].copy_from_slice(name);
+    v
+}
+
+/// Build a 53-byte regular `btrfs_file_extent_item` pointing at a data extent of
+/// `len` bytes at logical `disk_bytenr` (uncompressed, extent_offset 0).
+fn file_extent_reg(gen: u64, disk_bytenr: u64, len: u64) -> Vec<u8> {
+    let mut v = alloc::vec![0u8; 53];
+    v[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
+    v[8..16].copy_from_slice(&len.to_le_bytes()); // ram_bytes
+                                                  // compression@16 / encryption@17 / other_encoding@18 = 0
+    v[20] = format::FILE_EXTENT_REG; // type
+    v[21..29].copy_from_slice(&disk_bytenr.to_le_bytes()); // disk_bytenr
+    v[29..37].copy_from_slice(&len.to_le_bytes()); // disk_num_bytes
+                                                   // extent_offset@37 = 0
+    v[45..53].copy_from_slice(&len.to_le_bytes()); // num_bytes
     v
 }
 

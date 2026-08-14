@@ -64,13 +64,14 @@ than mis-read:
 
 ## COW writes — full Linux interop
 
-`FileOps::write` supports overwrite, partial write, append and grow of an
-existing regular, uncompressed, single-`EXTENT_DATA` file in the default
-subvolume (inline files, compressed or multi-extent files, and nested-subvolume
-writes return `Unsupported` / `ReadOnly`). `DirOps::create` / `DirOps::unlink`
-add and remove regular files in the default subvolume through the same
-transaction (`unlink` frees the file's data extent + checksums when its last link
-goes away).
+`FileOps::write` supports overwrite, partial write, append and grow of a regular,
+uncompressed file in the default subvolume that is either **empty** (e.g. freshly
+`create`d — the write allocates its first data extent) or a single-`EXTENT_DATA`
+file (inline, compressed or multi-extent files, and nested-subvolume writes
+return `Unsupported` / `ReadOnly`). `DirOps::create` / `DirOps::unlink` add and
+remove regular files in the default subvolume through the same transaction
+(`unlink` frees the file's data extent + checksums when its last link goes away),
+so `create` + `write` compose into a real new file.
 
 Each write is a genuine copy-on-write **mini-transaction** that produces a
 filesystem a real Linux kernel mounts **read-write** and that `btrfs check`
