@@ -2908,6 +2908,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // check`).
                         let created = root.create("narf-created.txt").await.map_err(|_| ())?;
                         created.write(0, MARKER).await.map_err(|_| ())?;
+                        // Rename it (content must survive) to its final name.
+                        root.rename("narf-created.txt", "narf-renamed.txt")
+                            .await
+                            .map_err(|_| ())?;
                         root.create("narf-scratch.tmp").await.map_err(|_| ())?;
                         root.unlink("narf-scratch.tmp").await.map_err(|_| ())?;
                         // Directories: one that persists, one created then removed.
@@ -2915,7 +2919,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         root.mkdir("narf-tmpdir").await.map_err(|_| ())?;
                         root.rmdir("narf-tmpdir").await.map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
-                        // the created file's content, the scratch file's removal, the
+                        // the renamed file's content, the scratch file's removal, the
                         // persistent directory, and the removed directory.
                         let fs2 = factory(dev).map_err(|_| ())?;
                         let root2 = fs2.root();
@@ -2923,7 +2927,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let mut buf = [0u8; MARKER.len()];
                         let n = f2.read(0, &mut buf).await.map_err(|_| ())?;
                         let cf = root2
-                            .lookup_async("narf-created.txt")
+                            .lookup_async("narf-renamed.txt")
                             .await
                             .map_err(|_| ())?;
                         let mut cbuf = [0u8; MARKER.len()];
@@ -2931,6 +2935,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
                         if root2.lookup_async("narf-scratch.tmp").await.is_ok()
                             || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
+                            || root2.lookup_async("narf-created.txt").await.is_ok()
                         {
                             return Err(());
                         }

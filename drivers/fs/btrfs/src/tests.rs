@@ -1509,6 +1509,95 @@ fn smoke_btrfs_rmdir_nonempty_rejected() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rmdir_nonempty_rejected);
 
+/// `rename` re-keys a file's directory entries within a directory: the old name
+/// disappears, the new name resolves to the same content, and the change is
+/// durable across a remount.
+fn smoke_btrfs_rename_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let want = expected_big();
+    match poll_once(vol.root().rename("big.dat", "renamed.dat")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("rename failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after rename failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_async("big.dat")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("old name still present after rename");
+    }
+    match poll_once(root2.lookup_async("renamed.dat")) {
+        Some(Ok(f)) => match read_all(&f, want.len() + 16) {
+            Some(got) if got == want => TestResult::Pass,
+            _ => TestResult::Fail("renamed file content changed"),
+        },
+        _ => TestResult::Fail("new name not found after rename"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_file);
+
+/// `rename` works on directories and refuses to clobber an existing name
+/// (overwrite is out of scope): `old` → `keep` is rejected, `old` → `fresh`
+/// succeeds, and both survive a remount.
+fn smoke_btrfs_rename_dir_and_reject_overwrite() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    if !matches!(poll_once(vol.root().mkdir("old")), Some(Ok(_)))
+        || !matches!(poll_once(vol.root().mkdir("keep")), Some(Ok(_)))
+    {
+        return TestResult::Fail("mkdir setup failed");
+    }
+    // Renaming onto an existing name is refused.
+    if !matches!(
+        poll_once(vol.root().rename("old", "keep")),
+        Some(Err(FsError::Unsupported))
+    ) {
+        return TestResult::Fail("overwrite rename was not refused");
+    }
+    // Renaming to a free name succeeds.
+    match poll_once(vol.root().rename("old", "fresh")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("directory rename failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after rename failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_dir_async("old")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("old directory name still present");
+    }
+    if !matches!(poll_once(root2.lookup_dir_async("fresh")), Some(Ok(_))) {
+        return TestResult::Fail("renamed directory not found");
+    }
+    if !matches!(poll_once(root2.lookup_dir_async("keep")), Some(Ok(_))) {
+        return TestResult::Fail("bystander directory lost");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rename_dir_and_reject_overwrite
+);
+
 // ── Phase 8: boot auto-mount chain ─────────────────────────────────
 
 /// A read-only synchronous block device over an in-memory image — the same

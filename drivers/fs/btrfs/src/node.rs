@@ -325,6 +325,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         })
     }
 
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+        })
+    }
+
     fn dir_mode(&self) -> u16 {
         self.inode.perms() & 0o777
     }
