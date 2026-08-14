@@ -236,6 +236,70 @@ pub async fn find_item<B: BlockDevice + 'static>(
     }
 }
 
+/// The `(key, body)` of the greatest item whose key is strictly less than
+/// `ceiling`, or `None` if the tree has no item before it. Descends to where
+/// `ceiling` would sit, then — if that leaf holds nothing below it — backtracks to
+/// the previous sibling subtree and takes its rightmost item. `O(log N)`; used to
+/// find the highest inode number and the highest `DIR_INDEX` of a directory
+/// without scanning the tree.
+pub async fn last_before<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+    ceiling: &BtrfsKey,
+) -> Result<Option<(BtrfsKey, Vec<u8>)>, FsError> {
+    // Descend, remembering each internal node and the child slot taken.
+    let mut path: Vec<(Vec<u8>, usize)> = Vec::new();
+    let mut node = root;
+    let leaf = loop {
+        let buf = vol.read_node(node).await?;
+        if level(&buf)? == 0 {
+            break buf;
+        }
+        let n = nritems(&buf)? as usize;
+        if n == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let slot = internal_child_slot(&buf, n, ceiling)?;
+        node = internal_blockptr(&buf, slot)?;
+        path.push((buf, slot));
+    };
+    // The last slot in this leaf with key < ceiling, if any.
+    let n = nritems(&leaf)? as usize;
+    let lb = leaf_lower_bound(&leaf, n, ceiling)?; // first slot with key >= ceiling
+    if lb > 0 {
+        let slot = lb - 1;
+        return Ok(Some((
+            leaf_item_key(&leaf, slot)?,
+            leaf_item_data(&leaf, slot)?.to_vec(),
+        )));
+    }
+    // Nothing here precedes `ceiling`: drop to the previous sibling subtree and
+    // take its rightmost leaf item (that whole subtree is entirely < ceiling).
+    while let Some((buf, slot)) = path.pop() {
+        if slot == 0 {
+            continue;
+        }
+        let mut child = internal_blockptr(&buf, slot - 1)?;
+        let last_leaf = loop {
+            let cbuf = vol.read_node(child).await?;
+            let cn = nritems(&cbuf)? as usize;
+            if cn == 0 {
+                return Err(FsError::InvalidData);
+            }
+            if level(&cbuf)? == 0 {
+                break cbuf;
+            }
+            child = internal_blockptr(&cbuf, cn - 1)?;
+        };
+        let cn = nritems(&last_leaf)? as usize;
+        return Ok(Some((
+            leaf_item_key(&last_leaf, cn - 1)?,
+            leaf_item_data(&last_leaf, cn - 1)?.to_vec(),
+        )));
+    }
+    Ok(None)
+}
+
 /// Collect `(key, body)` for every item with the given `objectid` and
 /// `item_type`, in key order. Used for readdir (`DIR_INDEX`) and file-extent
 /// (`EXTENT_DATA`) scans.

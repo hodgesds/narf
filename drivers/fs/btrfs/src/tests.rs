@@ -1213,6 +1213,79 @@ fn smoke_btrfs_write_extent_accounting() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
 
+/// Every block (root + internals + leaves) the fs tree currently occupies.
+fn fs_tree_blocks<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Option<alloc::collections::BTreeSet<u64>> {
+    let (fs_root, _) = vol.fs_tree_root();
+    let mut set = alloc::collections::BTreeSet::new();
+    let mut stack = alloc::vec![fs_root];
+    while let Some(addr) = stack.pop() {
+        let node = poll_once(vol.read_node(addr))?.ok()?;
+        set.insert(addr);
+        if btree::level(&node).ok()? > 0 {
+            for i in 0..btree::nritems(&node).ok()? as usize {
+                stack.push(btree::internal_blockptr(&node, i).ok()?);
+            }
+        }
+    }
+    Some(set)
+}
+
+/// A namespace mutation must path-COW the fs tree — rewrite only the touched
+/// root-to-leaf path — not rebuild the whole tree. On a multi-leaf tree a single
+/// `create` should therefore share almost every block with the pre-create tree;
+/// a whole-tree repack would share none. Guards the `O(fs size)` → `O(log N)`
+/// property the namespace ops were converted to.
+fn smoke_btrfs_namespace_create_is_path_cow() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    // Grow the fs tree to several leaves so path-COW sharing is observable.
+    for i in 0..90 {
+        if !matches!(
+            poll_once(vol.root().create(&format!("f{i:03}"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("setup create failed");
+        }
+    }
+    let before = match fs_tree_blocks(&vol) {
+        Some(s) => s,
+        None => return TestResult::Fail("could not walk fs tree"),
+    };
+    if before.len() < 3 {
+        return TestResult::Fail("fs tree stayed single-leaf; test not meaningful");
+    }
+
+    if !matches!(poll_once(vol.root().create("one_more")), Some(Ok(_))) {
+        return TestResult::Fail("create failed");
+    }
+    let after = match fs_tree_blocks(&vol) {
+        Some(s) => s,
+        None => return TestResult::Fail("could not re-walk fs tree"),
+    };
+
+    // Only the COWed path is new; the rest of the tree is shared in place.
+    let rewritten = after.difference(&before).count();
+    if rewritten >= before.len() {
+        return TestResult::Fail("whole fs tree rewritten — not path-COW");
+    }
+    // Everything must still be readable after the shared-block create.
+    let names = dir_names(&vol.root());
+    if !names.iter().any(|n| n == "one_more") || !names.iter().any(|n| n == "f000") {
+        return TestResult::Fail("entries lost after path-COW create");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_namespace_create_is_path_cow);
+
 /// The superblock's `bytes_used` field.
 fn super_bytes_used(dev: &WritableSparseDevice) -> u64 {
     let raw = read_super_at(dev, format::SUPERBLOCK_OFFSET);
