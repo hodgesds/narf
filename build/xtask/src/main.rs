@@ -12,9 +12,10 @@
 // `cargo xtask host-test`                        — fast host unit-test gate
 // `cargo xtask image --arch=<arch>`              — bootable UEFI media
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -70,7 +71,10 @@ enum Cmd {
     /// Streams + captures serial for a timeout, then kills QEMU and
     /// prints a digest of systemd's output. Requires a systemd rootfs
     /// disk at `target/narf-vblk.img`. Timeout via
-    /// `XTASK_SYSTEMD_PID1_TIMEOUT_SECS` (default 120).
+    /// `XTASK_SYSTEMD_PID1_TIMEOUT_SECS` (default 120). Optional
+    /// `XTASK_SYSTEMD_PID1_SUCCESS_MARKER` and
+    /// `XTASK_SYSTEMD_PID1_FAILURE_MARKER` turn the capture into a
+    /// fail-fast integration assertion.
     SystemdPid1(BuildArgs),
     /// Cross-compile and boot under QEMU with `boot-init` on, drive
     /// the serial port programmatically by typing `echo hello world`
@@ -594,6 +598,92 @@ mod gpu_backend_tests {
             qemu_display_arg("gtk,grab-on-hover=off", GpuBackend::Virtio2d),
             "gtk,grab-on-hover=off"
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SerialMarkerMatch {
+    None,
+    Success,
+    Failure,
+}
+
+fn classify_serial_marker(
+    line: &str,
+    success_marker: Option<&str>,
+    failure_marker: Option<&str>,
+) -> SerialMarkerMatch {
+    // Failure wins when callers accidentally choose overlapping markers: a
+    // negative diagnostic must never be hidden by a broader success token.
+    if failure_marker.is_some_and(|marker| line.contains(marker)) {
+        SerialMarkerMatch::Failure
+    } else if success_marker.is_some_and(|marker| line.contains(marker)) {
+        SerialMarkerMatch::Success
+    } else {
+        SerialMarkerMatch::None
+    }
+}
+
+fn emit_serial_line(writer: &mut impl Write, line: &str) {
+    // A tmux/PTY consumer can transiently return EAGAIN when a noisy distro
+    // boot fills its host-side buffer. `println!` panics on that error and,
+    // under this workspace's panic=abort profile, used to kill xtask and its
+    // QEMU child. The in-memory capture remains authoritative; mirroring to
+    // the interactive console is best-effort.
+    let _ = writeln!(writer, "{line}");
+}
+
+#[cfg(test)]
+mod systemd_marker_tests {
+    use super::*;
+
+    struct WouldBlockWriter;
+
+    impl Write for WouldBlockWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn classifies_optional_systemd_integration_markers() {
+        assert_eq!(
+            classify_serial_marker(
+                "NARF_UDEV_SEAT_PASS card0 master-of-seat CanGraphical=yes",
+                Some("NARF_UDEV_SEAT_PASS"),
+                Some("NARF_UDEV_SEAT_FAIL"),
+            ),
+            SerialMarkerMatch::Success,
+        );
+        assert_eq!(
+            classify_serial_marker(
+                "NARF_UDEV_SEAT_FAIL missing=/run/udev/data/c226:0",
+                Some("NARF_UDEV_SEAT_PASS"),
+                Some("NARF_UDEV_SEAT_FAIL"),
+            ),
+            SerialMarkerMatch::Failure,
+        );
+        assert_eq!(
+            classify_serial_marker("ordinary systemd output", None, None),
+            SerialMarkerMatch::None,
+        );
+    }
+
+    #[test]
+    fn failure_marker_wins_when_markers_overlap() {
+        assert_eq!(
+            classify_serial_marker("seat-fail", Some("seat"), Some("seat-fail")),
+            SerialMarkerMatch::Failure,
+        );
+    }
+
+    #[test]
+    fn serial_console_backpressure_is_nonfatal() {
+        emit_serial_line(&mut WouldBlockWriter, "noisy guest line");
     }
 }
 
@@ -2317,6 +2407,12 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(120);
+    let success_marker = std::env::var("XTASK_SYSTEMD_PID1_SUCCESS_MARKER")
+        .ok()
+        .filter(|marker| !marker.is_empty());
+    let failure_marker = std::env::var("XTASK_SYSTEMD_PID1_FAILURE_MARKER")
+        .ok()
+        .filter(|marker| !marker.is_empty());
 
     println!(
         "xtask systemd-pid1: launching {} {} (capturing serial for {}s)",
@@ -2344,8 +2440,16 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cap2 = captured.clone();
+    // 0 = no marker, 1 = success, 2 = failure. The reader owns classification;
+    // the control loop only observes this byte and terminates QEMU promptly.
+    let marker_state = Arc::new(AtomicU8::new(0));
+    let marker_state_reader = marker_state.clone();
+    let success_marker_reader = success_marker.clone();
+    let failure_marker_reader = failure_marker.clone();
     let reader_handle = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        let stdout = std::io::stdout();
+        let mut host_stdout = stdout.lock();
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -2354,9 +2458,29 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
             if line.contains("Closing set fd ") {
                 continue;
             }
-            println!("{line}");
+            emit_serial_line(&mut host_stdout, &line);
             if let Ok(mut g) = cap2.lock() {
-                g.push(line);
+                g.push(line.clone());
+            }
+            match classify_serial_marker(
+                &line,
+                success_marker_reader.as_deref(),
+                failure_marker_reader.as_deref(),
+            ) {
+                SerialMarkerMatch::None => {}
+                SerialMarkerMatch::Success => {
+                    // Preserve a failure observed on an earlier line.
+                    let _ = marker_state_reader.compare_exchange(
+                        0,
+                        1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                SerialMarkerMatch::Failure => {
+                    // Failure is sticky even if a later line contains success.
+                    marker_state_reader.store(2, Ordering::Release);
+                }
             }
         }
     });
@@ -2366,6 +2490,10 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     loop {
         if let Ok(Some(_)) = child.try_wait() {
             break; // kernel died / exited early
+        }
+        if marker_state.load(Ordering::Acquire) != 0 {
+            let _ = child.kill();
+            break;
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -2407,6 +2535,21 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     }
     if let Some(p) = panic_hit {
         bail!("xtask systemd-pid1: kernel panic during boot — {p}");
+    }
+    match marker_state.load(Ordering::Acquire) {
+        2 => bail!(
+            "xtask systemd-pid1: observed failure marker {:?}",
+            failure_marker.unwrap_or_default()
+        ),
+        1 => println!(
+            "xtask systemd-pid1: observed success marker {:?}",
+            success_marker.as_deref().unwrap_or_default()
+        ),
+        _ if success_marker.is_some() => bail!(
+            "xtask systemd-pid1: timed out without success marker {:?}",
+            success_marker.unwrap_or_default()
+        ),
+        _ => {}
     }
     println!(
         "xtask systemd-pid1: capture window elapsed ({} total serial lines)",

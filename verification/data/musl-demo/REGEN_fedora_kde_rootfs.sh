@@ -230,6 +230,31 @@ install -m 0755 \
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-drm-policy.sh" \
   "$WORK/root/usr/local/libexec/narf-drm-policy"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-udev-seat-gate.sh" \
+  "$WORK/root/usr/local/libexec/narf-udev-seat-gate"
+
+# Keep the real distro-device pipeline as an independently assertable gate.
+# A compositor black screen is too late and too ambiguous a signal: this unit
+# names the exact udev database + logind property contract Plasma Login uses.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify udev DRM seat integration on NARF' \
+  'Wants=systemd-udevd.service systemd-logind.service' \
+  'After=systemd-udevd.service systemd-logind.service' \
+  'Before=narf-plasma.service' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-udev-seat-gate' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=graphical.target' \
+  > "$WORK/root/etc/systemd/system/narf-udev-seat-gate.service"
+ln -sfn ../narf-udev-seat-gate.service \
+  "$WORK/root/etc/systemd/system/graphical.target.wants/narf-udev-seat-gate.service"
 
 # Keep DRM policy setup in its own root service. The `+` executable prefix on
 # an ExecStartPre of a User= service exercises systemd's privileged-command

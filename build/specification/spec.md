@@ -36,6 +36,11 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `cargo xtask test --arch=aarch64` — boot + run all kernel tests.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run one exact
   in-kernel subsystem, then perform the normal whole-kernel boot smoke.
+- `cargo xtask systemd-pid1 --arch=x86_64` — boot a systemd rootfs as real
+  PID 1 for a bounded capture. `XTASK_SYSTEMD_PID1_SUCCESS_MARKER` and
+  `XTASK_SYSTEMD_PID1_FAILURE_MARKER` optionally make serial substrings into
+  fail-fast integration assertions; the run fails if an expected success
+  marker is absent at the timeout.
 - `cargo xtask iso-boot --arch=x86_64` — build the removable-media
   image, boot it through a read-only OVMF pflash + Limine's
   `BOOTX64.EFI`, and require
