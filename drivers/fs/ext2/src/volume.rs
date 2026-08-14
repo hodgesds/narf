@@ -1148,6 +1148,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inodes: i64,
         dirs: i64,
         bitmap: Option<(BitmapKind, &[u8])>,
+        allocated_inode_index: Option<u32>,
     ) -> Result<(), FsError> {
         let (offset, mut desc) = self.group_desc_bytes(group).await?;
         for (lo_off, hi_off, delta) in
@@ -1172,6 +1173,36 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             desc[lo_off..lo_off + 2].copy_from_slice(&(updated as u16).to_le_bytes());
             if has_hi {
                 desc[hi_off..hi_off + 2].copy_from_slice(&((updated >> 16) as u16).to_le_bytes());
+            }
+        }
+        if let Some(index) = allocated_inode_index {
+            // ext4 uses bg_itable_unused to delimit the uninitialized tail of
+            // each inode table.  Leaving this at its mkfs value after writing
+            // a new inode makes Linux treat the allocated slot as deleted,
+            // even when its bitmap bit and inode checksum are both valid.
+            // Allocation may fill a hole below the current boundary, so this
+            // field only ever shrinks; freeing an inode must not expand it.
+            const ITABLE_UNUSED_LO: usize = 0x1c;
+            const ITABLE_UNUSED_HI: usize = 0x32;
+            let lo =
+                u16::from_le_bytes([desc[ITABLE_UNUSED_LO], desc[ITABLE_UNUSED_LO + 1]]) as u32;
+            let has_hi = desc.len() >= ITABLE_UNUSED_HI + 2;
+            let hi = if has_hi {
+                u16::from_le_bytes([desc[ITABLE_UNUSED_HI], desc[ITABLE_UNUSED_HI + 1]]) as u32
+            } else {
+                0
+            };
+            let current = (hi << 16) | lo;
+            let remaining = self
+                .superblock
+                .inodes_per_group
+                .saturating_sub(index.saturating_add(1));
+            let updated = current.min(remaining);
+            desc[ITABLE_UNUSED_LO..ITABLE_UNUSED_LO + 2]
+                .copy_from_slice(&(updated as u16).to_le_bytes());
+            if has_hi {
+                desc[ITABLE_UNUSED_HI..ITABLE_UNUSED_HI + 2]
+                    .copy_from_slice(&((updated >> 16) as u16).to_le_bytes());
             }
         }
         if let Some((kind, bytes)) = bitmap {
@@ -1262,8 +1293,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     BitmapKind::Block => (-1, 0),
                     BitmapKind::Inode => (0, -1),
                 };
-                self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)))
-                    .await?;
+                self.update_group_desc(
+                    group,
+                    blocks,
+                    inodes,
+                    0,
+                    Some((kind, &buf)),
+                    matches!(kind, BitmapKind::Inode).then_some(bit as u32),
+                )
+                .await?;
                 self.update_superblock_counters(blocks, inodes).await?;
                 return Ok(Some(bit as u32));
             }
@@ -1292,7 +1330,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 BitmapKind::Block => (1, 0),
                 BitmapKind::Inode => (0, 1),
             };
-            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)))
+            self.update_group_desc(group, blocks, inodes, 0, Some((kind, &buf)), None)
                 .await?;
             self.update_superblock_counters(blocks, inodes).await?;
         }
@@ -1394,7 +1432,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let (group, _) = self
             .inode_group_and_index(inode_no)
             .ok_or(FsError::NotFound)?;
-        self.update_group_desc(group as usize, 0, 0, delta, None)
+        self.update_group_desc(group as usize, 0, 0, delta, None, None)
             .await
     }
 

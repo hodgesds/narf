@@ -71,7 +71,10 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Allocation metadata is serialized and quarantined by group.** Bitmap,
   group-descriptor, and superblock-counter updates cannot interleave. A block
   group whose bitmap checksum fails is skipped without mutation, allowing a
-  large volume to continue allocating from independently valid groups.
+  large volume to continue allocating from independently valid groups. Inode
+  allocation also monotonically advances ext4's `bg_itable_unused` boundary
+  before the updated group-descriptor checksum is persisted, so Linux does not
+  classify newly initialized inode slots as deleted.
 
 ## 5. Architecture notes
 

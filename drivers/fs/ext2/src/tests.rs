@@ -861,6 +861,10 @@ fn sign_ext4_metadata_csum_fixture(img: &mut [u8]) -> Result<(), &'static str> {
     put_u32(img, SB + 16, 29);
     put_u16(img, GDT + 12, 53);
     put_u16(img, GDT + 14, 29);
+    // Inode 12 is the highest initialized inode, leaving 20 slots in the
+    // uninitialized tail. Linux rejects newly allocated inodes beyond this
+    // boundary unless the allocator advances it in the group descriptor.
+    put_u16(img, GDT + 28, 20);
 
     // metadata_csum classic directories reserve the last 12 bytes for the
     // checksum carrier. Shorten the final "data" dirent to end at the tail.
@@ -1001,6 +1005,21 @@ fn smoke_ext4_metadata_csum_writable_mkdir_survives_remount() -> TestResult {
     if !matches!(poll_once(root.mkdir("linger")), Some(Ok(_))) {
         return TestResult::Fail("mkdir failed on clean metadata-csum volume");
     }
+    if !matches!(poll_once(root.mkdir("past-tail")), Some(Ok(_))) {
+        return TestResult::Fail("second mkdir failed on clean metadata-csum volume");
+    }
+    let after = device.snapshot();
+    let descriptor = &after[2 * 1024..2 * 1024 + 32];
+    if u16::from_le_bytes([descriptor[28], descriptor[29]]) != 19 {
+        return TestResult::Fail("inode allocation did not advance bg_itable_unused");
+    }
+    let sb = match Superblock::parse(&after[1024..2048]) {
+        Some(sb) => sb,
+        None => return TestResult::Fail("mutated superblock did not parse"),
+    };
+    if !verify_group_desc_checksum(&sb, 0, descriptor) {
+        return TestResult::Fail("itable-unused update left stale group checksum");
+    }
     drop(root);
     drop(volume);
 
@@ -1015,6 +1034,12 @@ fn smoke_ext4_metadata_csum_writable_mkdir_survives_remount() -> TestResult {
         Some(Ok(_))
     ) {
         return TestResult::Fail("created directory was not readable after remount");
+    }
+    if !matches!(
+        poll_once(remounted.root().lookup_dir_async("past-tail")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("tail-advancing directory was not readable after remount");
     }
     TestResult::Pass
 }
