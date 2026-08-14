@@ -345,6 +345,46 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         })
     }
 
+    fn rename_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+        flags: u32,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if flags != 0 {
+                return Err(FsError::Unsupported); // RENAME_NOREPLACE/EXCHANGE unhandled
+            }
+            if self.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            // The destination must be a btrfs directory on the *same* volume and
+            // in the default subvolume — else it is a genuine cross-device move.
+            let dest = new_dir
+                .as_any()
+                .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
+                .ok_or(FsError::CrossDevice)?;
+            if dest.tree_root.is_some() {
+                return Err(FsError::ReadOnly);
+            }
+            let vol = self.volume()?;
+            let dest_vol = dest.volume()?;
+            if !Arc::ptr_eq(&vol, &dest_vol) {
+                return Err(FsError::CrossDevice);
+            }
+            if dest.ino == self.ino {
+                crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+            } else {
+                crate::write::rename_cross_dir(&vol, self.ino, dest.ino, old_name, new_name).await
+            }
+        })
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             if self.tree_root.is_some() {

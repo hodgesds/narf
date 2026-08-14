@@ -1907,3 +1907,318 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     .await?;
     Ok(())
 }
+
+/// Whether `ancestor` is `node` itself or one of its ancestors, walking up the
+/// `INODE_REF` chain (each `INODE_REF` key's offset is the parent inode) to the
+/// root directory. Bounded against a corrupted cyclic chain. Used to refuse
+/// moving a directory into its own subtree.
+fn is_ancestor_or_self(fs_leaf: &[u8], ancestor: u64, start: u64) -> Result<bool, FsError> {
+    let mut node = start;
+    for _ in 0..64 {
+        if node == ancestor {
+            return Ok(true);
+        }
+        if node == format::FIRST_FREE_OBJECTID {
+            return Ok(false); // reached the subvolume root
+        }
+        let n = nritems(fs_leaf)? as usize;
+        let mut parent = None;
+        for i in 0..n {
+            let k = leaf_item_key(fs_leaf, i)?;
+            if k.objectid == node && k.item_type == format::INODE_REF_KEY {
+                parent = Some(k.offset);
+                break;
+            }
+        }
+        match parent {
+            Some(p) => node = p,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// Move entry `old_name` from directory `old_parent` to `new_name` in a
+/// *different* directory `new_parent` (both in the default subvolume) via one COW
+/// mini-transaction. Re-keys the moved inode's `INODE_REF` from the old parent to
+/// the new, moves its directory entries, and adjusts both parents' `i_size`. If
+/// `new_name` already exists it is atomically replaced (same rules as the
+/// same-directory overwrite). Both parents and the moved inode share the single
+/// fs leaf.
+///
+/// Scope (else the noted error): `new_parent != old_parent`; a directory may not
+/// move into its own subtree (`InvalidData`); source/target reached by a single
+/// `INODE_REF` and a non-colliding `DIR_ITEM`; an overwrite target must match kind
+/// (`InvalidData`), be unshared (`nlink == 1`), and — for a directory — be empty
+/// (`Busy`) and xattr-free (`Unsupported`).
+pub async fn rename_cross_dir<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    old_parent: u64,
+    new_parent: u64,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), FsError> {
+    let old_bytes = old_name.as_bytes();
+    let new_bytes = new_name.as_bytes();
+    for n in [old_name, new_name] {
+        if n.is_empty() || n.len() > 255 || n.contains('/') || n == "." || n == ".." {
+            return Err(FsError::InvalidData);
+        }
+    }
+    if old_parent == new_parent {
+        return Err(FsError::InvalidData); // caller routes same-dir to rename_same_dir
+    }
+
+    let (fs_root, _) = vol.fs_tree_root();
+    let (root_tree, _) = vol.root_tree_root();
+    let old_fs = fs_root;
+    let old_root = root_tree;
+    let old_ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
+        .await?
+        .0;
+    let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
+        .await
+        .ok()
+        .map(|(r, _)| r);
+
+    let mut fs_leaf = vol.read_node(old_fs).await?;
+    let ext_leaf = vol.read_node(old_ext).await?;
+    let root_leaf = vol.read_node(old_root).await?;
+    let fst_leaf = match old_fst {
+        Some(f) => Some(vol.read_node(f).await?),
+        None => None,
+    };
+    for leaf in [&fs_leaf, &ext_leaf, &root_leaf] {
+        if level(leaf)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+    if let Some(fl) = &fst_leaf {
+        if level(fl)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+    }
+
+    // Resolve the source in the old parent.
+    let old_di_key = BtrfsKey::new(
+        old_parent,
+        format::DIR_ITEM_KEY,
+        u64::from(name_hash(old_bytes)),
+    );
+    let old_di_slot = leaf_find(&fs_leaf, &old_di_key)?.ok_or(FsError::NotFound)?;
+    let old_entries = decode_dir_items(leaf_item_data(&fs_leaf, old_di_slot)?)?;
+    if old_entries.len() != 1 {
+        return Err(FsError::Unsupported);
+    }
+    let entry = &old_entries[0];
+    if entry.name != old_name {
+        return Err(FsError::NotFound);
+    }
+    if entry.location.item_type != format::INODE_ITEM_KEY {
+        return Err(FsError::Unsupported);
+    }
+    let child_ino = entry.location.objectid;
+    let ftype = entry.ftype;
+    let source_is_dir = ftype == format::FT_DIR;
+
+    // A directory must not move into itself or a descendant (would orphan a loop).
+    if source_is_dir && is_ancestor_or_self(&fs_leaf, child_ino, new_parent)? {
+        return Err(FsError::InvalidData);
+    }
+
+    // The source's INODE_REF back to the old parent gives its current index.
+    let old_ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, old_parent);
+    let old_ref_slot = leaf_find(&fs_leaf, &old_ref_key)?.ok_or(FsError::NotFound)?;
+    let (old_index, single_ref) =
+        inode_ref_index(leaf_item_data(&fs_leaf, old_ref_slot)?, old_bytes)?;
+    if !single_ref {
+        return Err(FsError::Unsupported);
+    }
+
+    // Resolve the destination in the new parent (may exist -> overwrite).
+    let new_di_key = BtrfsKey::new(
+        new_parent,
+        format::DIR_ITEM_KEY,
+        u64::from(name_hash(new_bytes)),
+    );
+    let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
+    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    if let Some(t_slot) = leaf_find(&fs_leaf, &new_di_key)? {
+        let t_entries = decode_dir_items(leaf_item_data(&fs_leaf, t_slot)?)?;
+        if t_entries.len() != 1 {
+            return Err(FsError::Unsupported);
+        }
+        let t = &t_entries[0];
+        if t.name != new_name {
+            return Err(FsError::Unsupported);
+        }
+        if t.location.item_type != format::INODE_ITEM_KEY {
+            return Err(FsError::Unsupported);
+        }
+        let t_ino = t.location.objectid;
+        let target_is_dir = t.ftype == format::FT_DIR;
+        if source_is_dir != target_is_dir {
+            return Err(FsError::InvalidData);
+        }
+        let t_islot = leaf_find(&fs_leaf, &BtrfsKey::new(t_ino, format::INODE_ITEM_KEY, 0))?
+            .ok_or(FsError::NotFound)?;
+        if InodeItem::decode(leaf_item_data(&fs_leaf, t_islot)?)?.nlink != 1 {
+            return Err(FsError::Unsupported);
+        }
+        let mut ed_offsets = Vec::new();
+        let n = nritems(&fs_leaf)? as usize;
+        for i in 0..n {
+            let k = leaf_item_key(&fs_leaf, i)?;
+            if k.objectid != t_ino {
+                continue;
+            }
+            match k.item_type {
+                format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
+                format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => return Err(FsError::Busy),
+                format::EXTENT_DATA_KEY if !target_is_dir => {
+                    ed_offsets.push(k.offset);
+                    let body = leaf_item_data(&fs_leaf, i)?;
+                    if body.len() >= 37 && body[20] != format::FILE_EXTENT_INLINE {
+                        let db = le64(body, 21)?;
+                        let dn = le64(body, 29)?;
+                        if db != 0 {
+                            freed_data.push((db, dn));
+                        }
+                    }
+                }
+                _ => return Err(FsError::Unsupported),
+            }
+        }
+        let t_ref = BtrfsKey::new(t_ino, format::INODE_REF_KEY, new_parent);
+        let t_ref_slot = leaf_find(&fs_leaf, &t_ref)?.ok_or(FsError::NotFound)?;
+        let (t_index, t_single) =
+            inode_ref_index(leaf_item_data(&fs_leaf, t_ref_slot)?, new_bytes)?;
+        if !t_single {
+            return Err(FsError::Unsupported);
+        }
+        target = Some((t_ino, t_index, ed_offsets));
+    }
+    let overwrite = target.is_some();
+    let freed_bytes: u64 = freed_data.iter().map(|&(_, l)| l).sum();
+    let new_index = next_dir_index(&fs_leaf, new_parent)?;
+
+    let gen = vol.superblock().generation + 1;
+    let high_water = extent_high_water(vol, old_ext)
+        .await?
+        .max(vol.alloc_floor());
+    let mut alloc = BumpAllocator::new(high_water);
+    let n_fs = alloc.alloc_node(vol)?;
+    let n_ext = alloc.alloc_node(vol)?;
+    let n_root = alloc.alloc_node(vol)?;
+    let n_csum = if freed_data.is_empty() {
+        None
+    } else {
+        Some(alloc.alloc_node(vol)?)
+    };
+    let n_fst = if old_fst.is_some() {
+        Some(alloc.alloc_node(vol)?)
+    } else {
+        None
+    };
+    let alloc_span = (n_fs, alloc.next());
+
+    let csum = if let Some(n_csum) = n_csum {
+        let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
+            .await?
+            .0;
+        let mut csum_leaf = vol.read_node(old_csum).await?;
+        if level(&csum_leaf)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+        for &(bytenr, _) in &freed_data {
+            let key = BtrfsKey::new(
+                format::EXTENT_CSUM_OBJECTID,
+                format::EXTENT_CSUM_KEY,
+                bytenr,
+            );
+            if let Some(slot) = leaf_find(&csum_leaf, &key)? {
+                leaf_delete(&mut csum_leaf, slot)?;
+            }
+        }
+        Some(CowLeaf::new(csum_leaf, old_csum, n_csum))
+    } else {
+        None
+    };
+
+    // Update both parents' `i_size` in place (same-size replace, no slot shift):
+    // the old parent loses the source name; the new parent gains it (net zero on
+    // an overwrite, whose equal-length target name is reused). Bump transid+seq.
+    let adjust_dir_size = |fs_leaf: &mut [u8], dir: u64, delta: i64| -> Result<(), FsError> {
+        let slot = leaf_find(fs_leaf, &BtrfsKey::new(dir, format::INODE_ITEM_KEY, 0))?
+            .ok_or(FsError::NotFound)?;
+        let mut ino = leaf_item_data(fs_leaf, slot)?.to_vec();
+        let sz = le64(&ino, 16)? as i64;
+        ino[8..16].copy_from_slice(&gen.to_le_bytes());
+        ino[16..24].copy_from_slice(&(sz + delta).max(0).to_le_bytes());
+        let seq = le64(&ino, 72)?;
+        ino[72..80].copy_from_slice(&(seq + 1).to_le_bytes());
+        leaf_replace_inplace(fs_leaf, slot, &ino)
+    };
+    adjust_dir_size(&mut fs_leaf, old_parent, -2 * old_bytes.len() as i64)?;
+    let new_parent_delta = if overwrite {
+        0
+    } else {
+        2 * new_bytes.len() as i64
+    };
+    adjust_dir_size(&mut fs_leaf, new_parent, new_parent_delta)?;
+
+    // Remove the source's entries in the old parent + its old INODE_REF, plus the
+    // overwritten target's items in the new parent.
+    let mut deletes = alloc::vec![
+        old_di_key,
+        BtrfsKey::new(old_parent, format::DIR_INDEX_KEY, old_index),
+        old_ref_key,
+    ];
+    if let Some((t_ino, t_index, ed_offsets)) = &target {
+        deletes.push(new_di_key);
+        deletes.push(BtrfsKey::new(new_parent, format::DIR_INDEX_KEY, *t_index));
+        deletes.push(BtrfsKey::new(*t_ino, format::INODE_REF_KEY, new_parent));
+        deletes.push(BtrfsKey::new(*t_ino, format::INODE_ITEM_KEY, 0));
+        for off in ed_offsets {
+            deletes.push(BtrfsKey::new(*t_ino, format::EXTENT_DATA_KEY, *off));
+        }
+    }
+    for key in &deletes {
+        let slot = leaf_find(&fs_leaf, key)?.ok_or(FsError::NotFound)?;
+        leaf_delete(&mut fs_leaf, slot)?;
+    }
+
+    // Add the entry under the new parent + the moved inode's new INODE_REF.
+    let di = dir_item_body(child_ino, gen, ftype, new_bytes);
+    leaf_insert_sorted(&mut fs_leaf, &new_di_key, &di)?;
+    leaf_insert_sorted(
+        &mut fs_leaf,
+        &BtrfsKey::new(new_parent, format::DIR_INDEX_KEY, new_index),
+        &di,
+    )?;
+    let iref = inode_ref(new_index, new_bytes);
+    leaf_insert_sorted(
+        &mut fs_leaf,
+        &BtrfsKey::new(child_ino, format::INODE_REF_KEY, new_parent),
+        &iref,
+    )?;
+
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
+            csum,
+            ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
+            root: CowLeaf::new(root_leaf, old_root, n_root),
+            fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
+            freed_data,
+            new_data: Vec::new(),
+            data_used_delta: -(freed_bytes as i64),
+            alloc_span,
+        },
+    )
+    .await?;
+    Ok(())
+}

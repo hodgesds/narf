@@ -38,9 +38,10 @@ real laptop's btrfs root looks like.
   below.
 - **Namespace mutations**: `create` (new empty regular file), `unlink` (of an
   unshared regular file, freeing its data extent + checksums), `mkdir` (new empty
-  directory), `rmdir` (of an empty directory), same-directory `rename` (of a file
-  or directory, atomically replacing an existing target — freeing a clobbered
-  file's data + checksums), `symlink` (target stored inline), and `mknod` /
+  directory), `rmdir` (of an empty directory), `rename` (same- or
+  cross-directory, of a file or directory, atomically replacing an existing target
+  — freeing a clobbered file's data + checksums, and refusing to move a directory
+  into its own subtree), `symlink` (target stored inline), and `mknod` /
   `create_socket` (char/block device — raw-kernel-`dev_t` `rdev` — FIFO, socket),
   each a COW mini-transaction that keeps the directory `i_size`, back-refs, extent
   tree and free-space tree consistent — Linux-interoperable and `btrfs check`-clean.
@@ -61,10 +62,10 @@ than mis-read:
 - Non-CRC32C checksums (xxhash/sha256/blake2).
 - Writes into a nested subvolume (only the default subvolume is writable);
   xattr *writes*; multi-component `subvol=a/b` paths.
-- Hard-link creation; a symlink target `>= sectorsize`; cross-directory
-  `rename`; a `rename` that overwrites a hardlinked or non-empty-directory target;
-  `unlink` of a hardlinked inode (`nlink > 1`) or a name in a hash-colliding
-  `DIR_ITEM`; `rmdir` of a directory carrying xattrs.
+- Hard-link creation; a symlink target `>= sectorsize`; a `rename` across
+  subvolumes/volumes, or one that overwrites a hardlinked or non-empty-directory
+  target; `unlink` of a hardlinked inode (`nlink > 1`) or a name in a
+  hash-colliding `DIR_ITEM`; `rmdir` of a directory carrying xattrs.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## COW writes — full Linux interop

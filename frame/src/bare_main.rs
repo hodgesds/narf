@@ -2935,10 +2935,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         )
                         .await
                         .map_err(|_| ())?;
+                        // Cross-directory move: a file created at the root is moved
+                        // into narf-dir under a new name.
+                        root.create("narf-mover.txt").await.map_err(|_| ())?;
+                        let ndir = root.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        root.rename_to("narf-mover.txt", &*ndir, "narf-moved.txt", 0)
+                            .await
+                            .map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink
-                        // target, and the device node.
+                        // target, the device node, and the cross-directory move.
                         let fs2 = factory(dev).map_err(|_| ())?;
                         let root2 = fs2.root();
                         let f2 = root2.lookup_async("big.dat").await.map_err(|_| ())?;
@@ -2955,9 +2962,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let mut lbuf = [0u8; 16];
                         let ln = link.read(0, &mut lbuf).await.map_err(|_| ())?;
                         root2.lookup_async("narf-null").await.map_err(|_| ())?;
+                        // The moved file left the root and landed in narf-dir.
+                        let ndir2 = root2.lookup_dir_async("narf-dir").await.map_err(|_| ())?;
+                        ndir2.lookup_async("narf-moved.txt").await.map_err(|_| ())?;
                         if root2.lookup_async("narf-scratch.tmp").await.is_ok()
                             || root2.lookup_dir_async("narf-tmpdir").await.is_ok()
                             || root2.lookup_async("narf-created.txt").await.is_ok()
+                            || root2.lookup_async("narf-mover.txt").await.is_ok()
                             || &lbuf[..ln] != b"narf-renamed.txt"
                         {
                             return Err(());

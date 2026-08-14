@@ -1650,6 +1650,98 @@ fn smoke_btrfs_rename_overwrite_file() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_overwrite_file);
 
+/// Cross-directory `rename` (`rename_to`) moves a file into another directory: it
+/// leaves the old parent, appears in the new one under the new name with its
+/// content intact, and survives a remount.
+fn smoke_btrfs_rename_cross_dir() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    if !matches!(poll_once(root.mkdir("sub")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir failed");
+    }
+    let mover = match poll_once(root.create("mover.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let payload = b"moved across directories\n";
+    if !matches!(poll_once(mover.write(0, payload)), Some(Ok(_))) {
+        return TestResult::Fail("write failed");
+    }
+    let sub = match poll_once(root.lookup_dir_async("sub")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup sub failed"),
+    };
+    match poll_once(root.rename_to("mover.txt", &*sub, "moved.txt", 0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("cross-dir rename failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_async("mover.txt")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("source still in old parent");
+    }
+    let sub2 = match poll_once(root2.lookup_dir_async("sub")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("sub missing after remount"),
+    };
+    match poll_once(sub2.lookup_async("moved.txt")) {
+        Some(Ok(f)) => match read_all(&f, payload.len() + 16) {
+            Some(got) if got == payload => TestResult::Pass,
+            _ => TestResult::Fail("moved file content changed"),
+        },
+        _ => TestResult::Fail("file not in new parent"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_cross_dir);
+
+/// Cross-directory `rename` refuses to move a directory into its own subtree
+/// (which would orphan a cycle).
+fn smoke_btrfs_rename_cross_dir_loop_rejected() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.mkdir("a")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir a failed");
+    }
+    let a = match poll_once(root.lookup_dir_async("a")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup a failed"),
+    };
+    if !matches!(poll_once(a.mkdir("b")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir a/b failed");
+    }
+    let b = match poll_once(a.lookup_dir_async("b")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup a/b failed"),
+    };
+    // Moving `a` into `a/b` is a loop and must be refused.
+    match poll_once(root.rename_to("a", &*b, "a", 0)) {
+        Some(Err(FsError::InvalidData)) => TestResult::Pass,
+        _ => TestResult::Fail("directory loop move was not refused"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rename_cross_dir_loop_rejected
+);
+
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS
 /// follows it.
