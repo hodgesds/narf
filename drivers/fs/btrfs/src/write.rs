@@ -1628,14 +1628,17 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 }
 
 /// Rename entry `old_name` to `new_name` within directory `parent_ino` (default
-/// subvolume) via a COW mini-transaction. Works for a file or a directory — only
-/// the directory entries and the inode's back-ref are re-keyed; the inode itself,
-/// its data and its link count are untouched.
+/// subvolume) via a COW mini-transaction. Works for a file or a directory — the
+/// source inode, its data and its link count are untouched; only its directory
+/// entries and back-ref are re-keyed. If `new_name` already exists, it is
+/// atomically replaced (its inode removed and, for a file, its data extents +
+/// checksums freed) — the `QSaveFile`/`rename`-onto-target pattern.
 ///
-/// Scope (else the noted error): same directory only; `new_name` must not already
-/// exist (overwrite is out of scope — `Unsupported`); the source is reached by a
-/// single `INODE_REF` and a non-colliding `DIR_ITEM`, and `new_name` must not
-/// collide in the `DIR_ITEM` hash space.
+/// Scope (else the noted error): same directory only; source and destination
+/// reached by a single `INODE_REF` and a non-colliding `DIR_ITEM`. Overwrite
+/// requires the same kind (dir↔dir / file↔file, else `InvalidData`), an unshared
+/// target (`nlink == 1`), and — for a directory target — that it is empty
+/// (`Busy`) and free of xattrs (`Unsupported`).
 pub async fn rename_same_dir<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -1703,17 +1706,77 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     }
     let child_ino = entry.location.objectid;
     let ftype = entry.ftype;
+    let source_is_dir = ftype == format::FT_DIR;
 
-    // The destination name's DIR_ITEM key must be free (no overwrite; also rejects
-    // a hash collision that would share an item body).
+    // Resolve the destination. If it already exists, gather what removing it
+    // entails (an empty directory, or a file whose data + checksums we free).
     let new_di_key = BtrfsKey::new(
         parent_ino,
         format::DIR_ITEM_KEY,
         u64::from(name_hash(new_bytes)),
     );
-    if leaf_find(&fs_leaf, &new_di_key)?.is_some() {
-        return Err(FsError::Unsupported);
+    let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
+    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    if let Some(t_slot) = leaf_find(&fs_leaf, &new_di_key)? {
+        let t_entries = decode_dir_items(leaf_item_data(&fs_leaf, t_slot)?)?;
+        if t_entries.len() != 1 {
+            return Err(FsError::Unsupported); // hash collision at the destination
+        }
+        let t = &t_entries[0];
+        if t.name != new_name {
+            return Err(FsError::Unsupported);
+        }
+        if t.location.item_type != format::INODE_ITEM_KEY {
+            return Err(FsError::Unsupported); // subvolume mount point
+        }
+        let t_ino = t.location.objectid;
+        let target_is_dir = t.ftype == format::FT_DIR;
+        if source_is_dir != target_is_dir {
+            return Err(FsError::InvalidData); // EISDIR / ENOTDIR
+        }
+        let t_islot = leaf_find(&fs_leaf, &BtrfsKey::new(t_ino, format::INODE_ITEM_KEY, 0))?
+            .ok_or(FsError::NotFound)?;
+        if InodeItem::decode(leaf_item_data(&fs_leaf, t_islot)?)?.nlink != 1 {
+            return Err(FsError::Unsupported); // hardlinked target
+        }
+        let mut ed_offsets = Vec::new();
+        let n = nritems(&fs_leaf)? as usize;
+        for i in 0..n {
+            let k = leaf_item_key(&fs_leaf, i)?;
+            if k.objectid != t_ino {
+                continue;
+            }
+            match k.item_type {
+                format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
+                format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => {
+                    // A directory target must be empty.
+                    return Err(FsError::Busy);
+                }
+                format::EXTENT_DATA_KEY if !target_is_dir => {
+                    ed_offsets.push(k.offset);
+                    let body = leaf_item_data(&fs_leaf, i)?;
+                    if body.len() >= 37 && body[20] != format::FILE_EXTENT_INLINE {
+                        let db = le64(body, 21)?;
+                        let dn = le64(body, 29)?;
+                        if db != 0 {
+                            freed_data.push((db, dn));
+                        }
+                    }
+                }
+                _ => return Err(FsError::Unsupported), // xattrs etc.
+            }
+        }
+        let t_ref = BtrfsKey::new(t_ino, format::INODE_REF_KEY, parent_ino);
+        let t_ref_slot = leaf_find(&fs_leaf, &t_ref)?.ok_or(FsError::NotFound)?;
+        let (t_index, t_single) =
+            inode_ref_index(leaf_item_data(&fs_leaf, t_ref_slot)?, new_bytes)?;
+        if !t_single {
+            return Err(FsError::Unsupported);
+        }
+        target = Some((t_ino, t_index, ed_offsets));
     }
+    let overwrite = target.is_some();
+    let freed_bytes: u64 = freed_data.iter().map(|&(_, l)| l).sum();
 
     // The source's INODE_REF back to this dir gives its current DIR_INDEX offset.
     let ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino);
@@ -1732,6 +1795,12 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let n_fs = alloc.alloc_node(vol)?;
     let n_ext = alloc.alloc_node(vol)?;
     let n_root = alloc.alloc_node(vol)?;
+    // The csum tree is only copied when an overwritten file's checksums go away.
+    let n_csum = if freed_data.is_empty() {
+        None
+    } else {
+        Some(alloc.alloc_node(vol)?)
+    };
     let n_fst = if old_fst.is_some() {
         Some(alloc.alloc_node(vol)?)
     } else {
@@ -1739,8 +1808,34 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     };
     let alloc_span = (n_fs, alloc.next());
 
-    // Adjust the parent dir `i_size` by the name-length change (each name counts
-    // twice: DIR_ITEM + DIR_INDEX); bump transid + sequence.
+    // Edit the csum leaf: drop the overwritten file's data checksums.
+    let csum = if let Some(n_csum) = n_csum {
+        let old_csum = roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
+            .await?
+            .0;
+        let mut csum_leaf = vol.read_node(old_csum).await?;
+        if level(&csum_leaf)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+        for &(bytenr, _) in &freed_data {
+            let key = BtrfsKey::new(
+                format::EXTENT_CSUM_OBJECTID,
+                format::EXTENT_CSUM_KEY,
+                bytenr,
+            );
+            if let Some(slot) = leaf_find(&csum_leaf, &key)? {
+                leaf_delete(&mut csum_leaf, slot)?;
+            }
+        }
+        Some(CowLeaf::new(csum_leaf, old_csum, n_csum))
+    } else {
+        None
+    };
+
+    // Adjust the parent dir `i_size` (each name counts twice: DIR_ITEM +
+    // DIR_INDEX); bump transid + sequence. A plain rename swaps old→new name; an
+    // overwrite additionally drops the target's (equal-length) `new` name, so the
+    // net change is just the loss of the source's `old` name.
     let pslot = leaf_find(
         &fs_leaf,
         &BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0),
@@ -1748,20 +1843,37 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     .ok_or(FsError::NotFound)?;
     let mut pinode = leaf_item_data(&fs_leaf, pslot)?.to_vec();
     let psize = le64(&pinode, 16)? as i64;
-    let new_psize = psize - 2 * old_bytes.len() as i64 + 2 * new_bytes.len() as i64;
+    let size_delta = if overwrite {
+        -2 * old_bytes.len() as i64
+    } else {
+        2 * (new_bytes.len() as i64 - old_bytes.len() as i64)
+    };
     pinode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
-    pinode[16..24].copy_from_slice(&(new_psize.max(0) as u64).to_le_bytes());
+    pinode[16..24].copy_from_slice(&(psize + size_delta).max(0).to_le_bytes());
     let pseq = le64(&pinode, 72)?;
     pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
     leaf_replace_inplace(&mut fs_leaf, pslot, &pinode)?;
 
-    // Remove the old name's DIR_ITEM + DIR_INDEX + INODE_REF.
-    for key in [
+    // Remove the source's old DIR_ITEM + DIR_INDEX + INODE_REF.
+    let mut deletes = alloc::vec![
         old_di_key,
         BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, old_index),
         ref_key,
-    ] {
-        let slot = leaf_find(&fs_leaf, &key)?.ok_or(FsError::NotFound)?;
+    ];
+    // Remove the overwritten target's DIR_ITEM (at new_di_key) + DIR_INDEX +
+    // INODE_REF + INODE_ITEM + any EXTENT_DATA — before re-keying the source into
+    // its now-vacated DIR_ITEM slot.
+    if let Some((t_ino, t_index, ed_offsets)) = &target {
+        deletes.push(new_di_key);
+        deletes.push(BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, *t_index));
+        deletes.push(BtrfsKey::new(*t_ino, format::INODE_REF_KEY, parent_ino));
+        deletes.push(BtrfsKey::new(*t_ino, format::INODE_ITEM_KEY, 0));
+        for off in ed_offsets {
+            deletes.push(BtrfsKey::new(*t_ino, format::EXTENT_DATA_KEY, *off));
+        }
+    }
+    for key in &deletes {
+        let slot = leaf_find(&fs_leaf, key)?.ok_or(FsError::NotFound)?;
         leaf_delete(&mut fs_leaf, slot)?;
     }
 
@@ -1782,13 +1894,13 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         alloc,
         Txn {
             fs: CowLeaf::new(fs_leaf, old_fs, n_fs),
-            csum: None,
+            csum,
             ext: CowLeaf::new(ext_leaf, old_ext, n_ext),
             root: CowLeaf::new(root_leaf, old_root, n_root),
             fst: fst_leaf.map(|leaf| CowLeaf::new(leaf, old_fst.unwrap(), n_fst.unwrap())),
-            freed_data: Vec::new(),
+            freed_data,
             new_data: Vec::new(),
-            data_used_delta: 0,
+            data_used_delta: -(freed_bytes as i64),
             alloc_span,
         },
     )

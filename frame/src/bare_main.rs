@@ -2908,7 +2908,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // check`).
                         let created = root.create("narf-created.txt").await.map_err(|_| ())?;
                         created.write(0, MARKER).await.map_err(|_| ())?;
-                        // Rename it (content must survive) to its final name.
+                        // A victim file that the rename atomically replaces (its
+                        // data extent + csum are freed) — the QSaveFile pattern.
+                        let victim = root.create("narf-renamed.txt").await.map_err(|_| ())?;
+                        victim
+                            .write(0, b"OLD-VICTIM-DATA!!")
+                            .await
+                            .map_err(|_| ())?;
                         root.rename("narf-created.txt", "narf-renamed.txt")
                             .await
                             .map_err(|_| ())?;

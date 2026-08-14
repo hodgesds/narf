@@ -1546,10 +1546,9 @@ fn smoke_btrfs_rename_file() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_file);
 
-/// `rename` works on directories and refuses to clobber an existing name
-/// (overwrite is out of scope): `old` → `keep` is rejected, `old` → `fresh`
-/// succeeds, and both survive a remount.
-fn smoke_btrfs_rename_dir_and_reject_overwrite() -> TestResult {
+/// `rename` re-keys a directory to a free name (and rejects renaming a file onto
+/// a directory — a kind mismatch).
+fn smoke_btrfs_rename_dir() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
 
@@ -1559,18 +1558,18 @@ fn smoke_btrfs_rename_dir_and_reject_overwrite() -> TestResult {
     };
     let device: Arc<RamBlockDevice> = vol.device.clone();
     if !matches!(poll_once(vol.root().mkdir("old")), Some(Ok(_)))
-        || !matches!(poll_once(vol.root().mkdir("keep")), Some(Ok(_)))
+        || !matches!(poll_once(vol.root().create("afile")), Some(Ok(_)))
     {
-        return TestResult::Fail("mkdir setup failed");
+        return TestResult::Fail("setup failed");
     }
-    // Renaming onto an existing name is refused.
+    // A file cannot be renamed onto a directory (kind mismatch → InvalidData).
     if !matches!(
-        poll_once(vol.root().rename("old", "keep")),
-        Some(Err(FsError::Unsupported))
+        poll_once(vol.root().rename("afile", "old")),
+        Some(Err(FsError::InvalidData))
     ) {
-        return TestResult::Fail("overwrite rename was not refused");
+        return TestResult::Fail("file→dir rename was not refused");
     }
-    // Renaming to a free name succeeds.
+    // Renaming a directory to a free name succeeds.
     match poll_once(vol.root().rename("old", "fresh")) {
         Some(Ok(())) => {}
         _ => return TestResult::Fail("directory rename failed"),
@@ -1587,16 +1586,69 @@ fn smoke_btrfs_rename_dir_and_reject_overwrite() -> TestResult {
     if !matches!(poll_once(root2.lookup_dir_async("fresh")), Some(Ok(_))) {
         return TestResult::Fail("renamed directory not found");
     }
-    if !matches!(poll_once(root2.lookup_dir_async("keep")), Some(Ok(_))) {
-        return TestResult::Fail("bystander directory lost");
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_dir);
+
+/// `rename` onto an existing file atomically replaces it: the destination ends up
+/// with the source's content, the source name is gone, and the clobbered file's
+/// old data extent is freed from the extent tree (the QSaveFile pattern).
+fn smoke_btrfs_rename_overwrite_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    // Source: a freshly written file. Destination: the fixture's big.dat.
+    let src = match poll_once(vol.root().create("staging.tmp")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create source failed"),
+    };
+    let payload = b"atomically-replaced-content\n";
+    if !matches!(poll_once(src.write(0, payload)), Some(Ok(_))) {
+        return TestResult::Fail("write source failed");
+    }
+    // Record big.dat's data extent so we can prove it is freed on overwrite.
+    let dst_extent = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => file_data_extent(&vol, f.ino()),
+        _ => None,
+    };
+
+    match poll_once(vol.root().rename("staging.tmp", "big.dat")) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("overwrite rename failed"),
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after overwrite rename failed"),
+    };
+    let root2 = vol2.root();
+    if poll_once(root2.lookup_async("staging.tmp")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("source name still present after overwrite");
+    }
+    // big.dat now holds the source's content…
+    match poll_once(root2.lookup_async("big.dat")) {
+        Some(Ok(f)) => match read_all(&f, payload.len() + 16) {
+            Some(got) if got == payload => {}
+            _ => return TestResult::Fail("destination content not replaced"),
+        },
+        _ => return TestResult::Fail("destination missing after overwrite"),
+    }
+    // …and the clobbered file's old data extent is gone from the extent tree.
+    if let Some((bytenr, len)) = dst_extent {
+        if extent_item_present(&vol2, bytenr, len) {
+            return TestResult::Fail("overwritten file's data extent not freed");
+        }
     }
     TestResult::Pass
 }
 
-kernel_test_in!(
-    "drivers/fs/btrfs",
-    smoke_btrfs_rename_dir_and_reject_overwrite
-);
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_overwrite_file);
 
 /// `symlink` creates a symlink whose target (stored as an inline `EXTENT_DATA`)
 /// reads back and whose type is `Symlink` after a remount — exactly how the VFS

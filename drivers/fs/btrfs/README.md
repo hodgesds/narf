@@ -39,7 +39,8 @@ real laptop's btrfs root looks like.
 - **Namespace mutations**: `create` (new empty regular file), `unlink` (of an
   unshared regular file, freeing its data extent + checksums), `mkdir` (new empty
   directory), `rmdir` (of an empty directory), same-directory `rename` (of a file
-  or directory to a free name), `symlink` (target stored inline), and `mknod` /
+  or directory, atomically replacing an existing target — freeing a clobbered
+  file's data + checksums), `symlink` (target stored inline), and `mknod` /
   `create_socket` (char/block device — raw-kernel-`dev_t` `rdev` — FIFO, socket),
   each a COW mini-transaction that keeps the directory `i_size`, back-refs, extent
   tree and free-space tree consistent — Linux-interoperable and `btrfs check`-clean.
@@ -61,9 +62,9 @@ than mis-read:
 - Writes into a nested subvolume (only the default subvolume is writable);
   xattr *writes*; multi-component `subvol=a/b` paths.
 - Hard-link creation; a symlink target `>= sectorsize`; cross-directory
-  `rename`, or a `rename` that would overwrite an existing target; `unlink` of a
-  hardlinked inode (`nlink > 1`) or a name in a hash-colliding `DIR_ITEM`; `rmdir`
-  of a directory carrying xattrs.
+  `rename`; a `rename` that overwrites a hardlinked or non-empty-directory target;
+  `unlink` of a hardlinked inode (`nlink > 1`) or a name in a hash-colliding
+  `DIR_ITEM`; `rmdir` of a directory carrying xattrs.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## COW writes — full Linux interop
