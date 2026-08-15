@@ -850,6 +850,24 @@ impl SocketFile {
             } else {
                 narf_filesystem::uevent::UeventReader::new()
             };
+            // Debug-feature only: which task opened a uevent monitor, and
+            // whether it got the bounded boot-coldplug replay. udevd opening
+            // MANY monitors, or a monitor opened without replay, are both
+            // invisible from inside the guest.
+            #[cfg(feature = "unix-latency-trace")]
+            {
+                use core::fmt::Write as _;
+                let comm = crate::handlers::proc_comm_of_task(task)
+                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  uevent-sock: created tid={} comm={} replay={}",
+                    task,
+                    comm,
+                    crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
+                        || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
+                );
+            }
             SocketState::NetlinkUevent { reader }
         } else {
             SocketState::Fresh
@@ -2562,6 +2580,36 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
+                        // Boot-bringup diagnostic: WHO consumes each coldplug
+                        // uevent. "udevd was never handed the DRM add" and
+                        // "udevd read it and wrote no database" are the two
+                        // halves of the udev seat failure and are otherwise
+                        // indistinguishable — udevd's own log is unavailable
+                        // when journald has not started. Bounded by a hard
+                        // line budget so it can never become the stall it is
+                        // meant to explain.
+                        #[cfg(feature = "unix-latency-trace")]
+                        {
+                            use core::fmt::Write as _;
+                            static SHOWN: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            const BUDGET: u32 = 64;
+                            if SHOWN.fetch_add(1, Ordering::Relaxed) < BUDGET {
+                                let task = crate::handlers::current_task_id();
+                                let comm = crate::handlers::proc_comm_of_task(task)
+                                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  uevent-rx: sock={:x} tid={} comm={} seq={} {}@{}",
+                                    Arc::as_ptr(self) as *const () as usize & 0xffffff,
+                                    task,
+                                    comm,
+                                    env.seqnum,
+                                    env.action.as_str(),
+                                    env.devpath
+                                );
+                            }
+                        }
                         self.note_netlink_receive(flags);
                         self.netlink_last_recv_group.store(1, Ordering::Release);
                         // Kernel netlink uevent wire format (NUL-separated,

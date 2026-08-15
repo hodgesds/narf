@@ -248,6 +248,49 @@ pub fn ring_len() -> usize {
     UEVENT_RING.lock().len()
 }
 
+/// Boot-coldplug replay health: `(replay_start, next_seqnum, ring_len,
+/// overrun)`. `replay_start` is 0 when no boot window was marked.
+///
+/// `overrun` is the load-bearing field: it is true once the oldest event
+/// still in the ring is NEWER than the replay boundary, which means part of
+/// the bounded coldplug window this boundary exists to preserve has already
+/// been evicted. A `systemd-udevd` started after that point silently resumes
+/// at the oldest survivor — `read_from` skips the gap and reports nothing
+/// unusual — so the daemon cannot distinguish "no devices to process" from
+/// "your device ADDs were dropped". Reported once at end of boot precisely
+/// because it is otherwise invisible from inside the guest.
+pub fn boot_replay_health() -> (u64, u64, usize, bool) {
+    let start = BOOT_UDEVD_REPLAY_START.load(Ordering::Acquire) as u64;
+    let ring = UEVENT_RING.lock();
+    let oldest = ring.entries.front().map(|e| e.seqnum);
+    let overrun = start != 0 && oldest.is_some_and(|o| o > start);
+    (start, ring.next_seqnum, ring.entries.len(), overrun)
+}
+
+/// `(seqnum, action, subsystem, devpath)` for every event still in the ring,
+/// oldest first, capped at `max`.
+///
+/// The counts from [`boot_replay_health`] say how much udevd was handed, not
+/// WHAT — and "udevd has events but writes no database" and "udevd was never
+/// told about the device it needs" look identical from outside. A boot
+/// coldplug is a handful of events, so listing them outright is cheaper than
+/// inferring the answer from the daemon's behaviour.
+pub fn boot_replay_dump(max: usize) -> Vec<(u64, &'static str, String, String)> {
+    let ring = UEVENT_RING.lock();
+    ring.entries
+        .iter()
+        .take(max)
+        .map(|e| {
+            (
+                e.seqnum,
+                e.action.as_str(),
+                e.subsystem.clone(),
+                e.devpath.clone(),
+            )
+        })
+        .collect()
+}
+
 /// The seqnum that the *next* emit will assign.
 pub fn next_seqnum() -> u64 {
     UEVENT_RING.lock().next_seqnum()

@@ -998,3 +998,98 @@ kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_boot_replay_preserves_earliest_projection
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 13 — a boot-replay reader that falls behind the ring loses events
+//            SILENTLY, with no way to detect the gap.
+//
+// This is systemd-udevd's exact shape and it is not covered by smoke 8.
+// udevd's netlink socket is created by PID 1 for `systemd-udevd-kernel.socket`
+// and positioned with `boot_udevd_replay_reader()` — an ABSOLUTE seqnum
+// captured near the start of boot. Smoke 8 reads through `from_start()`,
+// which repositions onto the oldest survivor by construction and therefore
+// cannot observe this at all.
+//
+// If boot emits more than `UEVENT_RING_N` events after that boundary, the
+// coldplug ADDs the boundary exists to preserve are evicted before udevd
+// ever runs, and `read_from` just skips them: the reader's cursor is below
+// every surviving seqnum, so it silently resumes at the oldest survivor.
+//
+// LINUX-GAP: Linux does not lose a netlink monitor's events quietly. An
+// overrun socket receives -ENOBUFS, which is precisely how libudev learns it
+// must re-enumerate /sys instead of trusting its event stream. NARF has no
+// such signal, so a lagging udevd cannot tell "no events" from "your events
+// were dropped" — the difference between idling correctly and never creating
+// a single /dev node. Pinned here so closing it turns this test red.
+//
+// Linux ref: net/netlink/af_netlink.c::netlink_dump / netlink_overrun.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult {
+    reset();
+
+    // Boot marks the replay boundary once its device projection is complete.
+    let boundary = uevent::begin_boot_udevd_replay();
+
+    // The events the boundary exists to preserve — the ones udevd must see.
+    for i in 0..4 {
+        uevent::emit(
+            UeventAction::Add,
+            alloc::format!("/devices/coldplug-card{}", i),
+            "drm".to_string(),
+        );
+    }
+
+    // Boot then continues past the ring's capacity before udevd is started.
+    for i in 0..uevent::UEVENT_RING_N {
+        uevent::emit(
+            UeventAction::Add,
+            alloc::format!("/devices/later-noise{}", i),
+            "noise".to_string(),
+        );
+    }
+
+    // udevd finally starts and takes the boot-replay cursor.
+    let mut reader = uevent::boot_udevd_replay_reader();
+    let events = reader.drain(uevent::UEVENT_RING_N * 2);
+
+    // The cursor is genuinely below every surviving seqnum — that is what
+    // makes the loss undetectable rather than merely unlucky.
+    let oldest_surviving = match events.first() {
+        Some(e) => e.seqnum,
+        None => {
+            reset();
+            return TestResult::Fail("boot replay reader drained nothing at all");
+        }
+    };
+    if oldest_surviving <= boundary {
+        reset();
+        return TestResult::Fail("precondition: ring did not actually overrun the replay boundary");
+    }
+
+    // The DRM coldplug ADDs are gone, and the read reported success.
+    if events.iter().any(|e| e.subsystem == "drm") {
+        reset();
+        return TestResult::Fail("precondition: DRM coldplug events were not evicted");
+    }
+
+    // LINUX-GAP assertion: the reader is handed a clean, gap-free-looking
+    // batch. Nothing in the returned data, the cursor, or a status code says
+    // events were dropped. Linux would have raised ENOBUFS by now.
+    if events.len() != uevent::UEVENT_RING_N {
+        reset();
+        return TestResult::Fail("overrun drain did not return exactly the surviving window");
+    }
+    if !events.iter().all(|e| e.subsystem == "noise") {
+        reset();
+        return TestResult::Fail("surviving window contained something other than the tail");
+    }
+
+    reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_boot_replay_reader_silently_loses_overrun_window
+);

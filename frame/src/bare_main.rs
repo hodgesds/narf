@@ -3604,6 +3604,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
+    // Boot-coldplug replay health, once. `systemd-udevd` starts from the
+    // replay boundary, and if the ring has already evicted part of that
+    // window the daemon resumes at the oldest survivor without any error —
+    // it looks exactly like a correctly idle udevd that simply has no work.
+    // That ambiguity is unresolvable from inside the guest (journald may not
+    // even be up to record it), so the count is published here where the
+    // serial log always captures it.
+    {
+        let (replay_start, seqnum, ring, overrun) = narf_filesystem::uevent::boot_replay_health();
+        let _ = writeln!(
+            console::Writer,
+            "  uevent: seqnum={} ring={}/{} replay_start={} coldplug_overrun={}",
+            seqnum,
+            ring,
+            narf_filesystem::uevent::UEVENT_RING_N,
+            replay_start,
+            overrun
+        );
+        for (seq, action, subsystem, devpath) in narf_filesystem::uevent::boot_replay_dump(32) {
+            let _ = writeln!(
+                console::Writer,
+                "  uevent:   #{} {}@{} SUBSYSTEM={}",
+                seq,
+                action,
+                devpath,
+                subsystem
+            );
+        }
+    }
+
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
