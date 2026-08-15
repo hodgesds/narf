@@ -5027,3 +5027,241 @@ kernel_test_in!(
     "userspace/process",
     smoke_waitid_child_exit_wakes_parked_parent
 );
+
+// ── fork(2) process identity ─────────────────────────────────────────
+//
+// A forked child's `getpid()` must equal the pid its parent received from
+// fork, and its `getppid()` must equal the parent's `getpid()`. POSIX
+// requires the agreement; more practically, every process-tracking daemon
+// depends on it — systemd's `getpid_cached()` is reset in the child by
+// `safe_fork()` and then used for its log prefix, its sd_notify identity and
+// its own pid file, and udev's worker compares `si->ssi_pid` against
+// `worker->manager_pid` obtained this way.
+//
+// This was reasoned about from the source twice during the CachyOS bring-up
+// and got a wrong answer both times — once concluding the child inherited the
+// parent's pid (it does not) — which is exactly why it belongs in a test
+// rather than in a comment.
+//
+// Linux ref: kernel/fork.c::copy_process (the child's tgid is its own).
+
+fn smoke_process_fork_child_pid_identity() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_60;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let getpid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+    let getppid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPpid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        let parent_pid = getpid_now();
+        if parent_pid != PARENT {
+            return Err("parent getpid() did not report its own registered pid");
+        }
+
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+        let child_pid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("fork did not return a child pid to the parent"),
+        };
+        if child_pid == parent_pid {
+            return Err("fork handed the parent its OWN pid as the child's");
+        }
+
+        // The parent's identity must be untouched by having forked.
+        if getpid_now() != parent_pid {
+            return Err("parent getpid() changed across fork()");
+        }
+
+        let child_task = match crate::handlers::pid_to_task_raw(child_pid) {
+            Some(t) => t,
+            None => return Err("fork registered no PID->TaskId mapping for the child"),
+        };
+        if child_task == PARENT {
+            return Err("fork reused the parent's TaskId for the child");
+        }
+
+        // Now speak as the child.
+        LOOKUP_TASK.store(child_task, Ordering::Relaxed);
+        let seen = getpid_now();
+        if seen == parent_pid {
+            return Err("child getpid() returned the PARENT's pid");
+        }
+        if seen != child_pid {
+            return Err("child getpid() did not match the pid fork returned to the parent");
+        }
+        // Stable across calls — a one-shot answer would still break a daemon
+        // that caches it once and compares later.
+        if getpid_now() != child_pid {
+            return Err("child getpid() is not stable across calls");
+        }
+        if getppid_now() != parent_pid {
+            return Err("child getppid() did not report the parent's pid");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_fork_child_pid_identity);
+
+/// `CLONE_THREAD` creates a THREAD, not a process: it shares the caller's
+/// pid while getting its own TaskId. `getpid()` must therefore return the
+/// SAME value from both, even though `clone` handed the caller a distinct
+/// tid.
+///
+/// The pairing with the fork test above is the point. fork must give the
+/// child a NEW pid; CLONE_THREAD must NOT. A `getpid` implementation that
+/// simply returned the TaskId would pass neither, and one that always
+/// returned the group leader's pid would pass this and fail fork — so the
+/// two together pin the actual contract rather than one convenient half.
+///
+/// Linux ref: kernel/fork.c — a CLONE_THREAD child joins the caller's
+/// thread group, so `task_tgid_vnr()` (what getpid reports) is unchanged.
+fn smoke_process_clone_thread_shares_pid() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_61;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: see the fork test above — paging is live by the time smokes run.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let getpid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        let parent_pid = getpid_now();
+
+        // clone3 with a stack — the shape the desktop actually uses, and the
+        // one the sibling CLONE_SIGHAND smoke drives.
+        #[repr(C)]
+        #[derive(Default)]
+        struct ThreadCloneArgs {
+            flags: u64,
+            pidfd: u64,
+            child_tid: u64,
+            parent_tid: u64,
+            exit_signal: u64,
+            stack: u64,
+            stack_size: u64,
+            tls: u64,
+        }
+        let ca = ThreadCloneArgs {
+            flags: CLONE_VM | CLONE_SIGHAND | CLONE_THREAD,
+            stack: 0x7fff_fff0_0000,
+            stack_size: 0x1_0000,
+            ..Default::default()
+        };
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: &ca as *const ThreadCloneArgs as u64,
+                arg1: core::mem::size_of::<ThreadCloneArgs>() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+        let thread_tid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("clone3(CLONE_THREAD) did not return a thread tid"),
+        };
+        if thread_tid == PARENT {
+            return Err("clone(CLONE_THREAD) reused the caller's TaskId");
+        }
+
+        // Speak as the new thread: same process, so the same pid.
+        LOOKUP_TASK.store(thread_tid, Ordering::Relaxed);
+        let seen = getpid_now();
+        if seen != parent_pid {
+            return Err("CLONE_THREAD thread getpid() did not report the shared process pid");
+        }
+
+        // And the creator is unaffected.
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        if getpid_now() != parent_pid {
+            return Err("creator getpid() changed after CLONE_THREAD");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_clone_thread_shares_pid);
