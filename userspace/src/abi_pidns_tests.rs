@@ -654,3 +654,88 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_bpf_task_fd_query_self_pid_in_caller_pid_ns
 );
+
+// ── #28 setpriority(PRIO_PROCESS, who) — Linux kernel/sys.c:282 ──
+//
+// The `who` argument was DISCARDED, so setpriority always renamed the caller
+// (renice -p N reniced the caller). The fix resolves `who` via accept_pid_from.
+// The manager renices the worker by inner pid 2; the worker then reads its OWN
+// nice: the fix routed the change to the worker (5 → getpriority 25), the
+// discard left the worker at the default (0 → 20).
+fn smoke_abi_pidns_setpriority_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB400;
+        const MANAGER_PID: u64 = 0xB040;
+        const WORKER_TASK: u64 = 0xB401;
+        const WORKER_PID: u64 = 0xB041;
+        const PRIO_PROCESS: u64 = 0;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(MANAGER_TASK);
+            if call(Syscall::Setpriority.raw(), a2(PRIO_PROCESS, 2, 5)) != Some(0) {
+                return Err("setpriority(PRIO_PROCESS, inner 2, 5) did not succeed");
+            }
+            // Worker reads its own nice (self arm, who == 0).
+            set_task(WORKER_TASK);
+            match call(Syscall::Getpriority.raw(), a1(PRIO_PROCESS, 0)) {
+                Some(25) => Ok(()),
+                Some(20) => Err("setpriority ignored `who` and reniced the caller, not the worker — accept_pid_from resolution missing"),
+                _ => Err("getpriority returned an unexpected value for the worker"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_setpriority_resolves_in_caller_pid_ns
+);
+
+// ── #28 getpriority(PRIO_PROCESS, who) — Linux kernel/sys.c:282 ──
+//
+// Same discarded `who` on the read side. Seed the worker's own nice (7), then
+// have the manager read it by inner pid 2: the fix resolves to the worker
+// (getpriority 27), the discard reads the caller's own nice (default 20).
+fn smoke_abi_pidns_getpriority_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB410;
+        const MANAGER_PID: u64 = 0xB050;
+        const WORKER_TASK: u64 = 0xB411;
+        const WORKER_PID: u64 = 0xB051;
+        const PRIO_PROCESS: u64 = 0;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(WORKER_TASK);
+            if call(Syscall::Setpriority.raw(), a2(PRIO_PROCESS, 0, 7)) != Some(0) {
+                return Err("seeding the worker's nice failed");
+            }
+            set_task(MANAGER_TASK);
+            match call(Syscall::Getpriority.raw(), a1(PRIO_PROCESS, 2)) {
+                Some(27) => Ok(()),
+                Some(20) => Err("getpriority ignored `who` and read the caller's own nice, not the worker's — accept_pid_from resolution missing"),
+                _ => Err("getpriority returned an unexpected value"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_getpriority_resolves_in_caller_pid_ns
+);
