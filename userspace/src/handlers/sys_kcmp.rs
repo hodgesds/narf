@@ -23,7 +23,11 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
     // bound in the caller's namespace has no target -> ESRCH. Audit finding #12.
     let resolve = |pid: u64| -> Option<u64> {
         let outer = accept_pid_from(me, pid)?;
-        Some(pid_to_task_raw(outer).unwrap_or(outer))
+        // A pid that translates but has no registered task does not exist ->
+        // ESRCH (Linux find_task_by_vpid returns NULL). The `.unwrap_or(outer)`
+        // that was here masked that, letting kcmp(unknown_pid) return an
+        // ordering instead of failing.
+        pid_to_task_raw(outer)
     };
     let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
         (Some(x), Some(y)) => (x, y),
