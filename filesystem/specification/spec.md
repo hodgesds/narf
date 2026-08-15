@@ -286,6 +286,35 @@ on-disk devid. A complete generation-consistent set may be writable. A missing
 or stale member set is read-only and succeeds only when the selected profile can
 reconstruct every block needed by mount and later I/O.
 
+The typed btrfs administration surface is:
+
+```rust
+pub struct BalanceProfiles {
+    pub data: Option<ChunkProfile>,
+    pub metadata: Option<ChunkProfile>,
+    pub system: Option<ChunkProfile>,
+}
+
+impl<B: BlockDevice> BtrfsVolume<B> {
+    pub async fn add_device(&self, device: Arc<B>) -> Result<u64, FsError>;
+    pub async fn remove_device(&self, devid: u64) -> Result<(), FsError>;
+    pub async fn replace_device(&self, devid: u64, target: Arc<B>) -> Result<(), FsError>;
+    pub async fn balance_profiles(&self, targets: BalanceProfiles)
+        -> Result<BalanceStats, FsError>;
+}
+```
+
+Add commits the member's `DEV_ITEM` and superblocks; new chunks are allocated by
+the normal profile-aware growth path. Replace copies allocated device extents
+while retaining devid, UUID, and stripe offsets. Remove performs a synchronous
+balance evacuation before deleting the member. Profile conversion operates on
+complete DATA/METADATA/SYSTEM allocation classes, preserves every chunk's
+logical address, and commits replacement `CHUNK_ITEM`s, physical device extents,
+block-group flags, the system chunk array, and member superblocks atomically.
+Insufficient members return `Busy`; insufficient crash-safe destination space
+returns `NoSpace`. Linux lifecycle/balance ioctls and their filter/progress/
+pause/cancel ABI are not part of this typed interface yet.
+
 A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
@@ -798,9 +827,12 @@ usage updates incrementally with referenced equal to exclusive, shared-root
 snapshots begin uncharged, and hierarchy inheritance and hard limits work in
 simple mode. Simple-quota rescans are invalid and disabling preserves the
 on-disk incompat bit and owner refs. Btrfs also assembles member devices by
-FSID/devid and reads/writes existing SINGLE/DUP/RAID0/1/10/5/6 chunks, including
-read-only degraded parity recovery. Device lifecycle operations, RAID1C3/4 and
-multi-device chunk growth remain future work, as does narffs.
+FSID/devid; reads, writes, and grows SINGLE/DUP/RAID0/1/1C3/1C4/10/5/6 chunks;
+and performs read-only degraded parity recovery. Its typed administration
+surface adds/removes/replaces members, evacuates allocated devices, and
+synchronously converts DATA/METADATA/SYSTEM profiles with
+logical-address-preserving relocation. Linux lifecycle/balance ioctl dispatch
+and asynchronous filtered balance controls remain future work, as does narffs.
 
 ### 8.2 POSIX semantics scope (resolved)
 

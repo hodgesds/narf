@@ -85,6 +85,17 @@ const FIXTURE_RAID1: &[&[u8]] = &[
     include_bytes!("../testdata/fixture-raid1-1.img.sparse"),
     include_bytes!("../testdata/fixture-raid1-2.img.sparse"),
 ];
+const FIXTURE_RAID1C3: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid1c3-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1c3-2.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1c3-3.img.sparse"),
+];
+const FIXTURE_RAID1C4: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid1c4-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1c4-2.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1c4-3.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1c4-4.img.sparse"),
+];
 const FIXTURE_RAID10: &[&[u8]] = &[
     include_bytes!("../testdata/fixture-raid10-1.img.sparse"),
     include_bytes!("../testdata/fixture-raid10-2.img.sparse"),
@@ -333,7 +344,22 @@ impl narf_block::BlockDeviceSync for WritableSparseDevice {
         }
         let mut overlay = self.overlay.lock();
         for i in 0..n as usize {
-            overlay.insert(lba + i as u64, data[i * bs..(i + 1) * bs].to_vec());
+            let block_lba = lba + i as u64;
+            let block = &data[i * bs..(i + 1) * bs];
+            let block_start = block_lba * self.lba_size as u64;
+            let block_end = block_start + self.lba_size as u64;
+            let covers_base = self.runs.iter().any(|(start, bytes)| {
+                *start < block_end && start.saturating_add(bytes.len() as u64) > block_start
+            });
+            // Relocation copies complete logical chunks, most of whose bytes
+            // are sparse zeroes. Do not materialise a 512-byte overlay entry
+            // for a zero write into an underlying hole; this keeps the genuine
+            // 256 MiB RAID fixtures usable in the 512 MiB aarch64 test guest.
+            if block.iter().all(|byte| *byte == 0) && !covers_base {
+                overlay.remove(&block_lba);
+            } else {
+                overlay.insert(block_lba, block.to_vec());
+            }
         }
         Ok(())
     }
@@ -344,6 +370,15 @@ fn writable_sparse(sparse: &[u8]) -> Arc<WritableSparseDevice> {
     let (total, runs) = decode_sparse_runs(sparse);
     Arc::new(WritableSparseDevice {
         runs,
+        total,
+        lba_size: 512,
+        overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
+    })
+}
+
+fn blank_writable(total: u64) -> Arc<WritableSparseDevice> {
+    Arc::new(WritableSparseDevice {
+        runs: Vec::new(),
         total,
         lba_size: 512,
         overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
@@ -870,6 +905,8 @@ fn smoke_btrfs_multidevice_profiles() -> TestResult {
     for (profile, fixtures) in [
         ("raid0", FIXTURE_RAID0),
         ("raid1", FIXTURE_RAID1),
+        ("raid1c3", FIXTURE_RAID1C3),
+        ("raid1c4", FIXTURE_RAID1C4),
         ("raid10", FIXTURE_RAID10),
         ("raid5", FIXTURE_RAID5),
         ("raid6", FIXTURE_RAID6),
@@ -910,7 +947,14 @@ fn smoke_btrfs_degraded_multidevice_reads() -> TestResult {
 
     // Every single-member omission exercises mirror selection and, for RAID5/6,
     // rotating data/parity positions across the stripe-boundary payload.
-    for fixtures in [FIXTURE_RAID1, FIXTURE_RAID10, FIXTURE_RAID5, FIXTURE_RAID6] {
+    for fixtures in [
+        FIXTURE_RAID1,
+        FIXTURE_RAID1C3,
+        FIXTURE_RAID1C4,
+        FIXTURE_RAID10,
+        FIXTURE_RAID5,
+        FIXTURE_RAID6,
+    ] {
         for omitted in 0..fixtures.len() {
             let members: Vec<&[u8]> = fixtures
                 .iter()
@@ -957,6 +1001,23 @@ fn smoke_btrfs_degraded_multidevice_reads() -> TestResult {
             }
         }
     }
+    // RAID1C3 and RAID1C4 retain one readable copy after their full advertised
+    // two/three-member failure budgets are exhausted.
+    for fixtures in [FIXTURE_RAID1C3, FIXTURE_RAID1C4] {
+        for fixture in fixtures {
+            let vol = match mount_sparse_devices(core::slice::from_ref(fixture)) {
+                Ok(vol) => vol,
+                Err(_) => return TestResult::Fail("multi-copy RAID1 failed at failure budget"),
+            };
+            let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+                Some(Ok(file)) => file,
+                _ => return TestResult::Fail("multi-copy RAID1 degraded payload missing"),
+            };
+            if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+                return TestResult::Fail("multi-copy RAID1 degraded read mismatch");
+            }
+        }
+    }
     TestResult::Pass
 }
 
@@ -968,6 +1029,8 @@ fn smoke_btrfs_multidevice_write_roundtrip() -> TestResult {
     for fixtures in [
         FIXTURE_RAID0,
         FIXTURE_RAID1,
+        FIXTURE_RAID1C3,
+        FIXTURE_RAID1C4,
         FIXTURE_RAID10,
         FIXTURE_RAID5,
         FIXTURE_RAID6,
@@ -1078,6 +1141,275 @@ fn smoke_btrfs_multidevice_write_roundtrip() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multidevice_write_roundtrip);
+
+fn smoke_btrfs_multidevice_chunk_growth() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    for (profile, fixtures) in [
+        ("raid0", FIXTURE_RAID0),
+        ("raid1", FIXTURE_RAID1),
+        ("raid1c3", FIXTURE_RAID1C3),
+        ("raid1c4", FIXTURE_RAID1C4),
+        ("raid10", FIXTURE_RAID10),
+        ("raid5", FIXTURE_RAID5),
+        ("raid6", FIXTURE_RAID6),
+    ] {
+        let devices = writable_sparse_devices(fixtures);
+        let vol = match mount_writable_devices(&devices) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("growth profile failed to mount"),
+        };
+        let before = vol.chunk_map_len();
+        match poll_once(crate::write::grow_add_chunk(&vol)) {
+            Some(Ok(())) => {}
+            Some(Err(error)) if profile == "raid0" => {
+                return TestResult::Fail(match error {
+                    FsError::NoSpace => "RAID0 growth returned NoSpace",
+                    FsError::InvalidData => "RAID0 growth returned InvalidData",
+                    FsError::NotFound => "RAID0 growth returned NotFound",
+                    FsError::Unsupported => "RAID0 growth returned Unsupported",
+                    FsError::ReadOnly => "RAID0 growth returned ReadOnly",
+                    _ => "RAID0 growth returned another error",
+                })
+            }
+            Some(Err(_)) => {
+                return TestResult::Fail(match profile {
+                    "raid1" => "RAID1 multi-device growth failed",
+                    "raid1c3" => "RAID1C3 multi-device growth failed",
+                    "raid1c4" => "RAID1C4 multi-device growth failed",
+                    "raid10" => "RAID10 multi-device growth failed",
+                    "raid5" => "RAID5 multi-device growth failed",
+                    _ => "RAID6 multi-device growth failed",
+                })
+            }
+            None => return TestResult::Fail("multi-device growth remained pending"),
+        }
+        if vol.chunk_map_len() != before + 3 {
+            return TestResult::Fail("growth did not add DATA/METADATA/SYSTEM groups");
+        }
+        let file = match poll_once(vol.root().create("after-growth")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("create after multi-device growth failed"),
+        };
+        if !matches!(poll_once(file.write(0, b"grown\n")), Some(Ok(6))) {
+            return TestResult::Fail("write after multi-device growth failed");
+        }
+        let remounted = match mount_writable_devices(&devices) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("grown multi-device array did not remount"),
+        };
+        let file = match poll_once(remounted.root().lookup_async("after-growth")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("grown file missing after remount"),
+        };
+        if read_all(&file, 16).as_deref() != Some(b"grown\n") {
+            return TestResult::Fail("grown file content changed after remount");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/growth",
+    smoke_btrfs_multidevice_chunk_growth
+);
+
+fn smoke_btrfs_device_lifecycle() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let devices = writable_sparse_devices(FIXTURE_RAID1);
+    let vol = match mount_writable_devices(&devices) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("device lifecycle source failed to mount"),
+    };
+    let added = blank_writable(devices[0].total);
+    let added_async =
+        narf_block::SyncBlock::new(added.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    if !matches!(poll_once(vol.add_device(added_async)), Some(Ok(3))) {
+        return TestResult::Fail("device add failed");
+    }
+    let three = alloc::vec![devices[0].clone(), devices[1].clone(), added.clone()];
+    let vol = match mount_writable_devices(&three) {
+        Ok(vol) if vol.superblock().num_devices == 3 => vol,
+        _ => return TestResult::Fail("added device did not survive remount"),
+    };
+    match poll_once(crate::write::balance_profiles(
+        &vol,
+        crate::volume::BalanceProfiles::default(),
+        Some(1),
+    )) {
+        Some(Ok(_)) => {}
+        Some(Err(error)) => {
+            return TestResult::Fail(match error {
+                FsError::Busy => "allocated device balance returned Busy",
+                FsError::NoSpace => "allocated device balance returned NoSpace",
+                FsError::InvalidData => "allocated device balance returned InvalidData",
+                FsError::NotFound => "allocated device balance returned NotFound",
+                FsError::Unsupported => "allocated device balance returned Unsupported",
+                _ => "allocated device balance failed",
+            })
+        }
+        None => return TestResult::Fail("allocated device evacuation remained pending"),
+    }
+    match poll_once(crate::write::device_extent_ranges(&vol, 1)) {
+        Some(Ok(ranges)) if ranges.is_empty() => {}
+        Some(Ok(_)) => return TestResult::Fail("balance left device extents on evacuated member"),
+        _ => return TestResult::Fail("evacuated device extent scan failed"),
+    }
+    match poll_once(vol.remove_device(1)) {
+        Some(Ok(())) => {}
+        Some(Err(FsError::NotFound)) => {
+            return TestResult::Fail("evacuated device removal returned NotFound")
+        }
+        Some(Err(FsError::NoSpace)) => {
+            return TestResult::Fail("evacuated device removal returned NoSpace")
+        }
+        Some(Err(FsError::InvalidData)) => {
+            return TestResult::Fail("evacuated device removal returned InvalidData")
+        }
+        _ => return TestResult::Fail("evacuated device metadata removal failed"),
+    }
+    let active = alloc::vec![devices[1].clone(), added.clone()];
+    let vol = match mount_writable_devices(&active) {
+        Ok(vol) if vol.superblock().num_devices == 2 => vol,
+        _ => return TestResult::Fail("evacuated device remained in volume metadata"),
+    };
+    let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("payload missing after device evacuation"),
+    };
+    if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+        return TestResult::Fail("device evacuation changed payload bytes");
+    }
+
+    let unused = blank_writable(devices[0].total);
+    let unused_async = narf_block::SyncBlock::new(unused as Arc<dyn narf_block::BlockDeviceSync>);
+    if !matches!(poll_once(vol.add_device(unused_async)), Some(Ok(4)))
+        || !matches!(poll_once(vol.remove_device(4)), Some(Ok(())))
+    {
+        return TestResult::Fail("unused device add/remove failed");
+    }
+
+    let replacement = blank_writable(devices[1].total);
+    let replacement_async =
+        narf_block::SyncBlock::new(replacement.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    if !matches!(
+        poll_once(vol.replace_device(2, replacement_async)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("device replace failed");
+    }
+    let replaced = alloc::vec![replacement, added];
+    let vol = match mount_writable_devices(&replaced) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("replacement array did not remount"),
+    };
+    let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("replacement payload missing"),
+    };
+    if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+        return TestResult::Fail("replacement copied incorrect allocated bytes");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs/lifecycle", smoke_btrfs_device_lifecycle);
+
+fn smoke_btrfs_balance_profile_conversion() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let devices = writable_sparse_devices(FIXTURE_RAID1);
+    let vol = match mount_writable_devices(&devices) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("balance source failed to mount"),
+    };
+    let third = blank_writable(devices[0].total);
+    let third_async =
+        narf_block::SyncBlock::new(third.clone() as Arc<dyn narf_block::BlockDeviceSync>);
+    if !matches!(poll_once(vol.add_device(third_async)), Some(Ok(3))) {
+        return TestResult::Fail("balance target member add failed");
+    }
+    let target = crate::volume::BalanceProfiles {
+        data: Some(crate::chunk::ChunkProfile::Raid1C3),
+        metadata: Some(crate::chunk::ChunkProfile::Raid1C3),
+        system: Some(crate::chunk::ChunkProfile::Raid1C3),
+    };
+    match poll_once(vol.balance_profiles(target)) {
+        Some(Ok(stats)) if stats.converted > 0 && stats.converted <= stats.considered => {}
+        Some(Err(FsError::NoSpace)) => return TestResult::Fail("RAID1C3 balance returned NoSpace"),
+        Some(Err(_)) => return TestResult::Fail("RAID1C3 balance failed"),
+        _ => return TestResult::Fail("RAID1C3 balance converted no chunks"),
+    }
+
+    let members = alloc::vec![devices[0].clone(), devices[1].clone(), third.clone()];
+    let remounted = match mount_writable_devices(&members) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("balanced RAID1C3 volume did not remount"),
+    };
+    let profiles_ok = poll_once(async {
+        let mut cursor = btree::Cursor::seek(
+            &remounted,
+            remounted.superblock().chunk_root,
+            &BtrfsKey::new(format::FIRST_CHUNK_TREE_OBJECTID, format::CHUNK_ITEM_KEY, 0),
+        )
+        .await?;
+        let mut saw = false;
+        while let Some((key, body)) = cursor.current()? {
+            if key.objectid != format::FIRST_CHUNK_TREE_OBJECTID
+                || key.item_type != format::CHUNK_ITEM_KEY
+            {
+                break;
+            }
+            saw = true;
+            if format::le64(body, 24)? & format::BLOCK_GROUP_PROFILE_MASK
+                != format::BLOCK_GROUP_RAID1C3
+            {
+                return Ok::<bool, FsError>(false);
+            }
+            cursor.advance().await?;
+        }
+        Ok(saw)
+    });
+    if !matches!(profiles_ok, Some(Ok(true))) {
+        return TestResult::Fail("balance left a non-RAID1C3 chunk");
+    }
+    let payload = match poll_once(remounted.root().lookup_async("payload.bin")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("balanced payload missing"),
+    };
+    if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+        return TestResult::Fail("balance changed payload bytes");
+    }
+
+    // RAID1C3 remains readable with either original member absent, proving the
+    // new third copy and both retained copies describe the same logical bytes.
+    for omitted in 0..2 {
+        let degraded_members: Vec<Arc<WritableSparseDevice>> = members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != omitted)
+            .map(|(_, member)| member.clone())
+            .collect();
+        let degraded = match mount_writable_devices(&degraded_members) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("balanced RAID1C3 degraded mount failed"),
+        };
+        let payload = match poll_once(degraded.root().lookup_async("payload.bin")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("balanced degraded payload missing"),
+        };
+        if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+            return TestResult::Fail("balanced degraded copy mismatch");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/balance",
+    smoke_btrfs_balance_profile_conversion
+);
 
 // ── Phase 2: B-tree decoders ───────────────────────────────────────
 
@@ -3407,8 +3739,13 @@ fn smoke_btrfs_bytes_used_matches_block_groups() -> TestResult {
     if !matches!(poll_once(f.write(0, &payload[..64 * 1024])), Some(Ok(_))) {
         return TestResult::Fail("overwrite failed");
     }
-    if !matches!(poll_once(crate::write::grow_add_chunk(&vol)), Some(Ok(()))) {
-        return TestResult::Fail("grow failed");
+    if let Some(Err(error)) = poll_once(crate::write::grow_add_chunk(&vol)) {
+        return TestResult::Fail(match error {
+            FsError::NoSpace => "accounting grow returned NoSpace",
+            FsError::NotFound => "accounting grow returned NotFound",
+            FsError::InvalidData => "accounting grow returned InvalidData",
+            _ => "grow failed",
+        });
     }
     if !matches!(poll_once(vol.root().create("tiny.txt")), Some(Ok(_))) {
         return TestResult::Fail("post-grow create failed");
@@ -3432,7 +3769,7 @@ fn smoke_btrfs_bytes_used_matches_block_groups() -> TestResult {
 }
 
 kernel_test_in!(
-    "drivers/fs/btrfs",
+    "drivers/fs/btrfs/growth-single",
     smoke_btrfs_bytes_used_matches_block_groups
 );
 
@@ -4925,6 +5262,9 @@ fn smoke_btrfs_grow_add_chunk() -> TestResult {
     let device: Arc<RamBlockDevice> = vol.device.clone();
     match poll_once(crate::write::grow_add_chunk(&vol)) {
         Some(Ok(())) => {}
+        Some(Err(FsError::NoSpace)) => return TestResult::Fail("grow returned NoSpace"),
+        Some(Err(FsError::NotFound)) => return TestResult::Fail("grow returned NotFound"),
+        Some(Err(FsError::InvalidData)) => return TestResult::Fail("grow returned InvalidData"),
         _ => return TestResult::Fail("grow_add_chunk failed"),
     }
     // Create a few files after the grow (their metadata/data can land in the new
@@ -4961,7 +5301,7 @@ fn smoke_btrfs_grow_add_chunk() -> TestResult {
     TestResult::Pass
 }
 
-kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_grow_add_chunk);
+kernel_test_in!("drivers/fs/btrfs/growth-single", smoke_btrfs_grow_add_chunk);
 
 /// Space reclaim: on an image with a free-space tree, repeatedly overwriting a
 /// file reuses the space freed by the previous overwrite (each write allocates a

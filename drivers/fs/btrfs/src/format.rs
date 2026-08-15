@@ -160,6 +160,8 @@ pub const BLOCK_GROUP_DUP: u64 = 1 << 5;
 pub const BLOCK_GROUP_RAID10: u64 = 1 << 6;
 pub const BLOCK_GROUP_RAID5: u64 = 1 << 7;
 pub const BLOCK_GROUP_RAID6: u64 = 1 << 8;
+pub const BLOCK_GROUP_RAID1C3: u64 = 1 << 9;
+pub const BLOCK_GROUP_RAID1C4: u64 = 1 << 10;
 /// All RAID/DUP profile bits (`BTRFS_BLOCK_GROUP_PROFILE_MASK`): RAID0(3),
 /// RAID1(4), DUP(5), RAID10(6), RAID5(7), RAID6(8), RAID1C3(9), RAID1C4(10).
 /// A chunk whose masked profile is neither 0 (SINGLE) nor exactly DUP is
@@ -242,7 +244,7 @@ const OFF_BYTES_USED: usize = 120;
 const OFF_NUM_DEVICES: usize = 136;
 const OFF_SECTORSIZE: usize = 144;
 const OFF_NODESIZE: usize = 148;
-const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
+pub(crate) const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
 pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
@@ -276,6 +278,8 @@ pub const INCOMPAT_RAID56: u64 = 1 << 7;
 pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
 pub const INCOMPAT_NO_HOLES: u64 = 1 << 9;
 pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+/// Required when any three- or four-copy RAID1 block group exists.
+pub const INCOMPAT_RAID1C34: u64 = 1 << 11;
 /// Extents allocated while simple quotas are active carry a permanent owner
 /// reference. Linux deliberately leaves this bit set after quotas are disabled.
 pub const INCOMPAT_SIMPLE_QUOTA: u64 = 1 << 16;
@@ -290,6 +294,7 @@ pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
     | INCOMPAT_SKINNY_METADATA
     | INCOMPAT_NO_HOLES
     | INCOMPAT_METADATA_UUID
+    | INCOMPAT_RAID1C34
     | INCOMPAT_SIMPLE_QUOTA;
 
 /// Decoded btrfs superblock — only the fields the driver consumes.

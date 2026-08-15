@@ -7,9 +7,9 @@ under `drivers/fs/` include ext2, FAT/exFAT, 9p, ISO 9660, UDF, SquashFS,
 Minix, ext4, and the read-write btrfs implementation.
 The btrfs driver includes native snapshots, Linux-compatible full and simple
 qgroup administration, accounting and hard limits, and 4–64 KiB filesystem
-sectors. It assembles multi-device filesystems and supports SINGLE/DUP plus
-RAID0/1/10/5/6, including read-only degraded reconstruction for redundant
-profiles.
+sectors. It assembles and grows multi-device filesystems; supports SINGLE/DUP
+plus RAID0/1/1C3/1C4/10/5/6, including read-only degraded reconstruction; and
+provides typed member add/remove/replace plus synchronous profile conversion.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
 - Testing requirements (conformance checklist every FS must satisfy):

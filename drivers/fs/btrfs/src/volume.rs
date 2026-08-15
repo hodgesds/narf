@@ -27,7 +27,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use alloc::string::String;
 
-use crate::chunk::ChunkMap;
+use crate::chunk::{ChunkMap, ChunkProfile};
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::inode::InodeItem;
 
@@ -38,6 +38,23 @@ pub enum Subvol {
     Id(u64),
     /// `subvol=PATH` — a path from the top-level FS tree to a subvolume root.
     Name(String),
+}
+
+/// Profile targets for a balance conversion. `None` leaves that allocation
+/// class unchanged. Mixed DATA+METADATA block groups require identical data
+/// and metadata targets, as they do in Linux.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BalanceProfiles {
+    pub data: Option<ChunkProfile>,
+    pub metadata: Option<ChunkProfile>,
+    pub system: Option<ChunkProfile>,
+}
+
+/// Counts returned by a completed synchronous balance.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BalanceStats {
+    pub considered: u64,
+    pub converted: u64,
 }
 
 /// Volume-owned scratch DMA buffer, serialised across all block submissions.
@@ -55,7 +72,7 @@ struct VolumeDevice<B: BlockDevice> {
     capacity: u64,
     /// Member-specific embedded dev_item, preserved while common superblock
     /// transaction fields are replicated to every device.
-    dev_item: [u8; format::SUPERBLOCK_DEV_ITEM_SIZE],
+    dev_item: IrqSafeSpinLock<[u8; format::SUPERBLOCK_DEV_ITEM_SIZE]>,
     io: Mutex<VolumeIo>,
 }
 
@@ -110,18 +127,14 @@ pub struct BtrfsVolume<B: BlockDevice> {
     magic: u64,
     nodesize: u32,
     sectorsize: u32,
-    total_bytes: u64,
+    domain: DomainId,
     /// On-disk metadata/data checksum algorithm selected by the superblock.
     csum_type: u16,
     /// Enforce per-node/superblock checksum verification.
     verify_checksums: bool,
-    /// True when the filesystem declares more than one member. Chunk growth is
-    /// deliberately disabled for this case because it requires profile-aware
-    /// device-extent allocation.
-    multi_device: bool,
     /// Missing members make a redundant array readable but never writable.
     degraded: bool,
-    devices: BTreeMap<u64, Arc<VolumeDevice<B>>>,
+    devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
 }
 
@@ -141,7 +154,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes
+        self.state.lock().superblock.total_bytes
     }
 
     pub fn verify_checksums(&self) -> bool {
@@ -158,8 +171,224 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().writable_fs_tree
     }
 
-    pub(crate) fn is_multi_device(&self) -> bool {
-        self.multi_device
+    /// `(devid, physical capacity)` for every assembled member.
+    pub(crate) fn member_capacities(&self) -> Vec<(u64, u64)> {
+        self.devices
+            .lock()
+            .iter()
+            .map(|(&devid, member)| (devid, member.capacity))
+            .collect()
+    }
+
+    pub(crate) fn member_dev_items(&self) -> Vec<(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])> {
+        self.devices
+            .lock()
+            .iter()
+            .map(|(&devid, member)| (devid, *member.dev_item.lock()))
+            .collect()
+    }
+
+    fn device_uuid(&self, devid: u64, capacity: u64) -> [u8; 16] {
+        let sb = self.superblock();
+        let mut uuid = sb.fsid;
+        let salt = devid ^ capacity.rotate_left(17) ^ sb.generation.rotate_left(31);
+        for (index, byte) in uuid.iter_mut().enumerate() {
+            *byte ^= salt.rotate_left((index * 7) as u32) as u8;
+            *byte = byte.wrapping_add((index as u8).wrapping_mul(0x3d));
+        }
+        // RFC-4122-shaped bits are conventional for btrfs UUIDs even though
+        // the on-disk format treats the field as opaque.
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        uuid
+    }
+
+    async fn new_member(
+        &self,
+        device: Arc<B>,
+        dev_item: [u8; format::SUPERBLOCK_DEV_ITEM_SIZE],
+    ) -> Result<Arc<VolumeDevice<B>>, FsError> {
+        let logical = device.logical_block_size() as usize;
+        if !(512..=4096).contains(&logical) || !logical.is_power_of_two() {
+            return Err(FsError::Unsupported);
+        }
+        let capacity = device
+            .capacity_blocks()
+            .checked_mul(logical as u64)
+            .ok_or(FsError::InvalidData)?;
+        if capacity <= 1024 * 1024 || capacity % u64::from(self.sectorsize) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let dma =
+            alloc_coherent(logical, self.domain).map_err(|_| FsError::Io(BlockError::IOError))?;
+        Ok(Arc::new(VolumeDevice {
+            device,
+            capacity,
+            dev_item: IrqSafeSpinLock::new(dev_item),
+            io: Mutex::new(VolumeIo {
+                cap: register_with_cap(dma),
+                block_size: logical,
+            }),
+        }))
+    }
+
+    /// Add a writable member and commit its `DEV_ITEM` plus superblocks. New
+    /// chunks continue to use the current profiles; a later balance can spread
+    /// existing allocations onto the member.
+    pub async fn add_device(&self, device: Arc<B>) -> Result<u64, FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        if self
+            .devices
+            .lock()
+            .values()
+            .any(|member| Arc::ptr_eq(&member.device, &device))
+        {
+            return Err(FsError::Busy);
+        }
+        let devid = self
+            .devices
+            .lock()
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(FsError::InvalidData)?;
+        let logical = device.logical_block_size() as u64;
+        let capacity = device
+            .capacity_blocks()
+            .checked_mul(logical)
+            .ok_or(FsError::InvalidData)?;
+        let total = capacity / u64::from(self.sectorsize) * u64::from(self.sectorsize);
+        let mut item = [0u8; format::SUPERBLOCK_DEV_ITEM_SIZE];
+        item[0..8].copy_from_slice(&devid.to_le_bytes());
+        item[8..16].copy_from_slice(&total.to_le_bytes());
+        item[24..28].copy_from_slice(&self.sectorsize.to_le_bytes());
+        item[28..32].copy_from_slice(&self.sectorsize.to_le_bytes());
+        item[32..36].copy_from_slice(&self.sectorsize.to_le_bytes());
+        item[66..82].copy_from_slice(&self.device_uuid(devid, total));
+        item[82..98].copy_from_slice(&self.superblock().fsid);
+        let member = self.new_member(device, item).await?;
+        self.devices.lock().insert(devid, member);
+        if let Err(error) = crate::write::grow_add_chunk(self).await {
+            self.devices.lock().remove(&devid);
+            return Err(error);
+        }
+        Ok(devid)
+    }
+
+    /// Relocate selected block groups onto freshly allocated physical extents
+    /// and atomically replace their chunk geometry. Logical addresses do not
+    /// change, so file/tree backreferences remain valid while the profile does.
+    pub async fn balance_profiles(
+        &self,
+        profiles: BalanceProfiles,
+    ) -> Result<BalanceStats, FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        crate::write::balance_profiles(self, profiles, None).await
+    }
+
+    /// Replace one member with another device while retaining its devid, UUID,
+    /// and physical stripe offsets. Only allocated device extents are copied.
+    pub async fn replace_device(&self, devid: u64, target: Arc<B>) -> Result<(), FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        let source = self.member(devid)?;
+        if self
+            .devices
+            .lock()
+            .values()
+            .any(|member| Arc::ptr_eq(&member.device, &target))
+        {
+            return Err(FsError::Busy);
+        }
+        let replacement = self.new_member(target, *source.dev_item.lock()).await?;
+        if replacement.capacity < source.capacity {
+            return Err(FsError::NoSpace);
+        }
+        for (start, length) in crate::write::device_extent_ranges(self, devid).await? {
+            let mut offset = 0u64;
+            while offset < length {
+                let take = (length - offset).min(128 * 1024) as usize;
+                let mut bytes = vec![0u8; take];
+                read_exact_from(
+                    &*source.device,
+                    &source.io,
+                    source.capacity,
+                    start + offset,
+                    &mut bytes,
+                )
+                .await?;
+                write_exact_to(
+                    &*replacement.device,
+                    &replacement.io,
+                    replacement.capacity,
+                    start + offset,
+                    &bytes,
+                )
+                .await?;
+                offset += take as u64;
+            }
+        }
+        let raw = self.read_raw_superblock().await?;
+        self.devices.lock().insert(devid, replacement);
+        self.write_superblock(&raw).await?;
+        let zero = vec![0u8; format::SUPERBLOCK_SIZE];
+        for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+            if offset + format::SUPERBLOCK_SIZE as u64 <= source.capacity {
+                write_exact_to(&*source.device, &source.io, source.capacity, offset, &zero).await?;
+            }
+        }
+        source.device.flush().await;
+        Ok(())
+    }
+
+    /// Remove a member, first relocating every chunk stripe that resides on it
+    /// while retaining each block group's current profile.
+    pub async fn remove_device(&self, devid: u64) -> Result<(), FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        if self.devices.lock().len() <= 1 {
+            return Err(FsError::Busy);
+        }
+        if !crate::write::device_extent_ranges(self, devid)
+            .await?
+            .is_empty()
+        {
+            crate::write::balance_profiles(self, BalanceProfiles::default(), Some(devid)).await?;
+        }
+        let removed = self
+            .devices
+            .lock()
+            .remove(&devid)
+            .ok_or(FsError::NotFound)?;
+        self.select_live_superblock_source()?;
+        if let Err(error) = crate::write::grow_add_chunk(self).await {
+            self.devices.lock().insert(devid, removed);
+            self.select_live_superblock_source()?;
+            return Err(error);
+        }
+        let zero = vec![0u8; format::SUPERBLOCK_SIZE];
+        for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+            if offset + format::SUPERBLOCK_SIZE as u64 <= removed.capacity {
+                write_exact_to(
+                    &*removed.device,
+                    &removed.io,
+                    removed.capacity,
+                    offset,
+                    &zero,
+                )
+                .await?;
+            }
+        }
+        removed.device.flush().await;
+        Ok(())
     }
 
     /// Objectid of the currently mounted fs tree (`5` for the top-level tree).
@@ -223,11 +452,15 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     // ── Physical / logical reads ───────────────────────────────────
 
     fn member(&self, devid: u64) -> Result<Arc<VolumeDevice<B>>, FsError> {
-        self.devices.get(&devid).cloned().ok_or(FsError::NotFound)
+        self.devices
+            .lock()
+            .get(&devid)
+            .cloned()
+            .ok_or(FsError::NotFound)
     }
 
     /// Read `dst.len()` bytes at a member device's physical byte offset.
-    async fn read_physical_on(
+    pub(crate) async fn read_physical_on(
         &self,
         devid: u64,
         offset: u64,
@@ -654,7 +887,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     let member = Arc::new(VolumeDevice {
                         device,
                         capacity,
-                        dev_item,
+                        dev_item: IrqSafeSpinLock::new(dev_item),
                         io,
                     });
                     scanned.push((member, offset, superblock));
@@ -712,7 +945,6 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if devices.len() > superblock.num_devices as usize {
             return Err(FsError::InvalidData);
         }
-        let multi_device = superblock.num_devices > 1;
         // A member left behind by an interrupted prior commit is readable from
         // the newest mirrors, but must not participate in a new transaction.
         let degraded = devices.len() < superblock.num_devices as usize
@@ -730,12 +962,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             magic: superblock.magic,
             nodesize: superblock.nodesize,
             sectorsize: superblock.sectorsize,
-            total_bytes: superblock.total_bytes,
+            domain,
             csum_type,
             verify_checksums,
-            multi_device,
             degraded,
-            devices,
+            devices: IrqSafeSpinLock::new(devices),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -887,7 +1118,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Write `src` at physical device byte offset `offset` (block-granular,
     /// read-modify-write for partial leading/trailing blocks).
-    async fn write_physical_on(&self, devid: u64, offset: u64, src: &[u8]) -> Result<(), FsError> {
+    pub(crate) async fn write_physical_on(
+        &self,
+        devid: u64,
+        offset: u64,
+        src: &[u8],
+    ) -> Result<(), FsError> {
         let member = self.member(devid)?;
         write_exact_to(&*member.device, &member.io, member.capacity, offset, src).await
     }
@@ -1032,8 +1268,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Mirrors first (highest offset to lowest), primary (offset 0) last,
         // across every member. Common transaction fields are shared, while the
         // embedded dev_item remains unique to each device.
+        let members: Vec<(u64, Arc<VolumeDevice<B>>)> = self
+            .devices
+            .lock()
+            .iter()
+            .map(|(&devid, member)| (devid, member.clone()))
+            .collect();
         for &offset in format::SUPERBLOCK_MIRROR_OFFSETS.iter().rev() {
-            for (&devid, member) in &self.devices {
+            for (devid, member) in &members {
                 if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
                     continue; // this mirror doesn't fit on this member
                 }
@@ -1041,20 +1283,25 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 let b = format::SUPERBLOCK_BYTENR_OFFSET;
                 copy[b..b + 8].copy_from_slice(&offset.to_le_bytes());
                 let d = format::SUPERBLOCK_DEV_ITEM_OFFSET;
-                copy[d..d + format::SUPERBLOCK_DEV_ITEM_SIZE].copy_from_slice(&member.dev_item);
+                copy[d..d + format::SUPERBLOCK_DEV_ITEM_SIZE]
+                    .copy_from_slice(&*member.dev_item.lock());
                 crate::checksum::stamp_block(self.csum_type, &mut copy)?;
-                self.write_physical_on(devid, offset, &copy).await?;
+                self.write_physical_on(*devid, offset, &copy).await?;
                 member.device.flush().await; // each copy durable before the next
             }
         }
-        let devid = *self.devices.keys().next().ok_or(FsError::NotFound)?;
+        let devid = members
+            .first()
+            .map(|(devid, _)| *devid)
+            .ok_or(FsError::NotFound)?;
         self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
         Ok(())
     }
 
     /// Flush the backing device.
     pub async fn flush(&self) {
-        for member in self.devices.values() {
+        let members: Vec<Arc<VolumeDevice<B>>> = self.devices.lock().values().cloned().collect();
+        for member in members {
             member.device.flush().await;
         }
     }
@@ -1072,6 +1319,22 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             crate::checksum::stamp_block(self.csum_type, &mut raw)?;
         }
         Ok(raw)
+    }
+
+    /// Point raw-superblock reads at a currently assembled member. Device
+    /// removal can otherwise leave the cached source devid referring to the
+    /// member that was just detached even though every survivor has the same
+    /// committed generation.
+    fn select_live_superblock_source(&self) -> Result<(), FsError> {
+        let devid = self
+            .devices
+            .lock()
+            .keys()
+            .next()
+            .copied()
+            .ok_or(FsError::NotFound)?;
+        self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
+        Ok(())
     }
 
     /// Clear the cached superblock's log-root pointer after a tree-log has been
@@ -1114,13 +1377,64 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .add_entry(logical, length, devid, physical);
     }
 
+    /// Register a complete freshly allocated chunk item, including all member
+    /// stripes and its RAID profile.
+    pub(crate) fn add_chunk_item_mapping(&self, logical: u64, chunk: &[u8]) -> Result<(), FsError> {
+        self.state.lock().chunk_map.add_chunk_item(logical, chunk)
+    }
+
+    /// Publish replacement geometry for an existing logical chunk after its
+    /// new physical contents and COWed chunk tree are durable.
+    pub(crate) fn replace_chunk_item_mapping(
+        &self,
+        logical: u64,
+        chunk: &[u8],
+    ) -> Result<(), FsError> {
+        self.state
+            .lock()
+            .chunk_map
+            .replace_chunk_item(logical, chunk)
+    }
+
+    /// Publish per-member allocation accounting before the superblock copies
+    /// are emitted. Each copy retains its own embedded dev_item.
+    pub(crate) fn set_device_bytes_used(&self, used: &BTreeMap<u64, u64>) -> Result<(), FsError> {
+        for (&devid, &bytes) in used {
+            let member = self.member(devid)?;
+            let mut item = member.dev_item.lock();
+            item[16..24].copy_from_slice(&bytes.to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// After a chunk-growth commit, publish the new chunk-tree + root-tree roots
     /// and generation into the live superblock.
-    pub fn commit_chunk_root(&self, new_chunk_root: u64, new_root_tree: u64, new_generation: u64) {
+    pub fn commit_chunk_root(
+        &self,
+        new_chunk_root: u64,
+        new_root_tree: u64,
+        new_generation: u64,
+        total_bytes: u64,
+        num_devices: u64,
+        incompat_flags_add: u64,
+    ) {
         let mut g = self.state.lock();
         g.superblock.chunk_root = new_chunk_root;
         g.superblock.root = new_root_tree;
         g.superblock.generation = new_generation;
+        g.superblock.total_bytes = total_bytes;
+        g.superblock.num_devices = num_devices;
+        g.superblock.incompat_flags |= incompat_flags_add;
+    }
+
+    /// Replace the complete cached system chunk array after balance rewrites
+    /// one or more SYSTEM mappings.
+    pub(crate) fn commit_sys_chunk_array(&self, array: Vec<u8>) -> Result<(), FsError> {
+        if array.len() > format::SYS_CHUNK_ARRAY_SIZE {
+            return Err(FsError::NoSpace);
+        }
+        self.state.lock().superblock.sys_chunk_array = array;
+        Ok(())
     }
 }
 

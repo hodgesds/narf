@@ -5,11 +5,12 @@
 //! `fs/btrfs`. This is an independent Rust
 //! implementation; no C code is copied.
 //!
-//! Supported: SINGLE, DUP, RAID0/1/10/5/6 chunk profiles, degraded redundant
-//! reads, all four btrfs checksum algorithms, zlib/zstd/LZO and uncompressed
-//! reads, 4–64 KiB sectors, incremental COW writes, namespace mutations,
-//! nested writable subvolume mounts, full and simple qgroup accounting/limits/
-//! administration, and subvolume/snapshot ioctls.
+//! Supported: SINGLE, DUP, RAID0/1/1C3/1C4/10/5/6 chunk profiles, degraded
+//! redundant reads, profile-aware multi-device growth, typed device lifecycle
+//! and balance conversion, all four btrfs checksum algorithms, zlib/zstd/LZO
+//! and uncompressed reads, 4–64 KiB sectors, incremental COW writes, namespace
+//! mutations, nested writable subvolume mounts, full and simple qgroup
+//! accounting/limits/administration, and subvolume/snapshot ioctls.
 //! Unsupported on-disk shapes are rejected precisely rather than mis-read. See
 //! the crate `README` for the full matrix and limits.
 

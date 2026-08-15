@@ -24,7 +24,7 @@
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
-#   fixture-raid{0,1,10,5,6}-N.img.sparse  genuine multi-device members;
+#   fixture-raid{0,1,1c3,1c4,10,5,6}-N.img.sparse  genuine multi-device members;
 #                            RAID6 uses RAID6 for metadata as well as data so
 #                            two-member degraded recovery is testable
 #
@@ -110,8 +110,8 @@ generate_raid_fixture() (
     profile="$1"
     case "$profile" in
         raid0|raid1) devices=2 ;;
-        raid10|raid6) devices=4 ;;
-        raid5) devices=3 ;;
+        raid1c3|raid5) devices=3 ;;
+        raid1c4|raid10|raid6) devices=4 ;;
         *) echo "unknown RAID profile: $profile" >&2; exit 2 ;;
     esac
 
@@ -130,7 +130,9 @@ generate_raid_fixture() (
 
     for i in $(seq 1 "$devices"); do
         image="$raid_dir/device-$i.img"
-        truncate -s 128M "$image"
+        # Leave genuinely unallocated device space so NARF's chunk-growth tests
+        # can add DATA/METADATA/SYSTEM groups without resizing the members.
+        truncate -s 256M "$image"
         loops+=("$(losetup --find --show "$image")")
     done
 

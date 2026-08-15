@@ -8,7 +8,7 @@
 //! items and maintains the resulting map.
 //!
 //! The map retains complete stripe geometry for SINGLE, DUP, RAID0, RAID1,
-//! RAID10, RAID5 and RAID6 chunks. I/O routing is deliberately separate: this
+//! RAID1C3, RAID1C4, RAID10, RAID5 and RAID6 chunks. I/O routing is deliberately separate: this
 //! module answers which `(devid, physical)` locations cover a logical byte and
 //! how far that mapping stays contiguous.
 
@@ -18,8 +18,8 @@ use narf_filesystem::FsError;
 
 use crate::format::{
     le16, le64, BtrfsKey, BLOCK_GROUP_DUP, BLOCK_GROUP_PROFILE_MASK, BLOCK_GROUP_RAID0,
-    BLOCK_GROUP_RAID1, BLOCK_GROUP_RAID10, BLOCK_GROUP_RAID5, BLOCK_GROUP_RAID6, CHUNK_ITEM_KEY,
-    DISK_KEY_SIZE,
+    BLOCK_GROUP_RAID1, BLOCK_GROUP_RAID10, BLOCK_GROUP_RAID1C3, BLOCK_GROUP_RAID1C4,
+    BLOCK_GROUP_RAID5, BLOCK_GROUP_RAID6, CHUNK_ITEM_KEY, DISK_KEY_SIZE,
 };
 
 /// On-disk `struct btrfs_chunk` header size (fields before the first stripe).
@@ -34,6 +34,8 @@ pub enum ChunkProfile {
     Dup,
     Raid0,
     Raid1,
+    Raid1C3,
+    Raid1C4,
     Raid10,
     Raid5,
     Raid6,
@@ -95,8 +97,7 @@ impl ChunkMap {
         self.entries.is_empty()
     }
 
-    /// Register a freshly-allocated chunk mapping (the chunk-growth path adds one
-    /// SINGLE-profile chunk on one device).
+    /// Register a freshly-allocated SINGLE chunk mapping.
     pub fn add_entry(&mut self, logical_start: u64, length: u64, devid: u64, physical: u64) {
         self.entries.push(ChunkMapEntry {
             logical_start,
@@ -106,6 +107,33 @@ impl ChunkMap {
             sub_stripes: 1,
             stripes: alloc::vec![ChunkStripe { devid, physical }],
         });
+    }
+
+    /// Register a freshly-allocated on-disk chunk item. Keeping this path on the
+    /// same decoder as mount prevents the growth code from publishing geometry
+    /// that a later mount would reject.
+    pub fn add_chunk_item(&mut self, logical_start: u64, chunk: &[u8]) -> Result<(), FsError> {
+        self.insert_chunk_item(logical_start, chunk)
+    }
+
+    /// Atomically replace the geometry for one existing logical chunk. The new
+    /// item is decoded into a temporary map first, so a malformed balance
+    /// target cannot discard the live mapping.
+    pub(crate) fn replace_chunk_item(
+        &mut self,
+        logical_start: u64,
+        chunk: &[u8],
+    ) -> Result<(), FsError> {
+        let mut replacement = ChunkMap::new();
+        replacement.insert_chunk_item(logical_start, chunk)?;
+        let replacement = replacement.entries.pop().ok_or(FsError::InvalidData)?;
+        let slot = self
+            .entries
+            .iter()
+            .position(|entry| entry.logical_start == logical_start)
+            .ok_or(FsError::NotFound)?;
+        self.entries[slot] = replacement;
+        Ok(())
     }
 
     /// The highest `logical_start + length` across all mapped chunks — the next
@@ -150,7 +178,11 @@ impl ChunkMap {
             physical: stripe.physical + device_stripe * e.stripe_len + within,
         };
         let locations = match e.profile {
-            ChunkProfile::Single | ChunkProfile::Dup | ChunkProfile::Raid1 => e
+            ChunkProfile::Single
+            | ChunkProfile::Dup
+            | ChunkProfile::Raid1
+            | ChunkProfile::Raid1C3
+            | ChunkProfile::Raid1C4 => e
                 .stripes
                 .iter()
                 .copied()
@@ -199,7 +231,11 @@ impl ChunkMap {
         let delta = logical - e.logical_start;
         let chunk_left = e.length - delta;
         match e.profile {
-            ChunkProfile::Single | ChunkProfile::Dup | ChunkProfile::Raid1 => Ok(chunk_left),
+            ChunkProfile::Single
+            | ChunkProfile::Dup
+            | ChunkProfile::Raid1
+            | ChunkProfile::Raid1C3
+            | ChunkProfile::Raid1C4 => Ok(chunk_left),
             _ => Ok(chunk_left.min(e.stripe_len - delta % e.stripe_len)),
         }
     }
@@ -281,6 +317,10 @@ impl ChunkMap {
             BLOCK_GROUP_RAID0 => return Err(FsError::InvalidData),
             BLOCK_GROUP_RAID1 if num_stripes >= 2 => ChunkProfile::Raid1,
             BLOCK_GROUP_RAID1 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID1C3 if num_stripes == 3 => ChunkProfile::Raid1C3,
+            BLOCK_GROUP_RAID1C3 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID1C4 if num_stripes == 4 => ChunkProfile::Raid1C4,
+            BLOCK_GROUP_RAID1C4 => return Err(FsError::InvalidData),
             BLOCK_GROUP_RAID10
                 if num_stripes >= 4 && sub_stripes >= 2 && num_stripes % sub_stripes == 0 =>
             {
