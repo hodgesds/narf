@@ -1320,3 +1320,69 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_kill_pgrp_resolves_in_caller_pid_ns
 );
+
+// ptrace(2) interprets its target pid in the CALLER's pid namespace (Linux
+// find_get_task_by_vpid). The handler used the raw arg1 as an OUTER/visible
+// pid for every request, so a containerized tracer's PTRACE_ATTACH landed on
+// whatever ROOT-namespace process owned the same number — a containment
+// escape (ATTACH + POKEDATA is an arbitrary host-memory write). PTRACE_ATTACH
+// raises SIGSTOP on the resolved target, which is the observable here.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_ptrace_attach_resolves_in_caller_pid_ns() -> TestResult {
+    const PTRACE_ATTACH: u64 = 16;
+    const SIGSTOP: u64 = 19;
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB300;
+        const MANAGER_PID: u64 = 0xB000;
+        const WORKER_TASK: u64 = 0xB301;
+        const WORKER_PID: u64 = 0xB001;
+        const VICTIM_TASK: u64 = 0xB302;
+        const VICTIM_PID: u64 = 2; // collides with the worker's INNER pid
+
+        crate::pid_ns::__test_reset();
+        crate::ptrace::ptrace_init();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(VICTIM_TASK, VICTIM_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
+                return Err("worker was not assigned inner pid 2");
+            }
+            set_task(MANAGER_TASK);
+            // ATTACH to the worker by its IN-NAMESPACE pid (2).
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH, 2, 0, 0)) != Some(0) {
+                return Err("ptrace(ATTACH, inner 2) did not return 0");
+            }
+            let worker_stopped =
+                crate::handlers::signal_pending_of(WORKER_TASK) & (1u64 << (SIGSTOP - 1)) != 0;
+            let victim_stopped =
+                crate::handlers::signal_pending_of(VICTIM_TASK) & (1u64 << (SIGSTOP - 1)) != 0;
+            if victim_stopped {
+                return Err("ptrace ATTACH stopped the ROOT-namespace collision victim — containment escape");
+            }
+            if !worker_stopped {
+                return Err("ptrace ATTACH did not reach the worker — the in-namespace pid was not translated");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        crate::ptrace::ptrace_init();
+        for t in [MANAGER_TASK, WORKER_TASK, VICTIM_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_attach_resolves_in_caller_pid_ns
+);

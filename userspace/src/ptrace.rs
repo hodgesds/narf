@@ -631,6 +631,28 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
     let caller = current_task_id();
     let caller_pid = tid_to_pid(caller);
 
+    // Every ptrace request except TRACEME names its target by pid, interpreted
+    // in the CALLER's pid namespace (Linux resolves it via
+    // find_get_task_by_vpid, kernel/ptrace.c). The `tracers` map and every
+    // ownership check key on the OUTER/visible pid — `caller_pid` above is
+    // `tid_to_pid(caller)`, the outer ProcessId — so the incoming pid MUST be
+    // translated inner->outer here. Untranslated, a containerized tracer could
+    // PTRACE_ATTACH + PTRACE_POKEDATA a host process (or SEIZE host pid 1) by
+    // its inner-namespace number: a containment escape with write primitives.
+    // An inner pid not bound in the caller's namespace is ESRCH.
+    #[cfg(feature = "container")]
+    let pid = if request == PTRACE_TRACEME {
+        pid
+    } else {
+        match crate::pid_ns::resolve_inner_pid(caller, pid) {
+            Some(outer) => outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    };
+
     match request {
         PTRACE_TRACEME => {
             // `parent_of` stores the parent's TASK id, but the `tracers` map is
