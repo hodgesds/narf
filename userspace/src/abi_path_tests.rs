@@ -2096,6 +2096,73 @@ fn smoke_abi_path_statx_at_empty_path_fd() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_at_empty_path_fd);
 
+// Two independent opens of the SAME directory must be indistinguishable:
+// identical stx_ino AND identical stx_mnt_id. This is an identity invariant,
+// not a formatting one, and the existing statx smokes only check that the
+// fields are PRESENT.
+//
+// systemd's `path_is_root_at()` / `fds_inode_and_mount_same()` decide "have I
+// reached the root yet" by opening a reference directory and comparing it,
+// via statx(AT_EMPTY_PATH), against the fd it is walking. If two opens of one
+// directory disagree, that test can never say "yes" and the walk does not
+// terminate. `systemd-udevd` was caught doing exactly this on the Fedora
+// gate — an unbounded `openat("/") → statx(held_fd) → statx(new_fd) → close`
+// loop, which is what a never-satisfied root comparison looks like from the
+// syscall side, and it stops the daemon dead after two uevents.
+//
+// NARF fabricates inode numbers, so "same path, same identity" is a real
+// thing to get wrong here rather than something the filesystem hands over for
+// free — st_ino fabrication has already broken musl's DSO dedup once.
+fn smoke_abi_path_statx_same_dir_twice_has_stable_identity() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        let dir = b"/p ";
+        let mut fds = [0u64; 2];
+        for slot in fds.iter_mut() {
+            *slot = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, dir.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open(/p) should return a fd"),
+            };
+        }
+        let empty = b"\0";
+        let mut buf_a = [0u8; 256];
+        let mut buf_b = [0u8; 256];
+        let ra = do_statx(
+            fds[0],
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH_FLAG,
+            STATX_MNT_ID_BIT as u64,
+            &mut buf_a,
+        );
+        let rb = do_statx(
+            fds[1],
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH_FLAG,
+            STATX_MNT_ID_BIT as u64,
+            &mut buf_b,
+        );
+        for fd in fds {
+            let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+        }
+        if ra != Some(0) || rb != Some(0) {
+            return Err("statx(dirfd, \"\", AT_EMPTY_PATH) should return 0 for both opens");
+        }
+        if statx_u64(&buf_a, STATX_INO_OFF) != statx_u64(&buf_b, STATX_INO_OFF) {
+            return Err("two opens of the same directory reported different stx_ino");
+        }
+        if statx_u64(&buf_a, STATX_MNT_ID_OFF) != statx_u64(&buf_b, STATX_MNT_ID_OFF) {
+            return Err("two opens of the same directory reported different stx_mnt_id");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_statx_same_dir_twice_has_stable_identity
+);
+
 // AT_SYMLINK_NOFOLLOW gives lstat semantics: statx of a symlink WITH the
 // flag describes the LINK node (S_IFLNK), while statx WITHOUT it follows to
 // the target regular file (S_IFREG). systemd's chase() walks each component
