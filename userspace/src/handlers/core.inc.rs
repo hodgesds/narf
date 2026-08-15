@@ -2548,7 +2548,7 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
     const EXDEV: i64 = -18;
     const ENOENT: i64 = -2;
     const EISDIR: i64 = -21;
-    let res = narf_filesystem::registry().resolve_two_parents_absolute(
+    let res = current_resolve_two_parents_absolute(
         old_abs,
         new_abs,
         |_fs, old_dir, old_leaf, new_dir, new_leaf| {

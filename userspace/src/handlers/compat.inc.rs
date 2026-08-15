@@ -1972,6 +1972,25 @@ where
     }
 }
 
+/// Namespace-aware `resolve_two_parents_absolute` — the cross-DIRECTORY
+/// rename counterpart of [`current_resolve_parent_absolute`].
+pub(crate) fn current_resolve_two_parents_absolute<R, F>(a: &str, b: &str, f: F) -> Option<R>
+where
+    F: FnOnce(
+        &dyn narf_filesystem::FsInstance,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+    ) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_two_parents_absolute(a, b, f)
+    } else {
+        narf_filesystem::registry().resolve_two_parents_absolute(a, b, f)
+    }
+}
+
 pub(crate) fn current_clone_tree_at(
     path: &str,
 ) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {

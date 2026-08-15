@@ -2051,6 +2051,77 @@ impl MountNamespace {
         Some(f(&*fs, dir, leaf))
     }
 
+    /// Namespace-scoped twin of [`VfsRegistry::resolve_two_parents_absolute`],
+    /// for cross-DIRECTORY rename. Same contract: both parents must land on
+    /// the same mount (that same-mount check IS the EXDEV test), both walks
+    /// happen under one lock so a concurrent mount cannot move one path out
+    /// from under the other, and the lock is released before `f` runs because
+    /// `f` performs the rename and may block on block I/O.
+    ///
+    /// Without this, a cross-directory rename inside a private mount
+    /// namespace resolves against the global registry and fails, exactly as
+    /// same-directory rename did before `resolve_parent_absolute` gained a
+    /// namespace-aware twin.
+    pub fn resolve_two_parents_absolute<R, F>(&self, a: &str, b: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str, Arc<dyn DirOps>, &str) -> R,
+    {
+        fn split(abs: &str) -> Option<(&str, &str)> {
+            if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+                return None;
+            }
+            let last = abs.rfind('/')?;
+            let leaf = &abs[last + 1..];
+            if leaf.is_empty() {
+                return None;
+            }
+            let parent = &abs[..last];
+            Some((if parent.is_empty() { "/" } else { parent }, leaf))
+        }
+        let (a_parent, a_leaf) = split(a)?;
+        let (b_parent, b_leaf) = split(b)?;
+        let (fs, a_dir, b_dir) = {
+            let q = self.inner.lock();
+            let best_mount = |parent_path: &str| -> Option<&Mount> {
+                let mut best: Option<&Mount> = None;
+                for m in q.iter() {
+                    let is_match = parent_path == m.path.as_str()
+                        || m.path == "/"
+                        || (parent_path.starts_with(m.path.as_str())
+                            && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'));
+                    if is_match && best.map(|x| x.path.len()).unwrap_or(0) <= m.path.len() {
+                        best = Some(m);
+                    }
+                }
+                best
+            };
+            let ma = best_mount(a_parent)?;
+            let mb = best_mount(b_parent)?;
+            if ma.path != mb.path {
+                return None;
+            }
+            let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
+                let rel = &parent_path[m.path.len()..];
+                let rel = rel.strip_prefix('/').unwrap_or(rel);
+                let mut dir = m.fs.root();
+                for seg in rel.split('/') {
+                    if seg.is_empty() || seg == "." {
+                        continue;
+                    }
+                    if seg == ".." {
+                        return None;
+                    }
+                    dir = dir.lookup_dir(seg)?;
+                }
+                Some(dir)
+            };
+            let a_dir = walk(ma, a_parent)?;
+            let b_dir = walk(mb, b_parent)?;
+            (ma.fs.clone(), a_dir, b_dir)
+        };
+        Some(f(&*fs, a_dir, a_leaf, b_dir, b_leaf))
+    }
+
     /// Clone the filesystem object of the visible mount covering `abs`.
     ///
     /// Equal-length entries are mount stacks; the newest entry wins, matching

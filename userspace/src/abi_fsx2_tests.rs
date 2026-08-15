@@ -1693,6 +1693,70 @@ kernel_test_in!(
     smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace
 );
 
+/// Cross-DIRECTORY rename must resolve in the caller's mount namespace too.
+///
+/// `cross_dir_rename` takes a different path from the same-directory case —
+/// `resolve_two_parents_absolute`, whose same-mount check IS the EXDEV test —
+/// so it needed its own namespace-aware twin and its own test. Leaving it on
+/// the global registry would have kept exactly the udev-class bug alive for
+/// any rename that moves a name between two directories.
+fn smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsxdir", &[]));
+            if ns.mount_arc(&auth, "/abi-nsxdir", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+            for dir in [b"/abi-nsxdir/from\0".as_ref(), b"/abi-nsxdir/to\0".as_ref()] {
+                if call(Syscall::Mkdir.raw(), a1(dir.as_ptr() as u64, 0o755)) != Some(0) {
+                    return Err("mkdir of a cross-directory rename endpoint failed");
+                }
+            }
+            let src = b"/abi-nsxdir/from/entry\0";
+            let dst = b"/abi-nsxdir/to/entry\0";
+            let fd = call_open(src.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+            if fd < 0 {
+                return Err("could not create the cross-directory rename source");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+            match call(
+                Syscall::Rename.raw(),
+                a1(src.as_ptr() as u64, dst.as_ptr() as u64),
+            ) {
+                Some(0) => {}
+                Some(-2) => {
+                    return Err(
+                        "cross-directory rename reported ENOENT — cross_dir_rename bypasses the task's mount namespace",
+                    )
+                }
+                _ => return Err("cross-directory rename in a private namespace did not succeed"),
+            }
+            if call_open(dst.as_ptr() as u64, 0).unwrap_or(-1) < 0 {
+                return Err("cross-directory renamed file is not openable at its destination");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace
+);
+
 fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
