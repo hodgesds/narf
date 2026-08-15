@@ -564,3 +564,93 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_ioprio_get_resolves_in_caller_pid_ns
 );
+
+// ── #27 bpf(BPF_TASK_FD_QUERY).pid — Linux kernel/bpf/syscall.c ──
+//
+// The self-check `if pid != 0 && pid != me` compared the caller-namespace pid
+// against the OUTER self pid, so a container querying its own fds with its own
+// getpid() was rejected (ENOTSUP). The fix translates the pid first. The worker
+// loads an atomic program, attaches it to a tracepoint perf event via
+// PERF_EVENT_IOC_SET_BPF, then queries that fd by its OWN inner pid: the fix
+// reports the program (0), the bug rejects the inner pid with ENOTSUP.
+fn smoke_abi_pidns_bpf_task_fd_query_self_pid_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB300;
+        const MANAGER_PID: u64 = 0xB030;
+        const WORKER_TASK: u64 = 0xB301;
+        const WORKER_PID: u64 = 0xB031;
+        const BPF_PROG_LOAD: u64 = 5;
+        const BPF_TASK_FD_QUERY: u64 = 20;
+        const BPF_PROG_TYPE_RAW_TRACEPOINT: u32 = 17;
+        const PERF_TYPE_TRACEPOINT: u32 = 2;
+        const PERF_EVENT_IOC_SET_BPF: u64 = 0x4004_2408;
+        const ENOTSUP: i64 = -95;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(WORKER_TASK);
+            // Trivial atomic program: r0 = 0; exit.
+            let mut insns = [0u8; 16];
+            insns[0] = 0xB7; // BPF_ALU64|BPF_MOV|BPF_K, dst r0, imm 0
+            insns[8] = 0x95; // BPF_JMP|BPF_EXIT
+            let license = b"GPL\0";
+            let mut load_attr = [0u8; 160];
+            load_attr[0..4].copy_from_slice(&BPF_PROG_TYPE_RAW_TRACEPOINT.to_le_bytes());
+            load_attr[4..8].copy_from_slice(&2u32.to_le_bytes()); // insn_cnt
+            load_attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
+            load_attr[16..24].copy_from_slice(&(license.as_ptr() as u64).to_le_bytes());
+            let prog_fd = match call(
+                Syscall::Bpf.raw(),
+                a2(BPF_PROG_LOAD, load_attr.as_ptr() as u64, 160),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("BPF_PROG_LOAD of a trivial atomic program failed"),
+            };
+
+            // Tracepoint perf event for self (pid 0, any config != 0).
+            let mut pattr = [0u8; 144];
+            pattr[0..4].copy_from_slice(&PERF_TYPE_TRACEPOINT.to_le_bytes());
+            pattr[4..8].copy_from_slice(&144u32.to_le_bytes()); // size
+            pattr[8..16].copy_from_slice(&1u64.to_le_bytes()); // config != 0
+            let event_fd = match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(pattr.as_ptr() as u64, 0, -1i64 as u64, -1i64 as u64),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("perf_event_open(TRACEPOINT) failed"),
+            };
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(event_fd, PERF_EVENT_IOC_SET_BPF, prog_fd),
+            ) != Some(0)
+            {
+                return Err("PERF_EVENT_IOC_SET_BPF failed");
+            }
+
+            // Query that fd by the caller's OWN in-namespace pid (2).
+            let mut q = [0u8; 48];
+            q[0..4].copy_from_slice(&2u32.to_le_bytes()); // task_fd_query.pid
+            q[4..8].copy_from_slice(&(event_fd as u32).to_le_bytes()); // .fd
+            match call(
+                Syscall::Bpf.raw(),
+                a2(BPF_TASK_FD_QUERY, q.as_mut_ptr() as u64, 48),
+            ) {
+                Some(0) => Ok(()),
+                Some(v) if v == ENOTSUP => Err("BPF_TASK_FD_QUERY rejected the caller's OWN in-namespace pid with ENOTSUP — the inner pid was compared against the outer self pid without accept_pid_from"),
+                _ => Err("BPF_TASK_FD_QUERY returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_bpf_task_fd_query_self_pid_in_caller_pid_ns
+);

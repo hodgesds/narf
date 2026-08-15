@@ -475,7 +475,19 @@ fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
     }
     let pid = u32_at(&attr, TFQ_PID);
     let me = task_to_pid_raw(current_task_id()).unwrap_or(0) as u32;
-    if pid != 0 && pid != me {
+    // `pid` is interpreted in the CALLER's pid namespace (Linux
+    // kernel/bpf/syscall.c uses the thread's virtual pid). Translate the inner
+    // pid to its outer ProcessId before the self-comparison, so a container
+    // querying its own fds by getpid() is not rejected. Audit finding #27.
+    let translated = if pid != 0 {
+        match accept_pid_from(current_task_id(), pid as u64) {
+            Some(outer) => outer as u32,
+            None => return -ENOTSUP,
+        }
+    } else {
+        0
+    };
+    if translated != 0 && translated != me {
         return -ENOTSUP;
     }
     let (prog_id, fd_type) = match task_fd_prog_id(u32_at(&attr, TFQ_FD)) {
