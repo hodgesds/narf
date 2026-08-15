@@ -277,6 +277,44 @@ pub trait FsInstance {
 }
 ```
 
+Persistent-format drivers may expose a typed assembly entry point in addition
+to the generic mount registry. Btrfs provides
+`BtrfsVolume::mount_devices(Vec<Arc<B>>, DomainId)` and the corresponding
+`mount_devices_opts` / `mount_subvol_devices` variants. The first member selects
+the FSID; other supplied or registry-discovered devices are matched by FSID and
+on-disk devid. A complete generation-consistent set may be writable. A missing
+or stale member set is read-only and succeeds only when the selected profile can
+reconstruct every block needed by mount and later I/O.
+
+The typed btrfs administration surface is:
+
+```rust
+pub struct BalanceProfiles {
+    pub data: Option<ChunkProfile>,
+    pub metadata: Option<ChunkProfile>,
+    pub system: Option<ChunkProfile>,
+}
+
+impl<B: BlockDevice> BtrfsVolume<B> {
+    pub async fn add_device(&self, device: Arc<B>) -> Result<u64, FsError>;
+    pub async fn remove_device(&self, devid: u64) -> Result<(), FsError>;
+    pub async fn replace_device(&self, devid: u64, target: Arc<B>) -> Result<(), FsError>;
+    pub async fn balance_profiles(&self, targets: BalanceProfiles)
+        -> Result<BalanceStats, FsError>;
+}
+```
+
+Add commits the member's `DEV_ITEM` and superblocks; new chunks are allocated by
+the normal profile-aware growth path. Replace copies allocated device extents
+while retaining devid, UUID, and stripe offsets. Remove performs a synchronous
+balance evacuation before deleting the member. Profile conversion operates on
+complete DATA/METADATA/SYSTEM allocation classes, preserves every chunk's
+logical address, and commits replacement `CHUNK_ITEM`s, physical device extents,
+block-group flags, the system chunk array, and member superblocks atomically.
+Insufficient members return `Busy`; insufficient crash-safe destination space
+returns `NoSpace`. Linux lifecycle/balance ioctls and their filter/progress/
+pause/cancel ABI are not part of this typed interface yet.
+
 A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
@@ -749,7 +787,7 @@ Arch-neutral at the spec level. Two arch-touches:
 | Stage | Lands                                                               |
 | ----- | ------------------------------------------------------------------- |
 | 3     | VFS core (trait, resolution, open/read/write/stat), initramfs in-memory FS, virtiofs glue skeleton. |
-| 4     | virtiofs and persistent compatibility drivers (including ext2 and single-device btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
+| 4     | virtiofs and persistent compatibility drivers (including ext2 and btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
 | post-1.0 | NARF-native filesystem and quota policy, ACL-like caps, and broader on-disk-format coverage. |
 
 ## 8. Resolved decisions
@@ -779,7 +817,7 @@ narffs is a copy-on-write FS with:
 
 **Implementation status:** narffs remains the native-format target, not the
 first persistent driver that landed. Compatibility drivers now implement ext2,
-FAT-family formats, and single-device read-write btrfs behind the same VFS
+FAT-family formats, and read-write btrfs behind the same VFS
 traits. Btrfs supplies the currently implemented native snapshot backend;
 its compatibility driver also maintains already-enabled full qgroup trees,
 enforces referenced/exclusive hard limits, supports V2 qgroup inheritance, and
@@ -788,8 +826,13 @@ implements Linux simple quotas: post-enable extents have permanent owners,
 usage updates incrementally with referenced equal to exclusive, shared-root
 snapshots begin uncharged, and hierarchy inheritance and hard limits work in
 simple mode. Simple-quota rescans are invalid and disabling preserves the
-on-disk incompat bit and owner refs. Multi-device/RAID btrfs and narffs remain
-future work.
+on-disk incompat bit and owner refs. Btrfs also assembles member devices by
+FSID/devid; reads, writes, and grows SINGLE/DUP/RAID0/1/1C3/1C4/10/5/6 chunks;
+and performs read-only degraded parity recovery. Its typed administration
+surface adds/removes/replaces members, evacuates allocated devices, and
+synchronously converts DATA/METADATA/SYSTEM profiles with
+logical-address-preserving relocation. Linux lifecycle/balance ioctl dispatch
+and asynchronous filtered balance controls remain future work, as does narffs.
 
 ### 8.2 POSIX semantics scope (resolved)
 

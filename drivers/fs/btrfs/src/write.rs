@@ -67,7 +67,7 @@ use crate::dir::{append_dir_item, decode_dir_items, find_dir_item, remove_dir_it
 use crate::format::{self, le64, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::roots;
-use crate::volume::BtrfsVolume;
+use crate::volume::{BalanceProfiles, BalanceStats, BtrfsVolume};
 
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;
@@ -3971,6 +3971,7 @@ fn subvol_root_item(
 /// Create an empty subvolume below `parent_ino`, atomically COWing the parent
 /// tree, new child tree, UUID tree, root tree and extent/free-space metadata.
 /// Returns the new subvolume's tree objectid.
+#[cfg(feature = "kernel-test")]
 pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -6289,11 +6290,547 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
     Ok(true)
 }
 
-/// Grow the filesystem by allocating one new mixed (DATA|METADATA, SINGLE) chunk
-/// at the end of the device, creating its block group, and threading the change
-/// through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
-/// `DEV_EXTENT`), extent tree (new `BLOCK_GROUP_ITEM`), free-space tree (the new
-/// block group's free space), and root tree — one COW mini-transaction.
+/// Allocated physical ranges belonging to one member, in device-offset order.
+/// Device replace copies these ranges; device removal requires the list empty.
+pub(crate) async fn device_extent_ranges<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    devid: u64,
+) -> Result<Vec<(u64, u64)>, FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    let dev_root = roots::find_root(vol, root_tree, format::DEV_TREE_OBJECTID)
+        .await?
+        .0;
+    let (logical, _) = read_fs_oversized(vol, dev_root).await?;
+    let mut ranges = Vec::new();
+    for slot in 0..nritems(&logical)? as usize {
+        let key = leaf_item_key(&logical, slot)?;
+        if key.objectid == devid && key.item_type == format::DEV_EXTENT_KEY {
+            ranges.push((key.offset, le64(leaf_item_data(&logical, slot)?, 24)?));
+        }
+    }
+    ranges.sort_unstable();
+    Ok(ranges)
+}
+
+#[derive(Clone, Debug)]
+struct GrowthChunk {
+    logical: u64,
+    length: u64,
+    stripe_extent_len: u64,
+    flags: u64,
+    item: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ChunkRelocation {
+    old: GrowthChunk,
+    new: GrowthChunk,
+}
+
+fn profile_flag(profile: crate::chunk::ChunkProfile) -> u64 {
+    use crate::chunk::ChunkProfile;
+    match profile {
+        ChunkProfile::Single => 0,
+        ChunkProfile::Dup => format::BLOCK_GROUP_DUP,
+        ChunkProfile::Raid0 => format::BLOCK_GROUP_RAID0,
+        ChunkProfile::Raid1 => format::BLOCK_GROUP_RAID1,
+        ChunkProfile::Raid1C3 => format::BLOCK_GROUP_RAID1C3,
+        ChunkProfile::Raid1C4 => format::BLOCK_GROUP_RAID1C4,
+        ChunkProfile::Raid10 => format::BLOCK_GROUP_RAID10,
+        ChunkProfile::Raid5 => format::BLOCK_GROUP_RAID5,
+        ChunkProfile::Raid6 => format::BLOCK_GROUP_RAID6,
+    }
+}
+
+fn profile_from_flags(flags: u64) -> Result<crate::chunk::ChunkProfile, FsError> {
+    use crate::chunk::ChunkProfile;
+    Ok(match flags & format::BLOCK_GROUP_PROFILE_MASK {
+        0 => ChunkProfile::Single,
+        format::BLOCK_GROUP_DUP => ChunkProfile::Dup,
+        format::BLOCK_GROUP_RAID0 => ChunkProfile::Raid0,
+        format::BLOCK_GROUP_RAID1 => ChunkProfile::Raid1,
+        format::BLOCK_GROUP_RAID1C3 => ChunkProfile::Raid1C3,
+        format::BLOCK_GROUP_RAID1C4 => ChunkProfile::Raid1C4,
+        format::BLOCK_GROUP_RAID10 => ChunkProfile::Raid10,
+        format::BLOCK_GROUP_RAID5 => ChunkProfile::Raid5,
+        format::BLOCK_GROUP_RAID6 => ChunkProfile::Raid6,
+        _ => return Err(FsError::InvalidData),
+    })
+}
+
+fn balance_target(
+    flags: u64,
+    targets: BalanceProfiles,
+) -> Result<Option<crate::chunk::ChunkProfile>, FsError> {
+    let data = flags & format::BLOCK_GROUP_DATA != 0;
+    let metadata = flags & format::BLOCK_GROUP_METADATA != 0;
+    if data && metadata {
+        match (targets.data, targets.metadata) {
+            (Some(left), Some(right)) if left != right => Err(FsError::InvalidData),
+            (Some(profile), _) | (_, Some(profile)) => Ok(Some(profile)),
+            _ => Ok(None),
+        }
+    } else if data {
+        Ok(targets.data)
+    } else if metadata {
+        Ok(targets.metadata)
+    } else if flags & format::BLOCK_GROUP_SYSTEM != 0 {
+        Ok(targets.system)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Rebuild a chunk template with Linux-compatible stripe counts for `profile`.
+/// Device UUIDs come from the live member DEV_ITEMs; physical offsets are filled
+/// by the reservation pass.
+fn chunk_profile_template(
+    template: &[u8],
+    profile: crate::chunk::ChunkProfile,
+    members: &[(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])],
+) -> Result<Vec<u8>, FsError> {
+    use crate::chunk::ChunkProfile;
+    if template.len() < 48 || members.is_empty() {
+        return Err(FsError::InvalidData);
+    }
+    let (count, sub) = match profile {
+        ChunkProfile::Single => (1usize, 1u16),
+        ChunkProfile::Dup => (2, 1),
+        ChunkProfile::Raid0 => (members.len(), 1),
+        ChunkProfile::Raid1 => (2, 1),
+        ChunkProfile::Raid1C3 => (3, 1),
+        ChunkProfile::Raid1C4 => (4, 1),
+        ChunkProfile::Raid10 => (members.len() / 2 * 2, 2),
+        ChunkProfile::Raid5 => (members.len(), 1),
+        ChunkProfile::Raid6 => (members.len(), 1),
+    };
+    let minimum = match profile {
+        ChunkProfile::Single | ChunkProfile::Dup => 1,
+        ChunkProfile::Raid0 | ChunkProfile::Raid1 | ChunkProfile::Raid5 => 2,
+        ChunkProfile::Raid1C3 | ChunkProfile::Raid6 => 3,
+        ChunkProfile::Raid1C4 | ChunkProfile::Raid10 => 4,
+    };
+    if members.len() < minimum || count < minimum {
+        return Err(FsError::Busy);
+    }
+    let mut item = alloc::vec![0u8; 48 + count * 32];
+    item[..48].copy_from_slice(&template[..48]);
+    let flags = le64(template, 24)? & !format::BLOCK_GROUP_PROFILE_MASK | profile_flag(profile);
+    item[24..32].copy_from_slice(&flags.to_le_bytes());
+    item[44..46].copy_from_slice(&(count as u16).to_le_bytes());
+    item[46..48].copy_from_slice(&sub.to_le_bytes());
+    for stripe in 0..count {
+        let member = if profile == ChunkProfile::Dup {
+            &members[0]
+        } else {
+            &members[stripe]
+        };
+        let at = 48 + stripe * 32;
+        item[at..at + 8].copy_from_slice(&member.0.to_le_bytes());
+        item[at + 16..at + 32].copy_from_slice(&member.1[66..82]);
+    }
+    Ok(item)
+}
+
+fn chunk_data_stripes(flags: u64, num: u16, sub: u16) -> Result<u64, FsError> {
+    let n = u64::from(num);
+    match flags & format::BLOCK_GROUP_PROFILE_MASK {
+        0 if num == 1 => Ok(1),
+        format::BLOCK_GROUP_DUP if num == 2 => Ok(1),
+        format::BLOCK_GROUP_RAID0 if num >= 2 => Ok(n),
+        format::BLOCK_GROUP_RAID1 if num >= 2 => Ok(1),
+        format::BLOCK_GROUP_RAID1C3 if num == 3 => Ok(1),
+        format::BLOCK_GROUP_RAID1C4 if num == 4 => Ok(1),
+        format::BLOCK_GROUP_RAID10 if num >= 4 && sub >= 2 && num % sub == 0 => {
+            Ok(n / u64::from(sub))
+        }
+        format::BLOCK_GROUP_RAID5 if num >= 2 => Ok(n - 1),
+        format::BLOCK_GROUP_RAID6 if num >= 3 => Ok(n - 2),
+        _ => Err(FsError::InvalidData),
+    }
+}
+
+/// Reserve one new chunk using an existing block group's exact profile and
+/// stripe membership. Linux grows regular arrays from the existing allocation
+/// profile; preserving the template geometry also avoids silently weakening
+/// redundancy. The logical length is capped at 8 MiB for the small NARF writer.
+fn reserve_growth_chunk(
+    template: &[u8],
+    logical: u64,
+    physical_hw: &mut BTreeMap<u64, u64>,
+    capacities: &BTreeMap<u64, u64>,
+) -> Result<GrowthChunk, FsError> {
+    const MAX_CHUNK: u64 = 8 * 1024 * 1024;
+    const STRIPE_SIZE: usize = 32;
+    if template.len() < 48 {
+        return Err(FsError::InvalidData);
+    }
+    let flags = le64(template, 24)?;
+    let stripe_len = le64(template, 16)?;
+    let num = crate::format::le16(template, 44)?;
+    let sub = crate::format::le16(template, 46)?;
+    let data_stripes = chunk_data_stripes(flags, num, sub)?;
+    let stripe_set = stripe_len
+        .checked_mul(data_stripes)
+        .ok_or(FsError::InvalidData)?;
+    if stripe_len == 0 || stripe_set == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let need = 48usize
+        .checked_add(
+            usize::from(num)
+                .checked_mul(STRIPE_SIZE)
+                .ok_or(FsError::InvalidData)?,
+        )
+        .ok_or(FsError::InvalidData)?;
+    if template.len() < need {
+        return Err(FsError::InvalidData);
+    }
+
+    let mut logical_len = (MAX_CHUNK / stripe_set) * stripe_set;
+    while logical_len >= stripe_set {
+        let stripe_extent_len = logical_len / data_stripes;
+        let mut trial_hw = physical_hw.clone();
+        let mut item = template[..need].to_vec();
+        let mut fits = true;
+        for stripe in 0..usize::from(num) {
+            let at = 48 + stripe * STRIPE_SIZE;
+            let devid = le64(&item, at)?;
+            let capacity = match capacities.get(&devid) {
+                Some(capacity) => *capacity,
+                None => {
+                    fits = false;
+                    break;
+                }
+            };
+            let hw = trial_hw.get(&devid).copied().unwrap_or(0);
+            let (physical, available) = chunk_span_avoiding_supers(hw, capacity);
+            if available < stripe_extent_len {
+                fits = false;
+                break;
+            }
+            item[at + 8..at + 16].copy_from_slice(&physical.to_le_bytes());
+            trial_hw.insert(devid, physical + stripe_extent_len);
+        }
+        if fits {
+            item[0..8].copy_from_slice(&logical_len.to_le_bytes());
+            *physical_hw = trial_hw;
+            return Ok(GrowthChunk {
+                logical,
+                length: logical_len,
+                stripe_extent_len,
+                flags,
+                item,
+            });
+        }
+        logical_len -= stripe_set;
+    }
+    Err(FsError::NoSpace)
+}
+
+fn reserve_relocated_chunk(
+    template: &[u8],
+    logical: u64,
+    logical_len: u64,
+    physical_hw: &mut BTreeMap<u64, u64>,
+    capacities: &BTreeMap<u64, u64>,
+) -> Result<GrowthChunk, FsError> {
+    const STRIPE_SIZE: usize = 32;
+    if template.len() < 48 {
+        return Err(FsError::InvalidData);
+    }
+    let flags = le64(template, 24)?;
+    let stripe_len = le64(template, 16)?;
+    let num = crate::format::le16(template, 44)?;
+    let sub = crate::format::le16(template, 46)?;
+    let data_stripes = chunk_data_stripes(flags, num, sub)?;
+    let stripe_set = stripe_len
+        .checked_mul(data_stripes)
+        .ok_or(FsError::InvalidData)?;
+    if logical_len == 0 || logical_len % stripe_set != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let need = 48usize
+        .checked_add(
+            usize::from(num)
+                .checked_mul(STRIPE_SIZE)
+                .ok_or(FsError::InvalidData)?,
+        )
+        .ok_or(FsError::InvalidData)?;
+    if template.len() < need {
+        return Err(FsError::InvalidData);
+    }
+    let stripe_extent_len = logical_len / data_stripes;
+    let mut item = template[..need].to_vec();
+    let mut trial_hw = physical_hw.clone();
+    for stripe in 0..usize::from(num) {
+        let at = 48 + stripe * STRIPE_SIZE;
+        let devid = le64(&item, at)?;
+        let capacity = *capacities.get(&devid).ok_or(FsError::NotFound)?;
+        let hw = trial_hw.get(&devid).copied().unwrap_or(0);
+        let (physical, available) = chunk_span_avoiding_supers(hw, capacity);
+        if available < stripe_extent_len {
+            return Err(FsError::NoSpace);
+        }
+        item[at + 8..at + 16].copy_from_slice(&physical.to_le_bytes());
+        trial_hw.insert(devid, physical + stripe_extent_len);
+    }
+    item[0..8].copy_from_slice(&logical_len.to_le_bytes());
+    *physical_hw = trial_hw;
+    Ok(GrowthChunk {
+        logical,
+        length: logical_len,
+        stripe_extent_len,
+        flags,
+        item,
+    })
+}
+
+fn reserve_evacuated_chunk(
+    old: &GrowthChunk,
+    evacuate: u64,
+    members: &[(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])],
+    physical_hw: &mut BTreeMap<u64, u64>,
+    capacities: &BTreeMap<u64, u64>,
+) -> Result<GrowthChunk, FsError> {
+    let profile = profile_from_flags(old.flags)?;
+    let num = usize::from(crate::format::le16(&old.item, 44)?);
+    let mut item = old.item.clone();
+    let mut used_devids: Vec<u64> = (0..num)
+        .filter_map(|stripe| {
+            let devid = le64(&old.item, 48 + stripe * 32).ok()?;
+            (devid != evacuate).then_some(devid)
+        })
+        .collect();
+    let dup_target = if profile == crate::chunk::ChunkProfile::Dup {
+        members.first().map(|member| member.0)
+    } else {
+        None
+    };
+    for stripe in 0..num {
+        let at = 48 + stripe * 32;
+        if le64(&item, at)? != evacuate {
+            continue;
+        }
+        let candidate = if let Some(devid) = dup_target {
+            members.iter().find(|member| member.0 == devid)
+        } else {
+            members
+                .iter()
+                .filter(|member| !used_devids.contains(&member.0))
+                .min_by_key(|member| physical_hw.get(&member.0).copied().unwrap_or(0))
+        }
+        .ok_or(FsError::Busy)?;
+        let capacity = *capacities.get(&candidate.0).ok_or(FsError::NotFound)?;
+        let hw = physical_hw.get(&candidate.0).copied().unwrap_or(0);
+        let (physical, available) = chunk_span_avoiding_supers(hw, capacity);
+        if available < old.stripe_extent_len {
+            return Err(FsError::NoSpace);
+        }
+        item[at..at + 8].copy_from_slice(&candidate.0.to_le_bytes());
+        item[at + 8..at + 16].copy_from_slice(&physical.to_le_bytes());
+        item[at + 16..at + 32].copy_from_slice(&candidate.1[66..82]);
+        physical_hw.insert(candidate.0, physical + old.stripe_extent_len);
+        if profile != crate::chunk::ChunkProfile::Dup {
+            used_devids.push(candidate.0);
+        }
+    }
+    Ok(GrowthChunk {
+        logical: old.logical,
+        length: old.length,
+        stripe_extent_len: old.stripe_extent_len,
+        flags: old.flags,
+        item,
+    })
+}
+
+fn is_linear_mirror_profile(profile: crate::chunk::ChunkProfile) -> bool {
+    matches!(
+        profile,
+        crate::chunk::ChunkProfile::Single
+            | crate::chunk::ChunkProfile::Dup
+            | crate::chunk::ChunkProfile::Raid1
+            | crate::chunk::ChunkProfile::Raid1C3
+            | crate::chunk::ChunkProfile::Raid1C4
+    )
+}
+
+fn reserve_linear_conversion(
+    old: &GrowthChunk,
+    target_profile: crate::chunk::ChunkProfile,
+    members: &[(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])],
+    physical_hw: &mut BTreeMap<u64, u64>,
+    capacities: &BTreeMap<u64, u64>,
+) -> Result<GrowthChunk, FsError> {
+    use crate::chunk::ChunkProfile;
+    let mut item = chunk_profile_template(&old.item, target_profile, members)?;
+    let target_num = usize::from(crate::format::le16(&item, 44)?);
+    let old_num = usize::from(crate::format::le16(&old.item, 44)?);
+    let mut placed = 0usize;
+    let mut used = Vec::new();
+
+    // All profiles accepted here map each stripe as a complete logical copy.
+    // Reuse surviving copies before allocating new ones, exactly the useful
+    // fast path for SINGLE→RAID1 and RAID1→RAID1C3/C4 conversions.
+    for old_stripe in 0..old_num {
+        if placed >= target_num || (target_profile == ChunkProfile::Dup && placed >= 1) {
+            break;
+        }
+        let old_at = 48 + old_stripe * 32;
+        let devid = le64(&old.item, old_at)?;
+        if used.contains(&devid) || !members.iter().any(|member| member.0 == devid) {
+            continue;
+        }
+        let at = 48 + placed * 32;
+        item[at..at + 32].copy_from_slice(&old.item[old_at..old_at + 32]);
+        used.push(devid);
+        placed += 1;
+    }
+
+    while placed < target_num {
+        let candidate = if target_profile == ChunkProfile::Dup {
+            let devid = *used.first().ok_or(FsError::InvalidData)?;
+            members.iter().find(|member| member.0 == devid)
+        } else {
+            members
+                .iter()
+                .filter(|member| !used.contains(&member.0))
+                .min_by_key(|member| physical_hw.get(&member.0).copied().unwrap_or(0))
+        }
+        .ok_or(FsError::Busy)?;
+        let capacity = *capacities.get(&candidate.0).ok_or(FsError::NotFound)?;
+        let hw = physical_hw.get(&candidate.0).copied().unwrap_or(0);
+        let (physical, available) = chunk_span_avoiding_supers(hw, capacity);
+        if available < old.length {
+            return Err(FsError::NoSpace);
+        }
+        let at = 48 + placed * 32;
+        item[at..at + 8].copy_from_slice(&candidate.0.to_le_bytes());
+        item[at + 8..at + 16].copy_from_slice(&physical.to_le_bytes());
+        item[at + 16..at + 32].copy_from_slice(&candidate.1[66..82]);
+        physical_hw.insert(candidate.0, physical + old.length);
+        if target_profile != ChunkProfile::Dup {
+            used.push(candidate.0);
+        }
+        placed += 1;
+    }
+    let flags = le64(&item, 24)?;
+    Ok(GrowthChunk {
+        logical: old.logical,
+        length: old.length,
+        stripe_extent_len: old.length,
+        flags,
+        item,
+    })
+}
+
+async fn write_raid56_via_map<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    logical: u64,
+    src: &[u8],
+    set: &crate::chunk::Raid56Set,
+) -> Result<(), FsError> {
+    let delta = logical
+        .checked_sub(set.logical_start)
+        .ok_or(FsError::InvalidData)?;
+    let target = (delta / set.stripe_len) as usize;
+    let within = delta % set.stripe_len;
+    if target >= set.data.len() || src.len() as u64 > set.stripe_len - within {
+        return Err(FsError::InvalidData);
+    }
+    let mut data = Vec::with_capacity(set.data.len());
+    for (index, location) in set.data.iter().enumerate() {
+        if index == target {
+            data.push(src.to_vec());
+        } else {
+            let mut bytes = alloc::vec![0u8; src.len()];
+            vol.read_physical_on(location.devid, location.physical + within, &mut bytes)
+                .await?;
+            data.push(bytes);
+        }
+    }
+    let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+    let (p, q) = crate::raid56::syndromes(&slices, set.parity.len() == 2)?;
+    let location = set.data.get(target).ok_or(FsError::InvalidData)?;
+    vol.write_physical_on(location.devid, location.physical + within, src)
+        .await?;
+    for (index, location) in set.parity.iter().enumerate() {
+        let parity = if index == 0 {
+            p.as_slice()
+        } else {
+            q.as_slice()
+        };
+        vol.write_physical_on(location.devid, location.physical + within, parity)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn copy_chunk_to_relocation<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    relocation: &ChunkRelocation,
+) -> Result<(), FsError> {
+    // Destination extents are unreferenced until the final superblock flip.
+    // Zero them first so partial RAID56 read-modify-write sees deterministic
+    // contents in stripes that have not been copied yet.
+    let zero = alloc::vec![0u8; 128 * 1024];
+    let num = usize::from(crate::format::le16(&relocation.new.item, 44)?);
+    let old_num = usize::from(crate::format::le16(&relocation.old.item, 44)?);
+    let old_locations: Vec<(u64, u64)> = (0..old_num)
+        .map(|stripe| {
+            let at = 48 + stripe * 32;
+            Ok((
+                le64(&relocation.old.item, at)?,
+                le64(&relocation.old.item, at + 8)?,
+            ))
+        })
+        .collect::<Result<_, FsError>>()?;
+    for stripe in 0..num {
+        let at = 48 + stripe * 32;
+        let devid = le64(&relocation.new.item, at)?;
+        let physical = le64(&relocation.new.item, at + 8)?;
+        if old_locations.contains(&(devid, physical)) {
+            continue;
+        }
+        let mut cleared = 0u64;
+        while cleared < relocation.new.stripe_extent_len {
+            let take = (relocation.new.stripe_extent_len - cleared).min(zero.len() as u64) as usize;
+            vol.write_physical_on(devid, physical + cleared, &zero[..take])
+                .await?;
+            cleared += take as u64;
+        }
+    }
+
+    let mut target = crate::chunk::ChunkMap::new();
+    target.add_chunk_item(relocation.new.logical, &relocation.new.item)?;
+    let mut copied = 0u64;
+    while copied < relocation.old.length {
+        let logical = relocation.old.logical + copied;
+        let contiguous = target.max_contiguous(logical)?;
+        let take = (relocation.old.length - copied)
+            .min(contiguous)
+            .min(128 * 1024) as usize;
+        let bytes = vol.read_logical(logical, take).await?;
+        match target.raid56_set(logical) {
+            Ok(set) => write_raid56_via_map(vol, logical, &bytes, &set).await?,
+            Err(FsError::Unsupported) => {
+                for location in target.map_logical_stripes(logical)? {
+                    vol.write_physical_on(location.devid, location.physical, &bytes)
+                        .await?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        copied += take as u64;
+    }
+    Ok(())
+}
+
+/// Grow the filesystem by allocating either one mixed block group or one DATA
+/// and one METADATA block group using the existing per-type RAID profiles. The
+/// transaction threads every new stripe through the chunk tree (`CHUNK_ITEM` +
+/// per-member `DEV_ITEM`), device tree (`DEV_EXTENT`), extent tree
+/// (`BLOCK_GROUP_ITEM`), free-space tree, and root tree.
 ///
 /// Every one of those trees may be **multi-leaf**: each is read as one logical
 /// leaf, edited, then re-packed into as many real leaves as it needs under an
@@ -6306,6 +6843,29 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
 /// free-space leaf counts are resolved by the same fixed point [`commit_txn`]
 /// uses. `NoSpace` when the device (or system chunk) has no room.
 pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), FsError> {
+    grow_or_balance(vol, None, None).await.map(|_| ())
+}
+
+/// Synchronous subset of Linux balance used for profile conversion and device
+/// evacuation. Each selected chunk keeps its logical address while all bytes
+/// are copied to newly reserved physical stripes; chunk/device/block-group
+/// metadata and the system chunk array advance in the same COW transaction.
+pub(crate) async fn balance_profiles<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    profiles: BalanceProfiles,
+    evacuate: Option<u64>,
+) -> Result<BalanceStats, FsError> {
+    if profiles == BalanceProfiles::default() && evacuate.is_none() {
+        return Ok(BalanceStats::default());
+    }
+    grow_or_balance(vol, Some(profiles), evacuate).await
+}
+
+async fn grow_or_balance<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    profiles: Option<BalanceProfiles>,
+    evacuate: Option<u64>,
+) -> Result<BalanceStats, FsError> {
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
     let old_chunk = sb.chunk_root;
@@ -6326,24 +6886,64 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
     let (fst_base0, fst_old) = read_fs_oversized(vol, old_fst).await?;
 
-    // ── Locate the logical/physical high-water and a template chunk item ─
+    // ── Locate logical high-water and per-type chunk templates ─────────
     let mut logical_hw = 0u64;
-    let mut template: Option<Vec<u8>> = None; // an 80-byte DATA|METADATA CHUNK_ITEM
+    let mut mixed_template: Option<Vec<u8>> = None;
+    let mut data_template: Option<Vec<u8>> = None;
+    let mut meta_template: Option<Vec<u8>> = None;
+    let mut system_template: Option<Vec<u8>> = None;
+    let mut old_chunks = Vec::new();
     for i in 0..nritems(&chunk_logical)? as usize {
         let k = leaf_item_key(&chunk_logical, i)?;
         if k.item_type != format::CHUNK_ITEM_KEY {
             continue;
         }
         let body = leaf_item_data(&chunk_logical, i)?;
-        logical_hw = logical_hw.max(k.offset.saturating_add(le64(body, 0)?));
-        if le64(body, 24)? & format::BLOCK_GROUP_DATA != 0 && body.len() >= 80 {
-            template = Some(body.to_vec());
+        let length = le64(body, 0)?;
+        logical_hw = logical_hw.max(k.offset.saturating_add(length));
+        let flags = le64(body, 24)?;
+        old_chunks.push(GrowthChunk {
+            logical: k.offset,
+            length,
+            stripe_extent_len: length
+                / chunk_data_stripes(
+                    flags,
+                    crate::format::le16(body, 44)?,
+                    crate::format::le16(body, 46)?,
+                )?,
+            flags,
+            item: body.to_vec(),
+        });
+        if flags & format::BLOCK_GROUP_SYSTEM != 0 {
+            system_template = Some(body.to_vec());
+            continue;
+        }
+        let data = flags & format::BLOCK_GROUP_DATA != 0;
+        let meta = flags & format::BLOCK_GROUP_METADATA != 0;
+        if data && meta {
+            mixed_template = Some(body.to_vec());
+        } else if data {
+            data_template = Some(body.to_vec());
+        } else if meta {
+            meta_template = Some(body.to_vec());
         }
     }
-    let template = template.ok_or(FsError::Unsupported)?;
 
-    // Physical high-water + a chunk_tree_uuid template from the device extents.
-    let mut physical_hw = 0u64;
+    // Per-member physical high-water + a chunk_tree_uuid template from device
+    // extents. DEV_EXTENT keys use the member devid as their objectid.
+    let capacities: BTreeMap<u64, u64> = vol.member_capacities().into_iter().collect();
+    let member_items: BTreeMap<u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE]> =
+        vol.member_dev_items().into_iter().collect();
+    let eligible_members: Vec<(u64, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])> = member_items
+        .iter()
+        .filter(|(devid, _)| Some(**devid) != evacuate)
+        .map(|(&devid, item)| (devid, *item))
+        .collect();
+    if eligible_members.is_empty() {
+        return Err(FsError::Busy);
+    }
+    let mut physical_hw: BTreeMap<u64, u64> =
+        capacities.keys().copied().map(|devid| (devid, 0)).collect();
     let mut chunk_tree_uuid = [0u8; 16];
     for i in 0..nritems(&dev_logical)? as usize {
         let k = leaf_item_key(&dev_logical, i)?;
@@ -6351,102 +6951,325 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
             continue;
         }
         let body = leaf_item_data(&dev_logical, i)?;
-        physical_hw = physical_hw.max(k.offset.saturating_add(le64(body, 24)?));
+        let end = k.offset.saturating_add(le64(body, 24)?);
+        physical_hw
+            .entry(k.objectid)
+            .and_modify(|high| *high = (*high).max(end))
+            .or_insert(end);
         chunk_tree_uuid.copy_from_slice(&body[32..48]);
     }
 
-    // ── Size the new chunk to what remains on the device, skipping the
-    //    reserved band around any 64 MiB / 256 GiB superblock mirror ─────
-    const STRIPE_LEN: u64 = 65536;
-    const MAX_CHUNK: u64 = 8 * 1024 * 1024;
-    let (new_physical, avail) = chunk_span_avoiding_supers(physical_hw, sb.total_bytes);
-    let chunk_size = (avail.min(MAX_CHUNK) / STRIPE_LEN) * STRIPE_LEN;
-    if chunk_size < STRIPE_LEN {
-        return Err(FsError::NoSpace); // device full
+    let transform_template = |template: &[u8]| -> Result<Vec<u8>, FsError> {
+        let flags = le64(template, 24)?;
+        let requested = profiles
+            .map(|targets| balance_target(flags, targets))
+            .transpose()?
+            .flatten();
+        if requested.is_some() || evacuate.is_some() {
+            chunk_profile_template(
+                template,
+                requested.unwrap_or(profile_from_flags(flags)?),
+                &eligible_members,
+            )
+        } else {
+            Ok(template.to_vec())
+        }
+    };
+
+    // Mixed filesystems need one new group. Conventional filesystems receive a
+    // DATA group and a METADATA group in the same transaction so a retry can
+    // allocate both file extents and the COW metadata that describes them.
+    let mut chunks = Vec::new();
+    if let Some(template) = mixed_template.as_deref() {
+        let template = transform_template(template)?;
+        chunks.push(reserve_growth_chunk(
+            &template,
+            logical_hw,
+            &mut physical_hw,
+            &capacities,
+        )?);
+    } else {
+        let data = transform_template(data_template.as_deref().ok_or(FsError::Unsupported)?)?;
+        let meta = transform_template(meta_template.as_deref().ok_or(FsError::Unsupported)?)?;
+        let data_chunk = reserve_growth_chunk(&data, logical_hw, &mut physical_hw, &capacities)?;
+        logical_hw = logical_hw
+            .checked_add(data_chunk.length)
+            .ok_or(FsError::InvalidData)?;
+        chunks.push(data_chunk);
+        chunks.push(reserve_growth_chunk(
+            &meta,
+            logical_hw,
+            &mut physical_hw,
+            &capacities,
+        )?);
     }
-    let new_logical = logical_hw;
+    logical_hw = chunks
+        .last()
+        .map(|chunk| chunk.logical + chunk.length)
+        .ok_or(FsError::InvalidData)?;
+    let system_template =
+        transform_template(system_template.as_deref().ok_or(FsError::Unsupported)?)?;
+    let (system_chunk, added_system_chunk) =
+        match reserve_growth_chunk(&system_template, logical_hw, &mut physical_hw, &capacities) {
+            Ok(chunk) => {
+                chunks.push(chunk.clone());
+                (chunk, true)
+            }
+            Err(FsError::NoSpace) if profiles.is_none() => {
+                // Small single-device filesystems can lack room for another
+                // physical SYSTEM extent while the existing SYSTEM block group
+                // still has logical free space. Linux reuses that space.
+                let old = old_chunks
+                    .iter()
+                    .find(|chunk| chunk.flags & format::BLOCK_GROUP_SYSTEM != 0)
+                    .cloned()
+                    .ok_or(FsError::NoSpace)?;
+                (old, false)
+            }
+            Err(error) => return Err(error),
+        };
+
+    // Reserve replacement physical extents after the safety chunks. Linux
+    // similarly keeps an allocatable group aside before relocating the only
+    // group of an allocation class.
+    let mut considered = 0u64;
+    let mut relocations = Vec::new();
+    if let Some(targets) = profiles {
+        for old in &old_chunks {
+            let requested = balance_target(old.flags, targets)?;
+            let has_evacuated = evacuate.is_some_and(|devid| {
+                let num = crate::format::le16(&old.item, 44).unwrap_or(0) as usize;
+                (0..num).any(|stripe| le64(&old.item, 48 + stripe * 32).ok() == Some(devid))
+            });
+            if requested.is_none() && !has_evacuated {
+                continue;
+            }
+            considered += 1;
+            let target_profile = requested.unwrap_or(profile_from_flags(old.flags)?);
+            if !has_evacuated && target_profile == profile_from_flags(old.flags)? {
+                continue;
+            }
+            let new = if requested.is_none() {
+                reserve_evacuated_chunk(
+                    old,
+                    evacuate.ok_or(FsError::InvalidData)?,
+                    &eligible_members,
+                    &mut physical_hw,
+                    &capacities,
+                )?
+            } else if is_linear_mirror_profile(profile_from_flags(old.flags)?)
+                && is_linear_mirror_profile(target_profile)
+            {
+                reserve_linear_conversion(
+                    old,
+                    target_profile,
+                    &eligible_members,
+                    &mut physical_hw,
+                    &capacities,
+                )?
+            } else {
+                let template =
+                    chunk_profile_template(&old.item, target_profile, &eligible_members)?;
+                reserve_relocated_chunk(
+                    &template,
+                    old.logical,
+                    old.length,
+                    &mut physical_hw,
+                    &capacities,
+                )?
+            };
+            relocations.push(ChunkRelocation {
+                old: old.clone(),
+                new,
+            });
+        }
+    }
+    if profiles.is_some() && relocations.is_empty() {
+        return Ok(BalanceStats {
+            considered,
+            converted: 0,
+        });
+    }
+    for relocation in &relocations {
+        copy_chunk_to_relocation(vol, relocation).await?;
+    }
+    let meta_chunk = chunks
+        .iter()
+        .find(|chunk| chunk.flags & format::BLOCK_GROUP_METADATA != 0)
+        .ok_or(FsError::InvalidData)?
+        .clone();
     let gen = sb.generation + 1;
     let nodesize = vol.nodesize() as u64;
     let ns = vol.nodesize();
 
-    // System-chunk arena for the new chunk-tree blocks: past the highest live
-    // metadata block already in the system group.
-    let (sys_start, sys_len) =
-        block_group_of(&ext_base0, old_chunk)?.ok_or(FsError::InvalidData)?;
-    let mut sys_hw = sys_start;
-    for i in 0..nritems(&ext_base0)? as usize {
-        let k = leaf_item_key(&ext_base0, i)?;
-        if k.item_type == format::METADATA_ITEM_KEY
-            && k.objectid >= sys_start
-            && k.objectid < sys_start + sys_len
-        {
-            sys_hw = sys_hw.max(k.objectid + nodesize);
+    let (sys_hw, sys_limit) = if added_system_chunk {
+        (
+            system_chunk.logical,
+            system_chunk.logical + system_chunk.length,
+        )
+    } else {
+        let mut arena = None;
+        for slot in 0..nritems(&fst_base0)? as usize {
+            let key = leaf_item_key(&fst_base0, slot)?;
+            if key.item_type == format::FREE_SPACE_EXTENT_KEY
+                && key.objectid >= system_chunk.logical
+                && key.objectid < system_chunk.logical + system_chunk.length
+            {
+                arena = Some((key.objectid, key.objectid.saturating_add(key.offset)));
+                break;
+            }
         }
-    }
-    let sys_limit = sys_start + sys_len;
-    let new_limit = new_logical + chunk_size;
+        arena.ok_or(FsError::NoSpace)?
+    };
+    let new_limit = meta_chunk.logical + meta_chunk.length;
 
-    // ── Chunk tree: new CHUNK_ITEM + bump the DEV_ITEM's bytes_used ─────
-    let mut chunk_item = template.clone();
-    chunk_item[0..8].copy_from_slice(&chunk_size.to_le_bytes()); // length
-    chunk_item[56..64].copy_from_slice(&new_physical.to_le_bytes()); // stripe 0 physical
-    leaf_insert_sorted(
-        &mut chunk_logical,
-        &BtrfsKey::new(
+    // ── Chunk tree + device tree: record every chunk/physical stripe ───
+    for relocation in &relocations {
+        let key = BtrfsKey::new(
             format::FIRST_CHUNK_TREE_OBJECTID,
             format::CHUNK_ITEM_KEY,
-            new_logical,
-        ),
-        &chunk_item,
-    )?;
-    let di_slot = leaf_find(
-        &chunk_logical,
-        &BtrfsKey::new(format::DEV_ITEMS_OBJECTID, format::DEV_ITEM_KEY, 1),
-    )?
-    .ok_or(FsError::InvalidData)?;
-    let mut dev_item = leaf_item_data(&chunk_logical, di_slot)?.to_vec();
-    let dev_used = le64(&dev_item, 16)? + chunk_size;
-    dev_item[16..24].copy_from_slice(&dev_used.to_le_bytes());
-    leaf_replace_inplace(&mut chunk_logical, di_slot, &dev_item)?;
+            relocation.old.logical,
+        );
+        let slot = leaf_find(&chunk_logical, &key)?.ok_or(FsError::NotFound)?;
+        leaf_delete(&mut chunk_logical, slot)?;
+        leaf_insert_sorted(&mut chunk_logical, &key, &relocation.new.item)?;
+    }
 
-    // ── Device tree: new DEV_EXTENT for the physical range ─────────────
-    let mut dev_extent = alloc::vec![0u8; 48];
-    dev_extent[0..8].copy_from_slice(&format::CHUNK_TREE_OBJECTID.to_le_bytes());
-    dev_extent[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
-    dev_extent[16..24].copy_from_slice(&new_logical.to_le_bytes());
-    dev_extent[24..32].copy_from_slice(&chunk_size.to_le_bytes());
-    dev_extent[32..48].copy_from_slice(&chunk_tree_uuid);
-    leaf_insert_sorted(
-        &mut dev_logical,
-        &BtrfsKey::new(
-            format::DEV_ITEMS_OBJECTID,
-            format::DEV_EXTENT_KEY,
-            new_physical,
-        ),
-        &dev_extent,
-    )?;
+    // Drop the old physical allocations for relocated chunks. Their bytes stay
+    // untouched until after the superblock flip, providing the previous
+    // generation's crash-consistent fallback.
+    let relocated_logicals: Vec<u64> = relocations.iter().map(|r| r.old.logical).collect();
+    let mut old_dev_slots = Vec::new();
+    for slot in 0..nritems(&dev_logical)? as usize {
+        let key = leaf_item_key(&dev_logical, slot)?;
+        if key.item_type == format::DEV_EXTENT_KEY {
+            let body = leaf_item_data(&dev_logical, slot)?;
+            if relocated_logicals.contains(&le64(body, 16)?) {
+                old_dev_slots.push(slot);
+            }
+        }
+    }
+    for slot in old_dev_slots.into_iter().rev() {
+        leaf_delete(&mut dev_logical, slot)?;
+    }
 
-    // ── Extent tree base: add the new BLOCK_GROUP_ITEM (used charged later) ─
+    let mut stale_slots = Vec::new();
+    for slot in 0..nritems(&chunk_logical)? as usize {
+        let key = leaf_item_key(&chunk_logical, slot)?;
+        if key.objectid == format::DEV_ITEMS_OBJECTID
+            && key.item_type == format::DEV_ITEM_KEY
+            && !member_items.contains_key(&key.offset)
+        {
+            stale_slots.push(slot);
+        }
+    }
+    for slot in stale_slots.into_iter().rev() {
+        leaf_delete(&mut chunk_logical, slot)?;
+    }
+    let mut dev_used: BTreeMap<u64, u64> = member_items
+        .keys()
+        .copied()
+        .map(|devid| (devid, 0))
+        .collect();
+    for (&devid, item) in &member_items {
+        let key = BtrfsKey::new(format::DEV_ITEMS_OBJECTID, format::DEV_ITEM_KEY, devid);
+        if leaf_find(&chunk_logical, &key)?.is_none() {
+            leaf_insert_sorted(&mut chunk_logical, &key, item)?;
+        }
+    }
+    for slot in 0..nritems(&dev_logical)? as usize {
+        let key = leaf_item_key(&dev_logical, slot)?;
+        if key.item_type == format::DEV_EXTENT_KEY {
+            let length = le64(leaf_item_data(&dev_logical, slot)?, 24)?;
+            let used = dev_used
+                .get_mut(&key.objectid)
+                .ok_or(FsError::InvalidData)?;
+            *used = used.checked_add(length).ok_or(FsError::InvalidData)?;
+        }
+    }
+    for chunk in chunks
+        .iter()
+        .chain(relocations.iter().map(|relocation| &relocation.new))
+    {
+        if !relocated_logicals.contains(&chunk.logical) {
+            leaf_insert_sorted(
+                &mut chunk_logical,
+                &BtrfsKey::new(
+                    format::FIRST_CHUNK_TREE_OBJECTID,
+                    format::CHUNK_ITEM_KEY,
+                    chunk.logical,
+                ),
+                &chunk.item,
+            )?;
+        }
+        let num = usize::from(crate::format::le16(&chunk.item, 44)?);
+        for stripe in 0..num {
+            let at = 48 + stripe * 32;
+            let devid = le64(&chunk.item, at)?;
+            let physical = le64(&chunk.item, at + 8)?;
+            let used = dev_used.get_mut(&devid).ok_or(FsError::InvalidData)?;
+            *used = used
+                .checked_add(chunk.stripe_extent_len)
+                .ok_or(FsError::InvalidData)?;
+
+            let mut dev_extent = alloc::vec![0u8; 48];
+            dev_extent[0..8].copy_from_slice(&format::CHUNK_TREE_OBJECTID.to_le_bytes());
+            dev_extent[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
+            dev_extent[16..24].copy_from_slice(&chunk.logical.to_le_bytes());
+            dev_extent[24..32].copy_from_slice(&chunk.stripe_extent_len.to_le_bytes());
+            dev_extent[32..48].copy_from_slice(&chunk_tree_uuid);
+            leaf_insert_sorted(
+                &mut dev_logical,
+                &BtrfsKey::new(devid, format::DEV_EXTENT_KEY, physical),
+                &dev_extent,
+            )?;
+        }
+    }
+    for (&devid, &used) in &dev_used {
+        let slot = leaf_find(
+            &chunk_logical,
+            &BtrfsKey::new(format::DEV_ITEMS_OBJECTID, format::DEV_ITEM_KEY, devid),
+        )?
+        .ok_or(FsError::InvalidData)?;
+        let mut item = leaf_item_data(&chunk_logical, slot)?.to_vec();
+        item[16..24].copy_from_slice(&used.to_le_bytes());
+        leaf_replace_inplace(&mut chunk_logical, slot, &item)?;
+    }
+
+    // ── Extent/free-space bases: create each logical block group ───────
     let mut ext_base = ext_base0;
-    let mut bg = alloc::vec![0u8; 24];
-    bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes()); // chunk_objectid
-    bg[16..24]
-        .copy_from_slice(&(format::BLOCK_GROUP_DATA | format::BLOCK_GROUP_METADATA).to_le_bytes());
-    leaf_insert_sorted(
-        &mut ext_base,
-        &BtrfsKey::new(new_logical, format::BLOCK_GROUP_ITEM_KEY, chunk_size),
-        &bg,
-    )?;
-
-    // ── Free-space tree base: FREE_SPACE_INFO for the new group ────────
     let mut fst_base = fst_base0;
-    let mut info = alloc::vec![0u8; 8];
-    info[0..4].copy_from_slice(&1u32.to_le_bytes()); // extent_count (one free run)
-    leaf_insert_sorted(
-        &mut fst_base,
-        &BtrfsKey::new(new_logical, format::FREE_SPACE_INFO_KEY, chunk_size),
-        &info,
-    )?;
+    for relocation in &relocations {
+        let key = BtrfsKey::new(
+            relocation.old.logical,
+            format::BLOCK_GROUP_ITEM_KEY,
+            relocation.old.length,
+        );
+        let slot = leaf_find(&ext_base, &key)?.ok_or(FsError::NotFound)?;
+        let mut body = leaf_item_data(&ext_base, slot)?.to_vec();
+        if body.len() < 24 {
+            return Err(FsError::InvalidData);
+        }
+        body[16..24].copy_from_slice(&relocation.new.flags.to_le_bytes());
+        leaf_replace_inplace(&mut ext_base, slot, &body)?;
+    }
+    for chunk in &chunks {
+        let mut bg = alloc::vec![0u8; 24];
+        bg[8..16].copy_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
+        bg[16..24].copy_from_slice(&chunk.flags.to_le_bytes());
+        leaf_insert_sorted(
+            &mut ext_base,
+            &BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
+            &bg,
+        )?;
+        let mut info = alloc::vec![0u8; 8];
+        info[0..4].copy_from_slice(&1u32.to_le_bytes());
+        leaf_insert_sorted(
+            &mut fst_base,
+            &BtrfsKey::new(chunk.logical, format::FREE_SPACE_INFO_KEY, chunk.length),
+            &info,
+        )?;
+    }
 
     // Fixed groupings: chunk/dev content and the root tree's size are settled.
     let chunk_groups = group_items(vol, &chunk_logical)?;
@@ -6486,7 +7309,7 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
 
     for _ in 0..8 {
         let mut sc = sys_hw;
-        let mut nc = new_logical;
+        let mut nc = meta_chunk.logical;
         let chunk_addrs = take_nodes(&mut sc, sys_limit, chunk_nc, nodesize)?;
         let dev_addrs = take_nodes(&mut nc, new_limit, dev_nc, nodesize)?;
         let ext_addrs = take_nodes(
@@ -6502,7 +7325,7 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
             fst_leaves + usize::from(fst_leaves > 1),
             nodesize,
         )?;
-        // The new group's used prefix = every new block placed in the new chunk.
+        // The metadata group's used prefix is every non-chunk-tree block.
         let newbg_used = (dev_addrs.len() + ext_addrs.len() + root_addrs.len() + fst_addrs.len())
             as u64
             * nodesize;
@@ -6563,31 +7386,42 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
         }
         let ext_groups = group_items(vol, &ext_final)?;
 
-        // Free-space tree: the new group's free run, the carved system blocks,
-        // and every freed old block returned to its group.
+        // Free-space tree: full DATA groups, the METADATA group's remaining
+        // suffix, carved system blocks, and every freed old block.
         let mut fst_final = fst_base.clone();
-        leaf_insert_sorted(
-            &mut fst_final,
-            &BtrfsKey::new(
-                new_logical + newbg_used,
-                format::FREE_SPACE_EXTENT_KEY,
-                chunk_size - newbg_used,
-            ),
-            &[],
-        )?;
-        for &a in &chunk_addrs {
-            fst_mark_used(
+        for chunk in &chunks {
+            let used = if chunk.logical == meta_chunk.logical {
+                newbg_used
+            } else if chunk.logical == system_chunk.logical {
+                chunk_addrs.len() as u64 * nodesize
+            } else {
+                0
+            };
+            leaf_insert_sorted(
                 &mut fst_final,
-                vol.sectorsize() as u64,
-                sys_start,
-                sys_len,
-                a,
-                nodesize,
+                &BtrfsKey::new(
+                    chunk.logical + used,
+                    format::FREE_SPACE_EXTENT_KEY,
+                    chunk.length.checked_sub(used).ok_or(FsError::NoSpace)?,
+                ),
+                &[],
             )?;
         }
         for &(blk, _) in &freed_meta {
             let (s, l) = block_group_of(&ext_final, blk)?.ok_or(FsError::InvalidData)?;
             fst_mark_free(&mut fst_final, vol.sectorsize() as u64, s, l, blk, nodesize)?;
+        }
+        if !added_system_chunk {
+            for &addr in &chunk_addrs {
+                fst_mark_used(
+                    &mut fst_final,
+                    vol.sectorsize() as u64,
+                    system_chunk.logical,
+                    system_chunk.length,
+                    addr,
+                    nodesize,
+                )?;
+            }
         }
         let fst_groups = group_items(vol, &fst_final)?;
 
@@ -6661,7 +7495,9 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
     nodes.extend(pack_tree_at(vol, &fst_final, &fst_groups, &fst_addrs, gen)?.0);
 
-    vol.add_chunk_mapping(new_logical, chunk_size, 1, new_physical);
+    for chunk in &chunks {
+        vol.add_chunk_item_mapping(chunk.logical, &chunk.item)?;
+    }
     for (addr, buf) in &nodes {
         vol.write_logical(*addr, buf).await?;
     }
@@ -6672,12 +7508,83 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root
     raw[88..96].copy_from_slice(&chunk_root_addr.to_le_bytes()); // chunk_root
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes()); // bytes_used
+    let total_bytes = member_items.values().try_fold(0u64, |total, item| {
+        total
+            .checked_add(le64(item, 8)?)
+            .ok_or(FsError::InvalidData)
+    })?;
+    raw[112..120].copy_from_slice(&total_bytes.to_le_bytes());
+    raw[136..144].copy_from_slice(&(member_items.len() as u64).to_le_bytes());
     raw[164..172].copy_from_slice(&gen.to_le_bytes()); // chunk_root_generation
-                                                       // Embedded dev_item.bytes_used (dev_item@201, bytes_used@+16).
-    raw[217..225].copy_from_slice(&dev_used.to_le_bytes());
+    let incompat_add = if chunks
+        .iter()
+        .chain(relocations.iter().map(|relocation| &relocation.new))
+        .any(|chunk| chunk.flags & (format::BLOCK_GROUP_RAID1C3 | format::BLOCK_GROUP_RAID1C4) != 0)
+    {
+        format::INCOMPAT_RAID1C34
+    } else {
+        0
+    };
+    let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | incompat_add;
+    raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
+        .copy_from_slice(&incompat.to_le_bytes());
+    let mut sys_record = Vec::with_capacity(format::DISK_KEY_SIZE + system_chunk.item.len());
+    sys_record.extend_from_slice(&format::FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
+    sys_record.push(format::CHUNK_ITEM_KEY);
+    sys_record.extend_from_slice(&system_chunk.logical.to_le_bytes());
+    sys_record.extend_from_slice(&system_chunk.item);
+    let mut sys_array = Vec::new();
+    let mut pos = 0usize;
+    while pos < sb.sys_chunk_array.len() {
+        let key = BtrfsKey::decode(&sb.sys_chunk_array, pos)?;
+        let chunk_at = pos + format::DISK_KEY_SIZE;
+        let num = usize::from(crate::format::le16(&sb.sys_chunk_array, chunk_at + 44)?);
+        let end = chunk_at
+            .checked_add(48 + num * 32)
+            .filter(|end| *end <= sb.sys_chunk_array.len())
+            .ok_or(FsError::InvalidData)?;
+        if let Some(relocation) = relocations
+            .iter()
+            .find(|relocation| relocation.old.logical == key.offset)
+        {
+            sys_array.extend_from_slice(&sb.sys_chunk_array[pos..chunk_at]);
+            sys_array.extend_from_slice(&relocation.new.item);
+        } else {
+            sys_array.extend_from_slice(&sb.sys_chunk_array[pos..end]);
+        }
+        pos = end;
+    }
+    if added_system_chunk {
+        sys_array.extend_from_slice(&sys_record);
+    }
+    let new_sys_len = sys_array
+        .len()
+        .le(&format::SYS_CHUNK_ARRAY_SIZE)
+        .then_some(sys_array.len())
+        .ok_or(FsError::NoSpace)?;
+    raw[format::OFF_SYS_CHUNK_ARRAY_SIZE..format::OFF_SYS_CHUNK_ARRAY_SIZE + 4]
+        .copy_from_slice(&(new_sys_len as u32).to_le_bytes());
+    let sys_at = format::SYS_CHUNK_ARRAY_OFFSET;
+    raw[sys_at..sys_at + format::SYS_CHUNK_ARRAY_SIZE].fill(0);
+    raw[sys_at..sys_at + sys_array.len()].copy_from_slice(&sys_array);
+    vol.set_device_bytes_used(&dev_used)?;
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
     vol.write_superblock(&raw).await?;
-    vol.commit_chunk_root(chunk_root_addr, root_root_addr, gen);
-    Ok(())
+    vol.commit_chunk_root(
+        chunk_root_addr,
+        root_root_addr,
+        gen,
+        total_bytes,
+        member_items.len() as u64,
+        incompat_add,
+    );
+    vol.commit_sys_chunk_array(sys_array)?;
+    for relocation in &relocations {
+        vol.replace_chunk_item_mapping(relocation.new.logical, &relocation.new.item)?;
+    }
+    Ok(BalanceStats {
+        considered,
+        converted: relocations.len() as u64,
+    })
 }

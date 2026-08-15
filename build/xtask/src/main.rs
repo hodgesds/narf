@@ -6953,6 +6953,7 @@ fn aavmf_code_path() -> PathBuf {
         "/usr/share/AAVMF/AAVMF_CODE.fd",
         "/usr/share/AAVMF/AAVMF_CODE.ms.fd",
         "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+        "/usr/share/qemu/edk2-aarch64-code.fd",
         "/usr/share/edk2/aarch64/QEMU_EFI.fd",
         "/usr/share/edk2-armvirt/aarch64/QEMU_EFI.fd",
     ] {
@@ -7042,7 +7043,24 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&image);
     let file =
         std::fs::File::create(&image).with_context(|| format!("creating {}", image.display()))?;
-    file.set_len(256 * 1024 * 1024)
+    const MIB: u64 = 1024 * 1024;
+    const ESP_MIN_BYTES: u64 = 64 * MIB;
+    const ESP_HEADROOM_BYTES: u64 = 32 * MIB;
+    const ESP_ALIGNMENT_BYTES: u64 = 16 * MIB;
+    let payload_bytes = std::fs::metadata(&loader)?
+        .len()
+        .checked_add(std::fs::metadata(&staged_kernel)?.len())
+        .ok_or_else(|| anyhow!("aarch64 EFI payload size overflow"))?;
+    let required_bytes = payload_bytes
+        .checked_add(ESP_HEADROOM_BYTES)
+        .ok_or_else(|| anyhow!("aarch64 EFI payload size overflow"))?;
+    let image_bytes = required_bytes
+        .checked_add(ESP_ALIGNMENT_BYTES - 1)
+        .ok_or_else(|| anyhow!("aarch64 EFI image size overflow"))?
+        / ESP_ALIGNMENT_BYTES
+        * ESP_ALIGNMENT_BYTES;
+    let image_bytes = image_bytes.max(ESP_MIN_BYTES);
+    file.set_len(image_bytes)
         .with_context(|| format!("sizing {}", image.display()))?;
 
     run_checked(
@@ -7077,7 +7095,11 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
         ]),
         "copying aarch64 kernel",
     )?;
-    println!("xtask image: wrote {}", image.display());
+    println!(
+        "xtask image: wrote {} ({} MiB ESP)",
+        image.display(),
+        image_bytes / MIB
+    );
     Ok(image)
 }
 

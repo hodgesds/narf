@@ -122,7 +122,8 @@ see [`docs/PERSONAS.md`](docs/PERSONAS.md).
 - `time/` — NTP/PTP userspace hooks, leap-second smear.
 - `block/` — Multi-queue dispatch, discard/TRIM, write-zeroes, NVMe backing.
 - `filesystem/` — virtiofs, persistent block filesystems including ext2 and
-  single-device btrfs, unified page cache, and devpts.
+  btrfs (SINGLE/DUP plus RAID0/1/1C3/1C4/10/5/6, profile-aware growth, device
+  lifecycle, and balance conversion), unified page cache, and devpts.
 - `scheduler/` — CPU take-offline for suspend/resume, SMT-aware placement, deadline class.
 - `rcu/` — batched reclamation tuning, per-domain pacing, NUMA-aware queues, expanded consumers.
 - `net/` — Userspace stack-daemon attach protocol, Admin cap flow, hardware-NIC integration via `drivers/net/`,

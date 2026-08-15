@@ -22,10 +22,13 @@ narf-driver-runtime = { path = "../../runtime" }
 narf-filesystem = { path = "../../../filesystem" }
 narf-init = { path = "../../../init" }
 narf-io = { path = "../../../io" }
-narf-kernel-test = { path = "../../../verification/kernel-test" }
+narf-kernel-test = { path = "../../../verification/kernel-test", optional = true }
 narf-lib = { path = "../../../lib" }
 narf-memory = { path = "../../../memory" }
 narf-scheduler = { path = "../../../scheduler" }
+
+[features]
+kernel-test = ["dep:narf-kernel-test"]
 
 [lints]
 workspace = true

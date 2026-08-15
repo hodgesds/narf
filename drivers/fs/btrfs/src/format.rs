@@ -154,8 +154,14 @@ pub const FT_XATTR: u8 = 8;
 pub const BLOCK_GROUP_DATA: u64 = 1 << 0;
 pub const BLOCK_GROUP_SYSTEM: u64 = 1 << 1;
 pub const BLOCK_GROUP_METADATA: u64 = 1 << 2;
-/// Profile bits we support: SINGLE (no profile bit) and DUP.
+pub const BLOCK_GROUP_RAID0: u64 = 1 << 3;
+pub const BLOCK_GROUP_RAID1: u64 = 1 << 4;
 pub const BLOCK_GROUP_DUP: u64 = 1 << 5;
+pub const BLOCK_GROUP_RAID10: u64 = 1 << 6;
+pub const BLOCK_GROUP_RAID5: u64 = 1 << 7;
+pub const BLOCK_GROUP_RAID6: u64 = 1 << 8;
+pub const BLOCK_GROUP_RAID1C3: u64 = 1 << 9;
+pub const BLOCK_GROUP_RAID1C4: u64 = 1 << 10;
 /// All RAID/DUP profile bits (`BTRFS_BLOCK_GROUP_PROFILE_MASK`): RAID0(3),
 /// RAID1(4), DUP(5), RAID10(6), RAID5(7), RAID6(8), RAID1C3(9), RAID1C4(10).
 /// A chunk whose masked profile is neither 0 (SINGLE) nor exactly DUP is
@@ -238,12 +244,19 @@ const OFF_BYTES_USED: usize = 120;
 const OFF_NUM_DEVICES: usize = 136;
 const OFF_SECTORSIZE: usize = 144;
 const OFF_NODESIZE: usize = 148;
-const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
+pub(crate) const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
 pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
 const OFF_ROOT_LEVEL: usize = 198;
 const OFF_CHUNK_ROOT_LEVEL: usize = 199;
+const OFF_FSID: usize = 32;
+/// Embedded member-specific `struct btrfs_dev_item` in each superblock.
+pub const SUPERBLOCK_DEV_ITEM_OFFSET: usize = 201;
+pub const SUPERBLOCK_DEV_ITEM_SIZE: usize = 98;
+const OFF_DEV_ITEM: usize = SUPERBLOCK_DEV_ITEM_OFFSET;
+const DEV_ITEM_UUID: usize = 66;
+const DEV_ITEM_FSID: usize = 82;
 
 // Features whose on-disk shapes are understood by this driver. Read-only
 // compatibility bits are not safe to ignore here because this implementation
@@ -260,9 +273,13 @@ pub const INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
 pub const INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
 pub const INCOMPAT_BIG_METADATA: u64 = 1 << 5;
 pub const INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
+/// Required when any RAID5/RAID6 block group exists.
+pub const INCOMPAT_RAID56: u64 = 1 << 7;
 pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
 pub const INCOMPAT_NO_HOLES: u64 = 1 << 9;
 pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+/// Required when any three- or four-copy RAID1 block group exists.
+pub const INCOMPAT_RAID1C34: u64 = 1 << 11;
 /// Extents allocated while simple quotas are active carry a permanent owner
 /// reference. Linux deliberately leaves this bit set after quotas are disabled.
 pub const INCOMPAT_SIMPLE_QUOTA: u64 = 1 << 16;
@@ -273,9 +290,11 @@ pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
     | INCOMPAT_COMPRESS_ZSTD
     | INCOMPAT_BIG_METADATA
     | INCOMPAT_EXTENDED_IREF
+    | INCOMPAT_RAID56
     | INCOMPAT_SKINNY_METADATA
     | INCOMPAT_NO_HOLES
     | INCOMPAT_METADATA_UUID
+    | INCOMPAT_RAID1C34
     | INCOMPAT_SIMPLE_QUOTA;
 
 /// Decoded btrfs superblock — only the fields the driver consumes.
@@ -283,6 +302,10 @@ pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
 pub struct Superblock {
     /// Stored block checksum (the algorithm determines how many bytes are used).
     pub csum: [u8; CSUM_SIZE],
+    pub fsid: [u8; 16],
+    pub devid: u64,
+    pub device_total_bytes: u64,
+    pub dev_uuid: [u8; 16],
     pub magic: u64,
     pub generation: u64,
     /// Logical address of the root-tree root node.
@@ -330,8 +353,8 @@ impl Superblock {
             return Err(FsError::Unsupported);
         }
         let num_devices = le64(buf, OFF_NUM_DEVICES)?;
-        if num_devices != 1 {
-            return Err(FsError::Unsupported);
+        if num_devices == 0 {
+            return Err(FsError::InvalidData);
         }
         let sectorsize = le32(buf, OFF_SECTORSIZE)?;
         let nodesize = le32(buf, OFF_NODESIZE)?;
@@ -356,6 +379,25 @@ impl Superblock {
 
         let mut csum = [0u8; CSUM_SIZE];
         csum.copy_from_slice(&buf[OFF_CSUM..OFF_CSUM + CSUM_SIZE]);
+        let mut fsid = [0u8; 16];
+        fsid.copy_from_slice(
+            buf.get(OFF_FSID..OFF_FSID + 16)
+                .ok_or(FsError::InvalidData)?,
+        );
+        let devid = le64(buf, OFF_DEV_ITEM)?;
+        if devid == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let mut dev_uuid = [0u8; 16];
+        dev_uuid.copy_from_slice(
+            buf.get(OFF_DEV_ITEM + DEV_ITEM_UUID..OFF_DEV_ITEM + DEV_ITEM_UUID + 16)
+                .ok_or(FsError::InvalidData)?,
+        );
+        if buf.get(OFF_DEV_ITEM + DEV_ITEM_FSID..OFF_DEV_ITEM + DEV_ITEM_FSID + 16)
+            != Some(fsid.as_slice())
+        {
+            return Err(FsError::InvalidData);
+        }
 
         let compat_ro_flags = le64(buf, OFF_COMPAT_RO_FLAGS)?;
         let incompat_flags = le64(buf, OFF_INCOMPAT_FLAGS)?;
@@ -367,6 +409,10 @@ impl Superblock {
 
         Ok(Superblock {
             csum,
+            fsid,
+            devid,
+            device_total_bytes: le64(buf, OFF_DEV_ITEM + 8)?,
+            dev_uuid,
             magic,
             generation: le64(buf, OFF_GENERATION)?,
             root: le64(buf, OFF_ROOT)?,

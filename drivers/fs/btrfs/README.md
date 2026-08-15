@@ -1,9 +1,11 @@
 # narf-drivers-fs-btrfs
 
-A clean-room, read-write btrfs driver for single-device filesystems. It supports
-Linux-interoperable COW file and namespace mutations, all four checksum types,
-compressed reads, writable subvolumes, native subvolume/snapshot ioctls, and
-both full and simple qgroup quota modes.
+A clean-room, read-write btrfs driver for single- and multi-device filesystems.
+It supports Linux-interoperable COW file and namespace mutations, all four
+checksum types, compressed reads, SINGLE/DUP and RAID0/1/1C3/1C4/10/5/6
+profiles, profile-aware growth, typed device lifecycle and balance conversion,
+writable subvolumes, native subvolume/snapshot ioctls, and both full and simple
+qgroup quota modes.
 On-disk structures follow Linux's `include/uapi/linux/btrfs_tree.h` definitions;
 no C code is copied.
 
@@ -15,9 +17,18 @@ real laptop's btrfs root looks like.
 
 ## Supported
 
-- Single-device volumes, **SINGLE** and **DUP** chunk profiles. Both DUP copies
-  are retained: metadata and checksummed data retry the second stripe after an
-  I/O error or checksum failure.
+- Single- and multi-device volumes with **SINGLE, DUP, RAID0, RAID1, RAID1C3,
+  RAID1C4, RAID10, RAID5, and RAID6** chunks. Mount assembles members by FSID and devid from the
+  block registry (or an explicit device list), routes every stripe by devid,
+  and rejects duplicate or inconsistent member geometry. Mirrored and parity
+  profiles retry after I/O or checksum failure; degraded arrays are read-only.
+- Typed `BtrfsVolume` administration supports member add, allocated or unused
+  member removal, allocated-range device replacement, and synchronous
+  DATA/METADATA/SYSTEM profile conversion. Removal first evacuates every stripe
+  from the target while retaining each block group's profile. Balance preserves
+  logical addresses, copies bytes to fresh physical stripes, regenerates RAID56
+  parity, and atomically advances `CHUNK_ITEM`, `DEV_EXTENT`, block-group flags,
+  device accounting, system-chunk array, tree roots, and member superblocks.
 - Power-of-two filesystem sectors and metadata nodes from **4 KiB through
   64 KiB**, independent of the backing device's 512-byte/4-KiB logical block
   size. Allocation, partial I/O and CSUM widths follow the mounted sectorsize.
@@ -141,10 +152,13 @@ real laptop's btrfs root looks like.
 Each is rejected with a precise `Unsupported` / `NotFound` / `NoSpace` rather
 than mis-read:
 
-- RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
-  `num_devices != 1`.
-- Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
-  RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
+- Linux `BTRFS_IOC_{ADD,RM,DEV_REPLACE,BALANCE}` UAPI dispatch, balance
+  filters/progress/pause/cancel, seed devices, and device resize. The typed
+  administration API is synchronous and whole-allocation-class; it returns
+  `Busy` when the remaining member count cannot preserve a profile and
+  `NoSpace` when no crash-safe destination extents fit.
+- Unknown or unsupported incompat/compat-ro feature flags (including zoned,
+  extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
   child explicitly to write it).
 - A symlink target larger than Linux's inline item bound (Btrfs has no regular-
@@ -198,6 +212,17 @@ writes → btrfs check "no error found" → both files read back`). Per write it
    changed FS/CSUM/EXTENT/FREE_SPACE/QUOTA `ROOT_ITEM`s and generations;
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
+For a complete multi-device volume, logical writes stripe across RAID0, update
+every RAID1/1C3/1C4/10 mirror, and read-modify-write P/Q for RAID5/6 using Linux's
+GF(2^8) coefficient order. A commit writes every superblock mirror on every
+member, preserving the member-specific embedded `DEV_ITEM`; an incomplete or
+generation-inconsistent member set stays read-only. Degraded reads tolerate one
+missing member for RAID1/5, one missing member per RAID10 mirror group, and two
+for RAID6, with checksum-aware parity reconstruction. As with Linux RAID56
+without a parity journal, a crash during the data/parity update window can leave
+an inconsistent stripe; NARF does not yet implement a write-hole log or the
+newer stripe tree.
+
 **Every tree may be any height**, up to `BTRFS_MAX_LEVEL` (8). The fs and extent
 trees use path COW, rewriting only touched root-to-leaf paths. The smaller csum,
 root, free-space, and enabled quota trees are still read as logical item sets and repacked into
@@ -206,12 +231,15 @@ its own new blocks, so the transaction resolves the mutually-dependent extent
 and whole-repacked tree block counts with a fixed point, reusing the same
 allocation base each round and writing only the converged set.
 
-**Chunk growth** (`write::grow_add_chunk`) allocates one new mixed
-(DATA|METADATA, SINGLE) chunk at the end of the device, threading the change
-through the chunk tree (new `CHUNK_ITEM` + bumped `DEV_ITEM`), device tree (new
-`DEV_EXTENT`), extent tree (new `BLOCK_GROUP_ITEM`), free-space tree, and root
-tree in one COW mini-transaction — so a real kernel mounts the grown image
-read-write with the extra space and `btrfs check` reports it clean. It uses the
+**Profile-aware chunk growth** (`write::grow_add_chunk`) allocates either one
+mixed group or separate DATA and METADATA groups, plus a SYSTEM group when the
+existing SYSTEM arena cannot hold the new chunk-tree nodes. Each new group
+retains its allocation class's existing SINGLE/DUP/RAID profile and exact stripe
+membership. The transaction threads every stripe through the chunk tree
+(new `CHUNK_ITEM` + per-member `DEV_ITEM` accounting), device tree (new
+`DEV_EXTENT`s), extent tree (new `BLOCK_GROUP_ITEM`s), free-space tree, root
+tree, embedded `sys_chunk_array`, and every member superblock — so a real kernel
+mounts the grown image read-write with the extra space. It uses the
 same multi-leaf machinery as `commit_txn`, so it works **even when the
 chunk/dev/extent/root/free-space trees are already multi-leaf** (a large or
 heavily-churned filesystem): the new chunk-tree blocks are placed in the **system
@@ -222,7 +250,8 @@ accounting are charged **per block group**, so ordinary writes work correctly
 across the new chunk boundary once the filesystem spans more than one chunk. Chunk
 growth is **auto-triggered**: when a mutation's allocation runs out of chunk space
 (`NoSpace`), the write path grows the filesystem by a chunk and retries, so writes
-transparently keep succeeding until the device itself is full.
+transparently keep succeeding until one of the required member stripe spans is
+full.
 
 Images with a **free-space tree** (`space_cache=v2`) are supported for writes: the
 free-space tree is maintained in lockstep. A block group tracks its free space in
@@ -239,7 +268,8 @@ yet in the tree, so they stay unavailable until it commits — preserving COW.
 (Without a free-space tree the allocator falls back to appending past the
 extent-tree high-water; freed space is then not reused.)
 
-Mount validates every **superblock copy** that fits, selects the valid copy with
+Mount validates every **superblock copy** that fits on every supplied member,
+selects the valid copy with
 the newest generation (preferring the primary on a tie), and normalizes a
 selected mirror before the next transaction so that commit heals a damaged or
 stale primary. Every copy is then rewritten on each commit: btrfs keeps up to three
@@ -250,7 +280,9 @@ reports a mismatch. `write_superblock` writes each copy that fits within the
 filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
 overlaps chunk data. Images large enough to contain the 64 MiB mirror are
-therefore writable without leaving superblock copies out of sync.
+therefore writable without leaving superblock copies out of sync. On a
+multi-device commit the same common transaction state is written to every
+member while each member retains its own embedded devid, size and UUID fields.
 
 **fsync / tree-log.** Every mutation is a synchronous commit — it flips the
 superblock to a new generation and flushes the device before returning — so a
@@ -331,6 +363,15 @@ deliberately **fragmented** (via a loop mount) so its free space is a
 `FREE_SPACE_BITMAP`; it is also the boot smoke's NVMe image, so host `btrfs check`
 validates the bitmap path end to end. The kernel tests reconstruct the full
 zero-filled image at runtime and mount it under a `RamBlockDevice`.
+`fixture-raid{0,1,1c3,1c4,10,5,6}-N.img.sparse` are genuine 256 MiB
+btrfs-progs 6.17.1 member images with 64 KiB stripes and retained unallocated
+space. Tests assemble each profile, read across stripe boundaries, perform and
+remount COW writes, grow DATA/METADATA/SYSTEM groups, remove each possible
+member, and verify newly-written parity. RAID1C3/1C4 exercise their full
+advertised failure budgets; RAID6 uses RAID6 metadata and exercises every
+two-member omission. Separate lifecycle/balance tests add and replace devices,
+evacuate an allocated member, and convert all RAID1 allocation classes to
+RAID1C3 before healthy and degraded remounts.
 
 Regenerate with `testdata/regen_fixture.sh` (needs `mkfs.btrfs` + `btrfs`).
 Pinned so the layout can't silently drift:
