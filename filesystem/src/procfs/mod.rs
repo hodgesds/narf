@@ -198,6 +198,27 @@ pub fn install_proc_pidns_hooks(
     PID_REPORT_HOOK.store(report as usize, Ordering::Release);
 }
 
+/// Test-only: snapshot the three pid-namespace hook pointers so a test that
+/// installs stubs can restore the real hooks afterward (the procfs tests run in
+/// the same boot where userspace already installed them). Order matches
+/// `install_proc_pidns_hooks`: (current_outer, resolve, report).
+#[doc(hidden)]
+pub fn __test_pidns_hooks_snapshot() -> (usize, usize, usize) {
+    (
+        CURRENT_OUTER_PID_HOOK.load(Ordering::Acquire),
+        PID_RESOLVE_HOOK.load(Ordering::Acquire),
+        PID_REPORT_HOOK.load(Ordering::Acquire),
+    )
+}
+
+/// Test-only: restore hook pointers captured by `__test_pidns_hooks_snapshot`.
+#[doc(hidden)]
+pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize)) {
+    CURRENT_OUTER_PID_HOOK.store(snap.0, Ordering::Release);
+    PID_RESOLVE_HOOK.store(snap.1, Ordering::Release);
+    PID_REPORT_HOOK.store(snap.2, Ordering::Release);
+}
+
 pub(crate) fn current_pid() -> u64 {
     let v = CURRENT_PID_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -235,8 +256,8 @@ pub(crate) fn pid_resolve(n: u64) -> Option<u64> {
 
 /// Translate an outer ProcessId into the current reader's namespace view, or
 /// `None` if the process is invisible there. Falls back to identity (`Some(n)`)
-/// when the hook isn't installed. Backs cgroup.procs listing translation.
-#[cfg(feature = "cgroup")]
+/// when the hook isn't installed. Backs cgroup.procs listing translation and
+/// the `/proc/<pid>/task/<tid>` tid rendering.
 pub(crate) fn pid_report(n: u64) -> Option<u64> {
     let v = PID_REPORT_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -1702,8 +1723,12 @@ impl DirOps for ProcRoot {
             // /proc/thread-self → <pid>/task/<tid>; tid == pid in NARF.
             // Descending gives a ProcTaskTidDir that exposes `comm` etc.
             // Linux ref: `proc_thread_self_get_link` (fs/proc/self.c:80).
+            // Look up by the reader-visible tid (inner in a namespace), not the
+            // outer pid — ProcTaskDir::lookup_dir now matches on visible_tid. (#16)
             let pid = current_outer_pid();
-            return pid_ext::ProcTaskDir { pid }.lookup_dir(&pid.to_string());
+            let dir = pid_ext::ProcTaskDir { pid };
+            let tid = dir.visible_tid();
+            return dir.lookup_dir(&tid.to_string());
         }
         // Registry-backed subdirectory (e.g. "net").
         let snap = lookup_registry(&[name]);

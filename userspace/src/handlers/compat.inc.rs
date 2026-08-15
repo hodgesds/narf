@@ -4708,10 +4708,22 @@ fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
     if tid == linux_tid_for_task(caller) {
         return Some(caller);
     }
-    let is_non_leader_thread =
-        task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
-    if is_non_leader_thread {
-        return Some(tid);
+    // A CLONE_THREAD sibling is a raw TaskId whose thread-group leader lives at
+    // task_to_pid_raw(tid) but is a DIFFERENT task. Its gettid() is that raw
+    // TaskId, so intra-process tkill must accept it directly.
+    if let Some(group_pid) = task_to_pid_raw(tid) {
+        if pid_to_task_raw(group_pid) != Some(tid) {
+            // #26: only accept the raw sibling tid if its thread group is
+            // visible in the CALLER's pid namespace. Without this a container
+            // that passed a raw TaskId numerically matching a HOST (or
+            // sibling-namespace) thread signalled across the boundary. Linux
+            // resolves tkill/tgkill tids via the caller's ns
+            // (kernel/signal.c find_task_by_vpid on the thread's pid).
+            // Identity/visible in the root ns → unchanged there.
+            #[cfg(feature = "container")]
+            crate::pid_ns::ns_visible_inner(caller, group_pid)?;
+            return Some(tid);
+        }
     }
     let pid = accept_pid_from(caller, tid)?;
     Some(pid_to_task_raw(pid).unwrap_or(pid))

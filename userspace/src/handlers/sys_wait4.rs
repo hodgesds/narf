@@ -16,11 +16,21 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // translate inner→outer up front. All downstream matching — including the
     // want_pid stored for the blocking path — then works in outer space, and
     // finish_wait_child / the return sites translate the reaped pid back to the
-    // caller's view. Identity in the root namespace; an unbound inner pid stays
-    // as-is → matches no child → ECHILD (Linux-ish).
+    // caller's view. Identity in the root namespace.
+    //
+    // An inner pid NOT bound in the caller's namespace names no child of this
+    // caller → ECHILD. Keeping the raw inner (the old behaviour) was unsafe: it
+    // could numerically collide with a ROOT-namespace child queued in
+    // PENDING_EXITS at that same outer number and let a container reap a host
+    // process it must not see. Linux: kernel/exit.c do_wait → -ECHILD. (#30)
     if want_pid > 0 {
-        if let Some(outer) = accept_pid_from(parent, want_pid as u64) {
-            want_pid = outer as i64;
+        match accept_pid_from(parent, want_pid as u64) {
+            Some(outer) => want_pid = outer as i64,
+            None => {
+                const ECHILD: i64 = 10;
+                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                return;
+            }
         }
     }
 

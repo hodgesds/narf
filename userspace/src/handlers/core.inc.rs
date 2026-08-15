@@ -6695,6 +6695,16 @@ pub fn __test_stage_pending_exit(parent: u64, child: u64, status: i32) {
     }
 }
 
+/// Drop every staged pending-exit for `parent`. Teardown counterpart to
+/// `__test_stage_pending_exit` for tests whose asserted path (e.g. an ECHILD
+/// early-return) intentionally does NOT reap the entry it staged.
+pub fn __test_clear_pending_exits(parent: u64) {
+    let mut g = PENDING_EXITS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&parent);
+    }
+}
+
 fn parent_of_set(child: u64, parent: u64) {
     let mut g = PARENT_OF.lock();
     if let Some(m) = g.as_mut() {

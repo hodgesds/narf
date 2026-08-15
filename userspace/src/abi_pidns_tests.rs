@@ -654,6 +654,175 @@ kernel_test_in!(
     smoke_abi_pidns_bpf_task_fd_query_self_pid_in_caller_pid_ns
 );
 
+// ── #34 setns rejects a pid reinterpreted as an fd — Linux nsproxy.c (fd-only) ─
+//
+// The removed "legacy TaskId path" resolved setns's arg0 — an fd number — as an
+// outer pid when it wasn't a namespace fd, and joined that process's namespaces
+// with no ns translation. A caller passing a stray integer equal to a
+// namespaced task's outer pid could jump into that task's pid namespace. Linux
+// setns(2) takes only an fd. The fix rejects any non-NsFd target. Discriminator:
+// setns(<victim outer pid>, CLONE_NEWPID) returns -1 and leaves the caller in
+// its own namespace, rather than returning 0 and attaching it to the victim's.
+fn smoke_abi_pidns_setns_rejects_pid_as_fd() -> TestResult {
+    with_setup(|| {
+        const CALLER_TASK: u64 = 0xED00;
+        const CALLER_PID: u64 = 0xED80;
+        const VICT_TASK: u64 = 0xED01;
+        const VICT_PID: u64 = 0xED81;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(CALLER_TASK, CALLER_PID);
+            register(VICT_TASK, VICT_PID);
+            // The victim lives in its own pid namespace.
+            crate::pid_ns::unshare_pid_ns(VICT_TASK, VICT_PID);
+
+            set_task(CALLER_TASK);
+            // target == the victim's OUTER pid, passed where an fd is expected.
+            match call(Syscall::Setns.raw(), a1(VICT_PID, CLONE_NEWPID)) {
+                Some(-1) => {}
+                Some(0) => {
+                    return Err("setns joined a namespace by reinterpreting the fd number as a pid — legacy TaskId path not removed")
+                }
+                _ => return Err("setns(pid-as-fd) returned an unexpected result"),
+            }
+            // The caller must NOT have been attached to the victim's pid ns.
+            if crate::pid_ns::ns_of(CALLER_TASK).is_some() {
+                return Err("setns attached the caller to the victim's pid ns despite returning -1");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[CALLER_TASK, VICT_TASK]);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pidns_setns_rejects_pid_as_fd);
+
+// ── #26 tkill/tgkill non-leader raw-tid arm — Linux signal.c find_task_by_vpid ─
+//
+// A CLONE_THREAD sibling's gettid() is its raw TaskId, so signal_tid_from_user
+// accepts a raw non-leader tid directly. The old code did so WITHOUT any
+// namespace check, letting a container signal a HOST thread whose raw TaskId it
+// happened to name. The fix gates the raw arm on the sibling's thread group
+// being visible in the caller's ns. Discriminator: a root-ns process (leader +
+// one sibling thread) is invisible to a namespaced manager; the manager's
+// tkill of the sibling's raw tid returns ESRCH (fix) rather than delivering
+// (bug). A root-ns caller can still reach the sibling (regression guard).
+fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xEB00;
+        const MANAGER_PID: u64 = 0xEB80;
+        const WORKER_TASK: u64 = 0xEB01;
+        const WORKER_PID: u64 = 0xEB81;
+        const LEADER_TASK: u64 = 0xEC00; // thread-group leader in the ROOT ns
+        const GROUP_PID: u64 = 0xEC80;
+        const SIBLING_TID: u64 = 0xEC01; // non-leader sibling thread of GROUP_PID
+        const SIGTERM: u64 = 15;
+        const ESRCH: i64 = -3;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+            // Root-ns process: leader at GROUP_PID …
+            register(LEADER_TASK, GROUP_PID);
+            // … plus a sibling thread: task_to_pid_raw(SIBLING_TID) == GROUP_PID,
+            // but pid_to_task_raw(GROUP_PID) stays LEADER_TASK (so SIBLING_TID
+            // reads as a non-leader). Only the task→pid direction is registered.
+            crate::task::release_task(SIBLING_TID);
+            let _ = crate::task::Task::new_registered(SIBLING_TID, GROUP_PID);
+            crate::handlers::register_task_to_pid(SIBLING_TID, GROUP_PID);
+
+            // Namespaced manager: the sibling's group is invisible in its ns.
+            set_task(MANAGER_TASK);
+            match call(Syscall::Tkill.raw(), a1(SIBLING_TID, SIGTERM)) {
+                Some(v) if v == ESRCH => {}
+                Some(0) => {
+                    return Err("tkill delivered to a ROOT-ns sibling thread from a namespaced caller — raw non-leader arm not ns-gated")
+                }
+                _ => return Err("tkill(non-leader sibling) returned an unexpected result"),
+            }
+
+            // Regression guard: a root-ns caller still reaches the sibling
+            // (null signal existence probe → 0, not ESRCH).
+            set_task(FAKE_TASK);
+            match call(Syscall::Tkill.raw(), a1(SIBLING_TID, 0)) {
+                Some(0) => Ok(()),
+                _ => Err("ns gate wrongly rejected a root-ns caller signalling the sibling thread"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[
+            MANAGER_TASK, WORKER_TASK, LEADER_TASK, SIBLING_TID,
+        ]);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pidns_tkill_non_leader_ns_gated);
+
+// ── #30 wait4/waitid(P_PID) unbound inner pid → ECHILD — Linux exit.c do_wait ─
+//
+// A specific `want_pid` arriving from a namespaced caller was translated
+// inner→outer, but on a MISS (an inner pid not bound in the caller's ns) the
+// old code kept the RAW inner and let PENDING_EXITS matching proceed. A
+// ROOT-namespace child queued at that same OUTER number was then reaped by the
+// container. The fix returns ECHILD on the miss instead. Discriminator: stage a
+// pending exit for the manager at OUTER pid 3 (a root-ns collision victim) while
+// inner 3 is NOT bound in the manager's ns, then wait for inner 3 — the fix
+// returns ECHILD, the bug reaps the victim (a non-ECHILD result).
+fn smoke_abi_pidns_wait_unbound_inner_echild() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xE900;
+        const MANAGER_PID: u64 = 0xE090;
+        const WORKER_TASK: u64 = 0xE901;
+        const WORKER_PID: u64 = 0xE091;
+        const VICTIM_TASK: u64 = 0xEA00; // root-ns child registered at OUTER pid 3
+        const VICTIM_PID: u64 = 3;
+        const P_PID: u64 = 1;
+        const ECHILD: i64 = -10;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(VICTIM_TASK, VICTIM_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+            // The victim has exited and is queued for reaping under the manager.
+            crate::handlers::__test_stage_pending_exit(MANAGER_TASK, VICTIM_PID, 0);
+
+            set_task(MANAGER_TASK);
+            // wait4(inner 3): inner 3 is unbound in the manager's ns. The bug
+            // reaps the victim and returns report_pid_to(manager, 3) == 0 (the
+            // outer pid 3 is invisible in the manager's ns); the fix ECHILDs.
+            match call(Syscall::Wait4.raw(), a3(3, 0, 0, 0)) {
+                Some(v) if v == ECHILD => {}
+                Some(0) => {
+                    return Err("wait4 reaped a ROOT-ns collision victim for an unbound inner pid — kept the raw inner instead of returning ECHILD")
+                }
+                _ => return Err("wait4(unbound inner) returned an unexpected result"),
+            }
+
+            // waitid(P_PID, inner 3): same miss must be ECHILD before any reap.
+            match call(Syscall::Waitid.raw(), a3(P_PID, 3, 0, 0)) {
+                Some(v) if v == ECHILD => Ok(()),
+                Some(0) => Err("waitid(P_PID, unbound inner) reaped a ROOT-ns collision victim instead of returning ECHILD"),
+                _ => Err("waitid(P_PID, unbound inner) returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::handlers::__test_clear_pending_exits(MANAGER_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK, VICTIM_TASK]);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pidns_wait_unbound_inner_echild);
+
 // ── #13 fork/clone return after CLONE_NEWPID — Linux kernel/fork.c pid_vnr ──
 //
 // fork(2) returns the child's pid IN THE PARENT's namespace (Linux resolves it

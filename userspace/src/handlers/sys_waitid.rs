@@ -30,11 +30,18 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     let want_pid: i64 = match idtype {
         P_ALL => -1,
         // `id` is a pid in the caller's namespace; the reap machinery keys on
-        // the outer ProcessId. Unbound inner pid → keep as-is (matches nothing
-        // → the caller's own child set decides ECHILD). Identity in root ns.
-        P_PID => accept_pid_from(current_task_id(), id as u64)
-            .map(|o| o as i64)
-            .unwrap_or(id),
+        // the outer ProcessId. An inner pid NOT bound in the caller's namespace
+        // names no child of this caller → ECHILD. Keeping the raw inner risked
+        // reaping a ROOT-namespace child at a colliding outer number (#30).
+        // Identity in the root ns.
+        P_PID => match accept_pid_from(current_task_id(), id as u64) {
+            Some(o) => o as i64,
+            None => {
+                const ECHILD: i64 = 10;
+                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                return;
+            }
+        },
         P_PGID => -1,
         // P_PIDFD: `id` is a pidfd; wait on its target process. The error
         // shape is LOAD-BEARING: glibc's `__clone_pidfd_supported()` probes

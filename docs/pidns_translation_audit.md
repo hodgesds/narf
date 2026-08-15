@@ -23,7 +23,7 @@ Idioms to match:
 
 ## Status (updated as findings land)
 
-**LANDED — 24 of 34 findings fixed, every one with a RED-first test:**
+**LANDED — 28 of 34 findings fixed, every one with a RED-first test:**
 
 Core (main tree): #1/#3/#4/#5/#6 pgid family; #2 ptrace; #7 getsid; #8
 kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid stop/cont
@@ -54,27 +54,50 @@ pid for a root-ns parent (fixing `unshare(CLONE_NEWPID)` → parent `waitpid`
 ECHILD) and the child's in-namespace pid for an ordinary container fork
 (unchanged). Tests: `abi_pidns_tests.rs` (both container-gated).
 
+Second follow-up batch: #16 `/proc/<pid>/task/<tid>` now renders the tid via the
+reader's ns (`ProcTaskDir::visible_tid` → `procfs::pid_report`; `/proc/thread-self`
+looks up by the visible tid). #26 the tkill/tgkill raw non-leader-thread arm is
+gated on the sibling's thread group being visible in the caller's ns
+(`signal_tid_from_user`). #30 wait4/waitid(P_PID) return ECHILD on an unbound
+inner pid instead of keeping the raw inner (which could reap a colliding root-ns
+child). #34 setns's non-Linux "legacy TaskId path" (fd number reinterpreted as a
+pid, joining an arbitrary process's namespaces with no translation) is DELETED —
+setns now rejects any non-namespace fd; no caller or test depended on the path.
+Tests: `abi_pidns_tests.rs` (#26/#30/#34) and `procfs/pid_ext.rs` (#16).
+
 **VERIFIED-CORRECT-IN-PRACTICE (no fix needed):** #24 cgroup.threads — the
 write path routes cgroup.procs and cgroup.threads both into `members` via
 `place()`, so `cg.threads` is never populated and the read always hits the
 report_pid mirror-procs branch; the raw-tid branch is dead code.
 
-**DEFERRED (low value / risk, documented — the remaining 9):**
-- #16 /proc/<pid>/task/<tid> names — NARF is single-thread-per-process; task/
-  has one entry. Low impact until real threads land.
-- #25 mq_notify si_pid — POSIX mq, negligible reach.
-- #26 tkill/tgkill non-leader raw-tid arm — needs multi-threaded processes
-  NARF barely has; touching signal_tid_from_user outweighs the payoff.
-- #30 wait4/waitid unbound-inner fallback -> ECHILD — current behaviour is
-  documented-safe except for a numeric-collision sibling; changing it risks
-  the blocking-wait path.
-- #31 NSpid chain, #32 /proc stat tty fields (constant 0), #33 SysV IPC
-  IPC_STAT pids (written 0), #34 setns TaskId fallback (likely dead) — OUT
-  rendering with no live leak / UNSURE reachability.
+**N/A FOR THE FLAT NAMESPACE MODEL (documented, no work possible):**
+- #31 `/proc/<pid>/status` NSpid chain — NARF has a single-level pid-namespace
+  model (`PidNamespace` has ONE inner↔outer map; there is no parent-ns pointer,
+  so a task has exactly one inner pid, not a per-level chain). The single value
+  rendered IS the complete, correct `NSpid:` line for one nesting level. The
+  multi-value chain only exists under nested namespaces NARF cannot form; the
+  same limitation is why fork's nested-unshare case is unrepresentable (see #13).
 
-Net: every finding rated moderate-or-higher is fixed. The remaining deferred
-items are OUT-rendering polish or need machinery NARF lacks (real threads,
-nested namespaces); none has a live leak with a known consumer.
+**DEFERRED — unimplemented FEATURES that write 0/constant today (not a
+translation regression; the translation is pre-wired for when the source data
+lands — the remaining 4):**
+- #25 mq_notify si_pid — no siginfo is stored on mq notification at all, so
+  si_pid is 0; wiring `report_pid_to` needs the notify sigqueue path first.
+  POSIX mq, negligible reach.
+- #29 waitid(P_PGID) / wait4(pid==0 or <-1) pgid filtering — pgid is IGNORED
+  and collapsed to "any child". Real filtering needs the exited child's pgid
+  threaded through PENDING_EXITS AND the async blocking-reap path
+  (`wait_child_want_pid`), which has a history of hang bugs — a feature with
+  real regression risk, not a translation edit.
+- #32 /proc/<pid>/stat tty_nr/tpgid — hardcoded `0 0`; needs a controlling-tty
+  foreground-pgrp source before `pgid_to_user` has anything to translate.
+- #33 SysV IPC IPC_STAT cpid/lpid — the objects don't track creator/last-op
+  pids yet (written 0); `report_pid_to` applies once they do.
+
+Net: every finding rated moderate-or-higher is fixed, plus every bounded
+namespace-translation fix. What remains is one model limitation (#31, N/A) and
+four unimplemented features that currently emit 0/constant with no live
+cross-namespace leak.
 
 ## Findings (severity-ranked)
 
@@ -95,7 +118,7 @@ nested namespaces); none has a live leak with a known consumer.
 | 13 | fork/clone return after `CLONE_NEWPID` | OUT | child | sys_fork.rs:269 | FIXED — return routes through `pid_ns::fork_return_to_parent`: child's outer pid for a root-ns parent (fixes `unshare -fp` → parent `waitpid` ECHILD), child's in-ns pid for a shared-ns fork (unchanged) | fork.c `pid_vnr` in parent's ns | `unshare -fp`, runc/crun init | fixed — `fork_return_to_parent` (the "deliberate coupling" comment only held for a shared ns) |
 | 14 | `waitid` stop/cont `si_pid` | OUT | child | sys_waitid.rs:80 | untranslated (exit arm :113 IS translated) | exit.c `pid_vnr` | `waitid(WUNTRACED)` supervisors, systemd | `report_pid_to(parent, child_pid)` |
 | 15 | `fcntl(F_GETLK)` `l_pid` | OUT | owner | sys_fcntl.rs:161,183 | raw TaskId; no OFD `-1` | locks.c:2321 `locks_translate_pid` | lslocks, flock(1), sqlite | `report_pid_to(caller, task_to_pid_raw(owner))`; `-1` for OFD |
-| 16 | `/proc/<pid>/task/<tid>` names | OUT | tid | procfs/pid_ext.rs:997 | uses outer pid; inner reader sees host number | array.c:213 NSpid | `ps -L`, htop -H, JVM threads | `linux_tid_for_task` per member |
+| 16 | `/proc/<pid>/task/<tid>` names | OUT | tid | procfs/pid_ext.rs | FIXED — `ProcTaskDir::visible_tid` renders/resolves the tid via `procfs::pid_report` (reader ns); `/proc/thread-self` looks up by it | array.c:213 NSpid | `ps -L`, htop -H, JVM threads | fixed — reader-ns tid |
 | 17 | `kill(-1)` broadcast | IN | — | sys_kill.rs:74 | iterates every outer pid globally | signal.c:1591 `task_pid_vnr` visibility | container escape; systemd-shutdown broadcast | filter on ns visibility |
 | 18 | `sched_setparam`/`getparam` | IN | pid | sys_sched_setparam.rs:23 | user pid used directly as key | sched/syscalls.c:217 | chrt(1), systemd `CPUSchedulingPolicy=` | mirror `sched_setaffinity` |
 | 19 | `capset` self-check | IN | pid | sys_capset.rs:35 | compares inner pid vs outer → spurious EPERM | capability.c:115 | libcap `cap_set_proc`, runc | `accept_pid_from` then compare |
@@ -105,15 +128,15 @@ nested namespaces); none has a live leak with a known consumer.
 | 23 | `ioprio_set`/`get` | IN | pid/pgid | sys_ioprio_set.rs:14 | raw `who` as key → two ns share one entry | block/ioprio.c:84 | ionice, systemd `IOSchedulingClass=` | `accept_pid_from`/`pgid_from_user` |
 | 24 | `cgroup.threads` read | OUT | tid | cgroupfs/mod.rs:1140 | raw tids, no filter (Procs arm at :1116 IS correct) | cgroup.c `pid_vnr` | systemd cg_read_pid | mirror Procs arm |
 | 25 | `mq_notify` `si_pid` | OUT | sender | mqueue.rs:391 | no siginfo → `si_pid == 0` | mqueue.c `__do_notify` | POSIX mq RT apps | `store_sigqueue_info` + `report_pid_to` |
-| 26 | `tkill`/`tgkill` non-leader arm | IN | tid | compat.inc.rs:4674 | raw-TaskId thread tids bypass translation | signal.c:4123 | container→host thread signal | gate raw arm on ns visibility |
+| 26 | `tkill`/`tgkill` non-leader arm | IN | tid | compat.inc.rs `signal_tid_from_user` | FIXED — raw sibling-tid arm gated on the thread group being visible in the caller's ns (`ns_visible_inner`) | signal.c:4123 | container→host thread signal | fixed — ns-gated raw arm |
 | 27 | `bpf(TASK_FD_QUERY)` self-check | IN | pid | sys_bpf.rs:477 | untranslated self-compare | bpf/syscall.c | bpftool | as #19 |
 | 28 | `setpriority`/`getpriority` `who` | IN | pid/pgid | sys_setpriority.rs:7 | `who` discarded → always self; no leak | sys.c:282 | renice(1), systemd `Nice=` | resolve via `accept_pid_from` |
 | 29 | `waitid(P_PGID)`/`wait4(pid<-1 or ==0)` | IN | pgid | sys_waitid.rs:38 | pgid ignored, collapsed to "any child" | exit.c `find_vpid` | shells reaping by pgid | implement with fixed `pgid_from_user` |
-| 30 | wait4/waitid unbound-pid fallback | IN | pid | sys_wait4.rs:22 | raw inner kept on translation miss | exit.c → ECHILD | nested-ns supervision | `None` → ECHILD |
-| 31 | `/proc/<pid>/status` NSpid chain | OUT | pid chain | procfs/mod.rs:2376 | single value not the chain (value itself correct) | array.c:210 | nsenter/nspawn mapping | **UNSURE** — benign at 1 nesting level |
+| 30 | wait4/waitid unbound-pid fallback | IN | pid | sys_wait4.rs:21, sys_waitid.rs:35 | FIXED — an inner pid unbound in the caller's ns returns ECHILD (was: raw inner kept, could reap a colliding root-ns child) | exit.c → ECHILD | nested-ns supervision | fixed — `None` → ECHILD |
+| 31 | `/proc/<pid>/status` NSpid chain | OUT | pid chain | procfs/mod.rs:2376 | single value (correct); no multi-level chain | array.c:210 | nsenter/nspawn mapping | N/A — flat 1-level ns model; single value IS the complete chain |
 | 32 | `/proc/<pid>/stat` tty_nr/tpgid | OUT | tty pgrp | procfs/mod.rs:2325 | hardcoded `0 0`; no leak | array.c:516 | `ps -o tpgid`, w, who | `pgid_to_user(tty_fg_pgrp)` |
 | 33 | SysV IPC IPC_STAT pids | OUT | pid | sysvipc.rs:258/433, sys_shmctl.rs:40 | pid fields written as 0; no leak | ipc/*.c `pid_vnr` | `ipcs -p`, PostgreSQL | wrap in `report_pid_to` when implemented |
-| 34 | `setns` legacy TaskId fallback | IN | pid | sys_setns.rs:64 | reinterprets fd number as pid | nsproxy.c (fd-only) | — | **UNSURE** — likely dead; delete or test-gate |
+| 34 | `setns` legacy TaskId fallback | IN | pid | sys_setns.rs | FIXED — legacy path DELETED; a non-namespace fd is rejected (was: fd number reinterpreted as a pid, joining an arbitrary process's namespaces) | nsproxy.c (fd-only) | — | fixed — deleted, fd-only |
 
 ## Top 5
 
