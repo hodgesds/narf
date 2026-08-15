@@ -72,6 +72,10 @@ real laptop's btrfs root looks like.
 - `BTRFS_IOC_SUBVOL_GETFLAGS` / `BTRFS_IOC_SUBVOL_SETFLAGS` on an explicitly
   mounted subvolume root, including Linux's distinct `BTRFS_SUBVOL_RDONLY` UAPI
   bit and persistent read-only/writable transitions.
+- Legacy `BTRFS_IOC_SUBVOL_CREATE` and `BTRFS_IOC_SUBVOL_CREATE_V2` on a mounted
+  directory, including read-only creation. The parent fs tree, new empty child
+  tree, UUID index, root refs/backrefs, extent/free-space accounting and
+  superblock are committed atomically.
 - **statfs** reports total/free blocks (free approximated from the superblock's
   `bytes_used`).
 
@@ -82,8 +86,9 @@ than mis-read:
 
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
-- Snapshot/subvolume creation and deletion; mutations reached by traversing a
-  child subvolume from its parent (mount that child explicitly to write it).
+- Snapshot creation, and subvolume/snapshot deletion; mutations reached by
+  traversing a child subvolume from its parent (mount that child explicitly to
+  write it). `SUBVOL_CREATE_V2` qgroup inheritance is not supported.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a hardlinked or non-empty-directory target.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.

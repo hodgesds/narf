@@ -25,6 +25,10 @@ use crate::volume::BtrfsVolume;
 /// Linux `STATX_BASIC_STATS` — the fields this driver populates.
 const STATX_BASIC_STATS: u32 = 0x7ff;
 
+/// Legacy `_IOW(BTRFS_IOCTL_MAGIC, 14, struct btrfs_ioctl_vol_args)`.
+pub(crate) const BTRFS_IOC_SUBVOL_CREATE: u32 = 0x5000_940e;
+/// `_IOW(BTRFS_IOCTL_MAGIC, 24, struct btrfs_ioctl_vol_args_v2)`.
+pub(crate) const BTRFS_IOC_SUBVOL_CREATE_V2: u32 = 0x5000_9418;
 /// `_IOR(BTRFS_IOCTL_MAGIC, 25, __u64)` from Linux `uapi/linux/btrfs.h`.
 pub(crate) const BTRFS_IOC_SUBVOL_GETFLAGS: u32 = 0x8008_9419;
 /// `_IOW(BTRFS_IOCTL_MAGIC, 26, __u64)` from Linux `uapi/linux/btrfs.h`.
@@ -110,21 +114,27 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 {
                     return Err(FsError::InvalidData);
                 }
-                BTRFS_IOC_SUBVOL_GETFLAGS | BTRFS_IOC_SUBVOL_SETFLAGS => {}
+                BTRFS_IOC_SUBVOL_CREATE | BTRFS_IOC_SUBVOL_CREATE_V2
+                    if out_size != 0 || input.len() != 4096 =>
+                {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_SUBVOL_GETFLAGS
+                | BTRFS_IOC_SUBVOL_SETFLAGS
+                | BTRFS_IOC_SUBVOL_CREATE
+                | BTRFS_IOC_SUBVOL_CREATE_V2 => {}
                 _ => return Err(FsError::Unsupported),
             }
             let vol = self.volume()?;
-            // Linux accepts this ioctl only on a subvolume root directory.
-            // A traversal-pinned child root does not carry its stable root id or
-            // flags yet, so require the explicitly mounted live root.
-            if self.tree_root.is_some()
-                || self.ino != format::FIRST_FREE_OBJECTID
-                || self.inode.file_type() != FileType::Dir
-            {
-                return Err(FsError::InvalidData);
-            }
             match cmd {
                 BTRFS_IOC_SUBVOL_GETFLAGS => {
+                    // Flags operate only on an explicitly mounted subvolume root.
+                    if self.tree_root.is_some()
+                        || self.ino != format::FIRST_FREE_OBJECTID
+                        || self.inode.file_type() != FileType::Dir
+                    {
+                        return Err(FsError::InvalidData);
+                    }
                     let flags = if vol.fs_tree_flags() & format::ROOT_SUBVOL_RDONLY != 0 {
                         BTRFS_SUBVOL_RDONLY
                     } else {
@@ -136,6 +146,12 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     })
                 }
                 BTRFS_IOC_SUBVOL_SETFLAGS => {
+                    if self.tree_root.is_some()
+                        || self.ino != format::FIRST_FREE_OBJECTID
+                        || self.inode.file_type() != FileType::Dir
+                    {
+                        return Err(FsError::InvalidData);
+                    }
                     let flags =
                         u64::from_ne_bytes(input.try_into().map_err(|_| FsError::InvalidData)?);
                     if flags & !BTRFS_SUBVOL_RDONLY != 0 {
@@ -148,6 +164,39 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         disk_flags &= !format::ROOT_SUBVOL_RDONLY;
                     }
                     crate::write::set_subvol_flags(&vol, disk_flags).await?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_SUBVOL_CREATE | BTRFS_IOC_SUBVOL_CREATE_V2 => {
+                    // Creation is relative to the directory fd, but only a
+                    // directory in the explicitly mounted live tree is mutable.
+                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                        return Err(FsError::ReadOnly);
+                    }
+                    let (name_offset, readonly) = if cmd == BTRFS_IOC_SUBVOL_CREATE_V2 {
+                        let flags = u64::from_ne_bytes(
+                            input[16..24].try_into().map_err(|_| FsError::InvalidData)?,
+                        );
+                        if flags & !BTRFS_SUBVOL_RDONLY != 0 {
+                            return Err(FsError::InvalidData);
+                        }
+                        (56usize, flags & BTRFS_SUBVOL_RDONLY != 0)
+                    } else {
+                        (8usize, false)
+                    };
+                    let raw_name = input.get(name_offset..).ok_or(FsError::InvalidData)?;
+                    let end = raw_name
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .ok_or(FsError::InvalidData)?;
+                    let name =
+                        core::str::from_utf8(&raw_name[..end]).map_err(|_| FsError::InvalidData)?;
+                    autogrow!(
+                        vol,
+                        crate::write::create_subvolume(&vol, self.ino, name, readonly).await
+                    )?;
                     Ok(FsIoctlReply {
                         result: 0,
                         output: Vec::new(),

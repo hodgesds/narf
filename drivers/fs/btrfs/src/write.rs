@@ -861,6 +861,8 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             freed_data,
             new_data,
             root_flags: None,
+            extra_trees: Vec::new(),
+            root_inserts: Vec::new(),
         },
     )
     .await?;
@@ -912,6 +914,8 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
             freed_data,
             new_data,
             root_flags: None,
+            extra_trees: Vec::new(),
+            root_inserts: Vec::new(),
         },
     )
     .await
@@ -943,6 +947,14 @@ pub(crate) struct FsCommit {
     pub level: u8,
 }
 
+/// A second tree created or path-COWed by the same transaction as the mounted
+/// fs tree. Subvolume creation uses this for the new empty fs tree and, when
+/// present, the UUID tree update.
+struct ExtraTree {
+    owner: u64,
+    commit: FsCommit,
+}
+
 /// One mutation's fs-tree edit plus the data-extent bookkeeping the
 /// extent/free-space/csum trees must reflect. `commit_txn` reads the
 /// extent/csum/root/free-space trees itself, applies the data + metadata deltas,
@@ -960,6 +972,11 @@ struct Txn {
     /// root-tree-only administration transaction: the fs tree itself remains
     /// byte-for-byte unchanged.
     root_flags: Option<u64>,
+    /// Additional tree commits whose metadata refs and root items advance in
+    /// the same superblock generation as the mounted fs-tree edit.
+    extra_trees: Vec<ExtraTree>,
+    /// New root-tree items (new subvolume ROOT_ITEM plus forward/back refs).
+    root_inserts: Vec<(BtrfsKey, Vec<u8>)>,
 }
 
 /// Persist replacement on-disk flags for the explicitly mounted subvolume.
@@ -991,6 +1008,8 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
             freed_data: Vec::new(),
             new_data: Vec::new(),
             root_flags: Some(flags),
+            extra_trees: Vec::new(),
+            root_inserts: Vec::new(),
         },
     )
     .await
@@ -1790,6 +1809,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
         field.copy_from_slice(&flags.to_le_bytes());
         leaf_replace_inplace(&mut root_logical, slot, &root_item)?;
     }
+    for (key, body) in &txn.root_inserts {
+        if leaf_find(&root_logical, key)?.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        leaf_insert_sorted(&mut root_logical, key, body)?;
+    }
     let (csum_logical, csum_old) = match old_csum {
         Some(c) => {
             let (l, o) = read_fs_oversized(vol, c).await?;
@@ -1835,13 +1860,25 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
     // The fs tree arrives already path-COWed (nodes allocated from `alloc`).
     let c = &txn.fs;
-    let fs_new_meta: Vec<(u64, u64, u8)> = c
+    let mut fs_new_meta: Vec<(u64, u64, u8)> = c
         .new_blocks
         .iter()
         .map(|&(a, l)| (a, vol.fs_tree_id(), l))
         .collect();
-    let (fs_nodes, fs_freed, fs_root_addr, fs_level) =
+    let (mut fs_nodes, mut fs_freed, fs_root_addr, fs_level) =
         (c.nodes.clone(), c.freed.clone(), c.root, c.level);
+    let mut extra_roots = Vec::with_capacity(txn.extra_trees.len());
+    for tree in &txn.extra_trees {
+        fs_new_meta.extend(
+            tree.commit
+                .new_blocks
+                .iter()
+                .map(|&(a, l)| (a, tree.owner, l)),
+        );
+        fs_nodes.extend(tree.commit.nodes.clone());
+        fs_freed.extend(tree.commit.freed.iter().copied());
+        extra_roots.push((tree.owner, tree.commit.root, tree.commit.level));
+    }
 
     let csum_groups = csum_logical
         .as_ref()
@@ -2035,6 +2072,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if fs_tree_changed {
         root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
     }
+    root_updates.extend(extra_roots);
     if csum_logical.is_some() {
         root_updates.push((format::CSUM_TREE_OBJECTID, csum_root.0, csum_root.1));
     }
@@ -2144,10 +2182,21 @@ fn inode_ref(index: u64, name: &[u8]) -> Vec<u8> {
 /// `ft`: `{disk_key location; __le64 transid; __le16 data_len=0; __le16 name_len;
 /// u8 type; name}`.
 fn dir_item_body(child_ino: u64, gen: u64, ft: u8, name: &[u8]) -> Vec<u8> {
+    dir_item_body_at(
+        BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+        gen,
+        ft,
+        name,
+    )
+}
+
+/// Build a directory item with an explicit location key. Ordinary entries
+/// point at an `INODE_ITEM`; subvolume mount points point at a `ROOT_ITEM`.
+fn dir_item_body_at(location: BtrfsKey, gen: u64, ft: u8, name: &[u8]) -> Vec<u8> {
     let mut v = alloc::vec![0u8; 30 + name.len()];
-    v[0..8].copy_from_slice(&child_ino.to_le_bytes()); // location.objectid
-    v[8] = format::INODE_ITEM_KEY; // location.type
-                                   // location.offset@9 = 0
+    v[0..8].copy_from_slice(&location.objectid.to_le_bytes());
+    v[8] = location.item_type;
+    v[9..17].copy_from_slice(&location.offset.to_le_bytes());
     v[17..25].copy_from_slice(&gen.to_le_bytes()); // transid
                                                    // data_len@25 = 0
     v[27..29].copy_from_slice(&(name.len() as u16).to_le_bytes()); // name_len
@@ -2213,6 +2262,268 @@ async fn next_dir_index<B: BlockDevice + 'static>(
         _ => 1,
     };
     Ok(max + 1)
+}
+
+/// Allocate the next ordinary subvolume/tree objectid from the root tree.
+async fn next_subvol_id<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root_tree: u64,
+) -> Result<u64, FsError> {
+    let mut cursor = btree::Cursor::seek(
+        vol,
+        root_tree,
+        &BtrfsKey::new(format::FIRST_FREE_OBJECTID, 0, 0),
+    )
+    .await?;
+    let mut max_id = format::FIRST_FREE_OBJECTID - 1;
+    while let Some((key, _)) = cursor.current()? {
+        if key.objectid > format::LAST_FREE_OBJECTID {
+            break;
+        }
+        if key.item_type == format::ROOT_ITEM_KEY {
+            max_id = max_id.max(key.objectid);
+        }
+        cursor.advance().await?;
+    }
+    let next = max_id.checked_add(1).ok_or(FsError::NoSpace)?;
+    if next > format::LAST_FREE_OBJECTID {
+        return Err(FsError::NoSpace);
+    }
+    Ok(next)
+}
+
+/// `struct btrfs_root_ref` followed by its name.
+fn root_ref(dirid: u64, sequence: u64, name: &[u8]) -> Vec<u8> {
+    let mut body = alloc::vec![0u8; 18 + name.len()];
+    body[0..8].copy_from_slice(&dirid.to_le_bytes());
+    body[8..16].copy_from_slice(&sequence.to_le_bytes());
+    body[16..18].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    body[18..].copy_from_slice(name);
+    body
+}
+
+/// Derive a stable, filesystem-local RFC-4122-shaped UUID for a new subvolume.
+/// The current filesystem UUID, generation and never-reused tree id make the
+/// seed unique for this volume; SHA-256 provides a full-width deterministic
+/// digest without depending on a userspace RNG during an ioctl transaction.
+fn subvol_uuid(fsid: &[u8], gen: u64, tree_id: u64) -> Result<[u8; 16], FsError> {
+    let mut seed = Vec::with_capacity(fsid.len() + 16);
+    seed.extend_from_slice(fsid);
+    seed.extend_from_slice(&gen.to_le_bytes());
+    seed.extend_from_slice(&tree_id.to_le_bytes());
+    let digest = crate::checksum::digest(format::CSUM_TYPE_SHA256, &seed)?;
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    Ok(uuid)
+}
+
+/// Build the modern 439-byte `btrfs_root_item` for a new empty subvolume.
+#[allow(clippy::too_many_arguments)]
+fn subvol_root_item(
+    gen: u64,
+    bytenr: u64,
+    nodesize: u64,
+    flags: u64,
+    uuid: &[u8; 16],
+    time_sec: i64,
+    time_nsec: u32,
+) -> Vec<u8> {
+    let mut item = alloc::vec![0u8; 439];
+    let embedded = inode_item(gen, 0o040755, 0, 0, 1, 0, 0, 0, time_sec, time_nsec);
+    item[..160].copy_from_slice(&embedded);
+    item[160..168].copy_from_slice(&gen.to_le_bytes()); // generation
+    item[168..176].copy_from_slice(&format::FIRST_FREE_OBJECTID.to_le_bytes()); // root_dirid
+    item[176..184].copy_from_slice(&bytenr.to_le_bytes());
+    item[192..200].copy_from_slice(&nodesize.to_le_bytes()); // bytes_used
+    item[208..216].copy_from_slice(&flags.to_le_bytes());
+    item[216..220].copy_from_slice(&1u32.to_le_bytes()); // refs
+    item[238] = 0; // level (the new tree is one leaf)
+    item[239..247].copy_from_slice(&gen.to_le_bytes()); // generation_v2
+    item[247..263].copy_from_slice(uuid);
+    item[295..303].copy_from_slice(&gen.to_le_bytes()); // ctransid
+    item[303..311].copy_from_slice(&gen.to_le_bytes()); // otransid
+    for off in [327usize, 339] {
+        item[off..off + 8].copy_from_slice(&(time_sec as u64).to_le_bytes());
+        item[off + 8..off + 12].copy_from_slice(&time_nsec.to_le_bytes());
+    }
+    item
+}
+
+/// Create an empty subvolume below `parent_ino`, atomically COWing the parent
+/// tree, new child tree, UUID tree, root tree and extent/free-space metadata.
+/// Returns the new subvolume's tree objectid.
+pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+    readonly: bool,
+) -> Result<u64, FsError> {
+    let name_bytes = name.as_bytes();
+    if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
+        return Err(FsError::InvalidData);
+    }
+    let (fs_root, fs_level) = vol.fs_tree_root();
+    let (root_tree, _) = vol.root_tree_root();
+    let dir_item_key = BtrfsKey::new(
+        parent_ino,
+        format::DIR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+    let existing_dir_item = btree::find_item(vol, fs_root, &dir_item_key).await?;
+    if existing_dir_item
+        .as_deref()
+        .is_some_and(|body| find_dir_item(body, name).is_ok())
+    {
+        return Err(FsError::InvalidData);
+    }
+
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let new_id = next_subvol_id(vol, root_tree).await?;
+    let new_index = next_dir_index(vol, fs_root, parent_ino).await?;
+    let mut alloc = Allocator::build(vol).await?;
+
+    let mut pinode = btree::find_item(
+        vol,
+        fs_root,
+        &BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0),
+    )
+    .await?
+    .ok_or(FsError::NotFound)?;
+    let psize = le64(&pinode, 16)?;
+    let ptime_sec = le64(&pinode, 136)? as i64;
+    let ptime_nsec = format::le32(&pinode, 144)?;
+    pinode[8..16].copy_from_slice(&gen.to_le_bytes());
+    pinode[16..24].copy_from_slice(&(psize + 2 * name_bytes.len() as u64).to_le_bytes());
+    let pseq = le64(&pinode, 72)?;
+    pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
+
+    let location = BtrfsKey::new(new_id, format::ROOT_ITEM_KEY, 0);
+    let di = dir_item_body_at(location, gen, format::FT_DIR, name_bytes);
+    let parent_edits = alloc::vec![
+        Edit::Upsert(BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0), pinode),
+        Edit::Upsert(
+            dir_item_key,
+            append_dir_item(existing_dir_item.as_deref(), name, &di)?,
+        ),
+        Edit::Upsert(
+            BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
+            di,
+        ),
+    ];
+    let parent_out = PathCow::new(vol, gen, fs_root, fs_level)
+        .await?
+        .apply(&mut alloc, &parent_edits)
+        .await?;
+    let parent_commit = fs_commit_from(parent_out, gen, vol.csum_type())?;
+
+    // The new fs tree starts as a single leaf containing its root inode and `..`.
+    let child_addr = alloc.alloc_node(vol)?;
+    let header = vol.read_node(fs_root).await?;
+    let child_inode = inode_item(gen, 0o040755, 0, 0, 1, 0, 0, 0, ptime_sec, ptime_nsec);
+    let child_parent = inode_ref(0, b"..");
+    let child_items = [
+        (
+            BtrfsKey::new(format::FIRST_FREE_OBJECTID, format::INODE_ITEM_KEY, 0),
+            child_inode.as_slice(),
+        ),
+        (
+            BtrfsKey::new(
+                format::FIRST_FREE_OBJECTID,
+                format::INODE_REF_KEY,
+                format::FIRST_FREE_OBJECTID,
+            ),
+            child_parent.as_slice(),
+        ),
+    ];
+    let mut child_node = pack_leaf(&header, &child_items, vol.nodesize());
+    child_node[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&new_id.to_le_bytes());
+    stamp_node(&mut child_node, child_addr, gen, vol.csum_type())?;
+
+    let raw_super = vol.read_raw_superblock().await?;
+    let fsid = raw_super.get(32..48).ok_or(FsError::InvalidData)?;
+    let uuid = subvol_uuid(fsid, gen, new_id)?;
+    let flags = if readonly {
+        format::ROOT_SUBVOL_RDONLY
+    } else {
+        0
+    };
+    let root_item = subvol_root_item(
+        gen,
+        child_addr,
+        vol.nodesize() as u64,
+        flags,
+        &uuid,
+        ptime_sec,
+        ptime_nsec,
+    );
+    let ref_body = root_ref(parent_ino, new_index, name_bytes);
+    let root_inserts = alloc::vec![
+        (BtrfsKey::new(new_id, format::ROOT_ITEM_KEY, 0), root_item),
+        (
+            BtrfsKey::new(new_id, format::ROOT_BACKREF_KEY, vol.fs_tree_id()),
+            ref_body.clone(),
+        ),
+        (
+            BtrfsKey::new(vol.fs_tree_id(), format::ROOT_REF_KEY, new_id),
+            ref_body,
+        ),
+    ];
+
+    let mut extra_trees = alloc::vec![ExtraTree {
+        owner: new_id,
+        commit: FsCommit {
+            nodes: alloc::vec![(child_addr, child_node)],
+            new_blocks: alloc::vec![(child_addr, 0)],
+            freed: Vec::new(),
+            root: child_addr,
+            level: 0,
+        },
+    }];
+
+    // Modern filesystems index every subvolume UUID. Older images without a
+    // UUID tree remain supported; their root item still carries the UUID.
+    if let Ok((uuid_root, uuid_level)) =
+        roots::find_root(vol, root_tree, format::UUID_TREE_OBJECTID).await
+    {
+        let uuid_key = BtrfsKey::new(
+            u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+            format::UUID_KEY_SUBVOL,
+            u64::from_le_bytes(uuid[8..].try_into().unwrap()),
+        );
+        let uuid_out = PathCow::new(vol, gen, uuid_root, uuid_level)
+            .await?
+            .apply(
+                &mut alloc,
+                &[Edit::Upsert(uuid_key, new_id.to_le_bytes().to_vec())],
+            )
+            .await?;
+        extra_trees.push(ExtraTree {
+            owner: format::UUID_TREE_OBJECTID,
+            commit: fs_commit_from(uuid_out, gen, vol.csum_type())?,
+        });
+    }
+
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: parent_commit,
+            freed_data: Vec::new(),
+            new_data: Vec::new(),
+            root_flags: None,
+            extra_trees,
+            root_inserts,
+        },
+    )
+    .await?;
+    Ok(new_id)
 }
 
 /// What kind of inode [`create_node`] materialises: mode + directory-entry type,

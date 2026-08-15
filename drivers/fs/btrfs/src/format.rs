@@ -61,6 +61,8 @@ pub const ROOT_SUBVOL_RDONLY: u64 = 1;
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// UUID index tree (subvolume UUID → root objectid).
+pub const UUID_TREE_OBJECTID: u64 = 9;
 /// Device tree (holds `DEV_ITEM` + `DEV_EXTENT`).
 pub const DEV_TREE_OBJECTID: u64 = 4;
 /// Objectid every `DEV_ITEM`/`DEV_EXTENT` shares (`BTRFS_DEV_ITEMS_OBJECTID`).
@@ -96,6 +98,8 @@ pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
 pub const EXTENT_CSUM_KEY: u8 = 128;
 pub const ROOT_ITEM_KEY: u8 = 132;
+pub const ROOT_BACKREF_KEY: u8 = 144;
+pub const ROOT_REF_KEY: u8 = 156;
 pub const EXTENT_ITEM_KEY: u8 = 168;
 /// Skinny-metadata tree-block extent record; length is `nodesize`.
 pub const METADATA_ITEM_KEY: u8 = 169;
@@ -106,6 +110,7 @@ pub const FREE_SPACE_INFO_KEY: u8 = 198;
 pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
 pub const CHUNK_ITEM_KEY: u8 = 228;
+pub const UUID_KEY_SUBVOL: u8 = 251;
 
 // ── File-extent item types (`btrfs_file_extent_item.type`) ─────────
 

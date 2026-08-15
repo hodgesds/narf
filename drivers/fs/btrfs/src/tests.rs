@@ -4735,6 +4735,267 @@ fn smoke_btrfs_subvolume_getflags_ioctl() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_getflags_ioctl);
 
+fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+
+    let make_v2 = |name: &str, flags: u64| {
+        let mut args = alloc::vec![0u8; 4096];
+        args[16..24].copy_from_slice(&flags.to_ne_bytes());
+        let end = 56 + name.len();
+        if end < args.len() {
+            args[56..end].copy_from_slice(name.as_bytes());
+        }
+        args
+    };
+    let make_legacy = |name: &str| {
+        let mut args = alloc::vec![0u8; 4096];
+        let end = 8 + name.len();
+        if end < args.len() {
+            args[8..end].copy_from_slice(name.as_bytes());
+        }
+        args
+    };
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-create fixture mount failed"),
+    };
+    let root = top.root();
+
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &[0; 8], 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted the wrong ABI size");
+    }
+    let unknown = make_v2("badflags", 1 << 63);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &unknown, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted unknown flags");
+    }
+    let bad_name = make_v2("bad/name", 0);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &bad_name, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted a path instead of a name");
+    }
+
+    let fresh_args = make_v2("fresh", 0);
+    if !matches!(
+        poll_once(root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &fresh_args,
+            0,
+        )),
+        Some(Ok(ref reply)) if reply.result == 0 && reply.output.is_empty()
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 writable create failed");
+    }
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &fresh_args, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted a duplicate name");
+    }
+
+    let readonly_args = make_v2("frozen", crate::node::BTRFS_SUBVOL_RDONLY);
+    if !matches!(
+        poll_once(root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &readonly_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 read-only create failed");
+    }
+    let legacy_args = make_legacy("legacy");
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE, 0, &legacy_args, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("legacy SUBVOL_CREATE failed");
+    }
+    let listed = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-create parent enumerate failed"),
+    };
+    for name in ["fresh", "frozen", "legacy"] {
+        if !listed
+            .iter()
+            .any(|(entry, kind)| entry == name && *kind == FileType::Dir)
+        {
+            return TestResult::Fail("created subvolume missing from parent directory");
+        }
+    }
+
+    let mount_named = |name: &str| {
+        poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name(name.into())),
+        ))
+        .and_then(Result::ok)
+    };
+    let fresh = match mount_named("fresh") {
+        Some(v) => v,
+        None => return TestResult::Fail("created writable subvolume did not remount"),
+    };
+    if !fresh.supports_writes() {
+        return TestResult::Fail("created writable subvolume remounted read-only");
+    }
+    let fresh_id = fresh.fs_tree_id();
+    if fresh_id <= format::FIRST_FREE_OBJECTID {
+        return TestResult::Fail("created subvolume did not receive a new tree id");
+    }
+    let fresh_root = fresh.root();
+    if !matches!(
+        poll_once(fresh_root.enumerate_async(0, 8)),
+        Some(Ok(ref entries)) if entries.is_empty()
+    ) {
+        return TestResult::Fail("new subvolume was not empty");
+    }
+    let file = match poll_once(fresh_root.create("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("created subvolume rejected file creation"),
+    };
+    if !matches!(poll_once(file.write(0, b"new subvolume\n")), Some(Ok(14))) {
+        return TestResult::Fail("created subvolume rejected file write");
+    }
+
+    let frozen = match mount_named("frozen") {
+        Some(v) => v,
+        None => return TestResult::Fail("created read-only subvolume did not remount"),
+    };
+    if frozen.supports_writes()
+        || !matches!(
+            poll_once(frozen.root().create("blocked")),
+            Some(Err(FsError::ReadOnly))
+        )
+    {
+        return TestResult::Fail("created read-only subvolume accepted mutation");
+    }
+
+    // Remount the parent after the child transaction so its cached root tree is
+    // current, then traverse into the child and read the persisted file.
+    let remounted_top = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("parent remount after subvolume write failed"),
+    };
+    let traversed = match poll_once(remounted_top.root().lookup_dir_async("fresh")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("created subvolume was not traversable after remount"),
+    };
+    let persisted = match poll_once(traversed.lookup_async("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("created subvolume file did not persist"),
+    };
+    if read_all(&persisted, 32).as_deref() != Some(b"new subvolume\n") {
+        return TestResult::Fail("created subvolume file contents were wrong");
+    }
+
+    // The root tree must carry both directions of the parent relation.
+    let root_tree = remounted_top.root_tree_root().0;
+    let parent_id = remounted_top.fs_tree_id();
+    if poll_once(btree::find_item(
+        &*remounted_top,
+        root_tree,
+        &BtrfsKey::new(parent_id, format::ROOT_REF_KEY, fresh_id),
+    ))
+    .and_then(Result::ok)
+    .flatten()
+    .is_none()
+        || poll_once(btree::find_item(
+            &*remounted_top,
+            root_tree,
+            &BtrfsKey::new(fresh_id, format::ROOT_BACKREF_KEY, parent_id),
+        ))
+        .and_then(Result::ok)
+        .flatten()
+        .is_none()
+    {
+        return TestResult::Fail("created subvolume root refs were incomplete");
+    }
+    let root_item = match poll_once(btree::find_item(
+        &*remounted_top,
+        root_tree,
+        &BtrfsKey::new(fresh_id, format::ROOT_ITEM_KEY, 0),
+    )) {
+        Some(Ok(Some(body))) if body.len() >= 263 => body,
+        _ => return TestResult::Fail("created subvolume root item was missing"),
+    };
+    let uuid = &root_item[247..263];
+    let uuid_root = match poll_once(crate::roots::find_root(
+        &*remounted_top,
+        root_tree,
+        format::UUID_TREE_OBJECTID,
+    )) {
+        Some(Ok((root, _))) => root,
+        _ => return TestResult::Fail("UUID tree was missing after subvolume creation"),
+    };
+    let uuid_key = BtrfsKey::new(
+        u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+        format::UUID_KEY_SUBVOL,
+        u64::from_le_bytes(uuid[8..].try_into().unwrap()),
+    );
+    if !matches!(
+        poll_once(btree::find_item(&*remounted_top, uuid_root, &uuid_key)),
+        Some(Ok(Some(ref body))) if body.as_slice() == fresh_id.to_le_bytes()
+    ) {
+        return TestResult::Fail("created subvolume UUID index was incomplete");
+    }
+
+    // Exercise the same multi-tree transaction with space_cache=v2 enabled;
+    // every new parent/child/UUID/root/extent block must be removed from the
+    // free-space tree in the converged fixed point.
+    let fst_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let fst_top = match poll_once(BtrfsVolume::mount_opts(
+        fst_device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("free-space-tree subvolume fixture mount failed"),
+    };
+    let fst_args = make_v2("fstchild", 0);
+    if !matches!(
+        poll_once(fst_top.root().ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &fst_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("free-space-tree subvolume creation failed");
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            fst_device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("fstchild".into())),
+        )),
+        Some(Ok(ref child)) if child.supports_writes()
+    ) {
+        return TestResult::Fail("free-space-tree subvolume did not persist");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_create_ioctl);
+
 /// A writable multi-component `subvol=` mount commits into that subvolume's
 /// own tree id. The new root must be published through its `ROOT_ITEM`, data
 /// backrefs must name the subvolume rather than tree 5, and both an explicit
