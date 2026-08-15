@@ -90,6 +90,9 @@ pub struct MqueueNotification {
     pub task_id: u64,
     pub method: i32,
     pub signal: i32,
+    /// `sigev_value` (the sigval union) registered at mq_notify time. Delivered
+    /// as the notification signal's `si_value` (Linux mqueue.c __do_notify).
+    pub value: u64,
 }
 
 #[derive(Debug)]

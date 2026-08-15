@@ -4044,6 +4044,29 @@ pub fn proc_task_info(
             }
         }
     }
+    // stat fields 7-8: controlling terminal device (tty_nr) + its foreground
+    // process group (tpgid). `task_ctty` resolves the boot-console default and
+    // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
+    // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
+    // (Linux). Linux dev_t = (major << 8) | minor: console (5,1); pts/N (136,N).
+    #[cfg(feature = "linux-compat")]
+    let (tty_nr, tpgid): (u64, i64) = match task_ctty(tid) {
+        None => (0, -1),
+        Some(ctty) => {
+            let (tty_nr, fg) = if ctty == CTTY_CONSOLE {
+                ((5u64 << 8) | 1, narf_filesystem::console_tty::fg_pgrp())
+            } else {
+                (
+                    (136u64 << 8) | ctty as u64,
+                    narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
+                )
+            };
+            let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
+            (tty_nr, tpgid)
+        }
+    };
+    #[cfg(not(feature = "linux-compat"))]
+    let (tty_nr, tpgid): (u64, i64) = (0, -1);
     // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
     // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
@@ -4076,6 +4099,8 @@ pub fn proc_task_info(
         // visible-pid + namespace view (same boundary getpgid()/getsid() use).
         pgrp: pgid_to_user(read_pgid(tid)),
         session: pgid_to_user(read_sid(tid)),
+        tty_nr,
+        tpgid,
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,

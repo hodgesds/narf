@@ -108,6 +108,87 @@ fn smoke_abi_ipc_mq_unlink_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_unlink_neg);
 
+// ── #25 mq_notify si_pid ────────────────────────────────────────────
+//
+// When a message arrives at an empty queue with a registered SIGEV_SIGNAL
+// notification, Linux (mqueue.c __do_notify) delivers the signal with
+// si_code = SI_MESGQ, si_value = the registered sigev_value, and si_pid = the
+// SENDER's pid in the RECEIVER's namespace — NOT 0. The old code raised a bare
+// signal with no siginfo. A receiver R registers the notify; a distinct sender
+// S sends; the queued siginfo for R must carry (SI_MESGQ, value, S's pid).
+fn smoke_abi_ipc_mq_notify_si_pid() -> TestResult {
+    with_setup(|| {
+        const R_TASK: u64 = 0x7300_0000;
+        const R_PID: u64 = 0x7300_1000;
+        const S_TASK: u64 = 0x7300_0001;
+        const S_PID: u64 = 0x7300_1001;
+        const SIG: u64 = 40; // an RT signal, queued by store_sigqueue_info
+        const SI_MESGQ: i32 = -3;
+        const VALUE: u64 = 0xDEAD_BEEF_0000_0042;
+        let name = b"abi_mq_notify_sipid\0";
+
+        // Register both tasks so task_to_pid_raw(S) == S_PID (the si_pid).
+        for (t, p) in [(R_TASK, R_PID), (S_TASK, S_PID)] {
+            crate::task::release_task(t);
+            let _ = crate::task::Task::new_registered(t, p);
+            crate::handlers::register_task_to_pid(t, p);
+            crate::handlers::register_pid_task_mapping(p, t);
+        }
+
+        let result = (|| {
+            // Receiver R: open the queue and register a SIGEV_SIGNAL notify.
+            set_task(R_TASK);
+            let fd_r = open_mq(name)?;
+            let mut sigevent = [0u8; 64];
+            sigevent[0..8].copy_from_slice(&VALUE.to_ne_bytes());
+            sigevent[8..12].copy_from_slice(&(SIG as i32).to_ne_bytes());
+            sigevent[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
+            if call(
+                Syscall::MqNotify.raw(),
+                a1(fd_r, sigevent.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("mq_notify(SIGEV_SIGNAL) did not succeed");
+            }
+
+            // Sender S: open the same queue and send one message.
+            set_task(S_TASK);
+            let fd_s = open_mq(name)?;
+            let payload = b"ping";
+            if call(
+                Syscall::MqTimedsend.raw(),
+                a3(fd_s, payload.as_ptr() as u64, payload.len() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("mq_timedsend into the empty queue did not succeed");
+            }
+
+            // The receiver's queued siginfo must name the sender.
+            match crate::handlers::take_sigqueue_info(R_TASK, SIG as u32) {
+                Some((code, value, si_pid)) => {
+                    if code != SI_MESGQ {
+                        Err("mq notify siginfo si_code was not SI_MESGQ")
+                    } else if value != VALUE {
+                        Err("mq notify siginfo si_value was not the registered sigev_value")
+                    } else if si_pid as u64 != S_PID {
+                        Err("mq notify si_pid was not the sender's pid (0/unset means no siginfo was stored)")
+                    } else {
+                        Ok(())
+                    }
+                }
+                None => Err("mq notify stored NO siginfo — si_pid would read 0 (the #25 bug)"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64));
+        for t in [R_TASK, S_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_notify_si_pid);
+
 /// Open a fresh queue and return its fd (or Err string for the body).
 fn open_mq(name: &[u8]) -> Result<u64, &'static str> {
     match call(
@@ -756,6 +837,54 @@ fn smoke_abi_ipc_shmctl_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmctl_neg);
+
+// #33: shmctl(IPC_STAT) fills shm_cpid (creator) at offset 80, translated into
+// the reader's namespace, instead of leaving it caller-zeroed. shm_lpid stays
+// 0 until the first shmat (unreachable here — no live AS).
+fn smoke_abi_ipc_shmctl_cpid() -> TestResult {
+    with_setup(|| {
+        const C_TASK: u64 = 0x7500_0000;
+        const C_PID: u64 = 0x00AB_CDEF; // fits shm_cpid's 4 bytes
+
+        crate::task::release_task(C_TASK);
+        let _ = crate::task::Task::new_registered(C_TASK, C_PID);
+        crate::handlers::register_task_to_pid(C_TASK, C_PID);
+        crate::handlers::register_pid_task_mapping(C_PID, C_TASK);
+
+        let result = (|| {
+            set_task(C_TASK);
+            let id = match call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)) {
+                Some(id) if id > 0 => id as u64,
+                _ => return Err("setup: shmget create failed (shmem vtable absent?)"),
+            };
+            let mut buf = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a3(id, IPC_STAT, buf.as_mut_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("shmctl IPC_STAT into a buffer should return 0");
+            }
+            let segsz = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+            let cpid = u32::from_le_bytes(buf[80..84].try_into().unwrap());
+            let lpid = u32::from_le_bytes(buf[84..88].try_into().unwrap());
+            let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+            if segsz != 4096 {
+                Err("shmctl IPC_STAT shm_segsz (offset 48) wrong")
+            } else if cpid as u64 != C_PID {
+                Err("shmctl IPC_STAT shm_cpid (offset 80) was not the creator's pid — left caller-zeroed (#33 bug)")
+            } else if lpid != 0 {
+                Err("shm_lpid should be 0 before any shmat")
+            } else {
+                Ok(())
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::task::release_task(C_TASK);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmctl_cpid);
 
 // ════════════════════════════════════════════════════════════════════
 // NARF-native shmem registry (ShmemCreate / ShmemMap / ShmemDestroy)

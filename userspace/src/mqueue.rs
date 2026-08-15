@@ -340,10 +340,24 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
         Ok(notification) => {
             if let Some(notification) = notification {
                 if notification.method == 0 {
-                    crate::handlers::raise_signal_pending(
-                        notification.task_id,
+                    // Linux mqueue.c __do_notify delivers si_code = SI_MESGQ,
+                    // si_value = the registered sigev_value, and si_pid =
+                    // task_tgid_nr_ns(sender, receiver_ns) — the SENDER's pid in
+                    // the RECEIVER's namespace, NOT 0. (#25)
+                    const SI_MESGQ: i32 = -3;
+                    let receiver = notification.task_id;
+                    let sender = current_task_id();
+                    let sender_outer =
+                        crate::handlers::task_to_pid_raw(sender).unwrap_or(sender);
+                    let si_pid = crate::handlers::report_pid_to(receiver, sender_outer) as u32;
+                    crate::handlers::store_sigqueue_info(
+                        receiver,
                         notification.signal as u32,
+                        SI_MESGQ,
+                        notification.value,
+                        si_pid,
                     );
+                    crate::handlers::raise_signal_pending(receiver, notification.signal as u32);
                 }
             }
             narf_net::readiness::notify(0);
@@ -379,6 +393,9 @@ pub fn sys_mq_notify(ctx: &mut dyn TrapContext) {
             ctx.set_return(err(EFAULT));
             return;
         }
+        // struct sigevent: sigev_value (sigval union, 8 bytes) then
+        // sigev_signo (bytes[8..12]) then sigev_notify (bytes[12..16]).
+        let value = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
         let signal = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
         let method = i32::from_ne_bytes(bytes[12..16].try_into().unwrap());
         if !matches!(method, SIGEV_SIGNAL | SIGEV_NONE)
@@ -391,6 +408,7 @@ pub fn sys_mq_notify(ctx: &mut dyn TrapContext) {
             task_id: task,
             method,
             signal: if method == SIGEV_SIGNAL { signal } else { 0 },
+            value,
         })
     };
     match mqueuefs::notify(id, task, notification) {

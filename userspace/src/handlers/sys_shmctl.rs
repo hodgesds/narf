@@ -25,19 +25,34 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             }
         }
         2 => {
-            // IPC_STAT: report shm_segsz. On x86_64 the kernel's
-            // shmid64_ds places shm_segsz right after struct ipc64_perm
-            // (48 bytes). We fill just the size; the rest stays
-            // caller-zeroed.
-            let len = {
+            // IPC_STAT: fill the x86_64 shmid64_ds. shm_segsz sits right after
+            // struct ipc64_perm (offset 48); shm_cpid/shm_lpid are 4-byte pids
+            // at offsets 80/84 (after the three 8-byte time fields). The rest
+            // stays caller-zeroed. cpid/lpid are OUTER ProcessIds — render them
+            // in the READER's namespace (Linux pid_vnr), 0 = unset. (#33)
+            let seg = {
                 let g = SHM_SEGMENTS.lock();
-                g.as_ref().and_then(|m| m.get(&shmid)).map(|s| s.len)
+                g.as_ref()
+                    .and_then(|m| m.get(&shmid))
+                    .map(|s| (s.len, s.cpid, s.lpid))
             };
-            match len {
-                Some(len) if a.arg2 != 0 => {
+            match seg {
+                Some((len, cpid, lpid)) if a.arg2 != 0 => {
+                    let reader = current_task_id();
+                    let vis = |p: u64| -> u32 {
+                        if p == 0 {
+                            0
+                        } else {
+                            report_pid_to(reader, p) as u32
+                        }
+                    };
                     // SAFETY: a.arg2 is the user struct shmid_ds*; copy_to_user
-                    // validates the 8-byte shm_segsz write at offset 48.
-                    let _ = unsafe { copy_to_user(a.arg2.wrapping_add(48), &len.to_le_bytes()) };
+                    // validates each write within the caller's 112-byte struct.
+                    unsafe {
+                        let _ = copy_to_user(a.arg2.wrapping_add(48), &len.to_le_bytes());
+                        let _ = copy_to_user(a.arg2.wrapping_add(80), &vis(cpid).to_le_bytes());
+                        let _ = copy_to_user(a.arg2.wrapping_add(84), &vis(lpid).to_le_bytes());
+                    }
                     ctx.set_return(SyscallReturn::ok(0));
                 }
                 Some(_) => ctx.set_return(SyscallReturn::ok(0)),

@@ -39,12 +39,16 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
         return;
     }
     let shmid = SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let creator = current_task_id();
+    let cpid = task_to_pid_raw(creator).unwrap_or(creator);
     segs.insert(
         shmid,
         ShmSegment {
             handle,
             key,
             len: size,
+            cpid,
+            lpid: 0,
         },
     );
     ctx.set_return(SyscallReturn::ok(shmid));

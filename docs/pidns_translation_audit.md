@@ -23,7 +23,8 @@ Idioms to match:
 
 ## Status (updated as findings land)
 
-**LANDED — 28 of 34 findings fixed, every one with a RED-first test:**
+**LANDED — 32 of 34 findings fixed (the other two: #24 verified-correct, #31
+N/A for the flat model), every fix with a RED-first test:**
 
 Core (main tree): #1/#3/#4/#5/#6 pgid family; #2 ptrace; #7 getsid; #8
 kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid stop/cont
@@ -65,6 +66,22 @@ pid, joining an arbitrary process's namespaces with no translation) is DELETED �
 setns now rejects any non-namespace fd; no caller or test depended on the path.
 Tests: `abi_pidns_tests.rs` (#26/#30/#34) and `procfs/pid_ext.rs` (#16).
 
+Feature batch (previously deferred as unimplemented, now built out with the
+translation wired): #29 process-group-filtered wait — `waitpid(0)` /
+`waitpid(-pgid)` / `waitid(P_PGID)` now filter by the target group (a shared
+`wait_child_matches` across every reap site + the async blocking-reap path;
+`has_living_child` gained a pgid branch; the pgid is `pgid_from_user`-translated).
+#25 `mq_notify` now delivers `si_code = SI_MESGQ`, `si_value` = the registered
+sigev_value, and `si_pid` = the sender's pid in the RECEIVER's ns
+(`store_sigqueue_info` + `report_pid_to`), instead of a bare signal with
+si_pid 0. #32 `/proc/<pid>/stat` renders `tty_nr` (the controlling tty device)
+and `tpgid` (its foreground pgrp, `pgid_to_user`-translated) from `task_ctty` +
+the console/pty fg-pgrp, instead of a hardcoded `0 0`. #33 SysV shm IPC_STAT
+fills `shm_cpid` (creator) and `shm_lpid` (last shmat), translated into the
+reader's ns, instead of leaving them caller-zeroed (`ShmSegment` now tracks
+both). Tests: `abi_proc_tests.rs` (#29/#32), `abi_ipc_tests.rs` (#25/#33),
+`procfs/mod.rs` (#32 render).
+
 **VERIFIED-CORRECT-IN-PRACTICE (no fix needed):** #24 cgroup.threads — the
 write path routes cgroup.procs and cgroup.threads both into `members` via
 `place()`, so `cg.threads` is never populated and the read always hits the
@@ -78,26 +95,17 @@ report_pid mirror-procs branch; the raw-tid branch is dead code.
   multi-value chain only exists under nested namespaces NARF cannot form; the
   same limitation is why fork's nested-unshare case is unrepresentable (see #13).
 
-**DEFERRED — unimplemented FEATURES that write 0/constant today (not a
-translation regression; the translation is pre-wired for when the source data
-lands — the remaining 4):**
-- #25 mq_notify si_pid — no siginfo is stored on mq notification at all, so
-  si_pid is 0; wiring `report_pid_to` needs the notify sigqueue path first.
-  POSIX mq, negligible reach.
-- #29 waitid(P_PGID) / wait4(pid==0 or <-1) pgid filtering — pgid is IGNORED
-  and collapsed to "any child". Real filtering needs the exited child's pgid
-  threaded through PENDING_EXITS AND the async blocking-reap path
-  (`wait_child_want_pid`), which has a history of hang bugs — a feature with
-  real regression risk, not a translation edit.
-- #32 /proc/<pid>/stat tty_nr/tpgid — hardcoded `0 0`; needs a controlling-tty
-  foreground-pgrp source before `pgid_to_user` has anything to translate.
-- #33 SysV IPC IPC_STAT cpid/lpid — the objects don't track creator/last-op
-  pids yet (written 0); `report_pid_to` applies once they do.
+**REMAINING GAP (out of scope for a pid-translation audit — no pid leak):** the
+SysV **message-queue and semaphore** IPC_STAT paths (`sysvipc.rs`) are stubs that
+succeed without writing a `msqid_ds` / `semid_ds` at all, so `msg_lspid/lrpid`
+and the per-semaphore `sempid` are not merely zero-pid but wholly unimplemented.
+#33 fixed the shm side (which DID write a struct with zeroed pids); implementing
+the msg/sem structs is feature work beyond translation, and there is no pid leak
+in the meantime (nothing is written). Noted for a future IPC-completeness pass.
 
-Net: every finding rated moderate-or-higher is fixed, plus every bounded
-namespace-translation fix. What remains is one model limitation (#31, N/A) and
-four unimplemented features that currently emit 0/constant with no live
-cross-namespace leak.
+Net: all 32 addressable findings are fixed with RED-first tests; #24 is
+verified-correct (dead branch) and #31 is N/A for the flat namespace model. No
+finding at any severity has a remaining live cross-namespace leak.
 
 ## Findings (severity-ranked)
 
@@ -127,15 +135,15 @@ cross-namespace leak.
 | 22 | `get_robust_list(pid)` | IN | pid | sys_get_robust_list.rs:10 | user pid as table key | futex/syscalls.c:59 | glibc robust-mutex, criu | `accept_pid_from` → tid |
 | 23 | `ioprio_set`/`get` | IN | pid/pgid | sys_ioprio_set.rs:14 | raw `who` as key → two ns share one entry | block/ioprio.c:84 | ionice, systemd `IOSchedulingClass=` | `accept_pid_from`/`pgid_from_user` |
 | 24 | `cgroup.threads` read | OUT | tid | cgroupfs/mod.rs:1140 | raw tids, no filter (Procs arm at :1116 IS correct) | cgroup.c `pid_vnr` | systemd cg_read_pid | mirror Procs arm |
-| 25 | `mq_notify` `si_pid` | OUT | sender | mqueue.rs:391 | no siginfo → `si_pid == 0` | mqueue.c `__do_notify` | POSIX mq RT apps | `store_sigqueue_info` + `report_pid_to` |
+| 25 | `mq_notify` `si_pid` | OUT | sender | mqueue.rs | FIXED — delivery stores SI_MESGQ + sigev_value + si_pid = `report_pid_to(receiver, sender_outer)` (was: bare signal, si_pid 0) | mqueue.c `__do_notify` | POSIX mq RT apps | fixed — `store_sigqueue_info` + `report_pid_to` |
 | 26 | `tkill`/`tgkill` non-leader arm | IN | tid | compat.inc.rs `signal_tid_from_user` | FIXED — raw sibling-tid arm gated on the thread group being visible in the caller's ns (`ns_visible_inner`) | signal.c:4123 | container→host thread signal | fixed — ns-gated raw arm |
 | 27 | `bpf(TASK_FD_QUERY)` self-check | IN | pid | sys_bpf.rs:477 | untranslated self-compare | bpf/syscall.c | bpftool | as #19 |
 | 28 | `setpriority`/`getpriority` `who` | IN | pid/pgid | sys_setpriority.rs:7 | `who` discarded → always self; no leak | sys.c:282 | renice(1), systemd `Nice=` | resolve via `accept_pid_from` |
-| 29 | `waitid(P_PGID)`/`wait4(pid<-1 or ==0)` | IN | pgid | sys_waitid.rs:38 | pgid ignored, collapsed to "any child" | exit.c `find_vpid` | shells reaping by pgid | implement with fixed `pgid_from_user` |
+| 29 | `waitid(P_PGID)`/`wait4(pid<-1 or ==0)` | IN | pgid | sys_wait4.rs, sys_waitid.rs | FIXED — real pgid filtering via a shared `wait_child_matches` across all reap sites + the async path; pgid `pgid_from_user`-translated | exit.c `eligible_pid` | shells reaping by pgid | fixed — pgid-filtered wait |
 | 30 | wait4/waitid unbound-pid fallback | IN | pid | sys_wait4.rs:21, sys_waitid.rs:35 | FIXED — an inner pid unbound in the caller's ns returns ECHILD (was: raw inner kept, could reap a colliding root-ns child) | exit.c → ECHILD | nested-ns supervision | fixed — `None` → ECHILD |
 | 31 | `/proc/<pid>/status` NSpid chain | OUT | pid chain | procfs/mod.rs:2376 | single value (correct); no multi-level chain | array.c:210 | nsenter/nspawn mapping | N/A — flat 1-level ns model; single value IS the complete chain |
-| 32 | `/proc/<pid>/stat` tty_nr/tpgid | OUT | tty pgrp | procfs/mod.rs:2325 | hardcoded `0 0`; no leak | array.c:516 | `ps -o tpgid`, w, who | `pgid_to_user(tty_fg_pgrp)` |
-| 33 | SysV IPC IPC_STAT pids | OUT | pid | sysvipc.rs:258/433, sys_shmctl.rs:40 | pid fields written as 0; no leak | ipc/*.c `pid_vnr` | `ipcs -p`, PostgreSQL | wrap in `report_pid_to` when implemented |
+| 32 | `/proc/<pid>/stat` tty_nr/tpgid | OUT | tty pgrp | procfs/mod.rs render_stat | FIXED — tty_nr from `task_ctty` (console/pts dev), tpgid = `pgid_to_user` of the tty fg pgrp; -1/0 with no ctty (was `0 0`) | array.c:516 | `ps -o tpgid`, w, who | fixed — real tty_nr/tpgid |
+| 33 | SysV IPC IPC_STAT pids | OUT | pid | sys_shmctl.rs | FIXED (shm) — `ShmSegment` tracks cpid/lpid; IPC_STAT writes them at offsets 80/84 via `report_pid_to`. msg/sem IPC_STAT write no struct at all (separate feature gap, no leak) | ipc/*.c `pid_vnr` | `ipcs -p`, PostgreSQL | fixed — shm cpid/lpid |
 | 34 | `setns` legacy TaskId fallback | IN | pid | sys_setns.rs | FIXED — legacy path DELETED; a non-namespace fd is rejected (was: fd number reinterpreted as a pid, joining an arbitrary process's namespaces) | nsproxy.c (fd-only) | — | fixed — deleted, fd-only |
 
 ## Top 5

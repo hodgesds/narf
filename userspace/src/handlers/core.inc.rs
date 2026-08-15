@@ -8727,6 +8727,13 @@ struct ShmSegment {
     handle: u64,
     key: u32,
     len: u64,
+    /// Creator's OUTER ProcessId (shmid_ds.shm_cpid), set at shmget.
+    cpid: u64,
+    /// OUTER ProcessId of the last shmat (shmid_ds.shm_lpid); 0 until the
+    /// first attach. Rendered — translated into the reader's ns — by shmctl
+    /// IPC_STAT. shmdt unmaps by address (no shmid in hand) so it is not
+    /// tracked as a last-op here.
+    lpid: u64,
 }
 
 #[cfg(feature = "linux-compat")]

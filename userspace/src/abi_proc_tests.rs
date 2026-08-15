@@ -1000,6 +1000,57 @@ kernel_test_in!(
     smoke_abi_proc_wait4_pgid_echild_when_group_empty
 );
 
+// #32: proc_task_info fills stat fields 7-8 (tty_nr/tpgid) from the task's
+// controlling terminal + its foreground pgrp (translated), not hardcoded 0 0.
+fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
+    with_setup(|| {
+        const T_TASK: u64 = 0x7400_0000;
+        const T_PID: u64 = 0x7400_1000;
+        const LEADER_TASK: u64 = 0x7400_0101; // console fg pgrp (task-space)
+        const LEADER_PID: u64 = 0x7400_1101;
+        const CONSOLE_DEV: u64 = (5 << 8) | 1;
+
+        for (t, p) in [(T_TASK, T_PID), (LEADER_TASK, LEADER_PID)] {
+            crate::task::release_task(t);
+            let _ = crate::task::Task::new_registered(t, p);
+            crate::handlers::register_task_to_pid(t, p);
+            crate::handlers::register_pid_task_mapping(p, t);
+        }
+        let saved_fg = narf_filesystem::console_tty::fg_pgrp();
+        let result = (|| {
+            set_task(T_TASK);
+            // T's controlling terminal is the console; its fg pgrp is LEADER.
+            crate::handlers::set_controlling_tty_console(T_TASK);
+            narf_filesystem::console_tty::set_fg_pgrp(LEADER_TASK);
+            let info = crate::handlers::proc_task_info(T_PID)
+                .ok_or("proc_task_info returned None for a live task")?;
+            if info.tty_nr != CONSOLE_DEV {
+                return Err("tty_nr was not the console device (5,1) for a console-ctty task");
+            }
+            // tpgid is the fg pgrp rendered in the reader's ns (root ns here →
+            // the leader's outer pid), NOT the raw task-space id or 0.
+            if info.tpgid != LEADER_PID as i64 {
+                return Err("tpgid was not the fg pgrp's visible pid (pgid_to_user missing)");
+            }
+            // Detached from the controlling tty → tty_nr 0, tpgid -1 (Linux).
+            crate::handlers::detach_controlling_tty(T_TASK);
+            let info2 = crate::handlers::proc_task_info(T_PID)
+                .ok_or("proc_task_info returned None after detach")?;
+            if info2.tty_nr != 0 || info2.tpgid != -1 {
+                return Err("a task with no controlling tty must render tty_nr 0, tpgid -1");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        narf_filesystem::console_tty::set_fg_pgrp(saved_fg);
+        for t in [T_TASK, LEADER_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_stat_tty_fields_from_ctty);
+
 // ── fork(2) / vfork(2) — no live address space in the harness ──
 
 fn smoke_abi_proc_fork_neg() -> TestResult {
