@@ -249,11 +249,33 @@ pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
             if let Some(inner) = ns.outer_to_inner(outer_pid) {
                 inner
             } else {
-                // Some callers pass the caller's own TaskId in the `outer_pid`
-                // slot; accept a direct TaskId→inner binding too.
-                // If that is not mapped either, Linux reports 0 for an
-                // ancestor or un-nested peer rather than leaking a host pid.
-                ns.outer_to_inner(task).unwrap_or_default()
+                // The fallback exists for callers that pass the caller's own
+                // TaskId (or its own outer pid, registered under a TaskId key)
+                // in the `outer_pid` slot — SELF-queries like getpid.
+                //
+                // As a GENERAL miss-fallback it FABRICATED identities: it
+                // retried the lookup with the OBSERVER'S TaskId as the key, and
+                // TaskIds and outer pids share the same small integers in a real
+                // boot. So whenever any process happened to be registered under
+                // an outer pid numerically equal to the observer's TaskId, EVERY
+                // unmapped pid translated to that process's inner pid. For udev
+                // that makes `hashmap_get(manager->workers, &sender)` find a
+                // valid-but-wrong worker, and `on_worker_notify` then detaches
+                // or asserts on the wrong worker's event (the
+                // `assert(worker->event)` abort at udev-manager.c:1199) — with
+                // no warning anywhere, because the borrowed identity is a real
+                // registered worker.
+                //
+                // Linux renders a pid that is not mapped into the observer's
+                // namespace as 0 (credential/peer-pid queries); never as
+                // someone else.
+                let is_self_query =
+                    outer_pid == task || crate::handlers::task_to_pid_raw(task) == Some(outer_pid);
+                if is_self_query {
+                    ns.outer_to_inner(task).unwrap_or_default()
+                } else {
+                    0
+                }
             }
         }
         None => outer_pid,

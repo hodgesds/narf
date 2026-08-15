@@ -5,6 +5,23 @@ use super::*;
 /// pending-signal model is a per-task bitmask, so the accompanying
 /// `siginfo_t` payload isn't preserved, but the signal is delivered
 /// exactly like `kill(2)`/`tkill(2)`.
+///
+/// `pid` is interpreted in the CALLER's PID namespace, exactly like
+/// `kill(2)`: Linux `kernel/signal.c` routes `do_rt_sigqueueinfo` →
+/// `kill_proc_info` → `find_task_by_vpid`, i.e. a *virtual* pid lookup in
+/// the caller's namespace. Delivery here is keyed on the OUTER pid, so the
+/// argument must be translated first (see `sys_kill`).
+///
+/// Why this is load-bearing: systemd runs under `unshare --pid`, and its
+/// udevd manager acks every worker's INOTIFY_WATCH_ADD/REMOVE notification
+/// with `sigqueue(inner_pid, SIGUSR1)` — the PidRef carries no pidfd
+/// (NARF attaches no SCM_PIDFD), so it lands here. Untranslated, the inner
+/// pid is used as an outer pid and the signal goes to whatever process owns
+/// that number in the OUTER pid space — and small numbers are ALWAYS owned
+/// (early boot processes). The call still returns 0, so nothing is logged
+/// anywhere: the manager believes it acked, the worker waits forever for an
+/// ack that went to a stranger, never goes idle, is never reused, and the
+/// manager forks fresh workers up to the `children_max=18` ceiling.
 pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let sig = a.arg1 as u32;
@@ -12,7 +29,21 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    let target = pid_to_task_raw(a.arg0).unwrap_or(a.arg0);
+    #[allow(unused_mut)]
+    let mut pid = a.arg0;
+    #[cfg(feature = "container")]
+    {
+        match crate::pid_ns::resolve_inner_pid(current_task_id(), pid) {
+            Some(outer) => pid = outer,
+            None => {
+                // Not bound in the caller's namespace → ESRCH, never a
+                // same-numbered process from another namespace.
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+                return;
+            }
+        }
+    }
+    let target = pid_to_task_raw(pid).unwrap_or(pid);
     // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
     if !signal_target_exists(target) {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
