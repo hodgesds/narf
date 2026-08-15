@@ -1125,6 +1125,33 @@ impl SocketFile {
                 self.netlink_peer_groups.load(Ordering::Acquire),
             )
         });
+        // Debug-feature only: udev's manager hands each device to a specific
+        // worker by netlink UNICAST to that worker's autobound portid
+        // (`device_monitor_send(monitor, &worker->address, dev)`). Log EVERY
+        // send's resolved destination, including the (0,0) case that falls
+        // through to "accept and discard" — a device silently dropped there
+        // reaches no worker at all, and a device delivered to the wrong
+        // worker makes that worker process an event it was never assigned,
+        // which is what `assert(worker->event)` catches.
+        #[cfg(feature = "unix-latency-trace")]
+        {
+            use core::fmt::Write as _;
+            static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                let task = crate::handlers::current_task_id();
+                let comm = crate::handlers::proc_comm_of_task(task).unwrap_or_default();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  nl-send: tid={} comm={} proto={} to_port={} to_groups={} len={}",
+                    task,
+                    comm,
+                    self.protocol,
+                    destination.0,
+                    destination.1,
+                    buf.len()
+                );
+            }
+        }
         if destination == (0, 0) {
             return None;
         }
