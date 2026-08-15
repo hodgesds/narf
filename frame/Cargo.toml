@@ -267,6 +267,7 @@ kernel-test  = [
     "narf-pwm/kernel-test",
     "narf-drivers-leds/kernel-test",
     "narf-drivers-backlight/kernel-test",
+    "narf-drivers-fs-btrfs/kernel-test",
     "narf-pmbus/kernel-test",
     "narf-spdm/kernel-test",
     "narf-scmi/kernel-test",

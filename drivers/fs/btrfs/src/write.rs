@@ -3971,6 +3971,7 @@ fn subvol_root_item(
 /// Create an empty subvolume below `parent_ino`, atomically COWing the parent
 /// tree, new child tree, UUID tree, root tree and extent/free-space metadata.
 /// Returns the new subvolume's tree objectid.
+#[cfg(feature = "kernel-test")]
 pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,

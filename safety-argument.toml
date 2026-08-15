@@ -9,6 +9,10 @@ argument = "The only frame/ change forwards the existing kernel-test feature to 
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The frame manifest only forwards the existing kernel-test build feature to the untrusted Btrfs driver so its distributed tests and embedded fixtures are linked exclusively into verification kernels. Production frame code, authority, domain transitions, mappings, capabilities, scheduling state, and the TCB boundary are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The frame edit only forwards the interrupted instruction pointer already present in its trap frame into the existing IRQ dispatcher; it adds no new TCB member or authority."
 
 [[invariants_preserved]]

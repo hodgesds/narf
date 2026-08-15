@@ -3,21 +3,22 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
-extern crate alloc;
-
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     cstr16, entry, guid,
+    mem::memory_map::MemoryMap,
     prelude::Status,
+    proto::media::file::{File, FileAttribute, FileMode, RegularFile},
     system,
 };
 
 const PAGE_SIZE: u64 = 4096;
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
+const MAX_PROGRAM_HEADERS: usize = 64;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const EM_AARCH64: u16 = 183;
@@ -39,6 +40,35 @@ struct LoadSegment {
     file_size: u64,
     memory_size: u64,
     flags: u32,
+}
+
+const EMPTY_LOAD_SEGMENT: LoadSegment = LoadSegment {
+    file_offset: 0,
+    physical: 0,
+    file_size: 0,
+    memory_size: 0,
+    flags: 0,
+};
+
+#[derive(Clone, Copy)]
+struct ElfHeader {
+    entry: u64,
+    program_headers_offset: u64,
+    program_headers_count: usize,
+}
+
+struct ParsedElf {
+    entry: u64,
+    segments: [LoadSegment; MAX_PROGRAM_HEADERS],
+    segment_count: usize,
+    load_start: u64,
+    load_end: u64,
+}
+
+impl ParsedElf {
+    fn segments(&self) -> &[LoadSegment] {
+        &self.segments[..self.segment_count]
+    }
 }
 
 #[derive(Debug)]
@@ -97,17 +127,43 @@ fn load_and_start() -> Result<(), LoadError> {
     let dtb_size = validate_dtb_header(dtb_header)?;
     let dtb_end = dtb.checked_add(dtb_size).ok_or(LoadError::Arithmetic)?;
 
-    let kernel = {
-        let protocol =
-            boot::get_image_file_system(boot::image_handle()).map_err(|_| LoadError::FileSystem)?;
-        let mut fs = uefi::fs::FileSystem::new(protocol);
-        fs.read(cstr16!(r"\boot\narf-frame"))
-            .map_err(|_| LoadError::FileSystem)?
-    };
+    // Stream the kernel instead of reading the whole ELF into a pool-backed
+    // Vec. A large pool allocation may occupy pages inside the kernel's fixed
+    // physical load range, making AllocateAddress fail even when enough RAM is
+    // otherwise free.
+    let mut protocol =
+        boot::get_image_file_system(boot::image_handle()).map_err(|_| LoadError::FileSystem)?;
+    let mut root = protocol.open_volume().map_err(|_| LoadError::FileSystem)?;
+    let mut kernel = root
+        .open(
+            cstr16!(r"\boot\narf-frame"),
+            FileMode::Read,
+            FileAttribute::empty(),
+        )
+        .map_err(|_| LoadError::FileSystem)?
+        .into_regular_file()
+        .ok_or(LoadError::FileSystem)?;
+    kernel
+        .set_position(RegularFile::END_OF_FILE)
+        .map_err(|_| LoadError::FileSystem)?;
+    let kernel_size = kernel.get_position().map_err(|_| LoadError::FileSystem)?;
 
-    let (entry, segments, load_start, load_end) = parse_elf(&kernel)?;
-    let page_start = align_down(load_start, PAGE_SIZE);
-    let page_end = align_up(load_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
+    let mut elf_header = [0u8; ELF_HEADER_SIZE];
+    read_exact_at(&mut kernel, 0, &mut elf_header)?;
+    let header = parse_elf_header(&elf_header, kernel_size)?;
+    let table_size = PROGRAM_HEADER_SIZE
+        .checked_mul(header.program_headers_count)
+        .ok_or(LoadError::Arithmetic)?;
+    let mut program_headers = [0u8; PROGRAM_HEADER_SIZE * MAX_PROGRAM_HEADERS];
+    read_exact_at(
+        &mut kernel,
+        header.program_headers_offset,
+        &mut program_headers[..table_size],
+    )?;
+    let elf = parse_program_headers(&header, &program_headers[..table_size], kernel_size)?;
+
+    let page_start = align_down(elf.load_start, PAGE_SIZE);
+    let page_end = align_up(elf.load_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
     if page_end - page_start > MAX_KERNEL_LOAD_SPAN
         || ranges_overlap(page_start as usize, page_end as usize, dtb, dtb_end)
     {
@@ -120,32 +176,54 @@ fn load_and_start() -> Result<(), LoadError> {
         MemoryType::LOADER_DATA,
         pages,
     )
-    .map_err(|_| LoadError::Allocation)?;
+    .map_err(|_| {
+        if let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) {
+            for descriptor in map.entries() {
+                let end = descriptor
+                    .phys_start
+                    .saturating_add(descriptor.page_count.saturating_mul(PAGE_SIZE));
+                if descriptor.phys_start < page_end && page_start < end {
+                    uefi::println!(
+                        "NARF UEFI loader: map {:?} {:#x}-{:#x}",
+                        descriptor.ty,
+                        descriptor.phys_start,
+                        end
+                    );
+                }
+            }
+        }
+        LoadError::Allocation
+    })?;
     if allocation.as_ptr() as u64 != page_start {
         return Err(LoadError::Allocation);
     }
 
-    // SAFETY: the exact page range was allocated above and is exclusively
-    // owned by this loader until control transfers to the kernel.
-    unsafe { ptr::write_bytes(allocation.as_ptr(), 0, pages * PAGE_SIZE as usize) };
-    for segment in segments {
-        let source_start =
-            usize::try_from(segment.file_offset).map_err(|_| LoadError::Arithmetic)?;
+    for segment in elf.segments() {
         let source_len = usize::try_from(segment.file_size).map_err(|_| LoadError::Arithmetic)?;
-        let source_end = source_start
-            .checked_add(source_len)
-            .ok_or(LoadError::Arithmetic)?;
-        let source = kernel
-            .get(source_start..source_end)
-            .ok_or(LoadError::InvalidElf)?;
-        // SAFETY: parse_elf proved every segment lies in the allocated range,
-        // and source is a live slice of exactly p_filesz bytes.
+        let zero_len = usize::try_from(segment.memory_size - segment.file_size)
+            .map_err(|_| LoadError::Arithmetic)?;
+        // SAFETY: parse_program_headers proved every segment lies in the
+        // allocated range, which remains exclusively owned by this loader.
+        let destination =
+            unsafe { slice::from_raw_parts_mut(segment.physical as *mut u8, source_len) };
+        read_exact_at(&mut kernel, segment.file_offset, destination)?;
+        // ELF requires only the p_memsz - p_filesz tail to be zero. Clearing
+        // that tail after the direct read avoids writing every file-backed
+        // byte twice and leaves alignment holes untouched.
+        // SAFETY: p_filesz <= p_memsz and the complete segment was validated
+        // inside the exclusively allocated physical load range.
         unsafe {
-            ptr::copy_nonoverlapping(source.as_ptr(), segment.physical as *mut u8, source.len())
+            ptr::write_bytes(
+                (segment.physical + segment.file_size) as *mut u8,
+                0,
+                zero_len,
+            )
         };
     }
 
     drop(kernel);
+    drop(root);
+    drop(protocol);
     // SAFETY: filesystem protocols and all pool-backed objects were dropped;
     // loaded pages and the firmware-owned DTB intentionally remain live.
     let memory_map = unsafe { boot::exit_boot_services(None) };
@@ -153,13 +231,14 @@ fn load_and_start() -> Result<(), LoadError> {
 
     // The NARF aarch64 entry follows the Linux boot protocol: x0 is the
     // physical DTB address and execution begins at the ELF entry at EL1.
-    // SAFETY: parse_elf required entry to be inside an executable PT_LOAD
+    // SAFETY: parse_program_headers required entry to be inside an executable PT_LOAD
     // segment copied to its declared physical address.
-    let kernel_entry: extern "C" fn(usize) -> ! = unsafe { core::mem::transmute(entry as usize) };
+    let kernel_entry: extern "C" fn(usize) -> ! =
+        unsafe { core::mem::transmute(elf.entry as usize) };
     kernel_entry(dtb)
 }
 
-fn parse_elf(bytes: &[u8]) -> Result<(u64, alloc::vec::Vec<LoadSegment>, u64, u64), LoadError> {
+fn parse_elf_header(bytes: &[u8], file_size: u64) -> Result<ElfHeader, LoadError> {
     if bytes.len() < ELF_HEADER_SIZE
         || bytes.get(0..4) != Some(b"\x7fELF")
         || bytes[4] != 2
@@ -176,24 +255,41 @@ fn parse_elf(bytes: &[u8]) -> Result<(u64, alloc::vec::Vec<LoadSegment>, u64, u6
     let phoff = read_u64(bytes, 32)?;
     let phentsize = read_u16(bytes, 54)? as usize;
     let phnum = read_u16(bytes, 56)? as usize;
-    if phentsize != PROGRAM_HEADER_SIZE || phnum == 0 {
+    if phentsize != PROGRAM_HEADER_SIZE || phnum == 0 || phnum > MAX_PROGRAM_HEADERS {
         return Err(LoadError::InvalidElf);
     }
-    let table_start = usize::try_from(phoff).map_err(|_| LoadError::Arithmetic)?;
-    let table_size = phentsize.checked_mul(phnum).ok_or(LoadError::Arithmetic)?;
-    let table_end = table_start
-        .checked_add(table_size)
+    let table_size = u64::try_from(phentsize.checked_mul(phnum).ok_or(LoadError::Arithmetic)?)
+        .map_err(|_| LoadError::Arithmetic)?;
+    let table_end = phoff.checked_add(table_size).ok_or(LoadError::Arithmetic)?;
+    if table_end > file_size {
+        return Err(LoadError::InvalidElf);
+    }
+    Ok(ElfHeader {
+        entry,
+        program_headers_offset: phoff,
+        program_headers_count: phnum,
+    })
+}
+
+fn parse_program_headers(
+    header: &ElfHeader,
+    bytes: &[u8],
+    file_size: u64,
+) -> Result<ParsedElf, LoadError> {
+    let expected_size = PROGRAM_HEADER_SIZE
+        .checked_mul(header.program_headers_count)
         .ok_or(LoadError::Arithmetic)?;
-    if table_end > bytes.len() {
+    if bytes.len() != expected_size {
         return Err(LoadError::InvalidElf);
     }
 
-    let mut segments = alloc::vec::Vec::new();
+    let mut segments = [EMPTY_LOAD_SEGMENT; MAX_PROGRAM_HEADERS];
+    let mut segment_count = 0usize;
     let mut load_start = u64::MAX;
     let mut load_end = 0u64;
     let mut entry_is_executable = false;
-    for index in 0..phnum {
-        let offset = table_start + index * phentsize;
+    for index in 0..header.program_headers_count {
+        let offset = index * PROGRAM_HEADER_SIZE;
         if read_u32(bytes, offset)? != PT_LOAD {
             continue;
         }
@@ -218,33 +314,78 @@ fn parse_elf(bytes: &[u8]) -> Result<(u64, alloc::vec::Vec<LoadSegment>, u64, u6
             .file_offset
             .checked_add(segment.file_size)
             .ok_or(LoadError::Arithmetic)?;
-        if file_end > bytes.len() as u64 {
+        if file_end > file_size {
             return Err(LoadError::InvalidElf);
         }
         let memory_end = segment
             .physical
             .checked_add(segment.memory_size)
             .ok_or(LoadError::Arithmetic)?;
-        if segment.flags & PF_X != 0 && entry >= segment.physical && entry < memory_end {
+        if segment.flags & PF_X != 0
+            && header.entry >= segment.physical
+            && header.entry < memory_end
+        {
             entry_is_executable = true;
         }
         load_start = load_start.min(segment.physical);
         load_end = load_end.max(memory_end);
-        segments.push(segment);
+        segments[segment_count] = segment;
+        segment_count += 1;
     }
-    if segments.is_empty() || !entry_is_executable {
+    if segment_count == 0 || !entry_is_executable {
         return Err(LoadError::InvalidElf);
     }
-    for (index, left) in segments.iter().enumerate() {
+    for (index, left) in segments[..segment_count].iter().enumerate() {
         let left_end = left.physical + left.memory_size;
-        for right in &segments[index + 1..] {
+        for right in &segments[index + 1..segment_count] {
             let right_end = right.physical + right.memory_size;
             if left.physical < right_end && right.physical < left_end {
                 return Err(LoadError::InvalidElf);
             }
         }
     }
-    Ok((entry, segments, load_start, load_end))
+    Ok(ParsedElf {
+        entry: header.entry,
+        segments,
+        segment_count,
+        load_start,
+        load_end,
+    })
+}
+
+#[cfg(test)]
+fn parse_elf(bytes: &[u8]) -> Result<ParsedElf, LoadError> {
+    let file_size = u64::try_from(bytes.len()).map_err(|_| LoadError::Arithmetic)?;
+    let header = parse_elf_header(bytes, file_size)?;
+    let table_start =
+        usize::try_from(header.program_headers_offset).map_err(|_| LoadError::Arithmetic)?;
+    let table_size = PROGRAM_HEADER_SIZE
+        .checked_mul(header.program_headers_count)
+        .ok_or(LoadError::Arithmetic)?;
+    let table_end = table_start
+        .checked_add(table_size)
+        .ok_or(LoadError::Arithmetic)?;
+    let table = bytes
+        .get(table_start..table_end)
+        .ok_or(LoadError::InvalidElf)?;
+    parse_program_headers(&header, table, file_size)
+}
+
+fn read_exact_at(
+    file: &mut RegularFile,
+    offset: u64,
+    mut destination: &mut [u8],
+) -> Result<(), LoadError> {
+    file.set_position(offset)
+        .map_err(|_| LoadError::FileSystem)?;
+    while !destination.is_empty() {
+        let read = file.read(destination).map_err(|_| LoadError::FileSystem)?;
+        if read == 0 {
+            return Err(LoadError::FileSystem);
+        }
+        destination = &mut destination[read..];
+    }
+    Ok(())
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, LoadError> {
@@ -299,9 +440,10 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use std::vec;
+    use std::vec::Vec;
 
-    fn valid_elf() -> alloc::vec::Vec<u8> {
+    fn valid_elf() -> Vec<u8> {
         let mut bytes = vec![0u8; ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE + 4];
         bytes[0..4].copy_from_slice(b"\x7fELF");
         bytes[4] = 2;
@@ -329,11 +471,11 @@ mod tests {
 
     #[test]
     fn accepts_aarch64_load_segment_and_bss() {
-        let (entry, segments, start, end) = parse_elf(&valid_elf()).unwrap();
-        assert_eq!(entry, 0x4008_0000);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(start, 0x4008_0000);
-        assert_eq!(end, 0x4008_0008);
+        let elf = parse_elf(&valid_elf()).unwrap();
+        assert_eq!(elf.entry, 0x4008_0000);
+        assert_eq!(elf.segments().len(), 1);
+        assert_eq!(elf.load_start, 0x4008_0000);
+        assert_eq!(elf.load_end, 0x4008_0008);
     }
 
     #[test]
@@ -355,6 +497,13 @@ mod tests {
     fn rejects_entry_outside_executable_segment() {
         let mut bytes = valid_elf();
         bytes[24..32].copy_from_slice(&0x5000_0000u64.to_le_bytes());
+        assert!(matches!(parse_elf(&bytes), Err(LoadError::InvalidElf)));
+    }
+
+    #[test]
+    fn rejects_unbounded_program_header_table() {
+        let mut bytes = valid_elf();
+        bytes[56..58].copy_from_slice(&((MAX_PROGRAM_HEADERS + 1) as u16).to_le_bytes());
         assert!(matches!(parse_elf(&bytes), Err(LoadError::InvalidElf)));
     }
 

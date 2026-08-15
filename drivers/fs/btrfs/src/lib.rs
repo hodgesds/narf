@@ -40,6 +40,7 @@ pub mod volume;
 pub mod write;
 
 mod raid56;
+#[cfg(feature = "kernel-test")]
 mod tests;
 
 /// Register both the root auto-mount factory (used when `fs_detect` finds a

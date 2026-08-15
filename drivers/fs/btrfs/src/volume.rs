@@ -427,6 +427,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Translate a logical address to its primary and optional single-device
     /// DUP copy.
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn map_logical_copies(&self, logical: u64) -> Result<(u64, Option<u64>), FsError> {
         self.state.lock().chunk_map.map_logical_copies(logical)
     }
