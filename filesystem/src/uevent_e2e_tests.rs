@@ -982,7 +982,7 @@ fn smoke_uevent_boot_replay_preserves_earliest_projection() -> TestResult {
     if block_start != drm_start {
         return TestResult::Fail("later projection advanced the boot replay boundary");
     }
-    let events = uevent::boot_udevd_replay_reader().drain(8);
+    let events = uevent::boot_udevd_replay_reader_once(0, "systemd-udevd").drain(8);
     if events.len() != 2 || events[0].subsystem != "drm" || events[1].subsystem != "block" {
         return TestResult::Fail("boot replay did not retain DRM followed by block ADD");
     }
@@ -1005,7 +1005,7 @@ kernel_test_in!(
 //
 // This is systemd-udevd's exact shape and it is not covered by smoke 8.
 // udevd's netlink socket is created by PID 1 for `systemd-udevd-kernel.socket`
-// and positioned with `boot_udevd_replay_reader()` — an ABSOLUTE seqnum
+// and positioned with `boot_udevd_replay_reader_once()` — an ABSOLUTE seqnum
 // captured near the start of boot. Smoke 8 reads through `from_start()`,
 // which repositions onto the oldest survivor by construction and therefore
 // cannot observe this at all.
@@ -1050,7 +1050,7 @@ fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult
     }
 
     // udevd finally starts and takes the boot-replay cursor.
-    let mut reader = uevent::boot_udevd_replay_reader();
+    let mut reader = uevent::boot_udevd_replay_reader_once(0, "systemd-udevd");
     let events = reader.drain(uevent::UEVENT_RING_N * 2);
 
     // The cursor is genuinely below every surviving seqnum — that is what

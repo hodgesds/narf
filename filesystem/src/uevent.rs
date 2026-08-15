@@ -317,16 +317,43 @@ pub fn begin_boot_udevd_replay() -> u64 {
     }
 }
 
-/// Reader for the bounded boot coldplug window.
+/// Consumers that have already been handed the bounded boot-coldplug window.
+///
+/// Keyed by `(task, comm)` rather than globally, because the window has two
+/// legitimate independent consumers — PID 1's device manager and
+/// `systemd-udevd` — that each need it exactly once. The comm is part of the
+/// key because it is already how NARF decides who is privileged to receive
+/// the replay at all; scoping the grant the same way it is decided keeps the
+/// two from being answerable separately. A RESTARTED udevd is a new task that
+/// genuinely missed everything, so it is granted the window again.
+static BOOT_REPLAY_GRANTED: IrqSafeSpinLock<Option<alloc::collections::BTreeSet<(u64, String)>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Reader for the bounded boot coldplug window, granted at most ONCE per task.
 ///
 /// If boot did not mark such a window, retain ordinary tail-only netlink
 /// semantics instead of replaying arbitrary early bring-up events.
-pub fn boot_udevd_replay_reader() -> UeventReader {
+///
+/// The once-per-task rule is the load-bearing part. The replay exception
+/// exists so the FIRST monitor a consumer opens does not miss coldplug; every
+/// later monitor the same daemon opens is an ordinary tail consumer, exactly
+/// as on Linux, where `NETLINK_KOBJECT_UEVENT` is never replayed on bind.
+/// Without it, `systemd-udevd` — observed opening 18 monitors from one task on
+/// the Fedora gate — is handed the same ADDs over and over. Re-delivering
+/// stale ADDs to a monitor that did not ask for them is not hypothetical here:
+/// it is what tore down weston's already-created input devices until that
+/// monitor was fixed to tail-start (888c26d7).
+pub fn boot_udevd_replay_reader_once(task: u64, consumer: &str) -> UeventReader {
     let start = BOOT_UDEVD_REPLAY_START.load(Ordering::Acquire) as u64;
     if start == 0 {
-        UeventReader::new()
-    } else {
+        return UeventReader::new();
+    }
+    let mut g = BOOT_REPLAY_GRANTED.lock();
+    let granted = g.get_or_insert_with(alloc::collections::BTreeSet::new);
+    if granted.insert((task, String::from(consumer))) {
         UeventReader { next_seqnum: start }
+    } else {
+        UeventReader::new()
     }
 }
 
@@ -435,4 +462,5 @@ pub fn __reset_for_test() {
     ring.entries.clear();
     ring.next_seqnum = 1;
     BOOT_UDEVD_REPLAY_START.store(0, Ordering::Release);
+    *BOOT_REPLAY_GRANTED.lock() = None;
 }

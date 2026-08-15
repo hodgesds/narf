@@ -843,10 +843,15 @@ impl SocketFile {
             // DEVPATH. The marker is set immediately before the canonical
             // block ADDs that satisfy fstab UUID dependencies.
             let task = crate::handlers::current_task_id();
-            let reader = if crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
-                || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
-            {
-                narf_filesystem::uevent::boot_udevd_replay_reader()
+            let comm = crate::handlers::proc_comm_of_task(task).unwrap_or_default();
+            let replay_eligible =
+                crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
+                    || crate::handlers::proc_comm_of_task_matches(task, "systemd$");
+            // Eligibility says WHO may replay; the grant is still once per
+            // consumer, so a daemon that opens many monitors replays on the
+            // first and tail-starts the rest.
+            let reader = if replay_eligible {
+                narf_filesystem::uevent::boot_udevd_replay_reader_once(task, &comm)
             } else {
                 narf_filesystem::uevent::UeventReader::new()
             };
@@ -857,15 +862,12 @@ impl SocketFile {
             #[cfg(feature = "unix-latency-trace")]
             {
                 use core::fmt::Write as _;
-                let comm = crate::handlers::proc_comm_of_task(task)
-                    .unwrap_or_else(|| alloc::string::String::from("?"));
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  uevent-sock: created tid={} comm={} replay={}",
+                    "  uevent-sock: created tid={} comm={} eligible={}",
                     task,
                     comm,
-                    crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
-                        || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
+                    replay_eligible
                 );
             }
             SocketState::NetlinkUevent { reader }
@@ -5303,6 +5305,70 @@ fn smoke_systemd_netlink_replays_boot_coldplug_only() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_systemd_netlink_replays_boot_coldplug_only
+);
+
+/// The bounded boot-coldplug replay is a ONE-SHOT handoff, not a property of
+/// being named `systemd-udevd`.
+///
+/// `SocketFile::new` decides replay-vs-tail purely from the creating task's
+/// comm, so every monitor a udevd-named task opens is handed the same boot
+/// window again. On the Fedora gate `systemd-udevd` was observed opening 18
+/// `NETLINK_KOBJECT_UEVENT` monitors from a single task, each `replay=true` —
+/// so the same coldplug ADDs are re-delivered to monitor after monitor while
+/// the daemon writes no database at all.
+///
+/// Re-delivering stale ADDs to a monitor that did not ask for them is a known
+/// hazard in this codebase, not a hypothetical: it is what tore down weston's
+/// already-created input devices until that monitor was fixed to tail-start
+/// (888c26d7). The replay exception exists so the FIRST consumer does not miss
+/// the window; a second monitor on the same daemon is an ordinary tail
+/// consumer, exactly like Linux, where `NETLINK_KOBJECT_UEVENT` is never
+/// replayed on bind.
+fn smoke_boot_coldplug_replay_is_granted_once_per_task() -> TestResult {
+    use crate::handlers::{current_task_id, set_proc_comm};
+
+    narf_filesystem::uevent::__reset_for_test();
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/platform/narf-drm/card0"),
+        alloc::string::String::from("drm"),
+    );
+
+    let task = current_task_id();
+    set_proc_comm(task, "systemd-udevd");
+
+    // First monitor: gets the bounded window, as designed.
+    let first = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let first_pending = match &*first.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.has_pending(),
+        _ => false,
+    };
+
+    // Second monitor, SAME task, no new events emitted in between. Linux
+    // would give it nothing: a fresh bind never replays.
+    let second = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let second_pending = match &*second.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.has_pending(),
+        _ => true,
+    };
+
+    narf_filesystem::uevent::__reset_for_test();
+    set_proc_comm(task, "");
+
+    if !first_pending {
+        return TestResult::Fail("first udevd monitor did not receive the boot coldplug window");
+    }
+    if second_pending {
+        return TestResult::Fail(
+            "second udevd monitor re-replayed the boot coldplug window instead of tail-starting",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_boot_coldplug_replay_is_granted_once_per_task
 );
 
 /// A userspace multicast send must REACH the group's subscribers.

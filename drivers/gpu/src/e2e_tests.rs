@@ -1392,7 +1392,7 @@ fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let events = uevent::boot_udevd_replay_reader().drain(8);
+    let events = uevent::boot_udevd_replay_reader_once(0, "systemd-udevd").drain(8);
     let card = events
         .iter()
         .position(|event| event.devpath.ends_with("/card0"));
