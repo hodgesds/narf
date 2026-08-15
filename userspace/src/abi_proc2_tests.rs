@@ -1437,3 +1437,66 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_process_vm_rejects_unmapped_inner_pid
 );
+
+// kill(-1) broadcasts to every process the caller may signal EXCEPT init and
+// itself — and Linux uses task_pid_vnr (0 for tasks invisible in the caller's
+// pid namespace), so a namespaced caller signals only processes in its own
+// namespace. The handler iterated the global pid table, so a containerized
+// kill(-1) would have signalled the entire host.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_kill_broadcast_respects_pid_ns_visibility() -> TestResult {
+    const SIGUSR1: u64 = 10;
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB500;
+        const MANAGER_PID: u64 = 0xB000;
+        const WORKER_TASK: u64 = 0xB501;
+        const WORKER_PID: u64 = 0xB001;
+        const OUTSIDER_TASK: u64 = 0xB502; // root-ns, NOT in the manager's ns
+        const OUTSIDER_PID: u64 = 0xB0F2;
+
+        crate::pid_ns::__test_reset();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(OUTSIDER_TASK, OUTSIDER_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
+                return Err("worker was not assigned inner pid 2");
+            }
+            // OUTSIDER deliberately NOT inherited: invisible in the manager's ns.
+
+            set_task(MANAGER_TASK);
+            if call(Syscall::Kill.raw(), a1((-1i64) as u64, SIGUSR1)) != Some(0) {
+                return Err("kill(-1, SIGUSR1) did not report success");
+            }
+            let worker =
+                crate::handlers::signal_pending_of(WORKER_TASK) & (1u64 << (SIGUSR1 - 1)) != 0;
+            let outsider =
+                crate::handlers::signal_pending_of(OUTSIDER_TASK) & (1u64 << (SIGUSR1 - 1)) != 0;
+            if outsider {
+                return Err("kill(-1) signalled a process OUTSIDE the caller's pid namespace — host broadcast");
+            }
+            if !worker {
+                return Err("kill(-1) did not reach a process inside the caller's namespace");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        for t in [MANAGER_TASK, WORKER_TASK, OUTSIDER_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_kill_broadcast_respects_pid_ns_visibility
+);

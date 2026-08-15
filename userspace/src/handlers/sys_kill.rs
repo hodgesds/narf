@@ -69,15 +69,32 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             }
         }
         -1 => {
-            // Broadcast: every process with a registered pid except
-            // init (pid 1) and the caller itself, per Linux.
+            // Broadcast: every process the caller may signal, except init and
+            // itself. Linux walks for_each_process and uses task_pid_vnr,
+            // which is 0 for tasks INVISIBLE in the caller's pid namespace, so
+            // it signals only processes visible there. Without the ns filter a
+            // containerized kill(-1) broadcasts to the entire host.
             let self_tid = current_task_id();
             let targets: alloc::vec::Vec<(u64, u64)> = {
                 let g = PID_TO_TASK.lock();
                 g.as_ref()
                     .map(|m| {
                         m.iter()
-                            .filter(|&(&p, &t)| p != 1 && t != self_tid)
+                            .filter(|&(&p, &t)| {
+                                if t == self_tid {
+                                    return false;
+                                }
+                                #[cfg(feature = "container")]
+                                {
+                                    // Visible in the caller's ns and not init.
+                                    crate::pid_ns::ns_visible_inner(self_tid, p)
+                                        .is_some_and(|inner| inner > 1)
+                                }
+                                #[cfg(not(feature = "container"))]
+                                {
+                                    p != 1
+                                }
+                            })
                             .map(|(&p, &t)| (p, t))
                             .collect()
                     })
