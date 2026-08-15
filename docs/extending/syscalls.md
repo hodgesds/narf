@@ -237,6 +237,7 @@ site in the assembly sequence.
   without setting a value leaves stale registers.
 - `value` → RAX/X0, `status` → RDX/X1. Encode errno-style failures in the
   handler per the existing handlers' convention (negative values / status).
-- Handlers run in the syscall path — the fd-table lock-reentrancy rule from
-  [filesystem.md](filesystem.md) applies here too (`sys_read` holds the
-  fd-table lock across `ops.read`; don't re-enter it from a `FileOps` impl).
+- Handlers run in the syscall path. When dispatching to `FileOps`/`DirOps`,
+  follow the lock-ordering rule from [filesystem.md](filesystem.md): clone the
+  object and handle state under the fd-table lock, release it, then invoke the
+  filesystem callback.

@@ -1,6 +1,6 @@
 [package]
 name = "narf-drivers-fs-btrfs"
-description = "Partial verified-read and copy-on-write btrfs filesystem driver."
+description = "Single-device read-write btrfs filesystem driver with COW and snapshots."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

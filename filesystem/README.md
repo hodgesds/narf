@@ -2,11 +2,13 @@
 
 NARF's VFS. Capability-addressed nodes (no ambient namespace),
 async path resolution, mount tree, per-task roots, file-as-a-cap.
-Concrete filesystems (virtiofs, ext4-ish, initramfs) plug in under
-`drivers/fs/` and are glued here.
+In-memory and synthetic filesystems live here; block/network-backed drivers
+under `drivers/fs/` include ext2, FAT/exFAT, 9p, ISO 9660, UDF, SquashFS,
+Minix, ext4, and the single-device read-write btrfs implementation.
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
 - Testing requirements (conformance checklist every FS must satisfy):
   [`specification/testing-requirements.md`](./specification/testing-requirements.md)
 - Research: [`research/README.md`](./research/README.md)
-- Stage: 3 (VFS core + in-memory FS) → 4 (virtiofs, persistent FS, caching).
+- Stage: 3 (VFS core + in-memory FS) → 4 (persistent/remote drivers, Linux
+  compatibility, and caching).

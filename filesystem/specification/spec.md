@@ -23,7 +23,7 @@
 
 **Does NOT own:**
 
-- Concrete on-disk formats (ext-like, FAT, virtiofs) — those live in
+- Concrete on-disk formats (ext-like, btrfs, FAT, virtiofs) — those live in
   `drivers/fs/<name>/`.
 - Block layer — `block/`.
 - Process-scoped "current directory" — that's a `userspace/` concept
@@ -722,8 +722,8 @@ Arch-neutral at the spec level. Two arch-touches:
 | Stage | Lands                                                               |
 | ----- | ------------------------------------------------------------------- |
 | 3     | VFS core (trait, resolution, open/read/write/stat), initramfs in-memory FS, virtiofs glue skeleton. |
-| 4     | virtiofs driver, simple persistent FS (candidate: a Rust-native fs — littlefs-ish or a NARF-specific design), unified page cache, rename/link, `crypto/` integrity option. |
-| post-1.0 | Copy-on-write filesystems, snapshots, quotas, ACL-like caps.      |
+| 4     | virtiofs and persistent compatibility drivers (including ext2 and single-device btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
+| post-1.0 | NARF-native filesystem, quotas, ACL-like caps, and broader on-disk-format coverage. |
 
 ## 8. Resolved decisions
 
@@ -750,8 +750,11 @@ narffs is a copy-on-write FS with:
 - B-tree-of-B-trees layout (Linux btrfs-shaped) for good
   scaling.
 
-ext4 / FAT / NTFS support comes later as separate
-read-write driver crates implementing the same FS trait.
+**Implementation status:** narffs remains the native-format target, not the
+first persistent driver that landed. Compatibility drivers now implement ext2,
+FAT-family formats, and single-device read-write btrfs behind the same VFS
+traits. Btrfs supplies the currently implemented native snapshot backend;
+multi-device/RAID btrfs, quotas, and narffs remain future work.
 
 ### 8.2 POSIX semantics scope (resolved)
 

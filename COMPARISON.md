@@ -91,8 +91,12 @@ not to:
   NARF supports the ones we've written or ported. The wave-by-wave
   status in [`STATUS.md`](./STATUS.md) is up-to-date.
 - **Filesystem coverage**: ext2 (file-data write), exfat (bitmap +
-  cluster write), 9p, minix, iso9660 (RO), udf (RO). Missing: ext4
-  with journal, btrfs, xfs, zfs, NFS, SMB, FUSE.
+  cluster write), 9p, minix, iso9660/udf/SquashFS (RO), and read-write btrfs on
+  one device with SINGLE/DUP chunks, compression, alternate checksums,
+  subvolumes, and snapshots. Missing: ext4 with journal, multi-device/RAID
+  btrfs, xfs, zfs, NFS, and SMB; FUSE is available as the userspace escape
+  hatch. See the [Btrfs capability matrix](./drivers/fs/btrfs/README.md) for
+  precise on-disk and mutation limits.
 - **Networking depth**: NARF's kernel ships the frame-ring contract and
   per-NIC drivers. The TCP/IP stack lives in userspace (deliberate
   design choice — frees the kernel from socket buffer copies). Linux's

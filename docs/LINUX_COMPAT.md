@@ -420,11 +420,17 @@ full directory ops, per-file uid/gid/mode DAC.
 ### On-disk filesystems
 
 Per `COMPARISON.md`: **ext2** (file-data write), **exfat**, **9p**, **minix**,
-**iso9660** (RO), **udf** (RO), plus **FAT/vfat** for the ESP. **Bind mounts**
-work through VFS path resolution. Missing: ext4-with-journal, btrfs, xfs, zfs,
-NFS, SMB. (The `xtask disk-write-partitioned` path lays down a FAT32 ESP + ext4
+**iso9660**, **udf**, and **SquashFS** (RO), plus **FAT/vfat** for the ESP.
+**btrfs** is
+read-write for single-device SINGLE/DUP filesystems, including compressed
+reads, alternate checksums, subvolumes, snapshots, and COW namespace/file
+mutations; multi-device and RAID profiles remain unsupported. **Bind mounts**
+work through VFS path resolution. Missing: ext4-with-journal, xfs, zfs, NFS,
+and SMB. (The `xtask disk-write-partitioned` path lays down a FAT32 ESP + ext4
 root, but ext4 write support inside the kernel is **not** claimed here —
-**unverified**; treat kernel ext4 as read-path-only until confirmed.)
+**unverified**; treat kernel ext4 as read-path-only until confirmed.) The
+[Btrfs driver README](../drivers/fs/btrfs/README.md) is the authoritative
+capability and limitation matrix.
 
 FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 

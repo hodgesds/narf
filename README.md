@@ -224,7 +224,7 @@ narf/
 │
 │ ── Storage + filesystems ──
 ├── block/                      — Block-device trait + I/O scheduler
-├── filesystem/                 — VFS, mount tree, page cache, ext2, devpts
+├── filesystem/                 — VFS, mount tree, page cache, ext2/Btrfs, devpts
 │
 │ ── Userspace ──
 ├── userspace/                  — Process model, ELF loader, syscall surface

@@ -1,16 +1,15 @@
-//! Partial btrfs filesystem driver with verified reads and copy-on-write
-//! mutations for a selected writable subvolume.
+//! Clean-room read-write btrfs driver for single-device filesystems.
 //!
 //! The on-disk format is decoded per the authoritative kernel definitions in
-//! `/usr/src/linux/include/uapi/linux/btrfs_tree.h` and the read/COW call
-//! chains in `/usr/src/linux/fs/btrfs`. This is an independent Rust
+//! `include/uapi/linux/btrfs_tree.h` and the read/COW call chains in
+//! `fs/btrfs`. This is an independent Rust
 //! implementation; no C code is copied.
 //!
-//! Supported: single-device (SINGLE/DUP) volumes, all four btrfs checksum
-//! algorithms, compressed and uncompressed file reads, nested subvolume mounts,
-//! and a selected-checksum COW write path. Unsupported on-disk shapes are
-//! rejected precisely rather than mis-read. See the crate `README` for the full
-//! matrix.
+//! Supported: SINGLE/DUP chunk profiles, all four btrfs checksum algorithms,
+//! zlib/zstd/LZO and uncompressed reads, incremental COW writes, namespace
+//! mutations, nested writable subvolume mounts, and subvolume/snapshot ioctls.
+//! Unsupported on-disk shapes are rejected precisely rather than mis-read. See
+//! the crate `README` for the full matrix and limits.
 
 #![no_std]
 

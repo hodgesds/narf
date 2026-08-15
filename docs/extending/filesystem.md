@@ -14,7 +14,7 @@ global install slot — each mount owns its instance.
 
 ### `FsInstance` — the mount object
 
-`filesystem/src/lib.rs:782`
+Defined by `filesystem/src/lib.rs::FsInstance`.
 
 ```rust
 pub trait FsInstance: Send + Sync + 'static {
@@ -25,12 +25,12 @@ pub trait FsInstance: Send + Sync + 'static {
 }
 ```
 
-Both methods are **required**. That is the entire trait — a filesystem is
-just "give me your root directory and your name."
+Both methods are **required**. Optional methods expose a file-rooted bind
+mount, stable backing identity, `statfs`, and live reconfiguration.
 
 ### `DirOps` — directory operations
 
-`filesystem/src/lib.rs:678`
+Defined by `filesystem/src/lib.rs::DirOps`. The core shape is:
 
 ```rust
 pub trait DirOps: Send + Sync {
@@ -48,6 +48,8 @@ pub trait DirOps: Send + Sync {
         -> FsFuture<'a, Arc<dyn DirOps>>;    // default: wraps lookup_dir()
     fn enumerate_async<'a>(&'a self, cursor: usize, max: usize)
         -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>>;
+    fn snapshot_async<'a>(&'a self, source: Arc<dyn DirOps>, name: &'a str,
+        readonly: bool) -> FsFuture<'a, ()>;                         // default: Unsupported
     fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()>;          // default: Unsupported
     fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>>; // default: Unsupported
     fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>>;    // default: Unsupported
@@ -55,20 +57,22 @@ pub trait DirOps: Send + Sync {
     fn symlink<'a>(&'a self, _name: &'a str, _target: &'a str)
         -> FsFuture<'a, Arc<dyn FileOps>>;   // default: Unsupported
     fn rename<'a>(&'a self, _old: &'a str, _new: &'a str) -> FsFuture<'a, ()>; // default: Unsupported
+    fn rename_to<'a>(&'a self, old: &'a str, dst: &'a dyn DirOps,
+        new: &'a str, flags: u32) -> FsFuture<'a, ()>;               // default: Unsupported
+    fn link_to<'a>(&'a self, old: &'a str, dst: &'a dyn DirOps,
+        new: &'a str) -> FsFuture<'a, ()>;                           // default: Unsupported
 }
 ```
 
 Only `lookup` and `iter` are **required**. A read-only filesystem overrides
 nothing else — the default write methods all resolve to
-`FsError::Unsupported`. (Method line numbers, in order: `lookup` `:680`,
-`lookup_dir` `:687`, `iter` `:694`, `enumerate` `:706`, `lookup_async`
-`:723`, `lookup_dir_async` `:730`, `enumerate_async` `:736`, `unlink` `:747`,
-`create` `:752`, `mkdir` `:757`, `rmdir` `:762`, `symlink` `:768`, `rename`
-`:774`.)
+`FsError::Unsupported`. Disk-backed drivers normally implement matching sync
+and async lookup/enumeration plus whichever mutation methods they advertise;
+see the [filesystem conformance checklist](../../filesystem/specification/testing-requirements.md).
 
 ### `FileOps` — file operations
 
-`filesystem/src/lib.rs:346`
+Defined by `filesystem/src/lib.rs::FileOps`.
 
 ```rust
 pub trait FileOps: Send + Sync {
@@ -80,24 +84,27 @@ pub trait FileOps: Send + Sync {
 }
 ```
 
-`read` (`:351`), `write` (`:355`), and `stat` (`:359`) are **required**;
-everything else has a default. The defaults you are most likely to override:
+`read`, `write`, and `stat` are **required**; everything else has a default.
+The defaults you are most likely to override:
 
-| Method | Line | Default | When to override |
-| --- | --- | --- | --- |
-| `ino(&self) -> u64` | `:371` | `0` | give files stable inode numbers |
-| `truncate` | `:382` | `Unsupported` | resizable files |
-| `ioctl(&self, cmd, arg) -> Result<u64, FsError>` | `:461` | `Unsupported` | device-like nodes |
-| `poll_readiness(&self) -> u32` | `:411` | `POLL_IN\|POLL_OUT` | pollable streams |
-| `as_dir(&self) -> Option<Arc<dyn DirOps>>` | `:523` | `None` | a node that is also a directory |
-| `mmap_frames(&self, off, len) -> Result<Vec<u64>, FsError>` | `:485` | `Unsupported` | file-backed mmap |
-| `rdev(&self) -> u64` | `:532` | `0` | char/block device major:minor |
+| Method | Default | When to override |
+| --- | --- | --- |
+| `ino(&self) -> u64` | `0` | stable on-disk inode numbers |
+| `stat_async` / `statx_async` | sync stat / `Unsupported` | disk or remote metadata |
+| `truncate` | `Unsupported` | resizable files |
+| `fsync` / `syncfs` | success | durability barriers |
+| `ioctl_async` | `Unsupported` | remote/filesystem-specific ioctls |
+| `poll_readiness(&self) -> u32` | `POLL_IN\|POLL_OUT` | pollable streams |
+| `as_dir(&self) -> Option<Arc<dyn DirOps>>` | `None` | a node that is also a directory |
+| `mmap_frames` / `mmap_fault` | `Unsupported` | file/device-backed mmap |
+| `rdev(&self) -> u64` | `0` | char/block device major:minor |
 
 The remaining defaults (`owners`, `set_owners`, `set_perms`, `tty_*`,
 `pidfd_target_pid`, `mq_queue_id`, `inotify_instance`, `landlock_ruleset`,
-`as_any`, …, `:389`–`:648`) are integration hooks for specific kernel
-subsystems and default to a safe no-op/`None`; a plain filesystem ignores
-them.
+`as_any`, …) are integration hooks for specific kernel
+subsystems and default to a safe no-op, `None`, or `Unsupported`; a plain
+filesystem ignores them. Check the trait itself before implementing a driver:
+the compatibility surface grows as new syscalls land.
 
 `read` returns `Err(FsError::WouldBlock)` for a healthy open stream with no
 data available. `Ok(0)` is exclusively EOF; the syscall layer maps
@@ -106,16 +113,14 @@ data available. `Ok(0)` is exclusively EOF; the syscall layer maps
 ### Supporting types
 
 ```rust
-// filesystem/src/lib.rs:327
 pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Send + 'a>>;
 
-// filesystem/src/lib.rs:293
 pub enum FsError {
     NotFound, PermissionDenied, Io(BlockError), InvalidPath,
-    Busy, ReadOnly, NoSpace, Unsupported, InvalidData,
+    CrossDevice, Busy, ReadOnly, NoSpace, Unsupported, InvalidData,
+    BrokenPipe, BadFd, WouldBlock,
 }
 
-// filesystem/src/lib.rs:190
 pub struct Stat {
     pub size: u64,
     pub blocks: u64,
@@ -123,17 +128,15 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
-// filesystem/src/lib.rs:177
-pub enum FileType { File, Dir, Symlink, Special }
+pub enum FileType { File, Dir, Symlink, Special, Block, Socket, Fifo }
 ```
 
 ## The mount registry
 
-The registry is a single global `IrqSafeSpinLock<Vec<Mount>>`
-(`filesystem/src/lib.rs:1032`), reached through `registry()`:
+The shared registry is a control-plane `IrqSafeSpinLock<Vec<Mount>>`, reached
+through `registry()`:
 
 ```rust
-// filesystem/src/lib.rs:1038
 pub fn registry() -> &'static VfsRegistry;
 ```
 
@@ -141,24 +144,20 @@ Mounting is **capability-gated**. You need a `Cap<MountPoint, Grant>`, which
 the kernel mints once at boot:
 
 ```rust
-// filesystem/src/lib.rs:1165 — TCB-only; called once at boot.
 pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant>;
 ```
 
 `VfsRegistry` methods:
 
 ```rust
-// filesystem/src/lib.rs:1202 — mount a value you own by move
 pub fn mount<F: FsInstance>(
     &self, authority: &Cap<MountPoint, Grant>, path: &str, fs: F,
 ) -> Result<Cap<MountPoint, Write>, FsError>;
 
-// filesystem/src/lib.rs:1227 — mount a pre-boxed Arc<dyn FsInstance>
 pub fn mount_arc(
     &self, authority: &Cap<MountPoint, Grant>, path: &str, fs: Arc<dyn FsInstance>,
 ) -> Result<Cap<MountPoint, Write>, FsError>;
 
-// filesystem/src/lib.rs:1255 — bind an existing subtree to a second path
 pub fn bind_mount(
     &self, authority: &Cap<MountPoint, Grant>, source: &str, target: &str,
 ) -> Result<Cap<MountPoint, Write>, FsError>;
@@ -174,12 +173,10 @@ The returned `Cap<MountPoint, Write>` is the umount handle. A revoked
 best template to copy.
 
 - `struct MemFs { name: &'static str, root: Arc<MemDir> }`
-  (`memfs.rs:416`)
 - `struct MemDir { entries: IrqSafeSpinLock<BTreeMap<String, Entry>> }`
-  (`memfs.rs:250`)
-- `impl DirOps for MemDir` (`memfs.rs:262`) implements the full read/write
+- `impl DirOps for MemDir` implements the full read/write
   surface — a good example of overriding `create`/`mkdir`/`unlink`/etc.
-- `impl FsInstance for MemFs` (`memfs.rs:482`) is trivially:
+- `impl FsInstance for MemFs` is straightforward:
 
 ```rust
 fn root(&self) -> Arc<dyn DirOps> { Arc::clone(&self.root) as Arc<dyn DirOps> }
@@ -232,8 +229,10 @@ impl DirOps for HelloDir {
         if name == "hello" { Some(Arc::new(HelloFile) as Arc<dyn FileOps>) } else { None }
     }
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // Build DirEntry values per the definition in filesystem/src/lib.rs.
-        Box::new(core::iter::once(DirEntry::new("hello", FileType::File)))
+        Box::new(core::iter::once(DirEntry {
+            name: "hello",
+            file_type: FileType::File,
+        }))
     }
     // lookup_dir/create/mkdir/unlink/… all default to None / Unsupported.
 }
@@ -258,32 +257,20 @@ let fs: Arc<dyn FsInstance> = Arc::new(HelloFs::new());
 narf_filesystem::registry().mount_arc(&auth, "/hello", fs)?;
 ```
 
-> Check the exact `DirEntry` constructor / field shape against
-> `filesystem/src/lib.rs` (it lives near `FileType`); the snippet above
-> assumes a `DirEntry::new(name, kind)` — adjust to the real signature.
-
 ## Gotchas
 
-### `sys_mount` fstype dispatch is a hardcoded match — no fstype registry
+### Register both root detection and `mount -t` when needed
 
-The registry (`mount_arc` etc.) is fully open: any crate can mount an
-`Arc<dyn FsInstance>` at boot. **But** the `mount(2)` syscall path cannot
-reach your filesystem, because `sys_mount` dispatches on the fstype *string*
-with a hardcoded `if`/`match` chain and there is **no `register_fstype`
-hook**:
+`register_fstype(name, builder)` makes an out-of-tree filesystem reachable as
+`mount -t <name>` without editing the syscall dispatcher. The builder receives
+the source and option strings and returns `Arc<dyn FsInstance>`; built-in mount
+arms retain priority over the fallback registry.
 
-```
-userspace/src/handlers.rs:14492  if fstype == "bind" || (flags & MS_BIND) != 0 { … bind_mount … }
-userspace/src/handlers.rs:14504  if fstype == "tmpfs" || fstype == "ramfs" { … MemFs … }
-userspace/src/handlers.rs:14528  match fstype.as_str() { "fat" | "vfat" | … => mount_fat, _ => None }
-```
-
-**Signal for the parent:** to make a new fstype mountable *via the syscall*
-(e.g. `mount -t hellofs …`), you must edit
-`userspace/src/handlers.rs::sys_mount` to add a dispatch arm. Extending via a
-custom crate works only for the **programmatic** `registry().mount_arc(...)`
-path (boot code, initcalls). A string-keyed fstype registry would close this
-gap but does not exist today.
+Block filesystems that may be selected as the boot root also register an
+`FsFactory` with `root_mount::register_fs_factory(FsType::..., factory)`.
+Btrfs and SquashFS demonstrate both registrations in their `src/lib.rs` files.
+Register from a `Stage::Subsys` initcall so both paths are ready before late
+root discovery.
 
 ### `FsFuture` shape
 
@@ -292,15 +279,13 @@ gap but does not exist today.
 `Send`. The borrow `'a` ties the future to `&self` (and to `buf`/`name`
 args), so returned futures cannot outlive the call.
 
-### Lock reentrancy: `FileOps::read` must not touch the fd table
+### File operations run outside the fd-table lock
 
-`sys_read` holds the fd-table lock across `entry.ops.read(...)`
-(`userspace/src/handlers.rs:1356`). If your `FileOps::read`/`write`
-implementation calls back into `fd::with_table` it will **deadlock** on the
-same lock. The kernel works around this for fanotify by handling those reads
-*before* taking the lock (`handlers.rs:1329` documents exactly this). Rule:
-your `FileOps` methods operate on their own state only; they must not
-re-enter the fd layer.
+The read/write/readv/writev and directory-enumeration syscall paths snapshot an
+`Arc<dyn FileOps>` plus handle state under the fd-table lock, release the lock,
+and only then call the filesystem. Preserve that ordering in new syscall paths:
+filesystem objects such as proc fd views legitimately consult the fd table, and
+calling them while holding its non-reentrant lock deadlocks.
 
 ### `no_std`
 
