@@ -4188,26 +4188,56 @@ impl SocketFile {
                 narf_net::readiness::notify(0);
                 SocketOpResult::Ok(buf.len() as u64)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
+                // MSG_PEEK must LOOK without consuming: Linux's
+                // `unix_dgram_recvmsg` takes a reference to the skb and leaves
+                // it queued. Ignoring the flag and popping destroys the very
+                // datagram the caller asked to inspect — and every size-probe
+                // consumer peeks first. systemd's `next_datagram_size_fd()` is
+                // exactly `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)`, which
+                // `sd-device-monitor` calls before every real receive.
+                let peek = flags & MSG_PEEK != 0;
                 let mut state = self.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *state {
-                    if let Some(pkt) = inbox.pop_front() {
-                        let n = core::cmp::min(buf.len(), pkt.payload.len());
-                        buf[..n].copy_from_slice(&pkt.payload[..n]);
-                        let body = pkt.peer_unix.map(|a| a.to_body()).unwrap_or_default();
+                    let Some(front) = inbox.front() else {
+                        return SocketOpResult::Err(SockError::WouldBlock);
+                    };
+                    let full_len = front.payload.len();
+                    let n = core::cmp::min(buf.len(), full_len);
+                    buf[..n].copy_from_slice(&front.payload[..n]);
+                    let body = front
+                        .peer_unix
+                        .clone()
+                        .map(|a| a.to_body())
+                        .unwrap_or_default();
+                    let sender_cred = front.sender_cred;
+                    if peek {
+                        // Per-message credentials are still reported for a
+                        // peek, but the SCM_RIGHTS batch stays attached to the
+                        // queued datagram: taking it here would hand the fds
+                        // to the peek and leave the real receive with none.
+                        *self.last_recv_cred.lock() = sender_cred;
+                    } else if let Some(pkt) = inbox.pop_front() {
                         // Stash the sender's creds so a SO_PASSCRED recvmsg can
                         // attach them as SCM_CREDENTIALS.
                         *self.last_recv_cred.lock() = pkt.sender_cred;
                         *self.last_recv_fds.lock() = pkt.fds;
-                        return SocketOpResult::Received {
-                            n,
-                            peer: Some(SockAddr {
-                                family: AF_UNIX,
-                                body,
-                            }),
+                    }
+                    let peer = Some(SockAddr {
+                        family: AF_UNIX,
+                        body,
+                    });
+                    // Report the DATAGRAM's real length when it did not fit, so
+                    // MSG_TRUNC answers a size probe instead of the truncated
+                    // copy length (0 for the zero-byte probe shape).
+                    if n < full_len {
+                        return SocketOpResult::ReceivedTruncated {
+                            copied: n,
+                            full_len,
+                            peer,
                         };
                     }
-                    return SocketOpResult::Err(SockError::WouldBlock);
+                    return SocketOpResult::Received { n, peer };
                 }
                 SocketOpResult::Err(SockError::NotConnected)
             }

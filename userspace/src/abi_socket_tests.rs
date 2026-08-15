@@ -4556,6 +4556,173 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
 
+/// `MSG_PEEK` on a connectionless AF_UNIX datagram must NOT consume the
+/// datagram: the next receive has to return the same message again.
+///
+/// The connectionless receive branch ignores its flags entirely and always
+/// pops the inbox, so a peek destroys the message it was only supposed to
+/// look at. Every size-probe consumer is affected — systemd's
+/// `next_datagram_size_fd()` is exactly `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)`
+/// and is what `sd-device-monitor` calls before every real receive, so a
+/// peek that eats the datagram silently loses it.
+///
+/// Linux ref: `unix_dgram_recvmsg` — MSG_PEEK takes a reference to the skb
+/// and leaves it on the queue.
+fn smoke_abi_socket_unix_dgram_msg_peek_does_not_consume() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-peek-dgram");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the abstract datagram receiver failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+        for payload in [b"FIRST---".as_ref(), b"SECOND--".as_ref()] {
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            );
+            if sent != Some(payload.len() as i64) {
+                return Err("sendto of a test datagram failed");
+            }
+        }
+
+        // Peek: must return the FIRST datagram and leave it queued.
+        let mut peek = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, peek.as_mut_ptr() as u64, peek.len() as u64, MSG_PEEK),
+        )
+        .ok_or("MSG_PEEK recv status")?;
+        if n != 8 || &peek[..8] != b"FIRST---" {
+            return Err("MSG_PEEK did not return the first datagram");
+        }
+
+        // A real receive must still see FIRST — the peek consumed nothing.
+        let mut first = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, first.as_mut_ptr() as u64, first.len() as u64, 0),
+        )
+        .ok_or("recv-after-peek status")?;
+        if n != 8 || &first[..8] != b"FIRST---" {
+            return Err("MSG_PEEK consumed the datagram it only peeked at");
+        }
+
+        // And the queue must still hold the second, in order.
+        let mut second = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, second.as_mut_ptr() as u64, second.len() as u64, 0),
+        )
+        .ok_or("second recv status")?;
+        if n != 8 || &second[..8] != b"SECOND--" {
+            return Err("datagram order was not preserved across a peek");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_msg_peek_does_not_consume
+);
+
+/// `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)` on a connectionless AF_UNIX
+/// datagram must report the FULL datagram length, not the number of bytes
+/// copied (zero, for this probe shape).
+///
+/// This is systemd's `next_datagram_size_fd()` verbatim, and it is how
+/// `sd-device-monitor` sizes its receive buffer before every real recvmsg:
+/// answer 0 and it allocates nothing and then rejects the message as short
+/// (libudev drops anything under 32 bytes). Pairs with the peek test above —
+/// the probe is useless unless it is BOTH non-destructive and correctly
+/// sized.
+fn smoke_abi_socket_unix_dgram_peek_trunc_reports_full_size() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        const MSG_TRUNC_F: u64 = 0x20;
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-peektrunc-dgram");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the abstract datagram receiver failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\nSTATUS=probe-me\n";
+        if call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        ) != Some(payload.len() as i64)
+        {
+            return Err("sendto of the probe datagram failed");
+        }
+
+        // Zero-length probe: NULL buffer, length 0.
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, 0, 0, MSG_PEEK | MSG_TRUNC_F),
+        )
+        .ok_or("size-probe status")?;
+        if sized != payload.len() as i64 {
+            return Err("MSG_PEEK|MSG_TRUNC size probe did not report the full datagram length");
+        }
+
+        // A short buffer must report the full length too, while copying only
+        // what fits.
+        let mut short = [0u8; 4];
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            a3(
+                rx,
+                short.as_mut_ptr() as u64,
+                short.len() as u64,
+                MSG_PEEK | MSG_TRUNC_F,
+            ),
+        )
+        .ok_or("short-probe status")?;
+        if sized != payload.len() as i64 {
+            return Err("MSG_TRUNC with a short buffer did not report the full datagram length");
+        }
+
+        // And the probes consumed nothing: the real receive still gets it all.
+        let mut full = [0u8; 64];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, full.as_mut_ptr() as u64, full.len() as u64, 0),
+        )
+        .ok_or("real recv status")?;
+        if n != payload.len() as i64 || &full[..payload.len()] != payload {
+            return Err("size probes consumed or corrupted the datagram");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_peek_trunc_reports_full_size
+);
+
 /// The recvmsg-side half of libudev's `device_monitor_receive_device()`
 /// checks. A uevent that passes every payload rule is STILL dropped unless
 /// the receive itself reports the right sender and credentials:

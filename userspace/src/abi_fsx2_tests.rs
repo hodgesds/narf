@@ -1593,6 +1593,106 @@ kernel_test_in!(
     smoke_abi_fsx2_rename_resolves_in_private_mount_namespace
 );
 
+/// The rest of the directory-mutation family must resolve in the caller's
+/// mount namespace too — `renameat2`, `unlink`, `rmdir` and `symlink` were
+/// all routed through `current_resolve_parent_absolute()` alongside `rename`,
+/// and a fix proven on one syscall proves nothing about the other four.
+///
+/// Each arm here would report ENOENT against the global registry, because
+/// the mount exists only in this task's namespace.
+fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        const RENAME_NOREPLACE: u64 = 1;
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsmut", &[]));
+            if ns.mount_arc(&auth, "/abi-nsmut", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+
+            let make = |path: &[u8]| -> bool {
+                let fd = call_open(path.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+                if fd < 0 {
+                    return false;
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                true
+            };
+
+            // renameat2(RENAME_NOREPLACE)
+            let a = b"/abi-nsmut/r2-src\0";
+            let b = b"/abi-nsmut/r2-dst\0";
+            if !make(a) {
+                return Err("could not create the renameat2 source");
+            }
+            let r = call_raw(
+                Syscall::Renameat2.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: a.as_ptr() as u64,
+                    arg2: AT_FDCWD,
+                    arg3: b.as_ptr() as u64,
+                    arg4: RENAME_NOREPLACE,
+                    arg5: 0,
+                },
+            );
+            if r.value as i64 != 0 {
+                return Err("renameat2 did not resolve in the private mount namespace");
+            }
+
+            // unlink
+            let u = b"/abi-nsmut/to-unlink\0";
+            if !make(u) {
+                return Err("could not create the unlink target");
+            }
+            if call(Syscall::Unlink.raw(), a0(u.as_ptr() as u64)) != Some(0) {
+                return Err("unlink did not resolve in the private mount namespace");
+            }
+            if call_open(u.as_ptr() as u64, 0).unwrap_or(-1) >= 0 {
+                return Err("unlink reported success but the file is still there");
+            }
+
+            // symlink
+            let link = b"/abi-nsmut/a-link\0";
+            let target = b"r2-dst\0";
+            if call(
+                Syscall::Symlink.raw(),
+                a1(target.as_ptr() as u64, link.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("symlink did not resolve in the private mount namespace");
+            }
+
+            // rmdir
+            let d = b"/abi-nsmut/a-dir\0";
+            if call(Syscall::Mkdir.raw(), a1(d.as_ptr() as u64, 0o755)) != Some(0) {
+                return Err("mkdir did not resolve in the private mount namespace");
+            }
+            if call(Syscall::Rmdir.raw(), a0(d.as_ptr() as u64)) != Some(0) {
+                return Err("rmdir did not resolve in the private mount namespace");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace
+);
+
 fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
