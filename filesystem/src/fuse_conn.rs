@@ -959,6 +959,7 @@ fn errno_to_fs_error(neg_errno: i32) -> FsError {
         20 | 21 | 36 => FsError::InvalidPath, // ENOTDIR / EISDIR / ENAMETOOLONG
         22 => FsError::InvalidData,           // EINVAL
         28 => FsError::NoSpace,               // ENOSPC
+        122 => FsError::QuotaExceeded,        // EDQUOT
         30 => FsError::ReadOnly,              // EROFS
         95 => FsError::Unsupported,           // EOPNOTSUPP
         _ => FsError::Unsupported,

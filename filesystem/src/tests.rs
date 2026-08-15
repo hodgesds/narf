@@ -1732,6 +1732,7 @@ fn smoke_fs_error_variants_distinct() -> TestResult {
         FsError::Busy,
         FsError::ReadOnly,
         FsError::NoSpace,
+        FsError::QuotaExceeded,
         FsError::Unsupported,
     ];
     for (i, a) in all.iter().enumerate() {

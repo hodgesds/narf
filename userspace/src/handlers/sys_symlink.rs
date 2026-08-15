@@ -55,6 +55,9 @@ pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link
         Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
             ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
         }
+        Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64)) // -EDQUOT
+        }
         // Parent path/filesystem didn't resolve → a component is missing.
         _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }

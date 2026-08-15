@@ -20,6 +20,7 @@ fn metadata_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::PermissionDenied => -13, // -EACCES
         narf_filesystem::FsError::InvalidPath => -22,      // -EINVAL
         narf_filesystem::FsError::NoSpace => -28,          // -ENOSPC
+        narf_filesystem::FsError::QuotaExceeded => -122,   // -EDQUOT
         narf_filesystem::FsError::ReadOnly => -30,         // -EROFS
         narf_filesystem::FsError::Unsupported => -95,      // -EOPNOTSUPP
         _ => -5,                                           // -EIO

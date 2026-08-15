@@ -1177,6 +1177,10 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-28i64) as u64));
                     return;
                 }
+                Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
+                    ctx.set_return(SyscallReturn::ok((-122i64) as u64));
+                    return;
+                }
                 _ => {
                     ctx.set_return(fail);
                     return;
@@ -2389,6 +2393,7 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::InvalidPath => -22, // -EINVAL
         FsError::CrossDevice => -18, // -EXDEV
         FsError::ReadOnly => -30,    // -EROFS
+        FsError::QuotaExceeded => -122, // -EDQUOT
         _ => -1,
     };
     code as u64
@@ -2623,6 +2628,9 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
             Some(Some(Err(narf_filesystem::FsError::Busy))) => {
                 ctx.set_return(SyscallReturn::ok((-17i64) as u64))
             }
+            Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
+                ctx.set_return(SyscallReturn::ok((-122i64) as u64))
+            }
             _ => ctx.set_return(SyscallReturn::ok((-18i64) as u64)),
         }
         return;
@@ -2645,6 +2653,9 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         }
         Some(Some(Err(narf_filesystem::FsError::Busy))) => {
             ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+        }
+        Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64))
         }
         _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
@@ -2682,6 +2693,7 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
         }
         // Name already taken — linkat never replaces (EEXIST).
         Some(Err(narf_filesystem::FsError::Busy)) => -17,
+        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122,
         // The FS can't hold an externally-minted node (link_node default).
         Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // -EOPNOTSUPP
         _ => -1,
@@ -3243,6 +3255,10 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
             Some(Err(narf_filesystem::FsError::NotFound)) => {
                 ctx.set_return(SyscallReturn::ok((-61i64) as u64));
+                return;
+            }
+            Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
+                ctx.set_return(SyscallReturn::ok((-122i64) as u64));
                 return;
             }
             _ => {

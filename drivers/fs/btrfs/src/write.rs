@@ -50,7 +50,7 @@
 //! (`chunk_span_avoiding_supers`).
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -1052,6 +1052,11 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             extra_trees: Vec::new(),
             root_edits: Vec::new(),
             retired_meta: Vec::new(),
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await?;
@@ -1109,6 +1114,11 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
             extra_trees: Vec::new(),
             root_edits: Vec::new(),
             retired_meta: Vec::new(),
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await
@@ -1144,6 +1154,20 @@ struct ExtraTree {
     commit: FsCommit,
 }
 
+/// Validated `btrfs_qgroup_inherit` payload for V2 subvolume creation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QgroupInherit {
+    pub flags: u64,
+    pub parents: Vec<u64>,
+    pub limit: [u64; 5],
+}
+
+#[derive(Clone, Debug)]
+struct QgroupCreate {
+    id: u64,
+    inherit: QgroupInherit,
+}
+
 /// One mutation's fs-tree edit plus the data-extent bookkeeping the
 /// extent/free-space/csum trees must reflect. `commit_txn` reads the
 /// extent/csum/root/free-space trees itself, applies the data + metadata deltas,
@@ -1174,6 +1198,17 @@ struct Txn {
     root_edits: Vec<Edit>,
     /// Exclusively-owned metadata trees removed by this transaction.
     retired_meta: Vec<(u64, u8)>,
+    /// Quota-tree namespace changes paired with subvolume lifecycle changes.
+    qgroup_create: Option<QgroupCreate>,
+    qgroup_delete: Option<u64>,
+    /// Standalone qgroup administration edits (create/assign/limit/destroy).
+    qgroup_edits: Vec<Edit>,
+    /// Quota disable removes the quota root itself, so no recount may be
+    /// attempted against that transaction's root-tree image.
+    skip_qgroup_recount: bool,
+    /// Ordinary mutations enforce hard limits; quota administration/rescan
+    /// must be able to install or recount an already-exceeded limit.
+    enforce_qgroup_limits: bool,
 }
 
 /// Persist replacement on-disk flags for the explicitly mounted subvolume.
@@ -1211,6 +1246,11 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
             extra_trees: Vec::new(),
             root_edits: Vec::new(),
             retired_meta: Vec::new(),
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await
@@ -2030,6 +2070,11 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
             extra_trees: Vec::new(),
             root_edits: Vec::new(),
             retired_meta,
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await
@@ -2268,6 +2313,676 @@ async fn resolve_data_changes<B: BlockDevice + 'static>(
     })
 }
 
+const QGROUP_STATUS_ON: u64 = 1;
+const QGROUP_INHERIT_SET_LIMITS: u64 = 1;
+
+fn stamp_root_item_fields(
+    root_logical: &mut [u8],
+    owner: u64,
+    bytenr: u64,
+    tree_level: u8,
+    gen: u64,
+) -> Result<(), FsError> {
+    let slot =
+        leaf_find_by_type(root_logical, owner, format::ROOT_ITEM_KEY)?.ok_or(FsError::NotFound)?;
+    let mut item = leaf_item_data(root_logical, slot)?.to_vec();
+    if item.len() < 239 {
+        return Err(FsError::InvalidData);
+    }
+    item[160..168].copy_from_slice(&gen.to_le_bytes());
+    item[176..184].copy_from_slice(&bytenr.to_le_bytes());
+    item[238] = tree_level;
+    if item.len() >= 247 {
+        item[239..247].copy_from_slice(&gen.to_le_bytes());
+    }
+    leaf_replace_inplace(root_logical, slot, &item)
+}
+
+async fn qgroup_root_extents<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    pending: &BTreeMap<u64, Vec<u8>>,
+    root: u64,
+) -> Result<BTreeSet<(u64, u64)>, FsError> {
+    let mut extents = BTreeSet::new();
+    let mut seen_nodes = BTreeSet::new();
+    let mut stack = alloc::vec![root];
+    while let Some(addr) = stack.pop() {
+        if !seen_nodes.insert(addr) {
+            continue;
+        }
+        let node = match pending.get(&addr) {
+            Some(node) => node.clone(),
+            None => vol.read_node(addr).await?,
+        };
+        extents.insert((addr, vol.nodesize() as u64));
+        if level(&node)? > 0 {
+            for slot in 0..nritems(&node)? as usize {
+                stack.push(internal_blockptr(&node, slot)?);
+            }
+            continue;
+        }
+        for slot in 0..nritems(&node)? as usize {
+            if leaf_item_key(&node, slot)?.item_type != format::EXTENT_DATA_KEY {
+                continue;
+            }
+            let body = leaf_item_data(&node, slot)?;
+            if body.len() < 21 || body[20] == format::FILE_EXTENT_INLINE {
+                continue;
+            }
+            if body.len() < 53
+                || !matches!(
+                    body[20],
+                    format::FILE_EXTENT_REG | format::FILE_EXTENT_PREALLOC
+                )
+            {
+                return Err(FsError::InvalidData);
+            }
+            let bytenr = le64(body, 21)?;
+            let disk_len = le64(body, 29)?;
+            if bytenr != 0 {
+                if disk_len == 0 {
+                    return Err(FsError::InvalidData);
+                }
+                extents.insert((bytenr, disk_len));
+            }
+        }
+    }
+    Ok(extents)
+}
+
+fn apply_logical_edits(logical: &mut [u8], edits: &[Edit]) -> Result<(), FsError> {
+    for edit in edits {
+        match edit {
+            Edit::Upsert(key, body) => match leaf_find(logical, key)? {
+                Some(slot) => leaf_replace_inplace(logical, slot, body)?,
+                None => leaf_insert_sorted(logical, key, body)?,
+            },
+            Edit::Delete(key) => {
+                if let Some(slot) = leaf_find(logical, key)? {
+                    leaf_delete(logical, slot)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct QuotaChange<'a> {
+    root_logical: &'a [u8],
+    pending: &'a BTreeMap<u64, Vec<u8>>,
+    create: Option<&'a QgroupCreate>,
+    delete: Option<u64>,
+    edits: &'a [Edit],
+    enforce_limits: bool,
+}
+
+/// Rebuild all qgroup usage from the post-transaction subvolume roots. This is
+/// deliberately whole-tree accounting: slower than Linux delayed refs, but it
+/// makes shared snapshot exclusivity and hierarchy propagation exact and keeps
+/// the small quota tree independently checkable by btrfs-progs.
+async fn prepare_quota_tree<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    gen: u64,
+    alloc: &mut Allocator,
+    root_tree: u64,
+    change: QuotaChange<'_>,
+) -> Result<Option<ExtraTree>, FsError> {
+    let (quota_root, _quota_level) =
+        match roots::find_root(vol, root_tree, format::QUOTA_TREE_OBJECTID).await {
+            Ok(root) => root,
+            Err(FsError::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+    let (mut quota, old_blocks) = read_fs_oversized(vol, quota_root).await?;
+    let status_key = BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0);
+    let status_slot = leaf_find(&quota, &status_key)?.ok_or(FsError::InvalidData)?;
+    let mut status = leaf_item_data(&quota, status_slot)?.to_vec();
+    if status.len() < 32 || le64(&status, 0)? != 1 {
+        return Err(FsError::Unsupported);
+    }
+    let status_flags = le64(&status, 16)?;
+    if status_flags & QGROUP_STATUS_ON == 0 {
+        return Ok(None);
+    }
+
+    let mut edits = Vec::new();
+    if let Some(id) = change.delete {
+        edits.push(Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)));
+        edits.push(Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)));
+        for slot in 0..nritems(&quota)? as usize {
+            let key = leaf_item_key(&quota, slot)?;
+            if key.item_type == format::QGROUP_RELATION_KEY
+                && (key.objectid == id || key.offset == id)
+            {
+                edits.push(Edit::Delete(key));
+            }
+        }
+    }
+    if let Some(new) = change.create {
+        let info_key = BtrfsKey::new(0, format::QGROUP_INFO_KEY, new.id);
+        if leaf_find(&quota, &info_key)?.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        for &parent in &new.inherit.parents {
+            if parent >> 48 <= new.id >> 48
+                || leaf_find(&quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, parent))?.is_none()
+            {
+                return Err(FsError::InvalidData);
+            }
+        }
+        edits.push(Edit::Upsert(info_key, alloc::vec![0u8; 40]));
+        let mut limit = alloc::vec![0u8; 40];
+        if new.inherit.flags & QGROUP_INHERIT_SET_LIMITS != 0 {
+            for (idx, value) in new.inherit.limit.iter().enumerate() {
+                limit[idx * 8..idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        edits.push(Edit::Upsert(
+            BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, new.id),
+            limit,
+        ));
+        for &parent in &new.inherit.parents {
+            edits.push(Edit::Upsert(
+                BtrfsKey::new(new.id, format::QGROUP_RELATION_KEY, parent),
+                Vec::new(),
+            ));
+            edits.push(Edit::Upsert(
+                BtrfsKey::new(parent, format::QGROUP_RELATION_KEY, new.id),
+                Vec::new(),
+            ));
+        }
+    }
+    edits.extend(change.edits.iter().cloned());
+    apply_logical_edits(&mut quota, &edits)?;
+
+    let mut qgroup_ids = Vec::new();
+    let mut parents: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for slot in 0..nritems(&quota)? as usize {
+        let key = leaf_item_key(&quota, slot)?;
+        if key.objectid == 0 && key.item_type == format::QGROUP_INFO_KEY {
+            qgroup_ids.push(key.offset);
+        } else if key.item_type == format::QGROUP_RELATION_KEY
+            && key.objectid >> 48 < key.offset >> 48
+        {
+            parents.entry(key.objectid).or_default().push(key.offset);
+        }
+    }
+
+    let mut root_extents: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
+    let mut members: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
+        let slot = leaf_find_by_type(change.root_logical, id, format::ROOT_ITEM_KEY)?
+            .ok_or(FsError::InvalidData)?;
+        let root_item = leaf_item_data(change.root_logical, slot)?;
+        let root = le64(root_item, 176)?;
+        root_extents.insert(id, qgroup_root_extents(vol, change.pending, root).await?);
+        members.entry(id).or_default().insert(id);
+        let mut todo = parents.get(&id).cloned().unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        while let Some(parent) = todo.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            members.entry(parent).or_default().insert(id);
+            if let Some(next) = parents.get(&parent) {
+                todo.extend(next.iter().copied());
+            }
+        }
+    }
+
+    let mut extent_refs: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
+    for (&root_id, extents) in &root_extents {
+        for &extent in extents {
+            extent_refs.entry(extent).or_default().insert(root_id);
+        }
+    }
+    let mut info_edits = Vec::new();
+    for id in qgroup_ids {
+        let group_members = members.get(&id).cloned().unwrap_or_default();
+        let mut referenced = 0u64;
+        let mut exclusive = 0u64;
+        for (&(_bytenr, len), refs) in &extent_refs {
+            if refs.is_disjoint(&group_members) {
+                continue;
+            }
+            referenced = referenced.checked_add(len).ok_or(FsError::InvalidData)?;
+            if refs.is_subset(&group_members) {
+                exclusive = exclusive.checked_add(len).ok_or(FsError::InvalidData)?;
+            }
+        }
+        let limit_key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
+        let limit_slot = leaf_find(&quota, &limit_key)?.ok_or(FsError::InvalidData)?;
+        let limit = leaf_item_data(&quota, limit_slot)?;
+        if limit.len() != 40 {
+            return Err(FsError::InvalidData);
+        }
+        let limit_flags = le64(limit, 0)?;
+        if change.enforce_limits
+            && ((limit_flags & 1 != 0 && referenced > le64(limit, 8)?)
+                || (limit_flags & 2 != 0 && exclusive > le64(limit, 16)?))
+        {
+            return Err(FsError::QuotaExceeded);
+        }
+        let mut info = alloc::vec![0u8; 40];
+        info[0..8].copy_from_slice(&gen.to_le_bytes());
+        info[8..16].copy_from_slice(&referenced.to_le_bytes());
+        info[16..24].copy_from_slice(&referenced.to_le_bytes());
+        info[24..32].copy_from_slice(&exclusive.to_le_bytes());
+        info[32..40].copy_from_slice(&exclusive.to_le_bytes());
+        info_edits.push(Edit::Upsert(
+            BtrfsKey::new(0, format::QGROUP_INFO_KEY, id),
+            info,
+        ));
+    }
+    status[8..16].copy_from_slice(&gen.to_le_bytes());
+    status[16..24].copy_from_slice(&QGROUP_STATUS_ON.to_le_bytes());
+    info_edits.push(Edit::Upsert(status_key, status));
+    apply_logical_edits(&mut quota, &info_edits)?;
+
+    let groups = group_items(vol, &quota)?;
+    let addrs = alloc_nodes(alloc, vol, tree_block_count(groups.len(), vol.nodesize()))?;
+    let (nodes, root, level) = pack_tree_at(vol, &quota, &groups, &addrs, gen)?;
+    let mut new_blocks = Vec::new();
+    collect_tree_meta(
+        &addrs,
+        groups.len(),
+        vol.nodesize(),
+        format::QUOTA_TREE_OBJECTID,
+        &mut new_blocks,
+    );
+    Ok(Some(ExtraTree {
+        owner: format::QUOTA_TREE_OBJECTID,
+        commit: FsCommit {
+            nodes,
+            new_blocks: new_blocks
+                .into_iter()
+                .map(|(addr, _owner, level)| (addr, level))
+                .collect(),
+            freed: old_blocks,
+            root,
+            level,
+        },
+    }))
+}
+
+fn unchanged_fs_commit<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> FsCommit {
+    let (root, level) = vol.fs_tree_root();
+    FsCommit {
+        nodes: Vec::new(),
+        new_blocks: Vec::new(),
+        freed: Vec::new(),
+        root,
+        level,
+    }
+}
+
+async fn quota_root<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64, FsError> {
+    roots::find_root(vol, vol.root_tree_root().0, format::QUOTA_TREE_OBJECTID)
+        .await
+        .map(|(root, _)| root)
+}
+
+async fn commit_qgroup_edits<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    edits: Vec<Edit>,
+) -> Result<(), FsError> {
+    quota_root(vol).await?;
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let alloc = Allocator::build(vol).await?;
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: unchanged_fs_commit(vol),
+            dropped_data: Vec::new(),
+            added_data: Vec::new(),
+            added_meta: Vec::new(),
+            dropped_meta: Vec::new(),
+            new_data: Vec::new(),
+            root_flags: None,
+            extra_trees: Vec::new(),
+            root_edits: Vec::new(),
+            retired_meta: Vec::new(),
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: edits,
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: false,
+        },
+    )
+    .await
+}
+
+/// Enable full qgroups and synchronously perform the initial exact rescan.
+pub(crate) async fn quota_enable<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    match quota_root(vol).await {
+        Ok(_) => return Ok(()),
+        Err(FsError::NotFound) => {}
+        Err(err) => return Err(err),
+    }
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let (root_tree, _) = vol.root_tree_root();
+    let mut cursor = btree::Cursor::seek(
+        vol,
+        root_tree,
+        &BtrfsKey::new(format::FS_TREE_OBJECTID, format::ROOT_ITEM_KEY, 0),
+    )
+    .await?;
+    let mut root_ids = Vec::new();
+    while let Some((key, _)) = cursor.current()? {
+        if key.objectid > format::LAST_FREE_OBJECTID {
+            break;
+        }
+        if key.item_type == format::ROOT_ITEM_KEY
+            && (key.objectid == format::FS_TREE_OBJECTID
+                || key.objectid >= format::FIRST_FREE_OBJECTID)
+        {
+            root_ids.push(key.objectid);
+        }
+        cursor.advance().await?;
+    }
+    if root_ids.is_empty() {
+        return Err(FsError::InvalidData);
+    }
+
+    let mut status = alloc::vec![0u8; 32];
+    status[0..8].copy_from_slice(&1u64.to_le_bytes());
+    status[8..16].copy_from_slice(&gen.to_le_bytes());
+    status[16..24].copy_from_slice(&QGROUP_STATUS_ON.to_le_bytes());
+    let mut items = alloc::vec![(BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0), status,)];
+    for id in root_ids {
+        let mut info = alloc::vec![0u8; 40];
+        info[0..8].copy_from_slice(&gen.to_le_bytes());
+        items.push((BtrfsKey::new(0, format::QGROUP_INFO_KEY, id), info));
+        items.push((
+            BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id),
+            alloc::vec![0u8; 40],
+        ));
+    }
+    items.sort_by_key(|(key, _)| *key);
+
+    let mut header = vol.read_node(vol.fs_tree_root().0).await?;
+    header[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&format::QUOTA_TREE_OBJECTID.to_le_bytes());
+    let body_total: usize = items.iter().map(|(_, body)| body.len()).sum();
+    let capacity = HEADER_SIZE + items.len() * LEAF_ITEM_SIZE + body_total + vol.nodesize();
+    let refs: Vec<(BtrfsKey, &[u8])> = items
+        .iter()
+        .map(|(key, body)| (*key, body.as_slice()))
+        .collect();
+    let mut logical = pack_leaf(&header, &refs, capacity);
+    logical[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&format::QUOTA_TREE_OBJECTID.to_le_bytes());
+    let mut alloc = Allocator::build(vol).await?;
+    let groups = group_items(vol, &logical)?;
+    let addrs = alloc_nodes(
+        &mut alloc,
+        vol,
+        tree_block_count(groups.len(), vol.nodesize()),
+    )?;
+    let (nodes, quota_tree_root, quota_level) = pack_tree_at(vol, &logical, &groups, &addrs, gen)?;
+    let mut quota_meta = Vec::new();
+    collect_tree_meta(
+        &addrs,
+        groups.len(),
+        vol.nodesize(),
+        format::QUOTA_TREE_OBJECTID,
+        &mut quota_meta,
+    );
+
+    let root_item = btree::find_item(
+        vol,
+        root_tree,
+        &BtrfsKey::new(format::CSUM_TREE_OBJECTID, format::ROOT_ITEM_KEY, 0),
+    )
+    .await?
+    .ok_or(FsError::InvalidData)?;
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: unchanged_fs_commit(vol),
+            dropped_data: Vec::new(),
+            added_data: Vec::new(),
+            added_meta: Vec::new(),
+            dropped_meta: Vec::new(),
+            new_data: Vec::new(),
+            root_flags: None,
+            extra_trees: alloc::vec![ExtraTree {
+                owner: format::QUOTA_TREE_OBJECTID,
+                commit: FsCommit {
+                    nodes,
+                    new_blocks: quota_meta
+                        .into_iter()
+                        .map(|(addr, _owner, level)| (addr, level))
+                        .collect(),
+                    freed: Vec::new(),
+                    root: quota_tree_root,
+                    level: quota_level,
+                },
+            }],
+            root_edits: alloc::vec![Edit::Upsert(
+                BtrfsKey::new(format::QUOTA_TREE_OBJECTID, format::ROOT_ITEM_KEY, 0),
+                root_item,
+            )],
+            retired_meta: Vec::new(),
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: false,
+        },
+    )
+    .await?;
+    // The first transaction makes the new tree reachable. The second walks
+    // that committed tree and replaces the zero bootstrap counters atomically.
+    commit_qgroup_edits(vol, Vec::new()).await
+}
+
+/// Disable full qgroups by removing and reclaiming the complete quota tree.
+pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let quota = match quota_root(vol).await {
+        Ok(root) => root,
+        Err(FsError::NotFound) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let (_logical, old_blocks) = read_fs_oversized(vol, quota).await?;
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let alloc = Allocator::build(vol).await?;
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: unchanged_fs_commit(vol),
+            dropped_data: Vec::new(),
+            added_data: Vec::new(),
+            added_meta: Vec::new(),
+            dropped_meta: Vec::new(),
+            new_data: Vec::new(),
+            root_flags: None,
+            extra_trees: Vec::new(),
+            root_edits: alloc::vec![Edit::Delete(BtrfsKey::new(
+                format::QUOTA_TREE_OBJECTID,
+                format::ROOT_ITEM_KEY,
+                0,
+            ))],
+            retired_meta: old_blocks,
+            qgroup_create: None,
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: true,
+            enforce_qgroup_limits: false,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn qgroup_create_admin<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    id: u64,
+) -> Result<(), FsError> {
+    if id >> 48 == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let root = quota_root(vol).await?;
+    if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
+        .await?
+        .is_some()
+    {
+        return Err(FsError::Busy);
+    }
+    commit_qgroup_edits(
+        vol,
+        alloc::vec![
+            Edit::Upsert(
+                BtrfsKey::new(0, format::QGROUP_INFO_KEY, id),
+                alloc::vec![0u8; 40],
+            ),
+            Edit::Upsert(
+                BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id),
+                alloc::vec![0u8; 40],
+            ),
+        ],
+    )
+    .await
+}
+
+pub(crate) async fn qgroup_destroy_admin<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    id: u64,
+) -> Result<(), FsError> {
+    if id >> 48 == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let root = quota_root(vol).await?;
+    if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
+        .await?
+        .is_none()
+    {
+        return Err(FsError::NotFound);
+    }
+    let mut cursor = btree::Cursor::seek(vol, root, &BtrfsKey::new(0, 0, 0)).await?;
+    while let Some((key, _)) = cursor.current()? {
+        if key.item_type == format::QGROUP_RELATION_KEY && (key.objectid == id || key.offset == id)
+        {
+            return Err(FsError::Busy);
+        }
+        cursor.advance().await?;
+    }
+    commit_qgroup_edits(
+        vol,
+        alloc::vec![
+            Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)),
+            Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)),
+        ],
+    )
+    .await
+}
+
+pub(crate) async fn qgroup_assign_admin<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    assign: bool,
+    src: u64,
+    dst: u64,
+) -> Result<(), FsError> {
+    if dst >> 48 <= src >> 48 {
+        return Err(FsError::InvalidData);
+    }
+    let root = quota_root(vol).await?;
+    for id in [src, dst] {
+        if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
+            .await?
+            .is_none()
+        {
+            return Err(FsError::NotFound);
+        }
+    }
+    let keys = [
+        BtrfsKey::new(src, format::QGROUP_RELATION_KEY, dst),
+        BtrfsKey::new(dst, format::QGROUP_RELATION_KEY, src),
+    ];
+    let present = btree::find_item(vol, root, &keys[0]).await?.is_some();
+    if assign == present {
+        return Err(FsError::Busy);
+    }
+    let edits = keys
+        .into_iter()
+        .map(|key| {
+            if assign {
+                Edit::Upsert(key, Vec::new())
+            } else {
+                Edit::Delete(key)
+            }
+        })
+        .collect();
+    commit_qgroup_edits(vol, edits).await
+}
+
+pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    mut id: u64,
+    limit: [u64; 5],
+) -> Result<(), FsError> {
+    if limit[0] & !0x3f != 0 {
+        return Err(FsError::InvalidData);
+    }
+    if id == 0 {
+        id = vol.fs_tree_id();
+    }
+    let root = quota_root(vol).await?;
+    if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
+        .await?
+        .is_none()
+    {
+        return Err(FsError::NotFound);
+    }
+    let mut body = alloc::vec![0u8; 40];
+    for (idx, value) in limit.iter().enumerate() {
+        body[idx * 8..idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    commit_qgroup_edits(
+        vol,
+        alloc::vec![Edit::Upsert(
+            BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id),
+            body,
+        )],
+    )
+    .await
+}
+
+pub(crate) async fn quota_rescan<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    commit_qgroup_edits(vol, Vec::new()).await
+}
+
+pub(crate) async fn quota_status<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(u64, u64), FsError> {
+    let root = quota_root(vol).await?;
+    let body = btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0))
+        .await?
+        .ok_or(FsError::InvalidData)?;
+    Ok((le64(&body, 16)?, le64(&body, 24)?))
+}
+
 /// Finalize a mutation. The fs tree arrives prebuilt (path-COW for ordinary
 /// file/namespace mutations; selected subvolume operations may repack it). The
 /// **extent tree is path-COWed** — only paths containing changed block/data
@@ -2401,6 +3116,55 @@ async fn commit_txn<B: BlockDevice + 'static>(
         fs_nodes.extend(tree.commit.nodes.clone());
         fs_freed.extend(tree.commit.freed.iter().copied());
         extra_roots.push((tree.owner, tree.commit.root, tree.commit.level));
+    }
+    let fs_tree_changed = !c.nodes.is_empty() || !c.new_blocks.is_empty() || !c.freed.is_empty();
+    if fs_tree_changed {
+        stamp_root_item_fields(
+            &mut root_logical,
+            vol.fs_tree_id(),
+            fs_root_addr,
+            fs_level,
+            gen,
+        )?;
+    }
+    for &(owner, root, tree_level) in &extra_roots {
+        stamp_root_item_fields(&mut root_logical, owner, root, tree_level, gen)?;
+    }
+    let pending: BTreeMap<u64, Vec<u8>> = fs_nodes.iter().cloned().collect();
+    let quota_tree = if txn.skip_qgroup_recount {
+        None
+    } else {
+        prepare_quota_tree(
+            vol,
+            gen,
+            &mut alloc,
+            root_tree,
+            QuotaChange {
+                root_logical: &root_logical,
+                pending: &pending,
+                create: txn.qgroup_create.as_ref(),
+                delete: txn.qgroup_delete,
+                edits: &txn.qgroup_edits,
+                enforce_limits: txn.enforce_qgroup_limits,
+            },
+        )
+        .await?
+    };
+    if let Some(quota_tree) = quota_tree {
+        let quota_owner = quota_tree.owner;
+        let quota_root = quota_tree.commit.root;
+        let quota_level = quota_tree.commit.level;
+        fs_new_meta.extend(
+            quota_tree
+                .commit
+                .new_blocks
+                .iter()
+                .map(|&(addr, level)| (addr, quota_owner, level)),
+        );
+        fs_nodes.extend(quota_tree.commit.nodes);
+        fs_freed.extend(quota_tree.commit.freed);
+        stamp_root_item_fields(&mut root_logical, quota_owner, quota_root, quota_level, gen)?;
+        extra_roots.push((quota_owner, quota_root, quota_level));
     }
     fs_freed.extend(txn.retired_meta.iter().copied());
     fs_freed.extend(meta_changes.released.iter().copied());
@@ -2592,7 +3356,6 @@ async fn commit_txn<B: BlockDevice + 'static>(
             ri[239..247].copy_from_slice(&gen.to_le_bytes());
         }
     };
-    let fs_tree_changed = !c.nodes.is_empty() || !c.new_blocks.is_empty() || !c.freed.is_empty();
     let mut root_updates = alloc::vec![(format::EXTENT_TREE_OBJECTID, ext_root, ext_level)];
     if fs_tree_changed {
         root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
@@ -2885,6 +3648,16 @@ pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
     name: &str,
     readonly: bool,
 ) -> Result<u64, FsError> {
+    create_subvolume_with_qgroup(vol, parent_ino, name, readonly, None).await
+}
+
+pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    name: &str,
+    readonly: bool,
+    inherit: Option<QgroupInherit>,
+) -> Result<u64, FsError> {
     let name_bytes = name.as_bytes();
     if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
         return Err(FsError::InvalidData);
@@ -3050,6 +3823,14 @@ pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
             extra_trees,
             root_edits,
             retired_meta: Vec::new(),
+            qgroup_create: Some(QgroupCreate {
+                id: new_id,
+                inherit: inherit.unwrap_or_default(),
+            }),
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await?;
@@ -3064,13 +3845,14 @@ pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
 /// private metadata tree and direct data backrefs. A destination inside the
 /// source uses the atomic point-in-time fallback described below.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_snapshot<B: BlockDevice + 'static>(
+pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
     source_root: u64,
     source_id: u64,
     name: &str,
     readonly: bool,
+    inherit: Option<QgroupInherit>,
 ) -> Result<u64, FsError> {
     let name_bytes = name.as_bytes();
     if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
@@ -3291,6 +4073,14 @@ pub(crate) async fn create_snapshot<B: BlockDevice + 'static>(
             extra_trees,
             root_edits,
             retired_meta: Vec::new(),
+            qgroup_create: Some(QgroupCreate {
+                id: new_id,
+                inherit: inherit.unwrap_or_default(),
+            }),
+            qgroup_delete: None,
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await?;
@@ -3396,6 +4186,20 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
     let child_owner = le64(&child_node, HDR_OWNER)?;
     let child_root_refs = metadata_root_refcount(vol, child_root, child_level, child_id).await?;
 
+    // Linux's `may_destroy_subvol()` refuses to remove a root that still owns
+    // child ROOT_REFs. Those child roots are independent subvolumes and must be
+    // removed bottom-up; silently orphaning them would leave an unreachable
+    // root-tree namespace. Use the root tree as the authority instead of
+    // inferring this from directory items in a possibly shared fs tree.
+    let nested_start = BtrfsKey::new(child_id, format::ROOT_REF_KEY, 0);
+    let nested_cursor = btree::Cursor::seek(vol, root_tree, &nested_start).await?;
+    if matches!(
+        nested_cursor.current()?,
+        Some((key, _)) if key.objectid == child_id && key.item_type == format::ROOT_REF_KEY
+    ) {
+        return Err(FsError::Busy);
+    }
+
     let mut dropped_meta = Vec::new();
     let mut dropped_data = Vec::new();
     let mut child_blocks = Vec::new();
@@ -3409,19 +4213,6 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
         });
     } else {
         let (child_logical, blocks) = read_fs_oversized(vol, child_root).await?;
-
-        // A nested subvolume is a separate root and must survive deletion of its
-        // parent; implementing the orphan/stub semantics is deferred.
-        for slot in 0..nritems(&child_logical)? as usize {
-            let key = leaf_item_key(&child_logical, slot)?;
-            if key.item_type == format::DIR_INDEX_KEY {
-                for entry in decode_dir_items(leaf_item_data(&child_logical, slot)?)? {
-                    if entry.location.item_type == format::ROOT_ITEM_KEY {
-                        return Err(FsError::Unsupported);
-                    }
-                }
-            }
-        }
 
         // This is either an ordinary private tree or the final holder of a
         // formerly-shared tree. In both cases all blocks and direct data refs
@@ -3541,6 +4332,11 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
             extra_trees,
             root_edits,
             retired_meta: child_blocks,
+            qgroup_create: None,
+            qgroup_delete: Some(child_id),
+            qgroup_edits: Vec::new(),
+            skip_qgroup_recount: false,
+            enforce_qgroup_limits: true,
         },
     )
     .await
@@ -3603,14 +4399,22 @@ pub async fn mkdir_dir<B: BlockDevice + 'static>(
 /// Create a symlink `name` → `target` in directory `parent_ino` (default
 /// subvolume). The target is stored as one uncompressed inline `EXTENT_DATA`,
 /// exactly like `btrfs_symlink` (inode `size`/`nbytes`/`ram_bytes` all the target
-/// length). Targets `>= sectorsize` are out of scope (`Unsupported`).
+/// length). Linux requires the complete item to fit one leaf and also requires
+/// the target to be shorter than `sectorsize`; Btrfs has no regular-extent
+/// symlink representation.
 pub async fn symlink_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
     name: &str,
     target: &str,
 ) -> Result<(u64, InodeItem), FsError> {
-    if target.is_empty() || target.len() >= vol.sectorsize() as usize {
+    // BTRFS_MAX_INLINE_DATA_SIZE = nodesize - sizeof(header) -
+    // sizeof(item) - BTRFS_FILE_EXTENT_INLINE_DATA_START (21).
+    let max_inline = vol
+        .nodesize()
+        .checked_sub(HEADER_SIZE + LEAF_ITEM_SIZE + 21)
+        .ok_or(FsError::Unsupported)?;
+    if target.is_empty() || target.len() > max_inline || target.len() >= vol.sectorsize() as usize {
         return Err(FsError::Unsupported);
     }
     create_node(

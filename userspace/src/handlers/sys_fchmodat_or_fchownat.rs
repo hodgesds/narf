@@ -7,6 +7,7 @@ fn chown_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::PermissionDenied => -1,
         narf_filesystem::FsError::InvalidPath => -22,
         narf_filesystem::FsError::NoSpace => -28,
+        narf_filesystem::FsError::QuotaExceeded => -122,
         narf_filesystem::FsError::ReadOnly => -30,
         narf_filesystem::FsError::Unsupported => -95,
         _ => -5,

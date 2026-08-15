@@ -65,6 +65,9 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         Some(Some(Err(narf_filesystem::FsError::NoSpace))) => {
             ctx.set_return(SyscallReturn::ok((-28i64) as u64))
         }
+        Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64))
+        }
         Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
             ctx.set_return(SyscallReturn::ok((-95i64) as u64))
         }

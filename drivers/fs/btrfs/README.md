@@ -17,6 +17,9 @@ real laptop's btrfs root looks like.
 - Single-device volumes, **SINGLE** and **DUP** chunk profiles. Both DUP copies
   are retained: metadata and checksummed data retry the second stripe after an
   I/O error or checksum failure.
+- Power-of-two filesystem sectors and metadata nodes from **4 KiB through
+  64 KiB**, independent of the backing device's 512-byte/4-KiB logical block
+  size. Allocation, partial I/O and CSUM widths follow the mounted sectorsize.
 - **CRC32C, xxhash64, SHA-256, and BLAKE2b-256** checksums, verified on the
   superblock, every tree node, and regular data. The COW writer emits the
   mounted volume's selected algorithm and its format-defined CSUM item width.
@@ -32,7 +35,8 @@ real laptop's btrfs root looks like.
   compression when it saves physical sectors, emitting Linux-compatible padded
   payloads, extent metadata and data checksums. Zstd/LZO updates currently fall
   back to uncompressed COW extents after decoding.
-- **Symlinks** (target read via `FileOps::read`, so the VFS follows them),
+- **Symlinks** (target read via `FileOps::read`, so the VFS follows them), with
+  Linux's exact one-leaf inline target limit enforced before mutation,
   **extended attributes** (read via `get_xattr` / `list_xattr` and written via
   `set_xattr` / `remove_xattr` over `XATTR_ITEM`, honouring
   `XATTR_CREATE`/`XATTR_REPLACE`), and **statx** (size/mode/uid/gid/nlink/ino/mtime).
@@ -79,6 +83,21 @@ real laptop's btrfs root looks like.
   directory, including read-only creation. The parent fs tree, new empty child
   tree, UUID index, root refs/backrefs, extent/free-space accounting and
   superblock are committed atomically.
+- **Full qgroup quota trees** already enabled on disk: every commit exactly
+  recounts referenced/exclusive metadata and data across level-0 roots, then
+  propagates union/exclusivity through higher-level parent relations. V2
+  subvolume and snapshot creation accept `BTRFS_SUBVOL_QGROUP_INHERIT`, install
+  both relation directions and optional limits, and deletion removes the
+  level-0 qgroup. `max_rfer` / `max_excl` hard limits reject the transaction
+  atomically with `QuotaExceeded` (`EDQUOT`). The quota tree is whole-repacked;
+  correctness is preferred over Linux's delayed-ref performance model.
+- Full-qgroup administration through `BTRFS_IOC_QUOTA_CTL`,
+  `QGROUP_CREATE`/`QGROUP_ASSIGN`/`QGROUP_LIMIT`, and
+  `QUOTA_RESCAN`/`STATUS`/`WAIT`. Enabling quotas creates level-0 groups for
+  every existing subvolume and completes an exact synchronous rescan; disabling
+  removes and reclaims the complete quota tree. Higher-level group creation,
+  bidirectional assignment, limit replacement, unassignment and destruction
+  are atomic with their recount.
 - Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
@@ -97,6 +116,8 @@ real laptop's btrfs root looks like.
   dropping only its root ref. The final holder walks and reclaims the old tree;
   shared data loses only the deleted root's backref and is reclaimed with its
   checksum/free space only after the final reference disappears.
+  A target that still owns nested subvolumes returns `Busy`/`ENOTEMPTY`; deleting
+  those children first and retrying removes the hierarchy bottom-up.
 - **statfs** reports total/free blocks (free approximated from the superblock's
   `bytes_used`).
 
@@ -110,12 +131,13 @@ than mis-read:
 - Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
   RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
-  child explicitly to write it). Deleting the final holder of a tree that itself
-  contains nested subvolume mount points is not yet supported.
-  `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not supported.
-- A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
+  child explicitly to write it). Simple quotas (`QUOTA_CTL_ENABLE_SIMPLE_QUOTA`)
+  are not supported; the full-qgroup interface is supported.
+- A symlink target larger than Linux's inline item bound (Btrfs has no regular-
+  extent symlink representation); a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a non-empty-directory target.
-- `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
+- A sectorsize outside 4–64 KiB, or a nodesize that is not a power-of-two in
+  `[sectorsize, 64 KiB]`.
 
 ## COW writes — full Linux interop
 
@@ -158,13 +180,13 @@ writes → btrfs check "no error found" → both files read back`). Per write it
 4. on a `space_cache=v2` image, repacks the **free-space tree** — marks allocated
    ranges used and returns freed blocks to free space without merging across a
    block-group boundary;
-5. repacks the checksum and root trees as needed, repointing changed
-   FS/CSUM/EXTENT/FREE_SPACE `ROOT_ITEM`s and generations;
+5. repacks the checksum, root, and enabled quota trees as needed, repointing
+   changed FS/CSUM/EXTENT/FREE_SPACE/QUOTA `ROOT_ITEM`s and generations;
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
 **Every tree may be any height**, up to `BTRFS_MAX_LEVEL` (8). The fs and extent
 trees use path COW, rewriting only touched root-to-leaf paths. The smaller csum,
-root, and free-space trees are still read as logical item sets and repacked into
+root, free-space, and enabled quota trees are still read as logical item sets and repacked into
 as many `nodesize` leaves and internal levels as needed. The extent tree records
 its own new blocks, so the transaction resolves the mutually-dependent extent
 and whole-repacked tree block counts with a fixed point, reusing the same
@@ -270,6 +292,14 @@ read-only sibling used to verify root flags and mutation rejection.
 root-tree `default` entry. `fixture-laptop.img.sparse` covers a realistic
 non-mixed, 16 KiB-node, zstd-compressed distro layout with `root` and `home`
 subvolumes and current btrfs-progs default features.
+`fixture-sector8k.img.sparse` is a genuine 8 KiB-sector/node image used for
+cross-sector reads, partial COW writes, remount, and checksum verification.
+`fixture-quota.img.sparse` is a Linux-created full-qgroup image with level-0
+`0/5` assigned to `1/100`; tests cover recounting, V2 create/snapshot
+inheritance, hierarchy relations, hard-limit `EDQUOT`, and lifecycle cleanup.
+The ordinary no-quota fixture also exercises the complete quota administration
+lifecycle: enable/rescan, create/assign/limit, unassign/destroy, disable, and
+remount.
 `fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
 a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
 tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-

@@ -227,6 +227,12 @@ pub fn mkdir(d: &DirCap, name: &str, cap: …)       -> impl Future<Output = Dir
 pub fn unlink(d: &DirCap, name: &str, cap: …)      -> impl Future<Output = ()>;
 pub fn rename(src: &DirCap, src_name: &str, dst: &DirCap, dst_name: &str, cap: …) -> impl Future<Output = ()>;
 
+pub struct FsQuotaInherit {
+    pub flags: u64,
+    pub parents: Vec<u64>,
+    pub limit: [u64; 5],
+}
+
 pub trait DirOps {
     fn dir_owners(&self) -> (u32, u32);
     fn set_dir_owners(&self, uid: u32, gid: u32);
@@ -237,6 +243,13 @@ pub trait DirOps {
         source: Arc<dyn DirOps>,
         name: &str,
         readonly: bool,
+    ) -> Result<(), FsError>;
+    async fn snapshot_with_quota_async(
+        &self,
+        source: Arc<dyn DirOps>,
+        name: &str,
+        readonly: bool,
+        quota: FsQuotaInherit,
     ) -> Result<(), FsError>;
 }
 ```
@@ -357,6 +370,13 @@ pub trait DirOps: Send + Sync {
         source: Arc<dyn DirOps>,
         name: &str,
         readonly: bool,
+    ) -> Result<(), FsError>;
+    async fn snapshot_with_quota_async(
+        &self,
+        source: Arc<dyn DirOps>,
+        name: &str,
+        readonly: bool,
+        quota: FsQuotaInherit,
     ) -> Result<(), FsError>;
     /* … */
 }
@@ -515,7 +535,14 @@ for the separately privileged CUSE unrestricted-ioctl contract.
 calling process's fd table. This keeps process-local descriptor lookup in the
 syscall layer while allowing a filesystem to validate same-instance ancestry
 and commit a native snapshot below the destination directory. The default is
-`Unsupported`.
+`Unsupported`. `snapshot_with_quota_async` carries the same resolved source plus
+filesystem-native hierarchical quota parents and the Linux-compatible five-word
+limit record. Drivers without native quota inheritance return `Unsupported`
+without creating the snapshot.
+
+`FsError::QuotaExceeded` is the storage-independent hard-quota failure and maps
+to Linux `EDQUOT`. It remains distinct from `FsError::NoSpace`/`ENOSPC`, so a
+caller can distinguish policy exhaustion from exhausted backing storage.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that
@@ -723,7 +750,7 @@ Arch-neutral at the spec level. Two arch-touches:
 | ----- | ------------------------------------------------------------------- |
 | 3     | VFS core (trait, resolution, open/read/write/stat), initramfs in-memory FS, virtiofs glue skeleton. |
 | 4     | virtiofs and persistent compatibility drivers (including ext2 and single-device btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
-| post-1.0 | NARF-native filesystem, quotas, ACL-like caps, and broader on-disk-format coverage. |
+| post-1.0 | NARF-native filesystem and quota policy, ACL-like caps, and broader on-disk-format coverage. |
 
 ## 8. Resolved decisions
 
@@ -754,7 +781,10 @@ narffs is a copy-on-write FS with:
 first persistent driver that landed. Compatibility drivers now implement ext2,
 FAT-family formats, and single-device read-write btrfs behind the same VFS
 traits. Btrfs supplies the currently implemented native snapshot backend;
-multi-device/RAID btrfs, quotas, and narffs remain future work.
+its compatibility driver also maintains already-enabled full qgroup trees,
+enforces referenced/exclusive hard limits, supports V2 qgroup inheritance, and
+implements the full-qgroup enable/disable/rescan/create/assign/limit ioctls.
+Multi-device/RAID btrfs, simple quotas, and narffs remain future work.
 
 ### 8.2 POSIX semantics scope (resolved)
 

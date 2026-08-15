@@ -18,6 +18,8 @@
 #   fixture-nestedsubvol.img.sparse  normal-dir/subvolume/subvolume path
 #   fixture-manyfiles.img.sparse  400 files -> a multi-level FS b-tree
 #   fixture-defaultsubvol.img.sparse  default subvolume set to `def`
+#   fixture-sector8k.img.sparse  8 KiB sectors/nodes; non-native-sector I/O
+#   fixture-quota.img.sparse  quota tree + level-1 parent qgroup
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
@@ -48,9 +50,12 @@ imglzo="$(mktemp)"
 imgxx="$(mktemp)"
 imgsha="$(mktemp)"
 imgblake="$(mktemp)"
+imgsector8k="$(mktemp)"
+imgquota="$(mktemp)"
+quotamnt="$(mktemp -d)"
 nestedstage="$(mktemp -d)"
 imgnested="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$nestedstage" "$imgnested"' EXIT
+trap 'umount "$quotamnt" 2>/dev/null || true; rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$imgsector8k" "$imgquota" "$quotamnt" "$nestedstage" "$imgnested"' EXIT
 
 mkdir -p "$stage/subdir" "$stage/snap"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
@@ -94,6 +99,41 @@ print("wrote %s: total=%d runs=%d payload=%d"
       % (dst, len(data), len(runs), sum(len(b) for _, b in runs)))
 PY
 }
+
+generate_quota_fixture() {
+    truncate -s 32M "$imgquota"
+    mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+        -O ^no-holes --rootdir "$stage" "$imgquota" >/dev/null
+    mount -o loop "$imgquota" "$quotamnt"
+    btrfs quota enable "$quotamnt"
+    btrfs quota rescan -w "$quotamnt" >/dev/null
+    btrfs qgroup create 1/100 "$quotamnt"
+    btrfs qgroup assign 0/5 1/100 "$quotamnt"
+    sync
+    umount "$quotamnt"
+    btrfs check "$imgquota" >/dev/null
+    sparse_encode "$imgquota" fixture-quota.img.sparse
+    rm -f "$imgquota"
+    rmdir "$quotamnt"
+}
+
+if [[ "${NARF_BTRFS_SECTOR_ONLY:-0}" == 1 ]]; then
+    # A non-native sector geometry. Linux on a 4 KiB-page host cannot mount
+    # this image, but mkfs.btrfs and btrfs check support it; NARF's block I/O
+    # remains on the device's 512-byte logical blocks while Btrfs data/csum
+    # allocation uses 8 KiB sectors.
+    truncate -s 16M "$imgsector8k"
+    mkfs.btrfs --csum crc32c --sectorsize 8192 --nodesize 8192 -M \
+        -O ^free-space-tree,^no-holes --subvol rw:snap --rootdir "$stage" "$imgsector8k" >/dev/null
+    btrfs check "$imgsector8k" >/dev/null
+    sparse_encode "$imgsector8k" fixture-sector8k.img.sparse
+    exit 0
+fi
+
+if [[ "${NARF_BTRFS_QUOTA_ONLY:-0}" == 1 ]]; then
+    generate_quota_fixture
+    exit 0
+fi
 
 # A normal directory followed by two nested subvolume roots. This distinguishes
 # path walking from the old one-component lookup and exercises tree changes at
@@ -144,6 +184,18 @@ mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
     -O ^free-space-tree,^no-holes --subvol rw:snap --rootdir "$stage" "$img" >/dev/null
 btrfs check "$img" >/dev/null
 sparse_encode "$img" fixture.img.sparse
+
+# A non-native sector geometry. Linux on a 4 KiB-page host cannot mount this
+# image, but mkfs.btrfs and btrfs check support it; NARF's block I/O remains on
+# the device's 512-byte logical blocks while Btrfs data/csum allocation uses 8K.
+truncate -s 16M "$imgsector8k"
+mkfs.btrfs --csum crc32c --sectorsize 8192 --nodesize 8192 -M \
+    -O ^free-space-tree,^no-holes --subvol rw:snap --rootdir "$stage" "$imgsector8k" >/dev/null
+btrfs check "$imgsector8k" >/dev/null
+sparse_encode "$imgsector8k" fixture-sector8k.img.sparse
+rm -f "$imgsector8k"
+
+generate_quota_fixture
 
 truncate -s 16M "$imgz"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
