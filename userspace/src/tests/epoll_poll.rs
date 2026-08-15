@@ -1303,6 +1303,28 @@ fn smoke_epoll_epollet_netlink_uevent_token_advances_on_new_uevents() -> TestRes
         return TestResult::Fail("NETLINK_KOBJECT_UEVENT socket open failed");
     }
 
+    // Join the kernel uevent multicast group (sockaddr_nl: family u16 @0,
+    // pad u16 @2, pid u32 @4, groups u32 @8; group 1 = MONITOR_GROUP_KERNEL).
+    // An UNBOUND netlink socket legitimately receives nothing, so without
+    // this bind there is no edge to observe.
+    let mut nl_addr = [0u8; 12];
+    nl_addr[..2].copy_from_slice(&crate::socket::AF_NETLINK.to_le_bytes());
+    nl_addr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if call(
+        Syscall::SocketBind,
+        SyscallArgs {
+            arg0: sock_fd as u64,
+            arg1: nl_addr.as_ptr() as u64,
+            arg2: nl_addr.len() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("NETLINK_KOBJECT_UEVENT bind(groups=1) failed");
+    }
+
     let epfd = call(
         Syscall::EpollCreate,
         SyscallArgs {

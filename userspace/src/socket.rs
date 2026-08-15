@@ -531,6 +531,42 @@ pub struct SocketFile {
     /// Userspace-to-userspace unicast datagrams, independent of each
     /// protocol's kernel reply queue so sender port IDs remain attributable.
     netlink_user_inbox: IrqSafeSpinLock<VecDeque<NetlinkUserPacket>>,
+    /// Membership in the KERNEL uevent multicast group (group 1) for a
+    /// `NETLINK_KOBJECT_UEVENT` socket. False until a `bind` whose
+    /// `sockaddr_nl.nl_groups` has bit 0 set.
+    ///
+    /// Linux ref: `net/netlink/af_netlink.c` — `netlink_bind` is what
+    /// establishes multicast membership, and kernel broadcast
+    /// (`netlink_broadcast` → `do_one_broadcast`) walks `mc_list` and skips
+    /// any socket that is not a member of the destination group. So an
+    /// unbound socket, or one bound with `nl_groups == 0`, receives no
+    /// kernel uevents at all.
+    ///
+    /// This matters because groups=0 is a shape udev uses ON PURPOSE:
+    /// `systemd-udevd` builds each worker's device monitor with
+    /// `device_monitor_new_full(&worker_monitor, MONITOR_GROUP_NONE, -1)`,
+    /// meaning "deliver me only the manager's unicast hand-offs". NARF used
+    /// to attach the kernel uevent ring to every proto-15 socket, so every
+    /// worker also replayed the boot coldplug set — SEQNUM=2 was processed
+    /// seven times by workers forked once each, and a worker re-processing a
+    /// device-node device answers with `INOTIFY_WATCH_REMOVE=1` for an event
+    /// the manager never assigned it, tripping `assert(worker->event)` in
+    /// `udev-manager.c:1199` and aborting the daemon.
+    ///
+    /// The ring READER is still created at `socket()` time, unchanged — the
+    /// cursor position, and the boot-coldplug-replay decision that depends
+    /// on the opening task's comm, must stay exactly as they were, because
+    /// the replay window is chosen relative to socket creation and a
+    /// bind-time reader would start at the wrong place. Only DELIVERY is
+    /// gated, at the same read-side points Linux gates multicast:
+    /// `recv`, poll readiness, the edge-trigger token, and `SIOCINQ`.
+    ///
+    /// Deliberately NOT gated: `netlink_user_inbox`. Manager unicasts and
+    /// group-2 (`MONITOR_GROUP_UDEV`) user broadcasts are membership-checked
+    /// separately in `broadcast_netlink_user`, and must keep flowing to a
+    /// groups=0 socket — receiving those is the entire purpose of a worker
+    /// monitor.
+    netlink_uevent_subscribed: AtomicBool,
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
@@ -936,6 +972,7 @@ impl SocketFile {
             netlink_admin: IrqSafeSpinLock::new(None),
             netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
+            netlink_uevent_subscribed: AtomicBool::new(false),
         });
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
@@ -1104,6 +1141,14 @@ impl SocketFile {
         };
         self.netlink_portid.store(portid, Ordering::Release);
         self.netlink_groups.store(groups, Ordering::Release);
+        // Joining group 1 on NETLINK_KOBJECT_UEVENT is what subscribes this
+        // socket to the KERNEL uevent multicast (Linux: `netlink_bind` →
+        // `netlink_update_subscriptions`). A groups=0 bind — udev's
+        // MONITOR_GROUP_NONE worker monitor — deliberately joins nothing.
+        if self.protocol == NETLINK_KOBJECT_UEVENT && (groups & 1) != 0 {
+            self.netlink_uevent_subscribed
+                .store(true, Ordering::Release);
+        }
         {
             let mut memberships = self.netlink_memberships.lock();
             memberships.retain(|group| *group > 32);
@@ -1998,10 +2043,13 @@ impl FileOps for SocketFile {
                 narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
             }
             SocketState::NetlinkUevent { reader } => {
-                // Readable when an unread uevent is waiting; always writable
-                // (the udev monitor is read-only but POLL_OUT is harmless).
+                // Readable when an unread uevent is waiting AND this socket
+                // joined the kernel uevent group; always writable (the udev
+                // monitor is read-only but POLL_OUT is harmless). A
+                // non-member must never be reported readable: recv would
+                // answer EAGAIN and a level-triggered poller would spin.
                 let mut bits = narf_filesystem::POLL_OUT;
-                if reader.has_pending() {
+                if self.netlink_uevent_subscribed.load(Ordering::Acquire) && reader.has_pending() {
                     bits |= narf_filesystem::POLL_IN;
                 }
                 bits
@@ -2063,7 +2111,11 @@ impl FileOps for SocketFile {
                 (self.listener_readable_token.load(Ordering::Acquire), 0)
             }
             SocketState::NetlinkUevent { reader } => {
-                let rx_tok = if reader.has_pending() {
+                // No membership, no edge: an unsubscribed monitor must not
+                // advance its EPOLLET token on traffic it cannot receive.
+                let rx_tok = if self.netlink_uevent_subscribed.load(Ordering::Acquire)
+                    && reader.has_pending()
+                {
                     narf_filesystem::uevent_current_seqnum()
                 } else {
                     0
@@ -2115,12 +2167,18 @@ impl SocketFile {
             | SocketState::NetlinkSockDiag { replies }
             | SocketState::NetlinkNetfilter { replies }
             | SocketState::NetlinkAudit { replies } => replies.front().map(Vec::len).unwrap_or(0),
-            SocketState::NetlinkUevent { reader } => reader
-                .peek(1)
-                .into_iter()
-                .next()
-                .map(|event| event.to_netlink_bytes().len())
-                .unwrap_or(0),
+            // A non-member of the kernel uevent group has nothing queued to
+            // report, so SIOCINQ is 0 — matching the EAGAIN its recv gives.
+            SocketState::NetlinkUevent { reader }
+                if self.netlink_uevent_subscribed.load(Ordering::Acquire) =>
+            {
+                reader
+                    .peek(1)
+                    .into_iter()
+                    .next()
+                    .map(|event| event.to_netlink_bytes().len())
+                    .unwrap_or(0)
+            }
             _ => 0,
         }
     }
@@ -2624,6 +2682,14 @@ impl SocketFile {
                 SocketOpResult::Ok(buf.len() as u64)
             }
             SocketOp::Recv { buf, flags } => {
+                // Kernel multicast reaches group-1 members only. A socket
+                // that never bound, or bound with nl_groups=0 (udev's
+                // MONITOR_GROUP_NONE worker monitor), is not on `mc_list`
+                // and sees an empty queue — EAGAIN, not somebody else's
+                // coldplug replay.
+                if !self.netlink_uevent_subscribed.load(Ordering::Acquire) {
+                    return SocketOpResult::Err(SockError::WouldBlock);
+                }
                 let ev = {
                     let mut g = self.state.lock();
                     match &mut *g {
@@ -4271,6 +4337,37 @@ impl SocketFile {
                         .unwrap_or_default();
                     let sender_cred = front.sender_cred;
                     let receiver = crate::handlers::current_task_id();
+                    // The udev-manager dispatch sequence, in dequeue order.
+                    // `assert(worker->event)` fires while HANDLING a datagram
+                    // and aborts before udevd can log which one; the last
+                    // line printed here before the abort IS the killer
+                    // datagram, with its sender named in both pid spaces.
+                    #[cfg(feature = "unix-latency-trace")]
+                    if !peek
+                        && crate::handlers::proc_comm_of_task_matches(receiver, "systemd-udevd$")
+                    {
+                        use core::fmt::Write as _;
+                        static SHOWN: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                            let outer = front.sender_cred.pid;
+                            let inner = crate::handlers::report_pid_to(receiver, outer as u64);
+                            let mut txt = alloc::string::String::new();
+                            for &b in front.payload.iter().take(40) {
+                                txt.push(if b == b'\n' {
+                                    '.'
+                                } else if b.is_ascii_graphic() || b == b' ' {
+                                    b as char
+                                } else {
+                                    '?'
+                                });
+                            }
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  udevm-rx: outer={outer} inner={inner} payload={txt}"
+                            );
+                        }
+                    }
                     if peek {
                         // Per-message credentials are still reported for a
                         // peek, but the SCM_RIGHTS batch stays attached to the

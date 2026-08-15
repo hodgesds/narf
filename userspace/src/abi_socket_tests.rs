@@ -4556,6 +4556,124 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
 
+/// Kernel uevent multicast reaches ONLY group-1 subscribers. A
+/// `NETLINK_KOBJECT_UEVENT` socket bound with `nl_groups == 0` must receive
+/// nothing from the kernel.
+///
+/// Linux ref: `net/netlink/af_netlink.c`. `netlink_bind` records the bind's
+/// `nl_groups` mask as the socket's multicast membership
+/// (`netlink_update_subscriptions` / `nlk->groups`), and kernel-originated
+/// broadcast (`netlink_broadcast` → `do_one_broadcast`) walks `nl_table`'s
+/// `mc_list` and skips any socket that is not a member of the destination
+/// group. Group 1 is the kernel uevent group (`MONITOR_GROUP_KERNEL`); a
+/// socket bound with groups=0 joined no group and is not on `mc_list`, so
+/// `kobject_uevent_env`'s broadcast never reaches it.
+///
+/// This is load-bearing for udev. `systemd-udevd` creates its per-worker
+/// device monitor with `device_monitor_new_full(&worker_monitor,
+/// MONITOR_GROUP_NONE, -1)` — groups=0 on purpose, because a worker monitor
+/// exists ONLY to receive the manager's unicast hand-offs, never the kernel
+/// multicast. NARF attached the kernel uevent ring reader to every proto-15
+/// socket unconditionally, so every worker also got the ring INCLUDING the
+/// boot-coldplug replay. Measured on the Fedora systemd gate: SEQNUM=2 was
+/// processed SEVEN times, by workers that were each forked exactly once. A
+/// worker re-processing a device-node device replies with
+/// `INOTIFY_WATCH_REMOVE=1` for an event the manager never sent it, which
+/// trips `assert(worker->event)` in `udev-manager.c:1199` and aborts the
+/// daemon.
+///
+/// The group-1 socket in the same test is not decoration: it is what keeps
+/// this from being satisfiable by breaking kernel uevent delivery outright.
+fn smoke_abi_netlink_uevent_group_none_gets_nothing() -> TestResult {
+    with_setup(|| {
+        // Both monitors must exist BEFORE the emit — a tail-started reader
+        // only ever sees future events, so a socket created after the emit
+        // would report "nothing" for a reason unrelated to membership.
+        let worker = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        // The udev worker-monitor shape: MONITOR_GROUP_NONE == nl_groups 0.
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(worker, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT, groups=0) failed");
+        }
+        // The udev manager-monitor shape: MONITOR_GROUP_KERNEL == group 1.
+        let manager = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(manager, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT, groups=1) failed");
+        }
+
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/abi-netlink-group-none"),
+            alloc::string::String::from("net"),
+        );
+
+        let mut buf = [0u8; 512];
+        if netlink_recv_flags(worker, &mut buf, MSG_DONTWAIT).ok_or("groups=0 recv status")?
+            != EAGAIN
+        {
+            return Err("a groups=0 netlink socket received a kernel uevent — Linux delivers kernel uevent multicast only to group-1 subscribers");
+        }
+
+        // The positive half: a real group-1 subscriber still gets the event.
+        let mut buf = [0u8; 512];
+        let n =
+            netlink_recv_flags(manager, &mut buf, MSG_DONTWAIT).ok_or("groups=1 recv status")?;
+        if n <= 0 {
+            return Err("a groups=1 netlink socket did not receive the kernel uevent");
+        }
+        if !window_contains(&buf[..n as usize], b"add@/devices/abi-netlink-group-none") {
+            return Err("the group-1 subscriber's datagram was not the emitted uevent");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(worker));
+        let _ = call(Syscall::Close.raw(), a0(manager));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_group_none_gets_nothing
+);
+
+/// An UNBOUND `NETLINK_KOBJECT_UEVENT` socket receives no kernel uevents.
+///
+/// Linux ref: multicast membership is established only by `netlink_bind`
+/// (or `NETLINK_ADD_MEMBERSHIP`); a socket that never bound has an empty
+/// `nlk->groups` and is not on the protocol's `mc_list`, so
+/// `netlink_broadcast` never considers it. `socket()` alone subscribes to
+/// nothing.
+fn smoke_abi_netlink_uevent_unbound_gets_nothing() -> TestResult {
+    with_setup(|| {
+        // Created before the emit so a tail-started reader WOULD see the
+        // event if delivery were not membership-gated.
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/abi-netlink-unbound"),
+            alloc::string::String::from("net"),
+        );
+        let mut buf = [0u8; 512];
+        if netlink_recv_flags(fd, &mut buf, MSG_DONTWAIT).ok_or("unbound recv status")? != EAGAIN {
+            return Err("an unbound netlink socket received a kernel uevent — Linux grants multicast membership only at bind");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_unbound_gets_nothing
+);
+
 /// `MSG_PEEK` on a connectionless AF_UNIX datagram must NOT consume the
 /// datagram: the next receive has to return the same message again.
 ///
