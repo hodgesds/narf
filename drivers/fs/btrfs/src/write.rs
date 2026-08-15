@@ -6306,6 +6306,13 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
 /// free-space leaf counts are resolved by the same fixed point [`commit_txn`]
 /// uses. `NoSpace` when the device (or system chunk) has no room.
 pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), FsError> {
+    // Adding a multi-device chunk requires choosing a profile, reserving one
+    // device extent per stripe, and updating each member's dev_item. Existing
+    // multi-device block groups are writable, but profile-aware growth is kept
+    // explicit instead of silently creating a SINGLE chunk on devid 1.
+    if vol.is_multi_device() {
+        return Err(FsError::Unsupported);
+    }
     let sb = vol.superblock();
     let (root_tree, _) = vol.root_tree_root();
     let old_chunk = sb.chunk_root;

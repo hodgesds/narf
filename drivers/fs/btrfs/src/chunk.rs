@@ -7,16 +7,19 @@
 //! tree then yields every remaining chunk. This module parses `btrfs_chunk`
 //! items and maintains the resulting map.
 //!
-//! Scope: single-device SINGLE and DUP profiles only. Any RAID geometry (or a
-//! stripe on a foreign device) is rejected with `Unsupported`, since this
-//! driver cannot reconstruct data across stripes/mirrors.
+//! The map retains complete stripe geometry for SINGLE, DUP, RAID0, RAID1,
+//! RAID10, RAID5 and RAID6 chunks. I/O routing is deliberately separate: this
+//! module answers which `(devid, physical)` locations cover a logical byte and
+//! how far that mapping stays contiguous.
 
 use alloc::vec::Vec;
 
 use narf_filesystem::FsError;
 
 use crate::format::{
-    le16, le64, BtrfsKey, BLOCK_GROUP_DUP, BLOCK_GROUP_PROFILE_MASK, CHUNK_ITEM_KEY, DISK_KEY_SIZE,
+    le16, le64, BtrfsKey, BLOCK_GROUP_DUP, BLOCK_GROUP_PROFILE_MASK, BLOCK_GROUP_RAID0,
+    BLOCK_GROUP_RAID1, BLOCK_GROUP_RAID10, BLOCK_GROUP_RAID5, BLOCK_GROUP_RAID6, CHUNK_ITEM_KEY,
+    DISK_KEY_SIZE,
 };
 
 /// On-disk `struct btrfs_chunk` header size (fields before the first stripe).
@@ -24,17 +27,51 @@ const CHUNK_HEADER_SIZE: usize = 48;
 /// On-disk `struct btrfs_stripe` size (devid + offset + 16-byte uuid).
 const STRIPE_SIZE: usize = 32;
 
-/// One resolved chunk: a logical range and its one or two physical copies.
+/// Supported on-disk block-group profiles.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChunkProfile {
+    Single,
+    Dup,
+    Raid0,
+    Raid1,
+    Raid10,
+    Raid5,
+    Raid6,
+}
+
+/// One physical stripe described by a chunk item.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChunkStripe {
+    pub devid: u64,
+    pub physical: u64,
+}
+
+/// One resolved physical location for a logical byte.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StripeLocation {
+    pub devid: u64,
+    pub physical: u64,
+}
+
+/// A complete RAID5/6 full-stripe set in data/P/Q order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Raid56Set {
+    pub logical_start: u64,
+    pub stripe_len: u64,
+    pub data: Vec<StripeLocation>,
+    pub parity: Vec<StripeLocation>,
+}
+
+/// One resolved chunk and its complete stripe geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkMapEntry {
     pub logical_start: u64,
     pub length: u64,
-    /// Device id owning the stripe. Single-device volumes use one devid.
-    pub devid: u64,
-    /// Byte offset of the stripe on the device.
-    pub physical: u64,
-    /// Second same-device copy for the DUP profile.
-    pub mirror_physical: Option<u64>,
+    pub stripe_len: u64,
+    pub profile: ChunkProfile,
+    /// Number of adjacent mirrors in each RAID10 stripe group.
+    pub sub_stripes: u16,
+    pub stripes: Vec<ChunkStripe>,
 }
 
 /// The logical→physical translation table, ordered for lookup.
@@ -64,9 +101,10 @@ impl ChunkMap {
         self.entries.push(ChunkMapEntry {
             logical_start,
             length,
-            devid,
-            physical,
-            mirror_physical: None,
+            stripe_len: length,
+            profile: ChunkProfile::Single,
+            sub_stripes: 1,
+            stripes: alloc::vec![ChunkStripe { devid, physical }],
         });
     }
 
@@ -83,22 +121,139 @@ impl ChunkMap {
     /// Translate a logical address to a physical device offset. Returns
     /// `NotFound` if no chunk covers it.
     pub fn map_logical(&self, logical: u64) -> Result<u64, FsError> {
-        self.map_logical_copies(logical).map(|copies| copies.0)
+        self.map_logical_stripes(logical).and_then(|stripes| {
+            stripes
+                .first()
+                .map(|s| s.physical)
+                .ok_or(FsError::InvalidData)
+        })
     }
 
     /// Translate a logical address to its primary and optional DUP physical
     /// copy. Both offsets include the logical offset within the chunk.
     pub fn map_logical_copies(&self, logical: u64) -> Result<(u64, Option<u64>), FsError> {
-        for e in &self.entries {
-            if logical >= e.logical_start && logical < e.logical_start.saturating_add(e.length) {
-                let delta = logical - e.logical_start;
-                return Ok((
-                    e.physical + delta,
-                    e.mirror_physical.map(|physical| physical + delta),
-                ));
+        let stripes = self.map_logical_stripes(logical)?;
+        let primary = stripes.first().ok_or(FsError::InvalidData)?.physical;
+        Ok((primary, stripes.get(1).map(|s| s.physical)))
+    }
+
+    /// Resolve all direct copies of one logical byte. RAID5/6 return the data
+    /// stripe only; callers needing degraded reconstruction use
+    /// [`Self::raid56_set`].
+    pub fn map_logical_stripes(&self, logical: u64) -> Result<Vec<StripeLocation>, FsError> {
+        let e = self.entry(logical)?;
+        let delta = logical - e.logical_start;
+        let stripe_nr = delta / e.stripe_len;
+        let within = delta % e.stripe_len;
+        let at = |stripe: ChunkStripe, device_stripe: u64| StripeLocation {
+            devid: stripe.devid,
+            physical: stripe.physical + device_stripe * e.stripe_len + within,
+        };
+        let locations = match e.profile {
+            ChunkProfile::Single | ChunkProfile::Dup | ChunkProfile::Raid1 => e
+                .stripes
+                .iter()
+                .copied()
+                .map(|stripe| StripeLocation {
+                    devid: stripe.devid,
+                    physical: stripe.physical + delta,
+                })
+                .collect(),
+            ChunkProfile::Raid0 => {
+                let count = e.stripes.len() as u64;
+                alloc::vec![at(
+                    e.stripes[(stripe_nr % count) as usize],
+                    stripe_nr / count
+                )]
             }
+            ChunkProfile::Raid10 => {
+                let copies = u64::from(e.sub_stripes);
+                let data_stripes = e.stripes.len() as u64 / copies;
+                let first = (stripe_nr % data_stripes) * copies;
+                let device_stripe = stripe_nr / data_stripes;
+                (0..copies)
+                    .map(|copy| at(e.stripes[(first + copy) as usize], device_stripe))
+                    .collect()
+            }
+            ChunkProfile::Raid5 | ChunkProfile::Raid6 => {
+                let parity = if e.profile == ChunkProfile::Raid5 {
+                    1
+                } else {
+                    2
+                };
+                let data_stripes = e.stripes.len() as u64 - parity;
+                let full_stripe = stripe_nr / data_stripes;
+                let data_index = stripe_nr % data_stripes;
+                let stripe_index = (full_stripe + data_index) % e.stripes.len() as u64;
+                alloc::vec![at(e.stripes[stripe_index as usize], full_stripe)]
+            }
+        };
+        Ok(locations)
+    }
+
+    /// Maximum bytes from `logical` that retain the returned physical mapping.
+    /// Mirrored profiles are linear for the complete chunk; striped profiles
+    /// stop at the next stripe boundary.
+    pub fn max_contiguous(&self, logical: u64) -> Result<u64, FsError> {
+        let e = self.entry(logical)?;
+        let delta = logical - e.logical_start;
+        let chunk_left = e.length - delta;
+        match e.profile {
+            ChunkProfile::Single | ChunkProfile::Dup | ChunkProfile::Raid1 => Ok(chunk_left),
+            _ => Ok(chunk_left.min(e.stripe_len - delta % e.stripe_len)),
         }
-        Err(FsError::NotFound)
+    }
+
+    /// Bytes remaining in the chunk that contains `logical`, independent of
+    /// stripe boundaries. Allocators use this to keep one extent inside one
+    /// block group while the I/O layer splits it across member stripes.
+    pub fn chunk_remaining(&self, logical: u64) -> Result<u64, FsError> {
+        let e = self.entry(logical)?;
+        Ok(e.length - (logical - e.logical_start))
+    }
+
+    /// Resolve the complete RAID5/6 stripe set containing `logical`. Physical
+    /// stripes are returned in Linux's data-then-P-then-Q order after applying
+    /// the per-full-stripe rotation.
+    pub fn raid56_set(&self, logical: u64) -> Result<Raid56Set, FsError> {
+        let e = self.entry(logical)?;
+        let parity_count = match e.profile {
+            ChunkProfile::Raid5 => 1usize,
+            ChunkProfile::Raid6 => 2usize,
+            _ => return Err(FsError::Unsupported),
+        };
+        let data_count = e.stripes.len() - parity_count;
+        let full_logical_len = e
+            .stripe_len
+            .checked_mul(data_count as u64)
+            .ok_or(FsError::InvalidData)?;
+        let delta = logical - e.logical_start;
+        let full_stripe = delta / full_logical_len;
+        let logical_start = e.logical_start + full_stripe * full_logical_len;
+        let mut ordered = Vec::with_capacity(e.stripes.len());
+        for i in 0..e.stripes.len() {
+            let stripe = e.stripes[(i as u64 + full_stripe) as usize % e.stripes.len()];
+            ordered.push(StripeLocation {
+                devid: stripe.devid,
+                physical: stripe.physical + full_stripe * e.stripe_len,
+            });
+        }
+        let parity = ordered.split_off(data_count);
+        Ok(Raid56Set {
+            logical_start,
+            stripe_len: e.stripe_len,
+            data: ordered,
+            parity,
+        })
+    }
+
+    fn entry(&self, logical: u64) -> Result<&ChunkMapEntry, FsError> {
+        self.entries
+            .iter()
+            .find(|e| {
+                logical >= e.logical_start && logical < e.logical_start.saturating_add(e.length)
+            })
+            .ok_or(FsError::NotFound)
     }
 
     /// Parse and insert a single `btrfs_chunk` item covering `[logical_start,
@@ -115,14 +270,49 @@ impl ChunkMap {
             return Err(FsError::InvalidData);
         }
 
-        // Only SINGLE (one stripe) or DUP (two stripes on the same device) are
-        // supported. Any RAID profile requires reconstruction or routing that
-        // this single-device driver deliberately does not implement.
         let profile = chunk_type & BLOCK_GROUP_PROFILE_MASK;
-        if profile != 0 && profile != BLOCK_GROUP_DUP {
-            return Err(FsError::Unsupported);
+        let sub_stripes = le16(chunk, 46)?;
+        let profile = match profile {
+            0 if num_stripes == 1 => ChunkProfile::Single,
+            0 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_DUP if num_stripes == 2 => ChunkProfile::Dup,
+            BLOCK_GROUP_DUP => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID0 if num_stripes >= 2 => ChunkProfile::Raid0,
+            BLOCK_GROUP_RAID0 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID1 if num_stripes >= 2 => ChunkProfile::Raid1,
+            BLOCK_GROUP_RAID1 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID10
+                if num_stripes >= 4 && sub_stripes >= 2 && num_stripes % sub_stripes == 0 =>
+            {
+                ChunkProfile::Raid10
+            }
+            BLOCK_GROUP_RAID10 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID5 if num_stripes >= 2 => ChunkProfile::Raid5,
+            BLOCK_GROUP_RAID5 => return Err(FsError::InvalidData),
+            BLOCK_GROUP_RAID6 if num_stripes >= 3 => ChunkProfile::Raid6,
+            BLOCK_GROUP_RAID6 => return Err(FsError::InvalidData),
+            _ => return Err(FsError::Unsupported),
+        };
+
+        let stripe_len = le64(chunk, 16)?;
+        if stripe_len == 0 || !stripe_len.is_power_of_two() {
+            return Err(FsError::InvalidData);
         }
-        if (profile == 0 && num_stripes != 1) || (profile == BLOCK_GROUP_DUP && num_stripes != 2) {
+        let data_stripes = match profile {
+            ChunkProfile::Raid0 => usize::from(num_stripes),
+            ChunkProfile::Raid10 => usize::from(num_stripes / sub_stripes),
+            ChunkProfile::Raid5 => usize::from(num_stripes - 1),
+            ChunkProfile::Raid6 => usize::from(num_stripes - 2),
+            _ => 1,
+        };
+        let stripe_set_len = stripe_len
+            .checked_mul(data_stripes as u64)
+            .ok_or(FsError::InvalidData)?;
+        if matches!(
+            profile,
+            ChunkProfile::Raid0 | ChunkProfile::Raid10 | ChunkProfile::Raid5 | ChunkProfile::Raid6
+        ) && length % stripe_set_len != 0
+        {
             return Err(FsError::InvalidData);
         }
 
@@ -137,25 +327,25 @@ impl ChunkMap {
             return Err(FsError::InvalidData);
         }
 
-        // Stripe 0.
-        let devid = le64(chunk, CHUNK_HEADER_SIZE)?;
-        let physical = le64(chunk, CHUNK_HEADER_SIZE + 8)?;
-        let mirror_physical = if profile == BLOCK_GROUP_DUP {
-            let second = CHUNK_HEADER_SIZE + STRIPE_SIZE;
-            if le64(chunk, second)? != devid {
-                return Err(FsError::Unsupported);
-            }
-            Some(le64(chunk, second + 8)?)
-        } else {
-            None
-        };
+        let mut stripes = Vec::with_capacity(num_stripes as usize);
+        for i in 0..usize::from(num_stripes) {
+            let at = CHUNK_HEADER_SIZE + i * STRIPE_SIZE;
+            stripes.push(ChunkStripe {
+                devid: le64(chunk, at)?,
+                physical: le64(chunk, at + 8)?,
+            });
+        }
+        if profile == ChunkProfile::Dup && stripes[0].devid != stripes[1].devid {
+            return Err(FsError::InvalidData);
+        }
 
         self.entries.push(ChunkMapEntry {
             logical_start,
             length,
-            devid,
-            physical,
-            mirror_physical,
+            stripe_len,
+            profile,
+            sub_stripes,
+            stripes,
         });
         Ok(())
     }

@@ -9,7 +9,7 @@
 # the full zero-filled image at test time — keeping the committed blob and the
 # kernel `.rodata` embed tiny.
 #
-# Three fixtures are produced from the same staging tree:
+# The fixtures produced from the staging tree include:
 #   fixture.img.sparse       uncompressed (data reads exercise inline/regular)
 #   fixture-zlib.img.sparse  --compress zlib (exercises the zlib read path)
 #   fixture-zstd.img.sparse  --compress zstd (exercises the zstd read path)
@@ -24,6 +24,9 @@
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
+#   fixture-raid{0,1,10,5,6}-N.img.sparse  genuine multi-device members;
+#                            RAID6 uses RAID6 for metadata as well as data so
+#                            two-member degraded recovery is testable
 #
 # Staging tree: hello.txt (tiny -> inline; carries a user.narf xattr),
 # big.dat (12000 B -> regular extents), subdir/note.txt, link.txt (a symlink to
@@ -102,6 +105,61 @@ print("wrote %s: total=%d runs=%d payload=%d"
       % (dst, len(data), len(runs), sum(len(b) for _, b in runs)))
 PY
 }
+
+generate_raid_fixture() (
+    profile="$1"
+    case "$profile" in
+        raid0|raid1) devices=2 ;;
+        raid10|raid6) devices=4 ;;
+        raid5) devices=3 ;;
+        *) echo "unknown RAID profile: $profile" >&2; exit 2 ;;
+    esac
+
+    raid_dir="$(mktemp -d)"
+    raid_mnt="$raid_dir/mnt"
+    mkdir -p "$raid_mnt"
+    loops=()
+    cleanup_raid() {
+        umount "$raid_mnt" 2>/dev/null || true
+        for loop in "${loops[@]}"; do
+            losetup -d "$loop" 2>/dev/null || true
+        done
+        rm -rf "$raid_dir"
+    }
+    trap cleanup_raid EXIT
+
+    for i in $(seq 1 "$devices"); do
+        image="$raid_dir/device-$i.img"
+        truncate -s 128M "$image"
+        loops+=("$(losetup --find --show "$image")")
+    done
+
+    metadata="$profile"
+    case "$profile" in
+        raid0|raid5) metadata=raid1 ;;
+    esac
+    features=()
+    case "$profile" in
+        raid5|raid6) features=(-O raid56) ;;
+    esac
+    mkfs.btrfs -f --csum crc32c --sectorsize 4096 --nodesize 4096 \
+        "${features[@]}" -d "$profile" -m "$metadata" "${loops[@]}" >/dev/null
+    mount "${loops[0]}" "$raid_mnt"
+    cp fixture.img.sparse "$raid_mnt/payload.bin"
+    printf 'multi-device %s\n' "$profile" > "$raid_mnt/profile.txt"
+    sync
+    umount "$raid_mnt"
+    btrfs check "${loops[0]}" >/dev/null
+
+    for i in $(seq 1 "$devices"); do
+        sparse_encode "$raid_dir/device-$i.img" "fixture-$profile-$i.img.sparse"
+    done
+)
+
+if [[ -n "${NARF_BTRFS_RAID_ONLY:-}" ]]; then
+    generate_raid_fixture "$NARF_BTRFS_RAID_ONLY"
+    exit 0
+fi
 
 generate_quota_fixture() {
     truncate -s 32M "$imgquota"
@@ -356,4 +414,8 @@ btrfs inspect-internal dump-tree -t FREE_SPACE "$imgbm" | grep -q FREE_SPACE_BIT
     || { echo "fixture-bitmap has no FREE_SPACE_BITMAP" >&2; exit 1; }
 sparse_encode "$imgbm" fixture-bitmap.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror,-bitmap,-quota,-squota}.img.sparse"
+for profile in raid0 raid1 raid10 raid5 raid6; do
+    generate_raid_fixture "$profile"
+done
+
+echo "regenerated btrfs single-device, checksum, quota, compression, and RAID fixtures"

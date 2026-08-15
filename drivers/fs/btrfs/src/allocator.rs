@@ -190,16 +190,16 @@ impl Allocator {
                 }
                 Err(FsError::NoSpace)
             }
-            // Both ends must map, and physically contiguously — i.e. within one
-            // chunk. An unmapped address (the cursor ran past the last chunk) is
-            // out of space, not a lookup error, so it surfaces as `NoSpace`.
+            // The range must stay in one logical chunk/block group. Physical
+            // continuity is not required: the volume I/O layer splits RAID0/10/
+            // 5/6 extents at stripe boundaries. An unmapped address (the cursor
+            // ran past the last chunk) is out of space, not a lookup error.
             Allocator::Bump { next } => {
                 let start = align_up(*next, align);
-                let phys_start = vol.map_logical(start).map_err(|_| FsError::NoSpace)?;
-                let phys_end = vol
-                    .map_logical(start + size - 1)
+                let remaining = vol
+                    .logical_chunk_remaining(start)
                     .map_err(|_| FsError::NoSpace)?;
-                if phys_end != phys_start + size - 1 {
+                if size > remaining {
                     return Err(FsError::NoSpace);
                 }
                 *next = start + size;

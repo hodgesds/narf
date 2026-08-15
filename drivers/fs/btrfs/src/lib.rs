@@ -1,15 +1,15 @@
-//! Clean-room read-write btrfs driver for single-device filesystems.
+//! Clean-room read-write btrfs driver for single- and multi-device filesystems.
 //!
 //! The on-disk format is decoded per the authoritative kernel definitions in
 //! `include/uapi/linux/btrfs_tree.h` and the read/COW call chains in
 //! `fs/btrfs`. This is an independent Rust
 //! implementation; no C code is copied.
 //!
-//! Supported: SINGLE/DUP chunk profiles, all four btrfs checksum algorithms,
-//! zlib/zstd/LZO and uncompressed reads, 4–64 KiB sectors, incremental COW
-//! writes, namespace mutations, nested writable subvolume mounts, full and
-//! simple qgroup accounting/limits/administration, and subvolume/snapshot
-//! ioctls.
+//! Supported: SINGLE, DUP, RAID0/1/10/5/6 chunk profiles, degraded redundant
+//! reads, all four btrfs checksum algorithms, zlib/zstd/LZO and uncompressed
+//! reads, 4–64 KiB sectors, incremental COW writes, namespace mutations,
+//! nested writable subvolume mounts, full and simple qgroup accounting/limits/
+//! administration, and subvolume/snapshot ioctls.
 //! Unsupported on-disk shapes are rejected precisely rather than mis-read. See
 //! the crate `README` for the full matrix and limits.
 
@@ -38,6 +38,7 @@ pub mod roots;
 pub mod volume;
 pub mod write;
 
+mod raid56;
 mod tests;
 
 /// Register both the root auto-mount factory (used when `fs_detect` finds a
@@ -58,10 +59,24 @@ pub fn register_initcalls() {
 /// Root auto-mount factory: mount the btrfs volume on a synchronously-bridged
 /// block device.
 fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, FsError> {
-    let async_dev = SyncBlock::new(dev);
-    let volume =
-        narf_scheduler::block_on(volume::BtrfsVolume::mount(async_dev, DomainId::DRIVER_0))?;
+    let devices = discover_members(dev);
+    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_devices(
+        devices,
+        DomainId::DRIVER_0,
+    ))?;
     Ok(volume)
+}
+
+/// Put the requested source first, then offer every other registered block
+/// device to the FSID/devid-aware mount path. Foreign filesystems are ignored.
+fn discover_members(source: Arc<dyn BlockDeviceSync>) -> alloc::vec::Vec<Arc<SyncBlock>> {
+    let mut devices = alloc::vec![SyncBlock::new(source.clone())];
+    for entry in narf_block::block_devices() {
+        if !Arc::ptr_eq(&source, &entry.dev) {
+            devices.push(SyncBlock::new(entry.dev));
+        }
+    }
+    devices
 }
 
 /// Parse the `mount -t btrfs` option string into an optional subvolume selector.
@@ -100,9 +115,9 @@ fn btrfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstanc
     let subvol = parse_mount_subvol(options)?;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
-    let async_dev = SyncBlock::new(dev);
-    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol(
-        async_dev,
+    let devices = discover_members(dev);
+    let volume = narf_scheduler::block_on(volume::BtrfsVolume::mount_subvol_devices(
+        devices,
         DomainId::DRIVER_0,
         true,
         subvol,

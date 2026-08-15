@@ -77,6 +77,32 @@ const FIXTURE_MIRROR_SPARSE: &[u8] = include_bytes!("../testdata/fixture-mirror.
 /// space is a `FREE_SPACE_BITMAP` (not extent items); exercises the bitmap path.
 const FIXTURE_BITMAP_SPARSE: &[u8] = include_bytes!("../testdata/fixture-bitmap.img.sparse");
 
+const FIXTURE_RAID0: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid0-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid0-2.img.sparse"),
+];
+const FIXTURE_RAID1: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid1-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid1-2.img.sparse"),
+];
+const FIXTURE_RAID10: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid10-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid10-2.img.sparse"),
+    include_bytes!("../testdata/fixture-raid10-3.img.sparse"),
+    include_bytes!("../testdata/fixture-raid10-4.img.sparse"),
+];
+const FIXTURE_RAID5: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid5-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid5-2.img.sparse"),
+    include_bytes!("../testdata/fixture-raid5-3.img.sparse"),
+];
+const FIXTURE_RAID6: &[&[u8]] = &[
+    include_bytes!("../testdata/fixture-raid6-1.img.sparse"),
+    include_bytes!("../testdata/fixture-raid6-2.img.sparse"),
+    include_bytes!("../testdata/fixture-raid6-3.img.sparse"),
+    include_bytes!("../testdata/fixture-raid6-4.img.sparse"),
+];
+
 /// Reconstruct the full zero-filled image from the sparse encoding.
 fn decode_sparse(sparse: &[u8]) -> Vec<u8> {
     assert!(
@@ -220,6 +246,27 @@ fn mount_sparse_device(sparse: &[u8]) -> Result<Arc<BtrfsVolume<narf_block::Sync
     poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
 }
 
+fn sparse_async_device(sparse: &[u8]) -> Arc<narf_block::SyncBlock> {
+    let (total, runs) = decode_sparse_runs(sparse);
+    let dev: Arc<dyn narf_block::BlockDeviceSync> = Arc::new(SparseImageDevice {
+        runs,
+        total,
+        lba_size: 512,
+    });
+    narf_block::SyncBlock::new(dev)
+}
+
+fn mount_sparse_devices(
+    sparse: &[&[u8]],
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let devices = sparse
+        .iter()
+        .map(|image| sparse_async_device(image))
+        .collect();
+    poll_once(BtrfsVolume::mount_devices(devices, DomainId::DRIVER_0))
+        .ok_or(FsError::InvalidData)?
+}
+
 /// A *writable* sparse-backed device: a large logical capacity whose non-zero
 /// base runs read as the fixture, with an in-memory per-LBA write overlay. Lets a
 /// ≥64 MiB image be mounted read-write in-kernel without a full-size allocation
@@ -309,6 +356,25 @@ fn mount_writable(
 ) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
     let async_dev = narf_block::SyncBlock::new(dev as Arc<dyn narf_block::BlockDeviceSync>);
     poll_once(BtrfsVolume::mount(async_dev, DomainId::DRIVER_0)).ok_or(FsError::InvalidData)?
+}
+
+fn writable_sparse_devices(sparse: &[&[u8]]) -> Vec<Arc<WritableSparseDevice>> {
+    sparse.iter().map(|image| writable_sparse(image)).collect()
+}
+
+fn mount_writable_devices(
+    devices: &[Arc<WritableSparseDevice>],
+) -> Result<Arc<BtrfsVolume<narf_block::SyncBlock>>, FsError> {
+    let async_devices = devices
+        .iter()
+        .cloned()
+        .map(|device| narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>))
+        .collect();
+    poll_once(BtrfsVolume::mount_devices(
+        async_devices,
+        DomainId::DRIVER_0,
+    ))
+    .ok_or(FsError::InvalidData)?
 }
 
 // ── Phase 0: checksum ──────────────────────────────────────────────
@@ -408,6 +474,11 @@ fn build_superblock(magic: u64, csum_type: u16, num_devices: u64) -> alloc::vec:
     put16(&mut sb, 196, csum_type); // csum_type
     sb[198] = 0; // root_level
     sb[199] = 1; // chunk_root_level
+    sb[32..48].copy_from_slice(&[0x55; 16]); // fsid
+    put64(&mut sb, 201, 1); // dev_item.devid
+    put64(&mut sb, 209, 64 << 20); // dev_item.total_bytes
+    sb[267..283].copy_from_slice(&[0x11; 16]); // dev_item.uuid
+    sb[283..299].copy_from_slice(&[0x55; 16]); // dev_item.fsid
     sb
 }
 
@@ -461,21 +532,18 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
         return TestResult::Fail("unknown csum_type must be Unsupported");
     }
 
-    // Multi-device → Unsupported.
+    // Device assembly is a mount concern; the on-disk superblock decoder keeps
+    // the declared count for the multi-device mount path.
     let multidev = build_superblock(format::BTRFS_MAGIC, format::CSUM_TYPE_CRC32, 2);
-    if !matches!(
-        Superblock::decode(&multidev),
-        Err(narf_filesystem::FsError::Unsupported)
-    ) {
-        return TestResult::Fail("num_devices != 1 must be Unsupported");
+    if !matches!(Superblock::decode(&multidev), Ok(ref sb) if sb.num_devices == 2) {
+        return TestResult::Fail("multi-device count was not decoded");
     }
 
-    // Features that change tree or allocation semantics must be rejected at
-    // mount/decode, rather than failing later after metadata has been touched.
+    // RAID56 changes chunk mapping semantics but is now understood.
     let mut raid56 = good.clone();
     raid56[188..196].copy_from_slice(&(1u64 << 7).to_le_bytes());
-    if !matches!(Superblock::decode(&raid56), Err(FsError::Unsupported)) {
-        return TestResult::Fail("RAID56 incompat feature must be Unsupported");
+    if Superblock::decode(&raid56).is_err() {
+        return TestResult::Fail("RAID56 incompat feature must be accepted");
     }
     let mut unknown_incompat = good.clone();
     unknown_incompat[188..196].copy_from_slice(&(1u64 << 63).to_le_bytes());
@@ -514,6 +582,20 @@ fn build_sys_chunk(
     chunk_type: u64,
     num_stripes: u16,
 ) -> Vec<u8> {
+    let stripes: Vec<(u64, u64)> = (0..num_stripes)
+        .map(|s| (1, physical + u64::from(s) * length))
+        .collect();
+    build_sys_chunk_stripes(logical, length, 65536, chunk_type, 0, &stripes)
+}
+
+fn build_sys_chunk_stripes(
+    logical: u64,
+    length: u64,
+    stripe_len: u64,
+    chunk_type: u64,
+    sub_stripes: u16,
+    stripes: &[(u64, u64)],
+) -> Vec<u8> {
     let mut rec = Vec::new();
     // disk_key: objectid=FIRST_CHUNK_TREE(256), type=CHUNK_ITEM, offset=logical
     rec.extend_from_slice(&256u64.to_le_bytes());
@@ -522,17 +604,17 @@ fn build_sys_chunk(
     // btrfs_chunk header (48 bytes)
     rec.extend_from_slice(&length.to_le_bytes()); // length
     rec.extend_from_slice(&3u64.to_le_bytes()); // owner (chunk tree)
-    rec.extend_from_slice(&65536u64.to_le_bytes()); // stripe_len
+    rec.extend_from_slice(&stripe_len.to_le_bytes()); // stripe_len
     rec.extend_from_slice(&chunk_type.to_le_bytes()); // type
     rec.extend_from_slice(&4096u32.to_le_bytes()); // io_align
     rec.extend_from_slice(&4096u32.to_le_bytes()); // io_width
     rec.extend_from_slice(&4096u32.to_le_bytes()); // sector_size
-    rec.extend_from_slice(&num_stripes.to_le_bytes()); // num_stripes
-    rec.extend_from_slice(&0u16.to_le_bytes()); // sub_stripes
-                                                // stripes
-    for s in 0..num_stripes {
-        rec.extend_from_slice(&1u64.to_le_bytes()); // devid
-        rec.extend_from_slice(&(physical + u64::from(s) * length).to_le_bytes()); // offset
+    rec.extend_from_slice(&(stripes.len() as u16).to_le_bytes()); // num_stripes
+    rec.extend_from_slice(&sub_stripes.to_le_bytes()); // sub_stripes
+                                                       // stripes
+    for &(devid, physical) in stripes {
+        rec.extend_from_slice(&devid.to_le_bytes());
+        rec.extend_from_slice(&physical.to_le_bytes());
         rec.extend_from_slice(&[0u8; 16]); // dev_uuid
     }
     rec
@@ -583,18 +665,178 @@ fn smoke_btrfs_sys_chunk_array_parse() -> TestResult {
         return TestResult::Fail("two-stripe SINGLE chunk must be InvalidData");
     }
 
-    // A RAID1 profile is rejected.
-    let raid1 = build_sys_chunk(0, 0x10_0000, 0x80_0000, 1 << 4, 2);
-    if !matches!(
-        ChunkMap::seed_from_sys_array(&raid1),
-        Err(FsError::Unsupported)
-    ) {
-        return TestResult::Fail("RAID1 chunk must be Unsupported");
+    use crate::chunk::StripeLocation;
+    const S: u64 = 65536;
+
+    // RAID1 retains each device id and maps the complete logical range to both
+    // mirrors.
+    let raid1 = build_sys_chunk_stripes(
+        0,
+        4 * S,
+        S,
+        format::BLOCK_GROUP_RAID1,
+        0,
+        &[(1, 0x10_0000), (2, 0x20_0000)],
+    );
+    let raid1 = ChunkMap::seed_from_sys_array(&raid1).unwrap();
+    if raid1.map_logical_stripes(S + 7)
+        != Ok(alloc::vec![
+            StripeLocation {
+                devid: 1,
+                physical: 0x10_0000 + S + 7,
+            },
+            StripeLocation {
+                devid: 2,
+                physical: 0x20_0000 + S + 7,
+            },
+        ])
+    {
+        return TestResult::Fail("RAID1 mirrors mapped incorrectly");
+    }
+
+    // RAID0 alternates stripe_len regions and advances each device only after
+    // a complete stripe set.
+    let raid0 = build_sys_chunk_stripes(
+        0,
+        4 * S,
+        S,
+        format::BLOCK_GROUP_RAID0,
+        0,
+        &[(1, 0x10_0000), (2, 0x20_0000)],
+    );
+    let raid0 = ChunkMap::seed_from_sys_array(&raid0).unwrap();
+    let expected = [(1, 0x10_0000), (2, 0x20_0000), (1, 0x10_0000 + S)];
+    for (stripe, &(devid, physical)) in expected.iter().enumerate() {
+        if raid0.map_logical_stripes(stripe as u64 * S)
+            != Ok(alloc::vec![StripeLocation { devid, physical }])
+        {
+            return TestResult::Fail("RAID0 rotation mapped incorrectly");
+        }
+    }
+    if raid0.max_contiguous(S - 4096) != Ok(4096) {
+        return TestResult::Fail("RAID0 contiguous length crossed a stripe");
+    }
+
+    // RAID10 stripes across mirror groups, retaining both members of the
+    // selected group.
+    let raid10 = build_sys_chunk_stripes(
+        0,
+        4 * S,
+        S,
+        format::BLOCK_GROUP_RAID10,
+        2,
+        &[
+            (1, 0x10_0000),
+            (2, 0x20_0000),
+            (3, 0x30_0000),
+            (4, 0x40_0000),
+        ],
+    );
+    let raid10 = ChunkMap::seed_from_sys_array(&raid10).unwrap();
+    if raid10.map_logical_stripes(2 * S)
+        != Ok(alloc::vec![
+            StripeLocation {
+                devid: 1,
+                physical: 0x10_0000 + S,
+            },
+            StripeLocation {
+                devid: 2,
+                physical: 0x20_0000 + S,
+            },
+        ])
+    {
+        return TestResult::Fail("RAID10 mirror-group rotation mapped incorrectly");
+    }
+
+    // RAID5 rotates P after two data stripes on three devices. Full-stripe
+    // number one is ordered as dev2 data, dev3 data, dev1 P.
+    let raid5 = build_sys_chunk_stripes(
+        0,
+        4 * S,
+        S,
+        format::BLOCK_GROUP_RAID5,
+        0,
+        &[(1, 0x10_0000), (2, 0x20_0000), (3, 0x30_0000)],
+    );
+    let raid5 = ChunkMap::seed_from_sys_array(&raid5).unwrap();
+    let set = raid5.raid56_set(2 * S).unwrap();
+    if set.data.iter().map(|s| s.devid).collect::<Vec<_>>() != alloc::vec![2, 3]
+        || set.parity.iter().map(|s| s.devid).collect::<Vec<_>>() != alloc::vec![1]
+        || raid5.map_logical_stripes(3 * S).unwrap()[0].devid != 3
+    {
+        return TestResult::Fail("RAID5 data/parity rotation mapped incorrectly");
+    }
+
+    // RAID6 applies the same rotation with trailing P and Q stripes.
+    let raid6 = build_sys_chunk_stripes(
+        0,
+        4 * S,
+        S,
+        format::BLOCK_GROUP_RAID6,
+        0,
+        &[
+            (1, 0x10_0000),
+            (2, 0x20_0000),
+            (3, 0x30_0000),
+            (4, 0x40_0000),
+        ],
+    );
+    let raid6 = ChunkMap::seed_from_sys_array(&raid6).unwrap();
+    let set = raid6.raid56_set(2 * S).unwrap();
+    if set.data.iter().map(|s| s.devid).collect::<Vec<_>>() != alloc::vec![2, 3]
+        || set.parity.iter().map(|s| s.devid).collect::<Vec<_>>() != alloc::vec![4, 1]
+    {
+        return TestResult::Fail("RAID6 data/P/Q rotation mapped incorrectly");
     }
     TestResult::Pass
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_sys_chunk_array_parse);
+
+fn smoke_btrfs_raid56_recovery() -> TestResult {
+    let data: Vec<Vec<u8>> = (0..5u8)
+        .map(|stripe| {
+            (0..257u16)
+                .map(|at| stripe.wrapping_mul(73) ^ at.wrapping_mul(19) as u8)
+                .collect()
+        })
+        .collect();
+    let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+    let (p, q) = match crate::raid56::syndromes(&slices, true) {
+        Ok(value) => value,
+        Err(_) => return TestResult::Fail("RAID6 syndrome generation failed"),
+    };
+
+    // Exercise P-only and Q-only single-data recovery.
+    for (target, use_p) in [(0usize, true), (3, false)] {
+        let mut damaged: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        damaged[target] = None;
+        let result = crate::raid56::recover(
+            &mut damaged,
+            use_p.then_some(p.as_slice()),
+            (!use_p).then_some(q.as_slice()),
+            p.len(),
+        );
+        if result.is_err() || damaged[target].as_deref() != Some(data[target].as_slice()) {
+            return TestResult::Fail("single-stripe RAID56 recovery mismatch");
+        }
+    }
+
+    // RAID6 must solve two absent data stripes from P+Q, including the edge
+    // coefficients at the first and last logical data positions.
+    let mut damaged: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+    damaged[0] = None;
+    damaged[4] = None;
+    if crate::raid56::recover(&mut damaged, Some(&p), Some(&q), p.len()).is_err()
+        || damaged[0].as_deref() != Some(data[0].as_slice())
+        || damaged[4].as_deref() != Some(data[4].as_slice())
+    {
+        return TestResult::Fail("two-data RAID6 recovery mismatch");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_raid56_recovery);
 
 fn smoke_btrfs_mount_reads_superblock() -> TestResult {
     let vol = match mount_fixture() {
@@ -618,6 +860,224 @@ fn smoke_btrfs_mount_reads_superblock() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_reads_superblock);
+
+/// Genuine btrfs-progs multi-device images exercise registry-style assembly,
+/// foreign-devid routing, stripe-boundary reads, mirror groups and RAID56
+/// rotation. The payload is large enough to cross the 64 KiB stripe length.
+fn smoke_btrfs_multidevice_profiles() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    for (profile, fixtures) in [
+        ("raid0", FIXTURE_RAID0),
+        ("raid1", FIXTURE_RAID1),
+        ("raid10", FIXTURE_RAID10),
+        ("raid5", FIXTURE_RAID5),
+        ("raid6", FIXTURE_RAID6),
+    ] {
+        let vol = match mount_sparse_devices(fixtures) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("multi-device profile failed to mount"),
+        };
+        if vol.superblock().num_devices != fixtures.len() as u64 {
+            return TestResult::Fail("multi-device member count changed");
+        }
+        let marker = match poll_once(vol.root().lookup_async("profile.txt")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("multi-device profile marker missing"),
+        };
+        let expected = alloc::format!("multi-device {profile}\n");
+        if read_all(&marker, 64).as_deref() != Some(expected.as_bytes()) {
+            return TestResult::Fail("multi-device profile marker content wrong");
+        }
+        let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("multi-device striped payload missing"),
+        };
+        if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+            return TestResult::Fail("multi-device striped payload content wrong");
+        }
+        if !vol.supports_writes() {
+            return TestResult::Fail("complete multi-device volume mounted read-only");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multidevice_profiles);
+
+fn smoke_btrfs_degraded_multidevice_reads() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    // Every single-member omission exercises mirror selection and, for RAID5/6,
+    // rotating data/parity positions across the stripe-boundary payload.
+    for fixtures in [FIXTURE_RAID1, FIXTURE_RAID10, FIXTURE_RAID5, FIXTURE_RAID6] {
+        for omitted in 0..fixtures.len() {
+            let members: Vec<&[u8]> = fixtures
+                .iter()
+                .enumerate()
+                .filter_map(|(index, image)| (index != omitted).then_some(*image))
+                .collect();
+            let vol = match mount_sparse_devices(&members) {
+                Ok(vol) => vol,
+                Err(_) => return TestResult::Fail("degraded volume failed to mount"),
+            };
+            let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+                Some(Ok(file)) => file,
+                _ => return TestResult::Fail("degraded payload lookup failed"),
+            };
+            if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+                return TestResult::Fail("degraded payload reconstruction mismatch");
+            }
+            if !matches!(
+                poll_once(payload.write(0, b"degraded")),
+                Some(Err(FsError::ReadOnly))
+            ) {
+                return TestResult::Fail("degraded multi-device volume allowed a write");
+            }
+        }
+    }
+    // RAID6 metadata and data both tolerate every two-member failure pattern.
+    for first in 0..FIXTURE_RAID6.len() {
+        for second in first + 1..FIXTURE_RAID6.len() {
+            let members: Vec<&[u8]> = FIXTURE_RAID6
+                .iter()
+                .enumerate()
+                .filter_map(|(index, image)| (index != first && index != second).then_some(*image))
+                .collect();
+            let vol = match mount_sparse_devices(&members) {
+                Ok(vol) => vol,
+                Err(_) => return TestResult::Fail("two-member degraded RAID6 failed to mount"),
+            };
+            let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+                Some(Ok(file)) => file,
+                _ => return TestResult::Fail("two-member degraded RAID6 payload missing"),
+            };
+            if read_all(&payload, FIXTURE_SPARSE.len() + 1).as_deref() != Some(FIXTURE_SPARSE) {
+                return TestResult::Fail("two-member degraded RAID6 reconstruction mismatch");
+            }
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_degraded_multidevice_reads);
+
+fn smoke_btrfs_multidevice_write_roundtrip() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    for fixtures in [
+        FIXTURE_RAID0,
+        FIXTURE_RAID1,
+        FIXTURE_RAID10,
+        FIXTURE_RAID5,
+        FIXTURE_RAID6,
+    ] {
+        let devices = writable_sparse_devices(fixtures);
+        let vol = match mount_writable_devices(&devices) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("writable multi-device profile failed to mount"),
+        };
+        let payload = match poll_once(vol.root().lookup_async("payload.bin")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("writable multi-device payload missing"),
+        };
+        // Cross a 64 KiB file-offset boundary. The incremental writer COWs the
+        // changed sectors, exercising striped data plus mirrored metadata;
+        // RAID5/6 additionally perform parity read-modify-write.
+        const OFFSET: u64 = 65520;
+        const PATCH: &[u8] = b"NARF multi-device RAID write crosses a stripe";
+        if !matches!(poll_once(payload.write(OFFSET, PATCH)), Some(Ok(n)) if n == PATCH.len()) {
+            return TestResult::Fail("multi-device RAID write failed");
+        }
+
+        let remounted = match mount_writable_devices(&devices) {
+            Ok(vol) => vol,
+            Err(_) => return TestResult::Fail("written multi-device profile did not remount"),
+        };
+        let payload = match poll_once(remounted.root().lookup_async("payload.bin")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("written multi-device payload missing after remount"),
+        };
+        let got = match read_all(&payload, FIXTURE_SPARSE.len() + 1) {
+            Some(bytes) => bytes,
+            None => return TestResult::Fail("written multi-device payload unreadable"),
+        };
+        if got.get(OFFSET as usize..OFFSET as usize + PATCH.len()) != Some(PATCH) {
+            return TestResult::Fail("multi-device RAID write did not persist");
+        }
+
+        // Every redundant profile must still expose the committed bytes with
+        // any one member absent. For RAID5/6 this proves the newly written P/Q
+        // syndromes, rather than only the original mkfs parity, are usable.
+        if fixtures.as_ptr() != FIXTURE_RAID0.as_ptr() {
+            for omitted in 0..devices.len() {
+                let remaining: Vec<Arc<WritableSparseDevice>> = devices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, device)| (index != omitted).then_some(device.clone()))
+                    .collect();
+                let degraded = match mount_writable_devices(&remaining) {
+                    Ok(vol) => vol,
+                    Err(_) => return TestResult::Fail("written degraded RAID failed to mount"),
+                };
+                let payload = match poll_once(degraded.root().lookup_async("payload.bin")) {
+                    Some(Ok(file)) => file,
+                    _ => return TestResult::Fail("written degraded payload missing"),
+                };
+                let got = match read_all(&payload, FIXTURE_SPARSE.len() + 1) {
+                    Some(bytes) => bytes,
+                    None => return TestResult::Fail("written degraded payload unreadable"),
+                };
+                if got.get(OFFSET as usize..OFFSET as usize + PATCH.len()) != Some(PATCH) {
+                    return TestResult::Fail("written degraded RAID parity mismatch");
+                }
+            }
+        }
+        if fixtures.as_ptr() == FIXTURE_RAID6.as_ptr() {
+            for first in 0..devices.len() {
+                for second in first + 1..devices.len() {
+                    let remaining: Vec<Arc<WritableSparseDevice>> = devices
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, device)| {
+                            (index != first && index != second).then_some(device.clone())
+                        })
+                        .collect();
+                    let degraded = match mount_writable_devices(&remaining) {
+                        Ok(vol) => vol,
+                        Err(_) => {
+                            return TestResult::Fail(
+                                "written two-member degraded RAID6 failed to mount",
+                            )
+                        }
+                    };
+                    let payload = match poll_once(degraded.root().lookup_async("payload.bin")) {
+                        Some(Ok(file)) => file,
+                        _ => {
+                            return TestResult::Fail(
+                                "written two-member degraded RAID6 payload missing",
+                            )
+                        }
+                    };
+                    let got = match read_all(&payload, FIXTURE_SPARSE.len() + 1) {
+                        Some(bytes) => bytes,
+                        None => {
+                            return TestResult::Fail(
+                                "written two-member degraded RAID6 payload unreadable",
+                            )
+                        }
+                    };
+                    if got.get(OFFSET as usize..OFFSET as usize + PATCH.len()) != Some(PATCH) {
+                        return TestResult::Fail("written two-member RAID6 parity mismatch");
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multidevice_write_roundtrip);
 
 // ── Phase 2: B-tree decoders ───────────────────────────────────────
 

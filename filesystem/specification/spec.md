@@ -277,6 +277,15 @@ pub trait FsInstance {
 }
 ```
 
+Persistent-format drivers may expose a typed assembly entry point in addition
+to the generic mount registry. Btrfs provides
+`BtrfsVolume::mount_devices(Vec<Arc<B>>, DomainId)` and the corresponding
+`mount_devices_opts` / `mount_subvol_devices` variants. The first member selects
+the FSID; other supplied or registry-discovered devices are matched by FSID and
+on-disk devid. A complete generation-consistent set may be writable. A missing
+or stale member set is read-only and succeeds only when the selected profile can
+reconstruct every block needed by mount and later I/O.
+
 A mount is just another capability; removing it closes access via
 that path. Existing open caps on nodes across the mount continue to
 work (refcount-style) until they too are released.
@@ -749,7 +758,7 @@ Arch-neutral at the spec level. Two arch-touches:
 | Stage | Lands                                                               |
 | ----- | ------------------------------------------------------------------- |
 | 3     | VFS core (trait, resolution, open/read/write/stat), initramfs in-memory FS, virtiofs glue skeleton. |
-| 4     | virtiofs and persistent compatibility drivers (including ext2 and single-device btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
+| 4     | virtiofs and persistent compatibility drivers (including ext2 and btrfs), unified page cache, rename/link, native snapshot interface, `crypto/` integrity option. |
 | post-1.0 | NARF-native filesystem and quota policy, ACL-like caps, and broader on-disk-format coverage. |
 
 ## 8. Resolved decisions
@@ -779,7 +788,7 @@ narffs is a copy-on-write FS with:
 
 **Implementation status:** narffs remains the native-format target, not the
 first persistent driver that landed. Compatibility drivers now implement ext2,
-FAT-family formats, and single-device read-write btrfs behind the same VFS
+FAT-family formats, and read-write btrfs behind the same VFS
 traits. Btrfs supplies the currently implemented native snapshot backend;
 its compatibility driver also maintains already-enabled full qgroup trees,
 enforces referenced/exclusive hard limits, supports V2 qgroup inheritance, and
@@ -788,8 +797,10 @@ implements Linux simple quotas: post-enable extents have permanent owners,
 usage updates incrementally with referenced equal to exclusive, shared-root
 snapshots begin uncharged, and hierarchy inheritance and hard limits work in
 simple mode. Simple-quota rescans are invalid and disabling preserves the
-on-disk incompat bit and owner refs. Multi-device/RAID btrfs and narffs remain
-future work.
+on-disk incompat bit and owner refs. Btrfs also assembles member devices by
+FSID/devid and reads/writes existing SINGLE/DUP/RAID0/1/10/5/6 chunks, including
+read-only degraded parity recovery. Device lifecycle operations, RAID1C3/4 and
+multi-device chunk growth remain future work, as does narffs.
 
 ### 8.2 POSIX semantics scope (resolved)
 

@@ -12,6 +12,7 @@
 //! address), drop the guard, then do I/O. Holding a spinlock across
 //! `poll_blocking` would wedge the volume under an IRQ-driven backend.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -46,6 +47,18 @@ struct VolumeIo {
     block_size: usize,
 }
 
+/// One member device, with geometry and scratch I/O state local to that
+/// device. Different members may expose different logical block sizes.
+#[derive(Debug)]
+struct VolumeDevice<B: BlockDevice> {
+    device: Arc<B>,
+    capacity: u64,
+    /// Member-specific embedded dev_item, preserved while common superblock
+    /// transaction fields are replicated to every device.
+    dev_item: [u8; format::SUPERBLOCK_DEV_ITEM_SIZE],
+    io: Mutex<VolumeIo>,
+}
+
 impl VolumeIo {
     fn buffer(&self) -> Option<Arc<DmaBuffer>> {
         resolve_cap(&self.cap)
@@ -66,7 +79,7 @@ struct VolState {
     superblock: Superblock,
     /// Physical offset of the superblock copy selected at mount. Reads use this
     /// until the next commit rewrites every mirror and heals the primary.
-    superblock_source: u64,
+    superblock_source: (u64, u64),
     /// Completed logical→physical chunk map.
     chunk_map: ChunkMap,
     /// Selected FS-tree objectid and live root node (logical address + level).
@@ -88,6 +101,8 @@ struct VolState {
 /// A mounted btrfs filesystem.
 #[derive(Debug)]
 pub struct BtrfsVolume<B: BlockDevice> {
+    /// Source device passed first at mount. Retained for compatibility with
+    /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
     pub self_weak: Weak<BtrfsVolume<B>>,
     /// Immutable geometry (copied out of the superblock so hot reads need no
@@ -100,8 +115,13 @@ pub struct BtrfsVolume<B: BlockDevice> {
     csum_type: u16,
     /// Enforce per-node/superblock checksum verification.
     verify_checksums: bool,
-    io: Mutex<VolumeIo>,
-    device_capacity: u64,
+    /// True when the filesystem declares more than one member. Chunk growth is
+    /// deliberately disabled for this case because it requires profile-aware
+    /// device-extent allocation.
+    multi_device: bool,
+    /// Missing members make a redundant array readable but never writable.
+    degraded: bool,
+    devices: BTreeMap<u64, Arc<VolumeDevice<B>>>,
     state: IrqSafeSpinLock<VolState>,
 }
 
@@ -136,6 +156,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// A subvolume marked read-only in its root item remains read-only.
     pub(crate) fn supports_writes(&self) -> bool {
         self.state.lock().writable_fs_tree
+    }
+
+    pub(crate) fn is_multi_device(&self) -> bool {
+        self.multi_device
     }
 
     /// Objectid of the currently mounted fs tree (`5` for the top-level tree).
@@ -178,6 +202,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().chunk_map.map_logical_copies(logical)
     }
 
+    /// Logical bytes left in the containing chunk/block group.
+    pub(crate) fn logical_chunk_remaining(&self, logical: u64) -> Result<u64, FsError> {
+        self.state.lock().chunk_map.chunk_remaining(logical)
+    }
+
+    /// Resolve every direct copy of a logical byte, preserving device ids.
+    pub fn map_logical_stripes(
+        &self,
+        logical: u64,
+    ) -> Result<Vec<crate::chunk::StripeLocation>, FsError> {
+        self.state.lock().chunk_map.map_logical_stripes(logical)
+    }
+
     /// Snapshot of the live superblock (for statfs / write bookkeeping).
     pub fn superblock(&self) -> Superblock {
         self.state.lock().superblock.clone()
@@ -185,9 +222,128 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     // ── Physical / logical reads ───────────────────────────────────
 
-    /// Read `dst.len()` bytes at physical device byte offset `offset`.
-    async fn read_physical(&self, offset: u64, dst: &mut [u8]) -> Result<(), FsError> {
-        read_exact_from(&*self.device, &self.io, self.device_capacity, offset, dst).await
+    fn member(&self, devid: u64) -> Result<Arc<VolumeDevice<B>>, FsError> {
+        self.devices.get(&devid).cloned().ok_or(FsError::NotFound)
+    }
+
+    /// Read `dst.len()` bytes at a member device's physical byte offset.
+    async fn read_physical_on(
+        &self,
+        devid: u64,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), FsError> {
+        let member = self.member(devid)?;
+        read_exact_from(&*member.device, &member.io, member.capacity, offset, dst).await
+    }
+
+    /// Read one direct-copy choice, splitting at chunk/stripe boundaries.
+    async fn read_logical_copy(
+        &self,
+        logical: u64,
+        dst: &mut [u8],
+        copy: usize,
+    ) -> Result<(), FsError> {
+        let mut done = 0usize;
+        while done < dst.len() {
+            let at = logical
+                .checked_add(done as u64)
+                .ok_or(FsError::InvalidData)?;
+            let (locations, contiguous) = {
+                let g = self.state.lock();
+                (
+                    g.chunk_map.map_logical_stripes(at)?,
+                    g.chunk_map.max_contiguous(at)?,
+                )
+            };
+            let take = (dst.len() - done).min(contiguous as usize);
+            if let Some(location) = locations.get(copy) {
+                self.read_physical_on(
+                    location.devid,
+                    location.physical,
+                    &mut dst[done..done + take],
+                )
+                .await?;
+            } else if copy == locations.len() {
+                self.reconstruct_raid56(at, &mut dst[done..done + take])
+                    .await?;
+            } else {
+                return Err(FsError::NotFound);
+            }
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// Rebuild one RAID5/6 logical data slice. The requested stripe is treated
+    /// as absent even when readable, which gives checksum-aware callers an
+    /// independent parity-derived retry for silent corruption.
+    async fn reconstruct_raid56(&self, logical: u64, dst: &mut [u8]) -> Result<(), FsError> {
+        let set = self.state.lock().chunk_map.raid56_set(logical)?;
+        let delta = logical
+            .checked_sub(set.logical_start)
+            .ok_or(FsError::InvalidData)?;
+        let target = (delta / set.stripe_len) as usize;
+        let within = delta % set.stripe_len;
+        if target >= set.data.len() || dst.len() as u64 > set.stripe_len - within {
+            return Err(FsError::InvalidData);
+        }
+
+        let mut data = Vec::with_capacity(set.data.len());
+        let mut unavailable = 1usize; // requested data stripe is intentionally absent
+        for (index, location) in set.data.iter().enumerate() {
+            if index == target {
+                data.push(None);
+                continue;
+            }
+            let mut bytes = vec![0u8; dst.len()];
+            if self
+                .read_physical_on(location.devid, location.physical + within, &mut bytes)
+                .await
+                .is_ok()
+            {
+                data.push(Some(bytes));
+            } else {
+                unavailable += 1;
+                data.push(None);
+            }
+        }
+
+        let mut parity = Vec::with_capacity(set.parity.len());
+        for location in &set.parity {
+            let mut bytes = vec![0u8; dst.len()];
+            if self
+                .read_physical_on(location.devid, location.physical + within, &mut bytes)
+                .await
+                .is_ok()
+            {
+                parity.push(Some(bytes));
+            } else {
+                unavailable += 1;
+                parity.push(None);
+            }
+        }
+        if unavailable > set.parity.len() {
+            return Err(FsError::NotFound);
+        }
+        crate::raid56::recover(
+            &mut data,
+            parity.first().and_then(Option::as_deref),
+            parity.get(1).and_then(Option::as_deref),
+            dst.len(),
+        )?;
+        dst.copy_from_slice(data[target].as_deref().ok_or(FsError::InvalidData)?);
+        Ok(())
+    }
+
+    fn logical_read_copies(&self, logical: u64) -> Result<usize, FsError> {
+        let g = self.state.lock();
+        let direct = g.chunk_map.map_logical_stripes(logical)?.len();
+        match g.chunk_map.raid56_set(logical) {
+            Ok(_) => Ok(direct + 1),
+            Err(FsError::Unsupported) => Ok(direct),
+            Err(error) => Err(error),
+        }
     }
 
     /// Read `len` bytes at btrfs *logical* address `logical`. The range must lie
@@ -196,15 +352,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Resolve both physical copies under the lock, then release it before
         // I/O. A plain logical read can retry transport failure; callers with a
         // checksum (notably read_node and the data-csum path) retry corruption.
-        let (physical, mirror) = self.map_logical_copies(logical)?;
         let mut buf = vec![0u8; len];
-        if let Err(primary_error) = self.read_physical(physical, &mut buf).await {
-            let Some(mirror) = mirror else {
-                return Err(primary_error);
-            };
-            self.read_physical(mirror, &mut buf).await?;
+        let copies = self.logical_read_copies(logical)?;
+        let mut last = FsError::NotFound;
+        for copy in 0..copies {
+            match self.read_logical_copy(logical, &mut buf, copy).await {
+                Ok(()) => return Ok(buf),
+                Err(error) => last = error,
+            }
         }
-        Ok(buf)
+        Err(last)
     }
 
     /// Read a logical range from the first physical copy whose bytes match the
@@ -217,10 +374,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         len: usize,
         stored: &[u8],
     ) -> Result<Vec<u8>, FsError> {
-        let (primary, mirror) = self.map_logical_copies(logical)?;
         let mut buf = vec![0u8; len];
-        for physical in [Some(primary), mirror].into_iter().flatten() {
-            if self.read_physical(physical, &mut buf).await.is_err() {
+        let copies = self.logical_read_copies(logical)?;
+        for copy in 0..copies {
+            if self
+                .read_logical_copy(logical, &mut buf, copy)
+                .await
+                .is_err()
+            {
                 continue;
             }
             let digest = crate::checksum::digest(self.csum_type, &buf)?;
@@ -235,10 +396,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// validating its self-recorded `bytenr` and, when
     /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
-        let (primary, mirror) = self.map_logical_copies(logical)?;
         let mut buf = vec![0u8; self.nodesize()];
-        for physical in [Some(primary), mirror].into_iter().flatten() {
-            if self.read_physical(physical, &mut buf).await.is_err() {
+        let copies = self.logical_read_copies(logical)?;
+        for copy in 0..copies {
+            if self
+                .read_logical_copy(logical, &mut buf, copy)
+                .await
+                .is_err()
+            {
                 continue;
             }
             if format::le64(&buf, 48)? != logical {
@@ -265,6 +430,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Self::mount_opts(device, domain, true).await
     }
 
+    /// Mount a volume from an explicit set of member devices. The first device
+    /// is the requested source; additional devices with another FSID are
+    /// ignored, matching registry-wide discovery.
+    pub async fn mount_devices(
+        devices: Vec<Arc<B>>,
+        domain: DomainId,
+    ) -> Result<Arc<Self>, FsError> {
+        Self::mount_devices_opts(devices, domain, true).await
+    }
+
     /// Mount and, if a subvolume is selected, root the volume at that subvolume
     /// instead of the default `FS_TREE`.
     pub async fn mount_subvol(
@@ -274,6 +449,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         subvol: Option<Subvol>,
     ) -> Result<Arc<Self>, FsError> {
         let volume = Self::mount_opts(device, domain, verify_checksums).await?;
+        if let Some(sel) = subvol {
+            volume.switch_to_subvol(&sel).await?;
+        }
+        Ok(volume)
+    }
+
+    /// Multi-device equivalent of [`Self::mount_subvol`].
+    pub async fn mount_subvol_devices(
+        devices: Vec<Arc<B>>,
+        domain: DomainId,
+        verify_checksums: bool,
+        subvol: Option<Subvol>,
+    ) -> Result<Arc<Self>, FsError> {
+        let volume = Self::mount_devices_opts(devices, domain, verify_checksums).await?;
         if let Some(sel) = subvol {
             volume.switch_to_subvol(&sel).await?;
         }
@@ -302,7 +491,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.fs_tree_level = subvol_level;
         g.fs_tree_flags = subvol_flags;
         g.root_inode = Some(root_inode);
-        g.writable_fs_tree = subvol_flags & format::ROOT_SUBVOL_RDONLY == 0;
+        g.writable_fs_tree = !self.degraded && subvol_flags & format::ROOT_SUBVOL_RDONLY == 0;
         Ok(())
     }
 
@@ -367,83 +556,168 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         domain: DomainId,
         verify_checksums: bool,
     ) -> Result<Arc<Self>, FsError> {
-        let logical = device.logical_block_size() as usize;
-        if !(512..=4096).contains(&logical) || !logical.is_power_of_two() {
-            return Err(FsError::Unsupported);
+        Self::mount_devices_opts(alloc::vec![device], domain, verify_checksums).await
+    }
+
+    /// Mount from an explicit member set, optionally disabling checksum
+    /// verification (test bring-up only).
+    pub async fn mount_devices_opts(
+        input: Vec<Arc<B>>,
+        domain: DomainId,
+        verify_checksums: bool,
+    ) -> Result<Arc<Self>, FsError> {
+        let source_device = input.first().cloned().ok_or(FsError::NotFound)?;
+        let mut scanned = Vec::new();
+        for (index, device) in input.into_iter().enumerate() {
+            let logical = device.logical_block_size() as usize;
+            if !(512..=4096).contains(&logical) || !logical.is_power_of_two() {
+                if index == 0 {
+                    return Err(FsError::Unsupported);
+                }
+                continue;
+            }
+            let capacity = device
+                .capacity_blocks()
+                .checked_mul(logical as u64)
+                .ok_or(FsError::InvalidData)?;
+            if capacity < format::SUPERBLOCK_OFFSET + format::SUPERBLOCK_SIZE as u64 {
+                if index == 0 {
+                    return Err(FsError::InvalidData);
+                }
+                continue;
+            }
+            let dma =
+                alloc_coherent(logical, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
+            let io = Mutex::new(VolumeIo {
+                cap: register_with_cap(dma),
+                block_size: logical,
+            });
+            let mut best: Option<(u64, Superblock, [u8; format::SUPERBLOCK_DEV_ITEM_SIZE])> = None;
+            let mut saw_unsupported = false;
+            for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+                if offset + format::SUPERBLOCK_SIZE as u64 > capacity {
+                    continue;
+                }
+                let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
+                if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                if format::le64(&candidate, format::SUPERBLOCK_BYTENR_OFFSET) != Ok(offset) {
+                    continue;
+                }
+                let candidate_csum = match Superblock::checksum_type(&candidate) {
+                    Ok(kind) if crate::checksum::is_supported(kind) => kind,
+                    Ok(_) => {
+                        saw_unsupported = true;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                if verify_checksums
+                    && !matches!(
+                        crate::checksum::verify(
+                            candidate_csum,
+                            &candidate[format::CSUM_SIZE..format::SUPERBLOCK_SIZE],
+                            &candidate[..format::CSUM_SIZE],
+                        ),
+                        Ok(true)
+                    )
+                {
+                    continue;
+                }
+                let decoded = match Superblock::decode(&candidate) {
+                    Ok(sb) if sb.device_total_bytes <= capacity => sb,
+                    Ok(_) => continue,
+                    Err(FsError::Unsupported) => {
+                        saw_unsupported = true;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, current, _)| decoded.generation > current.generation)
+                {
+                    let start = format::SUPERBLOCK_DEV_ITEM_OFFSET;
+                    let mut dev_item = [0u8; format::SUPERBLOCK_DEV_ITEM_SIZE];
+                    dev_item.copy_from_slice(
+                        &candidate[start..start + format::SUPERBLOCK_DEV_ITEM_SIZE],
+                    );
+                    best = Some((offset, decoded, dev_item));
+                }
+            }
+            match best {
+                Some((offset, superblock, dev_item)) => {
+                    let member = Arc::new(VolumeDevice {
+                        device,
+                        capacity,
+                        dev_item,
+                        io,
+                    });
+                    scanned.push((member, offset, superblock));
+                }
+                None if index == 0 && saw_unsupported => return Err(FsError::Unsupported),
+                None if index == 0 => return Err(FsError::InvalidData),
+                None => {}
+            }
         }
-        let capacity = device
-            .capacity_blocks()
-            .checked_mul(logical as u64)
+
+        let source_fsid = scanned
+            .first()
+            .map(|(_, _, sb)| sb.fsid)
             .ok_or(FsError::InvalidData)?;
-        if capacity < format::SUPERBLOCK_OFFSET + format::SUPERBLOCK_SIZE as u64 {
+        let source_geometry = scanned
+            .first()
+            .map(|(_, _, sb)| (sb.sectorsize, sb.nodesize, sb.csum_type))
+            .ok_or(FsError::InvalidData)?;
+        let mut devices = BTreeMap::new();
+        let mut selected: Option<(u64, u64, Superblock)> = None;
+        let mut min_generation = u64::MAX;
+        let mut max_generation = 0u64;
+        let mut common_superblock: Option<Superblock> = None;
+        let mut inconsistent_members = false;
+        for (member, offset, candidate) in scanned {
+            if candidate.fsid != source_fsid {
+                continue;
+            }
+            if (
+                candidate.sectorsize,
+                candidate.nodesize,
+                candidate.csum_type,
+            ) != source_geometry
+            {
+                return Err(FsError::InvalidData);
+            }
+            if devices.insert(candidate.devid, member).is_some() {
+                return Err(FsError::InvalidData);
+            }
+            min_generation = min_generation.min(candidate.generation);
+            max_generation = max_generation.max(candidate.generation);
+            if let Some(common) = &common_superblock {
+                inconsistent_members |= !same_common_superblock(common, &candidate);
+            } else {
+                common_superblock = Some(candidate.clone());
+            }
+            if selected
+                .as_ref()
+                .is_none_or(|(_, _, current)| candidate.generation > current.generation)
+            {
+                selected = Some((candidate.devid, offset, candidate));
+            }
+        }
+        let (source_devid, source_offset, superblock) = selected.ok_or(FsError::InvalidData)?;
+        if devices.len() > superblock.num_devices as usize {
             return Err(FsError::InvalidData);
         }
-
-        let dma = alloc_coherent(logical, domain).map_err(|_| FsError::Io(BlockError::IOError))?;
-        let io = Mutex::new(VolumeIo {
-            cap: register_with_cap(dma),
-            block_size: logical,
-        });
-
-        // Validate every superblock copy that fits, then choose the newest
-        // generation. On a tie the earlier mirror wins, so a healthy primary
-        // remains preferred. Unsupported feature sets are reported distinctly
-        // when no usable copy remains.
-        let mut selected: Option<(u64, Vec<u8>, Superblock)> = None;
-        let mut saw_unsupported = false;
-        for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
-            if offset + format::SUPERBLOCK_SIZE as u64 > capacity {
-                continue;
-            }
-            let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
-            if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            if format::le64(&candidate, format::SUPERBLOCK_BYTENR_OFFSET) != Ok(offset) {
-                continue;
-            }
-            let candidate_csum = match Superblock::checksum_type(&candidate) {
-                Ok(kind) if crate::checksum::is_supported(kind) => kind,
-                Ok(_) => {
-                    saw_unsupported = true;
-                    continue;
-                }
-                Err(_) => continue,
-            };
-            if verify_checksums {
-                match crate::checksum::verify(
-                    candidate_csum,
-                    &candidate[format::CSUM_SIZE..format::SUPERBLOCK_SIZE],
-                    &candidate[..format::CSUM_SIZE],
-                ) {
-                    Ok(true) => {}
-                    _ => continue,
-                }
-            }
-            let decoded = match Superblock::decode(&candidate) {
-                Ok(sb) if sb.total_bytes <= capacity => sb,
-                Ok(_) => continue,
-                Err(FsError::Unsupported) => {
-                    saw_unsupported = true;
-                    continue;
-                }
-                Err(_) => continue,
-            };
-            let replace = selected
-                .as_ref()
-                .is_none_or(|(_, _, current)| decoded.generation > current.generation);
-            if replace {
-                selected = Some((offset, candidate, decoded));
-            }
-        }
-        let (superblock_source, _raw, superblock) = match selected {
-            Some(candidate) => candidate,
-            None if saw_unsupported => return Err(FsError::Unsupported),
-            None => return Err(FsError::InvalidData),
-        };
+        let multi_device = superblock.num_devices > 1;
+        // A member left behind by an interrupted prior commit is readable from
+        // the newest mirrors, but must not participate in a new transaction.
+        let degraded = devices.len() < superblock.num_devices as usize
+            || min_generation != max_generation
+            || inconsistent_members;
         let csum_type = superblock.csum_type;
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
@@ -451,7 +725,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         seed.map_logical(superblock.chunk_root)?;
 
         let volume = Arc::new_cyclic(|self_weak| BtrfsVolume {
-            device,
+            device: source_device,
             self_weak: self_weak.clone(),
             magic: superblock.magic,
             nodesize: superblock.nodesize,
@@ -459,18 +733,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             total_bytes: superblock.total_bytes,
             csum_type,
             verify_checksums,
-            io,
-            device_capacity: capacity,
+            multi_device,
+            degraded,
+            devices,
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
-                superblock_source,
+                superblock_source: (source_devid, source_offset),
                 chunk_map: seed,
                 fs_tree_id: format::FS_TREE_OBJECTID,
                 fs_tree_root: 0,
                 fs_tree_level: 0,
                 fs_tree_flags: 0,
                 root_inode: None,
-                writable_fs_tree: true,
+                writable_fs_tree: !degraded,
                 alloc_floor: 0,
             }),
         });
@@ -519,7 +794,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             g.fs_tree_root = fs_root;
             g.fs_tree_level = fs_level;
             g.fs_tree_flags = fs_flags;
-            g.writable_fs_tree = fs_flags & format::ROOT_SUBVOL_RDONLY == 0;
+            g.writable_fs_tree = !self.degraded && fs_flags & format::ROOT_SUBVOL_RDONLY == 0;
         }
 
         // 2b. Replay a pending fsync tree-log (crash recovery) before anything
@@ -612,8 +887,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Write `src` at physical device byte offset `offset` (block-granular,
     /// read-modify-write for partial leading/trailing blocks).
-    async fn write_physical(&self, offset: u64, src: &[u8]) -> Result<(), FsError> {
-        write_exact_to(&*self.device, &self.io, self.device_capacity, offset, src).await
+    async fn write_physical_on(&self, devid: u64, offset: u64, src: &[u8]) -> Result<(), FsError> {
+        let member = self.member(devid)?;
+        write_exact_to(&*member.device, &member.io, member.capacity, offset, src).await
     }
 
     /// Write `src` at btrfs *logical* address `logical` (single-chunk range).
@@ -633,20 +909,94 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         logical: u64,
         src: &[u8],
     ) -> Result<(), FsError> {
+        if self.degraded {
+            return Err(FsError::ReadOnly);
+        }
         self.write_logical_unchecked(logical, src).await
     }
 
     async fn write_logical_unchecked(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
-        let physical = self.map_logical(logical)?;
-        // The whole range must stay inside one chunk: the last byte must map to
-        // a physically-contiguous offset.
-        if src.len() > 1 {
-            let last = self.map_logical(logical + src.len() as u64 - 1)?;
-            if last != physical + src.len() as u64 - 1 {
-                return Err(FsError::NoSpace);
+        let mut done = 0usize;
+        while done < src.len() {
+            let at = logical
+                .checked_add(done as u64)
+                .ok_or(FsError::InvalidData)?;
+            let (locations, contiguous, raid56) = {
+                let g = self.state.lock();
+                let raid56 = match g.chunk_map.raid56_set(at) {
+                    Ok(set) => Some(set),
+                    Err(FsError::Unsupported) => None,
+                    Err(error) => return Err(error),
+                };
+                (
+                    g.chunk_map.map_logical_stripes(at)?,
+                    g.chunk_map.max_contiguous(at)?,
+                    raid56,
+                )
+            };
+            let take = (src.len() - done).min(contiguous as usize);
+            if let Some(set) = raid56 {
+                self.write_raid56(at, &src[done..done + take], &set).await?;
+            } else {
+                for location in locations {
+                    self.write_physical_on(
+                        location.devid,
+                        location.physical,
+                        &src[done..done + take],
+                    )
+                    .await?;
+                }
+            }
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// Read-modify-write one data slice and its P/Q parity. The caller splits
+    /// writes at stripe boundaries, and writable mounts require every declared
+    /// member, so all peer data is available without degraded reconstruction.
+    async fn write_raid56(
+        &self,
+        logical: u64,
+        src: &[u8],
+        set: &crate::chunk::Raid56Set,
+    ) -> Result<(), FsError> {
+        let delta = logical
+            .checked_sub(set.logical_start)
+            .ok_or(FsError::InvalidData)?;
+        let target = (delta / set.stripe_len) as usize;
+        let within = delta % set.stripe_len;
+        if target >= set.data.len() || src.len() as u64 > set.stripe_len - within {
+            return Err(FsError::InvalidData);
+        }
+
+        let mut data = Vec::with_capacity(set.data.len());
+        for (index, location) in set.data.iter().enumerate() {
+            if index == target {
+                data.push(src.to_vec());
+            } else {
+                let mut bytes = vec![0u8; src.len()];
+                self.read_physical_on(location.devid, location.physical + within, &mut bytes)
+                    .await?;
+                data.push(bytes);
             }
         }
-        self.write_physical(physical, src).await
+        let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+        let (p, q) = crate::raid56::syndromes(&slices, set.parity.len() == 2)?;
+
+        let location = set.data.get(target).ok_or(FsError::InvalidData)?;
+        self.write_physical_on(location.devid, location.physical + within, src)
+            .await?;
+        for (index, location) in set.parity.iter().enumerate() {
+            let parity = if index == 0 {
+                p.as_slice()
+            } else {
+                q.as_slice()
+            };
+            self.write_physical_on(location.devid, location.physical + within, parity)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Overwrite every superblock copy with `raw` (a full 4096-byte block whose
@@ -669,6 +1019,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Superblock half of [`Self::write_logical_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
+        if self.degraded {
+            return Err(FsError::ReadOnly);
+        }
         self.write_superblock_unchecked(raw).await
     }
 
@@ -676,43 +1029,43 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if raw.len() != format::SUPERBLOCK_SIZE {
             return Err(FsError::InvalidData);
         }
-        let limit = self.total_bytes.min(self.device_capacity);
-        // Mirrors first (highest offset to lowest), primary (offset 0) last.
+        // Mirrors first (highest offset to lowest), primary (offset 0) last,
+        // across every member. Common transaction fields are shared, while the
+        // embedded dev_item remains unique to each device.
         for &offset in format::SUPERBLOCK_MIRROR_OFFSETS.iter().rev() {
-            if offset != format::SUPERBLOCK_OFFSET
-                && offset + format::SUPERBLOCK_SIZE as u64 > limit
-            {
-                continue; // this mirror doesn't fit in the filesystem
-            }
-            let mut copy;
-            let block: &[u8] = if offset == format::SUPERBLOCK_OFFSET {
-                raw
-            } else {
-                copy = raw.to_vec();
+            for (&devid, member) in &self.devices {
+                if offset + format::SUPERBLOCK_SIZE as u64 > member.capacity {
+                    continue; // this mirror doesn't fit on this member
+                }
+                let mut copy = raw.to_vec();
                 let b = format::SUPERBLOCK_BYTENR_OFFSET;
                 copy[b..b + 8].copy_from_slice(&offset.to_le_bytes());
+                let d = format::SUPERBLOCK_DEV_ITEM_OFFSET;
+                copy[d..d + format::SUPERBLOCK_DEV_ITEM_SIZE].copy_from_slice(&member.dev_item);
                 crate::checksum::stamp_block(self.csum_type, &mut copy)?;
-                &copy
-            };
-            self.write_physical(offset, block).await?;
-            self.device.flush().await; // each copy durable before the next
+                self.write_physical_on(devid, offset, &copy).await?;
+                member.device.flush().await; // each copy durable before the next
+            }
         }
-        self.state.lock().superblock_source = format::SUPERBLOCK_OFFSET;
+        let devid = *self.devices.keys().next().ok_or(FsError::NotFound)?;
+        self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
         Ok(())
     }
 
     /// Flush the backing device.
     pub async fn flush(&self) {
-        self.device.flush().await;
+        for member in self.devices.values() {
+            member.device.flush().await;
+        }
     }
 
     /// Read the selected raw superblock and normalize it to primary-copy form.
     /// Transaction code can therefore heal a damaged primary without knowing
     /// which mirror supplied the mounted generation.
     pub async fn read_raw_superblock(&self) -> Result<Vec<u8>, FsError> {
-        let source = self.state.lock().superblock_source;
+        let (devid, source) = self.state.lock().superblock_source;
         let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
-        self.read_physical(source, &mut raw).await?;
+        self.read_physical_on(devid, source, &mut raw).await?;
         if source != format::SUPERBLOCK_OFFSET {
             let at = format::SUPERBLOCK_BYTENR_OFFSET;
             raw[at..at + 8].copy_from_slice(&format::SUPERBLOCK_OFFSET.to_le_bytes());
@@ -748,7 +1101,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.fs_tree_level = new_fs_level;
         if let Some(flags) = new_fs_tree_flags {
             g.fs_tree_flags = flags;
-            g.writable_fs_tree = flags & format::ROOT_SUBVOL_RDONLY == 0;
+            g.writable_fs_tree = !self.degraded && flags & format::ROOT_SUBVOL_RDONLY == 0;
         }
     }
 
@@ -769,6 +1122,30 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         g.superblock.root = new_root_tree;
         g.superblock.generation = new_generation;
     }
+}
+
+/// Compare the shared part of two member superblocks. The checksum and embedded
+/// dev_item fields are intentionally member-specific; every other decoded field
+/// must describe the same transaction before the array is safe to write.
+fn same_common_superblock(left: &Superblock, right: &Superblock) -> bool {
+    left.fsid == right.fsid
+        && left.magic == right.magic
+        && left.generation == right.generation
+        && left.root == right.root
+        && left.chunk_root == right.chunk_root
+        && left.log_root == right.log_root
+        && left.log_root_level == right.log_root_level
+        && left.total_bytes == right.total_bytes
+        && left.bytes_used == right.bytes_used
+        && left.num_devices == right.num_devices
+        && left.compat_ro_flags == right.compat_ro_flags
+        && left.incompat_flags == right.incompat_flags
+        && left.sectorsize == right.sectorsize
+        && left.nodesize == right.nodesize
+        && left.csum_type == right.csum_type
+        && left.root_level == right.root_level
+        && left.chunk_root_level == right.chunk_root_level
+        && left.sys_chunk_array == right.sys_chunk_array
 }
 
 /// Write `src` at physical byte offset `offset`, one logical block at a time,
