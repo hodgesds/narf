@@ -23,22 +23,36 @@ Idioms to match:
 
 ## Status (updated as findings land)
 
-LANDED (commit, RED-first test): #1 kill(-pgid), #3 pgid_from_user, #4 setpgid,
-#5 getpgid, #6 TIOCSPGRP (all in "Resolve pgid arguments in the caller's pid
-namespace"); #2 ptrace ("ptrace: resolve the target pid..."); #7 getsid
-("getsid: return the session id..."); #8 kill/tkill/tgkill/pidfd si_pid
-("Record the sender pid..."); #9 SIGCHLD si_pid ("SIGCHLD: name the exiting
-child...").
+LANDED (each with a RED-first test): #1/#3/#4/#5/#6 pgid family; #2 ptrace;
+#7 getsid; #8 kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid
+stop/cont si_pid; #15 fcntl F_GETLK l_pid; #17 kill(-1) ns visibility; #21
+process_vm.
 
-IN PROGRESS (worktree agent): #10 perf, #11 prlimit64, #12 kcmp, #18
-sched_param, #19 capset, #20 migrate/move_pages, #22 get_robust_list, #23
-ioprio, #27 bpf, #28 setpriority.
+IN PROGRESS (worktree agent, IN-direction batch): #10 perf, #11 prlimit64,
+#12 kcmp, #18 sched_param, #19 capset, #20 migrate/move_pages, #22
+get_robust_list, #23 ioprio, #27 bpf, #28 setpriority.
 
-REMAINING: #13 fork-return (UNSURE — verify project_pidns_flow_model), #14
-waitid stop/cont si_pid, #15 fcntl F_GETLK l_pid, #16 /proc task/tid names,
-#17 kill(-1) visibility, #21 process_vm, #24 cgroup.threads, #25 mq_notify,
-#26 tkill non-leader arm, #30 wait unbound->ECHILD, #31-#34 (mostly OUT
-rendering / UNSURE).
+VERIFIED-CORRECT-IN-PRACTICE (no fix needed): #24 cgroup.threads — the write
+path routes both cgroup.procs and cgroup.threads into `members` via `place()`,
+so `cg.threads` is never populated and the read always hits the report_pid
+mirror-procs branch; the raw-tid branch is dead code.
+
+DEFERRED (low value / risk, documented):
+- #13 fork-return after CLONE_NEWPID — UNSURE. The in-tree comment claims the
+  parent-sees-child's-new-ns-pid coupling is deliberate (cites
+  project_pidns_flow_model). Do NOT change without verifying that flow first.
+- #16 /proc/<pid>/task/<tid> names — NARF is single-thread-per-process, so
+  task/ has one entry; low impact until real threads land.
+- #25 mq_notify si_pid — POSIX mq, negligible reach in this tree.
+- #26 tkill/tgkill non-leader-thread raw-tid arm — requires multi-threaded
+  processes NARF barely has; niche, and touching signal_tid_from_user is
+  higher-risk than the payoff.
+- #30 wait4/waitid unbound-inner fallback -> ECHILD — the current "keep raw ->
+  matches nothing -> ECHILD" is documented-safe except for a numeric-collision
+  sibling; changing it risks the blocking-wait path.
+- #31 NSpid chain, #32 /proc stat tty fields (constant 0, no leak), #33 SysV
+  IPC IPC_STAT pids (fields written 0, no leak), #34 setns TaskId fallback
+  (likely dead) — OUT rendering / no live leak / UNSURE reachability.
 
 ## Findings (severity-ranked)
 
