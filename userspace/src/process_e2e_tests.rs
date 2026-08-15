@@ -5045,6 +5045,9 @@ kernel_test_in!(
 //
 // Linux ref: kernel/fork.c::copy_process (the child's tgid is its own).
 
+// x86_64-only: uses the arch-gated PROC_PARENT_AS + AddressSpace::new_for_user,
+// matching the x86_64-gated kernel_test_in! registration below.
+#[cfg(target_arch = "x86_64")]
 fn smoke_process_fork_child_pid_identity() -> TestResult {
     use narf_memory::AddressSpace;
 
@@ -5163,6 +5166,9 @@ kernel_test_in!("userspace/process", smoke_process_fork_child_pid_identity);
 ///
 /// Linux ref: kernel/fork.c — a CLONE_THREAD child joins the caller's
 /// thread group, so `task_tgid_vnr()` (what getpid reports) is unchanged.
+// x86_64-only: uses the arch-gated PROC_PARENT_AS + AddressSpace::new_for_user,
+// matching the x86_64-gated kernel_test_in! registration below.
+#[cfg(target_arch = "x86_64")]
 fn smoke_process_clone_thread_shares_pid() -> TestResult {
     use narf_memory::AddressSpace;
 
