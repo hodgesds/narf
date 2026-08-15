@@ -392,7 +392,6 @@ fn smoke_abi_pidns_move_pages_self_pid_in_caller_pid_ns() -> TestResult {
                 arg3: 0, // nodes == NULL (query mode)
                 arg4: status.as_mut_ptr() as u64,
                 arg5: 0, // flags
-                ..Default::default()
             };
             match call(Syscall::MovePages.raw(), args) {
                 None => Ok(()),
