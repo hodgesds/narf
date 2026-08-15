@@ -332,6 +332,15 @@ pub enum SocketOp<'a> {
     },
 }
 
+/// Ancillary data carried by one received connectionless AF_UNIX datagram,
+/// held between its dequeue and the recvmsg syscall's extraction of it.
+/// Keyed per receiving task — see `SocketFile::dgram_recv_ancillary`.
+#[derive(Default)]
+struct DgramRecvAncillary {
+    cred: Ucred,
+    fds: Vec<ScmRightsFile>,
+}
+
 #[derive(Debug)]
 pub enum SocketOpResult {
     Ok(u64),
@@ -446,15 +455,28 @@ pub struct SocketFile {
     peer_groups: IrqSafeSpinLock<Vec<u32>>,
     /// `SO_PASSCRED` — recvmsg attaches an `SCM_CREDENTIALS` cmsg when set.
     passcred: AtomicBool,
-    /// Credentials of the sender of the most recently received datagram.
-    /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
-    /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
-    last_recv_cred: IrqSafeSpinLock<Ucred>,
-    /// SCM_RIGHTS carried by the most recently received AF_UNIX datagram.
-    /// Datagram ancillary data is per-message, so this is overwritten exactly
-    /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
-    /// the following `recvmsg` (or discarded by a plain `read`).
-    last_recv_fds: IrqSafeSpinLock<Vec<ScmRightsFile>>,
+    /// Ancillary data of the connectionless AF_UNIX datagram most recently
+    /// dequeued BY EACH RECEIVING TASK, keyed by that task.
+    ///
+    /// Datagram ancillary data belongs to the RECORD that carried it, not to
+    /// the socket, and dequeue is not atomic with extraction: `dispatch_op
+    /// (Recv)` pops the packet and stashes its credentials here, and the
+    /// recvmsg syscall reads them back only after copying the payload out to
+    /// userspace. Socket-global slots therefore lose the association the
+    /// moment a SECOND receiver dequeues inside that window — the first
+    /// receiver goes on to report the second sender's identity.
+    ///
+    /// `systemd-udevd` is precisely that topology: many workers sending to
+    /// one manager, which identifies the sender purely from SCM_CREDENTIALS
+    /// (`hashmap_get(manager->workers, &sender)`). Attributing a worker's
+    /// `INOTIFY_WATCH_REMOVE=1` to a different, idle worker makes the manager
+    /// fail `assert(worker->event)` and abort.
+    ///
+    /// ORDER MATTERS for consumers: `unix_take_recv_fds` takes the rights and
+    /// leaves the entry; `recvmsg_cred` REMOVES it. Take the fds first, or
+    /// they are dropped with the entry. A plain `read(2)` wants neither and
+    /// calls `discard_dgram_recv_ancillary`.
+    dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
     /// Readable-transition generation for connectionless datagram inboxes.
     /// A bound AF_UNIX DGRAM socket is the systemd `$NOTIFY_SOCKET` shape:
     /// after an EPOLLET consumer drains it, a refill can occur before epoll
@@ -890,8 +912,7 @@ impl SocketFile {
             local_groups: IrqSafeSpinLock::new(Vec::new()),
             peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
-            last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
-            last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
+            dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             dgram_readable_token: AtomicU64::new(0),
             listener_readable_token: AtomicU64::new(0),
             #[cfg(feature = "unix-latency-trace")]
@@ -1365,7 +1386,15 @@ impl SocketFile {
             if matches!(&*self.state.lock(), SocketState::UnixConnected { .. }) {
                 *self.peer_cred.lock()
             } else {
-                *self.last_recv_cred.lock()
+                // Per-RECORD, keyed by the receiving task. Removing the entry
+                // here is what bounds the map; any rights still attached were
+                // not asked for and are dropped with it (see the field docs
+                // for the required take-fds-first ordering).
+                self.dgram_recv_ancillary
+                    .lock()
+                    .remove(&crate::handlers::current_task_id())
+                    .map(|a| a.cred)
+                    .unwrap_or_default()
             }
         } else {
             *self.peer_cred.lock()
@@ -1788,6 +1817,9 @@ impl FileOps for SocketFile {
                     // discard those rights now so a later recvmsg(2) cannot
                     // receive descriptors attached to already-consumed bytes.
                     drop(self.unix_take_recv_fds());
+                    // read(2) reports no credentials either, so clear the
+                    // whole per-record entry rather than leaving a cred behind.
+                    self.discard_dgram_recv_ancillary();
                     Ok(n)
                 }
                 // do_recv already distinguishes empty-but-open from EOF; pass
@@ -4211,17 +4243,30 @@ impl SocketFile {
                         .map(|a| a.to_body())
                         .unwrap_or_default();
                     let sender_cred = front.sender_cred;
+                    let receiver = crate::handlers::current_task_id();
                     if peek {
                         // Per-message credentials are still reported for a
                         // peek, but the SCM_RIGHTS batch stays attached to the
                         // queued datagram: taking it here would hand the fds
                         // to the peek and leave the real receive with none.
-                        *self.last_recv_cred.lock() = sender_cred;
+                        self.dgram_recv_ancillary.lock().insert(
+                            receiver,
+                            DgramRecvAncillary {
+                                cred: sender_cred,
+                                fds: Vec::new(),
+                            },
+                        );
                     } else if let Some(pkt) = inbox.pop_front() {
-                        // Stash the sender's creds so a SO_PASSCRED recvmsg can
-                        // attach them as SCM_CREDENTIALS.
-                        *self.last_recv_cred.lock() = pkt.sender_cred;
-                        *self.last_recv_fds.lock() = pkt.fds;
+                        // Stash this record's ancillary data against the
+                        // RECEIVING TASK so a concurrent receiver's dequeue
+                        // cannot overwrite it (see `dgram_recv_ancillary`).
+                        self.dgram_recv_ancillary.lock().insert(
+                            receiver,
+                            DgramRecvAncillary {
+                                cred: pkt.sender_cred,
+                                fds: pkt.fds,
+                            },
+                        );
                     }
                     let peer = Some(SockAddr {
                         family: AF_UNIX,
@@ -4540,11 +4585,27 @@ impl SocketFile {
         }
     }
 
+    /// Drop this task's pending datagram ancillary entry outright.
+    ///
+    /// `read(2)` has no ancillary output, so it wants neither the rights nor
+    /// the credentials; without this the entry would linger until the task's
+    /// next datagram receive overwrote it.
+    pub(crate) fn discard_dgram_recv_ancillary(&self) {
+        self.dgram_recv_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id());
+    }
+
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
     /// socket's receive ring (empty for non-unix sockets or when none were
     /// passed).
     pub(crate) fn unix_take_recv_fds(&self) -> Vec<ScmRightsFile> {
-        let from_dgram = core::mem::take(&mut *self.last_recv_fds.lock());
+        let from_dgram = self
+            .dgram_recv_ancillary
+            .lock()
+            .get_mut(&crate::handlers::current_task_id())
+            .map(|a| core::mem::take(&mut a.fds))
+            .unwrap_or_default();
         if !from_dgram.is_empty() {
             return from_dgram;
         }

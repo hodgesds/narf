@@ -4723,6 +4723,113 @@ kernel_test_in!(
     smoke_abi_socket_unix_dgram_peek_trunc_reports_full_size
 );
 
+/// A connectionless AF_UNIX datagram's ancillary data belongs to the RECORD
+/// that carried it, not to the socket. Two tasks receiving on one shared
+/// socket must each get the credentials of the datagram THEY dequeued.
+///
+/// `SocketFile` keeps `last_recv_cred` / `last_recv_fds` as socket-global
+/// slots: `dispatch_op(Recv)` writes them at dequeue, and the recvmsg
+/// syscall reads them back afterwards. That is not atomic per record. Any
+/// second receiver that dequeues in the window between the first receiver's
+/// dequeue and its ancillary extraction overwrites the slots, and the first
+/// receiver reports the SECOND sender's identity.
+///
+/// This is the shape `systemd-udevd` trips over. Its manager identifies which
+/// worker sent a notification purely from SCM_CREDENTIALS
+/// (`hashmap_get(manager->workers, &sender)`); attribute a worker's
+/// `INOTIFY_WATCH_REMOVE=1` to a DIFFERENT, idle worker and the manager hits
+/// `assert(worker->event)` at udev-manager.c:1199 and aborts the daemon.
+///
+/// Driven at the socket layer on purpose: the syscall path performs dequeue
+/// and extraction inside one call, so it cannot express the interleaving that
+/// the bug requires.
+fn smoke_abi_socket_unix_dgram_ancillary_is_per_record() -> TestResult {
+    use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult, AF_UNIX, SOCK_DGRAM};
+    with_setup(|| {
+        const SENDER_A: u64 = 0xDA01;
+        const SENDER_A_PID: u64 = 7001;
+        const SENDER_B: u64 = 0xDA02;
+        const SENDER_B_PID: u64 = 7002;
+        const RECEIVER_1: u64 = 0xDA11;
+        const RECEIVER_2: u64 = 0xDA12;
+
+        let addr = SockAddr {
+            family: AF_UNIX,
+            body: b"\0narf-ancillary-per-record".to_vec(),
+        };
+        let rx = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+        if !matches!(
+            rx.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("bind of the shared datagram receiver failed");
+        }
+
+        // Two senders with distinct identities, exactly like two udev workers.
+        for (task, pid, payload) in [
+            (SENDER_A, SENDER_A_PID, b"FROM-A--".as_ref()),
+            (SENDER_B, SENDER_B_PID, b"FROM-B--".as_ref()),
+        ] {
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+            set_task(task);
+            let tx = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+            match tx.dispatch_op(SocketOp::Send {
+                buf: payload,
+                flags: 0,
+                addr: Some(addr.clone()),
+            }) {
+                SocketOpResult::Ok(_) => {}
+                _ => return Err("sender could not enqueue its datagram"),
+            }
+        }
+
+        // Interleave: BOTH receivers dequeue before EITHER extracts its
+        // ancillary data. This is the window a real recvmsg leaves open while
+        // it copies the payload out to userspace.
+        let mut buf1 = [0u8; 16];
+        let mut buf2 = [0u8; 16];
+        set_task(RECEIVER_1);
+        let first = rx.dispatch_op(SocketOp::Recv {
+            buf: &mut buf1,
+            flags: 0,
+        });
+        set_task(RECEIVER_2);
+        let second = rx.dispatch_op(SocketOp::Recv {
+            buf: &mut buf2,
+            flags: 0,
+        });
+        if !matches!(first, SocketOpResult::Received { .. })
+            || !matches!(second, SocketOpResult::Received { .. })
+        {
+            return Err("both receivers should have dequeued a datagram");
+        }
+        if &buf1[..8] != b"FROM-A--" || &buf2[..8] != b"FROM-B--" {
+            return Err("datagrams were not delivered FIFO to the two receivers");
+        }
+
+        // Now each extracts. Each must see ITS OWN record's sender.
+        set_task(RECEIVER_1);
+        let cred1 = rx.recvmsg_cred();
+        set_task(RECEIVER_2);
+        let cred2 = rx.recvmsg_cred();
+
+        if cred1.pid as u64 != SENDER_A_PID {
+            return Err(
+                "first receiver reported the wrong sender pid — socket-global ancillary slots were overwritten by the second receiver's dequeue",
+            );
+        }
+        if cred2.pid as u64 != SENDER_B_PID {
+            return Err("second receiver reported the wrong sender pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_ancillary_is_per_record
+);
+
 /// The recvmsg-side half of libudev's `device_monitor_receive_device()`
 /// checks. A uevent that passes every payload rule is STILL dropped unless
 /// the receive itself reports the right sender and credentials:
