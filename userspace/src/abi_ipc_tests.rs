@@ -143,11 +143,7 @@ fn smoke_abi_ipc_mq_notify_si_pid() -> TestResult {
             sigevent[0..8].copy_from_slice(&VALUE.to_ne_bytes());
             sigevent[8..12].copy_from_slice(&(SIG as i32).to_ne_bytes());
             sigevent[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
-            if call(
-                Syscall::MqNotify.raw(),
-                a1(fd_r, sigevent.as_ptr() as u64),
-            ) != Some(0)
-            {
+            if call(Syscall::MqNotify.raw(), a1(fd_r, sigevent.as_ptr() as u64)) != Some(0) {
                 return Err("mq_notify(SIGEV_SIGNAL) did not succeed");
             }
 

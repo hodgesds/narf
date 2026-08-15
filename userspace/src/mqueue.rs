@@ -347,8 +347,7 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
                     const SI_MESGQ: i32 = -3;
                     let receiver = notification.task_id;
                     let sender = current_task_id();
-                    let sender_outer =
-                        crate::handlers::task_to_pid_raw(sender).unwrap_or(sender);
+                    let sender_outer = crate::handlers::task_to_pid_raw(sender).unwrap_or(sender);
                     let si_pid = crate::handlers::report_pid_to(receiver, sender_outer) as u32;
                     crate::handlers::store_sigqueue_info(
                         receiver,

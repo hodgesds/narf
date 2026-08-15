@@ -977,7 +977,11 @@ fn smoke_abi_proc_wait4_pgid_echild_when_group_empty() -> TestResult {
             let neg_a = (-(GA_LEADER_PID as i64)) as u64;
             match call(Syscall::Wait4.raw(), a3(neg_a, 0, WNOHANG, 0)) {
                 Some(0) => {}
-                _ => return Err("wait4(-pgidA, WNOHANG) with a living group-A child should return 0"),
+                _ => {
+                    return Err(
+                        "wait4(-pgidA, WNOHANG) with a living group-A child should return 0",
+                    )
+                }
             }
             // Group B has NO child of PARENT → ECHILD (the old any-child check
             // wrongly saw the group-A child and returned 0 here).

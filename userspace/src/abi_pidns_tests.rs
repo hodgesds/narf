@@ -689,7 +689,9 @@ fn smoke_abi_pidns_setns_rejects_pid_as_fd() -> TestResult {
             }
             // The caller must NOT have been attached to the victim's pid ns.
             if crate::pid_ns::ns_of(CALLER_TASK).is_some() {
-                return Err("setns attached the caller to the victim's pid ns despite returning -1");
+                return Err(
+                    "setns attached the caller to the victim's pid ns despite returning -1",
+                );
             }
             Ok(())
         })();
@@ -757,9 +759,7 @@ fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
         })();
         set_task(FAKE_TASK);
         crate::pid_ns::__test_reset();
-        release_all(&[
-            MANAGER_TASK, WORKER_TASK, LEADER_TASK, SIBLING_TID,
-        ]);
+        release_all(&[MANAGER_TASK, WORKER_TASK, LEADER_TASK, SIBLING_TID]);
         result
     })
 }
@@ -910,7 +910,12 @@ fn smoke_abi_pidns_fork_return_resolves_in_parent_pid_ns() -> TestResult {
         set_task(FAKE_TASK);
         crate::pid_ns::__test_reset();
         release_all(&[
-            P_ROOT_TASK, C_ROOT_TASK, P_CT_TASK, C_CT_TASK, P_UN_TASK, C_UN_TASK,
+            P_ROOT_TASK,
+            C_ROOT_TASK,
+            P_CT_TASK,
+            C_CT_TASK,
+            P_UN_TASK,
+            C_UN_TASK,
         ]);
         result
     })
