@@ -449,6 +449,55 @@ kernel_test_in!(
     smoke_abi_signal_kill_signalfd_reports_sender_pid
 );
 
+// SIGCHLD must name the exiting child in the PARENT's namespace. Linux
+// do_notify_parent fills si_pid = task_pid_nr_ns(child, parent_ns) and
+// si_code = CLD_EXITED/KILLED/DUMPED; NARF set only the pending bit, so the
+// parent's signalfd read ssi_pid == 0 and could not tell which child died.
+// systemd PID 1's manager_dispatch_signal_fd keys on ssi_pid.
+fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
+    with_setup(|| {
+        const SIGCHLD: u32 = 17;
+        const CLD_EXITED: i32 = 1;
+        const CHILD_PID: u64 = 0x7799;
+
+        // Parent (FAKE_TASK) watches SIGCHLD.
+        let mask = (1u64 << (SIGCHLD - 1)).to_le_bytes();
+        let sfd = match call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("signalfd(SIGCHLD) did not return a fd"),
+        };
+
+        // A child of FAKE_TASK exits with code 3.
+        crate::handlers::__test_inject_parent_of(CHILD_PID, FAKE_TASK);
+        crate::handlers::stage_pending_termination(CHILD_PID, 3 << 8);
+        crate::user_task::notify_task_exited(CHILD_PID, CHILD_PID);
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one SIGCHLD record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGCHLD {
+            return Err("signalfd record was not SIGCHLD");
+        }
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != CLD_EXITED {
+            return Err("SIGCHLD ssi_code was not CLD_EXITED");
+        }
+        match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
+            CHILD_PID => Ok(()),
+            0 => Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
+            _ => Err("SIGCHLD named the wrong child pid"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
+
 fn smoke_abi_signal_signalfd_neg() -> TestResult {
     with_setup(|| {
         // fd_arg = 0 (>=0) but fd 0 is not a registered signalfd →

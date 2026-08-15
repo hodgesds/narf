@@ -7515,6 +7515,27 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
     const SIGCHLD: u32 = 17;
     let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(SIGCHLD));
+    // Record which child, in the PARENT's namespace, so the parent's signalfd
+    // (systemd PID 1's manager_dispatch_signal_fd) and SA_SIGINFO SIGCHLD
+    // handler name the child rather than reading si_pid == 0. Linux
+    // do_notify_parent fills si_pid = task_pid_nr_ns(child, parent_ns) and
+    // si_code = CLD_EXITED/KILLED/DUMPED. SIGCHLD is a standard signal, so
+    // this coalesces to the most recent child (Linux does too); the parent's
+    // wait loop reaps the rest.
+    {
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        let si_code = if status & 0x7f == 0 {
+            CLD_EXITED
+        } else if status & 0x80 != 0 {
+            CLD_DUMPED
+        } else {
+            CLD_KILLED
+        };
+        let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
+        let _ = store_sigqueue_info(parent, SIGCHLD, si_code, 0, child_in_parent_ns);
+    }
     // A parent may be parked in epoll_wait on its signalfd rather than in
     // wait4. Publishing SIGCHLD without firing the signal waker leaves that
     // task asleep indefinitely: the earlier pidfd readiness notification can
