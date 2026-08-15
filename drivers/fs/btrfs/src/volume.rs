@@ -738,10 +738,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         new_fs_level: u8,
         new_generation: u64,
         new_fs_tree_flags: Option<u64>,
+        incompat_flags_add: u64,
     ) {
         let mut g = self.state.lock();
         g.superblock.root = new_root_tree;
         g.superblock.generation = new_generation;
+        g.superblock.incompat_flags |= incompat_flags_add;
         g.fs_tree_root = new_fs_root;
         g.fs_tree_level = new_fs_level;
         if let Some(flags) = new_fs_tree_flags {

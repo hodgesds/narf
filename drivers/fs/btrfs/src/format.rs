@@ -240,7 +240,7 @@ const OFF_SECTORSIZE: usize = 144;
 const OFF_NODESIZE: usize = 148;
 const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
 const OFF_COMPAT_RO_FLAGS: usize = 180;
-const OFF_INCOMPAT_FLAGS: usize = 188;
+pub(crate) const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
 const OFF_ROOT_LEVEL: usize = 198;
 const OFF_CHUNK_ROOT_LEVEL: usize = 199;
@@ -263,6 +263,9 @@ pub const INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
 pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
 pub const INCOMPAT_NO_HOLES: u64 = 1 << 9;
 pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+/// Extents allocated while simple quotas are active carry a permanent owner
+/// reference. Linux deliberately leaves this bit set after quotas are disabled.
+pub const INCOMPAT_SIMPLE_QUOTA: u64 = 1 << 16;
 pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
     | INCOMPAT_DEFAULT_SUBVOL
     | INCOMPAT_MIXED_GROUPS
@@ -272,7 +275,8 @@ pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
     | INCOMPAT_EXTENDED_IREF
     | INCOMPAT_SKINNY_METADATA
     | INCOMPAT_NO_HOLES
-    | INCOMPAT_METADATA_UUID;
+    | INCOMPAT_METADATA_UUID
+    | INCOMPAT_SIMPLE_QUOTA;
 
 /// Decoded btrfs superblock — only the fields the driver consumes.
 #[derive(Clone, Debug)]

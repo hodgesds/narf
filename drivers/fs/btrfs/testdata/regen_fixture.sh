@@ -20,6 +20,7 @@
 #   fixture-defaultsubvol.img.sparse  default subvolume set to `def`
 #   fixture-sector8k.img.sparse  8 KiB sectors/nodes; non-native-sector I/O
 #   fixture-quota.img.sparse  quota tree + level-1 parent qgroup
+#   fixture-squota.img.sparse Linux simple-quota mode + owned post-enable data
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
 #                            (space_cache=v2); exercises the write path's
 #                            free-space-tree maintenance
@@ -53,9 +54,11 @@ imgblake="$(mktemp)"
 imgsector8k="$(mktemp)"
 imgquota="$(mktemp)"
 quotamnt="$(mktemp -d)"
+imgsquota="$(mktemp)"
+squotamnt="$(mktemp -d)"
 nestedstage="$(mktemp -d)"
 imgnested="$(mktemp)"
-trap 'umount "$quotamnt" 2>/dev/null || true; rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$imgsector8k" "$imgquota" "$quotamnt" "$nestedstage" "$imgnested"' EXIT
+trap 'umount "$quotamnt" 2>/dev/null || true; umount "$squotamnt" 2>/dev/null || true; rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$imgsector8k" "$imgquota" "$quotamnt" "$imgsquota" "$squotamnt" "$nestedstage" "$imgnested"' EXIT
 
 mkdir -p "$stage/subdir" "$stage/snap"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
@@ -117,6 +120,25 @@ generate_quota_fixture() {
     rmdir "$quotamnt"
 }
 
+generate_squota_fixture() {
+    truncate -s 32M "$imgsquota"
+    mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+        -O ^no-holes --rootdir "$stage" "$imgsquota" >/dev/null
+    mount -o loop "$imgsquota" "$squotamnt"
+    btrfs quota enable --simple "$squotamnt"
+    # Extents present at enable time remain uncharged. This deterministic copy
+    # creates both metadata and a data owner-ref under simple quotas.
+    cp "$stage/big.dat" "$squotamnt/simple-owned.dat"
+    btrfs qgroup create 1/200 "$squotamnt"
+    btrfs qgroup assign 0/5 1/200 "$squotamnt"
+    sync
+    umount "$squotamnt"
+    btrfs check "$imgsquota" >/dev/null
+    sparse_encode "$imgsquota" fixture-squota.img.sparse
+    rm -f "$imgsquota"
+    rmdir "$squotamnt"
+}
+
 if [[ "${NARF_BTRFS_SECTOR_ONLY:-0}" == 1 ]]; then
     # A non-native sector geometry. Linux on a 4 KiB-page host cannot mount
     # this image, but mkfs.btrfs and btrfs check support it; NARF's block I/O
@@ -132,6 +154,11 @@ fi
 
 if [[ "${NARF_BTRFS_QUOTA_ONLY:-0}" == 1 ]]; then
     generate_quota_fixture
+    exit 0
+fi
+
+if [[ "${NARF_BTRFS_SQUOTA_ONLY:-0}" == 1 ]]; then
+    generate_squota_fixture
     exit 0
 fi
 
@@ -196,6 +223,7 @@ sparse_encode "$imgsector8k" fixture-sector8k.img.sparse
 rm -f "$imgsector8k"
 
 generate_quota_fixture
+generate_squota_fixture
 
 truncate -s 16M "$imgz"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
@@ -328,4 +356,4 @@ btrfs inspect-internal dump-tree -t FREE_SPACE "$imgbm" | grep -q FREE_SPACE_BIT
     || { echo "fixture-bitmap has no FREE_SPACE_BITMAP" >&2; exit 1; }
 sparse_encode "$imgbm" fixture-bitmap.img.sparse
 
-echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror,-bitmap}.img.sparse"
+echo "regenerated fixture{,-zlib,-zstd,-lzo,-fst,-defaultsubvol,-manyfiles,-laptop,-mirror,-bitmap,-quota,-squota}.img.sparse"

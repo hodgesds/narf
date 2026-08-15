@@ -783,8 +783,13 @@ FAT-family formats, and single-device read-write btrfs behind the same VFS
 traits. Btrfs supplies the currently implemented native snapshot backend;
 its compatibility driver also maintains already-enabled full qgroup trees,
 enforces referenced/exclusive hard limits, supports V2 qgroup inheritance, and
-implements the full-qgroup enable/disable/rescan/create/assign/limit ioctls.
-Multi-device/RAID btrfs, simple quotas, and narffs remain future work.
+implements full-qgroup enable/disable/rescan/create/assign/limit ioctls. It also
+implements Linux simple quotas: post-enable extents have permanent owners,
+usage updates incrementally with referenced equal to exclusive, shared-root
+snapshots begin uncharged, and hierarchy inheritance and hard limits work in
+simple mode. Simple-quota rescans are invalid and disabling preserves the
+on-disk incompat bit and owner refs. Multi-device/RAID btrfs and narffs remain
+future work.
 
 ### 8.2 POSIX semantics scope (resolved)
 

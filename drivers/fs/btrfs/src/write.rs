@@ -210,6 +210,7 @@ pub(crate) fn stamp_node(
 // Inline backref types within an extent item.
 const TREE_BLOCK_REF_KEY: u8 = 176;
 const EXTENT_DATA_REF_KEY: u8 = 178;
+const EXTENT_OWNER_REF_KEY: u8 = 172;
 const EXTENT_FLAG_DATA: u64 = 1;
 const EXTENT_FLAG_TREE_BLOCK: u64 = 2;
 
@@ -229,16 +230,22 @@ fn ext_item_meta(gen: u64, owner_root: u64) -> Vec<u8> {
 /// gen,flags=DATA}` + inline `EXTENT_DATA_REF{root, objectid, offset, count=1}`.
 /// `offset` is the extent's file position (the `EXTENT_DATA` key offset minus its
 /// `extent_offset`) — the value `btrfs check` recomputes for the back-reference.
-fn ext_item_data(gen: u64, root: u64, objectid: u64, offset: u64) -> Vec<u8> {
-    let mut v = alloc::vec![0u8; 53];
+fn ext_item_data(gen: u64, root: u64, objectid: u64, offset: u64, simple_quota: bool) -> Vec<u8> {
+    let owner_bytes = usize::from(simple_quota) * 9;
+    let mut v = alloc::vec![0u8; 53 + owner_bytes];
     v[0..8].copy_from_slice(&1u64.to_le_bytes());
     v[8..16].copy_from_slice(&gen.to_le_bytes());
     v[16..24].copy_from_slice(&EXTENT_FLAG_DATA.to_le_bytes());
-    v[24] = EXTENT_DATA_REF_KEY;
-    v[25..33].copy_from_slice(&root.to_le_bytes()); // ref root
-    v[33..41].copy_from_slice(&objectid.to_le_bytes()); // ref objectid (inode)
-    v[41..49].copy_from_slice(&offset.to_le_bytes()); // ref offset (file position)
-    v[49..53].copy_from_slice(&1u32.to_le_bytes()); // ref count
+    let at = 24 + owner_bytes;
+    if simple_quota {
+        v[24] = EXTENT_OWNER_REF_KEY;
+        v[25..33].copy_from_slice(&root.to_le_bytes());
+    }
+    v[at] = EXTENT_DATA_REF_KEY;
+    v[at + 1..at + 9].copy_from_slice(&root.to_le_bytes()); // ref root
+    v[at + 9..at + 17].copy_from_slice(&objectid.to_le_bytes()); // ref objectid
+    v[at + 17..at + 25].copy_from_slice(&offset.to_le_bytes()); // file position
+    v[at + 25..at + 29].copy_from_slice(&1u32.to_le_bytes()); // ref count
     v
 }
 
@@ -275,7 +282,7 @@ fn data_ref_hash(id: &DataRefId) -> u64 {
 
 fn inline_ref_size(kind: u8) -> Result<usize, FsError> {
     match kind {
-        TREE_BLOCK_REF_KEY | 182 => Ok(9), // TREE_BLOCK_REF / SHARED_BLOCK_REF
+        EXTENT_OWNER_REF_KEY | TREE_BLOCK_REF_KEY | 182 => Ok(9),
         EXTENT_DATA_REF_KEY => Ok(29),
         184 => Ok(13), // SHARED_DATA_REF
         _ => Err(FsError::Unsupported),
@@ -1057,6 +1064,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await?;
@@ -1119,6 +1127,7 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await
@@ -1165,6 +1174,10 @@ pub(crate) struct QgroupInherit {
 #[derive(Clone, Debug)]
 struct QgroupCreate {
     id: u64,
+    /// Linux simple quotas inherit the destination directory subvolume's
+    /// parents only when userspace did not provide an inherit structure.
+    explicit_inherit: bool,
+    auto_inherit_from: u64,
     inherit: QgroupInherit,
 }
 
@@ -1209,6 +1222,9 @@ struct Txn {
     /// Ordinary mutations enforce hard limits; quota administration/rescan
     /// must be able to install or recount an already-exceeded limit.
     enforce_qgroup_limits: bool,
+    /// Incompatibility bits made durable by this transaction. Bits are
+    /// monotonic; in particular SIMPLE_QUOTA survives quota disable.
+    incompat_flags_add: u64,
 }
 
 /// Persist replacement on-disk flags for the explicitly mounted subvolume.
@@ -1251,6 +1267,7 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await
@@ -2075,6 +2092,7 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await
@@ -2251,6 +2269,7 @@ async fn resolve_data_changes<B: BlockDevice + 'static>(
     extent_root: u64,
     txn: &Txn,
     gen: u64,
+    simple_quota: bool,
 ) -> Result<DataChanges, FsError> {
     let mut bodies: BTreeMap<(u64, u64), Option<Vec<u8>>> = BTreeMap::new();
     let mut allocated = Vec::new();
@@ -2259,7 +2278,13 @@ async fn resolve_data_changes<B: BlockDevice + 'static>(
         if bodies
             .insert(
                 (id.bytenr, id.len),
-                Some(ext_item_data(gen, id.ref_root, id.objectid, id.offset)),
+                Some(ext_item_data(
+                    gen,
+                    id.ref_root,
+                    id.objectid,
+                    id.offset,
+                    simple_quota,
+                )),
             )
             .is_some()
         {
@@ -2314,7 +2339,143 @@ async fn resolve_data_changes<B: BlockDevice + 'static>(
 }
 
 const QGROUP_STATUS_ON: u64 = 1;
+const QGROUP_STATUS_SIMPLE_MODE: u64 = 1 << 3;
 const QGROUP_INHERIT_SET_LIMITS: u64 = 1;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum QuotaMode {
+    Disabled,
+    Full,
+    Simple { enable_gen: u64 },
+}
+
+fn is_fs_tree_id(id: u64) -> bool {
+    id == format::FS_TREE_OBJECTID || id >= format::FIRST_FREE_OBJECTID
+}
+
+async fn quota_mode_at<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root_tree: u64,
+) -> Result<QuotaMode, FsError> {
+    let quota_root = match roots::find_root(vol, root_tree, format::QUOTA_TREE_OBJECTID).await {
+        Ok((root, _)) => root,
+        Err(FsError::NotFound) => return Ok(QuotaMode::Disabled),
+        Err(err) => return Err(err),
+    };
+    let status = btree::find_item(
+        vol,
+        quota_root,
+        &BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0),
+    )
+    .await?
+    .ok_or(FsError::InvalidData)?;
+    if status.len() < 32 || le64(&status, 0)? != 1 {
+        return Err(FsError::Unsupported);
+    }
+    let flags = le64(&status, 16)?;
+    if flags & QGROUP_STATUS_ON == 0 {
+        return Ok(QuotaMode::Disabled);
+    }
+    if flags & QGROUP_STATUS_SIMPLE_MODE == 0 {
+        return Ok(QuotaMode::Full);
+    }
+    if status.len() < 40 || vol.superblock().incompat_flags & format::INCOMPAT_SIMPLE_QUOTA == 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(QuotaMode::Simple {
+        enable_gen: le64(&status, 32)?,
+    })
+}
+
+fn extent_owner_ref(body: &[u8]) -> Result<Option<u64>, FsError> {
+    if body.len() < 24 {
+        return Err(FsError::InvalidData);
+    }
+    let mut pos = 24usize;
+    while pos < body.len() {
+        let kind = body[pos];
+        let size = inline_ref_size(kind)?;
+        if pos.checked_add(size).ok_or(FsError::InvalidData)? > body.len() {
+            return Err(FsError::InvalidData);
+        }
+        if kind == EXTENT_OWNER_REF_KEY {
+            return Ok(Some(le64(body, pos + 1)?));
+        }
+        pos += size;
+    }
+    Ok(None)
+}
+
+fn add_simple_delta(
+    deltas: &mut BTreeMap<u64, i128>,
+    owner: u64,
+    bytes: u64,
+    add: bool,
+) -> Result<(), FsError> {
+    if !is_fs_tree_id(owner) {
+        return Ok(());
+    }
+    let signed = i128::from(bytes) * if add { 1 } else { -1 };
+    let entry = deltas.entry(owner).or_default();
+    *entry = entry.checked_add(signed).ok_or(FsError::InvalidData)?;
+    Ok(())
+}
+
+async fn simple_quota_deltas<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    extent_root: u64,
+    txn: &Txn,
+    data: &DataChanges,
+    new_meta: &[(u64, u64, u8)],
+    freed_meta: &[(u64, u8)],
+    enable_gen: u64,
+) -> Result<BTreeMap<u64, i128>, FsError> {
+    let mut deltas = BTreeMap::new();
+    for item in &txn.new_data {
+        add_simple_delta(&mut deltas, item.id.ref_root, item.id.len, true)?;
+    }
+    for &(_addr, owner, _level) in new_meta {
+        add_simple_delta(&mut deltas, owner, vol.nodesize() as u64, true)?;
+    }
+    for &(bytenr, len) in &data.released {
+        let body = btree::find_item(
+            vol,
+            extent_root,
+            &BtrfsKey::new(bytenr, format::EXTENT_ITEM_KEY, len),
+        )
+        .await?
+        .ok_or(FsError::InvalidData)?;
+        if le64(&body, 8)? >= enable_gen {
+            if let Some(owner) = extent_owner_ref(&body)? {
+                add_simple_delta(&mut deltas, owner, len, false)?;
+            }
+        }
+    }
+    let mut seen_meta = BTreeSet::new();
+    for &(bytenr, level) in freed_meta {
+        if !seen_meta.insert((bytenr, level)) {
+            continue;
+        }
+        let body = btree::find_item(
+            vol,
+            extent_root,
+            &BtrfsKey::new(bytenr, format::METADATA_ITEM_KEY, u64::from(level)),
+        )
+        .await?
+        .ok_or(FsError::InvalidData)?;
+        if le64(&body, 8)? < enable_gen {
+            continue;
+        }
+        let node = vol.read_node(bytenr).await?;
+        add_simple_delta(
+            &mut deltas,
+            le64(&node, HDR_OWNER)?,
+            vol.nodesize() as u64,
+            false,
+        )?;
+    }
+    Ok(deltas)
+}
 
 fn stamp_root_item_fields(
     root_logical: &mut [u8],
@@ -2414,12 +2575,14 @@ struct QuotaChange<'a> {
     delete: Option<u64>,
     edits: &'a [Edit],
     enforce_limits: bool,
+    simple_deltas: &'a BTreeMap<u64, i128>,
 }
 
-/// Rebuild all qgroup usage from the post-transaction subvolume roots. This is
-/// deliberately whole-tree accounting: slower than Linux delayed refs, but it
-/// makes shared snapshot exclusivity and hierarchy propagation exact and keeps
-/// the small quota tree independently checkable by btrfs-progs.
+/// Update qgroup usage for the transaction. Full qgroups deliberately recount
+/// every post-transaction subvolume root so shared exclusivity stays exact;
+/// simple quotas apply permanent-owner deltas and rebuild only hierarchy sums.
+/// The small quota tree itself is whole-repacked in either mode so it remains
+/// independently checkable by btrfs-progs.
 async fn prepare_quota_tree<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
@@ -2444,9 +2607,16 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
     if status_flags & QGROUP_STATUS_ON == 0 {
         return Ok(None);
     }
+    let simple_mode = status_flags & QGROUP_STATUS_SIMPLE_MODE != 0;
+    if simple_mode
+        && (status.len() < 40
+            || vol.superblock().incompat_flags & format::INCOMPAT_SIMPLE_QUOTA == 0)
+    {
+        return Err(FsError::InvalidData);
+    }
 
     let mut edits = Vec::new();
-    if let Some(id) = change.delete {
+    if let Some(id) = change.delete.filter(|_| !simple_mode) {
         edits.push(Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)));
         edits.push(Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)));
         for slot in 0..nritems(&quota)? as usize {
@@ -2463,7 +2633,22 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
         if leaf_find(&quota, &info_key)?.is_some() {
             return Err(FsError::InvalidData);
         }
-        for &parent in &new.inherit.parents {
+        let parents = if simple_mode && !new.explicit_inherit {
+            let mut inherited = Vec::new();
+            for slot in 0..nritems(&quota)? as usize {
+                let key = leaf_item_key(&quota, slot)?;
+                if key.objectid == new.auto_inherit_from
+                    && key.item_type == format::QGROUP_RELATION_KEY
+                    && key.offset >> 48 > key.objectid >> 48
+                {
+                    inherited.push(key.offset);
+                }
+            }
+            inherited
+        } else {
+            new.inherit.parents.clone()
+        };
+        for &parent in &parents {
             if parent >> 48 <= new.id >> 48
                 || leaf_find(&quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, parent))?.is_none()
             {
@@ -2481,7 +2666,7 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
             BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, new.id),
             limit,
         ));
-        for &parent in &new.inherit.parents {
+        for &parent in &parents {
             edits.push(Edit::Upsert(
                 BtrfsKey::new(new.id, format::QGROUP_RELATION_KEY, parent),
                 Vec::new(),
@@ -2508,14 +2693,8 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
         }
     }
 
-    let mut root_extents: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
     let mut members: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
-        let slot = leaf_find_by_type(change.root_logical, id, format::ROOT_ITEM_KEY)?
-            .ok_or(FsError::InvalidData)?;
-        let root_item = leaf_item_data(change.root_logical, slot)?;
-        let root = le64(root_item, 176)?;
-        root_extents.insert(id, qgroup_root_extents(vol, change.pending, root).await?);
         members.entry(id).or_default().insert(id);
         let mut todo = parents.get(&id).cloned().unwrap_or_default();
         let mut seen = BTreeSet::new();
@@ -2530,26 +2709,94 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
         }
     }
 
-    let mut extent_refs: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
-    for (&root_id, extents) in &root_extents {
-        for &extent in extents {
-            extent_refs.entry(extent).or_default().insert(root_id);
+    let mut usage: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    if simple_mode {
+        for &owner in change.simple_deltas.keys() {
+            if !qgroup_ids.contains(&owner) || owner >> 48 != 0 {
+                return Err(FsError::InvalidData);
+            }
+        }
+        for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
+            let info_slot = leaf_find(&quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))?
+                .ok_or(FsError::InvalidData)?;
+            let info = leaf_item_data(&quota, info_slot)?;
+            if info.len() != 40 {
+                return Err(FsError::InvalidData);
+            }
+            let current = le64(info, 8)?;
+            if le64(info, 24)? != current {
+                return Err(FsError::InvalidData);
+            }
+            let next = i128::from(current)
+                .checked_add(*change.simple_deltas.get(&id).unwrap_or(&0))
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(FsError::InvalidData)?;
+            usage.insert(id, (next, next));
+        }
+        for &id in qgroup_ids.iter().filter(|id| **id >> 48 != 0) {
+            let mut total = 0u64;
+            for member in members.get(&id).into_iter().flatten() {
+                total = total
+                    .checked_add(usage.get(member).map_or(0, |value| value.0))
+                    .ok_or(FsError::InvalidData)?;
+            }
+            usage.insert(id, (total, total));
+        }
+
+        if let Some(id) = change.delete {
+            if usage.get(&id).copied() == Some((0, 0)) {
+                let mut delete_edits = alloc::vec![
+                    Edit::Delete(BtrfsKey::new(0, format::QGROUP_INFO_KEY, id)),
+                    Edit::Delete(BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id)),
+                ];
+                for slot in 0..nritems(&quota)? as usize {
+                    let key = leaf_item_key(&quota, slot)?;
+                    if key.item_type == format::QGROUP_RELATION_KEY
+                        && (key.objectid == id || key.offset == id)
+                    {
+                        delete_edits.push(Edit::Delete(key));
+                    }
+                }
+                apply_logical_edits(&mut quota, &delete_edits)?;
+                qgroup_ids.retain(|candidate| *candidate != id);
+                usage.remove(&id);
+            }
+        }
+    } else {
+        let mut root_extents: BTreeMap<u64, BTreeSet<(u64, u64)>> = BTreeMap::new();
+        for &id in qgroup_ids.iter().filter(|id| **id >> 48 == 0) {
+            let slot = leaf_find_by_type(change.root_logical, id, format::ROOT_ITEM_KEY)?
+                .ok_or(FsError::InvalidData)?;
+            let root_item = leaf_item_data(change.root_logical, slot)?;
+            let root = le64(root_item, 176)?;
+            root_extents.insert(id, qgroup_root_extents(vol, change.pending, root).await?);
+        }
+        let mut extent_refs: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
+        for (&root_id, extents) in &root_extents {
+            for &extent in extents {
+                extent_refs.entry(extent).or_default().insert(root_id);
+            }
+        }
+        for &id in &qgroup_ids {
+            let group_members = members.get(&id).cloned().unwrap_or_default();
+            let mut referenced = 0u64;
+            let mut exclusive = 0u64;
+            for (&(_bytenr, len), refs) in &extent_refs {
+                if refs.is_disjoint(&group_members) {
+                    continue;
+                }
+                referenced = referenced.checked_add(len).ok_or(FsError::InvalidData)?;
+                if refs.is_subset(&group_members) {
+                    exclusive = exclusive.checked_add(len).ok_or(FsError::InvalidData)?;
+                }
+            }
+            usage.insert(id, (referenced, exclusive));
         }
     }
+
     let mut info_edits = Vec::new();
     for id in qgroup_ids {
-        let group_members = members.get(&id).cloned().unwrap_or_default();
-        let mut referenced = 0u64;
-        let mut exclusive = 0u64;
-        for (&(_bytenr, len), refs) in &extent_refs {
-            if refs.is_disjoint(&group_members) {
-                continue;
-            }
-            referenced = referenced.checked_add(len).ok_or(FsError::InvalidData)?;
-            if refs.is_subset(&group_members) {
-                exclusive = exclusive.checked_add(len).ok_or(FsError::InvalidData)?;
-            }
-        }
+        let (referenced, exclusive) = usage.get(&id).copied().ok_or(FsError::InvalidData)?;
         let limit_key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
         let limit_slot = leaf_find(&quota, &limit_key)?.ok_or(FsError::InvalidData)?;
         let limit = leaf_item_data(&quota, limit_slot)?;
@@ -2575,7 +2822,13 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
         ));
     }
     status[8..16].copy_from_slice(&gen.to_le_bytes());
-    status[16..24].copy_from_slice(&QGROUP_STATUS_ON.to_le_bytes());
+    let committed_flags = QGROUP_STATUS_ON
+        | if simple_mode {
+            QGROUP_STATUS_SIMPLE_MODE
+        } else {
+            0
+        };
+    status[16..24].copy_from_slice(&committed_flags.to_le_bytes());
     info_edits.push(Edit::Upsert(status_key, status));
     apply_logical_edits(&mut quota, &info_edits)?;
 
@@ -2653,14 +2906,15 @@ async fn commit_qgroup_edits<B: BlockDevice + 'static>(
             qgroup_edits: edits,
             skip_qgroup_recount: false,
             enforce_qgroup_limits: false,
+            incompat_flags_add: 0,
         },
     )
     .await
 }
 
-/// Enable full qgroups and synchronously perform the initial exact rescan.
-pub(crate) async fn quota_enable<B: BlockDevice + 'static>(
+async fn quota_enable_mode<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
+    simple: bool,
 ) -> Result<(), FsError> {
     match quota_root(vol).await {
         Ok(_) => return Ok(()),
@@ -2696,10 +2950,14 @@ pub(crate) async fn quota_enable<B: BlockDevice + 'static>(
         return Err(FsError::InvalidData);
     }
 
-    let mut status = alloc::vec![0u8; 32];
+    let mut status = alloc::vec![0u8; if simple { 40 } else { 32 }];
     status[0..8].copy_from_slice(&1u64.to_le_bytes());
     status[8..16].copy_from_slice(&gen.to_le_bytes());
-    status[16..24].copy_from_slice(&QGROUP_STATUS_ON.to_le_bytes());
+    let status_flags = QGROUP_STATUS_ON | if simple { QGROUP_STATUS_SIMPLE_MODE } else { 0 };
+    status[16..24].copy_from_slice(&status_flags.to_le_bytes());
+    if simple {
+        status[32..40].copy_from_slice(&gen.to_le_bytes());
+    }
     let mut items = alloc::vec![(BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0), status,)];
     for id in root_ids {
         let mut info = alloc::vec![0u8; 40];
@@ -2781,15 +3039,40 @@ pub(crate) async fn quota_enable<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: false,
+            incompat_flags_add: if simple {
+                format::INCOMPAT_SIMPLE_QUOTA
+            } else {
+                0
+            },
         },
     )
     .await?;
-    // The first transaction makes the new tree reachable. The second walks
-    // that committed tree and replaces the zero bootstrap counters atomically.
-    commit_qgroup_edits(vol, Vec::new()).await
+    if simple {
+        // Linux deliberately skips a rescan: pre-enable extents are uncharged.
+        Ok(())
+    } else {
+        // The first transaction makes the new tree reachable. The second walks
+        // that committed tree and replaces the zero bootstrap counters atomically.
+        commit_qgroup_edits(vol, Vec::new()).await
+    }
 }
 
-/// Disable full qgroups by removing and reclaiming the complete quota tree.
+/// Enable full qgroups and synchronously perform the initial exact rescan.
+pub(crate) async fn quota_enable<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    quota_enable_mode(vol, false).await
+}
+
+/// Enable simple quotas without charging extents that predate this generation.
+pub(crate) async fn quota_enable_simple<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    quota_enable_mode(vol, true).await
+}
+
+/// Disable qgroups by removing and reclaiming the complete quota tree. The
+/// SIMPLE_QUOTA incompat bit and existing owner refs intentionally remain.
 pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
@@ -2829,6 +3112,7 @@ pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: true,
             enforce_qgroup_limits: false,
+            incompat_flags_add: 0,
         },
     )
     .await
@@ -2970,6 +3254,12 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
 pub(crate) async fn quota_rescan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    if matches!(
+        quota_mode_at(vol, vol.root_tree_root().0).await?,
+        QuotaMode::Simple { .. }
+    ) {
+        return Err(FsError::InvalidData);
+    }
     commit_qgroup_edits(vol, Vec::new()).await
 }
 
@@ -3007,11 +3297,19 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let ns = vol.nodesize();
     let ss = u64::from(vol.sectorsize());
     let (root_tree, _) = vol.root_tree_root();
+    let quota_mode = quota_mode_at(vol, root_tree).await?;
 
     let (old_ext, old_ext_level) =
         roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID).await?;
     let meta_changes = resolve_meta_changes(vol, old_ext, &txn).await?;
-    let data_changes = resolve_data_changes(vol, old_ext, &txn, gen).await?;
+    let data_changes = resolve_data_changes(
+        vol,
+        old_ext,
+        &txn,
+        gen,
+        matches!(quota_mode, QuotaMode::Simple { .. }),
+    )
+    .await?;
     let touch_csum = !txn.new_data.is_empty() || !data_changes.released.is_empty();
     let old_csum = match touch_csum {
         true => Some(
@@ -3117,6 +3415,23 @@ async fn commit_txn<B: BlockDevice + 'static>(
         fs_freed.extend(tree.commit.freed.iter().copied());
         extra_roots.push((tree.owner, tree.commit.root, tree.commit.level));
     }
+    fs_freed.extend(txn.retired_meta.iter().copied());
+    fs_freed.extend(meta_changes.released.iter().copied());
+    let simple_deltas = match quota_mode {
+        QuotaMode::Simple { enable_gen } => {
+            simple_quota_deltas(
+                vol,
+                old_ext,
+                &txn,
+                &data_changes,
+                &fs_new_meta,
+                &fs_freed,
+                enable_gen,
+            )
+            .await?
+        }
+        QuotaMode::Disabled | QuotaMode::Full => BTreeMap::new(),
+    };
     let fs_tree_changed = !c.nodes.is_empty() || !c.new_blocks.is_empty() || !c.freed.is_empty();
     if fs_tree_changed {
         stamp_root_item_fields(
@@ -3146,6 +3461,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 delete: txn.qgroup_delete,
                 edits: &txn.qgroup_edits,
                 enforce_limits: txn.enforce_qgroup_limits,
+                simple_deltas: &simple_deltas,
             },
         )
         .await?
@@ -3166,9 +3482,6 @@ async fn commit_txn<B: BlockDevice + 'static>(
         stamp_root_item_fields(&mut root_logical, quota_owner, quota_root, quota_level, gen)?;
         extra_roots.push((quota_owner, quota_root, quota_level));
     }
-    fs_freed.extend(txn.retired_meta.iter().copied());
-    fs_freed.extend(meta_changes.released.iter().copied());
-
     let csum_groups = csum_logical
         .as_ref()
         .map(|c| group_items(vol, c))
@@ -3407,6 +3720,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
+    let incompat = le64(&raw, format::OFF_INCOMPAT_FLAGS)? | txn.incompat_flags_add;
+    raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
+        .copy_from_slice(&incompat.to_le_bytes());
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
     if txn.root_flags.is_some() {
@@ -3418,7 +3734,14 @@ async fn commit_txn<B: BlockDevice + 'static>(
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);
     }
-    vol.commit_roots(root_root_addr, fs_root_addr, fs_level, gen, txn.root_flags);
+    vol.commit_roots(
+        root_root_addr,
+        fs_root_addr,
+        fs_level,
+        gen,
+        txn.root_flags,
+        txn.incompat_flags_add,
+    );
     Ok(())
 }
 
@@ -3825,12 +4148,15 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
             retired_meta: Vec::new(),
             qgroup_create: Some(QgroupCreate {
                 id: new_id,
+                explicit_inherit: inherit.is_some(),
+                auto_inherit_from: vol.fs_tree_id(),
                 inherit: inherit.unwrap_or_default(),
             }),
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await?;
@@ -4075,12 +4401,15 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
             retired_meta: Vec::new(),
             qgroup_create: Some(QgroupCreate {
                 id: new_id,
+                explicit_inherit: inherit.is_some(),
+                auto_inherit_from: vol.fs_tree_id(),
                 inherit: inherit.unwrap_or_default(),
             }),
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await?;
@@ -4099,17 +4428,22 @@ async fn require_exclusive_extent<B: BlockDevice + 'static>(
     let body = btree::find_item(vol, extent_root, &key)
         .await?
         .ok_or(FsError::InvalidData)?;
-    if body.len() < 33 || le64(&body, 0)? != 1 || body[24] != inline_ref_type {
+    if body.len() < 33 || le64(&body, 0)? != 1 {
         return Err(FsError::Unsupported);
     }
-    if le64(&body, 25)? != ref_root {
+    let at = if body[24] == EXTENT_OWNER_REF_KEY {
+        33
+    } else {
+        24
+    };
+    if body.get(at).copied() != Some(inline_ref_type) || le64(&body, at + 1)? != ref_root {
         return Err(FsError::Unsupported);
     }
     if inline_ref_type == EXTENT_DATA_REF_KEY
-        && (body.len() < 53
-            || le64(&body, 33)? != objectid
-            || le64(&body, 41)? != offset
-            || format::le32(&body, 49)? != 1)
+        && (body.len() < at + 29
+            || le64(&body, at + 9)? != objectid
+            || le64(&body, at + 17)? != offset
+            || format::le32(&body, at + 25)? != 1)
     {
         return Err(FsError::Unsupported);
     }
@@ -4337,6 +4671,7 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
             enforce_qgroup_limits: true,
+            incompat_flags_add: 0,
         },
     )
     .await
