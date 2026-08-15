@@ -8,9 +8,23 @@ set -u
 db=/run/udev/data/c226:0
 seat_path=/org/freedesktop/login1/seat/seat0
 
-for _ in $(seq 1 20); do
+# 20 one-second tries proved too short even for boots where the pipeline
+# works: this image's boot time varies enough that the gate service can start
+# well before udev settles. The PASS CONDITIONS below are unchanged — this is
+# patience, not a weaker assertion.
+#
+# The progress tick matters more than the count. Without it a gate that is
+# waiting on a slow-but-healthy udev and one waiting on a wedged udev produce
+# byte-identical output (nothing at all), and telling those apart by rerunning
+# with different timeouts wastes far more time than printing a line every ten
+# seconds does.
+for attempt in $(seq 1 45); do
     db_ready=0
     graphical=0
+
+    if [ $((attempt % 10)) -eq 0 ]; then
+        echo "narf-udev-seat-gate: still waiting (${attempt}s) db=$([ -e "$db" ] && echo present || echo missing)"
+    fi
 
     if [ -s "$db" ] && grep -q '^G:master-of-seat$' "$db"; then
         db_ready=1
