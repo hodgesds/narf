@@ -2,7 +2,8 @@
 
 Every concrete filesystem in NARF — `MemFs`, `DevFs`, `ProcFs`, `SysFs`,
 `CgroupFs`, `OverlayFs`, and the block/network-backed drivers under
-`drivers/fs/` (ext2/ext4, fat, exfat, iso9660, 9p, virtiofs, fuse) — implements
+`drivers/fs/` (ext2/ext4, btrfs, fat/exfat, minix, iso9660/udf/SquashFS, 9p,
+virtiofs, fuse) — implements
 the same three VFS traits: `FsInstance`, `DirOps`, `FileOps`
 (`filesystem/src/lib.rs`). Callers (path resolution, mount, bind-mount, execve,
 the syscall layer) rely on a **uniform contract** across all of them. A missing
@@ -107,7 +108,9 @@ For a mounted instance with a known tree (`root/`, `root/file`, `root/sub/`,
 - Block-backed drivers build a synthetic image in-heap and mount it via a
   `RamBlockDevice` (`narf_block::ram`); see `drivers/fs/ext2/src/tests.rs`
   (`build_ext2_image`, `build_ext2_image_nested`, `mount_root`) for the pattern
-  including a nested directory for the A7/F2 deep-walk test.
+  including a nested directory for the A7/F2 deep-walk test. Btrfs additionally
+  commits compact sparse mkfs fixtures under `drivers/fs/btrfs/testdata/` and
+  runs host `btrfs check` against mutation outputs when btrfs-progs is available.
 - `poll_once` (single poll) suffices when the backing device completes
   synchronously. A test that calls the **sync** VFS API on a block-backed FS
   implicitly exercises the driver's `block_on_spin` bridge — do not add a mock

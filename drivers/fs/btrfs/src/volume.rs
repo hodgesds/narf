@@ -150,7 +150,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     // ── State snapshots (brief lock, no I/O) ───────────────────────
 
-    /// Default FS_TREE root `(logical, level)`.
+    /// Currently mounted fs-tree/subvolume root `(logical, level)`.
     pub fn fs_tree_root(&self) -> (u64, u8) {
         let g = self.state.lock();
         (g.fs_tree_root, g.fs_tree_level)

@@ -128,7 +128,7 @@ from your PCI probe after bring-up.
 ## 2. Registering a filesystem driver (`root_mount` factory)
 
 Source: `filesystem/src/root_mount.rs`, `filesystem/src/lib.rs`. Reference
-drivers: `drivers/fs/fat`, `drivers/fs/ext2`.
+drivers: `drivers/fs/fat`, `drivers/fs/ext2`, `drivers/fs/btrfs`.
 
 **There is no per-superblock `register_filesystem` à la Linux with a
 `mount()`-callback vtable of many methods.** Instead a filesystem driver
@@ -233,8 +233,10 @@ The layered structure worth copying:
   `registry().mount(authority, path, FatMount(vol))`, for when you're mounting
   explicitly rather than via the auto-mount walker.
 
-ext2 mirrors this exactly (`drivers/fs/ext2/src/lib.rs:65` registration,
-`drivers/fs/ext2/src/volume.rs` mount). Keeping the two aligned is deliberate.
+ext2 mirrors this pattern in `drivers/fs/ext2/src/lib.rs` and
+`drivers/fs/ext2/src/volume.rs`. Btrfs registers both root auto-detection and
+the string-keyed `mount -t btrfs` builder so subvolume mount options can be
+parsed before constructing the volume.
 
 ### 2.4 Mounting explicitly (not via the root walker)
 

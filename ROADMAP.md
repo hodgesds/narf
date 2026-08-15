@@ -121,7 +121,8 @@ see [`docs/PERSONAS.md`](docs/PERSONAS.md).
 - `crypto/` — TPM 2.0 integration, measured-boot chain, post-quantum algorithm plan, FIPS-mode decision.
 - `time/` — NTP/PTP userspace hooks, leap-second smear.
 - `block/` — Multi-queue dispatch, discard/TRIM, write-zeroes, NVMe backing.
-- `filesystem/` — virtiofs driver, simple persistent FS, unified page cache, ext2 mount, devpts.
+- `filesystem/` — virtiofs, persistent block filesystems including ext2 and
+  single-device btrfs, unified page cache, and devpts.
 - `scheduler/` — CPU take-offline for suspend/resume, SMT-aware placement, deadline class.
 - `rcu/` — batched reclamation tuning, per-domain pacing, NUMA-aware queues, expanded consumers.
 - `net/` — Userspace stack-daemon attach protocol, Admin cap flow, hardware-NIC integration via `drivers/net/`,
@@ -136,7 +137,7 @@ see [`docs/PERSONAS.md`](docs/PERSONAS.md).
 **Exit criterion:** Boot on a Zen2 Renoir or Phoenix HawkPoint1 laptop
 from USB, display via native AMDGPU modeset (not UEFI GOP fallback),
 type into the keyboard / touchpad, connect to WiFi, persist files on
-an NVMe partition through ext2/ext4.
+an NVMe partition through ext2 or single-device btrfs.
 
 **Bring-up targets:** two AMD laptops are the canonical test silicon:
 - **Zen2 Renoir / Lucienne** (Family 0x17 0x30–0xAF) — Vega8 iGPU,

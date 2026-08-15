@@ -1,10 +1,10 @@
 # narf-drivers-fs-btrfs
 
-A partial btrfs driver: read-only mount / `ls` / `cat`, plus a narrowly-scoped
-basic copy-on-write file overwrite. On-disk structures are decoded per the
-authoritative kernel definitions in
-`/usr/src/linux/include/uapi/linux/btrfs_tree.h`; this is an independent Rust
-implementation (no C is copied).
+A clean-room, read-write btrfs driver for single-device filesystems. It supports
+Linux-interoperable COW file and namespace mutations, all four checksum types,
+compressed reads, writable subvolumes, and native subvolume/snapshot ioctls.
+On-disk structures follow Linux's `include/uapi/linux/btrfs_tree.h` definitions;
+no C code is copied.
 
 Verified against a **realistic laptop-distro image** (`fixture-laptop`): non-mixed
 block groups, `nodesize 16384`, btrfs-progs default features (free-space-tree /
@@ -48,9 +48,8 @@ real laptop's btrfs root looks like.
   with **any number of extents** — tiled into ≤128 KiB data extents — including
   small inline files, re-tiled as regular extents). A random write replaces only
   its intersected extents and preserves all other data refs/checksums. Writes are
-  **fully Linux-interoperable**: the
-  resulting filesystem mounts read-write on a real kernel and passes `btrfs check`
-  — see below.
+  **Linux-interoperable**: the resulting filesystem mounts read-write on a real
+  kernel and passes `btrfs check` — see below.
 - **Namespace mutations**: `create` (new empty regular file), `unlink` (freeing a
   file's data extent + checksums on its last link, else just decrementing
   `nlink`), `mkdir` (new empty
@@ -84,9 +83,9 @@ real laptop's btrfs root looks like.
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
   refs and the destination entry commit atomically. A snapshot outside its source
-  is an **O(1) shared-root operation**: both root items name the same tree block
-  and the extent tree gains one ordered inline `TREE_BLOCK_REF`; descendant
-  metadata and data remain implicit. The first mutation of either side lazily
+  is an **O(1)-metadata shared-root operation**: both root items name the same
+  tree block and the extent tree gains one ordered inline `TREE_BLOCK_REF`;
+  descendant metadata and data remain implicit. The first mutation of either side lazily
   materialises a private metadata tree and converts its payload references into
   ordered `EXTENT_DATA_REF`s, so subsequent source/snapshot writes COW
   independently. If the destination directory is inside the source being
@@ -133,13 +132,13 @@ while zstd/LZO currently fall back to uncompressed output. Intersected shared or
 partial extent references are read, dropped by exact backref identity, and COWed
 without reclaiming other roots' data; a read-only or traversal-pinned subvolume
 returns `ReadOnly`.
-`DirOps::create` / `unlink` / `mkdir` /
-`rmdir` / `rename` add, remove and re-key regular files and empty directories in
-the mounted writable subvolume through the same transaction (`unlink` frees the file's
-data extent + checksums when its last link goes away; `rmdir` refuses a non-empty
-directory with `Busy`; same-directory `rename` re-keys a file or directory to a
-free name, refusing overwrite), so `create` + `write` compose into a real new
-file and `mkdir` + `create` into a populated subdirectory. btrfs directories
+Namespace operations add, remove, link, and re-key files and directories in the
+mounted writable subvolume through the same transaction. `unlink` frees all
+data extents and checksums when the last link disappears; `rmdir` refuses a
+non-empty directory with `Busy`; rename works within or across directories and
+atomically replaces supported targets. `create` + `write` therefore compose
+into a real new file and `mkdir` + `create` into a populated subdirectory.
+Btrfs directories
 carry `nlink == 1` (subdirectories are not counted), matching the on-disk
 convention.
 
@@ -148,33 +147,28 @@ filesystem a real Linux kernel mounts **read-write** and that `btrfs check`
 reports clean — verified end to end (`NARF writes → host mount -o loop reads +
 writes → btrfs check "no error found" → both files read back`). Per write it:
 
-1. allocates + writes a new data extent and its per-sector selected **data
+1. allocates + writes new data extents and their per-sector selected **data
    checksums** (CRC32C, xxhash64, SHA-256, or BLAKE2b-256; CSUM tree updated,
    old extent's csums removed);
-2. rebuilds the fs leaf (`EXTENT_DATA` repointed/resized, `INODE_ITEM` updated);
-3. rebuilds the **extent tree** leaf — frees the old data extent + old COWed
-   metadata blocks, records the new data extent (`EXTENT_DATA_REF`) and every new
-   metadata block (skinny `METADATA_ITEM` + `TREE_BLOCK_REF`), and fixes the block
-   group's `used`;
-4. on a `space_cache=v2` image, rebuilds the **free-space tree** leaf — marks the
-   new extent's range used and returns the freed blocks to free space, merging
-   with neighbours but never across a block-group boundary;
-5. rebuilds the root leaf (FS/CSUM/EXTENT/FREE_SPACE `ROOT_ITEM`s repointed, incl.
-   generation);
+2. path-COWs only the affected fs-tree paths (`EXTENT_DATA` repointed/resized,
+   `INODE_ITEM` updated);
+3. path-COWs the affected **extent-tree** paths — drops exact old data/metadata
+   backrefs, records new data (`EXTENT_DATA_REF`) and metadata
+   (`METADATA_ITEM` + `TREE_BLOCK_REF`) refs, and fixes block-group `used`;
+4. on a `space_cache=v2` image, repacks the **free-space tree** — marks allocated
+   ranges used and returns freed blocks to free space without merging across a
+   block-group boundary;
+5. repacks the checksum and root trees as needed, repointing changed
+   FS/CSUM/EXTENT/FREE_SPACE `ROOT_ITEM`s and generations;
 6. writes a fresh superblock (generation + 1) last, atomically switching.
 
-**Every tree may be any height** — the fs, extent, csum, root and free-space trees
-are each read into one logical leaf, edited, then re-packed into as many real
-`nodesize` leaves as needed, with internal nodes stacked over them level by level
-up to a single root of arbitrary height (`BTRFS_MAX_LEVEL` = 8), so a file /
-directory / extent / checksum set can outgrow a single leaf — or a single internal
-node — as it does on a laptop-scale root (`btrfs check` validates the split
-trees). The extent tree records its own new blocks (a self-reference), so how many
-leaves it and the free-space tree need depends on the block count they produce;
-the commit resolves this with a **fixed point** over the leaf counts — re-handing-
-out node addresses from the same base each round until they stabilise, then
-writing only the converged set. This replaces the delayed-ref loop real btrfs uses
-and keeps the transaction closed-form.
+**Every tree may be any height**, up to `BTRFS_MAX_LEVEL` (8). The fs and extent
+trees use path COW, rewriting only touched root-to-leaf paths. The smaller csum,
+root, and free-space trees are still read as logical item sets and repacked into
+as many `nodesize` leaves and internal levels as needed. The extent tree records
+its own new blocks, so the transaction resolves the mutually-dependent extent
+and whole-repacked tree block counts with a fixed point, reusing the same
+allocation base each round and writing only the converged set.
 
 **Chunk growth** (`write::grow_add_chunk`) allocates one new mixed
 (DATA|METADATA, SINGLE) chunk at the end of the device, threading the change
@@ -219,7 +213,8 @@ enough to carry a mirror, all copies must advance together or `btrfs check`
 reports a mismatch. `write_superblock` writes each copy that fits within the
 filesystem, stamping its own physical `bytenr` and checksum; a grown chunk is
 placed clear of the reserved band around each mirror so writing a mirror never
-overlaps chunk data. A ≥64 MiB image is therefore fully writable.
+overlaps chunk data. Images large enough to contain the 64 MiB mirror are
+therefore writable without leaving superblock copies out of sync.
 
 **fsync / tree-log.** Every mutation is a synchronous commit — it flips the
 superblock to a new generation and flushes the device before returning — so a
@@ -234,12 +229,15 @@ produces such a log — the mounted subvolume's log tree plus the `log_root` tre
 mapping `subvolid → log`, in currently-free space (like btrfs's
 pinned log extents, deliberately not recorded in the extent/free-space trees) —
 so the write+replay round-trip is exercised in-kernel
-(`smoke_btrfs_tree_log_replay` and the nested-subvolume replay smoke). Ordinary logged items are upserted, while modern
+(`smoke_btrfs_tree_log_replay` and the nested-subvolume replay smoke). Ordinary
+logged items are upserted, while modern
 `DIR_LOG_INDEX` authoritative ranges replay missing entries through the normal
 unlink/rmdir transactions. Logged directory indexes also reconstruct their
 hash-keyed `DIR_ITEM` twins; log-only range markers never leak into the FS tree.
-Log emission/replay remains scoped to the top-level FS tree; ordinary mutations
-in an explicitly mounted subvolume are synchronous full commits and need no log.
+Log emission targets the mounted subvolume, and replay applies every
+`subvolid -> log` mapping before clearing the superblock pointer. Ordinary
+mutations in any writable mounted subvolume remain synchronous full commits and
+do not depend on the log for durability.
 
 Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and
@@ -253,13 +251,14 @@ tree it splits multi-leaf and then grows a chunk on top of**.
 
 ## Test fixtures
 
-`testdata/fixture.img.sparse` (uncompressed) and `testdata/fixture-zlib.img.sparse`
-(`--compress zlib`) are committed, compact (`NARFBTR1`) sparse encodings of small
-`mkfs.btrfs` images (a 16 MiB image is ~90 KiB of non-zero data). Both hold the
+`testdata/fixture.img.sparse` (uncompressed) and the zlib, zstd, and LZO fixtures
+are committed, compact (`NARFBTR1`) sparse encodings of small `mkfs.btrfs`
+images. They hold the
 same tree — `hello.txt` (with a `user.narf` xattr), `big.dat`, `subdir/note.txt`,
 `link.txt` (a symlink), and `snap/inside.txt` where `snap` is a nested
-subvolume. `fixture-manyfiles.img.sparse` is a separate 32 MiB image of 400
-small files whose FS tree spans multiple b-tree levels.
+subvolume — and exercise uncompressed, zlib, zstd, and LZO read/COW paths.
+`fixture-manyfiles.img.sparse` is a separate 32 MiB image of 400 small files
+whose FS tree spans multiple b-tree levels.
 `fixture-{xxhash,sha256,blake2}.img.sparse` are genuine mkfs images of the same
 small tree using each alternate checksum algorithm; they exercise verified
 mounts, COW writes, tree-log replay, remounts, and algorithm-specific CSUM item
@@ -267,6 +266,10 @@ widths.
 `fixture-nestedsubvol.img.sparse` has a normal directory followed by nested
 subvolumes (`container/outer/inner`) for multi-component `subvol=` mounts plus a
 read-only sibling used to verify root flags and mutation rejection.
+`fixture-defaultsubvol.img.sparse` verifies that a plain mount honours the
+root-tree `default` entry. `fixture-laptop.img.sparse` covers a realistic
+non-mixed, 16 KiB-node, zstd-compressed distro layout with `root` and `home`
+subvolumes and current btrfs-progs default features.
 `fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
 a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
 tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-

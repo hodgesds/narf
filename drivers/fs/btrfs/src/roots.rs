@@ -60,7 +60,7 @@ pub async fn find_root<B: BlockDevice + 'static>(
     Ok((bytenr, level))
 }
 
-/// Locate the default FS_TREE root `(logical, level)`.
+/// Locate the top-level FS_TREE (objectid 5) root `(logical, level)`.
 pub async fn find_fs_tree<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     root_tree: u64,

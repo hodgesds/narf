@@ -1,17 +1,12 @@
-//! Copy-on-write mutations: file writes (overwrite / partial / append / grow)
-//! and namespace operations (`create` / `unlink`) in the mounted subvolume.
+//! Copy-on-write file, namespace, subvolume, snapshot, and tree-log mutations
+//! in the mounted subvolume.
 //!
-//! All mutations share one closed-form COW mini-transaction ([`commit_txn`]):
-//! given the fully-edited fs leaf, it reads the extent/csum/root/free-space
-//! trees, frees the old blocks of every copied tree, records the new ones in the
-//! extent tree, maintains the free-space tree, repoints the affected `ROOT_ITEM`s,
-//! writes every node, and flips the superblock last. **Every** tree may be
-//! multi-leaf: each is re-packed into as many real leaves as it needs under an
-//! internal root. The extent tree records its own new blocks (a self-reference),
-//! so how many leaves it and the free-space tree need depends on the block count
-//! they produce — [`commit_txn`] resolves this with a fixed point over the leaf
-//! counts, re-handing-out node addresses from the same base each round until they
-//! stabilise. This replaces the delayed-ref loop real btrfs uses.
+//! Full commits converge on one closed-form COW mini-transaction ([`commit_txn`]).
+//! The fs and extent trees path-COW touched root-to-leaf paths; the smaller
+//! csum, root, and free-space trees are whole-repacked. Every tree may be
+//! multi-level. The extent tree records its own new blocks, so [`commit_txn`]
+//! resolves the mutually-dependent block counts with a fixed point, re-handing
+//! out addresses from the same base until the block set stabilises.
 //!
 //! Scope: a regular file in the mounted writable subvolume with any number of
 //! existing extents (exclusive, shared, partial, hole or inline). A write closes
@@ -22,17 +17,15 @@
 //!
 //! 1. allocates + writes the new data extents, and their per-sector selected
 //!    **data checksums** (updated in the CSUM tree; old csums removed);
-//! 2. rebuilds the fs leaf (`EXTENT_DATA` repointed/resized, `INODE_ITEM`
-//!    size/generation updated);
-//! 3. rebuilds the **extent tree** leaf: frees the old data extent + old COWed
-//!    metadata blocks, records the new data extent (with an `EXTENT_DATA_REF`)
-//!    and every new metadata block (skinny `METADATA_ITEM` + `TREE_BLOCK_REF`),
-//!    and adjusts the block group's `used`;
-//! 4. on a `space_cache=v2` image, rebuilds the **free-space tree** leaf: marks
+//! 2. path-COWs the touched fs-tree paths (`EXTENT_DATA` repointed/resized,
+//!    `INODE_ITEM` size/generation updated);
+//! 3. path-COWs touched **extent-tree** paths: drops exact old backrefs, records
+//!    new data and metadata refs, and adjusts block-group `used`;
+//! 4. on a `space_cache=v2` image, repacks the **free-space tree**: marks
 //!    the new data extent's range used (carved out of its containing free extent)
 //!    and returns the old data + old metadata blocks to free space, merging with
 //!    adjacent free extents but never across a block-group boundary;
-//! 5. rebuilds the root leaf so the `FS_TREE`/`CSUM`/`EXTENT`/`FREE_SPACE`
+//! 5. repacks the csum/root trees as needed so `FS_TREE`/`CSUM`/`EXTENT`/`FREE_SPACE`
 //!    `ROOT_ITEM`s name the new roots (bytenr + generation);
 //! 6. writes a fresh superblock (generation + 1) last, atomically switching.
 //!
@@ -41,14 +34,10 @@
 //! errors — verified end to end on both a plain image and a `space_cache=v2`
 //! (free-space-tree) image.
 //!
-//! **Every tree may be any height** (fs, extent, csum, root, dev, chunk,
-//! free-space): it is read into one logical leaf, edited, then re-packed into as
-//! many real leaves as needed and internal nodes stacked over them up to a single
-//! root of arbitrary level (`commit_txn` / [`grow_add_chunk`] via
-//! [`pack_tree_at`]), so a file / directory / extent / checksum set can outgrow a
-//! single leaf — or a single internal node — as it does on a laptop-scale root,
-//! and chunk growth works even when those trees have already split (its new
-//! chunk-tree blocks stay in the system chunk). On an image with a free-space
+//! **Every tree may be any height** up to `BTRFS_MAX_LEVEL` (8). Path-COW and
+//! whole-repack builders both split leaves and stack internal nodes as needed;
+//! chunk growth also handles already-split trees and keeps new chunk-tree blocks
+//! in the system chunk. On an image with a free-space
 //! tree, **space is reclaimed**: the allocator ([`Allocator`]) carves new extents
 //! / nodes from the tree's free ranges (skipping system block groups), so blocks
 //! freed by earlier transactions are reused instead of leaked. A block group's
@@ -2279,10 +2268,11 @@ async fn resolve_data_changes<B: BlockDevice + 'static>(
     })
 }
 
-/// Finalize a mutation. The fs tree arrives built (path-COW for the write path,
-/// whole-repack for namespace ops); the **extent tree is path-COWed** — only the
-/// leaves the block/data records touch are rewritten — while the csum, root and
-/// free-space trees are still whole-repacked (they stay small).
+/// Finalize a mutation. The fs tree arrives prebuilt (path-COW for ordinary
+/// file/namespace mutations; selected subvolume operations may repack it). The
+/// **extent tree is path-COWed** — only paths containing changed block/data
+/// records are rewritten — while the csum, root and free-space trees are still
+/// whole-repacked (they stay small).
 ///
 /// The extent tree records its own new blocks, so how many blocks it (and the
 /// other trees) produce depends on that record — a mutual recursion (btrfs's
