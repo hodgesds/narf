@@ -190,6 +190,56 @@ fn smoke_abi_proc_getsid_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getsid_neg);
 
+// getsid(2) must return the session id in the caller's VISIBLE-pid space —
+// the ProcessId, never the raw scheduler TaskId. `setsid` records the sid in
+// TaskId space (SID_TABLE[tid] = tid), so getsid has to translate TaskId →
+// ProcessId on the way out, exactly as `getpgid`/`getpgrp` do via
+// `pgid_to_user`. The handler instead wrapped the raw sid in
+// `report_pid_to`, which is the IDENTITY in a non-container build and expects
+// an outer pid (not a TaskId) in a container build — so the mandatory
+// `task_to_pid_raw` hop was missing and a raw TaskId leaked to userspace in
+// EVERY build.
+//
+// agetty/login compare `getsid(0)` against `tcgetsid(fd)` (which goes through
+// `current_task_sid_user` → `pgid_to_user`, the CORRECT idiom) to confirm
+// they own the tty's session after TIOCSCTTY; when the two come from
+// different number spaces the check can only pass by coincidence.
+//
+// Exposed only when TaskId != ProcessId, which the default FAKE_TASK
+// (tid == pid == 99) hides — so drive a task whose registered pid differs.
+fn smoke_abi_proc_getsid_reports_visible_pid_space() -> TestResult {
+    with_setup(|| {
+        const LEADER_TID: u64 = 0x5501;
+        const LEADER_PID: u64 = 0x5502; // deliberately != LEADER_TID
+        set_task(LEADER_TID);
+        crate::handlers::register_task_to_pid(LEADER_TID, LEADER_PID);
+        crate::handlers::register_pid_task_mapping(LEADER_PID, LEADER_TID);
+
+        // Become a session leader: sid == pid, recorded in TaskId space.
+        if call(Syscall::Setsid.raw(), a0(0))
+            .filter(|&v| v >= 0)
+            .is_none()
+        {
+            set_task(FAKE_TASK);
+            return Err("setsid setup failed");
+        }
+        let sid = call(Syscall::Getsid.raw(), a0(0));
+        set_task(FAKE_TASK);
+        match sid {
+            Some(v) if v as u64 == LEADER_PID => Ok(()),
+            Some(v) if v as u64 == LEADER_TID => Err(
+                "getsid returned the raw scheduler TaskId instead of the visible ProcessId — the TaskId->pid translation is missing",
+            ),
+            Some(_) => Err("getsid returned an unexpected value"),
+            None => Err("getsid returned a non-Ok status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_getsid_reports_visible_pid_space
+);
+
 // ── prctl(2) — PR_SET/GET_NO_NEW_PRIVS round-trip + bad op ──
 
 fn smoke_abi_proc_prctl_pos() -> TestResult {
