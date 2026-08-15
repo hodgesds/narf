@@ -1093,3 +1093,105 @@ kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_boot_replay_reader_silently_loses_overrun_window
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 14 — the wire format must satisfy every check libudev applies in
+//            `device_monitor_receive_device()` before it will build a device.
+//
+// udevd on the Fedora gate receives EVERY uevent we emit (seqnums 2..35,
+// including the DRM card0 ADD), drains its socket, and still queues no event
+// and spawns no worker — `event_run()` calls `worker_spawn()` unconditionally
+// and udevd issues zero clones. So the messages are arriving and being
+// dropped inside libudev's validation, which is silent (it logs at debug and
+// returns -EAGAIN, and journald is not up early enough to capture it).
+//
+// The rules, from systemd v258.9 `src/libsystemd/sd-device/device-monitor.c`,
+// in the order they are applied. One assertion per rule, so whichever is
+// violated names itself instead of leaving "libudev didn't like it".
+//
+// Rules 2-4 (sender nl_pid/nl_groups and the SCM_CREDENTIALS uid) live on the
+// recvmsg path, not in the payload, and are covered by the socket-layer
+// smokes; this pins the byte format.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_netlink_bytes_satisfy_libudev_validation() -> TestResult {
+    reset();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/platform/narf-drm/card0".to_string(),
+        "drm".to_string(),
+    );
+    let mut reader = UeventReader::from_start();
+    let events = reader.drain(1);
+    let Some(env) = events.into_iter().next() else {
+        reset();
+        return TestResult::Fail("no event to render");
+    };
+    let buf = env.to_netlink_bytes();
+    reset();
+
+    let n = buf.len();
+    // Rule 1: `if (n < 32) return -EINVAL` — short datagrams are dropped
+    // outright, before any parsing.
+    if n < 32 {
+        return TestResult::Fail("netlink uevent shorter than libudev's 32-byte minimum");
+    }
+    // Rule 5: `if (!memchr(message.buf, 0, n))` — there must be a NUL.
+    let Some(nul) = buf.iter().position(|&b| b == 0) else {
+        return TestResult::Fail("netlink uevent contains no NUL byte");
+    };
+    // Rule 6: a kernel message's header must contain "@/". libudev uses this
+    // to tell a kernel message from a "libudev"-magic one.
+    let header = &buf[..nul];
+    if !header.windows(2).any(|w| w == b"@/") {
+        return TestResult::Fail("netlink uevent header lacks the \"@/\" kernel marker");
+    }
+    // Rule 7: `offset = strlen(nulstr) + 1` must be strictly inside the
+    // message, or there are no properties to parse.
+    let offset = nul + 1;
+    if offset >= n {
+        return TestResult::Fail("netlink uevent has no properties after its header");
+    }
+    // Rule 8: device_new_from_nulstr() must find DEVPATH, SUBSYSTEM, ACTION
+    // and a NON-ZERO SEQNUM, or device_verify() rejects the device. The
+    // properties are NUL-separated KEY=value records.
+    let mut have_action = false;
+    let mut have_devpath = false;
+    let mut have_subsystem = false;
+    let mut seqnum_nonzero = false;
+    for rec in buf[offset..].split(|&b| b == 0) {
+        let Ok(kv) = core::str::from_utf8(rec) else {
+            return TestResult::Fail("netlink uevent property record is not valid UTF-8");
+        };
+        if let Some(v) = kv.strip_prefix("ACTION=") {
+            have_action = !v.is_empty();
+        } else if let Some(v) = kv.strip_prefix("DEVPATH=") {
+            // sd-device requires an absolute, /sys-relative devpath.
+            have_devpath = v.starts_with('/');
+        } else if let Some(v) = kv.strip_prefix("SUBSYSTEM=") {
+            have_subsystem = !v.is_empty();
+        } else if let Some(v) = kv.strip_prefix("SEQNUM=") {
+            seqnum_nonzero = v.parse::<u64>().map(|s| s > 0).unwrap_or(false);
+        }
+    }
+    if !have_action {
+        return TestResult::Fail("netlink uevent lacks a non-empty ACTION property");
+    }
+    if !have_devpath {
+        return TestResult::Fail("netlink uevent lacks an absolute DEVPATH property");
+    }
+    if !have_subsystem {
+        return TestResult::Fail("netlink uevent lacks a non-empty SUBSYSTEM property");
+    }
+    if !seqnum_nonzero {
+        return TestResult::Fail(
+            "netlink uevent lacks a non-zero SEQNUM (device_verify rejects 0)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_netlink_bytes_satisfy_libudev_validation
+);

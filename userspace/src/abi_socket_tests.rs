@@ -4556,6 +4556,105 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
 
+/// The recvmsg-side half of libudev's `device_monitor_receive_device()`
+/// checks. A uevent that passes every payload rule is STILL dropped unless
+/// the receive itself reports the right sender and credentials:
+///
+///   - `msg_name` must come back as a `sockaddr_nl` whose `nl_groups` is the
+///     KERNEL monitor group (1) and whose `nl_pid` is 0. A non-zero pid is
+///     treated as a spoofed multicast message and ignored.
+///   - an `SCM_CREDENTIALS` cmsg MUST be attached; "no sender credentials
+///     received" is an outright drop.
+///   - those credentials must carry uid 0, or `check_sender_uid()` rejects
+///     the message.
+///
+/// All three are silent at debug level, and journald is not up early enough
+/// in boot to capture them — which is exactly why udevd could receive every
+/// uevent we emit and still queue nothing. Pinned here so a regression names
+/// itself instead of presenting as "udev does nothing".
+fn smoke_abi_netlink_uevent_recvmsg_sender_and_creds() -> TestResult {
+    with_setup(|| {
+        const SCM_CREDENTIALS_TYPE: i32 = 2;
+        const MONITOR_GROUP_KERNEL: u32 = 1;
+
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/platform/narf-drm/card0"),
+            alloc::string::String::from("drm"),
+        );
+
+        let mut name = [0u8; 32];
+        let mut dst = [0u8; 512];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 128];
+        let mut msg = [0u8; 56];
+        msg[..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(fd, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
+        if n <= 0 {
+            return Err("recvmsg on a uevent monitor returned no bytes");
+        }
+        // libudev drops anything under 32 bytes before looking at it.
+        if n < 32 {
+            return Err("uevent datagram is under libudev's 32-byte minimum");
+        }
+
+        // sockaddr_nl: nl_family u16 @0, nl_pad u16 @2, nl_pid u32 @4,
+        // nl_groups u32 @8.
+        let namelen = u32::from_ne_bytes(msg[8..12].try_into().unwrap());
+        if (namelen as usize) < 12 {
+            return Err("recvmsg did not return a full sockaddr_nl for the sender");
+        }
+        let nl_pid = u32::from_ne_bytes(name[4..8].try_into().unwrap());
+        let nl_groups = u32::from_ne_bytes(name[8..12].try_into().unwrap());
+        if nl_pid != 0 {
+            return Err("uevent sender nl_pid != 0 (libudev treats it as spoofed multicast)");
+        }
+        if nl_groups != MONITOR_GROUP_KERNEL {
+            return Err("uevent sender nl_groups is not the KERNEL monitor group");
+        }
+
+        // cmsghdr: cmsg_len u64 @0, cmsg_level i32 @8, cmsg_type i32 @12,
+        // then struct ucred { pid, uid, gid } u32 x3 @16.
+        let ctrllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("recvmsg attached no SCM_CREDENTIALS to the uevent");
+        }
+        let ctype = i32::from_le_bytes(ctrl[12..16].try_into().unwrap());
+        if ctype != SCM_CREDENTIALS_TYPE {
+            return Err("uevent ancillary data was not SCM_CREDENTIALS");
+        }
+        let uid = u32::from_le_bytes(ctrl[20..24].try_into().unwrap());
+        if uid != 0 {
+            return Err("uevent SCM_CREDENTIALS uid != 0 (check_sender_uid rejects it)");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_recvmsg_sender_and_creds
+);
+
 /// A LEVEL-triggered epoll on a uevent monitor must keep reporting the fd
 /// readable while events remain queued — including on the epoll_wait that
 /// follows a partial drain, when no new uevent has been emitted since.
