@@ -111,6 +111,7 @@ mod abi_misc_tests;
 mod abi_path_tests;
 mod abi_pathx_tests;
 mod abi_perf_tests;
+mod abi_pidns_tests;
 mod abi_proc2_tests;
 mod abi_proc_tests;
 mod abi_sched_tests;

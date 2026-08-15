@@ -11,7 +11,20 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     // pid = 0 means "self"; non-zero pids are routed to that task
     // unconditionally (no permission check today — capabilities
     // would gate cross-task rlimit mutation in a real model).
-    let task = if pid == 0 { current_task_id() } else { pid };
+    // Linux (kernel/sys.c:1751) resolves `pid` via find_task_by_vpid — a
+    // lookup in the CALLER's pid namespace. Translate the inner pid to its
+    // outer ProcessId, then to the scheduler TaskId the rlimit table keys on.
+    // Passing the raw inner pid keyed some unrelated (or a same-numbered host)
+    // task's limits. Audit finding #11.
+    let task = if pid == 0 {
+        current_task_id()
+    } else {
+        let Some(outer) = accept_pid_from(current_task_id(), pid) else {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            return;
+        };
+        proc_pid_to_tid(outer)
+    };
 
     // Validate resource bound up-front so the read+write is atomic
     // from the user's perspective.

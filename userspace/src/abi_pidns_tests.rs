@@ -1,0 +1,115 @@
+//! Linux syscall ABI conformance — PID-namespace argument translation.
+//!
+//! Every syscall that takes a pid ARRIVING from userspace must resolve it in
+//! the CALLER's pid namespace (Linux `find_task_by_vpid`), i.e. through
+//! `accept_pid_from(current_task_id(), pid)` before it is used as an outer
+//! ProcessId / scheduler TaskId / table key. These tests pin the fixes for the
+//! `docs/pidns_translation_audit.md` findings whose handlers keyed on the RAW
+//! caller-namespace pid.
+//!
+//! Each test builds a fresh PID namespace: a MANAGER task (`unshare(CLONE_NEWPID)`
+//! → inner pid 1) and a WORKER inherited into it (inner pid 2). It then drives
+//! the syscall with the WORKER's IN-NAMESPACE pid (2) and asserts the handler
+//! acted on the WORKER (outer WORKER_PID / WORKER_TASK), not on whatever
+//! ROOT-namespace entity a raw lookup of the number 2 would land on.
+//!
+//! Gated on `container` (the pid-namespace tables only exist there) AND
+//! `linux-compat` (the ABI harness).
+#![cfg(all(feature = "linux-compat", feature = "container"))]
+
+use crate::abi_test_support::*;
+
+/// Register a task in every table a real spawned task appears in: the
+/// refcounted scheduler registry and the outer-pid ↔ TaskId maps. Only ever
+/// called with LARGE, synthetic TaskIds — never a small number that could
+/// alias a live boot/kernel task.
+fn register(task: u64, pid: u64) {
+    crate::task::release_task(task);
+    let _ = crate::task::Task::new_registered(task, pid);
+    crate::handlers::register_task_to_pid(task, pid);
+    crate::handlers::register_pid_task_mapping(pid, task);
+}
+
+/// Release each synthetic task from the refcounted registry (teardown).
+fn release_all(tasks: &[u64]) {
+    for &t in tasks {
+        crate::task::release_task(t);
+    }
+}
+
+/// unshare a fresh PID namespace for `manager` (→ inner pid 1) and inherit
+/// `worker` into it (→ inner pid 2). Returns Err on any binding surprise.
+fn build_manager_worker(
+    manager_task: u64,
+    manager_pid: u64,
+    worker_task: u64,
+    worker_pid: u64,
+) -> Result<(), &'static str> {
+    crate::pid_ns::unshare_pid_ns(manager_task, manager_pid);
+    if crate::pid_ns::inherit_into_child(manager_task, worker_task, worker_pid) != Some(2) {
+        return Err("worker was not assigned inner pid 2");
+    }
+    Ok(())
+}
+
+// ── #11 prlimit64(pid) — Linux kernel/sys.c:1751 `find_task_by_vpid` ──
+//
+// The handler did `let task = if pid == 0 { current } else { pid };`, using the
+// caller-namespace pid DIRECTLY as the TaskId the rlimit table keys on. The fix
+// translates inner → outer → TaskId. Observed by seeding only the WORKER's
+// RLIMIT_NOFILE and reading it back by the worker's inner pid: the fix reads the
+// worker's soft limit, the bug reads the (empty) TaskId `2` slot → the default.
+fn smoke_abi_pidns_prlimit64_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xD100;
+        const MANAGER_PID: u64 = 0xD000;
+        const WORKER_TASK: u64 = 0xD101;
+        const WORKER_PID: u64 = 0xD001;
+        const RLIMIT_NOFILE: u64 = 7;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            // Seed only the worker's soft NOFILE (111) via its self arm.
+            let mut wbuf = [0u8; 16];
+            wbuf[..8].copy_from_slice(&111u64.to_ne_bytes());
+            wbuf[8..].copy_from_slice(&222u64.to_ne_bytes());
+            set_task(WORKER_TASK);
+            if call(
+                Syscall::Prlimit64.raw(),
+                a3(0, RLIMIT_NOFILE, wbuf.as_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("seeding the worker rlimit failed");
+            }
+
+            // Manager reads inner pid 2's prior soft limit into oldbuf.
+            set_task(MANAGER_TASK);
+            let mut oldbuf = [0u8; 16];
+            if call(
+                Syscall::Prlimit64.raw(),
+                a3(2, RLIMIT_NOFILE, 0, oldbuf.as_mut_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("prlimit64 read of inner pid 2 did not succeed");
+            }
+            let cur = u64::from_ne_bytes(oldbuf[..8].try_into().unwrap());
+            if cur == 111 {
+                Ok(())
+            } else {
+                Err("prlimit64 used the inner pid directly as a TaskId (read the wrong / default rlimit) — accept_pid_from -> pid_to_task_raw missing")
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_prlimit64_resolves_in_caller_pid_ns
+);
