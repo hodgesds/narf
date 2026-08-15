@@ -4556,6 +4556,106 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
 
+/// A LEVEL-triggered epoll on a uevent monitor must keep reporting the fd
+/// readable while events remain queued — including on the epoll_wait that
+/// follows a partial drain, when no new uevent has been emitted since.
+///
+/// This is the shape `systemd-udevd` runs: its monitor fd is registered
+/// level-triggered, it reads one event per wakeup, and it returns to
+/// `epoll_wait(-1)` with the rest of the queue still pending. Nothing emits
+/// a fresh uevent afterwards, so if that epoll_wait parks on the strength of
+/// "no new readiness notification arrived", the daemon sleeps forever on data
+/// that is already sitting in its socket.
+///
+/// That is exactly what was observed on the Fedora gate: udevd read seqnum 2
+/// and 3, went back to epoll_wait with seqnums 4..31 still queued, and stayed
+/// parked with a frozen park-check counter for 300 seconds — no workers, no
+/// `/run/udev/data`. Readiness REPORTING was never the problem
+/// (`poll_readiness` sets POLL_IN whenever the reader has pending events);
+/// the question this pins is whether epoll consults it before parking.
+fn smoke_abi_netlink_uevent_epoll_level_redelivers_pending() -> TestResult {
+    with_setup(|| {
+        const EPOLLIN: u32 = 1;
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+
+        // Queue THREE events before epoll ever sees the fd, mirroring a boot
+        // coldplug that completed before the daemon started.
+        for i in 0..3u32 {
+            narf_filesystem::uevent::emit(
+                narf_filesystem::uevent::UeventAction::Add,
+                alloc::format!("/devices/epoll-level-{i}"),
+                alloc::string::String::from("drm"),
+            );
+        }
+
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create failed"),
+        };
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&EPOLLIN.to_ne_bytes());
+        interest[4..].copy_from_slice(&0xEEEEu64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, 1, fd, interest.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl ADD of the uevent monitor failed");
+        }
+
+        // Drain one event per wakeup, exactly as udevd does. Every iteration
+        // must wake: the queue is still non-empty and NOTHING emits a new
+        // uevent to supply a fresh readiness edge.
+        //
+        // A BLOCKING wait on purpose, with a finite timeout so a regression
+        // fails the suite instead of hanging it.
+        //
+        // KNOWN LIMIT: this harness has no user-task context, so even a
+        // blocking epoll_wait is answered by the immediate readiness scan and
+        // never reaches the own-stack park. That makes this test real
+        // coverage of the LEVEL-TRIGGERED contract but NOT a reproducer for
+        // the udevd wedge, whose distinguishing feature is a park whose
+        // re-check never runs (`dbg_park_checks` frozen). Reproducing that
+        // needs a test that actually parks — do not read this test passing as
+        // evidence the park path is correct.
+        const BLOCK_MS: u64 = 2_000;
+        for i in 0..3 {
+            let mut out = [0u8; 12];
+            let ready = call(
+                Syscall::EpollWait.raw(),
+                a3(epfd, out.as_mut_ptr() as u64, 1, BLOCK_MS),
+            )
+            .ok_or("epoll_wait status")?;
+            if ready != 1 {
+                return match i {
+                    0 => Err("epoll_wait did not report a monitor queued before registration"),
+                    _ => Err("epoll_wait parked with uevents still queued after a partial drain"),
+                };
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf).unwrap_or(-1) <= 0 {
+                return Err("recv returned nothing for an epoll-reported readable monitor");
+            }
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(epfd));
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_epoll_level_redelivers_pending
+);
+
 /// A NETLINK_KOBJECT_UEVENT monitor is udevd's primary event source.  Its
 /// queue may be drained between epoll scans, so EPOLLET must see a subsequent
 /// uevent even though no scan observed the temporary empty state.
