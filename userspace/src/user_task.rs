@@ -191,6 +191,12 @@ pub struct UserTaskCtx {
     /// for a specific child, ≤ 0 = any child.
     pub wait_child_want_pid: AtomicI64,
 
+    /// TASK-space process group a group-scoped blocking wait
+    /// (`waitpid(0)`/`waitpid(-pgid)`/`waitid(P_PGID)`) filters on; `0` = no
+    /// pgid filter (specific-pid or any-child wait). The poll-side reap
+    /// (`wait_child_check_fn`) reads this to match only children in the group.
+    pub wait_child_want_pgid: AtomicU64,
+
     /// on a successful reap. `0` = caller passed NULL (discard).
     /// For a `waitid(2)` wait this instead holds the `siginfo_t*`.
     pub wait_child_status_ptr: AtomicU64,
@@ -446,6 +452,7 @@ impl UserTaskCtx {
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
             wait_child_want_pid: AtomicI64::new(0),
+            wait_child_want_pgid: AtomicU64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             flock_key: core::sync::atomic::AtomicUsize::new(0),

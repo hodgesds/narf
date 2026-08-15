@@ -34,24 +34,35 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // Try-reap closure: pops the matching (child_pid, status)
-    // from the parent's queue if any. Returns Some on success.
-    let try_reap = |parent: u64, want: i64| -> Option<(u64, i32)> {
+    // Process-group-scoped wait targets (#29): `want_pid == 0` waits on the
+    // CALLER's own process group; `want_pid < -1` waits on process group
+    // |want_pid| resolved in the caller's ns (`pgid_from_user`). `want_pgid` is
+    // the TASK-space group id the reap/ECHILD checks filter on; 0 = specific-pid
+    // or any-child wait. A `< -1` pgid that resolves to no group is ECHILD.
+    let want_pgid: u64 = match args.arg0 as i64 {
+        0 => read_pgid(parent),
+        raw if raw < -1 => {
+            let g = pgid_from_user((-raw) as u64);
+            if g == 0 {
+                const ECHILD: i64 = 10;
+                ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
+                return;
+            }
+            g
+        }
+        _ => 0,
+    };
+
+    // Try-reap closure: pops the first matching (child_pid, status) from the
+    // parent's queue. Matching is by specific pid, process group, or any child
+    // per `wait_child_matches`.
+    let try_reap = |parent: u64, want: i64, want_pgid: u64| -> Option<(u64, i32)> {
         let mut g = PENDING_EXITS.lock();
         let m = g.as_mut()?;
         let q = m.get_mut(&parent)?;
-        let idx = if want > 0 {
-            // Specific child.
-            q.iter().position(|&(p, _)| p == want as u64)?
-        } else {
-            // Any child (including pid == 0 / pid < -1 we
-            // collapse to -1 for simplicity — no per-pgid wait
-            // until process groups are real).
-            if q.is_empty() {
-                return None;
-            }
-            0
-        };
+        let idx = q
+            .iter()
+            .position(|&(p, _)| wait_child_matches(p, want, want_pgid))?;
         Some(q.remove(idx))
     };
 
@@ -62,7 +73,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // the option + a queued report are present; a plain wait falls straight
     // through to the exit reap. Does NOT release the PID — child lives (or
     // its exit stays queued for the next wait).
-    if let Some((child, status)) = reap_stopcont(parent, want_pid, options) {
+    if let Some((child, status)) = reap_stopcont(parent, want_pid, want_pgid, options) {
         if status_ptr != 0 {
             // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
             // and SMAP-brackets the 4-byte write.
@@ -72,7 +83,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    if let Some((reaped, status)) = try_reap(parent, want_pid) {
+    if let Some((reaped, status)) = try_reap(parent, want_pid, want_pgid) {
         if status_ptr != 0 {
             // Write i32 status under the SMAP bracket.
             // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
@@ -108,7 +119,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // semantics. Without this, a parent that has already reaped its last child
     // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
     // its only worker exited, so the whole run never completes).
-    if !has_living_child(parent, want_pid) {
+    if !has_living_child(parent, want_pid, want_pgid) {
         const ECHILD: i64 = 10;
         ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
         return;
@@ -157,6 +168,8 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
                 .store(true, core::sync::atomic::Ordering::Release);
             uc.wait_child_want_pid
                 .store(want_pid, core::sync::atomic::Ordering::Release);
+            uc.wait_child_want_pgid
+                .store(want_pgid, core::sync::atomic::Ordering::Release);
             uc.wait_child_status_ptr
                 .store(status_ptr, core::sync::atomic::Ordering::Release);
             // wait4 writes a wstatus int, not a waitid siginfo.
@@ -186,7 +199,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     let deadline = narf_time::Deadline::after_ms(60_000);
     let mut reaped = None;
     while !deadline.expired() {
-        if let Some(entry) = try_reap(parent, want_pid) {
+        if let Some(entry) = try_reap(parent, want_pid, want_pgid) {
             reaped = Some(entry);
             break;
         }

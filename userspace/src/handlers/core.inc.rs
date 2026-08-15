@@ -5982,13 +5982,32 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
 /// the wait `options` (WUNTRACED selects stops, WCONTINUED selects
 /// continues) and the `want` pid filter. Returns `(child_pid,
 /// wstatus)` WITHOUT releasing the PID.
-fn reap_stopcont(parent: u64, want: i64, options: u32) -> Option<(u64, i32)> {
+/// Does an exited/candidate child `child_pid` (an outer ProcessId) satisfy a
+/// wait request? `want_pgid` != 0 selects a PROCESS-GROUP-scoped wait
+/// (`waitpid(0)` / `waitpid(-pgid)` / `waitid(P_PGID)`): the child matches iff
+/// its process group (its still-live PGID_TABLE entry — cleared only by
+/// `release_reaped_task` at the real reap) equals the TASK-space `want_pgid`.
+/// Otherwise `want_pid` decides: > 0 a specific outer pid, <= 0 any child.
+/// Linux `kernel/exit.c` `eligible_pid` / `__WNOTHREAD` filtering. (#29)
+fn wait_child_matches(child_pid: u64, want_pid: i64, want_pgid: u64) -> bool {
+    if want_pgid != 0 {
+        let child_task = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+        return read_pgid(child_task) == want_pgid;
+    }
+    if want_pid > 0 {
+        child_pid == want_pid as u64
+    } else {
+        true
+    }
+}
+
+fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option<(u64, i32)> {
     let want_stop = options & WUNTRACED != 0;
     let want_cont = options & WCONTINUED != 0;
     let mut g = PENDING_STOPCONT.lock();
     let q = g.as_mut()?.get_mut(&parent)?;
     let idx = q.iter().position(|&(p, _w, cont)| {
-        if want > 0 && p != want as u64 {
+        if !wait_child_matches(p, want, want_pgid) {
             return false;
         }
         if cont {
@@ -6298,6 +6317,17 @@ pub(crate) fn stage_killed_termination(pid: u64) {
 /// wstatus into the user-space pointer (same as `sys_wait4` does on the
 /// fast path).
 fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: *mut i32) -> i64 {
+    // A process-group-scoped blocking wait (waitpid(0)/(-pgid)/P_PGID) stored
+    // its TASK-space target pgid on the parked task's UserTaskCtx; the sync
+    // paths pass it as an argument, but this poll-side reap re-derives it from
+    // the same task. 0 = no pgid filter (specific-pid / any-child wait). (#29)
+    let want_pgid = crate::user_task::current_user_task()
+        .map(|u| {
+            // SAFETY: the poll routine holds the parked task's UserTaskCtx
+            // pinned; we only read one atomic field.
+            unsafe { (*u).wait_child_want_pgid.load(Ordering::Acquire) }
+        })
+        .unwrap_or(0);
     // Job-control stop/continue notification FIRST. Linux reaps a child's
     // state changes in order — a stop or continue is reported before the
     // child's later exit — so a `waitpid(WCONTINUED)` after `kill(SIGCONT)`
@@ -6307,7 +6337,7 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
     // and a report is queued, so a plain wait falls straight through to the
     // exit reap below. These do NOT release the PID: the child is alive (or
     // its exit is still queued for the next wait).
-    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, options) {
+    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, want_pgid, options) {
         if !out_status.is_null() {
             // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
             // poll routine's stack frame for the duration of this call.
@@ -6326,14 +6356,9 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         let mut g = PENDING_EXITS.lock();
         let reaped = g.as_mut().and_then(|m| {
             let q = m.get_mut(&parent_id)?;
-            let idx = if want_pid > 0 {
-                q.iter().position(|&(p, _)| p == want_pid as u64)?
-            } else {
-                if q.is_empty() {
-                    return None;
-                }
-                0
-            };
+            let idx = q
+                .iter()
+                .position(|&(p, _)| wait_child_matches(p, want_pid, want_pgid))?;
             if peek {
                 Some(q[idx])
             } else {
@@ -7239,9 +7264,19 @@ pub fn __test_set_foreground_task(tid: u64) {
 /// by the `PENDING_EXITS` reap path, so this only gates the block-vs-ECHILD
 /// decision once no matching exit is queued: a true result means "a child is
 /// still running, block for it"; false means "no such child — return ECHILD".
-fn has_living_child(parent: u64, want: i64) -> bool {
+fn has_living_child(parent: u64, want: i64, want_pgid: u64) -> bool {
     let g = PARENT_OF.lock();
     let is_parent = match g.as_ref() {
+        // Process-group-scoped wait: a living child of `parent` whose group is
+        // `want_pgid`. Without this the any-child arm below reported "has child"
+        // for a group with none, so waitpid(-emptygroup) blocked/returned 0
+        // instead of ECHILD. (#29)
+        Some(m) if want_pgid != 0 => m.iter().any(|(&child, &p)| {
+            p == parent && {
+                let ct = pid_to_task_raw(child).unwrap_or(child);
+                read_pgid(ct) == want_pgid
+            }
+        }),
         Some(m) if want > 0 => m.get(&(want as u64)).copied() == Some(parent),
         Some(m) => m.values().any(|&p| p == parent),
         None => false,

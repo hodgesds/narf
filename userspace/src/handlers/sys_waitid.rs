@@ -25,8 +25,9 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     const WNOWAIT: u32 = 0x0100_0000;
 
     // Translate (idtype, id) to the wait4-style want_pid: P_ALL → -1
-    // (any child), P_PID → the pid. P_PGID collapses to -1 until
-    // process groups are real (same simplification as wait4).
+    // (any child), P_PID → the pid. P_PGID sets a process-group filter
+    // (`want_pgid`) and waits on "any child" in that group (#29).
+    let mut want_pgid = 0u64;
     let want_pid: i64 = match idtype {
         P_ALL => -1,
         // `id` is a pid in the caller's namespace; the reap machinery keys on
@@ -42,7 +43,22 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
                 return;
             }
         },
-        P_PGID => -1,
+        // `id` is a pgid in the caller's ns; id == 0 means the caller's OWN
+        // process group. Resolve to the TASK-space group id the reap filters
+        // on; a group that resolves to nothing is ECHILD. Then wait on any
+        // child (want_pid = -1) — the pgid filter selects the member. (#29)
+        P_PGID => {
+            want_pgid = if id == 0 {
+                read_pgid(current_task_id())
+            } else {
+                pgid_from_user(id as u64)
+            };
+            if want_pgid == 0 {
+                ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+                return;
+            }
+            -1
+        }
         // P_PIDFD: `id` is a pidfd; wait on its target process. The error
         // shape is LOAD-BEARING: glibc's `__clone_pidfd_supported()` probes
         // `waitid(P_PIDFD, INT_MAX, NULL, WEXITED|WNOHANG)` and requires
@@ -82,7 +98,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // change is reported before the child's later exit, in order, matching
     // Linux. Only matches when the option + a queued report are present, so
     // a plain wait falls through to the exit reap. No PID release.
-    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
+    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, want_pgid, options) {
         if infop != 0 {
             // Report the child in the CALLER's namespace view, exactly like
             // the exit-reap arm below; the raw child_pid leaked an outer pid
@@ -103,13 +119,9 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
         let mut g = PENDING_EXITS.lock();
         g.as_mut().and_then(|m| {
             let q = m.get_mut(&parent)?;
-            let idx = if want_pid > 0 {
-                q.iter().position(|&(p, _)| p == want_pid as u64)?
-            } else if q.is_empty() {
-                return None;
-            } else {
-                0
-            };
+            let idx = q
+                .iter()
+                .position(|&(p, _)| wait_child_matches(p, want_pid, want_pgid))?;
             if peek {
                 Some(q[idx])
             } else {
@@ -162,7 +174,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // re-float the task after a wake that can never come — the strand is
     // unbounded, and invisible to the park-check heuristic because that path
     // does not tick `dbg_park_checks` either.
-    if !has_living_child(parent, want_pid) {
+    if !has_living_child(parent, want_pid, want_pgid) {
         const ECHILD: i64 = 10;
         ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
         return;
@@ -190,6 +202,8 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
                 .store(true, core::sync::atomic::Ordering::Release);
             uc.wait_child_want_pid
                 .store(want_pid, core::sync::atomic::Ordering::Release);
+            uc.wait_child_want_pgid
+                .store(want_pgid, core::sync::atomic::Ordering::Release);
             uc.wait_child_status_ptr
                 .store(infop, core::sync::atomic::Ordering::Release);
             uc.wait_child_options
