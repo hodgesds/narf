@@ -1655,3 +1655,96 @@ fn smoke_drm_two_cards_enumerate() -> TestResult {
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_two_cards_enumerate);
 
 extern crate alloc;
+
+// ── Smoke 17c: the DRM ADD carries what names /run/udev/data/c226:0 ──────
+//
+// The udev seat gate asserts on the literal path `/run/udev/data/c226:0`.
+// That filename is not a convention udev picks — it is
+// `sd_device_get_device_id()`, which builds `c<major>:<minor>` from the
+// device's MAJOR/MINOR properties and falls back to `+<subsystem>:<sysname>`
+// when it cannot read a devnum. A DRM ADD broadcast WITHOUT MAJOR/MINOR is
+// therefore not merely incomplete: udev would persist it as
+// `+drm:card0` and the gate could never find it, no matter how healthy the
+// rest of the pipeline is.
+//
+// `sd_device_get_devname()` reads DEVNAME, and `event_queue_insert()` accepts
+// only 0 or -ENOENT from it — so DEVNAME must be present AND well-formed
+// (relative to /dev, no leading slash) rather than merely absent.
+//
+// Linux ref: `sd_device_get_device_id` / `device_set_devnum` in
+// src/libsystemd/sd-device/sd-device.c.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_add_carries_devnum_naming_the_udev_db_file() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::{sysfs, uevent};
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    uevent::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    let events = uevent::boot_udevd_replay_reader().drain(16);
+    let card = events
+        .iter()
+        .find(|e| e.devpath.ends_with("/card0"))
+        .cloned();
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    uevent::__reset_for_test();
+
+    let Some(card) = card else {
+        return TestResult::Fail("no DRM card0 ADD was broadcast");
+    };
+    let prop = |key: &str| -> Option<alloc::string::String> {
+        card.extras
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+
+    // MAJOR/MINOR are what make the device id `c226:0` rather than
+    // `+drm:card0`.
+    let Some(major) = prop("MAJOR") else {
+        return TestResult::Fail("DRM card ADD carries no MAJOR (udev db would be +drm:card0)");
+    };
+    let Some(minor) = prop("MINOR") else {
+        return TestResult::Fail("DRM card ADD carries no MINOR (udev db would be +drm:card0)");
+    };
+    if major != "226" {
+        return TestResult::Fail("DRM card ADD MAJOR is not the DRM major 226");
+    }
+    if minor != "0" {
+        return TestResult::Fail("DRM card0 ADD MINOR is not 0");
+    }
+    // DEVNAME must be present and /dev-relative; sd-device rejects a leading
+    // slash when it composes the node path.
+    let Some(devname) = prop("DEVNAME") else {
+        return TestResult::Fail("DRM card ADD carries no DEVNAME");
+    };
+    if devname.starts_with('/') {
+        return TestResult::Fail("DRM card ADD DEVNAME must be /dev-relative, not absolute");
+    }
+    if devname != "dri/card0" {
+        return TestResult::Fail("DRM card ADD DEVNAME is not dri/card0");
+    }
+    // The gate's literal target, reconstructed the way sd-device does.
+    let device_id = alloc::format!("c{major}:{minor}");
+    if device_id != "c226:0" {
+        return TestResult::Fail("reconstructed udev device id is not c226:0");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_add_carries_devnum_naming_the_udev_db_file
+);
