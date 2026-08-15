@@ -242,6 +242,28 @@ impl EpollInstance {
 
     /// Return a vector of (events, data) pairs for ready fds.
     /// Consults the current fd-table for each interest item.
+    /// `(fd, poll_readiness_bits)` for every fd in the interest set, for the
+    /// unbounded-park diagnostic. Same snapshot-then-poll shape as
+    /// [`Self::collect_ready`] so it reports what that function would see.
+    #[cfg(feature = "unix-latency-trace")]
+    fn dbg_interest_readiness(&self, task_id: u64) -> Vec<(i32, u32)> {
+        let snapshot: Vec<(i32, EpollItem)> = {
+            let g = self.inner.lock();
+            g.interest.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        snapshot
+            .into_iter()
+            .map(|(fd, _)| {
+                let bits = crate::fd::with_table(task_id, |t| {
+                    t.get(fd as u32).map(|e| e.ops.poll_readiness())
+                })
+                .flatten()
+                .unwrap_or(u32::MAX);
+                (fd, bits)
+            })
+            .collect()
+    }
+
     fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
         let owner_id = task_id; // simplified owner model
 
@@ -1036,6 +1058,38 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // are its own `UnsafeCell` fields and the `hook` consumes
                         // the same pointer to park exactly this task.
                         // SAFETY: Valid memory or trusted environment
+                        // Debug-feature only: what the interest set looked
+                        // like at the instant we committed to an UNBOUNDED
+                        // park. With `timeout_ms < 0` the only wake sources
+                        // are `readiness::notify` and the timerfd clamp, so a
+                        // task that parks here with a readable fd in its set
+                        // never wakes. Printing the set is the difference
+                        // between "epoll never saw the fd" and "the fd really
+                        // was not ready", which no amount of outside
+                        // observation distinguishes.
+                        #[cfg(feature = "unix-latency-trace")]
+                        if deadline_ns.is_none() {
+                            use core::fmt::Write as _;
+                            static SHOWN: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            // Budget generously: an earlier 48-line cap was
+                            // spent entirely by PID 1 and systemd-tmpfiles
+                            // before the task under investigation had even
+                            // started, and a probe that goes silent early
+                            // looks exactly like a task that never parked.
+                            if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                                let comm = crate::handlers::proc_comm_of_task(task)
+                                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                                let _ = write!(
+                                    narf_console::Writer,
+                                    "  epoll-park: tid={task} comm={comm} epfd={epfd} set=[",
+                                );
+                                for (wfd, bits) in instance.dbg_interest_readiness(task) {
+                                    let _ = write!(narf_console::Writer, "{wfd}:{bits:#x} ");
+                                }
+                                let _ = writeln!(narf_console::Writer, "]");
+                            }
+                        }
                         unsafe {
                             let uc = &*uctx_ptr;
                             // Flag this park as a net-I/O wait so the poll

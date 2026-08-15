@@ -2593,7 +2593,13 @@ impl SocketFile {
                             use core::fmt::Write as _;
                             static SHOWN: core::sync::atomic::AtomicU32 =
                                 core::sync::atomic::AtomicU32::new(0);
-                            const BUDGET: u32 = 64;
+                            // Generous: a 64-line budget was spent almost
+                            // entirely by PID 1's own monitor before udevd
+                            // started, which made udevd look like it read two
+                            // events and stopped. A capped probe going quiet
+                            // is indistinguishable from the thing it watches
+                            // going quiet.
+                            const BUDGET: u32 = 4000;
                             if SHOWN.fetch_add(1, Ordering::Relaxed) < BUDGET {
                                 let task = crate::handlers::current_task_id();
                                 let comm = crate::handlers::proc_comm_of_task(task)
