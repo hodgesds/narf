@@ -20,7 +20,20 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
         return;
     }
     let val = i32::from_ne_bytes(buf);
-    let task = if pid == 0 { current_task_id() } else { pid };
+    // `pid` is resolved in the CALLER's pid namespace (Linux
+    // kernel/sched/syscalls.c find_process_by_pid -> find_task_by_vpid),
+    // exactly as sys_sched_setaffinity does. Translate inner -> outer -> TaskId
+    // before keying the sched-param table; the raw inner pid keyed an unrelated
+    // task. Audit finding #18.
+    let task = if pid == 0 {
+        current_task_id()
+    } else {
+        let Some(outer) = accept_pid_from(current_task_id(), pid) else {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            return;
+        };
+        proc_pid_to_tid(outer)
+    };
     let mut g = SCHED_PARAM_TABLE.lock();
     let m = match g.as_mut() {
         Some(m) => m,

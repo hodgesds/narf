@@ -170,3 +170,112 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_kcmp_resolves_in_caller_pid_ns
 );
+
+// ── #18 sched_setparam(pid) — Linux kernel/sched/syscalls.c ──
+//
+// `let task = if pid == 0 { current } else { pid };` used the caller-namespace
+// pid directly as the SCHED_PARAM_TABLE key. The fix mirrors sched_setaffinity.
+// The manager sets the worker's param by inner pid 2, then the worker reads its
+// OWN param (self arm): the fix routed the write to the worker (99), the bug
+// wrote the raw-`2` slot, leaving the worker's entry at the default (0).
+fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xE100;
+        const MANAGER_PID: u64 = 0xE000;
+        const WORKER_TASK: u64 = 0xE101;
+        const WORKER_PID: u64 = 0xE001;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            let prio = 99i32;
+            set_task(MANAGER_TASK);
+            if call(
+                Syscall::SchedSetparam.raw(),
+                a1(2, &prio as *const i32 as u64),
+            ) != Some(0)
+            {
+                return Err("sched_setparam(inner 2) did not succeed");
+            }
+            // Worker reads its own param (self arm — unaffected by the bug).
+            set_task(WORKER_TASK);
+            let mut out = 0i32;
+            if call(
+                Syscall::SchedGetparam.raw(),
+                a1(0, &mut out as *mut i32 as u64),
+            ) != Some(0)
+            {
+                return Err("reading the worker's sched param failed");
+            }
+            if out == 99 {
+                Ok(())
+            } else {
+                Err("sched_setparam wrote the raw inner pid's TaskId slot, not the worker's — accept_pid_from -> pid_to_task_raw missing")
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns
+);
+
+// ── #18 sched_getparam(pid) — Linux kernel/sched/syscalls.c ──
+//
+// Same raw-pid-as-key bug on the read side. Seed only the worker's param (77)
+// via its self arm, then have the manager read it by inner pid 2: the fix reads
+// the worker (77), the bug reads the empty raw-`2` slot (default 0).
+fn smoke_abi_pidns_sched_getparam_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xE110;
+        const MANAGER_PID: u64 = 0xE010;
+        const WORKER_TASK: u64 = 0xE111;
+        const WORKER_PID: u64 = 0xE011;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            let prio = 77i32;
+            set_task(WORKER_TASK);
+            if call(
+                Syscall::SchedSetparam.raw(),
+                a1(0, &prio as *const i32 as u64),
+            ) != Some(0)
+            {
+                return Err("seeding the worker's sched param failed");
+            }
+            set_task(MANAGER_TASK);
+            let mut out = 0i32;
+            if call(
+                Syscall::SchedGetparam.raw(),
+                a1(2, &mut out as *mut i32 as u64),
+            ) != Some(0)
+            {
+                return Err("sched_getparam(inner 2) did not succeed");
+            }
+            if out == 77 {
+                Ok(())
+            } else {
+                Err("sched_getparam read the raw inner pid's TaskId slot, not the worker's — accept_pid_from -> pid_to_task_raw missing")
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_sched_getparam_resolves_in_caller_pid_ns
+);
