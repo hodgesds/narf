@@ -77,7 +77,10 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // a plain wait falls through to the exit reap. No PID release.
     if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
         if infop != 0 {
-            let si = encode_waitid_siginfo(child_pid as i64, status);
+            // Report the child in the CALLER's namespace view, exactly like
+            // the exit-reap arm below; the raw child_pid leaked an outer pid
+            // to a containerized waiter (Linux pid_vnr on wo_stat).
+            let si = encode_waitid_siginfo(report_pid_to(parent, child_pid) as i64, status);
             // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
             let _ = unsafe { copy_to_user(infop, &si) };
         }
