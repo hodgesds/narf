@@ -478,6 +478,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             }
+            // Linux historically encoded QGROUP_LIMIT as `_IOR` even though
+            // its 48-byte argument is input. Preserve that ABI quirk while
+            // still keeping user-pointer access in the syscall layer.
+            const BTRFS_IOC_QGROUP_LIMIT: u32 = 0x8030_942b;
+            if cmd == BTRFS_IOC_QGROUP_LIMIT && input.is_empty() {
+                input.resize(48, 0);
+                // SAFETY: the fixed UAPI structure is 48 bytes and
+                // copy_from_user validates the whole pointed-to range.
+                if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    return;
+                }
+            }
             // `btrfs_ioctl_vol_args_v2` carries qgroup inheritance through a
             // second userspace pointer. Flatten that bounded payload after the
             // 4096-byte ioctl struct so the filesystem driver never
@@ -529,9 +542,21 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-13i64) as u64));
                 }
                 Some(Err(narf_filesystem::FsError::Busy)) => {
-                    // BTRFS_IOC_SNAP_DESTROY uses ENOTEMPTY when the target
-                    // subvolume still owns nested subvolumes.
-                    ctx.set_return(SyscallReturn::ok((-39i64) as u64));
+                    let errno = match cmd {
+                        0x5000_940f | 0x5000_943f => -39, // ENOTEMPTY
+                        0x4010_942a => -17,               // EEXIST
+                        _ => -16,                         // EBUSY
+                    };
+                    ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::NotFound)) => {
+                    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::NoSpace)) => {
+                    ctx.set_return(SyscallReturn::ok((-28i64) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::ReadOnly)) => {
+                    ctx.set_return(SyscallReturn::ok((-30i64) as u64));
                 }
                 Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
                     ctx.set_return(SyscallReturn::ok((-122i64) as u64));

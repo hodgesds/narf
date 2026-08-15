@@ -8,7 +8,7 @@
 //! Supported: SINGLE/DUP chunk profiles, all four btrfs checksum algorithms,
 //! zlib/zstd/LZO and uncompressed reads, 4–64 KiB sectors, incremental COW
 //! writes, namespace mutations, nested writable subvolume mounts, full qgroup
-//! accounting/limits, and subvolume/snapshot ioctls.
+//! accounting/limits/administration, and subvolume/snapshot ioctls.
 //! Unsupported on-disk shapes are rejected precisely rather than mis-read. See
 //! the crate `README` for the full matrix and limits.
 

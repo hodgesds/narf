@@ -782,9 +782,9 @@ first persistent driver that landed. Compatibility drivers now implement ext2,
 FAT-family formats, and single-device read-write btrfs behind the same VFS
 traits. Btrfs supplies the currently implemented native snapshot backend;
 its compatibility driver also maintains already-enabled full qgroup trees,
-enforces referenced/exclusive hard limits, and supports V2 qgroup inheritance.
-Multi-device/RAID btrfs, simple quotas and standalone quota-administration
-ioctls, and narffs remain future work.
+enforces referenced/exclusive hard limits, supports V2 qgroup inheritance, and
+implements the full-qgroup enable/disable/rescan/create/assign/limit ioctls.
+Multi-device/RAID btrfs, simple quotas, and narffs remain future work.
 
 ### 8.2 POSIX semantics scope (resolved)
 

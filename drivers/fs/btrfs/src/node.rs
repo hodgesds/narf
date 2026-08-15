@@ -37,6 +37,15 @@ pub(crate) const BTRFS_IOC_SNAP_DESTROY_V2: u32 = 0x5000_943f;
 pub(crate) const BTRFS_IOC_SUBVOL_GETFLAGS: u32 = 0x8008_9419;
 /// `_IOW(BTRFS_IOCTL_MAGIC, 26, __u64)` from Linux `uapi/linux/btrfs.h`.
 pub(crate) const BTRFS_IOC_SUBVOL_SETFLAGS: u32 = 0x4008_941a;
+/// Full-qgroup administration ioctls from Linux `uapi/linux/btrfs.h`.
+pub(crate) const BTRFS_IOC_QUOTA_CTL: u32 = 0xc010_9428;
+pub(crate) const BTRFS_IOC_QGROUP_ASSIGN: u32 = 0x4018_9429;
+pub(crate) const BTRFS_IOC_QGROUP_CREATE: u32 = 0x4010_942a;
+// This historical UAPI is encoded `_IOR` even though the structure is input.
+pub(crate) const BTRFS_IOC_QGROUP_LIMIT: u32 = 0x8030_942b;
+pub(crate) const BTRFS_IOC_QUOTA_RESCAN: u32 = 0x4040_942c;
+pub(crate) const BTRFS_IOC_QUOTA_RESCAN_STATUS: u32 = 0x8040_942d;
+pub(crate) const BTRFS_IOC_QUOTA_RESCAN_WAIT: u32 = 0x0000_942e;
 /// Userspace flag returned by `BTRFS_IOC_SUBVOL_GETFLAGS`. This is distinct
 /// from bit 0 in the on-disk `btrfs_root_item.flags` field.
 pub(crate) const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
@@ -201,12 +210,40 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 {
                     return Err(FsError::InvalidData);
                 }
+                BTRFS_IOC_QUOTA_CTL if input.len() != 16 || out_size != 16 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QGROUP_ASSIGN if input.len() != 24 || out_size != 0 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QGROUP_CREATE if input.len() != 16 || out_size != 0 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QGROUP_LIMIT if input.len() != 48 || out_size != 48 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QUOTA_RESCAN if input.len() != 64 || out_size != 0 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QUOTA_RESCAN_STATUS if !input.is_empty() || out_size != 64 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_QUOTA_RESCAN_WAIT if !input.is_empty() || out_size != 0 => {
+                    return Err(FsError::InvalidData);
+                }
                 BTRFS_IOC_SUBVOL_GETFLAGS
                 | BTRFS_IOC_SUBVOL_SETFLAGS
                 | BTRFS_IOC_SUBVOL_CREATE
                 | BTRFS_IOC_SUBVOL_CREATE_V2
                 | BTRFS_IOC_SNAP_DESTROY
-                | BTRFS_IOC_SNAP_DESTROY_V2 => {}
+                | BTRFS_IOC_SNAP_DESTROY_V2
+                | BTRFS_IOC_QUOTA_CTL
+                | BTRFS_IOC_QGROUP_ASSIGN
+                | BTRFS_IOC_QGROUP_CREATE
+                | BTRFS_IOC_QGROUP_LIMIT
+                | BTRFS_IOC_QUOTA_RESCAN
+                | BTRFS_IOC_QUOTA_RESCAN_STATUS
+                | BTRFS_IOC_QUOTA_RESCAN_WAIT => {}
                 _ => return Err(FsError::Unsupported),
             }
             let vol = self.volume()?;
@@ -324,6 +361,101 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         crate::write::destroy_subvolume(&vol, self.ino, name.as_deref(), subvolid,)
                             .await
                     )?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_QUOTA_CTL => {
+                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                        return Err(FsError::ReadOnly);
+                    }
+                    let command = u64::from_ne_bytes(input[0..8].try_into().unwrap());
+                    match command {
+                        1 => autogrow!(vol, crate::write::quota_enable(&vol).await)?,
+                        2 => crate::write::quota_disable(&vol).await?,
+                        // Simple quotas intentionally remain unsupported.
+                        4 => return Err(FsError::Unsupported),
+                        _ => return Err(FsError::InvalidData),
+                    }
+                    let status = match crate::write::quota_status(&vol).await {
+                        Ok((flags, _)) => flags,
+                        Err(FsError::NotFound) if command == 2 => 0,
+                        Err(err) => return Err(err),
+                    };
+                    let mut output = alloc::vec![0u8; 16];
+                    output[0..8].copy_from_slice(&command.to_ne_bytes());
+                    output[8..16].copy_from_slice(&status.to_ne_bytes());
+                    Ok(FsIoctlReply { result: 0, output })
+                }
+                BTRFS_IOC_QGROUP_CREATE => {
+                    let create = u64::from_ne_bytes(input[0..8].try_into().unwrap());
+                    let id = u64::from_ne_bytes(input[8..16].try_into().unwrap());
+                    match create {
+                        0 => crate::write::qgroup_destroy_admin(&vol, id).await?,
+                        1 => autogrow!(vol, crate::write::qgroup_create_admin(&vol, id).await)?,
+                        _ => return Err(FsError::InvalidData),
+                    }
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_QGROUP_ASSIGN => {
+                    let assign = u64::from_ne_bytes(input[0..8].try_into().unwrap());
+                    if assign > 1 {
+                        return Err(FsError::InvalidData);
+                    }
+                    let src = u64::from_ne_bytes(input[8..16].try_into().unwrap());
+                    let dst = u64::from_ne_bytes(input[16..24].try_into().unwrap());
+                    autogrow!(
+                        vol,
+                        crate::write::qgroup_assign_admin(&vol, assign != 0, src, dst).await
+                    )?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_QGROUP_LIMIT => {
+                    let id = u64::from_ne_bytes(input[0..8].try_into().unwrap());
+                    let mut limit = [0u64; 5];
+                    for (idx, value) in limit.iter_mut().enumerate() {
+                        let off = 8 + idx * 8;
+                        *value = u64::from_ne_bytes(input[off..off + 8].try_into().unwrap());
+                    }
+                    autogrow!(vol, crate::write::qgroup_limit_admin(&vol, id, limit).await)?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_QUOTA_RESCAN => {
+                    if input.iter().any(|byte| *byte != 0) {
+                        return Err(FsError::InvalidData);
+                    }
+                    autogrow!(vol, crate::write::quota_rescan(&vol).await)?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
+                BTRFS_IOC_QUOTA_RESCAN_STATUS => {
+                    let (flags, progress) = match crate::write::quota_status(&vol).await {
+                        Ok(status) => status,
+                        Err(FsError::NotFound) => (0, 0),
+                        Err(err) => return Err(err),
+                    };
+                    let mut output = alloc::vec![0u8; 64];
+                    // NARF rescans synchronously, so bit 0 (RESCAN) is clear
+                    // once this call can observe the committed status.
+                    output[0..8].copy_from_slice(&(flags & 2).to_ne_bytes());
+                    output[8..16].copy_from_slice(&progress.to_ne_bytes());
+                    Ok(FsIoctlReply { result: 0, output })
+                }
+                BTRFS_IOC_QUOTA_RESCAN_WAIT => {
+                    // Rescans are synchronous; all prior accounting is already
+                    // durable when the ioctl returns.
                     Ok(FsIoctlReply {
                         result: 0,
                         output: Vec::new(),

@@ -1208,6 +1208,257 @@ kernel_test_in!(
     smoke_btrfs_qgroup_accounting_and_inheritance
 );
 
+/// Exercise the complete full-qgroup administration lifecycle on an image
+/// created without quotas: enable + initial rescan, higher-level create,
+/// relation assignment, limit replacement, status/wait, unassign/destroy, and
+/// disable with quota-tree reclamation. Simple quotas stay explicitly rejected.
+fn smoke_btrfs_qgroup_admin_ioctls() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const PARENT: u64 = (1u64 << 48) | 200;
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota-admin fixture failed to mount"),
+    };
+    if poll_once(crate::roots::find_root(
+        &*vol,
+        vol.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    .is_some()
+    {
+        return TestResult::Fail("quota-admin fixture unexpectedly had quotas");
+    }
+
+    let mut ctl = [0u8; 16];
+    ctl[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    let enable =
+        match poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16),
+        ) {
+            Some(Ok(reply)) if reply.output.len() == 16 => reply,
+            _ => return TestResult::Fail("quota enable ioctl failed"),
+        };
+    if u64::from_ne_bytes(enable.output[8..16].try_into().unwrap()) & 1 == 0 {
+        return TestResult::Fail("quota enable did not return ON status");
+    }
+    let top_info = match qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID) {
+        Some(body) if body.len() == 40 => body,
+        _ => return TestResult::Fail("quota enable did not create the top qgroup"),
+    };
+    if format::le64(&top_info, 0).ok() != Some(vol.superblock().generation)
+        || format::le64(&top_info, 8).unwrap_or(0) == 0
+    {
+        return TestResult::Fail("initial synchronous quota rescan was incomplete");
+    }
+
+    let mut create = [0u8; 16];
+    create[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    create[8..16].copy_from_slice(&PARENT.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("higher-level qgroup create ioctl failed");
+    }
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0,)
+        ),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("duplicate qgroup create was not rejected");
+    }
+
+    let mut assign = [0u8; 24];
+    assign[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    assign[8..16].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    assign[16..24].copy_from_slice(&PARENT.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_ASSIGN, 0, &assign, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("qgroup assignment ioctl failed");
+    }
+    let quota_root = poll_once(crate::roots::find_root(
+        &*vol,
+        vol.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    .map(|root| root.0)
+    .unwrap_or(0);
+    for key in [
+        BtrfsKey::new(
+            format::FS_TREE_OBJECTID,
+            format::QGROUP_RELATION_KEY,
+            PARENT,
+        ),
+        BtrfsKey::new(
+            PARENT,
+            format::QGROUP_RELATION_KEY,
+            format::FS_TREE_OBJECTID,
+        ),
+    ] {
+        if poll_once(btree::find_item(&*vol, quota_root, &key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_none()
+        {
+            return TestResult::Fail("qgroup assignment was not bidirectional");
+        }
+    }
+
+    // Linux permits setting a hard limit below current usage. The ioctl itself
+    // succeeds; subsequent ordinary mutations enforce the new limit.
+    let mut limit = [0u8; 48];
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes());
+    limit[16..24].copy_from_slice(&1u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("qgroup limit ioctl rejected an exceeded limit");
+    }
+    let stored_limit =
+        qgroup_item(&vol, format::QGROUP_LIMIT_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
+    if format::le64(&stored_limit, 0).ok() != Some(1)
+        || format::le64(&stored_limit, 8).ok() != Some(1)
+    {
+        return TestResult::Fail("qgroup limit ioctl did not persist its record");
+    }
+
+    let rescan = [0u8; 64];
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_RESCAN, 0, &rescan, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("synchronous quota rescan ioctl failed");
+    }
+    let status = match poll_once(vol.root().ioctl_async(
+        crate::node::BTRFS_IOC_QUOTA_RESCAN_STATUS,
+        0,
+        &[],
+        64,
+    )) {
+        Some(Ok(reply)) if reply.output.len() == 64 => reply,
+        _ => return TestResult::Fail("quota rescan status ioctl failed"),
+    };
+    if status.output.iter().any(|byte| *byte != 0)
+        || !matches!(
+            poll_once(
+                vol.root()
+                    .ioctl_async(crate::node::BTRFS_IOC_QUOTA_RESCAN_WAIT, 0, &[], 0,)
+            ),
+            Some(Ok(_))
+        )
+    {
+        return TestResult::Fail("completed synchronous rescan reported active");
+    }
+
+    // An assigned parent cannot be destroyed. Unassign it, then removal must
+    // delete both its INFO and LIMIT records.
+    create[0..8].copy_from_slice(&0u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0,)
+        ),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("assigned parent qgroup was destroyable");
+    }
+    assign[0..8].copy_from_slice(&0u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_ASSIGN, 0, &assign, 0,)
+        ),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("qgroup unassign/destroy lifecycle failed");
+    }
+    if qgroup_item(&vol, format::QGROUP_INFO_KEY, PARENT).is_some()
+        || qgroup_item(&vol, format::QGROUP_LIMIT_KEY, PARENT).is_some()
+    {
+        return TestResult::Fail("destroyed parent qgroup items survived");
+    }
+
+    let mut simple = [0u8; 16];
+    simple[0..8].copy_from_slice(&4u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &simple, 16,)
+        ),
+        Some(Err(FsError::Unsupported))
+    ) {
+        return TestResult::Fail("simple-quota enable was not rejected precisely");
+    }
+
+    ctl[0..8].copy_from_slice(&2u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("quota disable ioctl failed");
+    }
+    let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after quota disable failed"),
+    };
+    if poll_once(crate::roots::find_root(
+        &*remount,
+        remount.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    .is_some()
+    {
+        return TestResult::Fail("disabled quota tree remained reachable");
+    }
+    let hello = match poll_once(remount.root().lookup_async("hello.txt")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("post-disable file lookup failed"),
+    };
+    if !matches!(poll_once(hello.write(0, b"quota-off")), Some(Ok(9))) {
+        return TestResult::Fail("ordinary write failed after quota disable");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_qgroup_admin_ioctls);
+
 /// Mount genuine mkfs images using every alternate checksum, COW-write regular
 /// data, remount through the newly checksummed metadata/superblock, and verify
 /// the algorithm-width CSUM tree entries emitted for the new extent.

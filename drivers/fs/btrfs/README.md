@@ -91,6 +91,13 @@ real laptop's btrfs root looks like.
   level-0 qgroup. `max_rfer` / `max_excl` hard limits reject the transaction
   atomically with `QuotaExceeded` (`EDQUOT`). The quota tree is whole-repacked;
   correctness is preferred over Linux's delayed-ref performance model.
+- Full-qgroup administration through `BTRFS_IOC_QUOTA_CTL`,
+  `QGROUP_CREATE`/`QGROUP_ASSIGN`/`QGROUP_LIMIT`, and
+  `QUOTA_RESCAN`/`STATUS`/`WAIT`. Enabling quotas creates level-0 groups for
+  every existing subvolume and completes an exact synchronous rescan; disabling
+  removes and reclaims the complete quota tree. Higher-level group creation,
+  bidirectional assignment, limit replacement, unassignment and destruction
+  are atomic with their recount.
 - Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
@@ -124,10 +131,8 @@ than mis-read:
 - Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
   RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
-  child explicitly to write it). Quota enable/disable/rescan and standalone
-  `QGROUP_CREATE`/`QGROUP_ASSIGN`/`QGROUP_LIMIT` administration ioctls remain
-  Linux-side setup operations; NARF maintains and enforces an existing full
-  qgroup tree. Simple quotas are not supported.
+  child explicitly to write it). Simple quotas (`QUOTA_CTL_ENABLE_SIMPLE_QUOTA`)
+  are not supported; the full-qgroup interface is supported.
 - A symlink target larger than Linux's inline item bound (Btrfs has no regular-
   extent symlink representation); a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a non-empty-directory target.
@@ -292,6 +297,9 @@ cross-sector reads, partial COW writes, remount, and checksum verification.
 `fixture-quota.img.sparse` is a Linux-created full-qgroup image with level-0
 `0/5` assigned to `1/100`; tests cover recounting, V2 create/snapshot
 inheritance, hierarchy relations, hard-limit `EDQUOT`, and lifecycle cleanup.
+The ordinary no-quota fixture also exercises the complete quota administration
+lifecycle: enable/rescan, create/assign/limit, unassign/destroy, disable, and
+remount.
 `fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
 a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
 tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-
