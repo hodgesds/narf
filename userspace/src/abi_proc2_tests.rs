@@ -1386,3 +1386,54 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_ptrace_attach_resolves_in_caller_pid_ns
 );
+
+// process_vm_readv/writev interpret their target pid in the CALLER's pid
+// namespace (Linux find_get_task_by_vpid, mm/process_vm_access.c). The
+// handler used the raw pid, so a foreign inner pid resolved to whatever
+// root-namespace task owned the same number — a host address-space identity
+// oracle. The translation now runs BEFORE the address-space check, so an
+// inner pid not bound in the caller's namespace is ESRCH up front rather than
+// falling through to the AS resolution.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_process_vm_rejects_unmapped_inner_pid() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB400;
+        const MANAGER_PID: u64 = 0xB000;
+
+        crate::pid_ns::__test_reset();
+        crate::task::release_task(MANAGER_TASK);
+        let _ = crate::task::Task::new_registered(MANAGER_TASK, MANAGER_PID);
+        crate::handlers::register_task_to_pid(MANAGER_TASK, MANAGER_PID);
+        crate::handlers::register_pid_task_mapping(MANAGER_PID, MANAGER_TASK);
+        crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+        set_task(MANAGER_TASK);
+
+        // Inner pid 999 is not bound in the manager's namespace.
+        let r = call_raw(
+            Syscall::ProcessVmReadv.raw(),
+            SyscallArgs {
+                arg0: 999,
+                arg1: 0,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        crate::task::release_task(MANAGER_TASK);
+        match r.value as i64 {
+            -3 => Ok(()), // ESRCH — translation rejected the unmapped inner pid
+            -14 => Err(
+                "process_vm reached the address-space check for an unmapped inner pid — the pid was not translated",
+            ),
+            _ => Err("process_vm returned an unexpected status for an unmapped inner pid"),
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_process_vm_rejects_unmapped_inner_pid
+);

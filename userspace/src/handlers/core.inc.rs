@@ -3546,7 +3546,24 @@ fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>
 /// copies local→remote (writev). Both sides live in the same AS here.
 fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let a = *ctx.args();
-    let pid = a.arg0;
+    #[allow(unused_mut)]
+    let mut pid = a.arg0;
+    // The target pid is in the CALLER's pid namespace (Linux
+    // find_get_task_by_vpid, mm/process_vm_access.c). Translate inner ->
+    // outer before the self/AS checks below: untranslated, a containerized
+    // process probing its own inner pid took the cross-AS path and failed,
+    // and a foreign inner pid resolved to whatever host task owned the same
+    // number — a host address-space identity oracle. Unmapped inner -> ESRCH.
+    #[cfg(feature = "container")]
+    {
+        match accept_pid_from(current_task_id(), pid) {
+            Some(outer) => pid = outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    }
     let local_ptr = a.arg1;
     let liovcnt = a.arg2 as usize;
     let remote_ptr = a.arg3;
