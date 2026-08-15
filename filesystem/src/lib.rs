@@ -1225,6 +1225,34 @@ pub trait DirOps: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Asynchronous ioctl transport for an open directory descriptor. The
+    /// syscall layer derives `input` and `out_size` from Linux `_IOC`; directory
+    /// fd wrappers forward the request here exactly as ordinary files use
+    /// [`FileOps::ioctl_async`].
+    fn ioctl_async<'a>(
+        &'a self,
+        _cmd: u32,
+        _arg: u64,
+        _input: &'a [u8],
+        _out_size: usize,
+    ) -> FsFuture<'a, FsIoctlReply> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// Create a filesystem-native snapshot of `source` below this directory.
+    ///
+    /// The syscall layer resolves the source fd before calling this method, so
+    /// filesystem drivers receive a stable directory object rather than a raw
+    /// process-local descriptor. Drivers must reject cross-filesystem sources.
+    fn snapshot_async<'a>(
+        &'a self,
+        _source: Arc<dyn DirOps>,
+        _name: &'a str,
+        _readonly: bool,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
 
     /// Remove the file entry named `name` from this directory.

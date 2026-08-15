@@ -1,17 +1,16 @@
-//! Partial btrfs filesystem driver: read-only mount/ls/cat plus a
-//! narrowly-scoped basic copy-on-write write path.
+//! Partial btrfs filesystem driver with verified reads and copy-on-write
+//! mutations for a selected writable subvolume.
 //!
 //! The on-disk format is decoded per the authoritative kernel definitions in
 //! `/usr/src/linux/include/uapi/linux/btrfs_tree.h` and the read/COW call
 //! chains in `/usr/src/linux/fs/btrfs`. This is an independent Rust
 //! implementation; no C code is copied.
 //!
-//! Supported: single-device (SINGLE/DUP) volumes with CRC32C checksums,
-//! `nodesize`/`sectorsize` at their common defaults, the default `FS_TREE`
-//! subvolume, inline and uncompressed regular extents. Everything else — RAID
-//! profiles, compression, subvolumes/snapshots beyond the default, xattrs, and
-//! non-CRC32C checksums — is rejected with a precise `Unsupported`/`NotFound`
-//! rather than mis-read. See the crate `README` for the supported matrix.
+//! Supported: single-device (SINGLE/DUP) volumes, all four btrfs checksum
+//! algorithms, compressed and uncompressed file reads, nested subvolume mounts,
+//! and a selected-checksum COW write path. Unsupported on-disk shapes are
+//! rejected precisely rather than mis-read. See the crate `README` for the full
+//! matrix.
 
 #![no_std]
 
@@ -65,8 +64,8 @@ fn btrfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>, F
 }
 
 /// Parse the `mount -t btrfs` option string into an optional subvolume selector.
-/// Accepts read-only-compatible options plus `subvolid=N` / `subvol=NAME`
-/// (single-component name); anything else is `Unsupported`.
+/// Accepts read-only-compatible options plus `subvolid=N` / `subvol=PATH`;
+/// anything else is `Unsupported`.
 pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsError> {
     let mut selector = None;
     for option in options.split(',').filter(|s| !s.is_empty()) {
@@ -76,13 +75,17 @@ pub fn parse_mount_subvol(options: &str) -> Result<Option<volume::Subvol>, FsErr
             let id: u64 = v.parse().map_err(|_| FsError::InvalidData)?;
             selector = Some(volume::Subvol::Id(id));
         } else if let Some(v) = option.strip_prefix("subvol=") {
-            // Only a single-component name (optionally slash-wrapped) is
-            // supported; a multi-level subvolume path is not.
-            let name = v.trim_matches('/');
-            if name.is_empty() || name.contains('/') {
+            // Leading/trailing slashes are harmless, but empty, dot, and dotdot
+            // components make resolution ambiguous and are rejected.
+            let path = v.trim_matches('/');
+            if path.is_empty()
+                || path
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == "..")
+            {
                 return Err(FsError::Unsupported);
             }
-            selector = Some(volume::Subvol::Name(alloc::string::String::from(name)));
+            selector = Some(volume::Subvol::Name(alloc::string::String::from(path)));
         } else {
             return Err(FsError::Unsupported);
         }

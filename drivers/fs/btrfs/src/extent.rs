@@ -136,6 +136,16 @@ pub async fn read_file<B: BlockDevice + 'static>(
     }
     let want = dst.len().min((size - offset) as usize);
     let sectorsize = vol.sectorsize() as usize;
+    let csum_root = if vol.verify_checksums() {
+        let (root_tree, _) = vol.root_tree_root();
+        Some(
+            crate::roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
     let extents = btree::collect_for(vol, tree_root, ino, format::EXTENT_DATA_KEY).await?;
 
     // Zero the window first; extents overwrite what they cover, so any hole
@@ -185,7 +195,12 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 if compression == format::COMPRESS_NONE {
                     // Read only the bytes the window needs.
                     let logical = disk_bytenr + extent_offset + (ov_start - file_start);
-                    let data = vol.read_logical(logical, read_len).await?;
+                    let data = match csum_root {
+                        Some(root) => {
+                            crate::csum::read_checked(vol, root, logical, read_len).await?
+                        }
+                        None => vol.read_logical(logical, read_len).await?,
+                    };
                     dst[d0..d0 + read_len].copy_from_slice(&data);
                 } else {
                     // Compressed extents are decoded whole, then sliced. The
@@ -195,9 +210,21 @@ pub async fn read_file<B: BlockDevice + 'static>(
                     // `ram_bytes`), so any index past its end is implicit zero
                     // padding — dst is already zeroed.
                     let _ = ram_bytes;
-                    let raw = vol
-                        .read_logical(disk_bytenr, disk_num_bytes as usize)
-                        .await?;
+                    let raw = match csum_root {
+                        Some(root) => {
+                            crate::csum::read_checked(
+                                vol,
+                                root,
+                                disk_bytenr,
+                                disk_num_bytes as usize,
+                            )
+                            .await?
+                        }
+                        None => {
+                            vol.read_logical(disk_bytenr, disk_num_bytes as usize)
+                                .await?
+                        }
+                    };
                     let plain = decompress(compression, &raw, sectorsize)?;
                     for pos in ov_start..ov_end {
                         let src_idx = (extent_offset + (pos - file_start)) as usize;

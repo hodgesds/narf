@@ -43,9 +43,11 @@ pub const SYS_CHUNK_ARRAY_SIZE: usize = 2048;
 /// array stays at `0x32b`.
 pub const SYS_CHUNK_ARRAY_OFFSET: usize = 811;
 
-/// `csum_type` value for CRC32C (`BTRFS_CSUM_TYPE_CRC32`); the only algorithm
-/// this driver supports.
+/// `csum_type` values from `enum btrfs_csum_type`.
 pub const CSUM_TYPE_CRC32: u16 = 0;
+pub(crate) const CSUM_TYPE_XXHASH: u16 = 1;
+pub(crate) const CSUM_TYPE_SHA256: u16 = 2;
+pub(crate) const CSUM_TYPE_BLAKE2: u16 = 3;
 
 // ── Well-known object ids ──────────────────────────────────────────
 
@@ -53,10 +55,14 @@ pub const ROOT_TREE_OBJECTID: u64 = 1;
 pub const EXTENT_TREE_OBJECTID: u64 = 2;
 pub const CHUNK_TREE_OBJECTID: u64 = 3;
 pub const FS_TREE_OBJECTID: u64 = 5;
+/// `btrfs_root_item.flags`: the subvolume must not be mutated.
+pub const ROOT_SUBVOL_RDONLY: u64 = 1;
 /// Directory objectid inside the root tree that holds the "default" subvolume
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// UUID index tree (subvolume UUID → root objectid).
+pub const UUID_TREE_OBJECTID: u64 = 9;
 /// Device tree (holds `DEV_ITEM` + `DEV_EXTENT`).
 pub const DEV_TREE_OBJECTID: u64 = 4;
 /// Objectid every `DEV_ITEM`/`DEV_EXTENT` shares (`BTRFS_DEV_ITEMS_OBJECTID`).
@@ -81,11 +87,19 @@ pub const LAST_FREE_OBJECTID: u64 = (-256i64) as u64;
 pub const INODE_ITEM_KEY: u8 = 1;
 pub const INODE_REF_KEY: u8 = 12;
 pub const XATTR_ITEM_KEY: u8 = 24;
+/// Legacy directory-log range key (defined by the format, no longer emitted by
+/// current Linux kernels). Kept so replay never copies it into the FS tree.
+pub const DIR_LOG_ITEM_KEY: u8 = 60;
+/// Modern directory-log authoritative range. The key offset is the inclusive
+/// start and its `btrfs_dir_log_item.end` body is the inclusive end.
+pub const DIR_LOG_INDEX_KEY: u8 = 72;
 pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
 pub const EXTENT_CSUM_KEY: u8 = 128;
 pub const ROOT_ITEM_KEY: u8 = 132;
+pub const ROOT_BACKREF_KEY: u8 = 144;
+pub const ROOT_REF_KEY: u8 = 156;
 pub const EXTENT_ITEM_KEY: u8 = 168;
 /// Skinny-metadata tree-block extent record; length is `nodesize`.
 pub const METADATA_ITEM_KEY: u8 = 169;
@@ -96,6 +110,7 @@ pub const FREE_SPACE_INFO_KEY: u8 = 198;
 pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
 pub const CHUNK_ITEM_KEY: u8 = 228;
+pub const UUID_KEY_SUBVOL: u8 = 251;
 
 // ── File-extent item types (`btrfs_file_extent_item.type`) ─────────
 
@@ -212,15 +227,45 @@ const OFF_NUM_DEVICES: usize = 136;
 const OFF_SECTORSIZE: usize = 144;
 const OFF_NODESIZE: usize = 148;
 const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
+const OFF_COMPAT_RO_FLAGS: usize = 180;
 const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
 const OFF_ROOT_LEVEL: usize = 198;
 const OFF_CHUNK_ROOT_LEVEL: usize = 199;
 
+// Features whose on-disk shapes are understood by this driver. Read-only
+// compatibility bits are not safe to ignore here because this implementation
+// can mount writable and does not yet have a read-only fallback mount mode.
+pub const COMPAT_RO_FREE_SPACE_TREE: u64 = 1 << 0;
+pub const COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+pub const SUPPORTED_COMPAT_RO_FLAGS: u64 =
+    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID;
+
+pub const INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
+pub const INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
+pub const INCOMPAT_MIXED_GROUPS: u64 = 1 << 2;
+pub const INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
+pub const INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
+pub const INCOMPAT_BIG_METADATA: u64 = 1 << 5;
+pub const INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
+pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
+pub const INCOMPAT_NO_HOLES: u64 = 1 << 9;
+pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
+    | INCOMPAT_DEFAULT_SUBVOL
+    | INCOMPAT_MIXED_GROUPS
+    | INCOMPAT_COMPRESS_LZO
+    | INCOMPAT_COMPRESS_ZSTD
+    | INCOMPAT_BIG_METADATA
+    | INCOMPAT_EXTENDED_IREF
+    | INCOMPAT_SKINNY_METADATA
+    | INCOMPAT_NO_HOLES
+    | INCOMPAT_METADATA_UUID;
+
 /// Decoded btrfs superblock — only the fields the driver consumes.
 #[derive(Clone, Debug)]
 pub struct Superblock {
-    /// Stored block checksum (low 4 bytes are the CRC32C).
+    /// Stored block checksum (the algorithm determines how many bytes are used).
     pub csum: [u8; CSUM_SIZE],
     pub magic: u64,
     pub generation: u64,
@@ -236,6 +281,8 @@ pub struct Superblock {
     pub total_bytes: u64,
     pub bytes_used: u64,
     pub num_devices: u64,
+    pub compat_ro_flags: u64,
+    pub incompat_flags: u64,
     pub sectorsize: u32,
     pub nodesize: u32,
     pub csum_type: u16,
@@ -246,6 +293,12 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Read the checksum selector before decoding the rest of a raw superblock.
+    /// Mount needs this field in order to verify the block that contains it.
+    pub(crate) fn checksum_type(buf: &[u8]) -> Result<u16, FsError> {
+        le16(buf, OFF_CSUM_TYPE)
+    }
+
     /// Decode a superblock from a ≥4096-byte buffer read at
     /// [`SUPERBLOCK_OFFSET`]. Validates magic and the driver's hard limits.
     pub fn decode(buf: &[u8]) -> Result<Self, FsError> {
@@ -256,9 +309,8 @@ impl Superblock {
         if magic != BTRFS_MAGIC {
             return Err(FsError::InvalidData);
         }
-        let csum_type = le16(buf, OFF_CSUM_TYPE)?;
-        if csum_type != CSUM_TYPE_CRC32 {
-            // xxhash/sha256/blake2 volumes are not supported.
+        let csum_type = Self::checksum_type(buf)?;
+        if !crate::checksum::is_supported(csum_type) {
             return Err(FsError::Unsupported);
         }
         let num_devices = le64(buf, OFF_NUM_DEVICES)?;
@@ -284,10 +336,13 @@ impl Superblock {
         let mut csum = [0u8; CSUM_SIZE];
         csum.copy_from_slice(&buf[OFF_CSUM..OFF_CSUM + CSUM_SIZE]);
 
-        // incompat_flags is decoded for future gating; unknown bits are
-        // tolerated because the driver rejects the specific on-disk shapes it
-        // cannot handle (RAID chunks, compressed extents) at point of use.
-        let _incompat = le64(buf, OFF_INCOMPAT_FLAGS)?;
+        let compat_ro_flags = le64(buf, OFF_COMPAT_RO_FLAGS)?;
+        let incompat_flags = le64(buf, OFF_INCOMPAT_FLAGS)?;
+        if compat_ro_flags & !SUPPORTED_COMPAT_RO_FLAGS != 0
+            || incompat_flags & !SUPPORTED_INCOMPAT_FLAGS != 0
+        {
+            return Err(FsError::Unsupported);
+        }
 
         Ok(Superblock {
             csum,
@@ -300,6 +355,8 @@ impl Superblock {
             total_bytes: le64(buf, OFF_TOTAL_BYTES)?,
             bytes_used: le64(buf, OFF_BYTES_USED)?,
             num_devices,
+            compat_ro_flags,
+            incompat_flags,
             sectorsize,
             nodesize,
             csum_type,

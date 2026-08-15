@@ -35,7 +35,7 @@ use crate::inode::InodeItem;
 pub enum Subvol {
     /// `subvolid=N` — a subvolume root objectid.
     Id(u64),
-    /// `subvol=NAME` — a single-component name under the default subvolume root.
+    /// `subvol=PATH` — a path from the top-level FS tree to a subvolume root.
     Name(String),
 }
 
@@ -64,13 +64,21 @@ struct VolState {
     /// The live superblock. Its tree roots and `generation` advance on a COW
     /// write; the read path snapshots the roots it needs.
     superblock: Superblock,
+    /// Physical offset of the superblock copy selected at mount. Reads use this
+    /// until the next commit rewrites every mirror and heals the primary.
+    superblock_source: u64,
     /// Completed logical→physical chunk map.
     chunk_map: ChunkMap,
-    /// Default FS_TREE root node (logical address + level).
+    /// Selected FS-tree objectid and live root node (logical address + level).
+    fs_tree_id: u64,
     fs_tree_root: u64,
     fs_tree_level: u8,
+    /// On-disk `btrfs_root_item.flags` for the selected tree.
+    fs_tree_flags: u64,
     /// Cached root-directory inode (objectid 256), for the sync `root()` path.
     root_inode: Option<InodeItem>,
+    /// False when the selected root item carries `BTRFS_ROOT_SUBVOL_RDONLY`.
+    writable_fs_tree: bool,
     /// Highest logical address handed out by a write this session. Seeds the
     /// next write's allocator so successive writes don't collide before the
     /// extent tree records the allocations. Reset to 0 at mount.
@@ -88,7 +96,9 @@ pub struct BtrfsVolume<B: BlockDevice> {
     nodesize: u32,
     sectorsize: u32,
     total_bytes: u64,
-    /// Enforce per-node/superblock CRC32C verification.
+    /// On-disk metadata/data checksum algorithm selected by the superblock.
+    csum_type: u16,
+    /// Enforce per-node/superblock checksum verification.
     verify_checksums: bool,
     io: Mutex<VolumeIo>,
     device_capacity: u64,
@@ -118,6 +128,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.verify_checksums
     }
 
+    pub(crate) fn csum_type(&self) -> u16 {
+        self.csum_type
+    }
+
+    /// All checksum algorithms accepted at mount are emitted by the COW writer.
+    /// A subvolume marked read-only in its root item remains read-only.
+    pub(crate) fn supports_writes(&self) -> bool {
+        self.state.lock().writable_fs_tree
+    }
+
+    /// Objectid of the currently mounted fs tree (`5` for the top-level tree).
+    pub(crate) fn fs_tree_id(&self) -> u64 {
+        self.state.lock().fs_tree_id
+    }
+
+    /// On-disk `btrfs_root_item.flags` for the mounted subvolume.
+    pub(crate) fn fs_tree_flags(&self) -> u64 {
+        self.state.lock().fs_tree_flags
+    }
+
     // ── State snapshots (brief lock, no I/O) ───────────────────────
 
     /// Default FS_TREE root `(logical, level)`.
@@ -142,6 +172,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().chunk_map.map_logical(logical)
     }
 
+    /// Translate a logical address to its primary and optional single-device
+    /// DUP copy.
+    pub(crate) fn map_logical_copies(&self, logical: u64) -> Result<(u64, Option<u64>), FsError> {
+        self.state.lock().chunk_map.map_logical_copies(logical)
+    }
+
     /// Snapshot of the live superblock (for statfs / write bookkeeping).
     pub fn superblock(&self) -> Superblock {
         self.state.lock().superblock.clone()
@@ -157,28 +193,69 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Read `len` bytes at btrfs *logical* address `logical`. The range must lie
     /// within a single chunk (true for any node or single extent read).
     pub async fn read_logical(&self, logical: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        // Resolve the physical offset under the lock, then release it before I/O.
-        let physical = self.map_logical(logical)?;
+        // Resolve both physical copies under the lock, then release it before
+        // I/O. A plain logical read can retry transport failure; callers with a
+        // checksum (notably read_node and the data-csum path) retry corruption.
+        let (physical, mirror) = self.map_logical_copies(logical)?;
         let mut buf = vec![0u8; len];
-        self.read_physical(physical, &mut buf).await?;
+        if let Err(primary_error) = self.read_physical(physical, &mut buf).await {
+            let Some(mirror) = mirror else {
+                return Err(primary_error);
+            };
+            self.read_physical(mirror, &mut buf).await?;
+        }
         Ok(buf)
+    }
+
+    /// Read a logical range from the first physical copy whose bytes match the
+    /// supplied on-disk data checksum. Unlike [`Self::read_logical`], checksum
+    /// failure is part of copy selection, so a readable-but-corrupt primary DUP
+    /// stripe falls back to its mirror.
+    pub(crate) async fn read_logical_checked(
+        &self,
+        logical: u64,
+        len: usize,
+        stored: &[u8],
+    ) -> Result<Vec<u8>, FsError> {
+        let (primary, mirror) = self.map_logical_copies(logical)?;
+        let mut buf = vec![0u8; len];
+        for physical in [Some(primary), mirror].into_iter().flatten() {
+            if self.read_physical(physical, &mut buf).await.is_err() {
+                continue;
+            }
+            let digest = crate::checksum::digest(self.csum_type, &buf)?;
+            if digest.get(..stored.len()) == Some(stored) {
+                return Ok(buf);
+            }
+        }
+        Err(FsError::InvalidData)
     }
 
     /// Read one b-tree node (a `nodesize` block) at logical address `logical`,
     /// validating its self-recorded `bytenr` and, when
-    /// [`verify_checksums`](Self::verify_checksums) is set, its CRC32C.
+    /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
-        let buf = self.read_logical(logical, self.nodesize()).await?;
-        if format::le64(&buf, 48)? != logical {
-            return Err(FsError::InvalidData);
-        }
-        if self.verify_checksums {
-            let stored = format::le32(&buf, 0)?;
-            if crate::checksum::block_csum(&buf[format::CSUM_SIZE..]) != stored {
-                return Err(FsError::InvalidData);
+        let (primary, mirror) = self.map_logical_copies(logical)?;
+        let mut buf = vec![0u8; self.nodesize()];
+        for physical in [Some(primary), mirror].into_iter().flatten() {
+            if self.read_physical(physical, &mut buf).await.is_err() {
+                continue;
             }
+            if format::le64(&buf, 48)? != logical {
+                continue;
+            }
+            if self.verify_checksums
+                && !crate::checksum::verify(
+                    self.csum_type,
+                    &buf[format::CSUM_SIZE..],
+                    &buf[..format::CSUM_SIZE],
+                )?
+            {
+                continue;
+            }
+            return Ok(buf);
         }
-        Ok(buf)
+        Err(FsError::InvalidData)
     }
 
     // ── Mount ──────────────────────────────────────────────────────
@@ -208,40 +285,80 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// calls start there.
     pub async fn switch_to_subvol(&self, sel: &Subvol) -> Result<(), FsError> {
         let (root_tree, _) = self.root_tree_root();
-        let subvol_id = match sel {
-            Subvol::Id(n) => *n,
-            Subvol::Name(name) => {
-                // Resolve the name in the default FS_TREE root directory; its
-                // location must be a subvolume ROOT_ITEM.
-                let (fs_root, _) = self.fs_tree_root();
-                let key = BtrfsKey::new(
-                    format::FIRST_FREE_OBJECTID,
-                    format::DIR_ITEM_KEY,
-                    u64::from(crate::checksum::name_hash(name.as_bytes())),
-                );
-                let body = crate::btree::find_item(self, fs_root, &key)
-                    .await?
-                    .ok_or(FsError::NotFound)?;
-                let entry = crate::dir::decode_dir_items(&body)?
-                    .into_iter()
-                    .find(|e| &e.name == name)
-                    .ok_or(FsError::NotFound)?;
-                if entry.location.item_type != format::ROOT_ITEM_KEY {
-                    return Err(FsError::NotFound);
-                }
-                entry.location.objectid
+        let (subvol_id, subvol_root, subvol_level, subvol_flags) = match sel {
+            Subvol::Id(n) => {
+                let (bytenr, level, flags) =
+                    crate::roots::find_root_with_flags(self, root_tree, *n).await?;
+                (*n, bytenr, level, flags)
             }
+            Subvol::Name(path) => self.resolve_subvol_path(root_tree, path).await?,
         };
-        let (subvol_root, subvol_level) =
-            crate::roots::find_root(self, root_tree, subvol_id).await?;
         let root_inode = self
             .load_inode_in(subvol_root, format::FIRST_FREE_OBJECTID)
             .await?;
         let mut g = self.state.lock();
+        g.fs_tree_id = subvol_id;
         g.fs_tree_root = subvol_root;
         g.fs_tree_level = subvol_level;
+        g.fs_tree_flags = subvol_flags;
         g.root_inode = Some(root_inode);
+        g.writable_fs_tree = subvol_flags & format::ROOT_SUBVOL_RDONLY == 0;
         Ok(())
+    }
+
+    /// Resolve a `subvol=PATH` from the top-level FS_TREE. Ordinary directory
+    /// components stay in the current tree; a ROOT_ITEM component enters that
+    /// subvolume at inode 256. The final component itself must be a subvolume.
+    async fn resolve_subvol_path(
+        &self,
+        root_tree: u64,
+        path: &str,
+    ) -> Result<(u64, u64, u8, u64), FsError> {
+        let mut components = path.split('/').peekable();
+        let mut dir_ino = format::FIRST_FREE_OBJECTID;
+        let (mut tree_root, _) = crate::roots::find_fs_tree(self, root_tree).await?;
+
+        while let Some(name) = components.next() {
+            if name.is_empty() || name == "." || name == ".." {
+                return Err(FsError::Unsupported);
+            }
+            let key = BtrfsKey::new(
+                dir_ino,
+                format::DIR_ITEM_KEY,
+                u64::from(crate::checksum::name_hash(name.as_bytes())),
+            );
+            let body = crate::btree::find_item(self, tree_root, &key)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            let entry = crate::dir::decode_dir_items(&body)?
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .ok_or(FsError::NotFound)?;
+
+            match entry.location.item_type {
+                format::ROOT_ITEM_KEY => {
+                    let subvol_id = entry.location.objectid;
+                    let (bytenr, level, flags) =
+                        crate::roots::find_root_with_flags(self, root_tree, subvol_id).await?;
+                    if components.peek().is_none() {
+                        return Ok((subvol_id, bytenr, level, flags));
+                    }
+                    tree_root = bytenr;
+                    dir_ino = format::FIRST_FREE_OBJECTID;
+                }
+                format::INODE_ITEM_KEY if components.peek().is_some() => {
+                    let inode = self
+                        .load_inode_in(tree_root, entry.location.objectid)
+                        .await?;
+                    if !inode.is_dir() {
+                        return Err(FsError::NotFound);
+                    }
+                    dir_ino = entry.location.objectid;
+                }
+                _ => return Err(FsError::NotFound),
+            }
+        }
+        Err(FsError::NotFound)
     }
 
     /// Mount, optionally disabling checksum verification (test bring-up only).
@@ -268,20 +385,66 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             block_size: logical,
         });
 
-        // Read + decode the primary superblock at 64 KiB.
-        let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
-        read_exact_from(&*device, &io, capacity, format::SUPERBLOCK_OFFSET, &mut raw).await?;
-        // The superblock checksum covers everything after the 32-byte csum
-        // field, up to the 4096-byte block.
-        if verify_checksums {
-            let stored = format::le32(&raw, 0)?;
-            if crate::checksum::block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE])
-                != stored
+        // Validate every superblock copy that fits, then choose the newest
+        // generation. On a tie the earlier mirror wins, so a healthy primary
+        // remains preferred. Unsupported feature sets are reported distinctly
+        // when no usable copy remains.
+        let mut selected: Option<(u64, Vec<u8>, Superblock)> = None;
+        let mut saw_unsupported = false;
+        for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+            if offset + format::SUPERBLOCK_SIZE as u64 > capacity {
+                continue;
+            }
+            let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
+            if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
+                .await
+                .is_err()
             {
-                return Err(FsError::InvalidData);
+                continue;
+            }
+            if format::le64(&candidate, format::SUPERBLOCK_BYTENR_OFFSET) != Ok(offset) {
+                continue;
+            }
+            let candidate_csum = match Superblock::checksum_type(&candidate) {
+                Ok(kind) if crate::checksum::is_supported(kind) => kind,
+                Ok(_) => {
+                    saw_unsupported = true;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if verify_checksums {
+                match crate::checksum::verify(
+                    candidate_csum,
+                    &candidate[format::CSUM_SIZE..format::SUPERBLOCK_SIZE],
+                    &candidate[..format::CSUM_SIZE],
+                ) {
+                    Ok(true) => {}
+                    _ => continue,
+                }
+            }
+            let decoded = match Superblock::decode(&candidate) {
+                Ok(sb) if sb.total_bytes <= capacity => sb,
+                Ok(_) => continue,
+                Err(FsError::Unsupported) => {
+                    saw_unsupported = true;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let replace = selected
+                .as_ref()
+                .is_none_or(|(_, _, current)| decoded.generation > current.generation);
+            if replace {
+                selected = Some((offset, candidate, decoded));
             }
         }
-        let superblock = Superblock::decode(&raw)?;
+        let (superblock_source, _raw, superblock) = match selected {
+            Some(candidate) => candidate,
+            None if saw_unsupported => return Err(FsError::Unsupported),
+            None => return Err(FsError::InvalidData),
+        };
+        let csum_type = superblock.csum_type;
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
@@ -294,15 +457,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             nodesize: superblock.nodesize,
             sectorsize: superblock.sectorsize,
             total_bytes: superblock.total_bytes,
+            csum_type,
             verify_checksums,
             io,
             device_capacity: capacity,
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
+                superblock_source,
                 chunk_map: seed,
+                fs_tree_id: format::FS_TREE_OBJECTID,
                 fs_tree_root: 0,
                 fs_tree_level: 0,
+                fs_tree_flags: 0,
                 root_inode: None,
+                writable_fs_tree: true,
                 alloc_floor: 0,
             }),
         });
@@ -344,16 +512,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         // 2. Find the FS_TREE root item (5, ROOT_ITEM, *) in the root tree and
         //    extract its root node address + level.
-        let (fs_root, fs_level) = crate::roots::find_fs_tree(self, root_tree).await?;
+        let (fs_root, fs_level, fs_flags) =
+            crate::roots::find_root_with_flags(self, root_tree, format::FS_TREE_OBJECTID).await?;
         {
             let mut g = self.state.lock();
             g.fs_tree_root = fs_root;
             g.fs_tree_level = fs_level;
+            g.fs_tree_flags = fs_flags;
+            g.writable_fs_tree = fs_flags & format::ROOT_SUBVOL_RDONLY == 0;
         }
 
         // 2b. Replay a pending fsync tree-log (crash recovery) before anything
         //     reads the fs tree. The replay commits into the fs tree and publishes
         //     the recovered roots via `commit_roots`, so later steps see them.
+        if self.superblock().log_root != 0 && !self.supports_writes() {
+            // Replay mutates the fs tree and superblock, so it is permitted only
+            // when the selected tree is writable.
+            return Err(FsError::Unsupported);
+        }
         crate::write::replay_log(self).await?;
 
         // 3. Cache the root-directory inode so the synchronous `root()` path has
@@ -442,6 +618,25 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Write `src` at btrfs *logical* address `logical` (single-chunk range).
     pub async fn write_logical(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        self.write_logical_unchecked(logical, src).await
+    }
+
+    /// Root-tree transaction write used only to change the mounted subvolume's
+    /// own read-only flag. Clearing that flag must be able to commit while the
+    /// current live subvolume is still read-only; ordinary mutations continue
+    /// to go through [`Self::write_logical`] and its writeability check.
+    pub(crate) async fn write_logical_root_admin(
+        &self,
+        logical: u64,
+        src: &[u8],
+    ) -> Result<(), FsError> {
+        self.write_logical_unchecked(logical, src).await
+    }
+
+    async fn write_logical_unchecked(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
         let physical = self.map_logical(logical)?;
         // The whole range must stay inside one chunk: the last byte must map to
         // a physically-contiguous offset.
@@ -466,6 +661,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// mirrors are durable, so a torn write can never leave the newest primary
     /// pointing at trees an out-of-date mirror would supersede on recovery.
     pub async fn write_superblock(&self, raw: &[u8]) -> Result<(), FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        self.write_superblock_unchecked(raw).await
+    }
+
+    /// Superblock half of [`Self::write_logical_root_admin`].
+    pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
+        self.write_superblock_unchecked(raw).await
+    }
+
+    async fn write_superblock_unchecked(&self, raw: &[u8]) -> Result<(), FsError> {
         if raw.len() != format::SUPERBLOCK_SIZE {
             return Err(FsError::InvalidData);
         }
@@ -484,17 +691,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 copy = raw.to_vec();
                 let b = format::SUPERBLOCK_BYTENR_OFFSET;
                 copy[b..b + 8].copy_from_slice(&offset.to_le_bytes());
-                let csum =
-                    crate::checksum::block_csum(&copy[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
-                copy[0..4].copy_from_slice(&csum.to_le_bytes());
-                for byte in &mut copy[4..format::CSUM_SIZE] {
-                    *byte = 0;
-                }
+                crate::checksum::stamp_block(self.csum_type, &mut copy)?;
                 &copy
             };
             self.write_physical(offset, block).await?;
             self.device.flush().await; // each copy durable before the next
         }
+        self.state.lock().superblock_source = format::SUPERBLOCK_OFFSET;
         Ok(())
     }
 
@@ -503,11 +706,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.device.flush().await;
     }
 
-    /// Read the raw 4096-byte superblock block from disk.
+    /// Read the selected raw superblock and normalize it to primary-copy form.
+    /// Transaction code can therefore heal a damaged primary without knowing
+    /// which mirror supplied the mounted generation.
     pub async fn read_raw_superblock(&self) -> Result<Vec<u8>, FsError> {
+        let source = self.state.lock().superblock_source;
         let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
-        self.read_physical(format::SUPERBLOCK_OFFSET, &mut raw)
-            .await?;
+        self.read_physical(source, &mut raw).await?;
+        if source != format::SUPERBLOCK_OFFSET {
+            let at = format::SUPERBLOCK_BYTENR_OFFSET;
+            raw[at..at + 8].copy_from_slice(&format::SUPERBLOCK_OFFSET.to_le_bytes());
+            crate::checksum::stamp_block(self.csum_type, &mut raw)?;
+        }
         Ok(raw)
     }
 
@@ -521,11 +731,23 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// After a COW commit, publish the new roots into the live volume so
     /// subsequent reads through this handle observe the write.
-    pub fn commit_roots(&self, new_root_tree: u64, new_fs_root: u64, new_generation: u64) {
+    pub(crate) fn commit_roots(
+        &self,
+        new_root_tree: u64,
+        new_fs_root: u64,
+        new_fs_level: u8,
+        new_generation: u64,
+        new_fs_tree_flags: Option<u64>,
+    ) {
         let mut g = self.state.lock();
         g.superblock.root = new_root_tree;
         g.superblock.generation = new_generation;
         g.fs_tree_root = new_fs_root;
+        g.fs_tree_level = new_fs_level;
+        if let Some(flags) = new_fs_tree_flags {
+            g.fs_tree_flags = flags;
+            g.writable_fs_tree = flags & format::ROOT_SUBVOL_RDONLY == 0;
+        }
     }
 
     /// Register a freshly-allocated chunk's `logical→physical` mapping so writes

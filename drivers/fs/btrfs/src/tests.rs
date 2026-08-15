@@ -34,6 +34,15 @@ const FIXTURE_ZSTD_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zstd.img.
 /// Same tree written with `--compress lzo`.
 const FIXTURE_LZO_SPARSE: &[u8] = include_bytes!("../testdata/fixture-lzo.img.sparse");
 
+/// Same tree written with each non-default btrfs checksum algorithm.
+const FIXTURE_XXHASH_SPARSE: &[u8] = include_bytes!("../testdata/fixture-xxhash.img.sparse");
+const FIXTURE_SHA256_SPARSE: &[u8] = include_bytes!("../testdata/fixture-sha256.img.sparse");
+const FIXTURE_BLAKE2_SPARSE: &[u8] = include_bytes!("../testdata/fixture-blake2.img.sparse");
+
+/// A normal directory containing a subvolume which itself contains a subvolume.
+const FIXTURE_NESTEDSUBVOL_SPARSE: &[u8] =
+    include_bytes!("../testdata/fixture-nestedsubvol.img.sparse");
+
 /// 400 small files, forcing the FS b-tree to more than one level.
 const FIXTURE_MANYFILES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-manyfiles.img.sparse");
 
@@ -318,6 +327,52 @@ fn smoke_btrfs_crc32c_known_vector() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_crc32c_known_vector);
 
+/// Known vectors for the three alternate algorithms, including xxhash64's
+/// little-endian on-disk encoding and BLAKE2b's 32-byte output parameter.
+fn smoke_btrfs_alternate_checksum_known_vectors() -> TestResult {
+    let xxhash = match checksum::digest(format::CSUM_TYPE_XXHASH, b"") {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("xxhash64 digest failed"),
+    };
+    if xxhash[..8] != [0x99, 0xe9, 0xd8, 0x51, 0x37, 0xdb, 0x46, 0xef] {
+        return TestResult::Fail("xxhash64 known vector mismatch");
+    }
+
+    let sha256 = match checksum::digest(format::CSUM_TYPE_SHA256, b"abc") {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("sha256 digest failed"),
+    };
+    if sha256
+        != [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ]
+    {
+        return TestResult::Fail("sha256 known vector mismatch");
+    }
+
+    let blake2 = match checksum::digest(format::CSUM_TYPE_BLAKE2, b"abc") {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("blake2b-256 digest failed"),
+    };
+    if blake2
+        != [
+            0xbd, 0xdd, 0x81, 0x3c, 0x63, 0x42, 0x39, 0x72, 0x31, 0x71, 0xef, 0x3f, 0xee, 0x98,
+            0x57, 0x9b, 0x94, 0x96, 0x4e, 0x3b, 0xb1, 0xcb, 0x3e, 0x42, 0x72, 0x62, 0xc8, 0xc0,
+            0x68, 0xd5, 0x23, 0x19,
+        ]
+    {
+        return TestResult::Fail("blake2b-256 known vector mismatch");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_alternate_checksum_known_vectors
+);
+
 // ── Phase 0: superblock decode ─────────────────────────────────────
 
 /// Assemble a minimal but structurally valid 4096-byte superblock image.
@@ -365,13 +420,20 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
         return TestResult::Fail("bad magic must be rejected");
     }
 
-    // xxhash csum type → Unsupported.
-    let xxhash = build_superblock(format::BTRFS_MAGIC, 1, 1);
-    if !matches!(
-        Superblock::decode(&xxhash),
-        Err(narf_filesystem::FsError::Unsupported)
-    ) {
-        return TestResult::Fail("non-crc32c csum_type must be Unsupported");
+    // Every kernel-defined checksum type is accepted; unknown values are not.
+    for csum_type in [
+        format::CSUM_TYPE_XXHASH,
+        format::CSUM_TYPE_SHA256,
+        format::CSUM_TYPE_BLAKE2,
+    ] {
+        let alternate = build_superblock(format::BTRFS_MAGIC, csum_type, 1);
+        if Superblock::decode(&alternate).is_err() {
+            return TestResult::Fail("supported alternate csum_type was rejected");
+        }
+    }
+    let unknown = build_superblock(format::BTRFS_MAGIC, 4, 1);
+    if !matches!(Superblock::decode(&unknown), Err(FsError::Unsupported)) {
+        return TestResult::Fail("unknown csum_type must be Unsupported");
     }
 
     // Multi-device → Unsupported.
@@ -381,6 +443,34 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
         Err(narf_filesystem::FsError::Unsupported)
     ) {
         return TestResult::Fail("num_devices != 1 must be Unsupported");
+    }
+
+    // Features that change tree or allocation semantics must be rejected at
+    // mount/decode, rather than failing later after metadata has been touched.
+    let mut raid56 = good.clone();
+    raid56[188..196].copy_from_slice(&(1u64 << 7).to_le_bytes());
+    if !matches!(Superblock::decode(&raid56), Err(FsError::Unsupported)) {
+        return TestResult::Fail("RAID56 incompat feature must be Unsupported");
+    }
+    let mut unknown_incompat = good.clone();
+    unknown_incompat[188..196].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    if !matches!(
+        Superblock::decode(&unknown_incompat),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("unknown incompat feature must be Unsupported");
+    }
+    let mut verity = good.clone();
+    verity[180..188].copy_from_slice(&(1u64 << 2).to_le_bytes());
+    if !matches!(Superblock::decode(&verity), Err(FsError::Unsupported)) {
+        return TestResult::Fail("unsupported compat-ro feature must be Unsupported");
+    }
+
+    let mut supported = good;
+    supported[180..188].copy_from_slice(&format::SUPPORTED_COMPAT_RO_FLAGS.to_le_bytes());
+    supported[188..196].copy_from_slice(&format::SUPPORTED_INCOMPAT_FLAGS.to_le_bytes());
+    if Superblock::decode(&supported).is_err() {
+        return TestResult::Fail("supported feature masks were rejected");
     }
 
     TestResult::Pass
@@ -449,10 +539,23 @@ fn smoke_btrfs_sys_chunk_array_parse() -> TestResult {
         return TestResult::Fail("out-of-range logical must be NotFound");
     }
 
-    // DUP (2 stripes, same device) is accepted; stripe 0 is authoritative.
+    // DUP (2 stripes, same device) preserves both physical copies.
     let dup = build_sys_chunk(0, 0x10_0000, 0x80_0000, format::BLOCK_GROUP_DUP, 2);
-    if ChunkMap::seed_from_sys_array(&dup).and_then(|m| m.map_logical(0)) != Ok(0x80_0000) {
-        return TestResult::Fail("DUP chunk should map to stripe 0");
+    let dup_map = match ChunkMap::seed_from_sys_array(&dup) {
+        Ok(map) => map,
+        Err(_) => return TestResult::Fail("DUP chunk failed to parse"),
+    };
+    if dup_map.map_logical_copies(0x1000) != Ok((0x80_1000, Some(0x90_1000))) {
+        return TestResult::Fail("DUP chunk did not preserve both stripes");
+    }
+
+    // Profile/stripe-count mismatches are corrupt, not silently truncated.
+    let bad_single = build_sys_chunk(0, 0x10_0000, 0x80_0000, 0, 2);
+    if !matches!(
+        ChunkMap::seed_from_sys_array(&bad_single),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("two-stripe SINGLE chunk must be InvalidData");
     }
 
     // A RAID1 profile is rejected.
@@ -755,6 +858,108 @@ fn smoke_btrfs_cat_inline_and_regular() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_cat_inline_and_regular);
 
+/// Mount genuine mkfs images using every alternate checksum, COW-write regular
+/// data, remount through the newly checksummed metadata/superblock, and verify
+/// the algorithm-width CSUM tree entries emitted for the new extent.
+fn smoke_btrfs_alternate_checksum_mounts() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    for (sparse, csum_type) in [
+        (FIXTURE_XXHASH_SPARSE, format::CSUM_TYPE_XXHASH),
+        (FIXTURE_SHA256_SPARSE, format::CSUM_TYPE_SHA256),
+        (FIXTURE_BLAKE2_SPARSE, format::CSUM_TYPE_BLAKE2),
+    ] {
+        let vol = match mount_sparse(sparse) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("alternate-checksum fixture failed to mount"),
+        };
+        if vol.csum_type() != csum_type || !vol.supports_writes() {
+            return TestResult::Fail("alternate-checksum volume mode is wrong");
+        }
+        let device: Arc<RamBlockDevice> = vol.device.clone();
+        let root = vol.root();
+        let hello = match poll_once(root.lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("alternate-checksum lookup failed"),
+        };
+        if read_all(&hello, 64).as_deref() != Some(b"narf\n") {
+            return TestResult::Fail("alternate-checksum inline read failed");
+        }
+        let big = match poll_once(root.lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("alternate-checksum regular lookup failed"),
+        };
+        if read_all(&big, 12_016) != Some(expected_big()) {
+            return TestResult::Fail("alternate-checksum regular read failed");
+        }
+        let payload = replacement_big();
+        match poll_once(big.write(0, &payload)) {
+            Some(Ok(n)) if n == payload.len() => {}
+            _ => return TestResult::Fail("alternate-checksum COW write failed"),
+        }
+
+        let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("alternate-checksum remount failed"),
+        };
+        if vol2.csum_type() != csum_type || !vol2.supports_writes() {
+            return TestResult::Fail("alternate-checksum remount mode is wrong");
+        }
+        let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("alternate-checksum remount lookup failed"),
+        };
+        if read_all(&big2, payload.len() + 16) != Some(payload) {
+            return TestResult::Fail("alternate-checksum written data mismatch");
+        }
+        let (fs_root, _) = vol2.fs_tree_root();
+        let csum_root = match csum_root_of(&vol2) {
+            Some(root) => root,
+            None => return TestResult::Fail("alternate-checksum csum root missing"),
+        };
+        match poll_once(crate::csum::verify_file_data_csums(
+            &vol2,
+            fs_root,
+            csum_root,
+            big2.ino(),
+        )) {
+            Some(Ok(true)) => {}
+            _ => return TestResult::Fail("alternate-checksum written csums are invalid"),
+        }
+
+        // Exercise the separate log-tree stamping path and mount-time replay.
+        let key = BtrfsKey::new(big2.ino(), format::INODE_ITEM_KEY, 0);
+        let mut inode = match poll_once(btree::find_item(&vol2, fs_root, &key)) {
+            Some(Ok(Some(body))) => body,
+            _ => return TestResult::Fail("alternate-checksum inode item missing"),
+        };
+        const LOG_MARK: u64 = 0x0000_2233_4455_6677;
+        inode[136..144].copy_from_slice(&LOG_MARK.to_le_bytes());
+        if !matches!(
+            poll_once(crate::write::write_log(&vol2, &[(key, inode)])),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("alternate-checksum write_log failed");
+        }
+        let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("alternate-checksum log replay failed"),
+        };
+        let big3 = match poll_once(vol3.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("alternate-checksum post-replay lookup failed"),
+        };
+        match poll_once(big3.statx_async(0, 0x7ff)) {
+            Some(Ok(sx)) if sx.mtime.seconds == LOG_MARK as i64 => {}
+            _ => return TestResult::Fail("alternate-checksum log record not replayed"),
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_alternate_checksum_mounts);
+
 // ── Phase 6: registration ──────────────────────────────────────────
 
 fn smoke_btrfs_registration() -> TestResult {
@@ -785,6 +990,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_registration);
 
 fn smoke_btrfs_checksum_enforced() -> TestResult {
     use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
     let sb_off = format::SUPERBLOCK_OFFSET as usize;
 
     // Corrupt a checksum-covered (but non-magic) superblock byte.
@@ -828,6 +1034,43 @@ fn smoke_btrfs_checksum_enforced() -> TestResult {
         .unwrap_or(false)
     {
         return TestResult::Fail("corrupt node csum should fail with verify on");
+    }
+
+    // Data checksums are enforced by ordinary FileOps reads too (not only the
+    // explicit verifier used by checksum tests).
+    let clean = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("clean fixture remount failed"),
+    };
+    let big = match poll_once(clean.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat for corruption test failed"),
+    };
+    let (data_logical, _) = match file_data_extent(&clean, big.ino()) {
+        Some(extent) => extent,
+        None => return TestResult::Fail("big.dat data extent missing"),
+    };
+    let data_physical = match clean.map_logical(data_logical) {
+        Ok(physical) => physical as usize,
+        Err(_) => return TestResult::Fail("big.dat data extent not mappable"),
+    };
+    let mut img3 = decode_sparse(FIXTURE_SPARSE);
+    img3[data_physical + 100] ^= 0x40;
+    let dev = RamBlockDevice::from_image(512, img3);
+    let corrupt = match poll_once(BtrfsVolume::mount(dev, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("data corruption should not prevent metadata mount"),
+    };
+    let big = match poll_once(corrupt.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("corrupt-data lookup failed"),
+    };
+    let mut buf = [0u8; 512];
+    if !matches!(
+        poll_once(big.read(0, &mut buf)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("ordinary file read accepted bad data checksum");
     }
     TestResult::Pass
 }
@@ -917,23 +1160,6 @@ fn smoke_btrfs_write_rejections() -> TestResult {
         Err(_) => return TestResult::Fail("fixture failed to mount"),
     };
     let root = vol.root();
-
-    // Overwriting a **compressed** extent is unsupported (freeing/rewriting it
-    // wholesale is out of scope) — the zstd fixture's big.dat is compressed.
-    let zvol = match mount_sparse(FIXTURE_ZSTD_SPARSE) {
-        Ok(v) => v,
-        Err(_) => return TestResult::Fail("zstd fixture failed to mount"),
-    };
-    let zbig = match poll_once(zvol.root().lookup_async("big.dat")) {
-        Some(Ok(f)) => f,
-        _ => return TestResult::Fail("lookup zstd big.dat failed"),
-    };
-    if !matches!(
-        poll_once(zbig.write(0, b"clobber")),
-        Some(Err(FsError::Unsupported))
-    ) {
-        return TestResult::Fail("compressed overwrite should be Unsupported");
-    }
 
     // A write into a nested subvolume is ReadOnly (only the default subvol is
     // writable).
@@ -1025,7 +1251,7 @@ fn csum_root_of(vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>) -> Option<u6
 
 /// Prove our CRC32C data-checksum computation matches what mkfs.btrfs wrote:
 /// every on-disk sector of big.dat must match its stored csum in the CSUM tree.
-/// If this passes, the write path (which uses the same `block_csum`) emits
+/// If this passes, the write path's selected-checksum dispatcher emits
 /// checksums a real Linux kernel will accept.
 fn smoke_btrfs_data_csum_matches_mkfs() -> TestResult {
     use narf_filesystem::FsInstance;
@@ -1054,7 +1280,14 @@ fn smoke_btrfs_data_csum_matches_mkfs() -> TestResult {
     }
     // Sanity: a wrong sector must NOT match (guards against a stub that always
     // returns true).
-    let bad = crate::csum::compute_csums(b"not-the-real-sector-bytes", 4096);
+    let bad = match crate::csum::compute_csums(
+        format::CSUM_TYPE_CRC32,
+        b"not-the-real-sector-bytes",
+        4096,
+    ) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("compute_csums errored"),
+    };
     if bad.len() != 4 {
         return TestResult::Fail("compute_csums produced wrong length");
     }
@@ -1116,8 +1349,8 @@ fn smoke_btrfs_write_emits_csums() -> TestResult {
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_emits_csums);
 
 /// The data extent an inode's single EXTENT_DATA points at: `(disk_bytenr, len)`.
-fn file_data_extent(
-    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+fn file_data_extent<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
     ino: u64,
 ) -> Option<(u64, u64)> {
     let (fs_root, _) = vol.fs_tree_root();
@@ -1133,8 +1366,8 @@ fn file_data_extent(
 }
 
 /// Whether the extent tree has an `EXTENT_ITEM` for `(logical, length)`.
-fn extent_item_present(
-    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+fn extent_item_present<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
     logical: u64,
     length: u64,
 ) -> bool {
@@ -1230,6 +1463,13 @@ fn smoke_btrfs_tree_log_replay() -> TestResult {
         _ => return TestResult::Fail("create failed"),
     };
     let ino = f.ino();
+    const COLLIDE_A: &str = "n5wrWL7foZTV";
+    const COLLIDE_B: &str = "Vf5Y4fyl9fqh";
+    if !matches!(poll_once(vol.root().create(COLLIDE_A)), Some(Ok(_)))
+        || !matches!(poll_once(vol.root().create(COLLIDE_B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("logged collision setup failed");
+    }
 
     // Read the committed INODE_ITEM and log a copy with a distinctive mtime,
     // WITHOUT touching the fs tree — as a crashed fsync would leave it.
@@ -1241,8 +1481,25 @@ fn smoke_btrfs_tree_log_replay() -> TestResult {
     };
     const MARK: u64 = 0x0011_2233_4455;
     body[136..144].copy_from_slice(&MARK.to_le_bytes()); // mtime seconds
+    let collision_index = match poll_once(btree::collect_for(
+        &vol,
+        fs_root,
+        vol.root().ino(),
+        format::DIR_INDEX_KEY,
+    )) {
+        Some(Ok(items)) => items
+            .into_iter()
+            .find(|(_, item_body)| crate::dir::find_dir_item(item_body, COLLIDE_A).is_ok()),
+        _ => None,
+    };
+    let Some(collision_index) = collision_index else {
+        return TestResult::Fail("logged collision index missing");
+    };
     if !matches!(
-        poll_once(crate::write::write_log(&vol, &[(key, body)])),
+        poll_once(crate::write::write_log(
+            &vol,
+            &[(key, body), collision_index]
+        )),
         Some(Ok(()))
     ) {
         return TestResult::Fail("write_log failed");
@@ -1275,6 +1532,11 @@ fn smoke_btrfs_tree_log_replay() -> TestResult {
         Some(Ok(sx)) if sx.mtime.seconds == MARK as i64 => {}
         _ => return TestResult::Fail("logged mtime not applied by replay"),
     }
+    if !matches!(poll_once(vol2.root().lookup_async(COLLIDE_A)), Some(Ok(_)))
+        || !matches!(poll_once(vol2.root().lookup_async(COLLIDE_B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("tree-log replay damaged collision bucket");
+    }
     // A subsequent remount finds no log (idempotent) and the state persists.
     let vol3 = match mount_writable(device) {
         Ok(v) => v,
@@ -1287,6 +1549,240 @@ fn smoke_btrfs_tree_log_replay() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_log_replay);
+
+/// Tree-log mappings are keyed by subvolume id, not hard-coded to FS_TREE. A
+/// pending log emitted while a child is mounted must be replayed during the
+/// next ordinary top-level mount, before mount-option selection.
+fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let top = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("subvolume-log fixture failed to mount"),
+    };
+    let mut args = alloc::vec![0u8; 4096];
+    args[56..64].copy_from_slice(b"logchild");
+    if !matches!(
+        poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &args, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("log child creation failed");
+    }
+    let child = match poll_once(BtrfsVolume::mount_subvol(
+        narf_block::SyncBlock::new(device.clone() as Arc<dyn narf_block::BlockDeviceSync>),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("logchild".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("log child mount failed"),
+    };
+    let file = match poll_once(child.root().create("pending")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("log child file creation failed"),
+    };
+    let key = BtrfsKey::new(file.ino(), format::INODE_ITEM_KEY, 0);
+    let mut inode = match poll_once(btree::find_item(&*child, child.fs_tree_root().0, &key)) {
+        Some(Ok(Some(body))) => body,
+        _ => return TestResult::Fail("log child inode missing"),
+    };
+    const MARK: u64 = 0x0055_6677_8899;
+    inode[136..144].copy_from_slice(&MARK.to_le_bytes());
+    if !matches!(
+        poll_once(crate::write::write_log(&child, &[(key, inode)])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("nested-subvolume write_log failed");
+    }
+
+    let replayed_top = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("top-level mount did not replay child log"),
+    };
+    if replayed_top.superblock().log_root != 0 {
+        return TestResult::Fail("child log pointer survived replay");
+    }
+    let replayed_child = match poll_once(BtrfsVolume::mount_subvol(
+        narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("logchild".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("replayed child did not remount"),
+    };
+    let file = match poll_once(replayed_child.root().lookup_async("pending")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("replayed child file missing"),
+    };
+    match poll_once(file.statx_async(0, 0x7ff)) {
+        Some(Ok(stat)) if stat.mtime.seconds == MARK as i64 => TestResult::Pass,
+        _ => TestResult::Fail("nested-subvolume log item was not replayed"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_tree_log_replay);
+
+/// A modern `DIR_LOG_INDEX` range makes the log authoritative for a span of
+/// directory indexes. Entries absent from the log are deletions: replay must
+/// unlink a data-bearing file and rmdir an empty directory, preserve an entry
+/// present in the log, free the removed file's extent, and never copy the
+/// log-only range marker into the FS tree.
+fn smoke_btrfs_tree_log_deletion_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    let parent = root.ino();
+    let doomed = match poll_once(root.create("log-gone.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("doomed file create failed"),
+    };
+    if !matches!(
+        poll_once(doomed.write(0, b"tree-log deletion payload\n")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("doomed file write failed");
+    }
+    let old_extent = match file_data_extent(&vol, doomed.ino()) {
+        Some(extent) => extent,
+        None => return TestResult::Fail("doomed file extent missing"),
+    };
+    let keep = match poll_once(root.create("log-keep.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("kept file create failed"),
+    };
+    if !matches!(poll_once(keep.write(0, b"keep\n")), Some(Ok(_))) {
+        return TestResult::Fail("kept file write failed");
+    }
+    if !matches!(poll_once(root.mkdir("log-gone-dir")), Some(Ok(_))) {
+        return TestResult::Fail("doomed directory create failed");
+    }
+
+    // The three freshly-created entries have consecutive high directory indexes.
+    // Log the middle entry and an authoritative range spanning all three: the two
+    // absent names must be removed on replay.
+    let (fs_root, _) = vol.fs_tree_root();
+    let indices = match poll_once(btree::collect_for(
+        &vol,
+        fs_root,
+        parent,
+        format::DIR_INDEX_KEY,
+    )) {
+        Some(Ok(items)) => items,
+        _ => return TestResult::Fail("directory indexes unavailable"),
+    };
+    let mut gone_index = None;
+    let mut keep_item = None;
+    let mut gone_dir_index = None;
+    for (key, body) in indices {
+        let entries = match crate::dir::decode_dir_items(&body) {
+            Ok(entries) => entries,
+            Err(_) => return TestResult::Fail("directory index malformed"),
+        };
+        if entries.len() != 1 {
+            return TestResult::Fail("directory index contains multiple names");
+        }
+        match entries[0].name.as_str() {
+            "log-gone.txt" => gone_index = Some(key.offset),
+            "log-keep.txt" => keep_item = Some((key, body)),
+            "log-gone-dir" => gone_dir_index = Some(key.offset),
+            _ => {}
+        }
+    }
+    let (gone_index, (keep_key, keep_body), gone_dir_index) =
+        match (gone_index, keep_item, gone_dir_index) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return TestResult::Fail("new directory indexes not found"),
+        };
+    let range_start = gone_index.min(keep_key.offset).min(gone_dir_index);
+    let range_end = gone_index.max(keep_key.offset).max(gone_dir_index);
+    if range_end - range_start != 2 {
+        return TestResult::Fail("new directory indexes are not consecutive");
+    }
+    let range_key = BtrfsKey::new(parent, format::DIR_LOG_INDEX_KEY, range_start);
+    let log_items = [
+        (range_key, range_end.to_le_bytes().to_vec()),
+        (keep_key, keep_body),
+    ];
+    if !matches!(
+        poll_once(crate::write::write_log(&vol, &log_items)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("deletion-range write_log failed");
+    }
+    // A log is only an overlay: committed names remain visible before replay.
+    if poll_once(root.lookup_async("log-gone.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+        || poll_once(root.lookup_dir_async("log-gone-dir"))
+            .and_then(|r| r.ok())
+            .is_none()
+    {
+        return TestResult::Fail("deletion became visible before replay");
+    }
+
+    let vol2 = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("deletion replay mount failed"),
+    };
+    let root2 = vol2.root();
+    if !matches!(
+        poll_once(root2.lookup_async("log-gone.txt")),
+        Some(Err(FsError::NotFound))
+    ) || !matches!(
+        poll_once(root2.lookup_dir_async("log-gone-dir")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("log-recorded deletions were not replayed");
+    }
+    let keep2 = match poll_once(root2.lookup_async("log-keep.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("logged survivor was removed"),
+    };
+    if read_all(&keep2, 16).as_deref() != Some(b"keep\n") {
+        return TestResult::Fail("logged survivor content changed");
+    }
+    if extent_item_present(&vol2, old_extent.0, old_extent.1) {
+        return TestResult::Fail("deleted file extent was not freed");
+    }
+    let (fs_root2, _) = vol2.fs_tree_root();
+    if !matches!(
+        poll_once(btree::find_item(&vol2, fs_root2, &range_key)),
+        Some(Ok(None))
+    ) {
+        return TestResult::Fail("DIR_LOG_INDEX leaked into the fs tree");
+    }
+    if format::le64(&read_super_at(&device, format::SUPERBLOCK_OFFSET), 96).unwrap_or(1) != 0 {
+        return TestResult::Fail("log root not cleared after deletion replay");
+    }
+
+    // A second mount has no log to replay and preserves both absence/presence.
+    let vol3 = match mount_writable(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("post-deletion second mount failed"),
+    };
+    if !matches!(
+        poll_once(vol3.root().lookup_async("log-gone.txt")),
+        Some(Err(FsError::NotFound))
+    ) || poll_once(vol3.root().lookup_async("log-keep.txt"))
+        .and_then(|r| r.ok())
+        .is_none()
+    {
+        return TestResult::Fail("deletion replay was not idempotent");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_log_deletion_replay);
 
 /// Every block (root + internals + leaves) the fs tree currently occupies.
 fn fs_tree_blocks<B: narf_block::BlockDevice + 'static>(
@@ -1801,6 +2297,47 @@ fn smoke_btrfs_mkdir_and_rmdir() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mkdir_and_rmdir);
 
+/// Xattrs do not make an otherwise-empty directory non-empty. `rmdir` removes
+/// every XATTR_ITEM with the inode in the same COW transaction.
+fn smoke_btrfs_rmdir_xattr_directory() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    if !matches!(poll_once(root.mkdir("xdir")), Some(Ok(_))) {
+        return TestResult::Fail("mkdir for xattr rmdir failed");
+    }
+    let xdir = match poll_once(root.lookup_async("xdir")) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("xattr directory lookup failed"),
+    };
+    if !matches!(
+        poll_once(xdir.set_xattr("user.narf", b"directory", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("directory setxattr failed");
+    }
+    if !matches!(poll_once(root.rmdir("xdir")), Some(Ok(()))) {
+        return TestResult::Fail("rmdir rejected an xattr-only directory");
+    }
+
+    let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after xattr rmdir failed"),
+    };
+    if poll_once(remount.root().lookup_dir_async("xdir")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("xattr directory survived rmdir");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rmdir_xattr_directory);
+
 /// `rmdir` of a non-empty directory is refused (`Busy`), and a file created
 /// inside a `mkdir`'d directory is navigable after a remount (nested write).
 fn smoke_btrfs_rmdir_nonempty_rejected() -> TestResult {
@@ -1986,6 +2523,271 @@ fn smoke_btrfs_rename_overwrite_file() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_overwrite_file);
 
+/// Rename-overwrite edits hardlink refs record-by-record: hardlinked source and
+/// target peers survive with correct link counts/data/xattrs, while a last-link
+/// target (and an ordinary last-link unlink) reclaims its xattr items.
+fn smoke_btrfs_rename_hardlink_xattr_overwrite() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+
+    // Both source and destination have a peer in the same packed INODE_REF.
+    let source = match poll_once(root.create("rename-source")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir source creation failed"),
+    };
+    let source_ino = source.ino();
+    let source_data = b"same-dir source\n";
+    if !matches!(poll_once(source.write(0, source_data)), Some(Ok(_)))
+        || !matches!(
+            poll_once(source.set_xattr("user.source", b"kept", 0)),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.link("rename-source", "rename-source-peer")),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("same-dir source setup failed");
+    }
+    let victim = match poll_once(root.create("rename-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir target creation failed"),
+    };
+    let victim_ino = victim.ino();
+    let victim_data = b"same-dir victim\n";
+    if !matches!(poll_once(victim.write(0, victim_data)), Some(Ok(_)))
+        || !matches!(
+            poll_once(victim.set_xattr("user.victim", b"survives", 0)),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.link("rename-target", "rename-target-peer")),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.rename("rename-source", "rename-target")),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("same-dir hardlink overwrite failed");
+    }
+
+    // A last-link xattr-bearing destination is reclaimed completely.
+    let doomed = match poll_once(root.create("rename-doomed")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link target creation failed"),
+    };
+    let doomed_ino = doomed.ino();
+    if !matches!(
+        poll_once(doomed.set_xattr("user.doomed", b"remove", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("last-link target xattr setup failed");
+    }
+    let replacement = match poll_once(root.create("rename-replacement")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link replacement creation failed"),
+    };
+    let replacement_data = b"replacement\n";
+    if !matches!(
+        poll_once(replacement.write(0, replacement_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(root.rename("rename-replacement", "rename-doomed")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("xattr-bearing last-link overwrite failed");
+    }
+
+    // Last-link unlink follows the same inode teardown rule.
+    let unlinked = match poll_once(root.create("unlink-xattr")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("xattr unlink target creation failed"),
+    };
+    let unlinked_ino = unlinked.ino();
+    if !matches!(
+        poll_once(unlinked.set_xattr("user.unlink", b"remove", 0)),
+        Some(Ok(()))
+    ) || !matches!(poll_once(root.unlink("unlink-xattr")), Some(Ok(())))
+    {
+        return TestResult::Fail("xattr-bearing unlink failed");
+    }
+
+    // Cross-directory: the source already has a peer in the destination and
+    // the overwritten target has another peer there too.
+    if !matches!(poll_once(root.mkdir("rename-src-dir")), Some(Ok(_)))
+        || !matches!(poll_once(root.mkdir("rename-dst-dir")), Some(Ok(_)))
+    {
+        return TestResult::Fail("cross-dir setup mkdir failed");
+    }
+    let src_dir = match poll_once(root.lookup_dir_async("rename-src-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("cross-dir source lookup failed"),
+    };
+    let dst_dir = match poll_once(root.lookup_dir_async("rename-dst-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("cross-dir destination lookup failed"),
+    };
+    let cross_source = match poll_once(src_dir.create("cross-source")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir source creation failed"),
+    };
+    let cross_source_ino = cross_source.ino();
+    let cross_source_data = b"cross-dir source\n";
+    if !matches!(
+        poll_once(cross_source.write(0, cross_source_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(src_dir.link_to("cross-source", &*dst_dir, "cross-source-peer")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("cross-dir source hardlink setup failed");
+    }
+    let cross_target = match poll_once(dst_dir.create("cross-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir target creation failed"),
+    };
+    let cross_target_ino = cross_target.ino();
+    let cross_target_data = b"cross-dir victim\n";
+    if !matches!(
+        poll_once(cross_target.write(0, cross_target_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(cross_target.set_xattr("user.cross-victim", b"kept", 0)),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once(dst_dir.link("cross-target", "cross-target-peer")),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once(src_dir.rename_to("cross-source", &*dst_dir, "cross-target", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("cross-dir hardlink overwrite failed");
+    }
+    // Both destination names now identify the moved source; POSIX specifies a
+    // successful no-op when renaming one hardlink over the other.
+    if !matches!(
+        poll_once(dst_dir.rename("cross-target", "cross-source-peer")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("same-inode rename was not a successful no-op");
+    }
+
+    let remounted = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("hardlink/xattr rename remount failed"),
+    };
+    let root = remounted.root();
+    if poll_once(root.lookup_async("rename-source")).is_some_and(|result| result.is_ok()) {
+        return TestResult::Fail("same-dir source name survived overwrite");
+    }
+    let renamed = match poll_once(root.lookup_async("rename-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir renamed source missing"),
+    };
+    let source_peer = match poll_once(root.lookup_async("rename-source-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir source peer missing"),
+    };
+    if renamed.ino() != source_ino
+        || source_peer.ino() != source_ino
+        || read_all(&renamed, source_data.len() + 8).as_deref() != Some(source_data)
+        || poll_once(renamed.get_xattr("user.source")).map(|result| result.ok())
+            != Some(Some(b"kept".to_vec()))
+        || !matches!(poll_once(renamed.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 2)
+    {
+        return TestResult::Fail("same-dir source refs/data/xattrs changed");
+    }
+    let victim_peer = match poll_once(root.lookup_async("rename-target-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir target peer missing"),
+    };
+    if victim_peer.ino() != victim_ino
+        || read_all(&victim_peer, victim_data.len() + 8).as_deref() != Some(victim_data)
+        || poll_once(victim_peer.get_xattr("user.victim")).map(|result| result.ok())
+            != Some(Some(b"survives".to_vec()))
+        || !matches!(poll_once(victim_peer.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 1)
+    {
+        return TestResult::Fail("same-dir target peer was not preserved");
+    }
+    let replaced = match poll_once(root.lookup_async("rename-doomed")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link replacement missing"),
+    };
+    if read_all(&replaced, replacement_data.len() + 8).as_deref() != Some(replacement_data)
+        || poll_once(root.lookup_async("rename-replacement")).is_some_and(|result| result.is_ok())
+    {
+        return TestResult::Fail("last-link replacement namespace/data wrong");
+    }
+    let fs_root = remounted.fs_tree_root().0;
+    for ino in [doomed_ino, unlinked_ino] {
+        match poll_once(btree::collect_for(
+            &*remounted,
+            fs_root,
+            ino,
+            format::XATTR_ITEM_KEY,
+        )) {
+            Some(Ok(items)) if items.is_empty() => {}
+            Some(Ok(_)) => return TestResult::Fail("reclaimed inode left orphaned xattrs"),
+            _ => return TestResult::Fail("reclaimed inode xattr scan failed"),
+        }
+    }
+
+    let src_dir = match poll_once(root.lookup_dir_async("rename-src-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("remounted cross-dir source missing"),
+    };
+    let dst_dir = match poll_once(root.lookup_dir_async("rename-dst-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("remounted cross-dir destination missing"),
+    };
+    if poll_once(src_dir.lookup_async("cross-source")).is_some_and(|result| result.is_ok()) {
+        return TestResult::Fail("cross-dir source name survived move");
+    }
+    let cross_renamed = match poll_once(dst_dir.lookup_async("cross-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir renamed source missing"),
+    };
+    let cross_source_peer = match poll_once(dst_dir.lookup_async("cross-source-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir source peer missing"),
+    };
+    if cross_renamed.ino() != cross_source_ino
+        || cross_source_peer.ino() != cross_source_ino
+        || read_all(&cross_renamed, cross_source_data.len() + 8).as_deref()
+            != Some(cross_source_data)
+        || !matches!(poll_once(cross_renamed.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 2)
+    {
+        return TestResult::Fail("cross-dir source refs/data changed");
+    }
+    let cross_target_peer = match poll_once(dst_dir.lookup_async("cross-target-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir target peer missing"),
+    };
+    if cross_target_peer.ino() != cross_target_ino
+        || read_all(&cross_target_peer, cross_target_data.len() + 8).as_deref()
+            != Some(cross_target_data)
+        || poll_once(cross_target_peer.get_xattr("user.cross-victim")).map(|result| result.ok())
+            != Some(Some(b"kept".to_vec()))
+        || !matches!(poll_once(cross_target_peer.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 1)
+    {
+        return TestResult::Fail("cross-dir target peer was not preserved");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rename_hardlink_xattr_overwrite
+);
+
 /// Cross-directory `rename` (`rename_to`) moves a file into another directory: it
 /// leaves the old parent, appears in the new one under the new name with its
 /// content intact, and survives a remount.
@@ -2130,6 +2932,207 @@ fn smoke_btrfs_link_same_dir() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_link_same_dir);
+
+/// Real CRC32C-colliding UTF-8 names coexist in one DIR_ITEM bucket. Exercise
+/// exact lookup plus record-level create, rename-out, rename-in, hard-link and
+/// unlink edits, then verify the surviving collision peers after remount.
+fn smoke_btrfs_dir_item_hash_collisions() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const A: &str = "n5wrWL7foZTV";
+    const B: &str = "Vf5Y4fyl9fqh";
+    if checksum::name_hash(A.as_bytes()) != checksum::name_hash(B.as_bytes()) {
+        return TestResult::Fail("collision test names no longer collide");
+    }
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    let a = match poll_once(root.create(A)) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("first colliding create failed"),
+    };
+    let b = match poll_once(root.create(B)) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second colliding create failed"),
+    };
+    if a.ino() == b.ino()
+        || !matches!(poll_once(root.lookup_async(A)), Some(Ok(_)))
+        || !matches!(poll_once(root.lookup_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("colliding names did not resolve independently");
+    }
+
+    // Remove A from the shared bucket and add it back from a different hash.
+    if !matches!(poll_once(root.rename(A, "collision-moved")), Some(Ok(())))
+        || !matches!(poll_once(root.lookup_async(B)), Some(Ok(_)))
+        || !matches!(poll_once(root.rename("collision-moved", A)), Some(Ok(())))
+    {
+        return TestResult::Fail("rename did not preserve collision peer");
+    }
+    // Source lookup occurs in a collision bucket; then delete B alone and add a
+    // hard link back under B, which is a destination collision append.
+    if !matches!(poll_once(root.link(A, "collision-hard")), Some(Ok(())))
+        || !matches!(poll_once(root.unlink(B)), Some(Ok(())))
+        || !matches!(poll_once(root.lookup_async(A)), Some(Ok(_)))
+        || !matches!(poll_once(root.link(A, B)), Some(Ok(())))
+    {
+        return TestResult::Fail("link/unlink collision edit failed");
+    }
+
+    // Directory removal uses the same record-level bucket deletion.
+    if !matches!(poll_once(root.mkdir("collision-dirs")), Some(Ok(_))) {
+        return TestResult::Fail("collision directory parent create failed");
+    }
+    let dirs = match poll_once(root.lookup_dir_async("collision-dirs")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("collision directory parent lookup failed"),
+    };
+    if !matches!(poll_once(dirs.mkdir(A)), Some(Ok(_)))
+        || !matches!(poll_once(dirs.mkdir(B)), Some(Ok(_)))
+        || !matches!(poll_once(dirs.rmdir(A)), Some(Ok(())))
+        || !matches!(poll_once(dirs.lookup_dir_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("rmdir removed or damaged collision peer");
+    }
+
+    // Source and overwrite target occupy the very same hash bucket. The final
+    // body must contain B pointing at A's inode, not competing key edits.
+    if !matches!(poll_once(root.mkdir("collision-overwrite")), Some(Ok(_))) {
+        return TestResult::Fail("collision overwrite parent create failed");
+    }
+    let overwrite_dir = match poll_once(root.lookup_dir_async("collision-overwrite")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("collision overwrite parent lookup failed"),
+    };
+    let overwrite_source = match poll_once(overwrite_dir.create(A)) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("collision overwrite source create failed"),
+    };
+    if !matches!(poll_once(overwrite_dir.create(B)), Some(Ok(_)))
+        || !matches!(poll_once(overwrite_dir.rename(A, B)), Some(Ok(())))
+    {
+        return TestResult::Fail("same-bucket collision overwrite failed");
+    }
+    match poll_once(overwrite_dir.lookup_async(B)) {
+        Some(Ok(f)) if f.ino() == overwrite_source.ino() => {}
+        _ => return TestResult::Fail("collision overwrite retained wrong inode"),
+    }
+    if poll_once(overwrite_dir.lookup_async(A)).is_some_and(|result| result.is_ok()) {
+        return TestResult::Fail("collision overwrite source name survived");
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("collision remount failed"),
+    };
+    let root2 = vol2.root();
+    let a2 = match poll_once(root2.lookup_async(A)) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("first collision name missing after remount"),
+    };
+    let b2 = match poll_once(root2.lookup_async(B)) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second collision name missing after remount"),
+    };
+    if a2.ino() != b2.ino() {
+        return TestResult::Fail("colliding hard links diverged after remount");
+    }
+    let dirs2 = match poll_once(root2.lookup_dir_async("collision-dirs")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("collision directory missing after remount"),
+    };
+    if poll_once(dirs2.lookup_async(A)).is_some_and(|result| result.is_ok())
+        || !matches!(poll_once(dirs2.lookup_dir_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("rmdir collision state wrong after remount");
+    }
+    let overwrite_dir2 = match poll_once(root2.lookup_dir_async("collision-overwrite")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("collision overwrite parent missing after remount"),
+    };
+    if poll_once(overwrite_dir2.lookup_async(A)).is_some_and(|result| result.is_ok())
+        || !matches!(poll_once(overwrite_dir2.lookup_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("collision overwrite state wrong after remount");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_dir_item_hash_collisions);
+
+/// Cross-directory rename removes and appends exact records while both source
+/// and destination parents already contain another name with the same hash.
+fn smoke_btrfs_cross_dir_hash_collision_rename() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const A: &str = "n5wrWL7foZTV";
+    const B: &str = "Vf5Y4fyl9fqh";
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+    if !matches!(poll_once(root.mkdir("collision-src")), Some(Ok(_)))
+        || !matches!(poll_once(root.mkdir("collision-dst")), Some(Ok(_)))
+    {
+        return TestResult::Fail("collision parent setup failed");
+    }
+    let src = match poll_once(root.lookup_dir_async("collision-src")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("source parent lookup failed"),
+    };
+    let dst = match poll_once(root.lookup_dir_async("collision-dst")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("destination parent lookup failed"),
+    };
+    if !matches!(poll_once(src.create(A)), Some(Ok(_)))
+        || !matches!(poll_once(src.create(B)), Some(Ok(_)))
+        || !matches!(poll_once(dst.create(B)), Some(Ok(_)))
+        || !matches!(poll_once(src.rename_to(A, &*dst, A, 0)), Some(Ok(())))
+    {
+        return TestResult::Fail("cross-directory collision rename failed");
+    }
+    if !matches!(poll_once(src.lookup_async(B)), Some(Ok(_)))
+        || !matches!(poll_once(dst.lookup_async(A)), Some(Ok(_)))
+        || !matches!(poll_once(dst.lookup_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("cross-directory collision peer was damaged");
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("cross-directory collision remount failed"),
+    };
+    let root2 = vol2.root();
+    let src2 = match poll_once(root2.lookup_dir_async("collision-src")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("remount source parent missing"),
+    };
+    let dst2 = match poll_once(root2.lookup_dir_async("collision-dst")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("remount destination parent missing"),
+    };
+    if poll_once(src2.lookup_async(A)).is_some_and(|result| result.is_ok())
+        || !matches!(poll_once(src2.lookup_async(B)), Some(Ok(_)))
+        || !matches!(poll_once(dst2.lookup_async(A)), Some(Ok(_)))
+        || !matches!(poll_once(dst2.lookup_async(B)), Some(Ok(_)))
+    {
+        return TestResult::Fail("cross-directory collision state wrong after remount");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_cross_dir_hash_collision_rename
+);
 
 /// A cross-directory hard link aliases the same inode into another directory, and
 /// hard-linking a directory is refused (`EPERM`).
@@ -2595,6 +3598,111 @@ fn smoke_btrfs_superblock_mirror() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_mirror);
 
+/// Mount chooses the newest valid superblock copy, not unconditionally the
+/// primary. The next transaction then rewrites every copy and heals the stale
+/// primary so a subsequent mount no longer depends on the mirror.
+fn smoke_btrfs_superblock_recovery() -> TestResult {
+    use narf_block::BlockDeviceSync;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let mut primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    let mirror = read_super_at(&dev, 64 << 20);
+    let field = |sb: &[u8], off: usize| u64::from_le_bytes(sb[off..off + 8].try_into().unwrap());
+    let mirror_gen = field(&mirror, 72);
+    if mirror_gen == 0 || field(&primary, 72) != mirror_gen {
+        return TestResult::Fail("fixture superblock mirrors do not start in sync");
+    }
+
+    primary[72..80].copy_from_slice(&(mirror_gen - 1).to_le_bytes());
+    if checksum::stamp_block(format::CSUM_TYPE_CRC32, &mut primary).is_err() {
+        return TestResult::Fail("failed to restamp stale primary");
+    }
+    let lba = format::SUPERBLOCK_OFFSET / u64::from(dev.lba_size());
+    let blocks = (format::SUPERBLOCK_SIZE / dev.lba_size() as usize) as u16;
+    if dev.write(lba, blocks, &primary).is_err() {
+        return TestResult::Fail("failed to install stale primary");
+    }
+
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("newer mirror was not mountable"),
+    };
+    if vol.superblock().generation != mirror_gen {
+        return TestResult::Fail("mount selected the stale primary generation");
+    }
+
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after mirror recovery failed"),
+    };
+    let payload = replacement_big();
+    match poll_once(big.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("healing transaction failed"),
+    }
+
+    let healed_primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    let healed_mirror = read_super_at(&dev, 64 << 20);
+    if field(&healed_primary, 72) <= mirror_gen
+        || field(&healed_primary, 72) != field(&healed_mirror, 72)
+        || field(&healed_primary, 80) != field(&healed_mirror, 80)
+    {
+        return TestResult::Fail("transaction did not heal the stale primary");
+    }
+    match mount_writable(dev) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("healed volume did not remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_recovery);
+
+/// A checksum-bad primary metadata stripe in a DUP chunk is recovered from the
+/// second same-device copy. This uses the realistic non-mixed laptop fixture,
+/// whose metadata profile is DUP, and corrupts only the mounted FS-tree root's
+/// first physical copy.
+fn smoke_btrfs_dup_metadata_recovery() -> TestResult {
+    use narf_block::BlockDeviceSync;
+
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    let (fs_root, _) = vol.fs_tree_root();
+    let (primary, mirror) = match vol.map_logical_copies(fs_root) {
+        Ok((primary, Some(mirror))) => (primary, mirror),
+        _ => return TestResult::Fail("laptop metadata root is not mapped as DUP"),
+    };
+    if primary == mirror {
+        return TestResult::Fail("DUP metadata copies alias each other");
+    }
+
+    let blocks = (vol.nodesize() / dev.lba_size() as usize) as u16;
+    let mut node = alloc::vec![0u8; vol.nodesize()];
+    if dev
+        .read(primary / u64::from(dev.lba_size()), blocks, &mut node)
+        .is_err()
+    {
+        return TestResult::Fail("failed to read primary metadata stripe");
+    }
+    node[0] ^= 0x80; // invalidate only the stored checksum
+    if dev
+        .write(primary / u64::from(dev.lba_size()), blocks, &node)
+        .is_err()
+    {
+        return TestResult::Fail("failed to corrupt primary metadata stripe");
+    }
+
+    match mount_writable(dev) {
+        Ok(recovered) if recovered.root_inode().is_some() => TestResult::Pass,
+        _ => TestResult::Fail("mount did not recover metadata from DUP mirror"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_dup_metadata_recovery);
+
 /// A new chunk never overlaps a superblock mirror: the span helper caps a chunk
 /// that would cross the 64 MiB mirror, and bumps a start landing inside its band.
 fn smoke_btrfs_chunk_avoids_supers() -> TestResult {
@@ -2879,6 +3987,34 @@ fn file_extent_count(vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>, ino: u6
     .map_or(0, |items| items.len())
 }
 
+/// Regular extent layout as `(file offset, disk bytenr, disk length)`.
+fn regular_file_extents<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+) -> Option<Vec<(u64, u64, u64)>> {
+    let (fs_root, _) = vol.fs_tree_root();
+    let items = poll_once(btree::collect_for(
+        vol,
+        fs_root,
+        ino,
+        format::EXTENT_DATA_KEY,
+    ))?
+    .ok()?;
+    items
+        .into_iter()
+        .map(|(key, body)| {
+            if body.len() < 53 || body[20] != format::FILE_EXTENT_REG {
+                return None;
+            }
+            Some((
+                key.offset,
+                format::le64(&body, 21).ok()?,
+                format::le64(&body, 29).ok()?,
+            ))
+        })
+        .collect()
+}
+
 /// A file larger than one extent: the write path tiles it into several data
 /// extents, and a later write reads that multi-extent file back, frees every old
 /// extent, and re-tiles it — all durable across remounts.
@@ -2948,6 +4084,102 @@ fn smoke_btrfs_multi_extent_write() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_multi_extent_write);
+
+/// A small random write into a large file COWs only the intersected 128 KiB
+/// extent. The other file items, physical extents, extent-tree records and
+/// checksums remain live across the commit and remount.
+fn smoke_btrfs_incremental_extent_write() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const EXT: usize = 128 * 1024;
+    const SZ: usize = 4 * EXT;
+    let original = (0..SZ)
+        .map(|i| (i as u8).wrapping_mul(37) ^ (i >> 11) as u8)
+        .collect::<Vec<u8>>();
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let created = match poll_once(vol.root().create("incremental.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = created.ino();
+    if !matches!(poll_once(created.write(0, &original)), Some(Ok(SZ))) {
+        return TestResult::Fail("initial large write failed");
+    }
+
+    let before = match regular_file_extents(&vol, ino) {
+        Some(v) if v.len() == 4 => v,
+        _ => return TestResult::Fail("initial write did not produce four extents"),
+    };
+    // Reload the inode so its cached size reflects the first synchronous commit.
+    let file = match poll_once(vol.root().lookup_async("incremental.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("post-create lookup failed"),
+    };
+    let patch = b"incremental-sector-COW";
+    let patch_off = EXT + 777;
+    if !matches!(
+        poll_once(file.write(patch_off as u64, patch)),
+        Some(Ok(n)) if n == patch.len()
+    ) {
+        return TestResult::Fail("small random write failed");
+    }
+
+    let after = match regular_file_extents(&vol, ino) {
+        Some(v) if v.len() == 4 => v,
+        _ => return TestResult::Fail("incremental write changed extent count"),
+    };
+    for i in [0usize, 2, 3] {
+        if after[i] != before[i] {
+            return TestResult::Fail("non-overlapping extent was rewritten");
+        }
+        if !extent_item_present(&vol, before[i].1, before[i].2) {
+            return TestResult::Fail("preserved extent lost its extent-tree record");
+        }
+    }
+    if after[1].0 != before[1].0 || after[1].1 == before[1].1 {
+        return TestResult::Fail("intersected extent was not independently COWed");
+    }
+    if extent_item_present(&vol, before[1].1, before[1].2) {
+        return TestResult::Fail("replaced extent remains in extent tree");
+    }
+    if !extent_item_present(&vol, after[1].1, after[1].2) {
+        return TestResult::Fail("replacement extent missing from extent tree");
+    }
+
+    let mut expected = original;
+    expected[patch_off..patch_off + patch.len()].copy_from_slice(patch);
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount failed"),
+    };
+    let file2 = match poll_once(vol2.root().lookup_async("incremental.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lookup failed"),
+    };
+    if read_all(&file2, SZ + 16).as_deref() != Some(expected.as_slice()) {
+        return TestResult::Fail("incremental write content mismatch after remount");
+    }
+    let (fs_root, _) = vol2.fs_tree_root();
+    let csum_root = match csum_root_of(&vol2) {
+        Some(r) => r,
+        None => return TestResult::Fail("csum root missing after incremental write"),
+    };
+    match poll_once(crate::csum::verify_file_data_csums(
+        &vol2, fs_root, csum_root, ino,
+    )) {
+        Some(Ok(true)) => TestResult::Pass,
+        Some(Ok(false)) => TestResult::Fail("incremental extent checksums are invalid"),
+        _ => TestResult::Fail("incremental checksum verification errored"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_incremental_extent_write);
 
 /// Overwriting a small **inline** file (its data stored in the `EXTENT_DATA` item)
 /// now works: the write reads the inline content and re-tiles it as a regular
@@ -3135,7 +4367,7 @@ fn smoke_btrfs_path_cow_engine() -> TestResult {
         // Stamp + write the new nodes so the tree is readable from its new root.
         for (addr, buf, _lvl) in &out.nodes {
             let mut b = buf.clone();
-            crate::write::stamp_node(&mut b, *addr, gen);
+            crate::write::stamp_node(&mut b, *addr, gen, vol.csum_type())?;
             vol.write_logical(*addr, &b).await?;
         }
         Ok::<_, FsError>((
@@ -3504,6 +4736,168 @@ fn smoke_btrfs_lzo_read() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_lzo_read);
 
+/// Exercise a tail overwrite+grow for one readable compression codec, then
+/// verify extent metadata, accounting and physical data checksums after
+/// remount. Keeping codecs as separately registered tests makes architecture-
+/// specific codec failures directly isolatable through the subsystem filter.
+fn smoke_btrfs_compressed_cow_write_case(sparse: &[u8], compression: u8) -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    {
+        let vol = match mount_sparse(sparse) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("compressed fixture failed to mount"),
+        };
+        let device: Arc<RamBlockDevice> = vol.device.clone();
+        let big = match poll_once(vol.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("compressed big.dat lookup failed"),
+        };
+        let ino = big.ino();
+        let (fs_root, _) = vol.fs_tree_root();
+        let old_items = match poll_once(btree::collect_for(
+            &vol,
+            fs_root,
+            ino,
+            format::EXTENT_DATA_KEY,
+        )) {
+            Some(Ok(items)) => items,
+            _ => return TestResult::Fail("compressed extent lookup failed"),
+        };
+        if old_items.len() != 1
+            || old_items[0].1.get(16).copied() != Some(compression)
+            || old_items[0].1.get(20).copied() != Some(format::FILE_EXTENT_REG)
+        {
+            return TestResult::Fail("fixture does not contain expected compressed extent");
+        }
+        let old_extent = match file_data_extent(&vol, ino) {
+            Some(extent) => extent,
+            None => return TestResult::Fail("compressed physical extent missing"),
+        };
+
+        let mut want = expected_big();
+        let offset = want.len() - 4;
+        let patch = b"compressed-cow-tail\n";
+        want.resize(offset + patch.len(), 0);
+        want[offset..].copy_from_slice(patch);
+        match poll_once(big.write(offset as u64, patch)) {
+            Some(Ok(n)) if n == patch.len() => {}
+            _ => return TestResult::Fail("compressed COW write failed"),
+        }
+
+        let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("compressed COW remount failed"),
+        };
+        let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("compressed COW remount lookup failed"),
+        };
+        if read_all(&big2, want.len() + 16) != Some(want) {
+            return TestResult::Fail("compressed COW content mismatch");
+        }
+        let (fs_root2, _) = vol2.fs_tree_root();
+        let new_items = match poll_once(btree::collect_for(
+            &vol2,
+            fs_root2,
+            ino,
+            format::EXTENT_DATA_KEY,
+        )) {
+            Some(Ok(items)) => items,
+            _ => return TestResult::Fail("replacement extent lookup failed"),
+        };
+        let expected_compression = if compression == format::COMPRESS_ZLIB {
+            format::COMPRESS_ZLIB
+        } else {
+            format::COMPRESS_NONE
+        };
+        if new_items.iter().any(|(_, body)| {
+            body.get(16).copied() != Some(expected_compression)
+                || body.get(20).copied() != Some(format::FILE_EXTENT_REG)
+        }) {
+            return TestResult::Fail("replacement extent compression mode is wrong");
+        }
+        if compression == format::COMPRESS_ZLIB {
+            let body = &new_items[0].1;
+            let ram_bytes = format::le64(body, 8).unwrap_or(0);
+            let disk_bytes = format::le64(body, 29).unwrap_or(u64::MAX);
+            let num_bytes = format::le64(body, 45).unwrap_or(0);
+            if disk_bytes >= ram_bytes
+                || disk_bytes % u64::from(vol2.sectorsize()) != 0
+                || num_bytes != ram_bytes
+            {
+                return TestResult::Fail("emitted zlib extent sizes are invalid");
+            }
+        }
+        let new_extent = match file_data_extent(&vol2, ino) {
+            Some(extent) => extent,
+            None => return TestResult::Fail("replacement physical extent missing"),
+        };
+        if new_extent.0 == old_extent.0
+            || extent_item_present(&vol2, old_extent.0, old_extent.1)
+            || !extent_item_present(&vol2, new_extent.0, new_extent.1)
+        {
+            return TestResult::Fail("compressed extent accounting is wrong");
+        }
+        let csum_root = match csum_root_of(&vol2) {
+            Some(root) => root,
+            None => return TestResult::Fail("compressed COW csum root missing"),
+        };
+        match poll_once(crate::csum::verify_file_data_csums(
+            &vol2, fs_root2, csum_root, ino,
+        )) {
+            Some(Ok(true)) => {}
+            _ => return TestResult::Fail("compressed replacement physical csums are invalid"),
+        }
+    }
+    TestResult::Pass
+}
+
+fn smoke_btrfs_zlib_cow_write() -> TestResult {
+    smoke_btrfs_compressed_cow_write_case(FIXTURE_ZLIB_SPARSE, format::COMPRESS_ZLIB)
+}
+
+fn smoke_btrfs_zlib_codec_roundtrip() -> TestResult {
+    let plain = expected_big();
+    let encoded = match crate::write::compress_zlib_heap(&plain, 6) {
+        Ok(encoded) => encoded,
+        Err(_) => return TestResult::Fail("zlib encode failed"),
+    };
+    match miniz_oxide::inflate::decompress_to_vec_zlib(&encoded) {
+        Ok(decoded) if decoded == plain => TestResult::Pass,
+        _ => TestResult::Fail("zlib codec round-trip mismatch"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/zlib/codec",
+    smoke_btrfs_zlib_codec_roundtrip
+);
+
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/zlib",
+    smoke_btrfs_zlib_cow_write
+);
+
+fn smoke_btrfs_zstd_cow_write() -> TestResult {
+    smoke_btrfs_compressed_cow_write_case(FIXTURE_ZSTD_SPARSE, format::COMPRESS_ZSTD)
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/zstd",
+    smoke_btrfs_zstd_cow_write
+);
+
+fn smoke_btrfs_lzo_cow_write() -> TestResult {
+    smoke_btrfs_compressed_cow_write_case(FIXTURE_LZO_SPARSE, format::COMPRESS_LZO)
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/compression/lzo",
+    smoke_btrfs_lzo_cow_write
+);
+
 // ── Subvolumes ─────────────────────────────────────────────────────
 
 fn smoke_btrfs_subvolume() -> TestResult {
@@ -3613,8 +5007,14 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
         Ok(Some(crate::volume::Subvol::Id(256))) => {}
         _ => return TestResult::Fail("subvolid=256 did not parse"),
     }
-    if crate::parse_mount_subvol("subvol=a/b").is_ok() {
-        return TestResult::Fail("multi-level subvol path should be rejected");
+    match crate::parse_mount_subvol("subvol=/container/outer/inner/") {
+        Ok(Some(crate::volume::Subvol::Name(ref n))) if n == "container/outer/inner" => {}
+        _ => return TestResult::Fail("multi-level subvol path did not parse"),
+    }
+    for bad in ["subvol=a//b", "subvol=a/./b", "subvol=a/../b"] {
+        if crate::parse_mount_subvol(bad).is_ok() {
+            return TestResult::Fail("ambiguous subvol path should be rejected");
+        }
     }
     if crate::parse_mount_subvol("bogus=1").is_ok() {
         return TestResult::Fail("unknown option should be rejected");
@@ -3642,6 +5042,9 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
     {
         return TestResult::Fail("subvol root listing is not the subvolume's");
     }
+    if !vol.supports_writes() {
+        return TestResult::Fail("rw subvolume mounted read-only");
+    }
 
     // subvolid= reaching the same subvolume works too (snap's id resolved by
     // switching a default mount, then mounting by that id).
@@ -3655,10 +5058,1247 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
     {
         return TestResult::Fail("switch_to_subvol by name failed");
     }
+
+    // A path can cross an ordinary directory, enter a subvolume, and then enter
+    // a subvolume nested inside it. Resolution starts at FS_TREE, not whichever
+    // on-disk default subvolume mount_opts may have selected.
+    let dev = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let sel = Some(crate::volume::Subvol::Name("container/outer/inner".into()));
+    let nested = match poll_once(BtrfsVolume::mount_subvol(
+        dev,
+        DomainId::DRIVER_0,
+        true,
+        sel,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("multi-level subvol mount failed"),
+    };
+    let entries = match poll_once(nested.root().enumerate_async(0, 16)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("nested subvol root enumerate failed"),
+    };
+    if entries.len() != 1 || entries[0].0 != "deep.txt" {
+        return TestResult::Fail("multi-level subvol mounted the wrong tree");
+    }
     TestResult::Pass
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_mount_subvol_option);
+
+fn smoke_btrfs_subvolume_getflags_ioctl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let mount_fresh = |path: &str| {
+        let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+        poll_once(BtrfsVolume::mount_subvol(
+            device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name(path.into())),
+        ))
+        .and_then(Result::ok)
+    };
+    let get_flags = |root: &dyn narf_filesystem::DirOps| {
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_GETFLAGS, 0, &[], 8))
+            .and_then(Result::ok)
+            .and_then(|reply| reply.output.try_into().ok())
+            .map(u64::from_ne_bytes)
+    };
+    let set_flags = |root: &dyn narf_filesystem::DirOps, flags: u64| {
+        let input = flags.to_ne_bytes();
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_SETFLAGS, 0, &input, 0))
+    };
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let selected = crate::volume::Subvol::Name("container/outer/inner".into());
+    let mount_selected = || {
+        poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(selected.clone()),
+        ))
+        .and_then(Result::ok)
+    };
+
+    let writable = match mount_selected() {
+        Some(v) => v,
+        None => return TestResult::Fail("writable subvolume ioctl mount failed"),
+    };
+    let writable_root = writable.root();
+    let original_fs_root = writable.fs_tree_root();
+    let original_root_tree = writable.root_tree_root();
+    let original_generation = writable.superblock().generation;
+    if get_flags(&*writable_root) != Some(0) {
+        return TestResult::Fail("writable subvolume returned incorrect flags");
+    }
+    if !matches!(
+        poll_once(writable_root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_GETFLAGS, 0, &[], 4,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("subvolume GETFLAGS accepted the wrong ABI size");
+    }
+    let ordinary = match poll_once(writable_root.lookup_async("deep.txt")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("subvolume ioctl ordinary-file lookup failed"),
+    };
+    if !matches!(
+        poll_once(ordinary.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_GETFLAGS, 0, &[], 8,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("ordinary file accepted subvolume GETFLAGS");
+    }
+    if !matches!(
+        poll_once(ordinary.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_SETFLAGS,
+            0,
+            &crate::node::BTRFS_SUBVOL_RDONLY.to_ne_bytes(),
+            0,
+        )),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("ordinary file accepted subvolume SETFLAGS");
+    }
+    if !matches!(
+        poll_once(
+            writable_root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_SETFLAGS, 0, &[0; 4], 0,)
+        ),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("subvolume SETFLAGS accepted the wrong input size");
+    }
+    if !matches!(
+        set_flags(&*writable_root, 1 << 63),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("subvolume SETFLAGS accepted an unknown flag");
+    }
+
+    let set_reply = match set_flags(&*writable_root, crate::node::BTRFS_SUBVOL_RDONLY) {
+        Some(Ok(reply)) => reply,
+        _ => return TestResult::Fail("setting subvolume read-only failed"),
+    };
+    if set_reply.result != 0 || !set_reply.output.is_empty() {
+        return TestResult::Fail("subvolume SETFLAGS returned the wrong ABI reply");
+    }
+    if writable.supports_writes()
+        || get_flags(&*writable_root) != Some(crate::node::BTRFS_SUBVOL_RDONLY)
+    {
+        return TestResult::Fail("SETFLAGS did not publish read-only state immediately");
+    }
+    if writable.fs_tree_root() != original_fs_root {
+        return TestResult::Fail("root-only SETFLAGS rewrote the subvolume fs tree");
+    }
+    if writable.root_tree_root() == original_root_tree
+        || writable.superblock().generation != original_generation + 1
+    {
+        return TestResult::Fail("SETFLAGS did not commit a new root-tree generation");
+    }
+    if !matches!(
+        poll_once(writable_root.create("must-not-exist")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("newly read-only subvolume accepted a mutation");
+    }
+
+    let remounted_readonly = match mount_selected() {
+        Some(v) => v,
+        None => return TestResult::Fail("read-only SETFLAGS remount failed"),
+    };
+    let remounted_readonly_root = remounted_readonly.root();
+    if remounted_readonly.supports_writes()
+        || get_flags(&*remounted_readonly_root) != Some(crate::node::BTRFS_SUBVOL_RDONLY)
+        || remounted_readonly.fs_tree_root() != original_fs_root
+    {
+        return TestResult::Fail("read-only SETFLAGS state did not persist across remount");
+    }
+
+    let readonly_generation = remounted_readonly.superblock().generation;
+    if !matches!(set_flags(&*remounted_readonly_root, 0), Some(Ok(_))) {
+        return TestResult::Fail("clearing flags on a read-only subvolume failed");
+    }
+    if !remounted_readonly.supports_writes()
+        || get_flags(&*remounted_readonly_root) != Some(0)
+        || remounted_readonly.superblock().generation != readonly_generation + 1
+    {
+        return TestResult::Fail("clearing SETFLAGS did not publish writable state");
+    }
+
+    let remounted_writable = match mount_selected() {
+        Some(v) => v,
+        None => return TestResult::Fail("writable SETFLAGS remount failed"),
+    };
+    let remounted_writable_root = remounted_writable.root();
+    if !remounted_writable.supports_writes() || get_flags(&*remounted_writable_root) != Some(0) {
+        return TestResult::Fail("cleared SETFLAGS state did not persist across remount");
+    }
+    if !matches!(
+        poll_once(remounted_writable_root.create("flags-write-ok")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("writable subvolume rejected mutation after clearing flags");
+    }
+
+    let readonly = match mount_fresh("container/outer/rochild") {
+        Some(vol) => vol,
+        None => return TestResult::Fail("read-only subvolume ioctl mount failed"),
+    };
+    let readonly_root = readonly.root();
+    if readonly.supports_writes()
+        || get_flags(&*readonly_root) != Some(crate::node::BTRFS_SUBVOL_RDONLY)
+    {
+        return TestResult::Fail("read-only subvolume flag was not surfaced");
+    }
+    if !matches!(
+        poll_once(readonly_root.create("must-not-exist")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("read-only subvolume accepted a mutation");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_getflags_ioctl);
+
+fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+
+    let make_v2 = |name: &str, flags: u64| {
+        let mut args = alloc::vec![0u8; 4096];
+        args[16..24].copy_from_slice(&flags.to_ne_bytes());
+        let end = 56 + name.len();
+        if end < args.len() {
+            args[56..end].copy_from_slice(name.as_bytes());
+        }
+        args
+    };
+    let make_legacy = |name: &str| {
+        let mut args = alloc::vec![0u8; 4096];
+        let end = 8 + name.len();
+        if end < args.len() {
+            args[8..end].copy_from_slice(name.as_bytes());
+        }
+        args
+    };
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-create fixture mount failed"),
+    };
+    let root = top.root();
+
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &[0; 8], 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted the wrong ABI size");
+    }
+    let unknown = make_v2("badflags", 1 << 63);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &unknown, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted unknown flags");
+    }
+    let bad_name = make_v2("bad/name", 0);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &bad_name, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted a path instead of a name");
+    }
+
+    let fresh_args = make_v2("fresh", 0);
+    if !matches!(
+        poll_once(root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &fresh_args,
+            0,
+        )),
+        Some(Ok(ref reply)) if reply.result == 0 && reply.output.is_empty()
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 writable create failed");
+    }
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &fresh_args, 0,)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 accepted a duplicate name");
+    }
+
+    let readonly_args = make_v2("frozen", crate::node::BTRFS_SUBVOL_RDONLY);
+    if !matches!(
+        poll_once(root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &readonly_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("SUBVOL_CREATE_V2 read-only create failed");
+    }
+    let legacy_args = make_legacy("legacy");
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE, 0, &legacy_args, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("legacy SUBVOL_CREATE failed");
+    }
+    let listed = match poll_once(root.enumerate_async(0, 64)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-create parent enumerate failed"),
+    };
+    for name in ["fresh", "frozen", "legacy"] {
+        if !listed
+            .iter()
+            .any(|(entry, kind)| entry == name && *kind == FileType::Dir)
+        {
+            return TestResult::Fail("created subvolume missing from parent directory");
+        }
+    }
+
+    let mount_named = |name: &str| {
+        poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name(name.into())),
+        ))
+        .and_then(Result::ok)
+    };
+    let fresh = match mount_named("fresh") {
+        Some(v) => v,
+        None => return TestResult::Fail("created writable subvolume did not remount"),
+    };
+    if !fresh.supports_writes() {
+        return TestResult::Fail("created writable subvolume remounted read-only");
+    }
+    let fresh_id = fresh.fs_tree_id();
+    if fresh_id <= format::FIRST_FREE_OBJECTID {
+        return TestResult::Fail("created subvolume did not receive a new tree id");
+    }
+    let fresh_root = fresh.root();
+    if !matches!(
+        poll_once(fresh_root.enumerate_async(0, 8)),
+        Some(Ok(ref entries)) if entries.is_empty()
+    ) {
+        return TestResult::Fail("new subvolume was not empty");
+    }
+    let file = match poll_once(fresh_root.create("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("created subvolume rejected file creation"),
+    };
+    if !matches!(poll_once(file.write(0, b"new subvolume\n")), Some(Ok(14))) {
+        return TestResult::Fail("created subvolume rejected file write");
+    }
+
+    let frozen = match mount_named("frozen") {
+        Some(v) => v,
+        None => return TestResult::Fail("created read-only subvolume did not remount"),
+    };
+    if frozen.supports_writes()
+        || !matches!(
+            poll_once(frozen.root().create("blocked")),
+            Some(Err(FsError::ReadOnly))
+        )
+    {
+        return TestResult::Fail("created read-only subvolume accepted mutation");
+    }
+
+    // Remount the parent after the child transaction so its cached root tree is
+    // current, then traverse into the child and read the persisted file.
+    let remounted_top = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("parent remount after subvolume write failed"),
+    };
+    let traversed = match poll_once(remounted_top.root().lookup_dir_async("fresh")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("created subvolume was not traversable after remount"),
+    };
+    let persisted = match poll_once(traversed.lookup_async("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("created subvolume file did not persist"),
+    };
+    if read_all(&persisted, 32).as_deref() != Some(b"new subvolume\n") {
+        return TestResult::Fail("created subvolume file contents were wrong");
+    }
+
+    // The root tree must carry both directions of the parent relation.
+    let root_tree = remounted_top.root_tree_root().0;
+    let parent_id = remounted_top.fs_tree_id();
+    if poll_once(btree::find_item(
+        &*remounted_top,
+        root_tree,
+        &BtrfsKey::new(parent_id, format::ROOT_REF_KEY, fresh_id),
+    ))
+    .and_then(Result::ok)
+    .flatten()
+    .is_none()
+        || poll_once(btree::find_item(
+            &*remounted_top,
+            root_tree,
+            &BtrfsKey::new(fresh_id, format::ROOT_BACKREF_KEY, parent_id),
+        ))
+        .and_then(Result::ok)
+        .flatten()
+        .is_none()
+    {
+        return TestResult::Fail("created subvolume root refs were incomplete");
+    }
+    let root_item = match poll_once(btree::find_item(
+        &*remounted_top,
+        root_tree,
+        &BtrfsKey::new(fresh_id, format::ROOT_ITEM_KEY, 0),
+    )) {
+        Some(Ok(Some(body))) if body.len() >= 263 => body,
+        _ => return TestResult::Fail("created subvolume root item was missing"),
+    };
+    let uuid = &root_item[247..263];
+    let uuid_root = match poll_once(crate::roots::find_root(
+        &*remounted_top,
+        root_tree,
+        format::UUID_TREE_OBJECTID,
+    )) {
+        Some(Ok((root, _))) => root,
+        _ => return TestResult::Fail("UUID tree was missing after subvolume creation"),
+    };
+    let uuid_key = BtrfsKey::new(
+        u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+        format::UUID_KEY_SUBVOL,
+        u64::from_le_bytes(uuid[8..].try_into().unwrap()),
+    );
+    if !matches!(
+        poll_once(btree::find_item(&*remounted_top, uuid_root, &uuid_key)),
+        Some(Ok(Some(ref body))) if body.as_slice() == fresh_id.to_le_bytes()
+    ) {
+        return TestResult::Fail("created subvolume UUID index was incomplete");
+    }
+
+    // Exercise the same multi-tree transaction with space_cache=v2 enabled;
+    // every new parent/child/UUID/root/extent block must be removed from the
+    // free-space tree in the converged fixed point.
+    let fst_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let fst_top = match poll_once(BtrfsVolume::mount_opts(
+        fst_device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("free-space-tree subvolume fixture mount failed"),
+    };
+    let fst_args = make_v2("fstchild", 0);
+    if !matches!(
+        poll_once(fst_top.root().ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &fst_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("free-space-tree subvolume creation failed");
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            fst_device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("fstchild".into())),
+        )),
+        Some(Ok(ref child)) if child.supports_writes()
+    ) {
+        return TestResult::Fail("free-space-tree subvolume did not persist");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_create_ioctl);
+
+fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let source_big_extent;
+    let pre_snapshot_root;
+    {
+        let vol = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("snapshot fixture mount failed"),
+        };
+        let root = vol.root();
+        let big = match poll_once(root.lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source big.dat lookup failed"),
+        };
+        source_big_extent = match file_data_extent(&vol, big.ino()) {
+            Some(extent) => extent,
+            None => return TestResult::Fail("source big.dat extent missing"),
+        };
+        pre_snapshot_root = vol.fs_tree_root();
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "snap", false)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("writable snapshot creation failed");
+        }
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "snap", false)),
+            Some(Err(FsError::InvalidData))
+        ) {
+            return TestResult::Fail("duplicate snapshot name was accepted");
+        }
+    }
+
+    let snapshot_id;
+    {
+        let snap = match poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("snap".into())),
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("created snapshot did not remount"),
+        };
+        if !snap.supports_writes() {
+            return TestResult::Fail("writable snapshot remounted read-only");
+        }
+        snapshot_id = snap.fs_tree_id();
+        if snap.fs_tree_root() != pre_snapshot_root {
+            return TestResult::Fail("snapshot did not retain the source point-in-time root");
+        }
+        let extent_root = match poll_once(crate::roots::find_root(
+            &*snap,
+            snap.root_tree_root().0,
+            format::EXTENT_TREE_OBJECTID,
+        )) {
+            Some(Ok((root, _))) => root,
+            _ => return TestResult::Fail("snapshot extent tree missing"),
+        };
+        let extent_item = match poll_once(btree::find_item(
+            &*snap,
+            extent_root,
+            &BtrfsKey::new(
+                source_big_extent.0,
+                format::EXTENT_ITEM_KEY,
+                source_big_extent.1,
+            ),
+        )) {
+            Some(Ok(Some(body))) => body,
+            _ => return TestResult::Fail("shared snapshot extent item missing"),
+        };
+        if format::le64(&extent_item, 0).ok() != Some(2) {
+            return TestResult::Fail("shared extent aggregate refcount is not two");
+        }
+        let mut roots = Vec::new();
+        let mut counts = Vec::new();
+        let mut pos = 24usize;
+        while pos < extent_item.len() {
+            if extent_item[pos] != 178 || pos + 29 > extent_item.len() {
+                return TestResult::Fail("shared extent inline ref encoding malformed");
+            }
+            roots.push(format::le64(&extent_item, pos + 1).unwrap_or(0));
+            counts.push(format::le32(&extent_item, pos + 25).unwrap_or(0));
+            pos += 29;
+        }
+        if roots.as_slice() != [format::FS_TREE_OBJECTID] || counts.as_slice() != [2] {
+            return TestResult::Fail("implicit snapshot data reference was not retained");
+        }
+        let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot lost inline file"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"narf\n") {
+            return TestResult::Fail("snapshot inline content was wrong");
+        }
+        let big = match poll_once(snap.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot lost regular extent file"),
+        };
+        if read_all(&big, expected_big().len() + 8).as_deref() != Some(expected_big().as_slice()) {
+            return TestResult::Fail("snapshot regular extent content was wrong");
+        }
+        if file_data_extent(&snap, big.ino()) != Some(source_big_extent) {
+            return TestResult::Fail("snapshot copied data instead of sharing its extent");
+        }
+        if !matches!(poll_once(big.write(100, b"SNAP")), Some(Ok(4))) {
+            return TestResult::Fail("shared snapshot data write failed");
+        }
+    }
+
+    // Mutating the source after snapshot creation must not alter the snapshot.
+    {
+        let source = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("source remount after snapshot failed"),
+        };
+        let hello = match poll_once(source.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source hello lookup failed"),
+        };
+        if !matches!(poll_once(hello.write(0, b"source\n")), Some(Ok(7))) {
+            return TestResult::Fail("source mutation after snapshot failed");
+        }
+    }
+    {
+        let snap = match poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(snapshot_id)),
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("snapshot id remount failed"),
+        };
+        let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot hello lookup failed"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"narf\n") {
+            return TestResult::Fail("source write leaked into snapshot");
+        }
+        let big = match poll_once(snap.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot big.dat remount lookup failed"),
+        };
+        let mut expected = expected_big();
+        expected[100..104].copy_from_slice(b"SNAP");
+        if read_all(&big, expected.len() + 8).as_deref() != Some(expected.as_slice()) {
+            return TestResult::Fail("snapshot shared-data write did not persist");
+        }
+        if !matches!(poll_once(hello.write(0, b"snapshot\n")), Some(Ok(9))) {
+            return TestResult::Fail("snapshot mutation failed");
+        }
+    }
+    {
+        let source = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("source final remount failed"),
+        };
+        let hello = match poll_once(source.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source final hello lookup failed"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"source\n") {
+            return TestResult::Fail("snapshot write leaked into source");
+        }
+        let big = match poll_once(source.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source final big.dat lookup failed"),
+        };
+        if read_all(&big, expected_big().len() + 8).as_deref() != Some(expected_big().as_slice()) {
+            return TestResult::Fail("snapshot shared-data write leaked into source");
+        }
+
+        let root_tree = source.root_tree_root().0;
+        let source_item = match poll_once(btree::find_item(
+            &*source,
+            root_tree,
+            &BtrfsKey::new(source.fs_tree_id(), format::ROOT_ITEM_KEY, 0),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 263 => body,
+            _ => return TestResult::Fail("source root item UUID missing"),
+        };
+        let snapshot_item = match poll_once(btree::find_item(
+            &*source,
+            root_tree,
+            &BtrfsKey::new(snapshot_id, format::ROOT_ITEM_KEY, 0),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 279 => body,
+            _ => return TestResult::Fail("snapshot root item ancestry missing"),
+        };
+        if snapshot_item[263..279] != source_item[247..263] {
+            return TestResult::Fail("snapshot parent UUID did not name the source");
+        }
+    }
+
+    // Read-only creation uses the same transaction but persists the root flag.
+    let ro_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    {
+        let vol = match poll_once(BtrfsVolume::mount_opts(
+            ro_device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("read-only snapshot fixture mount failed"),
+        };
+        let root = vol.root();
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "frozen-snap", true)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("read-only snapshot creation failed");
+        }
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            ro_device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("frozen-snap".into())),
+        )),
+        Some(Ok(ref snap)) if !snap.supports_writes()
+    ) {
+        return TestResult::Fail("read-only snapshot flag did not persist");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_snapshot_create_and_isolate);
+
+fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root fixture mount failed"),
+    };
+    let origin_id = match poll_once(crate::write::create_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        "origin",
+        false,
+    )) {
+        Some(Ok(id)) => id,
+        _ => return TestResult::Fail("shared-root origin creation failed"),
+    };
+    let origin_dir = match poll_once(top.root().lookup_dir_async("origin")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("shared-root origin traversal failed"),
+    };
+    if !matches!(
+        poll_once(top.root().snapshot_async(origin_dir, "shared", false)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("constant-size shared-root snapshot failed");
+    }
+
+    let origin = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(origin_id)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root origin remount failed"),
+    };
+    let shared = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("shared".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root snapshot remount failed"),
+    };
+    let shared_id = shared.fs_tree_id();
+    let shared_root = shared.fs_tree_root();
+    if origin.fs_tree_root() != shared_root {
+        return TestResult::Fail("snapshot did not share the origin metadata root");
+    }
+    let extent_root = match poll_once(crate::roots::find_root(
+        &*shared,
+        shared.root_tree_root().0,
+        format::EXTENT_TREE_OBJECTID,
+    )) {
+        Some(Ok((root, _))) => root,
+        _ => return TestResult::Fail("shared-root extent tree missing"),
+    };
+    let metadata = match poll_once(btree::find_item(
+        &*shared,
+        extent_root,
+        &BtrfsKey::new(
+            shared_root.0,
+            format::METADATA_ITEM_KEY,
+            u64::from(shared_root.1),
+        ),
+    )) {
+        Some(Ok(Some(body))) => body,
+        _ => return TestResult::Fail("shared metadata extent item missing"),
+    };
+    if format::le64(&metadata, 0).ok() != Some(2) {
+        return TestResult::Fail("shared metadata root refcount was not two");
+    }
+    let mut root_refs = Vec::new();
+    let mut pos = 24usize;
+    while pos < metadata.len() {
+        if metadata[pos] != 176 || pos + 9 > metadata.len() {
+            return TestResult::Fail("shared metadata inline refs were malformed");
+        }
+        root_refs.push(format::le64(&metadata, pos + 1).unwrap_or(0));
+        pos += 9;
+    }
+    if !root_refs.contains(&origin_id) || !root_refs.contains(&shared_id) {
+        return TestResult::Fail("shared metadata did not name both subvolume roots");
+    }
+
+    // The first origin mutation must materialise it privately while the snapshot
+    // keeps the old tree intact.
+    if !matches!(poll_once(origin.root().create("origin-only")), Some(Ok(_))) {
+        return TestResult::Fail("shared origin first mutation failed");
+    }
+    if origin.fs_tree_root() == shared_root {
+        return TestResult::Fail("shared origin was not materialised before mutation");
+    }
+    let shared_after = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(shared_id)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared snapshot remount after COW failed"),
+    };
+    if !matches!(
+        poll_once(shared_after.root().lookup_async("origin-only")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("origin mutation leaked into shared snapshot");
+    }
+
+    // The snapshot is now the final holder of the old root. Deleting it must
+    // reclaim that tree while leaving the materialised origin mountable.
+    let parent = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root parent remount failed"),
+    };
+    if !matches!(
+        poll_once(crate::write::destroy_subvolume(
+            &parent,
+            format::FIRST_FREE_OBJECTID,
+            Some("shared"),
+            None,
+        )),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("final shared-root snapshot deletion failed");
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(origin_id)),
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("origin was damaged by shared-root deletion");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_shared_root_snapshot_lifecycle
+);
+
+fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let make_args = |name: &str, v2: bool| {
+        let mut args = alloc::vec![0u8; 4096];
+        let offset = if v2 { 56 } else { 8 };
+        args[offset..offset + name.len()].copy_from_slice(name.as_bytes());
+        args
+    };
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-destroy fixture mount failed"),
+    };
+    let root = vol.root();
+    let initial_used = match poll_once(vol.read_raw_superblock()) {
+        Some(Ok(raw)) => u64::from_le_bytes(raw[120..128].try_into().unwrap()),
+        _ => return TestResult::Fail("initial bytes_used read failed"),
+    };
+
+    let create_empty = {
+        let mut args = alloc::vec![0u8; 4096];
+        args[56..61].copy_from_slice(b"empty");
+        args
+    };
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &create_empty, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("delete-test subvolume creation failed");
+    }
+    let empty_id = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("empty".into())),
+    )) {
+        Some(Ok(v)) => v.fs_tree_id(),
+        _ => return TestResult::Fail("delete-test subvolume did not mount"),
+    };
+    let legacy = make_args("empty", false);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY, 0, &legacy, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("legacy subvolume destroy failed");
+    }
+    if !matches!(
+        poll_once(root.lookup_dir_async("empty")),
+        Some(Err(FsError::NotFound))
+    ) || !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(empty_id)),
+        )),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("legacy-destroyed subvolume remained reachable");
+    }
+
+    // Delete an isolated snapshot with real regular data through V2-by-name.
+    if !matches!(
+        poll_once(root.snapshot_async(root.clone(), "snap-delete", false)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("delete-test snapshot creation failed");
+    }
+    let snap = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("snap-delete".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("delete-test snapshot did not mount"),
+    };
+    let snap_id = snap.fs_tree_id();
+    let root_tree_before = vol.root_tree_root().0;
+    let snap_item = match poll_once(btree::find_item(
+        &*vol,
+        root_tree_before,
+        &BtrfsKey::new(snap_id, format::ROOT_ITEM_KEY, 0),
+    )) {
+        Some(Ok(Some(body))) if body.len() >= 263 => body,
+        _ => return TestResult::Fail("delete-test snapshot root item missing"),
+    };
+    let snap_uuid = snap_item[247..263].to_vec();
+    let used_with_snapshot = match poll_once(vol.read_raw_superblock()) {
+        Some(Ok(raw)) => u64::from_le_bytes(raw[120..128].try_into().unwrap()),
+        _ => return TestResult::Fail("snapshot bytes_used read failed"),
+    };
+    if used_with_snapshot <= initial_used {
+        return TestResult::Fail("snapshot creation did not account allocated space");
+    }
+    let v2_name = make_args("snap-delete", true);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY_V2, 0, &v2_name, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("V2 name snapshot destroy failed");
+    }
+
+    let remounted = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after snapshot destroy failed"),
+    };
+    if remounted.superblock().bytes_used >= used_with_snapshot {
+        return TestResult::Fail("snapshot destroy did not reclaim space");
+    }
+    let root_tree = remounted.root_tree_root().0;
+    if poll_once(btree::find_item(
+        &*remounted,
+        root_tree,
+        &BtrfsKey::new(snap_id, format::ROOT_ITEM_KEY, 0),
+    ))
+    .and_then(Result::ok)
+    .flatten()
+    .is_some()
+    {
+        return TestResult::Fail("destroyed snapshot root item survived");
+    }
+    if let Some((uuid_root, _)) = poll_once(crate::roots::find_root(
+        &*remounted,
+        root_tree,
+        format::UUID_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    {
+        let uuid_key = BtrfsKey::new(
+            u64::from_le_bytes(snap_uuid[..8].try_into().unwrap()),
+            format::UUID_KEY_SUBVOL,
+            u64::from_le_bytes(snap_uuid[8..].try_into().unwrap()),
+        );
+        if poll_once(btree::find_item(&*remounted, uuid_root, &uuid_key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+        {
+            return TestResult::Fail("destroyed snapshot UUID index survived");
+        }
+    }
+    let source_hello = match poll_once(remounted.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("snapshot destroy damaged source namespace"),
+    };
+    if read_all(&source_hello, 16).as_deref() != Some(b"narf\n") {
+        return TestResult::Fail("snapshot destroy damaged source data");
+    }
+
+    // V2-by-id resolves the child name from DIR_INDEX and removes both indices.
+    let byid_create = {
+        let mut args = alloc::vec![0u8; 4096];
+        args[56..60].copy_from_slice(b"byid");
+        args
+    };
+    let remount_root = remounted.root();
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &byid_create,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("by-id delete-test subvolume creation failed");
+    }
+    let byid = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("byid".into())),
+    )) {
+        Some(Ok(v)) => v.fs_tree_id(),
+        _ => return TestResult::Fail("by-id delete-test subvolume did not mount"),
+    };
+    let mut byid_args = alloc::vec![0u8; 4096];
+    byid_args[16..24].copy_from_slice(&(1u64 << 4).to_ne_bytes());
+    byid_args[56..64].copy_from_slice(&byid.to_ne_bytes());
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &byid_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("V2 by-id subvolume destroy failed");
+    }
+    if !matches!(
+        poll_once(remount_root.lookup_dir_async("byid")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("V2 by-id destroy left the directory entry");
+    }
+
+    let mut bad_flags = alloc::vec![0u8; 4096];
+    bad_flags[16..24].copy_from_slice(&(1u64 << 63).to_ne_bytes());
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &bad_flags,
+            0,
+        )),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("snapshot destroy accepted unknown flags");
+    }
+
+    // A child that contains another subvolume cannot be reclaimed as one
+    // exclusive tree; it must remain intact on the rejection path.
+    let nested_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let nested = match poll_once(BtrfsVolume::mount_opts(
+        nested_device,
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("nested destroy-rejection fixture mount failed"),
+    };
+    let container = match poll_once(nested.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("nested destroy-rejection parent missing"),
+    };
+    let outer_args = make_args("outer", false);
+    if !matches!(
+        poll_once(container.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY, 0, &outer_args, 0,)),
+        Some(Err(FsError::Unsupported))
+    ) || !matches!(poll_once(container.lookup_dir_async("outer")), Some(Ok(_)))
+    {
+        return TestResult::Fail("nested subvolume destroy rejection was not atomic");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_destroy_ioctl);
+
+/// A writable multi-component `subvol=` mount commits into that subvolume's
+/// own tree id. The new root must be published through its `ROOT_ITEM`, data
+/// backrefs must name the subvolume rather than tree 5, and both an explicit
+/// remount and traversal from the top-level tree must observe the mutations.
+fn smoke_btrfs_writable_nested_subvolume() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let selected = crate::volume::Subvol::Name("container/outer/inner".into());
+    let payload = b"written through nested subvol mount\n";
+
+    {
+        let vol = match poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(selected.clone()),
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("nested writable mount failed"),
+        };
+        if !vol.supports_writes() || vol.fs_tree_id() == format::FS_TREE_OBJECTID {
+            return TestResult::Fail("nested mount did not select a writable subvolume tree");
+        }
+        let root = vol.root();
+        let file = match poll_once(root.create("created.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("create in nested subvolume failed"),
+        };
+        if !matches!(poll_once(file.write(0, payload)), Some(Ok(n)) if n == payload.len()) {
+            return TestResult::Fail("write in nested subvolume failed");
+        }
+        if !matches!(
+            poll_once(file.set_xattr("user.nested", b"yes", 0)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("xattr in nested subvolume failed");
+        }
+        if !matches!(
+            poll_once(root.rename("created.txt", "renamed.txt")),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("rename in nested subvolume failed");
+        }
+        let child = match poll_once(root.mkdir("child")) {
+            Some(Ok(d)) => d,
+            _ => return TestResult::Fail("mkdir in nested subvolume failed"),
+        };
+        let inside = match poll_once(child.create("inside.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("nested directory create failed"),
+        };
+        if !matches!(poll_once(inside.write(0, b"inside\n")), Some(Ok(7))) {
+            return TestResult::Fail("nested directory write failed");
+        }
+    }
+
+    let remounted = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(selected),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("nested subvolume remount failed"),
+    };
+    let root = remounted.root();
+    if poll_once(root.lookup_async("created.txt")).is_some_and(|r| r.is_ok()) {
+        return TestResult::Fail("old nested-subvolume name survived rename");
+    }
+    let renamed = match poll_once(root.lookup_async("renamed.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("renamed nested-subvolume file missing"),
+    };
+    if read_all(&renamed, payload.len() + 8).as_deref() != Some(payload)
+        || poll_once(renamed.get_xattr("user.nested")).map(|r| r.ok())
+            != Some(Some(b"yes".to_vec()))
+    {
+        return TestResult::Fail("nested-subvolume data/xattr did not persist");
+    }
+    let child = match poll_once(root.lookup_dir_async("child")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("nested-subvolume directory missing"),
+    };
+    let inside = match poll_once(child.lookup_async("inside.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("nested-subvolume child file missing"),
+    };
+    if read_all(&inside, 16).as_deref() != Some(&b"inside\n"[..]) {
+        return TestResult::Fail("nested-subvolume child data changed");
+    }
+
+    // The root-tree item was repointed, so entering the same subvolume from a
+    // top-level mount must reach the new root as well.
+    let top = match poll_once(BtrfsVolume::mount_subvol(
+        device,
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("top-level remount after nested write failed"),
+    };
+    let container = match poll_once(top.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("container missing after nested write"),
+    };
+    let outer = match poll_once(container.lookup_dir_async("outer")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("outer subvolume missing after nested write"),
+    };
+    let inner = match poll_once(outer.lookup_dir_async("inner")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("inner subvolume missing after nested write"),
+    };
+    match poll_once(inner.lookup_async("renamed.txt")) {
+        Some(Ok(f)) if read_all(&f, payload.len() + 8).as_deref() == Some(payload) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("top-level traversal saw a stale nested-subvolume root"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_writable_nested_subvolume);
 
 // ── Hardlinks ──────────────────────────────────────────────────────
 
@@ -3785,13 +6425,29 @@ fn smoke_btrfs_default_subvolume() -> TestResult {
     {
         return TestResult::Fail("plain mount did not land in the default subvolume");
     }
+    if !vol.supports_writes() {
+        return TestResult::Fail("rw default subvolume mounted read-only");
+    }
+    let device = vol.device.clone();
+    if !matches!(
+        poll_once(vol.root().create("default-created.txt")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("create in on-disk default subvolume failed");
+    }
+    let remounted = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("default-subvolume write did not remount"),
+    };
+    if !dir_names(&remounted.root())
+        .iter()
+        .any(|n| n == "default-created.txt")
+    {
+        return TestResult::Fail("default-subvolume mutation did not persist");
+    }
     // subvolid=5 explicitly overrides the default and reaches the top-level tree.
-    let dev = narf_block::ram::RamBlockDevice::from_image(
-        512,
-        decode_sparse(FIXTURE_DEFAULTSUBVOL_SPARSE),
-    );
     let top = match poll_once(BtrfsVolume::mount_subvol(
-        dev,
+        device,
         DomainId::DRIVER_0,
         true,
         Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),

@@ -18,6 +18,70 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Btrfs snapshot ioctls embed a source directory fd in their 4096-byte
+    // argument. Resolve that process-local fd here, then pass a stable DirOps
+    // object through the VFS snapshot surface; filesystem drivers must never
+    // reach into a caller's descriptor table.
+    const BTRFS_IOC_SNAP_CREATE: u32 = 0x5000_9401;
+    const BTRFS_IOC_SNAP_CREATE_V2: u32 = 0x5000_9417;
+    const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
+    if matches!(cmd, BTRFS_IOC_SNAP_CREATE | BTRFS_IOC_SNAP_CREATE_V2) {
+        let mut input = [0u8; 4096];
+        // SAFETY: both snapshot UAPIs are _IOW with an exact 4096-byte
+        // argument; copy_from_user validates the complete range.
+        if unsafe { copy_from_user(&mut input, arg as u64) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        let source_fd = i64::from_ne_bytes(input[0..8].try_into().unwrap());
+        if source_fd < 0 || source_fd > i64::from(u32::MAX) {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        }
+        let (name_offset, readonly) = if cmd == BTRFS_IOC_SNAP_CREATE_V2 {
+            let flags = u64::from_ne_bytes(input[16..24].try_into().unwrap());
+            if flags & !BTRFS_SUBVOL_RDONLY != 0 {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
+            (56usize, flags & BTRFS_SUBVOL_RDONLY != 0)
+        } else {
+            (8usize, false)
+        };
+        let raw_name = &input[name_offset..];
+        let Some(end) = raw_name.iter().position(|&byte| byte == 0) else {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            return;
+        };
+        let Ok(name) = core::str::from_utf8(&raw_name[..end]) else {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            return;
+        };
+        let source = fd::with_table(task, |t| {
+            t.get(source_fd as u32)
+                .and_then(|entry| entry.ops.as_dir())
+        })
+        .flatten();
+        let Some(source) = source else {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        };
+        let Some(destination) = ops.as_dir() else {
+            ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+            return;
+        };
+        let result = poll_blocking(destination.snapshot_async(source, name, readonly));
+        let rc = match result {
+            Some(Ok(())) => 0,
+            Some(Err(narf_filesystem::FsError::CrossDevice)) => -18, // EXDEV
+            Some(Err(narf_filesystem::FsError::ReadOnly)) => -30,    // EROFS
+            Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // EOPNOTSUPP
+            Some(Err(narf_filesystem::FsError::NotFound)) => -2,     // ENOENT
+            _ => -(EINVAL_CODE as i64),
+        };
+        ctx.set_return(SyscallReturn::ok(rc as u64));
+        return;
+    }
     // FUSE_DEV_IOC_CLONE attaches this freshly opened `/dev/fuse` fd to
     // the connection named by the u32 source fd at `arg`. Linux implements
     // this in fs/fuse/dev.c because it must inspect and replace fd-private

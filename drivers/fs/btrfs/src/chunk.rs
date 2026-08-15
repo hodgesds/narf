@@ -24,8 +24,7 @@ const CHUNK_HEADER_SIZE: usize = 48;
 /// On-disk `struct btrfs_stripe` size (devid + offset + 16-byte uuid).
 const STRIPE_SIZE: usize = 32;
 
-/// One resolved chunk: a logical range and the physical location of its first
-/// (and, for the profiles we accept, canonical) stripe.
+/// One resolved chunk: a logical range and its one or two physical copies.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ChunkMapEntry {
     pub logical_start: u64,
@@ -34,6 +33,8 @@ pub struct ChunkMapEntry {
     pub devid: u64,
     /// Byte offset of the stripe on the device.
     pub physical: u64,
+    /// Second same-device copy for the DUP profile.
+    pub mirror_physical: Option<u64>,
 }
 
 /// The logical→physical translation table, ordered for lookup.
@@ -65,6 +66,7 @@ impl ChunkMap {
             length,
             devid,
             physical,
+            mirror_physical: None,
         });
     }
 
@@ -81,9 +83,19 @@ impl ChunkMap {
     /// Translate a logical address to a physical device offset. Returns
     /// `NotFound` if no chunk covers it.
     pub fn map_logical(&self, logical: u64) -> Result<u64, FsError> {
+        self.map_logical_copies(logical).map(|copies| copies.0)
+    }
+
+    /// Translate a logical address to its primary and optional DUP physical
+    /// copy. Both offsets include the logical offset within the chunk.
+    pub fn map_logical_copies(&self, logical: u64) -> Result<(u64, Option<u64>), FsError> {
         for e in &self.entries {
             if logical >= e.logical_start && logical < e.logical_start.saturating_add(e.length) {
-                return Ok(e.physical + (logical - e.logical_start));
+                let delta = logical - e.logical_start;
+                return Ok((
+                    e.physical + delta,
+                    e.mirror_physical.map(|physical| physical + delta),
+                ));
             }
         }
         Err(FsError::NotFound)
@@ -103,13 +115,15 @@ impl ChunkMap {
             return Err(FsError::InvalidData);
         }
 
-        // Only SINGLE (no profile bit) or DUP are supported. DUP keeps two
-        // stripes on one device; both hold identical data, so stripe 0 is
-        // authoritative. Any RAID profile would require cross-stripe
-        // reconstruction we don't implement.
+        // Only SINGLE (one stripe) or DUP (two stripes on the same device) are
+        // supported. Any RAID profile requires reconstruction or routing that
+        // this single-device driver deliberately does not implement.
         let profile = chunk_type & BLOCK_GROUP_PROFILE_MASK;
         if profile != 0 && profile != BLOCK_GROUP_DUP {
             return Err(FsError::Unsupported);
+        }
+        if (profile == 0 && num_stripes != 1) || (profile == BLOCK_GROUP_DUP && num_stripes != 2) {
+            return Err(FsError::InvalidData);
         }
 
         let need = CHUNK_HEADER_SIZE
@@ -126,12 +140,22 @@ impl ChunkMap {
         // Stripe 0.
         let devid = le64(chunk, CHUNK_HEADER_SIZE)?;
         let physical = le64(chunk, CHUNK_HEADER_SIZE + 8)?;
+        let mirror_physical = if profile == BLOCK_GROUP_DUP {
+            let second = CHUNK_HEADER_SIZE + STRIPE_SIZE;
+            if le64(chunk, second)? != devid {
+                return Err(FsError::Unsupported);
+            }
+            Some(le64(chunk, second + 8)?)
+        } else {
+            None
+        };
 
         self.entries.push(ChunkMapEntry {
             logical_start,
             length,
             devid,
             physical,
+            mirror_physical,
         });
         Ok(())
     }
