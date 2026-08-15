@@ -5528,6 +5528,7 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
 
     let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
     let source_big_extent;
+    let pre_snapshot_root;
     {
         let vol = match poll_once(BtrfsVolume::mount_opts(
             device.clone(),
@@ -5546,6 +5547,7 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             Some(extent) => extent,
             None => return TestResult::Fail("source big.dat extent missing"),
         };
+        pre_snapshot_root = vol.fs_tree_root();
         if !matches!(
             poll_once(root.snapshot_async(root.clone(), "snap", false)),
             Some(Ok(()))
@@ -5575,6 +5577,9 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             return TestResult::Fail("writable snapshot remounted read-only");
         }
         snapshot_id = snap.fs_tree_id();
+        if snap.fs_tree_root() != pre_snapshot_root {
+            return TestResult::Fail("snapshot did not retain the source point-in-time root");
+        }
         let extent_root = match poll_once(crate::roots::find_root(
             &*snap,
             snap.root_tree_root().0,
@@ -5599,16 +5604,18 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             return TestResult::Fail("shared extent aggregate refcount is not two");
         }
         let mut roots = Vec::new();
+        let mut counts = Vec::new();
         let mut pos = 24usize;
         while pos < extent_item.len() {
             if extent_item[pos] != 178 || pos + 29 > extent_item.len() {
                 return TestResult::Fail("shared extent inline ref encoding malformed");
             }
             roots.push(format::le64(&extent_item, pos + 1).unwrap_or(0));
+            counts.push(format::le32(&extent_item, pos + 25).unwrap_or(0));
             pos += 29;
         }
-        if !roots.contains(&format::FS_TREE_OBJECTID) || !roots.contains(&snapshot_id) {
-            return TestResult::Fail("shared extent did not name both roots");
+        if roots.as_slice() != [format::FS_TREE_OBJECTID] || counts.as_slice() != [2] {
+            return TestResult::Fail("implicit snapshot data reference was not retained");
         }
         let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
             Some(Ok(f)) => f,
@@ -5760,6 +5767,162 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_snapshot_create_and_isolate);
+
+fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root fixture mount failed"),
+    };
+    let origin_id = match poll_once(crate::write::create_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        "origin",
+        false,
+    )) {
+        Some(Ok(id)) => id,
+        _ => return TestResult::Fail("shared-root origin creation failed"),
+    };
+    let origin_dir = match poll_once(top.root().lookup_dir_async("origin")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("shared-root origin traversal failed"),
+    };
+    if !matches!(
+        poll_once(top.root().snapshot_async(origin_dir, "shared", false)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("constant-size shared-root snapshot failed");
+    }
+
+    let origin = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(origin_id)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root origin remount failed"),
+    };
+    let shared = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("shared".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root snapshot remount failed"),
+    };
+    let shared_id = shared.fs_tree_id();
+    let shared_root = shared.fs_tree_root();
+    if origin.fs_tree_root() != shared_root {
+        return TestResult::Fail("snapshot did not share the origin metadata root");
+    }
+    let extent_root = match poll_once(crate::roots::find_root(
+        &*shared,
+        shared.root_tree_root().0,
+        format::EXTENT_TREE_OBJECTID,
+    )) {
+        Some(Ok((root, _))) => root,
+        _ => return TestResult::Fail("shared-root extent tree missing"),
+    };
+    let metadata = match poll_once(btree::find_item(
+        &*shared,
+        extent_root,
+        &BtrfsKey::new(
+            shared_root.0,
+            format::METADATA_ITEM_KEY,
+            u64::from(shared_root.1),
+        ),
+    )) {
+        Some(Ok(Some(body))) => body,
+        _ => return TestResult::Fail("shared metadata extent item missing"),
+    };
+    if format::le64(&metadata, 0).ok() != Some(2) {
+        return TestResult::Fail("shared metadata root refcount was not two");
+    }
+    let mut root_refs = Vec::new();
+    let mut pos = 24usize;
+    while pos < metadata.len() {
+        if metadata[pos] != 176 || pos + 9 > metadata.len() {
+            return TestResult::Fail("shared metadata inline refs were malformed");
+        }
+        root_refs.push(format::le64(&metadata, pos + 1).unwrap_or(0));
+        pos += 9;
+    }
+    if !root_refs.contains(&origin_id) || !root_refs.contains(&shared_id) {
+        return TestResult::Fail("shared metadata did not name both subvolume roots");
+    }
+
+    // The first origin mutation must materialise it privately while the snapshot
+    // keeps the old tree intact.
+    if !matches!(poll_once(origin.root().create("origin-only")), Some(Ok(_))) {
+        return TestResult::Fail("shared origin first mutation failed");
+    }
+    if origin.fs_tree_root() == shared_root {
+        return TestResult::Fail("shared origin was not materialised before mutation");
+    }
+    let shared_after = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(shared_id)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared snapshot remount after COW failed"),
+    };
+    if !matches!(
+        poll_once(shared_after.root().lookup_async("origin-only")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("origin mutation leaked into shared snapshot");
+    }
+
+    // The snapshot is now the final holder of the old root. Deleting it must
+    // reclaim that tree while leaving the materialised origin mountable.
+    let parent = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("shared-root parent remount failed"),
+    };
+    if !matches!(
+        poll_once(crate::write::destroy_subvolume(
+            &parent,
+            format::FIRST_FREE_OBJECTID,
+            Some("shared"),
+            None,
+        )),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("final shared-root snapshot deletion failed");
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(origin_id)),
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("origin was damaged by shared-root deletion");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_shared_root_snapshot_lifecycle
+);
 
 fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     use narf_block::ram::RamBlockDevice;

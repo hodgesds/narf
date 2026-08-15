@@ -83,14 +83,19 @@ real laptop's btrfs root looks like.
 - Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
-  refs and the destination entry commit atomically. Data extents are shared with
-  ordered inline `EXTENT_DATA_REF`s and refcounted delayed adds/drops; snapshot
-  and source writes COW independently without copying untouched payloads.
-  Metadata is still rebuilt under a private root, so creation is O(tree metadata)
-  rather than the usual O(1) shared-root operation.
+  refs and the destination entry commit atomically. A snapshot outside its source
+  is an **O(1) shared-root operation**: both root items name the same tree block
+  and the extent tree gains one ordered inline `TREE_BLOCK_REF`; descendant
+  metadata and data remain implicit. The first mutation of either side lazily
+  materialises a private metadata tree and converts its payload references into
+  ordered `EXTENT_DATA_REF`s, so subsequent source/snapshot writes COW
+  independently. If the destination directory is inside the source being
+  snapshotted, the transaction must also preserve the pre-insertion namespace;
+  that edge case atomically rehomes the live source and is O(tree metadata).
 - Legacy `BTRFS_IOC_SNAP_DESTROY` and V2 deletion by name or subvolume id.
   The parent namespace, root refs/item, UUID index, checksums, extent tree and
-  free-space tree update in one transaction. Metadata is proven exclusive;
+  free-space tree update in one transaction. A still-shared tree is detached by
+  dropping only its root ref. The final holder walks and reclaims the old tree;
   shared data loses only the deleted root's backref and is reclaimed with its
   checksum/free space only after the final reference disappears.
 - **statfs** reports total/free blocks (free approximated from the superblock's
@@ -106,8 +111,8 @@ than mis-read:
 - Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
   RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
-  child explicitly to write it). Snapshot creation or deletion of a child that
-  itself contains nested subvolume mount points is not yet supported.
+  child explicitly to write it). Deleting the final holder of a tree that itself
+  contains nested subvolume mount points is not yet supported.
   `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not supported.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a non-empty-directory target.
