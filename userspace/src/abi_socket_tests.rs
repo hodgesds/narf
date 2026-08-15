@@ -1027,6 +1027,98 @@ kernel_test_in!(
     smoke_abi_socket_listener_readable_through_nested_epoll
 );
 
+/// Socket-activation shape: an AF_UNIX listener already has PENDING connections
+/// BEFORE it is added to an epoll set. systemd queues client connections on the
+/// socket-activated listener, hands the fd to the daemon (dbus-broker /
+/// journald), and only THEN does the daemon `epoll_ctl(ADD)` it. The first
+/// `epoll_wait` MUST report the already-ready listener — both level and edge
+/// (EPOLLET owes an initial-readiness edge for an fd that is ready at ADD).
+///
+/// This is the exact strand a full-desktop boot dies on: the `/run/dbus/
+/// system_bus_socket` listener carries queued connections, dbus-broker adds the
+/// inherited fd to its epoll, `epoll_wait` never reports it, so it never
+/// `accept`s — the session bus wedges and the Plasma greeter hangs waiting for
+/// a bus reply that can't arrive. The neighbouring
+/// `..._readable_through_nested_epoll` cannot catch this: it registers the
+/// listener with epoll BEFORE the connection, so it exercises the arrival edge,
+/// never the already-pending-at-registration state.
+fn smoke_abi_socket_listener_pending_before_epoll_add_is_reported() -> TestResult {
+    with_setup(|| {
+        for (label, et) in [("level", 0u32), ("edge", crate::epoll::EPOLLET)] {
+            let srv = open_unix_stream()?;
+            let (addr, alen) = unix_sockaddr(if et == 0 {
+                b"/abi-pending-preadd-lvl"
+            } else {
+                b"/abi-pending-preadd-et"
+            });
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(srv, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err("listener bind failed");
+            }
+            if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+                return Err("listen failed");
+            }
+
+            // Queue a connection BEFORE the listener is watched — the socket
+            // sits readable with a pending accept, exactly as an inherited
+            // socket-activated fd does when the daemon finally epolls it.
+            let cli = open_unix_stream()?;
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(cli, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("connect status")?
+                != 0
+            {
+                return Err("client connect failed");
+            }
+
+            // NOW add the already-pending listener to a fresh epoll.
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+            if epfd < 0 {
+                return Err("epoll_create failed");
+            }
+            let epfd = epfd as u64;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&(1u32 | et).to_ne_bytes()); // EPOLLIN [| EPOLLET]
+            interest[4..].copy_from_slice(&0x4C49_5354u64.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd, 1, srv, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl ADD of the already-pending listener failed");
+            }
+
+            // The very first epoll_wait must report the already-pending
+            // listener. Missing it here is the dbus-broker never-accepts strand.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err(if et == 0 {
+                    "epoll_wait missed a listener already pending at ADD (level)"
+                } else {
+                    "epoll_wait missed a listener already pending at ADD (edge) — the socket-activation dbus-broker strand"
+                });
+            }
+            // And the accept it then issues must produce the connection.
+            let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+            if conn < 0 {
+                return Err("accept after the epoll report returned no connection");
+            }
+            let _ = label;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_listener_pending_before_epoll_add_is_reported
+);
+
 /// A task parked in `epoll_wait` with an INFINITE timeout on a CONNECTED
 /// AF_UNIX socketpair must wake when its peer sends.
 ///

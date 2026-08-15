@@ -5170,6 +5170,49 @@ pub fn unix_listener_stall_sweep() {
             uc.futex_uaddr.load(Ordering::Relaxed),
             uc.sleep_deadline_ns.load(Ordering::Relaxed),
         );
+
+        // The owner above is only who called listen() — under socket
+        // activation that is PID 1, NOT the daemon that inherited the fd and
+        // actually accepts (dbus-broker / journald). Surface every task that
+        // holds an fd to THIS listener object (Arc identity) with its park
+        // state, so the census names the real stranded acceptor and the fd it
+        // watches. `try_with_table` keeps this a NON-BLOCKING read — a table
+        // whose lock the interrupted CPU already holds is skipped, not waited
+        // on — which is exactly why `listen_owner_tid` avoided this walk; the
+        // try-lock makes it trap-safe.
+        let l_ptr = Arc::as_ptr(&l) as *const SocketFile;
+        for t2 in narf_scheduler::all_task_ids() {
+            let tid2 = t2.0;
+            let held_fd = crate::fd::try_with_table(tid2, |tab| {
+                tab.open_fd_numbers().into_iter().find(|&fd| {
+                    tab.get(fd)
+                        .and_then(|e| e.ops.as_any())
+                        .and_then(|a| a.downcast_ref::<SocketFile>())
+                        .is_some_and(|s| core::ptr::eq(s as *const SocketFile, l_ptr))
+                })
+            })
+            .flatten();
+            let Some(fd) = held_fd else {
+                continue;
+            };
+            let Some(task2) = crate::task::task_get(tid2) else {
+                continue;
+            };
+            let uc2 = &task2.uctx;
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "UNIXPEND-HOLDER name={name} tid={tid2} fd={fd} pid={} st={} parked={} scans={} checks={} pnfds={} epfd_enc={} netio={} deadline={:#x}",
+                task2.pid.load(Ordering::Relaxed),
+                task2.state.load(Ordering::Relaxed),
+                uc2.parked_in_syscall.load(Ordering::Relaxed) as u8,
+                uc2.dbg_poll_scans.load(Ordering::Relaxed),
+                uc2.dbg_park_checks.load(Ordering::Relaxed),
+                uc2.poll_wait_nfds.load(Ordering::Relaxed),
+                uc2.epoll_wait_fd.load(Ordering::Relaxed),
+                uc2.net_io_wait.load(Ordering::Relaxed) as u8,
+                uc2.sleep_deadline_ns.load(Ordering::Relaxed),
+            );
+        }
     }
 }
 

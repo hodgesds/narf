@@ -361,12 +361,32 @@ impl EpollInstance {
             let mut g = self.inner.lock();
             for (fd, cur_mask, cur_token) in observed {
                 if let Some(item) = g.interest.get_mut(&fd) {
-                    item.last_mask = cur_mask;
-                    item.last_token = cur_token;
-
-                    if (item.events & EPOLLONESHOT) != 0 && delivered_fds.contains(&fd) {
-                        // Clear all event-interest bits; keep flags.
-                        item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
+                    if delivered_fds.contains(&fd) {
+                        // Delivered to the caller — the EPOLLET edge is now
+                        // consumed, so advance the recorded mask/token to the
+                        // values that were reported.
+                        item.last_mask = cur_mask;
+                        item.last_token = cur_token;
+                        if (item.events & EPOLLONESHOT) != 0 {
+                            // Clear all event-interest bits; keep flags.
+                            item.events &= EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE;
+                        }
+                    } else {
+                        // Observed but NOT delivered (an EPOLLET item with no
+                        // new edge, a not-ready fd, an EPOLLEXCLUSIVE claim lost
+                        // to another epoll, or a fd drained by a concurrent
+                        // reader between the token snapshot and the readiness
+                        // poll). Re-arm by clearing readiness bits that have
+                        // dropped so a later rising edge still fires, but do NOT
+                        // consume the edge: advancing `last_token` here to a
+                        // stale/racing snapshot swallowed an AF_UNIX listener's
+                        // accept-ready edge — the connection stayed queued and
+                        // EPOLLET never re-reported it, permanently stranding a
+                        // socket-activation acceptor (dbus-broker / journald)
+                        // whose accept thread races its epoll thread. `last_token`
+                        // is left untouched so the still-pending edge is
+                        // delivered on the next scan.
+                        item.last_mask &= cur_mask;
                     }
                 }
             }
