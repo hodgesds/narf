@@ -54,8 +54,10 @@ real laptop's btrfs root looks like.
   `nlink`), `mkdir` (new empty
   directory), `rmdir` (of an empty directory), `rename` (same- or
   cross-directory, of a file or directory, atomically replacing an existing target
-  — freeing a clobbered file's data + checksums, and refusing to move a directory
-  into its own subtree), `symlink` (target stored inline), `mknod` /
+  — freeing a last-link target's data/checksums/xattrs, or removing just one name
+  and decrementing `nlink` for a hardlinked target; packed same-parent hardlink
+  refs are preserved; a directory cannot move into its own subtree), `symlink`
+  (target stored inline), `mknod` /
   `create_socket` (char/block device — raw-kernel-`dev_t` `rdev` — FIFO, socket),
   and hard links (`link` / `link_to`, same- or cross-directory, appending to the
   shared `INODE_REF` and bumping `nlink`), each a COW mini-transaction that keeps
@@ -103,7 +105,7 @@ than mis-read:
   itself contains nested subvolume mount points is not yet supported.
   `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not supported.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
-  or a `rename` that overwrites a hardlinked or non-empty-directory target.
+  or a `rename` that overwrites a non-empty-directory target.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.
 
 ## COW writes — full Linux interop

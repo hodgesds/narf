@@ -74,7 +74,7 @@ use crate::btree::{
     leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
 };
 use crate::checksum::name_hash;
-use crate::dir::{append_dir_item, decode_dir_items, find_dir_item, remove_dir_item};
+use crate::dir::{append_dir_item, decode_dir_items, find_dir_item, remove_dir_item, DirEntry};
 use crate::format::{self, le64, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::roots;
@@ -3408,6 +3408,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     // extents and holes own no separate disk block.
     let mut freed_data: Vec<(u64, u64)> = Vec::new();
     let mut ed_offsets: Vec<u64> = Vec::new();
+    let mut xattr_keys: Vec<BtrfsKey> = Vec::new();
     if last_link {
         for (k, body) in
             btree::collect_for(vol, fs_root, child_ino, format::EXTENT_DATA_KEY).await?
@@ -3422,6 +3423,11 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
                 }
             }
         }
+        xattr_keys = btree::collect_for(vol, fs_root, child_ino, format::XATTR_ITEM_KEY)
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
     }
 
     let gen = vol.superblock().generation + 1;
@@ -3494,10 +3500,136 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
                 off,
             )));
         }
+        edits.extend(xattr_keys.into_iter().map(Edit::Delete));
     }
 
     commit_fs_edits(vol, gen, alloc, &edits, freed_data, Vec::new()).await?;
     Ok(())
+}
+
+/// On-disk teardown prepared for an existing rename destination.
+///
+/// A last-link target owns its inode items and is reclaimed completely. A
+/// hardlinked file loses only the overwritten name: its packed `INODE_REF`,
+/// inode link count, data and xattrs otherwise survive.
+struct RenameTarget {
+    ino: u64,
+    dir_index_key: BtrfsKey,
+    ref_key: BtrfsKey,
+    ref_remaining: Vec<u8>,
+    inode_update: Option<Vec<u8>>,
+    extent_offsets: Vec<u64>,
+    xattr_keys: Vec<BtrfsKey>,
+    freed_data: Vec<(u64, u64)>,
+}
+
+impl RenameTarget {
+    fn append_edits(self, edits: &mut Vec<Edit>) {
+        edits.push(Edit::Delete(self.dir_index_key));
+        edits.push(if self.ref_remaining.is_empty() {
+            Edit::Delete(self.ref_key)
+        } else {
+            Edit::Upsert(self.ref_key, self.ref_remaining)
+        });
+        if let Some(inode) = self.inode_update {
+            edits.push(Edit::Upsert(
+                BtrfsKey::new(self.ino, format::INODE_ITEM_KEY, 0),
+                inode,
+            ));
+        } else {
+            edits.push(Edit::Delete(BtrfsKey::new(
+                self.ino,
+                format::INODE_ITEM_KEY,
+                0,
+            )));
+            edits.extend(self.extent_offsets.into_iter().map(|offset| {
+                Edit::Delete(BtrfsKey::new(self.ino, format::EXTENT_DATA_KEY, offset))
+            }));
+            edits.extend(self.xattr_keys.into_iter().map(Edit::Delete));
+        }
+    }
+}
+
+async fn prepare_rename_target<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+    parent_ino: u64,
+    name: &str,
+    entry: &DirEntry,
+    source_is_dir: bool,
+    gen: u64,
+) -> Result<RenameTarget, FsError> {
+    if entry.location.item_type != format::INODE_ITEM_KEY {
+        return Err(FsError::Unsupported); // subvolume mount point
+    }
+    let ino = entry.location.objectid;
+    let target_is_dir = entry.ftype == format::FT_DIR;
+    if source_is_dir != target_is_dir {
+        return Err(FsError::InvalidData); // EISDIR / ENOTDIR
+    }
+    let mut inode_body =
+        btree::find_item(vol, fs_root, &BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0))
+            .await?
+            .ok_or(FsError::NotFound)?;
+    let inode = InodeItem::decode(&inode_body)?;
+    if inode.is_dir() != target_is_dir {
+        return Err(FsError::InvalidData);
+    }
+    let last_link = inode.nlink <= 1;
+    if target_is_dir && !last_link {
+        return Err(FsError::InvalidData); // btrfs directories cannot be hardlinked
+    }
+
+    let ref_key = BtrfsKey::new(ino, format::INODE_REF_KEY, parent_ino);
+    let ref_body = btree::find_item(vol, fs_root, &ref_key)
+        .await?
+        .ok_or(FsError::NotFound)?;
+    let (dir_index, ref_remaining) = inode_ref_remove(&ref_body, name.as_bytes())?;
+
+    let mut extent_offsets = Vec::new();
+    let mut xattr_keys = Vec::new();
+    let mut freed_data = Vec::new();
+    let inode_update = if last_link {
+        let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(ino, 0, 0)).await?;
+        while let Some((key, body)) = cursor.current()? {
+            if key.objectid != ino {
+                break;
+            }
+            match key.item_type {
+                format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
+                format::XATTR_ITEM_KEY => xattr_keys.push(key),
+                format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => return Err(FsError::Busy),
+                format::EXTENT_DATA_KEY if !target_is_dir => {
+                    extent_offsets.push(key.offset);
+                    if body.len() >= 37 && body[20] != format::FILE_EXTENT_INLINE {
+                        let bytenr = le64(body, 21)?;
+                        let len = le64(body, 29)?;
+                        if bytenr != 0 {
+                            freed_data.push((bytenr, len));
+                        }
+                    }
+                }
+                _ => return Err(FsError::Unsupported),
+            }
+            cursor.advance().await?;
+        }
+        None
+    } else {
+        inode_body[8..16].copy_from_slice(&gen.to_le_bytes());
+        inode_body[40..44].copy_from_slice(&(inode.nlink - 1).to_le_bytes());
+        Some(inode_body)
+    };
+
+    Ok(RenameTarget {
+        ino,
+        dir_index_key: BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index),
+        ref_key,
+        ref_remaining,
+        inode_update,
+        extent_offsets,
+        xattr_keys,
+        freed_data,
+    })
 }
 
 /// Remove the empty subdirectory `name` from directory `parent_ino` (default
@@ -3629,9 +3761,10 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 /// checksums freed) — the `QSaveFile`/`rename`-onto-target pattern.
 ///
 /// Scope (else the noted error): same directory only. Overwrite requires the
-/// same kind (dir↔dir / file↔file, else `InvalidData`), an unshared target
-/// (`nlink == 1`), and — for a directory target — that it is empty (`Busy`) and
-/// free of xattrs (`Unsupported`). Colliding peer names are preserved.
+/// same kind (dir↔dir / file↔file, else `InvalidData`); a directory target must
+/// be empty (`Busy`). Hardlinked file targets lose just the overwritten name,
+/// and xattrs are preserved or reclaimed with their inode. Colliding peer names
+/// and packed hardlink refs are preserved.
 pub async fn rename_same_dir<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -3667,6 +3800,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let child_ino = entry.location.objectid;
     let ftype = entry.ftype;
     let source_is_dir = ftype == format::FT_DIR;
+    let gen = vol.superblock().generation + 1;
 
     // Resolve the destination. If it already exists, gather what removing it
     // entails (an empty directory, or a file whose data + checksums we free).
@@ -3675,8 +3809,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         format::DIR_ITEM_KEY,
         u64::from(name_hash(new_bytes)),
     );
-    let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
-    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    let mut target: Option<RenameTarget> = None;
     let new_di_body = btree::find_item(vol, fs_root, &new_di_key).await?;
     let target_entry = match &new_di_body {
         Some(body) => decode_dir_items(body)?
@@ -3685,74 +3818,30 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         None => None,
     };
     if let Some(t) = target_entry {
-        if t.location.item_type != format::INODE_ITEM_KEY {
-            return Err(FsError::Unsupported); // subvolume mount point
+        // POSIX: renaming one hardlink over another name for the same inode is
+        // successful and leaves both names untouched.
+        if t.location.objectid == child_ino && t.location.item_type == format::INODE_ITEM_KEY {
+            return Ok(());
         }
-        let t_ino = t.location.objectid;
-        let target_is_dir = t.ftype == format::FT_DIR;
-        if source_is_dir != target_is_dir {
-            return Err(FsError::InvalidData); // EISDIR / ENOTDIR
-        }
-        let t_ibody = btree::find_item(
-            vol,
-            fs_root,
-            &BtrfsKey::new(t_ino, format::INODE_ITEM_KEY, 0),
-        )
-        .await?
-        .ok_or(FsError::NotFound)?;
-        if InodeItem::decode(&t_ibody)?.nlink != 1 {
-            return Err(FsError::Unsupported); // hardlinked target
-        }
-        let mut ed_offsets = Vec::new();
-        let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(t_ino, 0, 0)).await?;
-        while let Some((k, body)) = cursor.current()? {
-            if k.objectid != t_ino {
-                break;
-            }
-            match k.item_type {
-                format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
-                format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => {
-                    // A directory target must be empty.
-                    return Err(FsError::Busy);
-                }
-                format::EXTENT_DATA_KEY if !target_is_dir => {
-                    ed_offsets.push(k.offset);
-                    if body.len() >= 37 && body[20] != format::FILE_EXTENT_INLINE {
-                        let db = le64(body, 21)?;
-                        let dn = le64(body, 29)?;
-                        if db != 0 {
-                            freed_data.push((db, dn));
-                        }
-                    }
-                }
-                _ => return Err(FsError::Unsupported), // xattrs etc.
-            }
-            cursor.advance().await?;
-        }
-        let t_ref = BtrfsKey::new(t_ino, format::INODE_REF_KEY, parent_ino);
-        let t_ref_body = btree::find_item(vol, fs_root, &t_ref)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        let (t_index, t_single) = inode_ref_index(&t_ref_body, new_bytes)?;
-        if !t_single {
-            return Err(FsError::Unsupported);
-        }
-        target = Some((t_ino, t_index, ed_offsets));
+        target = Some(
+            prepare_rename_target(vol, fs_root, parent_ino, new_name, &t, source_is_dir, gen)
+                .await?,
+        );
     }
     let overwrite = target.is_some();
+    let freed_data = target
+        .as_mut()
+        .map_or_else(Vec::new, |target| core::mem::take(&mut target.freed_data));
 
-    // The source's INODE_REF back to this dir gives its current DIR_INDEX offset.
+    // Re-key only this source name inside its potentially packed INODE_REF.
     let ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, parent_ino);
     let ref_body = btree::find_item(vol, fs_root, &ref_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let (old_index, single_ref) = inode_ref_index(&ref_body, old_bytes)?;
-    if !single_ref {
-        return Err(FsError::Unsupported);
-    }
+    let (old_index, mut ref_remaining) = inode_ref_remove(&ref_body, old_bytes)?;
     let new_index = next_dir_index(vol, fs_root, parent_ino).await?;
+    ref_remaining.extend_from_slice(&inode_ref(new_index, new_bytes));
 
-    let gen = vol.superblock().generation + 1;
     let alloc = Allocator::build(vol).await?;
 
     // Adjust the parent dir `i_size` (each name counts twice: DIR_ITEM +
@@ -3787,7 +3876,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
             BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
             di.clone()
         ),
-        Edit::Upsert(ref_key, inode_ref(new_index, new_bytes)),
+        Edit::Upsert(ref_key, ref_remaining),
     ];
     if old_di_key == new_di_key {
         let mut bucket = remove_dir_item(&old_di_body, old_name)?;
@@ -3810,29 +3899,8 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
         edits.push(Edit::Upsert(new_di_key, new_bucket));
     }
-    if let Some((t_ino, t_index, ed_offsets)) = &target {
-        edits.push(Edit::Delete(BtrfsKey::new(
-            parent_ino,
-            format::DIR_INDEX_KEY,
-            *t_index,
-        )));
-        edits.push(Edit::Delete(BtrfsKey::new(
-            *t_ino,
-            format::INODE_REF_KEY,
-            parent_ino,
-        )));
-        edits.push(Edit::Delete(BtrfsKey::new(
-            *t_ino,
-            format::INODE_ITEM_KEY,
-            0,
-        )));
-        for off in ed_offsets {
-            edits.push(Edit::Delete(BtrfsKey::new(
-                *t_ino,
-                format::EXTENT_DATA_KEY,
-                *off,
-            )));
-        }
+    if let Some(target) = target {
+        target.append_edits(&mut edits);
     }
 
     commit_fs_edits(vol, gen, alloc, &edits, freed_data, Vec::new()).await?;
@@ -3881,8 +3949,9 @@ async fn is_ancestor_or_self<B: BlockDevice + 'static>(
 ///
 /// Scope (else the noted error): `new_parent != old_parent`; a directory may not
 /// move into its own subtree (`InvalidData`); an overwrite target must match kind
-/// (`InvalidData`), be unshared (`nlink == 1`), and — for a directory — be empty
-/// (`Busy`) and xattr-free (`Unsupported`). Colliding peer names are preserved.
+/// (`InvalidData`) and a directory target must be empty (`Busy`). Hardlinked
+/// files and xattrs follow the same preservation/reclamation rules as same-dir
+/// rename. Colliding peer names and packed hardlink refs are preserved.
 pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     old_parent: u64,
@@ -3919,21 +3988,19 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     let child_ino = entry.location.objectid;
     let ftype = entry.ftype;
     let source_is_dir = ftype == format::FT_DIR;
+    let gen = vol.superblock().generation + 1;
 
     // A directory must not move into itself or a descendant (would orphan a loop).
     if source_is_dir && is_ancestor_or_self(vol, fs_root, child_ino, new_parent).await? {
         return Err(FsError::InvalidData);
     }
 
-    // The source's INODE_REF back to the old parent gives its current index.
+    // Remove only this name from the source's possibly packed old-parent ref.
     let old_ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, old_parent);
     let old_ref_body = btree::find_item(vol, fs_root, &old_ref_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let (old_index, single_ref) = inode_ref_index(&old_ref_body, old_bytes)?;
-    if !single_ref {
-        return Err(FsError::Unsupported);
-    }
+    let (old_index, old_ref_remaining) = inode_ref_remove(&old_ref_body, old_bytes)?;
 
     // Resolve the destination in the new parent (may exist -> overwrite).
     let new_di_key = BtrfsKey::new(
@@ -3941,8 +4008,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         format::DIR_ITEM_KEY,
         u64::from(name_hash(new_bytes)),
     );
-    let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
-    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    let mut target: Option<RenameTarget> = None;
     let new_di_body = btree::find_item(vol, fs_root, &new_di_key).await?;
     let target_entry = match &new_di_body {
         Some(body) => decode_dir_items(body)?
@@ -3951,61 +4017,27 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         None => None,
     };
     if let Some(t) = target_entry {
-        if t.location.item_type != format::INODE_ITEM_KEY {
-            return Err(FsError::Unsupported);
+        if t.location.objectid == child_ino && t.location.item_type == format::INODE_ITEM_KEY {
+            return Ok(());
         }
-        let t_ino = t.location.objectid;
-        let target_is_dir = t.ftype == format::FT_DIR;
-        if source_is_dir != target_is_dir {
-            return Err(FsError::InvalidData);
-        }
-        let t_ibody = btree::find_item(
-            vol,
-            fs_root,
-            &BtrfsKey::new(t_ino, format::INODE_ITEM_KEY, 0),
-        )
-        .await?
-        .ok_or(FsError::NotFound)?;
-        if InodeItem::decode(&t_ibody)?.nlink != 1 {
-            return Err(FsError::Unsupported);
-        }
-        let mut ed_offsets = Vec::new();
-        let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(t_ino, 0, 0)).await?;
-        while let Some((k, body)) = cursor.current()? {
-            if k.objectid != t_ino {
-                break;
-            }
-            match k.item_type {
-                format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
-                format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => return Err(FsError::Busy),
-                format::EXTENT_DATA_KEY if !target_is_dir => {
-                    ed_offsets.push(k.offset);
-                    if body.len() >= 37 && body[20] != format::FILE_EXTENT_INLINE {
-                        let db = le64(body, 21)?;
-                        let dn = le64(body, 29)?;
-                        if db != 0 {
-                            freed_data.push((db, dn));
-                        }
-                    }
-                }
-                _ => return Err(FsError::Unsupported),
-            }
-            cursor.advance().await?;
-        }
-        let t_ref = BtrfsKey::new(t_ino, format::INODE_REF_KEY, new_parent);
-        let t_ref_body = btree::find_item(vol, fs_root, &t_ref)
-            .await?
-            .ok_or(FsError::NotFound)?;
-        let (t_index, t_single) = inode_ref_index(&t_ref_body, new_bytes)?;
-        if !t_single {
-            return Err(FsError::Unsupported);
-        }
-        target = Some((t_ino, t_index, ed_offsets));
+        target = Some(
+            prepare_rename_target(vol, fs_root, new_parent, new_name, &t, source_is_dir, gen)
+                .await?,
+        );
     }
     let overwrite = target.is_some();
+    let freed_data = target
+        .as_mut()
+        .map_or_else(Vec::new, |target| core::mem::take(&mut target.freed_data));
     let new_index = next_dir_index(vol, fs_root, new_parent).await?;
 
-    let gen = vol.superblock().generation + 1;
+    // Preserve any other source links already present in the destination dir.
+    let new_ref_key = BtrfsKey::new(child_ino, format::INODE_REF_KEY, new_parent);
+    let mut new_ref_body = btree::find_item(vol, fs_root, &new_ref_key)
+        .await?
+        .unwrap_or_default();
+    new_ref_body.extend_from_slice(&inode_ref(new_index, new_bytes));
+
     let alloc = Allocator::build(vol).await?;
 
     // Both parents' `i_size` change: the old parent loses the source name; the new
@@ -4056,15 +4088,16 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
             new_pinode
         ),
         Edit::Delete(BtrfsKey::new(old_parent, format::DIR_INDEX_KEY, old_index)),
-        Edit::Delete(old_ref_key),
+        if old_ref_remaining.is_empty() {
+            Edit::Delete(old_ref_key)
+        } else {
+            Edit::Upsert(old_ref_key, old_ref_remaining)
+        },
         Edit::Upsert(
             BtrfsKey::new(new_parent, format::DIR_INDEX_KEY, new_index),
             di.clone()
         ),
-        Edit::Upsert(
-            BtrfsKey::new(child_ino, format::INODE_REF_KEY, new_parent),
-            inode_ref(new_index, new_bytes),
-        ),
+        Edit::Upsert(new_ref_key, new_ref_body),
     ];
     let old_bucket = remove_dir_item(&old_di_body, old_name)?;
     edits.push(if old_bucket.is_empty() {
@@ -4078,29 +4111,8 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     }
     new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
     edits.push(Edit::Upsert(new_di_key, new_bucket));
-    if let Some((t_ino, t_index, ed_offsets)) = &target {
-        edits.push(Edit::Delete(BtrfsKey::new(
-            new_parent,
-            format::DIR_INDEX_KEY,
-            *t_index,
-        )));
-        edits.push(Edit::Delete(BtrfsKey::new(
-            *t_ino,
-            format::INODE_REF_KEY,
-            new_parent,
-        )));
-        edits.push(Edit::Delete(BtrfsKey::new(
-            *t_ino,
-            format::INODE_ITEM_KEY,
-            0,
-        )));
-        for off in ed_offsets {
-            edits.push(Edit::Delete(BtrfsKey::new(
-                *t_ino,
-                format::EXTENT_DATA_KEY,
-                *off,
-            )));
-        }
+    if let Some(target) = target {
+        target.append_edits(&mut edits);
     }
 
     commit_fs_edits(vol, gen, alloc, &edits, freed_data, Vec::new()).await?;

@@ -2367,6 +2367,271 @@ fn smoke_btrfs_rename_overwrite_file() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_rename_overwrite_file);
 
+/// Rename-overwrite edits hardlink refs record-by-record: hardlinked source and
+/// target peers survive with correct link counts/data/xattrs, while a last-link
+/// target (and an ordinary last-link unlink) reclaims its xattr items.
+fn smoke_btrfs_rename_hardlink_xattr_overwrite() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let root = vol.root();
+
+    // Both source and destination have a peer in the same packed INODE_REF.
+    let source = match poll_once(root.create("rename-source")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir source creation failed"),
+    };
+    let source_ino = source.ino();
+    let source_data = b"same-dir source\n";
+    if !matches!(poll_once(source.write(0, source_data)), Some(Ok(_)))
+        || !matches!(
+            poll_once(source.set_xattr("user.source", b"kept", 0)),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.link("rename-source", "rename-source-peer")),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("same-dir source setup failed");
+    }
+    let victim = match poll_once(root.create("rename-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir target creation failed"),
+    };
+    let victim_ino = victim.ino();
+    let victim_data = b"same-dir victim\n";
+    if !matches!(poll_once(victim.write(0, victim_data)), Some(Ok(_)))
+        || !matches!(
+            poll_once(victim.set_xattr("user.victim", b"survives", 0)),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.link("rename-target", "rename-target-peer")),
+            Some(Ok(()))
+        )
+        || !matches!(
+            poll_once(root.rename("rename-source", "rename-target")),
+            Some(Ok(()))
+        )
+    {
+        return TestResult::Fail("same-dir hardlink overwrite failed");
+    }
+
+    // A last-link xattr-bearing destination is reclaimed completely.
+    let doomed = match poll_once(root.create("rename-doomed")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link target creation failed"),
+    };
+    let doomed_ino = doomed.ino();
+    if !matches!(
+        poll_once(doomed.set_xattr("user.doomed", b"remove", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("last-link target xattr setup failed");
+    }
+    let replacement = match poll_once(root.create("rename-replacement")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link replacement creation failed"),
+    };
+    let replacement_data = b"replacement\n";
+    if !matches!(
+        poll_once(replacement.write(0, replacement_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(root.rename("rename-replacement", "rename-doomed")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("xattr-bearing last-link overwrite failed");
+    }
+
+    // Last-link unlink follows the same inode teardown rule.
+    let unlinked = match poll_once(root.create("unlink-xattr")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("xattr unlink target creation failed"),
+    };
+    let unlinked_ino = unlinked.ino();
+    if !matches!(
+        poll_once(unlinked.set_xattr("user.unlink", b"remove", 0)),
+        Some(Ok(()))
+    ) || !matches!(poll_once(root.unlink("unlink-xattr")), Some(Ok(())))
+    {
+        return TestResult::Fail("xattr-bearing unlink failed");
+    }
+
+    // Cross-directory: the source already has a peer in the destination and
+    // the overwritten target has another peer there too.
+    if !matches!(poll_once(root.mkdir("rename-src-dir")), Some(Ok(_)))
+        || !matches!(poll_once(root.mkdir("rename-dst-dir")), Some(Ok(_)))
+    {
+        return TestResult::Fail("cross-dir setup mkdir failed");
+    }
+    let src_dir = match poll_once(root.lookup_dir_async("rename-src-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("cross-dir source lookup failed"),
+    };
+    let dst_dir = match poll_once(root.lookup_dir_async("rename-dst-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("cross-dir destination lookup failed"),
+    };
+    let cross_source = match poll_once(src_dir.create("cross-source")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir source creation failed"),
+    };
+    let cross_source_ino = cross_source.ino();
+    let cross_source_data = b"cross-dir source\n";
+    if !matches!(
+        poll_once(cross_source.write(0, cross_source_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(src_dir.link_to("cross-source", &*dst_dir, "cross-source-peer")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("cross-dir source hardlink setup failed");
+    }
+    let cross_target = match poll_once(dst_dir.create("cross-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir target creation failed"),
+    };
+    let cross_target_ino = cross_target.ino();
+    let cross_target_data = b"cross-dir victim\n";
+    if !matches!(
+        poll_once(cross_target.write(0, cross_target_data)),
+        Some(Ok(_))
+    ) || !matches!(
+        poll_once(cross_target.set_xattr("user.cross-victim", b"kept", 0)),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once(dst_dir.link("cross-target", "cross-target-peer")),
+        Some(Ok(()))
+    ) || !matches!(
+        poll_once(src_dir.rename_to("cross-source", &*dst_dir, "cross-target", 0)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("cross-dir hardlink overwrite failed");
+    }
+    // Both destination names now identify the moved source; POSIX specifies a
+    // successful no-op when renaming one hardlink over the other.
+    if !matches!(
+        poll_once(dst_dir.rename("cross-target", "cross-source-peer")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("same-inode rename was not a successful no-op");
+    }
+
+    let remounted = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("hardlink/xattr rename remount failed"),
+    };
+    let root = remounted.root();
+    if poll_once(root.lookup_async("rename-source")).is_some_and(|result| result.is_ok()) {
+        return TestResult::Fail("same-dir source name survived overwrite");
+    }
+    let renamed = match poll_once(root.lookup_async("rename-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir renamed source missing"),
+    };
+    let source_peer = match poll_once(root.lookup_async("rename-source-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir source peer missing"),
+    };
+    if renamed.ino() != source_ino
+        || source_peer.ino() != source_ino
+        || read_all(&renamed, source_data.len() + 8).as_deref() != Some(source_data)
+        || poll_once(renamed.get_xattr("user.source")).map(|result| result.ok())
+            != Some(Some(b"kept".to_vec()))
+        || !matches!(poll_once(renamed.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 2)
+    {
+        return TestResult::Fail("same-dir source refs/data/xattrs changed");
+    }
+    let victim_peer = match poll_once(root.lookup_async("rename-target-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("same-dir target peer missing"),
+    };
+    if victim_peer.ino() != victim_ino
+        || read_all(&victim_peer, victim_data.len() + 8).as_deref() != Some(victim_data)
+        || poll_once(victim_peer.get_xattr("user.victim")).map(|result| result.ok())
+            != Some(Some(b"survives".to_vec()))
+        || !matches!(poll_once(victim_peer.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 1)
+    {
+        return TestResult::Fail("same-dir target peer was not preserved");
+    }
+    let replaced = match poll_once(root.lookup_async("rename-doomed")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("last-link replacement missing"),
+    };
+    if read_all(&replaced, replacement_data.len() + 8).as_deref() != Some(replacement_data)
+        || poll_once(root.lookup_async("rename-replacement")).is_some_and(|result| result.is_ok())
+    {
+        return TestResult::Fail("last-link replacement namespace/data wrong");
+    }
+    let fs_root = remounted.fs_tree_root().0;
+    for ino in [doomed_ino, unlinked_ino] {
+        match poll_once(btree::collect_for(
+            &*remounted,
+            fs_root,
+            ino,
+            format::XATTR_ITEM_KEY,
+        )) {
+            Some(Ok(items)) if items.is_empty() => {}
+            Some(Ok(_)) => return TestResult::Fail("reclaimed inode left orphaned xattrs"),
+            _ => return TestResult::Fail("reclaimed inode xattr scan failed"),
+        }
+    }
+
+    let src_dir = match poll_once(root.lookup_dir_async("rename-src-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("remounted cross-dir source missing"),
+    };
+    let dst_dir = match poll_once(root.lookup_dir_async("rename-dst-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("remounted cross-dir destination missing"),
+    };
+    if poll_once(src_dir.lookup_async("cross-source")).is_some_and(|result| result.is_ok()) {
+        return TestResult::Fail("cross-dir source name survived move");
+    }
+    let cross_renamed = match poll_once(dst_dir.lookup_async("cross-target")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir renamed source missing"),
+    };
+    let cross_source_peer = match poll_once(dst_dir.lookup_async("cross-source-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir source peer missing"),
+    };
+    if cross_renamed.ino() != cross_source_ino
+        || cross_source_peer.ino() != cross_source_ino
+        || read_all(&cross_renamed, cross_source_data.len() + 8).as_deref()
+            != Some(cross_source_data)
+        || !matches!(poll_once(cross_renamed.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 2)
+    {
+        return TestResult::Fail("cross-dir source refs/data changed");
+    }
+    let cross_target_peer = match poll_once(dst_dir.lookup_async("cross-target-peer")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("cross-dir target peer missing"),
+    };
+    if cross_target_peer.ino() != cross_target_ino
+        || read_all(&cross_target_peer, cross_target_data.len() + 8).as_deref()
+            != Some(cross_target_data)
+        || poll_once(cross_target_peer.get_xattr("user.cross-victim")).map(|result| result.ok())
+            != Some(Some(b"kept".to_vec()))
+        || !matches!(poll_once(cross_target_peer.statx_async(0, 0x7ff)), Some(Ok(stat)) if stat.nlink == 1)
+    {
+        return TestResult::Fail("cross-dir target peer was not preserved");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_rename_hardlink_xattr_overwrite
+);
+
 /// Cross-directory `rename` (`rename_to`) moves a file into another directory: it
 /// leaves the old parent, appears in the new one under the new name with its
 /// content intact, and survives a remount.
