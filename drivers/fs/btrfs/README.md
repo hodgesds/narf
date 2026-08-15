@@ -2,7 +2,8 @@
 
 A clean-room, read-write btrfs driver for single-device filesystems. It supports
 Linux-interoperable COW file and namespace mutations, all four checksum types,
-compressed reads, writable subvolumes, and native subvolume/snapshot ioctls.
+compressed reads, writable subvolumes, native subvolume/snapshot ioctls, and
+both full and simple qgroup quota modes.
 On-disk structures follow Linux's `include/uapi/linux/btrfs_tree.h` definitions;
 no C code is copied.
 
@@ -91,13 +92,27 @@ real laptop's btrfs root looks like.
   level-0 qgroup. `max_rfer` / `max_excl` hard limits reject the transaction
   atomically with `QuotaExceeded` (`EDQUOT`). The quota tree is whole-repacked;
   correctness is preferred over Linux's delayed-ref performance model.
-- Full-qgroup administration through `BTRFS_IOC_QUOTA_CTL`,
+- **Simple quotas** (`QUOTA_CTL_ENABLE_SIMPLE_QUOTA`) use Linux's permanent-owner
+  model. Enabling records an `enable_gen`, sets the sticky `SIMPLE_QUOTA`
+  incompat bit, creates zero-usage level-0 qgroups, and deliberately does not
+  charge pre-enable extents or run a rescan. New data and metadata carry a
+  permanent subvolume owner; allocation and final release apply incremental
+  signed deltas with referenced and exclusive usage kept equal. Higher-level
+  parents receive the sum of their unique level-0 descendants and enforce the
+  same hard limits. Shared-root snapshots start at zero usage, auto-inherit the
+  destination subvolume's direct parents when no explicit inheritance record is
+  supplied, and charge only later private COW allocations. A deleted subvolume's
+  nonzero qgroup remains until all extents it permanently owns receive their
+  final debit. Disabling removes the quota tree but intentionally preserves the
+  incompat bit and on-disk owner refs; a later full-qgroup enable accepts them.
+- Quota administration through `BTRFS_IOC_QUOTA_CTL`,
   `QGROUP_CREATE`/`QGROUP_ASSIGN`/`QGROUP_LIMIT`, and
-  `QUOTA_RESCAN`/`STATUS`/`WAIT`. Enabling quotas creates level-0 groups for
-  every existing subvolume and completes an exact synchronous rescan; disabling
+  `QUOTA_RESCAN`/`STATUS`/`WAIT`. Full-mode enable creates level-0 groups for
+  every existing subvolume and completes an exact synchronous rescan; simple
+  mode reports `SIMPLE_MODE` and rejects rescans, as Linux does. Disabling
   removes and reclaims the complete quota tree. Higher-level group creation,
   bidirectional assignment, limit replacement, unassignment and destruction
-  are atomic with their recount.
+  are atomic with accounting updates in either mode.
 - Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
@@ -131,8 +146,7 @@ than mis-read:
 - Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
   RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
-  child explicitly to write it). Simple quotas (`QUOTA_CTL_ENABLE_SIMPLE_QUOTA`)
-  are not supported; the full-qgroup interface is supported.
+  child explicitly to write it).
 - A symlink target larger than Linux's inline item bound (Btrfs has no regular-
   extent symlink representation); a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a non-empty-directory target.
@@ -297,9 +311,15 @@ cross-sector reads, partial COW writes, remount, and checksum verification.
 `fixture-quota.img.sparse` is a Linux-created full-qgroup image with level-0
 `0/5` assigned to `1/100`; tests cover recounting, V2 create/snapshot
 inheritance, hierarchy relations, hard-limit `EDQUOT`, and lifecycle cleanup.
+`fixture-squota.img.sparse` is a Linux-created simple-quota image with
+post-enable data carrying an `EXTENT_OWNER_REF` and `0/5` assigned to `1/200`.
+Tests cover Linux-image compatibility, incremental owner accounting, hierarchy
+propagation, destination-parent inheritance, shared-root snapshot isolation,
+orphan-owner final debits, hard-limit atomicity, remount durability, disable
+semantics, and transition back to full qgroups.
 The ordinary no-quota fixture also exercises the complete quota administration
-lifecycle: enable/rescan, create/assign/limit, unassign/destroy, disable, and
-remount.
+lifecycle in both modes: enable, full-mode rescan, create/assign/limit,
+unassign/destroy, disable, and remount.
 `fixture-fst.img.sparse` is the same small layout as `fixture.img.sparse` but with
 a **free-space tree** (`space_cache=v2`), exercising the write path's free-space-
 tree maintenance. `fixture-mirror.img.sparse` is a **96 MiB** mixed + free-space-

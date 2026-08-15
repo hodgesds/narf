@@ -37,7 +37,7 @@ pub(crate) const BTRFS_IOC_SNAP_DESTROY_V2: u32 = 0x5000_943f;
 pub(crate) const BTRFS_IOC_SUBVOL_GETFLAGS: u32 = 0x8008_9419;
 /// `_IOW(BTRFS_IOCTL_MAGIC, 26, __u64)` from Linux `uapi/linux/btrfs.h`.
 pub(crate) const BTRFS_IOC_SUBVOL_SETFLAGS: u32 = 0x4008_941a;
-/// Full-qgroup administration ioctls from Linux `uapi/linux/btrfs.h`.
+/// Full- and simple-qgroup administration ioctls from Linux `uapi/linux/btrfs.h`.
 pub(crate) const BTRFS_IOC_QUOTA_CTL: u32 = 0xc010_9428;
 pub(crate) const BTRFS_IOC_QGROUP_ASSIGN: u32 = 0x4018_9429;
 pub(crate) const BTRFS_IOC_QGROUP_CREATE: u32 = 0x4010_942a;
@@ -374,8 +374,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     match command {
                         1 => autogrow!(vol, crate::write::quota_enable(&vol).await)?,
                         2 => crate::write::quota_disable(&vol).await?,
-                        // Simple quotas intentionally remain unsupported.
-                        4 => return Err(FsError::Unsupported),
+                        4 => autogrow!(vol, crate::write::quota_enable_simple(&vol).await)?,
                         _ => return Err(FsError::InvalidData),
                     }
                     let status = match crate::write::quota_status(&vol).await {

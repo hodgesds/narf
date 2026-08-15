@@ -30,6 +30,10 @@ const FIXTURE_SECTOR8K_SPARSE: &[u8] = include_bytes!("../testdata/fixture-secto
 /// Genuine quota-enabled image with qgroup 0/5 assigned to parent 1/100.
 const FIXTURE_QUOTA_SPARSE: &[u8] = include_bytes!("../testdata/fixture-quota.img.sparse");
 
+/// Linux-created simple-quota image with post-enable owned extents and 0/5
+/// assigned to parent 1/200.
+const FIXTURE_SQUOTA_SPARSE: &[u8] = include_bytes!("../testdata/fixture-squota.img.sparse");
+
 /// Same tree as the primary fixture but written with `--compress zlib`, so
 /// `big.dat` is a zlib-compressed regular extent.
 const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.sparse");
@@ -854,6 +858,31 @@ fn qgroup_item(
     .flatten()
 }
 
+fn qgroup_relation_present(
+    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+    child: u64,
+    parent: u64,
+) -> bool {
+    let Some(Ok((quota_root, _))) = poll_once(crate::roots::find_root(
+        vol,
+        vol.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    )) else {
+        return false;
+    };
+    [
+        BtrfsKey::new(child, format::QGROUP_RELATION_KEY, parent),
+        BtrfsKey::new(parent, format::QGROUP_RELATION_KEY, child),
+    ]
+    .into_iter()
+    .all(|key| {
+        poll_once(btree::find_item(vol, quota_root, &key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+    })
+}
+
 fn smoke_btrfs_cat_inline_and_regular() -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_fixture() {
@@ -1211,7 +1240,7 @@ kernel_test_in!(
 /// Exercise the complete full-qgroup administration lifecycle on an image
 /// created without quotas: enable + initial rescan, higher-level create,
 /// relation assignment, limit replacement, status/wait, unassign/destroy, and
-/// disable with quota-tree reclamation. Simple quotas stay explicitly rejected.
+/// disable with quota-tree reclamation.
 fn smoke_btrfs_qgroup_admin_ioctls() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
@@ -1411,16 +1440,20 @@ fn smoke_btrfs_qgroup_admin_ioctls() -> TestResult {
         return TestResult::Fail("destroyed parent qgroup items survived");
     }
 
+    // Enabling another quota mode while quotas are already active is an
+    // idempotent no-op, matching Linux; it must not switch the live mode.
     let mut simple = [0u8; 16];
     simple[0..8].copy_from_slice(&4u64.to_ne_bytes());
-    if !matches!(
-        poll_once(
+    let mode_reply =
+        match poll_once(
             vol.root()
-                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &simple, 16,)
-        ),
-        Some(Err(FsError::Unsupported))
-    ) {
-        return TestResult::Fail("simple-quota enable was not rejected precisely");
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &simple, 16),
+        ) {
+            Some(Ok(reply)) => reply,
+            _ => return TestResult::Fail("active full quotas rejected idempotent enable"),
+        };
+    if u64::from_ne_bytes(mode_reply.output[8..16].try_into().unwrap()) & (1 << 3) != 0 {
+        return TestResult::Fail("active full quotas unexpectedly switched to simple mode");
     }
 
     ctl[0..8].copy_from_slice(&2u64.to_ne_bytes());
@@ -1458,6 +1491,383 @@ fn smoke_btrfs_qgroup_admin_ioctls() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_qgroup_admin_ioctls);
+
+/// Mount a Linux-created simple-quota filesystem containing real owner refs,
+/// mutate it, and prove incremental owner accounting remains durable.
+fn smoke_btrfs_linux_simple_quota_fixture() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const PARENT: u64 = (1u64 << 48) | 200;
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_SQUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("Linux simple-quota fixture failed to mount"),
+    };
+    if vol.superblock().incompat_flags & format::INCOMPAT_SIMPLE_QUOTA == 0 {
+        return TestResult::Fail("simple-quota incompat bit was not accepted");
+    }
+    let status = qgroup_item(&vol, format::QGROUP_STATUS_KEY, 0).unwrap_or_default();
+    if status.len() < 40
+        || format::le64(&status, 16).ok() != Some(1 | (1 << 3))
+        || format::le64(&status, 32).unwrap_or(0) == 0
+    {
+        return TestResult::Fail("Linux simple-quota status was decoded incorrectly");
+    }
+    let initial =
+        qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
+    let initial_usage = format::le64(&initial, 8).unwrap_or(0);
+    if initial.len() != 40
+        || initial_usage == 0
+        || format::le64(&initial, 24).ok() != Some(initial_usage)
+    {
+        return TestResult::Fail("Linux simple-quota usage was missing or asymmetric");
+    }
+    let parent_usage = qgroup_item(&vol, format::QGROUP_INFO_KEY, PARENT)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if parent_usage != initial_usage || !qgroup_relation_present(&vol, 5, PARENT) {
+        return TestResult::Fail("Linux simple-quota parent accounting was wrong");
+    }
+
+    let linux_owned = match poll_once(vol.root().lookup_async("simple-owned.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("Linux-owned simple-quota file was missing"),
+    };
+    let (bytenr, len) = file_data_extent(&vol, linux_owned.ino()).unwrap_or((0, 0));
+    if bytenr == 0 || data_extent_owner(&vol, bytenr, len) != Some(5) {
+        return TestResult::Fail("Linux data extent owner ref was not understood");
+    }
+
+    let payload = alloc::vec![0x6du8; 20 * 1024];
+    let created = match poll_once(vol.root().create("narf-simple.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("simple-quota file create failed"),
+    };
+    if !matches!(
+        poll_once(created.write(0, &payload)),
+        Some(Ok(n)) if n == payload.len()
+    ) {
+        return TestResult::Fail("simple-quota data allocation failed");
+    }
+    let charged = qgroup_item(&vol, format::QGROUP_INFO_KEY, 5).unwrap_or_default();
+    let charged_usage = format::le64(&charged, 8).unwrap_or(0);
+    if charged_usage <= initial_usage || format::le64(&charged, 24).ok() != Some(charged_usage) {
+        return TestResult::Fail("NARF allocation did not increment simple usage");
+    }
+    let (new_bytenr, new_len) = file_data_extent(&vol, created.ino()).unwrap_or((0, 0));
+    if data_extent_owner(&vol, new_bytenr, new_len) != Some(5) {
+        return TestResult::Fail("NARF data extent omitted the simple owner ref");
+    }
+
+    let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("simple-quota fixture failed to remount"),
+    };
+    let durable = qgroup_item(&remount, format::QGROUP_INFO_KEY, 5)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    let file = match poll_once(remount.root().lookup_async("narf-simple.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("simple-quota file vanished on remount"),
+    };
+    if durable != charged_usage || read_all(&file, payload.len() + 1).as_deref() != Some(&payload) {
+        return TestResult::Fail("simple-quota accounting/data was not durable");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_linux_simple_quota_fixture);
+
+/// Exercise NARF-created simple quotas, hierarchy, shared snapshots, limits,
+/// disable semantics, and the supported transition back to full qgroups.
+fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const PARENT: u64 = (1u64 << 48) | 210;
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_SPARSE));
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("simple-quota lifecycle fixture failed to mount"),
+    };
+    let mut ctl = [0u8; 16];
+    ctl[0..8].copy_from_slice(&4u64.to_ne_bytes());
+    let reply =
+        match poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16),
+        ) {
+            Some(Ok(reply)) => reply,
+            _ => return TestResult::Fail("simple-quota enable failed"),
+        };
+    if u64::from_ne_bytes(reply.output[8..16].try_into().unwrap()) != 1 | (1 << 3)
+        || top.superblock().incompat_flags & format::INCOMPAT_SIMPLE_QUOTA == 0
+    {
+        return TestResult::Fail("simple-quota mode was not persisted/reported");
+    }
+    let initial = qgroup_item(&top, format::QGROUP_INFO_KEY, 5).unwrap_or_default();
+    if format::le64(&initial, 8).ok() != Some(0) || format::le64(&initial, 24).ok() != Some(0) {
+        return TestResult::Fail("pre-enable extents were charged by simple quotas");
+    }
+    let rescan = [0u8; 64];
+    if !matches!(
+        poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_RESCAN, 0, &rescan, 0,)
+        ),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("simple quotas incorrectly accepted a rescan");
+    }
+
+    let mut create_group = [0u8; 16];
+    create_group[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    create_group[8..16].copy_from_slice(&PARENT.to_ne_bytes());
+    if !matches!(
+        poll_once(top.root().ioctl_async(
+            crate::node::BTRFS_IOC_QGROUP_CREATE,
+            0,
+            &create_group,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("simple parent qgroup create failed");
+    }
+    let mut assign = [0u8; 24];
+    assign[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    assign[8..16].copy_from_slice(&5u64.to_ne_bytes());
+    assign[16..24].copy_from_slice(&PARENT.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_ASSIGN, 0, &assign, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("simple parent assignment failed");
+    }
+
+    let top_payload = alloc::vec![0x35u8; 9 * 1024];
+    let top_file = match poll_once(top.root().create("simple-new.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("simple top-level file create failed"),
+    };
+    if !matches!(
+        poll_once(top_file.write(0, &top_payload)),
+        Some(Ok(n)) if n == top_payload.len()
+    ) {
+        return TestResult::Fail("simple top-level allocation failed");
+    }
+    let top_usage = qgroup_item(&top, format::QGROUP_INFO_KEY, 5)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if top_usage == 0
+        || qgroup_item(&top, format::QGROUP_INFO_KEY, PARENT)
+            .and_then(|body| format::le64(&body, 8).ok())
+            .unwrap_or(0)
+            != top_usage
+    {
+        return TestResult::Fail("simple owner/parent charging did not advance");
+    }
+
+    let child_id = match poll_once(crate::write::create_subvolume(
+        &top,
+        format::FIRST_FREE_OBJECTID,
+        "simple-child",
+        false,
+    )) {
+        Some(Ok(id)) => id,
+        _ => return TestResult::Fail("simple child subvolume create failed"),
+    };
+    if !qgroup_relation_present(&top, child_id, PARENT) {
+        return TestResult::Fail("simple child did not auto-inherit destination parents");
+    }
+    let child_usage = qgroup_item(&top, format::QGROUP_INFO_KEY, child_id)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if child_usage < top.nodesize() as u64 {
+        return TestResult::Fail("simple child metadata was not owner-charged");
+    }
+
+    let child_dir = match poll_once(top.root().lookup_dir_async("simple-child")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("simple child traversal failed"),
+    };
+    if !matches!(
+        poll_once(top.root().snapshot_async(child_dir, "simple-snap", false)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("simple shared-root snapshot create failed");
+    }
+    let snapshot = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("simple-snap".into())),
+    )) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("simple snapshot failed to mount"),
+    };
+    let snapshot_id = snapshot.fs_tree_id();
+    if qgroup_item(&snapshot, format::QGROUP_INFO_KEY, snapshot_id)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(u64::MAX)
+        != 0
+        || !qgroup_relation_present(&snapshot, snapshot_id, PARENT)
+    {
+        return TestResult::Fail("shared snapshot was charged or missed auto-inheritance");
+    }
+
+    // The source qgroup cannot disappear while the shared root still contains
+    // metadata permanently owned by it. Once the snapshot COWs that final
+    // holder, the debit must still find the orphaned qgroup.
+    let top_for_delete = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("top remount before simple child delete failed"),
+    };
+    if !matches!(
+        poll_once(crate::write::destroy_subvolume(
+            &top_for_delete,
+            format::FIRST_FREE_OBJECTID,
+            Some("simple-child"),
+            None,
+        )),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("simple shared-root source deletion failed");
+    }
+    let orphan_usage = qgroup_item(&top_for_delete, format::QGROUP_INFO_KEY, child_id)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if orphan_usage != child_usage {
+        return TestResult::Fail("simple source qgroup was dropped before its final debit");
+    }
+    let snapshot = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(snapshot_id)),
+    )) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("simple snapshot remount after source delete failed"),
+    };
+
+    let snap_payload = alloc::vec![0xabu8; 12 * 1024];
+    let snap_file = match poll_once(snapshot.root().create("snapshot-owned.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("simple snapshot private create failed"),
+    };
+    if !matches!(
+        poll_once(snap_file.write(0, &snap_payload)),
+        Some(Ok(n)) if n == snap_payload.len()
+    ) {
+        return TestResult::Fail("simple snapshot-local allocation failed");
+    }
+    let snap_usage = qgroup_item(&snapshot, format::QGROUP_INFO_KEY, snapshot_id)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if snap_usage == 0 {
+        return TestResult::Fail("simple snapshot-local allocation was not charged");
+    }
+    let debited_orphan = qgroup_item(&snapshot, format::QGROUP_INFO_KEY, child_id)
+        .and_then(|body| format::le64(&body, 8).ok());
+    if debited_orphan != Some(0) {
+        return TestResult::Fail("simple orphan qgroup missed its final owner debit");
+    }
+
+    let mut limit = [0u8; 48];
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes());
+    limit[16..24].copy_from_slice(&snap_usage.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            snapshot
+                .root()
+                .ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("simple hard-limit install failed");
+    }
+    let too_large = alloc::vec![0xccu8; 32 * 1024];
+    if !matches!(
+        poll_once(snap_file.write(0, &too_large)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("simple hard limit did not return QuotaExceeded");
+    }
+    let snap_file_after = match poll_once(snapshot.root().lookup_async("snapshot-owned.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("simple-limited file vanished after rejection"),
+    };
+    if read_all(&snap_file_after, snap_payload.len() + 1).as_deref()
+        != Some(snap_payload.as_slice())
+    {
+        return TestResult::Fail("simple hard-limit rejection was not atomic");
+    }
+
+    let top = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("top remount before simple disable failed"),
+    };
+    ctl[0..8].copy_from_slice(&2u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("simple quota disable failed");
+    }
+    let disabled = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(vol)) => vol,
+        _ => return TestResult::Fail("simple-disabled filesystem failed to remount"),
+    };
+    if disabled.superblock().incompat_flags & format::INCOMPAT_SIMPLE_QUOTA == 0
+        || qgroup_item(&disabled, format::QGROUP_STATUS_KEY, 0).is_some()
+    {
+        return TestResult::Fail("simple disable cleared owner format or retained quota tree");
+    }
+
+    ctl[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            disabled
+                .root()
+                .ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("simple-to-full quota transition failed");
+    }
+    let full_status = qgroup_item(&disabled, format::QGROUP_STATUS_KEY, 0).unwrap_or_default();
+    if format::le64(&full_status, 16).ok() != Some(1) {
+        return TestResult::Fail("full re-enable retained simple mode status");
+    }
+    let old_simple_file = match poll_once(disabled.root().lookup_async("simple-new.dat")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("old simple-owned file vanished after full enable"),
+    };
+    if !matches!(
+        poll_once(old_simple_file.write(0, b"full-mode")),
+        Some(Ok(9))
+    ) {
+        return TestResult::Fail("full quotas could not update an owner-ref extent");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_simple_quota_lifecycle);
 
 /// Mount genuine mkfs images using every alternate checksum, COW-write regular
 /// data, remount through the newly checksummed metadata/superblock, and verify
@@ -1964,6 +2374,30 @@ fn file_data_extent<B: narf_block::BlockDevice + 'static>(
     .ok()?;
     let (_k, body) = items.first()?;
     Some((format::le64(body, 21).ok()?, format::le64(body, 29).ok()?))
+}
+
+fn data_extent_owner<B: narf_block::BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    logical: u64,
+    length: u64,
+) -> Option<u64> {
+    let (root_tree, _) = vol.root_tree_root();
+    let (extent_root, _) = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::EXTENT_TREE_OBJECTID,
+    ))?
+    .ok()?;
+    let body = poll_once(btree::find_item(
+        vol,
+        extent_root,
+        &BtrfsKey::new(logical, format::EXTENT_ITEM_KEY, length),
+    ))?
+    .ok()??;
+    if body.get(24).copied()? != 172 {
+        return None;
+    }
+    format::le64(&body, 25).ok()
 }
 
 /// Whether the extent tree has an `EXTENT_ITEM` for `(logical, length)`.
