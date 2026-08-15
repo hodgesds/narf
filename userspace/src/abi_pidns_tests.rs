@@ -324,3 +324,89 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_capset_self_pid_in_caller_pid_ns
 );
+
+// ── #20 migrate_pages(pid) — Linux mm/migrate.c:2541 `find_task_by_vpid` ──
+//
+// The self-check `arg0 != task && arg0 != visible_pid` compared the inner pid
+// against the outer self pid → spurious EPERM in a container. The fix translates
+// arg0 first. With arg0 = the worker's own inner pid and maxnode = 0, a PASSING
+// self-check falls through to the next validation (EINVAL); a FAILING one
+// returns EPERM.
+fn smoke_abi_pidns_migrate_pages_self_pid_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xF200;
+        const MANAGER_PID: u64 = 0xF010;
+        const WORKER_TASK: u64 = 0xF201;
+        const WORKER_PID: u64 = 0xF011;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(WORKER_TASK);
+            match call(Syscall::MigratePages.raw(), a3(2, 0, 0, 0)) {
+                Some(-22) => Ok(()),
+                Some(-1) => Err("migrate_pages rejected the caller's OWN in-namespace pid with EPERM — arg0 compared untranslated against the outer self pid"),
+                _ => Err("migrate_pages returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_migrate_pages_self_pid_in_caller_pid_ns
+);
+
+// ── #20 move_pages(pid) — Linux mm/migrate.c `find_task_by_vpid` ──
+//
+// Same untranslated self-comparison. With arg0 = the worker's own inner pid and
+// valid page/status pointers, a PASSING self-check falls through to
+// current_address_space() (absent in the ABI harness → InvalidOp, so `call`
+// yields None); a FAILING one returns EPERM.
+fn smoke_abi_pidns_move_pages_self_pid_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xF210;
+        const MANAGER_PID: u64 = 0xF020;
+        const WORKER_TASK: u64 = 0xF211;
+        const WORKER_PID: u64 = 0xF021;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(WORKER_TASK);
+            let pages = [0u64; 1];
+            let mut status = [0i32; 1];
+            let args = SyscallArgs {
+                arg0: 2, // caller's own inner pid
+                arg1: 1, // count
+                arg2: pages.as_ptr() as u64,
+                arg3: 0, // nodes == NULL (query mode)
+                arg4: status.as_mut_ptr() as u64,
+                arg5: 0, // flags
+                ..Default::default()
+            };
+            match call(Syscall::MovePages.raw(), args) {
+                None => Ok(()),
+                Some(-1) => Err("move_pages rejected the caller's OWN in-namespace pid with EPERM — arg0 compared untranslated against the outer self pid"),
+                Some(_) => Err("move_pages returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_move_pages_self_pid_in_caller_pid_ns
+);
