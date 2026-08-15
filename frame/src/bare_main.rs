@@ -2884,7 +2884,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // target/narf-nvme-btrfs.img /mnt && head -c 17 /mnt/big.dat`).
             // NotPresent when no btrfs disk is attached, so distro boots are
             // unaffected.
-            narf_init::register(narf_init::Stage::Late, "btrfs-write-smoke", || {
+            // This is an on-disk interop stress, not a normal device probe. Under
+            // QEMU TCG the deliberate multi-tree split workload takes about a
+            // minute, so give it a verification-sized budget instead of emitting
+            // the 500 ms default-probe warning on every successful run.
+            let btrfs_write_smoke = || {
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 const MARKER: &[u8] = b"NARF-WROTE-THIS!\n";
                 for entry in &narf_block::block_devices() {
@@ -3122,7 +3126,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                 }
                 narf_init::InitResult::NotPresent
-            });
+            };
+            narf_init::register_with_budget(
+                narf_init::Stage::Late,
+                "btrfs-write-smoke",
+                btrfs_write_smoke,
+                120_000,
+            );
 
             // Populate /sys/class/input/event<N> from the live evdev router.
             // The early filesystem populate_all() ran before the virtio

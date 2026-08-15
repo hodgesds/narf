@@ -137,6 +137,10 @@ argument = "User-stack sampling resolves bytes only through the sampled AddressS
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit changes only the diagnostic time budget attached to the existing verification-only Btrfs interop initcall. It adds no trusted subsystem, execution path, authority, capability, mapping, domain transition, or ownership change; the initcall body and result handling are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The scheduler and frame edits add forward-progress accounting, idle-state reporting, and fatal-path stall diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
 
 [[invariants_preserved]]

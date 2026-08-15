@@ -3513,7 +3513,13 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let mut prev_ext_root = 0u64;
     let mut fst_leaves = usize::from(fst_base.is_some());
 
-    for _ in 0..12 {
+    // A split extent tree can require more than a dozen rounds: recording the
+    // prior round's new extent-tree nodes may COW additional paths, whose nodes
+    // must themselves be recorded in the following round. The sequence is
+    // bounded and monotonic on supported trees, but the 12-round historical cap
+    // cut off a real 14-round convergence during the NVMe late-init smoke.
+    const MAX_FIXED_POINT_ROUNDS: usize = 64;
+    for _ in 0..MAX_FIXED_POINT_ROUNDS {
         alloc.restore(&base);
         let csum_addrs = alloc_nodes(&mut alloc, vol, csum_nc)?;
         let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
