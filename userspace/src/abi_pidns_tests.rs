@@ -279,3 +279,48 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_sched_getparam_resolves_in_caller_pid_ns
 );
+
+// ── #19 capset(hdr.pid) — Linux kernel/capability.c:115 `task_pid_vnr` ──
+//
+// The self-check compared the caller-supplied (inner) pid against the caller's
+// OUTER self pid, so a container task passing its own getpid() (an inner value)
+// hit a spurious EPERM. The fix translates the incoming pid first. The worker
+// runs the standard capget→capset privilege-drop with its OWN in-namespace pid.
+fn smoke_abi_pidns_capset_self_pid_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xF100;
+        const MANAGER_PID: u64 = 0xF000;
+        const WORKER_TASK: u64 = 0xF101;
+        const WORKER_PID: u64 = 0xF001;
+        const CAP_VERSION_3: u32 = 0x2008_0522;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            let mut hdr = [0u8; 8];
+            hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+            hdr[4..].copy_from_slice(&2i32.to_le_bytes()); // caller's getpid() == inner 2
+            let mut data = [0u8; 24];
+            set_task(WORKER_TASK);
+            match call(
+                Syscall::Capset.raw(),
+                a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+            ) {
+                Some(0) => Ok(()),
+                Some(-1) => Err("capset rejected the caller's OWN in-namespace pid with EPERM — the inner pid was compared against the outer self pid without accept_pid_from"),
+                _ => Err("capset returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_capset_self_pid_in_caller_pid_ns
+);

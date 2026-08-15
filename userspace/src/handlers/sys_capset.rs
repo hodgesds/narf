@@ -33,7 +33,23 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
     // obtains that value from getpid(2) and supplies it here.
     let task = current_task_id();
     let self_pid = task_to_pid_raw(task).unwrap_or(task);
-    if pid != 0 && pid as u64 != self_pid {
+    // The header pid is interpreted in the CALLER's pid namespace (Linux
+    // kernel/capability.c:115 compares task_pid_vnr(current)). Translate the
+    // inner pid to its outer ProcessId before comparing against the caller's
+    // own outer self pid — a container passing getpid() (an inner value) must
+    // not hit a spurious EPERM. Audit finding #19.
+    let target_pid = if pid != 0 {
+        match accept_pid_from(task, pid as u64) {
+            Some(outer) => outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
+        }
+    } else {
+        0
+    };
+    if target_pid != 0 && target_pid != self_pid {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         return;
     }
