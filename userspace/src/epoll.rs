@@ -1053,11 +1053,6 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         if let Some(old) = old_mask {
                             crate::handlers::set_signal_mask_for_task(task, old);
                         }
-                        // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
-                        // from `CURRENT`, live for this trap; `state`/`exit_reason`
-                        // are its own `UnsafeCell` fields and the `hook` consumes
-                        // the same pointer to park exactly this task.
-                        // SAFETY: Valid memory or trusted environment
                         // Debug-feature only: what the interest set looked
                         // like at the instant we committed to an UNBOUNDED
                         // park. With `timeout_ms < 0` the only wake sources
@@ -1090,6 +1085,11 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                                 let _ = writeln!(narf_console::Writer, "]");
                             }
                         }
+                        // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
+                        // from `CURRENT`, live for this trap; `state`/`exit_reason`
+                        // are its own `UnsafeCell` fields and the `hook` consumes
+                        // the same pointer to park exactly this task.
+                        // SAFETY: Valid memory or trusted environment
                         unsafe {
                             let uc = &*uctx_ptr;
                             // Flag this park as a net-I/O wait so the poll
