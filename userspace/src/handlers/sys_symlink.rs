@@ -35,8 +35,7 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
 /// `newdirfd` and share this body. The target string stays verbatim —
 /// symlink targets may legitimately be relative and must not be rewritten.
 pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link_path: &str) {
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
+    let outcome = current_resolve_parent_absolute(link_path, |_fs, parent, leaf| {
             poll_blocking(parent.symlink(leaf, target_str))
         });
     match outcome {

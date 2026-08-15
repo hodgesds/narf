@@ -75,8 +75,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     };
     let new_leaf = &new_path[new_split + 1..];
     if flags & RENAME_NOREPLACE != 0 {
-        let exists = narf_filesystem::registry()
-            .resolve_parent_absolute(&new_path, |_fs, parent, leaf| parent.lookup(leaf).is_some())
+        let exists = current_resolve_parent_absolute(&new_path, |_fs, parent, leaf| parent.lookup(leaf).is_some())
             .unwrap_or(false);
         if exists {
             ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
@@ -89,8 +88,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
         return;
     }
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
+    let outcome = current_resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     // Report the filesystem's ACTUAL error. Collapsing everything to ENOENT

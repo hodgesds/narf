@@ -1514,6 +1514,85 @@ kernel_test_in!(
     smoke_abi_fsx2_move_mount_private_namespace_pos
 );
 
+/// Directory-MUTATION syscalls must resolve through the caller's mount
+/// namespace, exactly as `open` already does.
+///
+/// `open`/`read` go through `current_resolve_absolute()`, which consults the
+/// task's `MountNamespace` and falls back to the global registry. Every
+/// directory-mutation syscall — rename, renameat2, unlink, rmdir, symlink —
+/// instead calls `registry().resolve_parent_absolute()` directly, because no
+/// namespace-aware `current_resolve_parent_absolute` exists. A task in a
+/// private mount namespace can therefore CREATE a file it cannot afterwards
+/// rename or unlink: the parent resolves for one call and not the other.
+///
+/// This is what breaks udev. `systemd-udevd` runs with `PrivateMounts=yes`,
+/// and `sd-device` publishes a database entry by writing
+/// `/run/udev/data/.#<id><random>` and renaming it onto `/run/udev/data/<id>`.
+/// The write succeeds, the rename returns ENOENT because the parent is
+/// invisible to the global registry, and udevd reports "Failed to rename
+/// temporary database file ... No such file or directory" for every device.
+/// The same gap takes out its `/dev/char/<major>:<minor>` symlinks and
+/// `/run/udev/watch/`.
+fn smoke_abi_fsx2_rename_resolves_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            // Mounted ONLY in this namespace — the global registry never
+            // learns about it, which is the whole point.
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsdata", &[]));
+            if ns.mount_arc(&auth, "/abi-nsdata", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+
+            // sd-device's publish shape: create the temporary, then rename.
+            let tmp = b"/abi-nsdata/.#c226:0e270627d7a3faea1\0";
+            let fin = b"/abi-nsdata/c226:0\0";
+            let fd = call_open(tmp.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+            if fd < 0 {
+                return Err("open(O_CREAT) could not create a file in the private namespace");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+            let r = call(
+                Syscall::Rename.raw(),
+                a1(tmp.as_ptr() as u64, fin.as_ptr() as u64),
+            );
+            match r {
+                Some(0) => {}
+                Some(-2) => {
+                    return Err(
+                        "rename reported ENOENT for a file open() had just created — directory-mutation syscalls bypass the task's mount namespace",
+                    )
+                }
+                _ => return Err("rename in a private mount namespace did not succeed"),
+            }
+            // And the result must be visible under its new name.
+            let check = call_open(fin.as_ptr() as u64, 0).unwrap_or(-1);
+            if check < 0 {
+                return Err("renamed file is not openable under its final name");
+            }
+            let _ = call(Syscall::Close.raw(), a0(check as u64));
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_rename_resolves_in_private_mount_namespace
+);
+
 fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;

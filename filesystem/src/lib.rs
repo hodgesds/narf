@@ -1984,6 +1984,73 @@ impl MountNamespace {
         Some(f(&*fs, &rel))
     }
 
+    /// Resolve `abs` to its parent directory + leaf within THIS namespace's
+    /// mount table, and run `f(fs, parent_dir, leaf)`.
+    ///
+    /// The namespace-aware twin of [`VfsRegistry::resolve_parent_absolute`],
+    /// and it has to exist for the same reason [`Self::resolve_absolute`]
+    /// does. Without it every directory-MUTATION syscall (rename, unlink,
+    /// rmdir, symlink) resolves against the GLOBAL registry while open/read
+    /// resolve against the task's namespace — so a task in a private mount
+    /// namespace can create a file it then cannot rename or remove, because
+    /// the parent is visible to one call and not the other.
+    ///
+    /// That asymmetry is what stopped udev dead: `systemd-udevd` runs with
+    /// `PrivateMounts=yes`, and `sd-device` publishes each database entry by
+    /// writing `/run/udev/data/.#<id><random>` and renaming it onto
+    /// `/run/udev/data/<id>`. The write succeeded and the rename returned
+    /// ENOENT, so no device was ever recorded.
+    pub fn resolve_parent_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str) -> R,
+    {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let last = abs.rfind('/')?;
+        let leaf = &abs[last + 1..];
+        if leaf.is_empty() {
+            return None;
+        }
+        let parent_path = &abs[..last];
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
+        // Resolve + walk under the lock, then release it BEFORE running `f`:
+        // `f` may block on block I/O and `inner` is an IrqSafeSpinLock, so
+        // holding it across `f` deadlocks the box (see `resolve_absolute`).
+        let (fs, dir) = {
+            let q = self.inner.lock();
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = parent_path == m.path.as_str()
+                    || m.path == "/"
+                    || (parent_path.starts_with(m.path.as_str())
+                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                    best = Some(m);
+                }
+            }
+            let m = best?;
+            let rel = &parent_path[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            let mut dir = m.fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                dir = dir.lookup_dir(seg)?;
+            }
+            (m.fs.clone(), dir)
+        };
+        Some(f(&*fs, dir, leaf))
+    }
+
     /// Clone the filesystem object of the visible mount covering `abs`.
     ///
     /// Equal-length entries are mount stacks; the newest entry wins, matching

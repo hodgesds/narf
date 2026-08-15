@@ -1953,6 +1953,25 @@ where
     }
 }
 
+/// Namespace-aware `resolve_parent_absolute`. Every directory-MUTATION
+/// syscall must go through this rather than `registry()` directly, or a task
+/// in a private mount namespace can create a file it cannot then rename or
+/// unlink — see `MountNamespace::resolve_parent_absolute`.
+pub(crate) fn current_resolve_parent_absolute<R, F>(path: &str, f: F) -> Option<R>
+where
+    F: FnOnce(
+        &dyn narf_filesystem::FsInstance,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+    ) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_parent_absolute(path, f)
+    } else {
+        narf_filesystem::registry().resolve_parent_absolute(path, f)
+    }
+}
+
 pub(crate) fn current_clone_tree_at(
     path: &str,
 ) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
