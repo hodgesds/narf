@@ -21,6 +21,25 @@ Idioms to match:
 - IN (arg arriving from userspace): `accept_pid_from(caller, pid)` / `resolve_inner_pid`, `None` → ESRCH. Reference: `sys_kill.rs:33`, `sys_sched_setaffinity.rs:31`.
 - OUT (value rendered to userspace): `report_pid_to(reader, outer)` / `pgid_to_user`. Reference: `sys_wait4.rs:61`, `report_ucred_to`.
 
+## Status (updated as findings land)
+
+LANDED (commit, RED-first test): #1 kill(-pgid), #3 pgid_from_user, #4 setpgid,
+#5 getpgid, #6 TIOCSPGRP (all in "Resolve pgid arguments in the caller's pid
+namespace"); #2 ptrace ("ptrace: resolve the target pid..."); #7 getsid
+("getsid: return the session id..."); #8 kill/tkill/tgkill/pidfd si_pid
+("Record the sender pid..."); #9 SIGCHLD si_pid ("SIGCHLD: name the exiting
+child...").
+
+IN PROGRESS (worktree agent): #10 perf, #11 prlimit64, #12 kcmp, #18
+sched_param, #19 capset, #20 migrate/move_pages, #22 get_robust_list, #23
+ioprio, #27 bpf, #28 setpriority.
+
+REMAINING: #13 fork-return (UNSURE — verify project_pidns_flow_model), #14
+waitid stop/cont si_pid, #15 fcntl F_GETLK l_pid, #16 /proc task/tid names,
+#17 kill(-1) visibility, #21 process_vm, #24 cgroup.threads, #25 mq_notify,
+#26 tkill non-leader arm, #30 wait unbound->ECHILD, #31-#34 (mostly OUT
+rendering / UNSURE).
+
 ## Findings (severity-ranked)
 
 | # | surface | dir | kind | file:line | current behavior | Linux ref | consumer that breaks | fix |
