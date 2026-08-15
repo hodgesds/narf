@@ -93,8 +93,38 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
+    // Report the filesystem's ACTUAL error. Collapsing everything to ENOENT
+    // reads as "the source path is not there", which is a lie whenever the
+    // source exists and the filesystem simply declined the operation — and
+    // callers act on that difference. systemd's `rename_noreplace()` retries
+    // via a link/unlink dance only on EINVAL/ENOSYS/ENOTTY and returns
+    // anything else to its caller verbatim, while code all over systemd
+    // treats ENOENT as "the source vanished, nothing to do". So an
+    // unimplemented `DirOps::rename` surfacing as ENOENT turns a recoverable
+    // "unsupported" into a permanent, silent give-up.
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
+        Some(Some(Err(e))) => {
+            let errno: i64 = match e {
+                narf_filesystem::FsError::NotFound => -2,          // ENOENT
+                narf_filesystem::FsError::PermissionDenied => -13, // EACCES
+                narf_filesystem::FsError::InvalidPath => -22,      // EINVAL
+                narf_filesystem::FsError::CrossDevice => -18,      // EXDEV
+                narf_filesystem::FsError::Busy => -16,             // EBUSY
+                narf_filesystem::FsError::ReadOnly => -30,         // EROFS
+                narf_filesystem::FsError::NoSpace => -28,          // ENOSPC
+                narf_filesystem::FsError::InvalidData => -22,      // EINVAL
+                // EINVAL, deliberately, not EOPNOTSUPP: it is the errno
+                // systemd's rename_noreplace() treats as "try the fallback",
+                // and Linux itself returns EINVAL for a rename a filesystem
+                // cannot perform.
+                narf_filesystem::FsError::Unsupported => -22,
+                _ => -22, // EINVAL
+            };
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+        }
+        // The parent directory itself did not resolve — the one case where
+        // ENOENT is the honest answer.
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)),
     }
 }

@@ -1044,6 +1044,201 @@ fn smoke_abi_pathx_renameat2_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_pos);
 
+// The exact shape `sd-device` uses to publish a udev database entry:
+// write `<dir>/.#<id><random>`, then RENAME_NOREPLACE it onto `<dir>/<id>`.
+// The names carry `.`, `#`, `+` and `:`, none of which are special to
+// rename(2) but all of which are unusual enough to be worth pinning.
+//
+// The errno matters as much as the success. systemd's `rename_noreplace()`
+// falls back to a racy link/unlink dance ONLY on EINVAL, ENOSYS or ENOTTY;
+// any other error is returned to the caller verbatim. So a renameat2 that
+// reports ENOENT for a rename it simply did not perform makes udev give up
+// with "Failed to rename temporary database file ... No such file or
+// directory" and never write `/run/udev/data/<id>` at all — which is exactly
+// the failure the udev seat gate reports.
+fn smoke_abi_pathx_renameat2_udev_db_publish_shape() -> TestResult {
+    const RENAME_NOREPLACE: u64 = 1;
+    const TMP: &str = ".#+pci:0000:00:02.037385736e4f26399";
+    const FINAL: &str = "+pci:0000:00:02.0";
+    with_memfs(
+        "/p3",
+        "p3",
+        &[(TMP, b"E:ID_PATH=pci-0000:00:02.0\n")],
+        || {
+            let old = b"/p3/.#+pci:0000:00:02.037385736e4f26399\0";
+            let new = b"/p3/+pci:0000:00:02.0\0";
+            let r = call_raw(
+                Syscall::Renameat2.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: old.as_ptr() as u64,
+                    arg2: AT_FDCWD,
+                    arg3: new.as_ptr() as u64,
+                    arg4: RENAME_NOREPLACE,
+                    arg5: 0,
+                },
+            );
+            if r.status != SyscallReturn::OK {
+                return Err("renameat2 of a udev db temp file returned a non-OK NARF status");
+            }
+            match r.value as i64 {
+            0 => {}
+            -2 => {
+                return Err(
+                    "renameat2(RENAME_NOREPLACE) reported ENOENT — systemd's rename_noreplace only falls back on EINVAL/ENOSYS/ENOTTY, so udev gives up here",
+                )
+            }
+            _ => return Err("renameat2 of a udev db temp file did not succeed"),
+        }
+            // The published entry must be readable under its final name, and the
+            // temporary must be gone — a rename that reports success without
+            // moving anything leaves udev reading a stale database forever.
+            let mut buf = [0u8; 64];
+            let final_path = b"/p3/+pci:0000:00:02.0\0";
+            let fd = call_open(final_path.as_ptr() as u64, 0).unwrap_or(-1);
+            if fd < 0 {
+                return Err("renamed udev db entry is not openable under its final name");
+            }
+            let n = call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, 64),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            if n.unwrap_or(-1) <= 0 {
+                return Err("renamed udev db entry has no contents");
+            }
+            let tmp_path = b"/p3/.#+pci:0000:00:02.037385736e4f26399\0";
+            if call_open(tmp_path.as_ptr() as u64, 0).unwrap_or(-1) >= 0 {
+                return Err("the temporary udev db file still exists after a successful rename");
+            }
+            let _ = (TMP, FINAL);
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_udev_db_publish_shape
+);
+
+/// The same publish, but in a NESTED directory created at runtime — which is
+/// what `/run/udev/data/` actually is: systemd mounts /run, then udev
+/// `mkdir_parents()` its way to `data/`. The mount-root case above resolves
+/// its parent trivially; this one exercises a real multi-component walk to
+/// the parent before the rename.
+fn smoke_abi_pathx_renameat2_udev_db_publish_nested() -> TestResult {
+    const RENAME_NOREPLACE: u64 = 1;
+    with_memfs("/p4", "p4", &[], || {
+        // /p4/udev/data, built a component at a time like mkdir_parents.
+        for dir in [b"/p4/udev\0".as_ref(), b"/p4/udev/data\0".as_ref()] {
+            let r = call(Syscall::Mkdir.raw(), a1(dir.as_ptr() as u64, 0o755)).unwrap_or(-1);
+            if r != 0 && r != -17 {
+                return Err("mkdir of a udev database parent directory failed");
+            }
+        }
+        let tmp = b"/p4/udev/data/.#c226:0e270627d7a3faea1\0";
+        let fin = b"/p4/udev/data/c226:0\0";
+        // Create the temp entry the way sd-device does (O_CREAT|O_EXCL).
+        let fd = call_open(tmp.as_ptr() as u64, 0o100 | 0o200 | 0o1).unwrap_or(-1);
+        if fd < 0 {
+            return Err("could not create the temporary udev db file in a nested directory");
+        }
+        let payload = b"E:ID_FOR_SEAT=drm-pci\n";
+        let _ = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, payload.as_ptr() as u64, payload.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        let r = call_raw(
+            Syscall::Renameat2.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: tmp.as_ptr() as u64,
+                arg2: AT_FDCWD,
+                arg3: fin.as_ptr() as u64,
+                arg4: RENAME_NOREPLACE,
+                arg5: 0,
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return Err("nested renameat2 returned a non-OK NARF status");
+        }
+        match r.value as i64 {
+            0 => {}
+            -2 => {
+                return Err(
+                    "nested renameat2(RENAME_NOREPLACE) reported ENOENT — this is the udev database publish failing",
+                )
+            }
+            _ => return Err("nested renameat2 of a udev db temp file did not succeed"),
+        }
+        if call_open(fin.as_ptr() as u64, 0).unwrap_or(-1) < 0 {
+            return Err("nested udev db entry is not openable under its final name");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_udev_db_publish_nested
+);
+
+/// Renaming a file that EXISTS must never report ENOENT. `/proc` has no
+/// rename support, so the honest answer is EPERM/EINVAL/EXDEV/EACCES — the
+/// errno family that says "this filesystem will not do that", not the one
+/// that says "the path you named is not there".
+///
+/// The distinction is load-bearing rather than pedantic. systemd's
+/// `rename_noreplace()` falls back to a link/unlink dance only on EINVAL,
+/// ENOSYS or ENOTTY, and callers throughout systemd treat ENOENT as "the
+/// source vanished, nothing to do". A rename handler that funnels every
+/// failure — including an unimplemented `DirOps::rename` — into ENOENT
+/// therefore turns a recoverable "unsupported" into a silent, permanent
+/// give-up. That is the shape of the udev database publish failure:
+/// "Failed to rename temporary database file ... No such file or directory"
+/// for a temporary file that was created successfully moments earlier.
+fn smoke_abi_pathx_rename_unsupported_is_not_enoent() -> TestResult {
+    with_setup(|| {
+        // A path that definitely exists and definitely cannot be renamed.
+        let old = b"/proc/self/stat\0";
+        let new = b"/proc/self/stat-renamed\0";
+        // Confirm the source exists, so an ENOENT below cannot be honest.
+        let fd = call_open(old.as_ptr() as u64, 0).unwrap_or(-1);
+        if fd < 0 {
+            // No procfs in this configuration — nothing to assert against.
+            return Ok(());
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        let r = call_raw(
+            Syscall::Renameat2.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: old.as_ptr() as u64,
+                arg2: AT_FDCWD,
+                arg3: new.as_ptr() as u64,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return Err("renameat2 on an unrenameable file returned a non-OK NARF status");
+        }
+        match r.value as i64 {
+            0 => Err("renameat2 claimed to rename a /proc entry"),
+            -2 => Err(
+                "renameat2 reported ENOENT for a file that exists — 'unsupported' must not be laundered into 'no such file' (systemd's rename_noreplace only falls back on EINVAL/ENOSYS/ENOTTY)",
+            ),
+            _ => Ok(()),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_rename_unsupported_is_not_enoent
+);
+
 fn smoke_abi_pathx_renameat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("old", b"x")], || {
         let old = b"/p2/old\0";
