@@ -4830,6 +4830,155 @@ kernel_test_in!(
     smoke_abi_socket_unix_dgram_ancillary_is_per_record
 );
 
+/// Datagram ORDER on a bound AF_UNIX receiver is global, not per-sender-
+/// socket: messages must be dequeued in the order they were sent, even when
+/// each one came from a DIFFERENT sender socket.
+///
+/// This is `sd_notify()`'s shape exactly. It does not keep a socket around —
+/// every call opens a fresh `AF_UNIX SOCK_DGRAM`, sends one datagram to
+/// `$NOTIFY_SOCKET`, and closes it. So a udev worker's three notifications
+/// (`INOTIFY_WATCH_REMOVE=1`, then `INOTIFY_WATCH_ADD=1`, then
+/// `PROCESSED=1`) arrive from three unrelated sockets, and the manager's
+/// correctness depends on seeing them in that order.
+///
+/// Reordering them is not a cosmetic fault. `on_worker_notify` DETACHES the
+/// worker's event for `PROCESSED=1` (udev-manager.c:1218) and asserts the
+/// event is present for `INOTIFY_WATCH_*` (:1199) — so a `PROCESSED=1`
+/// overtaking an earlier `INOTIFY_WATCH_REMOVE=1` from the same worker makes
+/// the manager abort. Every other route to that abort has been measured
+/// closed, which is why this ordering is worth pinning explicitly.
+fn smoke_abi_socket_unix_dgram_fifo_across_sender_sockets() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-notify-order");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the notify-order receiver failed");
+        }
+
+        // A worker's three notifications, each from its own fresh socket.
+        const MSGS: [&[u8]; 3] = [
+            b"INOTIFY_WATCH_REMOVE=1",
+            b"INOTIFY_WATCH_ADD=1---",
+            b"PROCESSED=1-----------",
+        ];
+        for payload in MSGS {
+            let tx = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            ) != Some(payload.len() as i64)
+            {
+                return Err("sd_notify-shaped send failed");
+            }
+            // sd_notify closes immediately; a queued datagram must outlive
+            // the socket that sent it.
+            let _ = call(Syscall::Close.raw(), a0(tx));
+        }
+
+        for (i, expect) in MSGS.iter().enumerate() {
+            let mut buf = [0u8; 32];
+            let n = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if n != expect.len() as i64 {
+                return Err("a queued datagram did not survive its sender socket closing");
+            }
+            if &buf[..expect.len()] != *expect {
+                return match i {
+                    0 => Err("first notification was not delivered first"),
+                    1 => Err("notifications from distinct sender sockets were reordered"),
+                    _ => Err("PROCESSED=1 overtook an earlier notification"),
+                };
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_fifo_across_sender_sockets
+);
+
+/// The same ordering guarantee when the senders are different TASKS, which
+/// is the real udev topology: many workers notifying one manager. Interleave
+/// them so a per-sender queue would be visible as reordering.
+fn smoke_abi_socket_unix_dgram_fifo_across_sender_tasks() -> TestResult {
+    with_setup(|| {
+        const WORKER_A: u64 = 0xE100;
+        const WORKER_B: u64 = 0xE101;
+
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-notify-order-tasks");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the multi-task receiver failed");
+        }
+
+        // A, B, A, B — a per-sender queue drained sender-at-a-time would come
+        // back as A, A, B, B and fail here.
+        const ORDER: [(u64, &[u8]); 4] = [
+            (WORKER_A, b"A1"),
+            (WORKER_B, b"B1"),
+            (WORKER_A, b"A2"),
+            (WORKER_B, b"B2"),
+        ];
+        for (task, payload) in ORDER {
+            set_task(task);
+            let tx = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            ) != Some(payload.len() as i64)
+            {
+                set_task(FAKE_TASK);
+                return Err("cross-task notify send failed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(tx));
+        }
+        set_task(FAKE_TASK);
+
+        for (_, expect) in ORDER {
+            let mut buf = [0u8; 8];
+            let n = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if n != expect.len() as i64 || &buf[..expect.len()] != expect {
+                return Err("datagrams from two sender tasks were not dequeued in send order");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_fifo_across_sender_tasks
+);
+
 /// The recvmsg-side half of libudev's `device_monitor_receive_device()`
 /// checks. A uevent that passes every payload rule is STILL dropped unless
 /// the receive itself reports the right sender and credentials:
