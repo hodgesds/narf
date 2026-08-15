@@ -194,6 +194,35 @@ pub fn inherit_into_child(parent_task: u64, child_task: u64, child_outer_pid: u6
     Some(inner)
 }
 
+/// The child's pid AS SEEN BY THE PARENT — the value fork(2)/clone(2) returns
+/// to the parent. Linux resolves this with `pid_vnr(pid)` in the CALLER's
+/// active pid namespace (`kernel/fork.c` `kernel_clone` → `nr = pid_vnr(pid)`),
+/// which is NOT necessarily the pid the child reports for ITSELF.
+///
+/// `child_outer` is the child's outer ProcessId; `child_self_inner` is the pid
+/// the child reports for itself (its inner pid in whatever namespace
+/// `inherit_into_child` placed it in). The two DIVERGE across a
+/// `CLONE_NEWPID` boundary:
+///
+///  * Parent in the ROOT namespace → the child's OUTER pid. This covers a
+///    plain root fork (outer == the return) AND `unshare(CLONE_NEWPID)` from
+///    the root (`unshare -fp`, runc/crun init): there the child is pid 1 in a
+///    NEW child namespace the parent is not in, but the parent must still see —
+///    and `waitpid` — the child by its pid in the PARENT's namespace. Returning
+///    the child's new-ns `1` made the parent's `waitpid` look for a child it
+///    has no record of (`PENDING_EXITS` is keyed by outer pid) → ECHILD.
+///  * Parent SHARES the child's namespace (ordinary container fork) → the
+///    child's inner pid there, which equals `child_self_inner` (its getpid()).
+///  * Parent is namespaced but the child went to a DIFFERENT (nested) namespace
+///    the flat model does not bind into the parent's ns → not representable;
+///    fall back to `child_self_inner` (prior behaviour) rather than 0.
+pub fn fork_return_to_parent(parent_task: u64, child_outer: u64, child_self_inner: u64) -> u64 {
+    match ns_of(parent_task) {
+        None => child_outer,
+        Some(pns) => pns.outer_to_inner(child_outer).unwrap_or(child_self_inner),
+    }
+}
+
 /// Linux `unshare(CLONE_NEWPID)` semantics: creates a fresh PID namespace for
 /// future children of `task`. The calling task itself remains in its current namespace.
 pub fn unshare_pid_ns_for_children(task: u64) -> Arc<PidNamespace> {

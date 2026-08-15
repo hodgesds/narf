@@ -3672,12 +3672,30 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
     let count_user = attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0;
 
+    // A positive pid is in the CALLER's pid namespace (Linux
+    // kernel/events/core.c find_task_by_vpid). Translate inner -> outer once;
+    // the raw inner pid resolved to whatever ROOT-namespace task owned the
+    // same number, so `perf record -p <inner>` in a container profiled the
+    // wrong host task. An inner pid not bound in the caller's namespace is
+    // ESRCH. `target_outer` is the OUTER ProcessId, kept for the sample-record
+    // rendering below.
+    let target_outer = if pid > 0 {
+        match crate::handlers::accept_pid_from(task, pid as u64) {
+            Some(outer) => outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    } else {
+        0
+    };
     let target_task = if pid == 0 {
         task
     } else if pid > 0 {
-        match crate::handlers::pid_to_task_raw(pid as u64) {
+        match crate::handlers::pid_to_task_raw(target_outer) {
             Some(target) => target,
-            None if pid as u64 == task => task,
+            None if target_outer == task => task,
             None => {
                 ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
                 return;
@@ -3690,7 +3708,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let target_pid = if pid == 0 {
         crate::handlers::task_to_pid_raw(task).unwrap_or(task)
     } else if pid > 0 {
-        pid as u64
+        target_outer
     } else {
         u64::MAX
     };

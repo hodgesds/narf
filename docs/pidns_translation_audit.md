@@ -23,7 +23,7 @@ Idioms to match:
 
 ## Status (updated as findings land)
 
-**LANDED — 22 of 34 findings fixed, every one with a RED-first test:**
+**LANDED — 24 of 34 findings fixed, every one with a RED-first test:**
 
 Core (main tree): #1/#3/#4/#5/#6 pgid family; #2 ptrace; #7 getsid; #8
 kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid stop/cont
@@ -37,22 +37,29 @@ bpf(TASK_FD_QUERY); #28 setpriority/getpriority (`who` was discarded — now
 implemented via accept_pid_from, not just documented). Tests live in
 `userspace/src/abi_pidns_tests.rs` (container-gated).
 
-Every fix uses the same idiom: `accept_pid_from(caller, pid)` (inner->outer,
-identity in non-container) then `pid_to_task_raw`/`proc_pid_to_tid`
+Every IN-direction fix uses the same idiom: `accept_pid_from(caller, pid)`
+(inner->outer, identity in non-container) then `pid_to_task_raw`/`proc_pid_to_tid`
 (outer->TaskId), matching sys_kill.rs / sys_sched_setaffinity.rs.
+
+Follow-ups (this pass): #10 perf_event_open — the pid target now resolves via
+`accept_pid_from` (inner->outer, ESRCH for an inner pid unbound in the caller's
+ns, no silent hit on a root-ns collision victim); the sample-record pid already
+renders the outer pid (correct for a root-ns `perf` tool) — full owner-ns
+rendering of the sample pid/tid is a documented sub-gap (the event carries no
+owner-ns handle; threading it through the IRQ sample path is disproportionate).
+#13 fork/clone return after `CLONE_NEWPID` — the "deliberate coupling" comment
+was wrong: it only holds when parent and child SHARE a namespace. The return now
+routes through `pid_ns::fork_return_to_parent`, which yields the child's outer
+pid for a root-ns parent (fixing `unshare(CLONE_NEWPID)` → parent `waitpid`
+ECHILD) and the child's in-namespace pid for an ordinary container fork
+(unchanged). Tests: `abi_pidns_tests.rs` (both container-gated).
 
 **VERIFIED-CORRECT-IN-PRACTICE (no fix needed):** #24 cgroup.threads — the
 write path routes cgroup.procs and cgroup.threads both into `members` via
 `place()`, so `cg.threads` is never populated and the read always hits the
 report_pid mirror-procs branch; the raw-tid branch is dead code.
 
-**DEFERRED (low value / risk, documented — the remaining 11):**
-- #10 perf_event_open — NOT done. In perf_event.rs (a non-handler module);
-  the agent's batch excluded it. Real (perf record -p in a container) but
-  needs perf infrastructure to test. Follow-up.
-- #13 fork-return after CLONE_NEWPID — UNSURE. In-tree comment claims the
-  coupling is deliberate (cites project_pidns_flow_model). Verify that flow
-  before touching.
+**DEFERRED (low value / risk, documented — the remaining 9):**
 - #16 /proc/<pid>/task/<tid> names — NARF is single-thread-per-process; task/
   has one entry. Low impact until real threads land.
 - #25 mq_notify si_pid — POSIX mq, negligible reach.
@@ -65,8 +72,9 @@ report_pid mirror-procs branch; the raw-tid branch is dead code.
   IPC_STAT pids (written 0), #34 setns TaskId fallback (likely dead) — OUT
   rendering with no live leak / UNSURE reachability.
 
-Net: every finding rated moderate-or-higher is fixed; #10 is the one real
-remaining item with a clear consumer.
+Net: every finding rated moderate-or-higher is fixed. The remaining deferred
+items are OUT-rendering polish or need machinery NARF lacks (real threads,
+nested namespaces); none has a live leak with a known consumer.
 
 ## Findings (severity-ranked)
 
@@ -81,10 +89,10 @@ remaining item with a clear consumer.
 | 7 | `getsid()` return | OUT | sid | sys_getsid.rs:17 | `report_pid_to(read_sid())` — misses `task_to_pid_raw` hop; wrong in non-container too | sys.c:1240 + `pid_vnr` | agetty/login session check, `ps -o sid` | `pgid_to_user(read_sid(target))` |
 | 8 | `kill`/`tkill`/`tgkill` `si_pid` | OUT | sender | sys_kill.rs:44 → linux_compat.rs:112 | plain kill delivers `si_pid == 0` | signal.c:1097 `task_tgid_nr_ns` | **udevd on_sigusr1**, systemd signalfd | `store_sigqueue_info(target, sig, SI_USER, 0, report_pid_to(target, sender))` |
 | 9 | SIGCHLD `si_pid` | OUT | child | core.inc.rs:7501 | bit only, no siginfo → `si_pid == 0` | signal.c:2211 `task_pid_nr_ns` | **systemd PID 1 dispatch_sigchld**, dbus | same idiom into parent's ns |
-| 10 | `perf_event_open(pid)` | IN | pid | perf_event.rs:3678 | raw; sample records emit raw pid + raw TaskId tid | events/core.c:5082 | `perf record -p` / bpftrace in a container | `accept_pid_from` in; `report_pid_to`/`linux_tid_for_task` on records |
+| 10 | `perf_event_open(pid)` | IN | pid | perf_event.rs:3675 | FIXED — pid target resolves via `accept_pid_from` (ESRCH for an inner pid unbound in the caller's ns). Sample-record pid = outer (correct for root-ns perf); full owner-ns pid/tid rendering is a documented sub-gap | events/core.c:5082 | `perf record -p` / bpftrace in a container | fixed — `accept_pid_from` in; OUT rendering follow-up |
 | 11 | `prlimit64(pid)` | IN | pid | sys_prlimit64.rs:14 | user pid used directly as TaskId | sys.c:1751 | systemd `LimitNOFILE=`, prlimit(1) | `accept_pid_from` → tid |
 | 12 | `kcmp(pid1,pid2)` | IN | 2×pid | sys_kcmp.rs:22 | raw both | kcmp.c:146 | systemd fd-dedup, criu | `accept_pid_from` in `resolve` |
-| 13 | fork/clone return after `CLONE_NEWPID` | OUT | child | sys_fork.rs:232 | returns child's new-ns pid (1) to parent in old ns → parent `waitpid` ECHILD | fork.c:2667 `pid_vnr` in parent's ns | `unshare -fp`, runc/crun init | `report_pid_to(parent, child.raw())` — **UNSURE**, see notes |
+| 13 | fork/clone return after `CLONE_NEWPID` | OUT | child | sys_fork.rs:269 | FIXED — return routes through `pid_ns::fork_return_to_parent`: child's outer pid for a root-ns parent (fixes `unshare -fp` → parent `waitpid` ECHILD), child's in-ns pid for a shared-ns fork (unchanged) | fork.c `pid_vnr` in parent's ns | `unshare -fp`, runc/crun init | fixed — `fork_return_to_parent` (the "deliberate coupling" comment only held for a shared ns) |
 | 14 | `waitid` stop/cont `si_pid` | OUT | child | sys_waitid.rs:80 | untranslated (exit arm :113 IS translated) | exit.c `pid_vnr` | `waitid(WUNTRACED)` supervisors, systemd | `report_pid_to(parent, child_pid)` |
 | 15 | `fcntl(F_GETLK)` `l_pid` | OUT | owner | sys_fcntl.rs:161,183 | raw TaskId; no OFD `-1` | locks.c:2321 `locks_translate_pid` | lslocks, flock(1), sqlite | `report_pid_to(caller, task_to_pid_raw(owner))`; `-1` for OFD |
 | 16 | `/proc/<pid>/task/<tid>` names | OUT | tid | procfs/pid_ext.rs:997 | uses outer pid; inner reader sees host number | array.c:213 NSpid | `ps -L`, htop -H, JVM threads | `linux_tid_for_task` per member |

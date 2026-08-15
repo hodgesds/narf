@@ -654,6 +654,180 @@ kernel_test_in!(
     smoke_abi_pidns_bpf_task_fd_query_self_pid_in_caller_pid_ns
 );
 
+// ── #13 fork/clone return after CLONE_NEWPID — Linux kernel/fork.c pid_vnr ──
+//
+// fork(2) returns the child's pid IN THE PARENT's namespace (Linux resolves it
+// with `pid_vnr(pid)` in the caller's active ns), which is NOT always the pid
+// the child reports for itself. The old handler returned `child_ns_pid` — the
+// child's SELF view — directly, so a parent that did `unshare(CLONE_NEWPID)`
+// from the root got the child's new-ns pid 1 instead of the child's outer pid;
+// its `waitpid` then looked for a child it had no record of (PENDING_EXITS is
+// keyed by outer pid) → ECHILD. The fix routes the return through
+// `pid_ns::fork_return_to_parent`. This drives the SAME pid-ns primitives
+// sys_fork does (the harness cannot reach fork's spawn path — no live AS) and
+// pins the contract that function encodes across all three namespace shapes.
+fn smoke_abi_pidns_fork_return_resolves_in_parent_pid_ns() -> TestResult {
+    with_setup(|| {
+        use crate::pid_ns::{fork_return_to_parent, inherit_into_child};
+        // Root parent (no namespace at all).
+        const P_ROOT_TASK: u64 = 0xB700;
+        const P_ROOT_PID: u64 = 0xB070;
+        const C_ROOT_TASK: u64 = 0xB701;
+        const C_ROOT_PID: u64 = 0xB071;
+        // Container parent sharing its child's namespace.
+        const P_CT_TASK: u64 = 0xB710;
+        const P_CT_PID: u64 = 0xB080;
+        const C_CT_TASK: u64 = 0xB711;
+        const C_CT_PID: u64 = 0xB081;
+        // Root parent that did unshare(CLONE_NEWPID) — child lands in a NEW ns.
+        const P_UN_TASK: u64 = 0xB720;
+        const P_UN_PID: u64 = 0xB090;
+        const C_UN_TASK: u64 = 0xB721;
+        const C_UN_PID: u64 = 0xB091;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            for &(t, p) in &[
+                (P_ROOT_TASK, P_ROOT_PID),
+                (C_ROOT_TASK, C_ROOT_PID),
+                (P_CT_TASK, P_CT_PID),
+                (C_CT_TASK, C_CT_PID),
+                (P_UN_TASK, P_UN_PID),
+                (C_UN_TASK, C_UN_PID),
+            ] {
+                register(t, p);
+            }
+
+            // 1) Plain root fork: parent in the root ns, child in the root ns.
+            // inherit_into_child returns None (no namespace), so sys_fork keeps
+            // child_ns_pid == the child's outer pid; the parent must see it too.
+            if inherit_into_child(P_ROOT_TASK, C_ROOT_TASK, C_ROOT_PID).is_some() {
+                return Err("root parent unexpectedly namespaced its child");
+            }
+            if fork_return_to_parent(P_ROOT_TASK, C_ROOT_PID, C_ROOT_PID) != C_ROOT_PID {
+                return Err("plain root fork did not return the child's outer pid");
+            }
+
+            // 2) Ordinary container fork: parent already IN namespace N (inner
+            // pid 1); the child shares N (inner pid 2). The parent must see the
+            // child's IN-namespace pid, and it must equal the child's getpid().
+            crate::pid_ns::unshare_pid_ns(P_CT_TASK, P_CT_PID);
+            let child_self = match inherit_into_child(P_CT_TASK, C_CT_TASK, C_CT_PID) {
+                Some(2) => 2u64,
+                _ => return Err("container child was not bound as inner pid 2 in the shared ns"),
+            };
+            if fork_return_to_parent(P_CT_TASK, C_CT_PID, child_self) != child_self {
+                return Err("container fork return diverged from the child's in-namespace pid — over-translated a shared-namespace fork");
+            }
+
+            // 3) unshare(CLONE_NEWPID) from the root: the parent stays in the
+            // root ns; the child becomes pid 1 in a NEW child namespace. The
+            // parent must see the child's OUTER pid (so its waitpid matches),
+            // NOT the child's new-ns pid 1.
+            crate::pid_ns::unshare_pid_ns_for_children(P_UN_TASK);
+            let child_self = match inherit_into_child(P_UN_TASK, C_UN_TASK, C_UN_PID) {
+                Some(1) => 1u64,
+                _ => return Err("unshared child was not pid 1 in the new namespace"),
+            };
+            let ret = fork_return_to_parent(P_UN_TASK, C_UN_PID, child_self);
+            if ret == child_self {
+                return Err("fork returned the child's NEW-ns pid 1 to a root parent — parent waitpid would ECHILD (fork_return_to_parent not applied)");
+            }
+            if ret != C_UN_PID {
+                return Err("fork return after unshare(CLONE_NEWPID) was neither the child's outer pid nor its new-ns pid");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[
+            P_ROOT_TASK, C_ROOT_TASK, P_CT_TASK, C_CT_TASK, P_UN_TASK, C_UN_TASK,
+        ]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_fork_return_resolves_in_parent_pid_ns
+);
+
+// ── #10 perf_event_open(pid) — Linux kernel/events/core.c find_task_by_vpid ──
+//
+// The pid target resolution did `pid_to_task_raw(pid)` on the RAW caller-ns pid,
+// so `perf record -p <inner>` in a container profiled whatever ROOT-namespace
+// task owned the same small number. The fix translates inner → outer via
+// accept_pid_from first, and an inner pid NOT bound in the caller's namespace is
+// ESRCH (not a silent hit on a collision victim).
+//
+// Discriminator: a WORKER is inherited at inner 2, but a VICTIM is registered at
+// OUTER pid 3 with NO inner-3 binding in the manager's ns. The manager opens a
+// software CPU-clock event twice:
+//   * pid 2 (the worker's real inner pid)  → resolvable → fd (guards the fix
+//     against over-rejecting a legitimately bound inner pid), and
+//   * pid 3 (unbound inner; collides with the victim's OUTER pid) → the fix
+//     returns ESRCH, the bug returns a live fd targeting the ROOT-ns victim.
+fn smoke_abi_pidns_perf_event_open_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB500;
+        const MANAGER_PID: u64 = 0xB060;
+        const WORKER_TASK: u64 = 0xB501;
+        const WORKER_PID: u64 = 0xB061;
+        const VICTIM_TASK: u64 = 0xB600; // registered at OUTER pid 3
+        const VICTIM_PID: u64 = 3;
+        const ESRCH: i64 = -3;
+
+        // Software CPU-clock event: type_=PERF_TYPE_SOFTWARE(1), size=144,
+        // config=PERF_COUNT_SW_CPU_CLOCK(0). cpu=-1 follows the task.
+        let mut pattr = [0u8; 144];
+        pattr[0..4].copy_from_slice(&1u32.to_le_bytes());
+        pattr[4..8].copy_from_slice(&144u32.to_le_bytes());
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(VICTIM_TASK, VICTIM_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(MANAGER_TASK);
+            // Resolvable inner pid 2 → the worker: must still be admitted.
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(pattr.as_ptr() as u64, 2, -1i64 as u64, -1i64 as u64),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a1(fd as u64, 0));
+                }
+                Some(v) if v == ESRCH => {
+                    return Err("perf_event_open rejected the worker's resolvable inner pid 2 with ESRCH — accept_pid_from → pid_to_task_raw over-rejects a bound inner pid")
+                }
+                _ => return Err("perf_event_open(inner 2) returned an unexpected result"),
+            }
+
+            // Unbound inner pid 3 that collides with the victim's OUTER pid.
+            match call(
+                Syscall::PerfEventOpen.raw(),
+                a3(pattr.as_ptr() as u64, 3, -1i64 as u64, -1i64 as u64),
+            ) {
+                Some(v) if v == ESRCH => Ok(()),
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a1(fd as u64, 0));
+                    Err("perf_event_open targeted a ROOT-namespace collision victim for an inner pid unbound in the caller's ns — raw pid_to_task_raw instead of accept_pid_from")
+                }
+                _ => Err("perf_event_open(unbound inner 3) returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK, VICTIM_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_perf_event_open_resolves_in_caller_pid_ns
+);
+
 // ── #28 setpriority(PRIO_PROCESS, who) — Linux kernel/sys.c:282 ──
 //
 // The `who` argument was DISCARDED, so setpriority always renamed the caller
