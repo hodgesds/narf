@@ -466,3 +466,101 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_get_robust_list_resolves_in_caller_pid_ns
 );
+
+// ── #23 ioprio_set(WHO_PROCESS, who) — Linux block/ioprio.c ──
+//
+// `who` was used raw as the IOPRIO_TABLE key `(which, who)`, so two namespaces
+// with the same inner pid share one entry. For IOPRIO_WHO_PROCESS the fix
+// translates `who`. The manager sets the worker's ioprio by inner pid 2; a
+// root-ns reader then queries the worker's OUTER pid: the fix stored it there,
+// the bug stored it under the raw-`2` key (leaving the outer key at default).
+fn smoke_abi_pidns_ioprio_set_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xA200;
+        const MANAGER_PID: u64 = 0xA010;
+        const WORKER_TASK: u64 = 0xA201;
+        const WORKER_PID: u64 = 0xA011;
+        const IOPRIO_WHO_PROCESS: u64 = 1;
+        const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
+        const WORKER_PRIO: u64 = 0x0AAA;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(MANAGER_TASK);
+            if call(
+                Syscall::IoprioSet.raw(),
+                a2(IOPRIO_WHO_PROCESS, 2, WORKER_PRIO),
+            ) != Some(0)
+            {
+                return Err("ioprio_set(WHO_PROCESS, inner 2) did not succeed");
+            }
+            // Root-ns reader queries the worker by its OUTER pid.
+            set_task(FAKE_TASK);
+            match call(Syscall::IoprioGet.raw(), a1(IOPRIO_WHO_PROCESS, WORKER_PID)) {
+                Some(v) if v as u64 == WORKER_PRIO => Ok(()),
+                Some(v) if v as u64 == IOPRIO_DEFAULT => Err("ioprio_set keyed the ioprio under the raw inner pid, not the worker's outer pid — accept_pid_from missing"),
+                _ => Err("ioprio entry for the worker has an unexpected value"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_ioprio_set_resolves_in_caller_pid_ns
+);
+
+// ── #23 ioprio_get(WHO_PROCESS, who) — Linux block/ioprio.c ──
+//
+// Same raw-`who` bug on the read side. A root-ns task records the worker's
+// ioprio under its OUTER pid; the manager then reads it by inner pid 2: the fix
+// resolves to the worker (found), the bug reads the raw-`2` key (default).
+fn smoke_abi_pidns_ioprio_get_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xA210;
+        const MANAGER_PID: u64 = 0xA020;
+        const WORKER_TASK: u64 = 0xA211;
+        const WORKER_PID: u64 = 0xA021;
+        const IOPRIO_WHO_PROCESS: u64 = 1;
+        const IOPRIO_DEFAULT: u64 = (2u64 << 13) | 4;
+        const WORKER_PRIO: u64 = 0x0246;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            // Root-ns task records the worker's real (outer-pid) ioprio.
+            set_task(FAKE_TASK);
+            if call(
+                Syscall::IoprioSet.raw(),
+                a2(IOPRIO_WHO_PROCESS, WORKER_PID, WORKER_PRIO),
+            ) != Some(0)
+            {
+                return Err("seeding the worker ioprio failed");
+            }
+            set_task(MANAGER_TASK);
+            match call(Syscall::IoprioGet.raw(), a1(IOPRIO_WHO_PROCESS, 2)) {
+                Some(v) if v as u64 == WORKER_PRIO => Ok(()),
+                Some(v) if v as u64 == IOPRIO_DEFAULT => Err("ioprio_get read the raw inner pid key, not the worker's outer pid — accept_pid_from missing"),
+                _ => Err("ioprio_get returned an unexpected value"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_ioprio_get_resolves_in_caller_pid_ns
+);
