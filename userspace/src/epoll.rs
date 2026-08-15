@@ -234,6 +234,17 @@ impl EpollInstance {
             }
             item.events = events;
             item.data = data;
+            // Linux re-evaluates the fd against its new mask on every MOD and
+            // re-adds it to the ready list if currently ready — so a MOD acts as
+            // a fresh edge for EPOLLET (and re-arms EPOLLONESHOT). Reset the
+            // edge state, exactly as `ctl_add` initializes it, so the next scan
+            // treats current readiness as a rising edge. Without this, re-arming
+            // EPOLLOUT|EPOLLET on a still-writable fd whose `last_mask` already
+            // held POLLOUT gave `new_bits == 0` with no token change and the
+            // readiness was swallowed — dbus-broker's queued-reply flush
+            // stranded, hanging the greeter's D-Bus round-trip on CachyOS boot.
+            item.last_mask = 0;
+            item.last_token = (0, 0);
             true
         } else {
             false // ENOENT
@@ -260,6 +271,52 @@ impl EpollInstance {
                 .flatten()
                 .unwrap_or(u32::MAX);
                 (fd, bits)
+            })
+            .collect()
+    }
+
+    /// Per-interest-fd EPOLLET edge state for the unbounded-park diagnostic.
+    /// Mirrors [`Self::collect_ready`]'s exact delivery decision so a fd that
+    /// is level-readable (`ready != 0`) but `would_deliver == false` while the
+    /// owner is parked on an infinite timeout is a SWALLOWED edge — the
+    /// readiness landed but no rising edge/token change will ever re-report it.
+    /// Returns `(fd, events, cur_mask, last_mask, cur_tok0, last_tok0,
+    /// would_deliver)`.
+    #[cfg(feature = "unix-latency-trace")]
+    #[allow(clippy::type_complexity)]
+    fn dbg_interest_edge_state(&self) -> Vec<(i32, u32, u32, u32, u64, u64, bool)> {
+        let snapshot: Vec<(i32, EpollItem)> = {
+            let g = self.inner.lock();
+            g.interest.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        snapshot
+            .into_iter()
+            .map(|(fd, item)| {
+                let cur_token = item
+                    .file
+                    .upgrade()
+                    .map(|o| o.poll_edge_token())
+                    .unwrap_or((0, 0));
+                let cur_mask = poll_item_readiness(&item);
+                let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                let ready = cur_mask & (want | EPOLLERR | EPOLLHUP);
+                let would_deliver = if ready == 0 {
+                    false
+                } else if (item.events & EPOLLET) != 0 {
+                    let new_bits = ready & !item.last_mask;
+                    new_bits != 0 || token_changed_for_ready(ready, cur_token, item.last_token)
+                } else {
+                    true
+                };
+                (
+                    fd,
+                    item.events,
+                    cur_mask,
+                    item.last_mask,
+                    cur_token.0,
+                    item.last_token.0,
+                    would_deliver,
+                )
             })
             .collect()
     }
@@ -1092,15 +1149,57 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // before the task under investigation had even
                             // started, and a probe that goes silent early
                             // looks exactly like a task that never parked.
-                            if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                            // Committing to an infinite park with a fd already
+                            // readable-for-a-requested-bit in the set is the
+                            // strand signature: the owner should have been
+                            // delivered that fd (LT) or a rising edge for it (ET)
+                            // and is nonetheless sleeping. Printing ONLY then —
+                            // instead of on every park — keeps this probe from
+                            // flooding the serial line (thousands of lines/boot),
+                            // which itself perturbs scheduling and back-pressures
+                            // journald enough to manufacture the very accept
+                            // pile-up under investigation.
+                            let edge = instance.dbg_interest_edge_state();
+                            let suspicious = edge.iter().any(|&(_, ev, cur, _, _, _, _)| {
+                                let want = ev & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                                // Gate on the READ side only. POLLOUT is
+                                // level-writable on an idle socket almost always,
+                                // so an always-registered EPOLLOUT|ET fd reads as
+                                // a permanent "swallowed" edge that is in fact
+                                // benign ET steady state (dbus-broker keeps
+                                // EPOLLOUT armed on every connection). A
+                                // readable/acceptable fd (IN/ERR/HUP) left
+                                // undelivered to a parked owner is the real
+                                // accept/read strand worth printing.
+                                (cur & ((want & EPOLLIN) | EPOLLERR | EPOLLHUP)) != 0
+                            });
+                            if suspicious && SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
                                 let comm = crate::handlers::proc_comm_of_task(task)
                                     .unwrap_or_else(|| alloc::string::String::from("?"));
                                 let _ = write!(
                                     narf_console::Writer,
                                     "  epoll-park: tid={task} comm={comm} epfd={epfd} set=[",
                                 );
-                                for (wfd, bits) in instance.dbg_interest_readiness(task) {
-                                    let _ = write!(narf_console::Writer, "{wfd}:{bits:#x} ");
+                                for (wfd, ev, cur, last, ctok, ltok, deliv) in edge {
+                                    // SWALLOW: level-readable for a requested bit
+                                    // but the ET delivery decision says no — a lost
+                                    // edge that an infinite park will never re-see.
+                                    // STRAND: ready and WOULD deliver, yet the owner
+                                    // parked — a lost wake, not a lost edge.
+                                    let want = ev & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                                    let readable = (cur & (want | EPOLLERR | EPOLLHUP)) != 0;
+                                    let mark = if readable && !deliv {
+                                        "SWALLOW"
+                                    } else if readable && deliv {
+                                        "STRAND"
+                                    } else {
+                                        "-"
+                                    };
+                                    let et = if (ev & EPOLLET) != 0 { "ET" } else { "LT" };
+                                    let _ = write!(
+                                        narf_console::Writer,
+                                        "{wfd}:{et}:cur={cur:#x}:last={last:#x}:tok={ctok}/{ltok}:{mark} ",
+                                    );
                                 }
                                 let _ = writeln!(narf_console::Writer, "]");
                             }

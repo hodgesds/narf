@@ -921,6 +921,113 @@ fn smoke_epoll_epollet_edge_triggered() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
 
+/// `EPOLL_CTL_MOD` must RE-ARM edge-triggered readiness. Linux re-checks the fd
+/// against its (possibly new) event mask on MOD and re-adds it to the ready
+/// list if currently ready — so a MOD acts as a fresh edge. NARF's `ctl_mod`
+/// updated `events`/`data` but left `last_mask`/`last_token` stale, so
+/// re-arming `EPOLLOUT|EPOLLET` on a still-writable fd whose `last_mask` already
+/// held POLLOUT gave `new_bits == 0` with no token change → the writable
+/// readiness was SWALLOWED. dbus-broker re-arms EPOLLOUT exactly this way to
+/// flush a queued reply; the swallowed edge stranded it, hanging the greeter's
+/// D-Bus round-trip and wedging the whole CachyOS boot (socket-activation
+/// cascade). `ReadyFile`'s edge token is a constant `(0,0)`, so ONLY a
+/// `last_mask` reset can re-deliver — this isolates the MOD-rearm path.
+fn smoke_epoll_ctl_mod_rearms_epollet_edge() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+
+    let epfd_r = call(
+        Syscall::EpollCreate,
+        SyscallArgs {
+            arg0: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if epfd_r.status != SyscallReturn::OK {
+        return TestResult::Fail("create failed");
+    }
+    let epfd = epfd_r.value as u32;
+
+    // Continuously-writable fd. EPOLLOUT == POLL_OUT == 0x4.
+    let watched = install_ready_file(task, narf_filesystem::POLL_OUT);
+    let mut ev = [0u8; 12];
+    let flags = crate::epoll::EPOLLOUT | crate::epoll::EPOLLET;
+    ev[..4].copy_from_slice(&flags.to_ne_bytes());
+    ev[4..12].copy_from_slice(&7u64.to_ne_bytes());
+
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+
+    let mut out_ev = [0u8; 12];
+    // First wait: last_mask 0 → POLLOUT rising edge → delivered.
+    let r1 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    // Second wait: same state, no new edge → 0. This sets up the stale
+    // last_mask == POLLOUT that the MOD must clear.
+    let r2 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    // Re-arm via MOD (same mask; Linux re-checks readiness on any MOD).
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_MOD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    // Third wait: MOD reset the edge state, so the still-writable fd is a fresh
+    // edge again → delivered.
+    let r3 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+
+    if r1.status != SyscallReturn::OK || r1.value != 1 {
+        return TestResult::Fail("MOD-rearm: initial EPOLLOUT edge should deliver");
+    }
+    if r2.status != SyscallReturn::OK || r2.value != 0 {
+        return TestResult::Fail("MOD-rearm: same-state poll should return 0");
+    }
+    if r3.status != SyscallReturn::OK || r3.value != 1 {
+        return TestResult::Fail("MOD-rearm: EPOLL_CTL_MOD must re-report a ready fd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_ctl_mod_rearms_epollet_edge);
+
 /// Accepting the final AF_UNIX connection and receiving another connection
 /// before the next scan is a real EPOLLET edge even though both epoll samples
 /// see the listener as POLLIN. Event-driven accept loops may exercise this
