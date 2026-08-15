@@ -61,6 +61,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     enum WriteError {
         BrokenPipe,
         NoSpace,
+        QuotaExceeded,
         /// Descriptor's open mode forbids writing (a pipe read end):
         /// -EBADF, per the FMODE_WRITE check in `fs/read_write.c::vfs_write`.
         BadFd,
@@ -81,6 +82,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
             Err(narf_filesystem::FsError::BrokenPipe) => Err(WriteError::BrokenPipe),
             Err(narf_filesystem::FsError::NoSpace) => Err(WriteError::NoSpace),
+            Err(narf_filesystem::FsError::QuotaExceeded) => Err(WriteError::QuotaExceeded),
             Err(narf_filesystem::FsError::BadFd) => Err(WriteError::BadFd),
             Err(_) => Err(WriteError::Other),
         }
@@ -120,6 +122,9 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         }
         Some(Err(WriteError::NoSpace)) => {
             ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // -ENOSPC
+        }
+        Some(Err(WriteError::QuotaExceeded)) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64)); // -EDQUOT
         }
         // Wrong-direction descriptor (writing a pipe read end) → -EBADF;
         // no SIGPIPE — Linux never reaches the pipe op for these.

@@ -126,6 +126,10 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // -ENOSPC
                 return;
             }
+            Err(narf_filesystem::FsError::QuotaExceeded) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-122i64) as u64)); // -EDQUOT
+                return;
+            }
             Err(_) => {
                 if total == 0 {
                     ctx.set_return(SyscallReturn::invalid_op());

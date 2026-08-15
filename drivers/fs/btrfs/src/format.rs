@@ -29,6 +29,12 @@ pub const SUPERBLOCK_BYTENR_OFFSET: usize = 48;
 /// On-disk superblock size, padded to 4096 bytes.
 pub const SUPERBLOCK_SIZE: usize = 4096;
 
+/// Linux Btrfs accepts power-of-two data sectors from 4 KiB through 64 KiB.
+pub const MIN_SECTORSIZE: u32 = 4096;
+pub const MAX_SECTORSIZE: u32 = 65536;
+/// Maximum metadata node size accepted by Linux Btrfs.
+pub const MAX_NODESIZE: u32 = 65536;
+
 /// Bytes of csum at the front of the superblock and every tree node.
 pub const CSUM_SIZE: usize = 32;
 
@@ -61,6 +67,8 @@ pub const ROOT_SUBVOL_RDONLY: u64 = 1;
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+/// Quota-group status, accounting, limits, and hierarchy.
+pub const QUOTA_TREE_OBJECTID: u64 = 8;
 /// UUID index tree (subvolume UUID → root objectid).
 pub const UUID_TREE_OBJECTID: u64 = 9;
 /// Device tree (holds `DEV_ITEM` + `DEV_EXTENT`).
@@ -110,6 +118,10 @@ pub const FREE_SPACE_INFO_KEY: u8 = 198;
 pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
 pub const CHUNK_ITEM_KEY: u8 = 228;
+pub const QGROUP_STATUS_KEY: u8 = 240;
+pub const QGROUP_INFO_KEY: u8 = 242;
+pub const QGROUP_LIMIT_KEY: u8 = 244;
+pub const QGROUP_RELATION_KEY: u8 = 246;
 pub const UUID_KEY_SUBVOL: u8 = 251;
 
 // ── File-extent item types (`btrfs_file_extent_item.type`) ─────────
@@ -319,7 +331,12 @@ impl Superblock {
         }
         let sectorsize = le32(buf, OFF_SECTORSIZE)?;
         let nodesize = le32(buf, OFF_NODESIZE)?;
-        if sectorsize != 4096 || !nodesize.is_power_of_two() || nodesize < sectorsize {
+        if !sectorsize.is_power_of_two()
+            || !(MIN_SECTORSIZE..=MAX_SECTORSIZE).contains(&sectorsize)
+            || !nodesize.is_power_of_two()
+            || nodesize < sectorsize
+            || nodesize > MAX_NODESIZE
+        {
             return Err(FsError::Unsupported);
         }
         let sys_len = le32(buf, OFF_SYS_CHUNK_ARRAY_SIZE)? as usize;

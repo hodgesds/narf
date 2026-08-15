@@ -430,6 +430,9 @@ pub enum FsError {
     Busy,
     ReadOnly,
     NoSpace,
+    /// A filesystem quota or qgroup hard limit would be exceeded. Maps to
+    /// Linux `EDQUOT`, distinct from exhausted backing storage (`ENOSPC`).
+    QuotaExceeded,
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,
@@ -493,6 +496,16 @@ pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Sen
 pub struct FsIoctlReply {
     pub result: i32,
     pub output: Vec<u8>,
+}
+
+/// Filesystem-native quota inheritance requested while creating a snapshot.
+/// The five limit words use Linux qgroup order: flags, max referenced,
+/// max exclusive, reserved referenced, reserved exclusive.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsQuotaInherit {
+    pub flags: u64,
+    pub parents: Vec<u64>,
+    pub limit: [u64; 5],
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1249,6 +1262,19 @@ pub trait DirOps: Send + Sync {
         _source: Arc<dyn DirOps>,
         _name: &'a str,
         _readonly: bool,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// Snapshot variant that attaches the new filesystem quota group to parent
+    /// groups and optionally installs hard limits. Filesystems without native
+    /// hierarchical quotas reject it without changing the namespace.
+    fn snapshot_with_quota_async<'a>(
+        &'a self,
+        _source: Arc<dyn DirOps>,
+        _name: &'a str,
+        _readonly: bool,
+        _quota: FsQuotaInherit,
     ) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
     }

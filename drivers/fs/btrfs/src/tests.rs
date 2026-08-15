@@ -24,6 +24,12 @@ use crate::volume::BtrfsVolume;
 /// `mkfs.btrfs` image with hello.txt / big.dat / subdir/note.txt).
 const FIXTURE_SPARSE: &[u8] = include_bytes!("../testdata/fixture.img.sparse");
 
+/// Same layout with 8 KiB data sectors and metadata nodes.
+const FIXTURE_SECTOR8K_SPARSE: &[u8] = include_bytes!("../testdata/fixture-sector8k.img.sparse");
+
+/// Genuine quota-enabled image with qgroup 0/5 assigned to parent 1/100.
+const FIXTURE_QUOTA_SPARSE: &[u8] = include_bytes!("../testdata/fixture-quota.img.sparse");
+
 /// Same tree as the primary fixture but written with `--compress zlib`, so
 /// `big.dat` is a zlib-compressed regular extent.
 const FIXTURE_ZLIB_SPARSE: &[u8] = include_bytes!("../testdata/fixture-zlib.img.sparse");
@@ -412,6 +418,21 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
     }
     if sb.sectorsize != 4096 || sb.nodesize != 16384 || sb.chunk_root_level != 1 {
         return TestResult::Fail("geometry fields decoded wrong");
+    }
+
+    let mut sector8k = good.clone();
+    sector8k[144..148].copy_from_slice(&8192u32.to_le_bytes());
+    sector8k[148..152].copy_from_slice(&8192u32.to_le_bytes());
+    if Superblock::decode(&sector8k).is_err() {
+        return TestResult::Fail("8K sectors/nodes must be accepted");
+    }
+    for bad_sector in [2048u32, 12288, 131072] {
+        let mut bad = good.clone();
+        bad[144..148].copy_from_slice(&bad_sector.to_le_bytes());
+        bad[148..152].copy_from_slice(&bad_sector.to_le_bytes());
+        if !matches!(Superblock::decode(&bad), Err(FsError::Unsupported)) {
+            return TestResult::Fail("invalid sector geometry must be Unsupported");
+        }
     }
 
     // Bad magic → InvalidData.
@@ -811,6 +832,28 @@ fn read_all(file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>, size: usize) 
     }
 }
 
+fn qgroup_item(
+    vol: &BtrfsVolume<narf_block::ram::RamBlockDevice>,
+    item_type: u8,
+    id: u64,
+) -> Option<Vec<u8>> {
+    let root_tree = vol.root_tree_root().0;
+    let quota_root = poll_once(crate::roots::find_root(
+        vol,
+        root_tree,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)?
+    .0;
+    poll_once(btree::find_item(
+        vol,
+        quota_root,
+        &BtrfsKey::new(0, item_type, id),
+    ))
+    .and_then(Result::ok)
+    .flatten()
+}
+
 fn smoke_btrfs_cat_inline_and_regular() -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_fixture() {
@@ -857,6 +900,313 @@ fn smoke_btrfs_cat_inline_and_regular() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_cat_inline_and_regular);
+
+/// An 8 KiB-sector image uses the filesystem sector size (not the device's
+/// 512-byte LBA or NARF's 4 KiB page size) for checksum and COW allocation.
+/// Exercise reads on both sides of an 8 KiB boundary, a partial overwrite,
+/// remount, and checksum verification of the replacement extent.
+fn smoke_btrfs_sector8k_read_write() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_SECTOR8K_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8K-sector fixture failed to mount"),
+    };
+    if vol.sectorsize() != 8192 || vol.nodesize() != 8192 || !vol.supports_writes() {
+        return TestResult::Fail("8K-sector geometry or write mode was wrong");
+    }
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("8K-sector regular file lookup failed"),
+    };
+    let original = expected_big();
+    let mut crossing = [0u8; 32];
+    if !matches!(poll_once(big.read(8180, &mut crossing)), Some(Ok(32)))
+        || crossing[..] != original[8180..8212]
+    {
+        return TestResult::Fail("8K-sector cross-boundary read was wrong");
+    }
+    let patch = b"eight-kib-sector";
+    if !matches!(poll_once(big.write(8188, patch)), Some(Ok(n)) if n == patch.len()) {
+        return TestResult::Fail("8K-sector partial COW write failed");
+    }
+    let mut expected = original;
+    expected[8188..8188 + patch.len()].copy_from_slice(patch);
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("8K-sector remount failed"),
+    };
+    if vol2.sectorsize() != 8192 || vol2.nodesize() != 8192 {
+        return TestResult::Fail("8K-sector geometry changed after remount");
+    }
+    let big2 = match poll_once(vol2.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("8K-sector remount lookup failed"),
+    };
+    if read_all(&big2, expected.len() + 16) != Some(expected) {
+        return TestResult::Fail("8K-sector written data did not persist");
+    }
+    let (fs_root, _) = vol2.fs_tree_root();
+    let Some(csum_root) = csum_root_of(&vol2) else {
+        return TestResult::Fail("8K-sector csum tree was missing");
+    };
+    match poll_once(crate::csum::verify_file_data_csums(
+        &vol2,
+        fs_root,
+        csum_root,
+        big2.ino(),
+    )) {
+        Some(Ok(true)) => TestResult::Pass,
+        _ => TestResult::Fail("8K-sector replacement checksums were invalid"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_sector8k_read_write);
+
+/// A quota-enabled Linux image remains consistently accounted across COW
+/// writes and subvolume lifecycle operations. V2 inheritance creates both
+/// relation directions and applies limits; deletion removes all of them.
+fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    const PARENT: u64 = (1u64 << 48) | 100;
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let initial = match qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID) {
+        Some(body) if body.len() == 40 => body,
+        _ => return TestResult::Fail("top-level qgroup info was missing"),
+    };
+    let initial_rfer = format::le64(&initial, 8).unwrap_or(0);
+    if initial_rfer == 0 || qgroup_item(&vol, format::QGROUP_INFO_KEY, PARENT).is_none() {
+        return TestResult::Fail("fixture qgroup accounting or parent was empty");
+    }
+
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("quota fixture regular file lookup failed"),
+    };
+    if !matches!(poll_once(big.write(100, b"QGROUP")), Some(Ok(6))) {
+        return TestResult::Fail("quota-accounted COW write failed");
+    }
+    let after_write = match qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID) {
+        Some(body) if body.len() == 40 => body,
+        _ => return TestResult::Fail("qgroup info vanished after write"),
+    };
+    if format::le64(&after_write, 0).ok() != Some(vol.superblock().generation)
+        || format::le64(&after_write, 8).unwrap_or(0) == 0
+    {
+        return TestResult::Fail("qgroup generation/usage did not advance with write");
+    }
+
+    // Flattened btrfs_qgroup_inherit follows the 4096-byte V2 argument, exactly
+    // as sys_ioctl passes the separately pointed-to userspace payload.
+    let mut args = alloc::vec![0u8; 4096 + 80];
+    args[16..24].copy_from_slice(&crate::node::BTRFS_SUBVOL_QGROUP_INHERIT.to_ne_bytes());
+    args[24..32].copy_from_slice(&80u64.to_ne_bytes());
+    args[56..62].copy_from_slice(b"qchild");
+    let inherit = &mut args[4096..];
+    inherit[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SET_LIMITS
+    inherit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // one parent
+    inherit[32..40].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER flag
+    inherit[40..48].copy_from_slice(&(32u64 << 10).to_ne_bytes());
+    inherit[72..80].copy_from_slice(&PARENT.to_ne_bytes());
+    if !matches!(
+        poll_once(
+            vol.root()
+                .ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &args, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("V2 qgroup-inheriting subvolume create failed");
+    }
+    let child = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("qchild".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("qgroup child did not mount"),
+    };
+    let child_id = child.fs_tree_id();
+    let child_info = match qgroup_item(&child, format::QGROUP_INFO_KEY, child_id) {
+        Some(body) if body.len() == 40 => body,
+        _ => return TestResult::Fail("new child qgroup info was missing"),
+    };
+    if format::le64(&child_info, 8).unwrap_or(0) < child.nodesize() as u64
+        || qgroup_item(&child, format::QGROUP_INFO_KEY, PARENT).is_none()
+    {
+        return TestResult::Fail("new child qgroup usage was not recounted");
+    }
+    let limit = match qgroup_item(&child, format::QGROUP_LIMIT_KEY, child_id) {
+        Some(body) if body.len() == 40 => body,
+        _ => return TestResult::Fail("new child qgroup limit was missing"),
+    };
+    if format::le64(&limit, 0).ok() != Some(1) || format::le64(&limit, 8).ok() != Some(32u64 << 10)
+    {
+        return TestResult::Fail("inherited qgroup limit was wrong");
+    }
+    let quota_root = poll_once(crate::roots::find_root(
+        &*child,
+        child.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    .map(|r| r.0)
+    .unwrap_or(0);
+    for key in [
+        BtrfsKey::new(child_id, format::QGROUP_RELATION_KEY, PARENT),
+        BtrfsKey::new(PARENT, format::QGROUP_RELATION_KEY, child_id),
+    ] {
+        if poll_once(btree::find_item(&*child, quota_root, &key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_none()
+        {
+            return TestResult::Fail("qgroup inheritance relation was incomplete");
+        }
+    }
+
+    let payload = alloc::vec![0x5au8; 9000];
+    let child_file = match poll_once(child.root().create("charged.bin")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("qgroup child file creation failed"),
+    };
+    if !matches!(
+        poll_once(child_file.write(0, &payload)),
+        Some(Ok(n)) if n == payload.len()
+    ) {
+        return TestResult::Fail("qgroup child data write failed");
+    }
+    let charged = match qgroup_item(&child, format::QGROUP_INFO_KEY, child_id) {
+        Some(body) => format::le64(&body, 8).unwrap_or(0),
+        None => 0,
+    };
+    if charged <= format::le64(&child_info, 8).unwrap_or(0) {
+        return TestResult::Fail("child qgroup did not charge new data/metadata");
+    }
+    let over_limit = alloc::vec![0xa5u8; 40 * 1024];
+    if !matches!(
+        poll_once(child_file.write(0, &over_limit)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("qgroup hard limit did not return QuotaExceeded");
+    }
+    let child_file_after = match poll_once(child.root().lookup_async("charged.bin")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("quota-limited file vanished after rejection"),
+    };
+    if read_all(&child_file_after, payload.len() + 8).as_deref() != Some(payload.as_slice()) {
+        return TestResult::Fail("qgroup hard-limit rejection was not atomic");
+    }
+
+    let top = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("top remount before qgroup deletion failed"),
+    };
+    let child_dir = match poll_once(top.root().lookup_dir_async("qchild")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("qgroup snapshot source lookup failed"),
+    };
+    if !matches!(
+        poll_once(top.root().snapshot_with_quota_async(
+            child_dir,
+            "qsnap",
+            false,
+            narf_filesystem::FsQuotaInherit {
+                flags: 0,
+                parents: alloc::vec![PARENT],
+                limit: [0; 5],
+            },
+        )),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("quota-inheriting snapshot failed");
+    }
+    let snapshot = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("qsnap".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota-inheriting snapshot did not mount"),
+    };
+    let snapshot_id = snapshot.fs_tree_id();
+    if qgroup_item(&snapshot, format::QGROUP_INFO_KEY, snapshot_id).is_none() {
+        return TestResult::Fail("snapshot qgroup was not created");
+    }
+
+    for name in ["qsnap", "qchild"] {
+        let mut destroy = alloc::vec![0u8; 4096];
+        destroy[56..56 + name.len()].copy_from_slice(name.as_bytes());
+        if !matches!(
+            poll_once(top.root().ioctl_async(
+                crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+                0,
+                &destroy,
+                0,
+            )),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("quota subvolume/snapshot deletion failed");
+        }
+    }
+    if qgroup_item(&top, format::QGROUP_INFO_KEY, child_id).is_some()
+        || qgroup_item(&top, format::QGROUP_LIMIT_KEY, child_id).is_some()
+        || qgroup_item(&top, format::QGROUP_INFO_KEY, snapshot_id).is_some()
+    {
+        return TestResult::Fail("deleted subvolume qgroup items survived");
+    }
+    let final_quota = poll_once(crate::roots::find_root(
+        &*top,
+        top.root_tree_root().0,
+        format::QUOTA_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    .map(|r| r.0)
+    .unwrap_or(0);
+    if [
+        BtrfsKey::new(child_id, format::QGROUP_RELATION_KEY, PARENT),
+        BtrfsKey::new(PARENT, format::QGROUP_RELATION_KEY, child_id),
+    ]
+    .iter()
+    .any(|key| {
+        poll_once(btree::find_item(&*top, final_quota, key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+    }) {
+        return TestResult::Fail("deleted subvolume qgroup relation survived");
+    }
+    let status = qgroup_item(&top, format::QGROUP_STATUS_KEY, 0).unwrap_or_default();
+    if format::le64(&status, 8).ok() != Some(top.superblock().generation)
+        || format::le64(&status, 16).ok() != Some(1)
+    {
+        return TestResult::Fail("quota status did not finish at the committed generation");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_accounting_and_inheritance
+);
 
 /// Mount genuine mkfs images using every alternate checksum, COW-write regular
 /// data, remount through the newly checksummed metadata/superblock, and verify
@@ -4440,6 +4790,60 @@ fn smoke_btrfs_symlink_create() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_symlink_create);
 
+/// Btrfs symlinks are always one uncompressed inline extent. Match Linux's
+/// exact single-item limit: the largest fitting target persists, while the
+/// next byte is rejected instead of emitting a non-interoperable regular
+/// extent or failing later while packing the leaf.
+fn smoke_btrfs_symlink_inline_limit() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("symlink-limit fixture failed to mount"),
+    };
+    let device: Arc<RamBlockDevice> = vol.device.clone();
+    let max = core::cmp::min(
+        vol.nodesize() - crate::btree::HEADER_SIZE - format::DISK_KEY_SIZE - 8 - 21,
+        vol.sectorsize() as usize - 1,
+    );
+    let accepted = "x".repeat(max);
+    if !matches!(
+        poll_once(vol.root().symlink("max-link", &accepted)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("maximum inline symlink target was rejected");
+    }
+    let rejected = "y".repeat(max + 1);
+    if !matches!(
+        poll_once(vol.root().symlink("too-long", &rejected)),
+        Some(Err(FsError::Unsupported))
+    ) {
+        return TestResult::Fail("oversized symlink target was accepted");
+    }
+
+    let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after maximum symlink failed"),
+    };
+    let link = match poll_once(vol2.root().lookup_async("max-link")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("maximum symlink did not persist"),
+    };
+    if read_all(&link, accepted.len() + 1).as_deref() != Some(accepted.as_bytes()) {
+        return TestResult::Fail("maximum symlink target changed after remount");
+    }
+    if !matches!(
+        poll_once(vol2.root().lookup_async("too-long")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("rejected symlink left a directory entry");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_symlink_inline_limit);
+
 /// `mknod` creates a char device node that stats as `Special` with the right
 /// `st_rdev` after a remount.
 fn smoke_btrfs_mknod_device() -> TestResult {
@@ -6164,7 +6568,7 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     let outer_args = make_args("outer", false);
     if !matches!(
         poll_once(container.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY, 0, &outer_args, 0,)),
-        Some(Err(FsError::Unsupported))
+        Some(Err(FsError::Busy))
     ) || !matches!(poll_once(container.lookup_dir_async("outer")), Some(Ok(_)))
     {
         return TestResult::Fail("nested subvolume destroy rejection was not atomic");
@@ -6299,6 +6703,161 @@ fn smoke_btrfs_writable_nested_subvolume() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_writable_nested_subvolume);
+
+/// Linux refuses to delete a subvolume that still owns nested ROOT_REFs with
+/// ENOTEMPTY. Once children are removed bottom-up, the parent deletion must
+/// retire all root items/refs and remain absent after remount.
+fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let destroy_args = |name: &str| {
+        let mut args = alloc::vec![0u8; 4096];
+        args[56..56 + name.len()].copy_from_slice(name.as_bytes());
+        args
+    };
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let outer = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("container/outer".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("outer subvolume mount for deletion failed"),
+    };
+    let outer_id = outer.fs_tree_id();
+    let inner = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("container/outer/inner".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("inner subvolume mount for deletion failed"),
+    };
+    let inner_id = inner.fs_tree_id();
+    let rochild = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name(
+            "container/outer/rochild".into(),
+        )),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("read-only child mount for deletion failed"),
+    };
+    let rochild_id = rochild.fs_tree_id();
+
+    // The direct parent delete is rejected while both ROOT_REF children exist.
+    let top = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("top-level mount for nested delete failed"),
+    };
+    let container = match poll_once(top.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("nested-delete container lookup failed"),
+    };
+    if !matches!(
+        poll_once(container.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &destroy_args("outer"),
+            0,
+        )),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("parent subvolume with children was not ENOTEMPTY-shaped");
+    }
+
+    for child_name in ["inner", "rochild"] {
+        let args = destroy_args(child_name);
+        if !matches!(
+            poll_once(outer.root().ioctl_async(
+                crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+                0,
+                &args,
+                0,
+            )),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("bottom-up child subvolume deletion failed");
+        }
+    }
+
+    // The first top-level mount has a stale fs-tree view after the child-root
+    // transactions. Remount before deleting the now-empty outer subvolume.
+    let top2 = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("top-level remount before parent deletion failed"),
+    };
+    let container2 = match poll_once(top2.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("container remount lookup failed"),
+    };
+    let outer_args = destroy_args("outer");
+    if !matches!(
+        poll_once(container2.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &outer_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("empty parent subvolume deletion failed");
+    }
+
+    let final_top = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Id(format::FS_TREE_OBJECTID)),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("final remount after nested delete failed"),
+    };
+    let final_container = match poll_once(final_top.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("final container lookup failed"),
+    };
+    if !matches!(
+        poll_once(final_container.lookup_dir_async("outer")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("deleted nested hierarchy remained reachable");
+    }
+    for id in [outer_id, inner_id, rochild_id] {
+        if !matches!(
+            poll_once(BtrfsVolume::mount_subvol(
+                device.clone(),
+                DomainId::DRIVER_0,
+                true,
+                Some(crate::volume::Subvol::Id(id)),
+            )),
+            Some(Err(FsError::NotFound))
+        ) {
+            return TestResult::Fail("deleted nested subvolume root item survived");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_nested_subvolume_delete_bottom_up
+);
 
 // ── Hardlinks ──────────────────────────────────────────────────────
 

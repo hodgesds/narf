@@ -11,8 +11,8 @@ use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
 use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply, FsStat,
-    FsStatx, FsStatxTimestamp, Mode, Stat,
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsIoctlReply,
+    FsQuotaInherit, FsStat, FsStatx, FsStatxTimestamp, Mode, Stat,
 };
 
 use crate::btree;
@@ -40,6 +40,60 @@ pub(crate) const BTRFS_IOC_SUBVOL_SETFLAGS: u32 = 0x4008_941a;
 /// Userspace flag returned by `BTRFS_IOC_SUBVOL_GETFLAGS`. This is distinct
 /// from bit 0 in the on-disk `btrfs_root_item.flags` field.
 pub(crate) const BTRFS_SUBVOL_RDONLY: u64 = 1 << 1;
+/// Attach the new subvolume's level-0 qgroup to inherited parent qgroups.
+pub(crate) const BTRFS_SUBVOL_QGROUP_INHERIT: u64 = 1 << 2;
+
+fn parse_qgroup_inherit(
+    input: &[u8],
+    flags: u64,
+) -> Result<Option<crate::write::QgroupInherit>, FsError> {
+    if flags & BTRFS_SUBVOL_QGROUP_INHERIT == 0 {
+        if input.len() != 4096 {
+            return Err(FsError::InvalidData);
+        }
+        return Ok(None);
+    }
+    let size = usize::try_from(u64::from_ne_bytes(
+        input[24..32].try_into().map_err(|_| FsError::InvalidData)?,
+    ))
+    .map_err(|_| FsError::InvalidData)?;
+    if !(72..=4096).contains(&size) || input.len() != 4096 + size {
+        return Err(FsError::InvalidData);
+    }
+    let inherit = &input[4096..];
+    let inherit_flags = u64::from_ne_bytes(inherit[0..8].try_into().unwrap());
+    let count = usize::try_from(u64::from_ne_bytes(inherit[8..16].try_into().unwrap()))
+        .map_err(|_| FsError::InvalidData)?;
+    let ref_copies = u64::from_ne_bytes(inherit[16..24].try_into().unwrap());
+    let excl_copies = u64::from_ne_bytes(inherit[24..32].try_into().unwrap());
+    if inherit_flags & !1 != 0
+        || ref_copies != 0
+        || excl_copies != 0
+        || size != 72usize.saturating_add(count.saturating_mul(8))
+    {
+        return Err(FsError::InvalidData);
+    }
+    let mut limit = [0u64; 5];
+    for (idx, value) in limit.iter_mut().enumerate() {
+        let off = 32 + idx * 8;
+        *value = u64::from_ne_bytes(inherit[off..off + 8].try_into().unwrap());
+    }
+    if limit[0] & !0x3f != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut parents = Vec::with_capacity(count);
+    for idx in 0..count {
+        let off = 72 + idx * 8;
+        parents.push(u64::from_ne_bytes(
+            inherit[off..off + 8].try_into().unwrap(),
+        ));
+    }
+    Ok(Some(crate::write::QgroupInherit {
+        flags: inherit_flags,
+        parents,
+        limit,
+    }))
+}
 
 /// Convert a packed userspace `dev_t` (as `mknod` delivers it) to the raw kernel
 /// `dev_t` btrfs stores on disk — Linux `new_decode_dev` followed by `MKDEV`
@@ -136,9 +190,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 {
                     return Err(FsError::InvalidData);
                 }
-                BTRFS_IOC_SUBVOL_CREATE | BTRFS_IOC_SUBVOL_CREATE_V2
-                    if out_size != 0 || input.len() != 4096 =>
-                {
+                BTRFS_IOC_SUBVOL_CREATE if out_size != 0 || input.len() != 4096 => {
+                    return Err(FsError::InvalidData);
+                }
+                BTRFS_IOC_SUBVOL_CREATE_V2 if out_size != 0 || input.len() < 4096 => {
                     return Err(FsError::InvalidData);
                 }
                 BTRFS_IOC_SNAP_DESTROY | BTRFS_IOC_SNAP_DESTROY_V2
@@ -204,18 +259,22 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
                         return Err(FsError::ReadOnly);
                     }
-                    let (name_offset, readonly) = if cmd == BTRFS_IOC_SUBVOL_CREATE_V2 {
+                    let (name_offset, readonly, inherit) = if cmd == BTRFS_IOC_SUBVOL_CREATE_V2 {
                         let flags = u64::from_ne_bytes(
                             input[16..24].try_into().map_err(|_| FsError::InvalidData)?,
                         );
-                        if flags & !BTRFS_SUBVOL_RDONLY != 0 {
+                        if flags & !(BTRFS_SUBVOL_RDONLY | BTRFS_SUBVOL_QGROUP_INHERIT) != 0 {
                             return Err(FsError::InvalidData);
                         }
-                        (56usize, flags & BTRFS_SUBVOL_RDONLY != 0)
+                        (
+                            56usize,
+                            flags & BTRFS_SUBVOL_RDONLY != 0,
+                            parse_qgroup_inherit(input, flags)?,
+                        )
                     } else {
-                        (8usize, false)
+                        (8usize, false, None)
                     };
-                    let raw_name = input.get(name_offset..).ok_or(FsError::InvalidData)?;
+                    let raw_name = input.get(name_offset..4096).ok_or(FsError::InvalidData)?;
                     let end = raw_name
                         .iter()
                         .position(|&byte| byte == 0)
@@ -224,7 +283,14 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         core::str::from_utf8(&raw_name[..end]).map_err(|_| FsError::InvalidData)?;
                     autogrow!(
                         vol,
-                        crate::write::create_subvolume(&vol, self.ino, name, readonly).await
+                        crate::write::create_subvolume_with_qgroup(
+                            &vol,
+                            self.ino,
+                            name,
+                            readonly,
+                            inherit.clone(),
+                        )
+                        .await
                     )?;
                     Ok(FsIoctlReply {
                         result: 0,
@@ -265,6 +331,53 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 }
                 _ => unreachable!(),
             }
+        })
+    }
+
+    fn snapshot_impl<'a>(
+        &'a self,
+        source: Arc<dyn DirOps>,
+        name: &'a str,
+        readonly: bool,
+        inherit: Option<crate::write::QgroupInherit>,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                return Err(FsError::ReadOnly);
+            }
+            let source = source
+                .as_any()
+                .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
+                .ok_or(FsError::CrossDevice)?;
+            if source.ino != format::FIRST_FREE_OBJECTID
+                || source.inode.file_type() != FileType::Dir
+            {
+                return Err(FsError::InvalidData);
+            }
+            let vol = self.volume()?;
+            let source_vol = source.volume()?;
+            if !Arc::ptr_eq(&vol, &source_vol) {
+                return Err(FsError::CrossDevice);
+            }
+            let (source_root, source_id) = match (source.tree_root, source.tree_id) {
+                (Some(root), Some(id)) => (root, id),
+                (None, None) => (vol.fs_tree_root().0, vol.fs_tree_id()),
+                _ => return Err(FsError::InvalidData),
+            };
+            autogrow!(
+                vol,
+                crate::write::create_snapshot_with_qgroup(
+                    &vol,
+                    self.ino,
+                    source_root,
+                    source_id,
+                    name,
+                    readonly,
+                    inherit.clone(),
+                )
+                .await
+            )?;
+            Ok(())
         })
     }
 
@@ -579,45 +692,26 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         name: &'a str,
         readonly: bool,
     ) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            // The destination must be in the explicitly mounted live tree: it
-            // is the parent namespace the transaction path-COWs.
-            if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
-                return Err(FsError::ReadOnly);
-            }
-            let source = source
-                .as_any()
-                .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
-                .ok_or(FsError::CrossDevice)?;
-            if source.ino != format::FIRST_FREE_OBJECTID
-                || source.inode.file_type() != FileType::Dir
-            {
-                return Err(FsError::InvalidData);
-            }
-            let vol = self.volume()?;
-            let source_vol = source.volume()?;
-            if !Arc::ptr_eq(&vol, &source_vol) {
-                return Err(FsError::CrossDevice);
-            }
-            let (source_root, source_id) = match (source.tree_root, source.tree_id) {
-                (Some(root), Some(id)) => (root, id),
-                (None, None) => (vol.fs_tree_root().0, vol.fs_tree_id()),
-                _ => return Err(FsError::InvalidData),
-            };
-            autogrow!(
-                vol,
-                crate::write::create_snapshot(
-                    &vol,
-                    self.ino,
-                    source_root,
-                    source_id,
-                    name,
-                    readonly,
-                )
-                .await
-            )?;
-            Ok(())
-        })
+        self.snapshot_impl(source, name, readonly, None)
+    }
+
+    fn snapshot_with_quota_async<'a>(
+        &'a self,
+        source: Arc<dyn DirOps>,
+        name: &'a str,
+        readonly: bool,
+        quota: FsQuotaInherit,
+    ) -> FsFuture<'a, ()> {
+        self.snapshot_impl(
+            source,
+            name,
+            readonly,
+            Some(crate::write::QgroupInherit {
+                flags: quota.flags,
+                parents: quota.parents,
+                limit: quota.limit,
+            }),
+        )
     }
 
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {

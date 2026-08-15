@@ -99,6 +99,7 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                         Some(narf_filesystem::FsError::PermissionDenied) => -13, // EACCES
                         Some(narf_filesystem::FsError::ReadOnly) => -30, // EROFS
                         Some(narf_filesystem::FsError::NoSpace) => -28, // ENOSPC
+                        Some(narf_filesystem::FsError::QuotaExceeded) => -122, // EDQUOT
                         _ => -5,                                       // EIO
                     };
                     ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
@@ -122,6 +123,9 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         }
         Some(Err(narf_filesystem::FsError::NoSpace)) => {
             ctx.set_return(SyscallReturn::ok((-28i64) as u64)) // -ENOSPC
+        }
+        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64)) // -EDQUOT
         }
         _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
     }

@@ -53,6 +53,9 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         Some(Err(narf_filesystem::FsError::NoSpace)) => {
             ctx.set_return(SyscallReturn::ok((-28i64) as u64))
         }
+        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
+            ctx.set_return(SyscallReturn::ok((-122i64) as u64))
+        }
         _ => ctx.set_return(fail),
     }
 }
