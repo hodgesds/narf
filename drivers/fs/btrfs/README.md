@@ -83,6 +83,11 @@ real laptop's btrfs root looks like.
   land, snapshot creation eagerly gives every disk extent private storage, so
   source and snapshot are independently writable but creation is O(tree + data)
   rather than the usual O(1) shared-root operation.
+- Legacy `BTRFS_IOC_SNAP_DESTROY` and V2 deletion by name or subvolume id.
+  The parent namespace, root refs/item, UUID index, checksums, extent tree and
+  free-space tree update in one transaction. Every child metadata/data extent
+  is proven exclusive before reclamation; an externally shared snapshot is
+  rejected until shared delayed refs are supported.
 - **statfs** reports total/free blocks (free approximated from the superblock's
   `bytes_used`).
 
@@ -93,11 +98,10 @@ than mis-read:
 
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
-- Subvolume/snapshot deletion; mutations reached by traversing a child subvolume
-  from its parent (mount that child explicitly to write it). Snapshotting a
-  source that itself contains nested subvolume mount points is not yet
-  supported. `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not
-  supported.
+- Mutations reached by traversing a child subvolume from its parent (mount that
+  child explicitly to write it). Snapshot creation or deletion of a child that
+  itself contains nested subvolume mount points is not yet supported.
+  `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not supported.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a hardlinked or non-empty-directory target.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.

@@ -29,6 +29,10 @@ const STATX_BASIC_STATS: u32 = 0x7ff;
 pub(crate) const BTRFS_IOC_SUBVOL_CREATE: u32 = 0x5000_940e;
 /// `_IOW(BTRFS_IOCTL_MAGIC, 24, struct btrfs_ioctl_vol_args_v2)`.
 pub(crate) const BTRFS_IOC_SUBVOL_CREATE_V2: u32 = 0x5000_9418;
+/// Legacy `_IOW(BTRFS_IOCTL_MAGIC, 15, struct btrfs_ioctl_vol_args)`.
+pub(crate) const BTRFS_IOC_SNAP_DESTROY: u32 = 0x5000_940f;
+/// `_IOW(BTRFS_IOCTL_MAGIC, 63, struct btrfs_ioctl_vol_args_v2)`.
+pub(crate) const BTRFS_IOC_SNAP_DESTROY_V2: u32 = 0x5000_943f;
 /// `_IOR(BTRFS_IOCTL_MAGIC, 25, __u64)` from Linux `uapi/linux/btrfs.h`.
 pub(crate) const BTRFS_IOC_SUBVOL_GETFLAGS: u32 = 0x8008_9419;
 /// `_IOW(BTRFS_IOCTL_MAGIC, 26, __u64)` from Linux `uapi/linux/btrfs.h`.
@@ -137,10 +141,17 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 {
                     return Err(FsError::InvalidData);
                 }
+                BTRFS_IOC_SNAP_DESTROY | BTRFS_IOC_SNAP_DESTROY_V2
+                    if out_size != 0 || input.len() != 4096 =>
+                {
+                    return Err(FsError::InvalidData);
+                }
                 BTRFS_IOC_SUBVOL_GETFLAGS
                 | BTRFS_IOC_SUBVOL_SETFLAGS
                 | BTRFS_IOC_SUBVOL_CREATE
-                | BTRFS_IOC_SUBVOL_CREATE_V2 => {}
+                | BTRFS_IOC_SUBVOL_CREATE_V2
+                | BTRFS_IOC_SNAP_DESTROY
+                | BTRFS_IOC_SNAP_DESTROY_V2 => {}
                 _ => return Err(FsError::Unsupported),
             }
             let vol = self.volume()?;
@@ -220,6 +231,38 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                         output: Vec::new(),
                     })
                 }
+                BTRFS_IOC_SNAP_DESTROY | BTRFS_IOC_SNAP_DESTROY_V2 => {
+                    if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                        return Err(FsError::ReadOnly);
+                    }
+                    let (name, subvolid) = if cmd == BTRFS_IOC_SNAP_DESTROY_V2 {
+                        let flags = u64::from_ne_bytes(
+                            input[16..24].try_into().map_err(|_| FsError::InvalidData)?,
+                        );
+                        if flags & !(1 << 4) != 0 {
+                            return Err(FsError::InvalidData);
+                        }
+                        if flags & (1 << 4) != 0 {
+                            let id = u64::from_ne_bytes(
+                                input[56..64].try_into().map_err(|_| FsError::InvalidData)?,
+                            );
+                            (None, Some(id))
+                        } else {
+                            (Some(parse_subvol_name(&input[56..])?), None)
+                        }
+                    } else {
+                        (Some(parse_subvol_name(&input[8..])?), None)
+                    };
+                    autogrow!(
+                        vol,
+                        crate::write::destroy_subvolume(&vol, self.ino, name.as_deref(), subvolid,)
+                            .await
+                    )?;
+                    Ok(FsIoctlReply {
+                        result: 0,
+                        output: Vec::new(),
+                    })
+                }
                 _ => unreachable!(),
             }
         })
@@ -290,6 +333,18 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             _ => Err(FsError::NotFound),
         }
     }
+}
+
+fn parse_subvol_name(raw: &[u8]) -> Result<String, FsError> {
+    let end = raw
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(FsError::InvalidData)?;
+    let name = core::str::from_utf8(&raw[..end]).map_err(|_| FsError::InvalidData)?;
+    if name.is_empty() || name.len() > 255 || name.contains('/') {
+        return Err(FsError::InvalidData);
+    }
+    Ok(name.into())
 }
 
 impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {

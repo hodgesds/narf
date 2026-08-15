@@ -5169,6 +5169,256 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_snapshot_create_and_isolate);
 
+fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let make_args = |name: &str, v2: bool| {
+        let mut args = alloc::vec![0u8; 4096];
+        let offset = if v2 { 56 } else { 8 };
+        args[offset..offset + name.len()].copy_from_slice(name.as_bytes());
+        args
+    };
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("subvolume-destroy fixture mount failed"),
+    };
+    let root = vol.root();
+    let initial_used = match poll_once(vol.read_raw_superblock()) {
+        Some(Ok(raw)) => u64::from_le_bytes(raw[120..128].try_into().unwrap()),
+        _ => return TestResult::Fail("initial bytes_used read failed"),
+    };
+
+    let create_empty = {
+        let mut args = alloc::vec![0u8; 4096];
+        args[56..61].copy_from_slice(b"empty");
+        args
+    };
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &create_empty, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("delete-test subvolume creation failed");
+    }
+    let empty_id = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("empty".into())),
+    )) {
+        Some(Ok(v)) => v.fs_tree_id(),
+        _ => return TestResult::Fail("delete-test subvolume did not mount"),
+    };
+    let legacy = make_args("empty", false);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY, 0, &legacy, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("legacy subvolume destroy failed");
+    }
+    if !matches!(
+        poll_once(root.lookup_dir_async("empty")),
+        Some(Err(FsError::NotFound))
+    ) || !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(empty_id)),
+        )),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("legacy-destroyed subvolume remained reachable");
+    }
+
+    // Delete an isolated snapshot with real regular data through V2-by-name.
+    if !matches!(
+        poll_once(root.snapshot_async(root.clone(), "snap-delete", false)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("delete-test snapshot creation failed");
+    }
+    let snap = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("snap-delete".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("delete-test snapshot did not mount"),
+    };
+    let snap_id = snap.fs_tree_id();
+    let root_tree_before = vol.root_tree_root().0;
+    let snap_item = match poll_once(btree::find_item(
+        &*vol,
+        root_tree_before,
+        &BtrfsKey::new(snap_id, format::ROOT_ITEM_KEY, 0),
+    )) {
+        Some(Ok(Some(body))) if body.len() >= 263 => body,
+        _ => return TestResult::Fail("delete-test snapshot root item missing"),
+    };
+    let snap_uuid = snap_item[247..263].to_vec();
+    let used_with_snapshot = match poll_once(vol.read_raw_superblock()) {
+        Some(Ok(raw)) => u64::from_le_bytes(raw[120..128].try_into().unwrap()),
+        _ => return TestResult::Fail("snapshot bytes_used read failed"),
+    };
+    if used_with_snapshot <= initial_used {
+        return TestResult::Fail("snapshot creation did not account allocated space");
+    }
+    let v2_name = make_args("snap-delete", true);
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY_V2, 0, &v2_name, 0,)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("V2 name snapshot destroy failed");
+    }
+
+    let remounted = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after snapshot destroy failed"),
+    };
+    if remounted.superblock().bytes_used >= used_with_snapshot {
+        return TestResult::Fail("snapshot destroy did not reclaim space");
+    }
+    let root_tree = remounted.root_tree_root().0;
+    if poll_once(btree::find_item(
+        &*remounted,
+        root_tree,
+        &BtrfsKey::new(snap_id, format::ROOT_ITEM_KEY, 0),
+    ))
+    .and_then(Result::ok)
+    .flatten()
+    .is_some()
+    {
+        return TestResult::Fail("destroyed snapshot root item survived");
+    }
+    if let Some((uuid_root, _)) = poll_once(crate::roots::find_root(
+        &*remounted,
+        root_tree,
+        format::UUID_TREE_OBJECTID,
+    ))
+    .and_then(Result::ok)
+    {
+        let uuid_key = BtrfsKey::new(
+            u64::from_le_bytes(snap_uuid[..8].try_into().unwrap()),
+            format::UUID_KEY_SUBVOL,
+            u64::from_le_bytes(snap_uuid[8..].try_into().unwrap()),
+        );
+        if poll_once(btree::find_item(&*remounted, uuid_root, &uuid_key))
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+        {
+            return TestResult::Fail("destroyed snapshot UUID index survived");
+        }
+    }
+    let source_hello = match poll_once(remounted.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("snapshot destroy damaged source namespace"),
+    };
+    if read_all(&source_hello, 16).as_deref() != Some(b"narf\n") {
+        return TestResult::Fail("snapshot destroy damaged source data");
+    }
+
+    // V2-by-id resolves the child name from DIR_INDEX and removes both indices.
+    let byid_create = {
+        let mut args = alloc::vec![0u8; 4096];
+        args[56..60].copy_from_slice(b"byid");
+        args
+    };
+    let remount_root = remounted.root();
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SUBVOL_CREATE_V2,
+            0,
+            &byid_create,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("by-id delete-test subvolume creation failed");
+    }
+    let byid = match poll_once(BtrfsVolume::mount_subvol(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("byid".into())),
+    )) {
+        Some(Ok(v)) => v.fs_tree_id(),
+        _ => return TestResult::Fail("by-id delete-test subvolume did not mount"),
+    };
+    let mut byid_args = alloc::vec![0u8; 4096];
+    byid_args[16..24].copy_from_slice(&(1u64 << 4).to_ne_bytes());
+    byid_args[56..64].copy_from_slice(&byid.to_ne_bytes());
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &byid_args,
+            0,
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("V2 by-id subvolume destroy failed");
+    }
+    if !matches!(
+        poll_once(remount_root.lookup_dir_async("byid")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("V2 by-id destroy left the directory entry");
+    }
+
+    let mut bad_flags = alloc::vec![0u8; 4096];
+    bad_flags[16..24].copy_from_slice(&(1u64 << 63).to_ne_bytes());
+    if !matches!(
+        poll_once(remount_root.ioctl_async(
+            crate::node::BTRFS_IOC_SNAP_DESTROY_V2,
+            0,
+            &bad_flags,
+            0,
+        )),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("snapshot destroy accepted unknown flags");
+    }
+
+    // A child that contains another subvolume cannot be reclaimed as one
+    // exclusive tree; it must remain intact on the rejection path.
+    let nested_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
+    let nested = match poll_once(BtrfsVolume::mount_opts(
+        nested_device,
+        DomainId::DRIVER_0,
+        true,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("nested destroy-rejection fixture mount failed"),
+    };
+    let container = match poll_once(nested.root().lookup_dir_async("container")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("nested destroy-rejection parent missing"),
+    };
+    let outer_args = make_args("outer", false);
+    if !matches!(
+        poll_once(container.ioctl_async(crate::node::BTRFS_IOC_SNAP_DESTROY, 0, &outer_args, 0,)),
+        Some(Err(FsError::Unsupported))
+    ) || !matches!(poll_once(container.lookup_dir_async("outer")), Some(Ok(_)))
+    {
+        return TestResult::Fail("nested subvolume destroy rejection was not atomic");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_destroy_ioctl);
+
 /// A writable multi-component `subvol=` mount commits into that subvolume's
 /// own tree id. The new root must be published through its `ROOT_ITEM`, data
 /// backrefs must name the subvolume rather than tree 5, and both an explicit
