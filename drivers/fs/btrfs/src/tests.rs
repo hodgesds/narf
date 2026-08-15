@@ -1550,6 +1550,83 @@ fn smoke_btrfs_tree_log_replay() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_log_replay);
 
+/// Tree-log mappings are keyed by subvolume id, not hard-coded to FS_TREE. A
+/// pending log emitted while a child is mounted must be replayed during the
+/// next ordinary top-level mount, before mount-option selection.
+fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let top = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("subvolume-log fixture failed to mount"),
+    };
+    let mut args = alloc::vec![0u8; 4096];
+    args[56..64].copy_from_slice(b"logchild");
+    if !matches!(
+        poll_once(
+            top.root()
+                .ioctl_async(crate::node::BTRFS_IOC_SUBVOL_CREATE_V2, 0, &args, 0,)
+        ),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("log child creation failed");
+    }
+    let child = match poll_once(BtrfsVolume::mount_subvol(
+        narf_block::SyncBlock::new(device.clone() as Arc<dyn narf_block::BlockDeviceSync>),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("logchild".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("log child mount failed"),
+    };
+    let file = match poll_once(child.root().create("pending")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("log child file creation failed"),
+    };
+    let key = BtrfsKey::new(file.ino(), format::INODE_ITEM_KEY, 0);
+    let mut inode = match poll_once(btree::find_item(&*child, child.fs_tree_root().0, &key)) {
+        Some(Ok(Some(body))) => body,
+        _ => return TestResult::Fail("log child inode missing"),
+    };
+    const MARK: u64 = 0x0055_6677_8899;
+    inode[136..144].copy_from_slice(&MARK.to_le_bytes());
+    if !matches!(
+        poll_once(crate::write::write_log(&child, &[(key, inode)])),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("nested-subvolume write_log failed");
+    }
+
+    let replayed_top = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("top-level mount did not replay child log"),
+    };
+    if replayed_top.superblock().log_root != 0 {
+        return TestResult::Fail("child log pointer survived replay");
+    }
+    let replayed_child = match poll_once(BtrfsVolume::mount_subvol(
+        narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>),
+        DomainId::DRIVER_0,
+        true,
+        Some(crate::volume::Subvol::Name("logchild".into())),
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("replayed child did not remount"),
+    };
+    let file = match poll_once(replayed_child.root().lookup_async("pending")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("replayed child file missing"),
+    };
+    match poll_once(file.statx_async(0, 0x7ff)) {
+        Some(Ok(stat)) if stat.mtime.seconds == MARK as i64 => TestResult::Pass,
+        _ => TestResult::Fail("nested-subvolume log item was not replayed"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_tree_log_replay);
+
 /// A modern `DIR_LOG_INDEX` range makes the log authoritative for a span of
 /// directory indexes. Entries absent from the log are deletions: replay must
 /// unlink a data-bearing file and rmdir an empty directory, preserve an entry
@@ -5450,6 +5527,7 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
     use narf_filesystem::FsInstance;
 
     let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let source_big_extent;
     {
         let vol = match poll_once(BtrfsVolume::mount_opts(
             device.clone(),
@@ -5460,6 +5538,14 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             _ => return TestResult::Fail("snapshot fixture mount failed"),
         };
         let root = vol.root();
+        let big = match poll_once(root.lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source big.dat lookup failed"),
+        };
+        source_big_extent = match file_data_extent(&vol, big.ino()) {
+            Some(extent) => extent,
+            None => return TestResult::Fail("source big.dat extent missing"),
+        };
         if !matches!(
             poll_once(root.snapshot_async(root.clone(), "snap", false)),
             Some(Ok(()))
@@ -5489,6 +5575,41 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             return TestResult::Fail("writable snapshot remounted read-only");
         }
         snapshot_id = snap.fs_tree_id();
+        let extent_root = match poll_once(crate::roots::find_root(
+            &*snap,
+            snap.root_tree_root().0,
+            format::EXTENT_TREE_OBJECTID,
+        )) {
+            Some(Ok((root, _))) => root,
+            _ => return TestResult::Fail("snapshot extent tree missing"),
+        };
+        let extent_item = match poll_once(btree::find_item(
+            &*snap,
+            extent_root,
+            &BtrfsKey::new(
+                source_big_extent.0,
+                format::EXTENT_ITEM_KEY,
+                source_big_extent.1,
+            ),
+        )) {
+            Some(Ok(Some(body))) => body,
+            _ => return TestResult::Fail("shared snapshot extent item missing"),
+        };
+        if format::le64(&extent_item, 0).ok() != Some(2) {
+            return TestResult::Fail("shared extent aggregate refcount is not two");
+        }
+        let mut roots = Vec::new();
+        let mut pos = 24usize;
+        while pos < extent_item.len() {
+            if extent_item[pos] != 178 || pos + 29 > extent_item.len() {
+                return TestResult::Fail("shared extent inline ref encoding malformed");
+            }
+            roots.push(format::le64(&extent_item, pos + 1).unwrap_or(0));
+            pos += 29;
+        }
+        if !roots.contains(&format::FS_TREE_OBJECTID) || !roots.contains(&snapshot_id) {
+            return TestResult::Fail("shared extent did not name both roots");
+        }
         let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
             Some(Ok(f)) => f,
             _ => return TestResult::Fail("snapshot lost inline file"),
@@ -5502,6 +5623,12 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         };
         if read_all(&big, expected_big().len() + 8).as_deref() != Some(expected_big().as_slice()) {
             return TestResult::Fail("snapshot regular extent content was wrong");
+        }
+        if file_data_extent(&snap, big.ino()) != Some(source_big_extent) {
+            return TestResult::Fail("snapshot copied data instead of sharing its extent");
+        }
+        if !matches!(poll_once(big.write(100, b"SNAP")), Some(Ok(4))) {
+            return TestResult::Fail("shared snapshot data write failed");
         }
     }
 
@@ -5540,6 +5667,15 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         if read_all(&hello, 16).as_deref() != Some(b"narf\n") {
             return TestResult::Fail("source write leaked into snapshot");
         }
+        let big = match poll_once(snap.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot big.dat remount lookup failed"),
+        };
+        let mut expected = expected_big();
+        expected[100..104].copy_from_slice(b"SNAP");
+        if read_all(&big, expected.len() + 8).as_deref() != Some(expected.as_slice()) {
+            return TestResult::Fail("snapshot shared-data write did not persist");
+        }
         if !matches!(poll_once(hello.write(0, b"snapshot\n")), Some(Ok(9))) {
             return TestResult::Fail("snapshot mutation failed");
         }
@@ -5559,6 +5695,13 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         };
         if read_all(&hello, 16).as_deref() != Some(b"source\n") {
             return TestResult::Fail("snapshot write leaked into source");
+        }
+        let big = match poll_once(source.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source final big.dat lookup failed"),
+        };
+        if read_all(&big, expected_big().len() + 8).as_deref() != Some(expected_big().as_slice()) {
+            return TestResult::Fail("snapshot shared-data write leaked into source");
         }
 
         let root_tree = source.root_tree_root().0;

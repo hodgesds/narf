@@ -83,15 +83,16 @@ real laptop's btrfs root looks like.
 - Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
   writable/read-only snapshots selected by source directory fd. Snapshot
   ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
-  refs and the destination entry commit atomically. Until shared delayed refs
-  land, snapshot creation eagerly gives every disk extent private storage, so
-  source and snapshot are independently writable but creation is O(tree + data)
+  refs and the destination entry commit atomically. Data extents are shared with
+  ordered inline `EXTENT_DATA_REF`s and refcounted delayed adds/drops; snapshot
+  and source writes COW independently without copying untouched payloads.
+  Metadata is still rebuilt under a private root, so creation is O(tree metadata)
   rather than the usual O(1) shared-root operation.
 - Legacy `BTRFS_IOC_SNAP_DESTROY` and V2 deletion by name or subvolume id.
   The parent namespace, root refs/item, UUID index, checksums, extent tree and
-  free-space tree update in one transaction. Every child metadata/data extent
-  is proven exclusive before reclamation; an externally shared snapshot is
-  rejected until shared delayed refs are supported.
+  free-space tree update in one transaction. Metadata is proven exclusive;
+  shared data loses only the deleted root's backref and is reclaimed with its
+  checksum/free space only after the final reference disappears.
 - **statfs** reports total/free blocks (free approximated from the superblock's
   `bytes_used`).
 
@@ -123,10 +124,10 @@ the replaced backing extents. Non-overlapping file items, physical refs and
 checksums are preserved, so small random writes no longer scale with the whole
 file. Existing intersected full zlib/zstd/LZO extents are decompressed; zlib
 windows are recompressed when that reduces their sector-rounded physical size,
-while zstd/LZO currently fall back to uncompressed output. An intersected disk
-extent must be exclusively and wholly owned; an intersected **shared/partial**
-extent returns `Unsupported`; a read-only or traversal-pinned subvolume returns
-`ReadOnly`.
+while zstd/LZO currently fall back to uncompressed output. Intersected shared or
+partial extent references are read, dropped by exact backref identity, and COWed
+without reclaiming other roots' data; a read-only or traversal-pinned subvolume
+returns `ReadOnly`.
 `DirOps::create` / `unlink` / `mkdir` /
 `rmdir` / `rename` add, remove and re-key regular files and empty directories in
 the mounted writable subvolume through the same transaction (`unlink` frees the file's
@@ -222,12 +223,13 @@ re-issues a device-flush barrier (there is no deferred transaction to force out)
 The **tree-log** is therefore used for crash *recovery*, not deferred durability:
 `replay_log` runs once at mount, and if the superblock names an unreplayed log
 (`log_root != 0`, as a crash between an fsync and the next commit leaves it) it
-merges the log's items into the fs tree in one path-COW commit and zeroes the
-pointer. `write_log` produces such a log — the subvolume's log tree plus the
-`log_root` tree mapping `FS_TREE → log`, in currently-free space (like btrfs's
+preloads every mapped subvolume log, merges each into its own fs tree with
+path-COW commits, and zeroes the pointer only after all roots recover. `write_log`
+produces such a log — the mounted subvolume's log tree plus the `log_root` tree
+mapping `subvolid → log`, in currently-free space (like btrfs's
 pinned log extents, deliberately not recorded in the extent/free-space trees) —
 so the write+replay round-trip is exercised in-kernel
-(`smoke_btrfs_tree_log_replay`). Ordinary logged items are upserted, while modern
+(`smoke_btrfs_tree_log_replay` and the nested-subvolume replay smoke). Ordinary logged items are upserted, while modern
 `DIR_LOG_INDEX` authoritative ranges replay missing entries through the normal
 unlink/rmdir transactions. Logged directory indexes also reconstruct their
 hash-keyed `DIR_ITEM` twins; log-only range markers never leak into the FS tree.
