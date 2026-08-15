@@ -158,7 +158,14 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         } else {
                             lock.end.saturating_sub(lock.start).saturating_add(1) as i64
                         };
-                        out.l_pid = lock.pid as i32;
+                        // l_pid is the CALLER's-namespace pid of the lock
+                        // owner (Linux locks_translate_pid). The lock table
+                        // stamps owners in TaskId space, so translate TaskId
+                        // -> outer -> caller's ns view rather than leaking a
+                        // raw scheduler id to lslocks/sqlite.
+                        out.l_pid =
+                            report_pid_to(task, task_to_pid_raw(lock.pid as u64).unwrap_or(lock.pid as u64))
+                                as i32;
                         if write_flock_to_user(arg, &out).is_err() {
                             ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                         } else {
@@ -180,7 +187,12 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         out.l_type = b.ty;
                         out.l_start = b.start;
                         out.l_len = b.len;
-                        out.l_pid = b.owner as i32;
+                        // Owner is a TaskId; report it in the caller's ns view
+                        // (see the get_lock path above).
+                        out.l_pid = report_pid_to(
+                            task,
+                            task_to_pid_raw(b.owner).unwrap_or(b.owner),
+                        ) as i32;
                     }
                 }
                 if write_flock_to_user(arg, &out).is_err() {

@@ -1914,3 +1914,71 @@ fn smoke_abi_fdio_setlkw_unlock_wakes_waiters() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_setlkw_unlock_wakes_waiters);
+
+// F_GETLK must report the conflicting lock owner's pid in the CALLER's
+// namespace (Linux locks_translate_pid), not the raw scheduler TaskId the
+// lock table stores. lslocks/sqlite/dpkg read l_pid.
+fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
+    const F_GETLK: u64 = 5;
+    const F_WRLCK: i16 = 1;
+    const FOREIGN_TASK: u64 = 0xF0E1;
+    const FOREIGN_PID: u64 = 0xBEEF; // distinct from the TaskId
+    with_memfs("/lk", "lk", &[("f", b"hi")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/lk/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0), // O_RDWR
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/lk/f, O_RDWR) should succeed"),
+        };
+        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32)
+                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        })
+        .flatten()
+        .ok_or("fd should resolve to an ops key")?;
+
+        // A foreign owner (a TaskId) holds a whole-file write lock; that
+        // TaskId maps to a distinct visible pid.
+        crate::fd::locks::__test_reset();
+        crate::handlers::register_task_to_pid(FOREIGN_TASK, FOREIGN_PID);
+        crate::handlers::register_pid_task_mapping(FOREIGN_PID, FOREIGN_TASK);
+        let foreign = crate::fd::locks::Lock {
+            owner: FOREIGN_TASK,
+            ty: F_WRLCK,
+            start: 0,
+            len: 0,
+        };
+        if crate::fd::locks::try_set(key, foreign).is_err() {
+            return Err("installing the foreign holder should succeed");
+        }
+
+        // F_GETLK with a conflicting request returns the blocker's l_pid.
+        // struct flock: l_type@0(i16) l_whence@2(i16) l_start@8(i64)
+        // l_len@16(i64) l_pid@24(i32).
+        let mut fl = [0u8; 32];
+        fl[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
+        let r = call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_GETLK, fl.as_mut_ptr() as u64),
+        );
+        crate::fd::locks::__test_reset();
+        if r != Some(0) {
+            return Err("F_GETLK should return 0");
+        }
+        let l_pid = i32::from_le_bytes(fl[24..28].try_into().unwrap()) as u64;
+        match l_pid {
+            FOREIGN_PID => Ok(()),
+            FOREIGN_TASK => {
+                Err("F_GETLK reported the raw scheduler TaskId as l_pid instead of the visible pid")
+            }
+            _ => Err("F_GETLK reported an unexpected l_pid"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_getlk_reports_owner_visible_pid
+);
