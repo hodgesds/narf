@@ -64,6 +64,9 @@ struct VolState {
     /// The live superblock. Its tree roots and `generation` advance on a COW
     /// write; the read path snapshots the roots it needs.
     superblock: Superblock,
+    /// Physical offset of the superblock copy selected at mount. Reads use this
+    /// until the next commit rewrites every mirror and heals the primary.
+    superblock_source: u64,
     /// Completed logical→physical chunk map.
     chunk_map: ChunkMap,
     /// Selected FS-tree objectid and live root node (logical address + level).
@@ -169,6 +172,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().chunk_map.map_logical(logical)
     }
 
+    /// Translate a logical address to its primary and optional single-device
+    /// DUP copy.
+    pub(crate) fn map_logical_copies(&self, logical: u64) -> Result<(u64, Option<u64>), FsError> {
+        self.state.lock().chunk_map.map_logical_copies(logical)
+    }
+
     /// Snapshot of the live superblock (for statfs / write bookkeeping).
     pub fn superblock(&self) -> Superblock {
         self.state.lock().superblock.clone()
@@ -184,31 +193,69 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Read `len` bytes at btrfs *logical* address `logical`. The range must lie
     /// within a single chunk (true for any node or single extent read).
     pub async fn read_logical(&self, logical: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        // Resolve the physical offset under the lock, then release it before I/O.
-        let physical = self.map_logical(logical)?;
+        // Resolve both physical copies under the lock, then release it before
+        // I/O. A plain logical read can retry transport failure; callers with a
+        // checksum (notably read_node and the data-csum path) retry corruption.
+        let (physical, mirror) = self.map_logical_copies(logical)?;
         let mut buf = vec![0u8; len];
-        self.read_physical(physical, &mut buf).await?;
+        if let Err(primary_error) = self.read_physical(physical, &mut buf).await {
+            let Some(mirror) = mirror else {
+                return Err(primary_error);
+            };
+            self.read_physical(mirror, &mut buf).await?;
+        }
         Ok(buf)
+    }
+
+    /// Read a logical range from the first physical copy whose bytes match the
+    /// supplied on-disk data checksum. Unlike [`Self::read_logical`], checksum
+    /// failure is part of copy selection, so a readable-but-corrupt primary DUP
+    /// stripe falls back to its mirror.
+    pub(crate) async fn read_logical_checked(
+        &self,
+        logical: u64,
+        len: usize,
+        stored: &[u8],
+    ) -> Result<Vec<u8>, FsError> {
+        let (primary, mirror) = self.map_logical_copies(logical)?;
+        let mut buf = vec![0u8; len];
+        for physical in [Some(primary), mirror].into_iter().flatten() {
+            if self.read_physical(physical, &mut buf).await.is_err() {
+                continue;
+            }
+            let digest = crate::checksum::digest(self.csum_type, &buf)?;
+            if digest.get(..stored.len()) == Some(stored) {
+                return Ok(buf);
+            }
+        }
+        Err(FsError::InvalidData)
     }
 
     /// Read one b-tree node (a `nodesize` block) at logical address `logical`,
     /// validating its self-recorded `bytenr` and, when
     /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
-        let buf = self.read_logical(logical, self.nodesize()).await?;
-        if format::le64(&buf, 48)? != logical {
-            return Err(FsError::InvalidData);
+        let (primary, mirror) = self.map_logical_copies(logical)?;
+        let mut buf = vec![0u8; self.nodesize()];
+        for physical in [Some(primary), mirror].into_iter().flatten() {
+            if self.read_physical(physical, &mut buf).await.is_err() {
+                continue;
+            }
+            if format::le64(&buf, 48)? != logical {
+                continue;
+            }
+            if self.verify_checksums
+                && !crate::checksum::verify(
+                    self.csum_type,
+                    &buf[format::CSUM_SIZE..],
+                    &buf[..format::CSUM_SIZE],
+                )?
+            {
+                continue;
+            }
+            return Ok(buf);
         }
-        if self.verify_checksums
-            && !crate::checksum::verify(
-                self.csum_type,
-                &buf[format::CSUM_SIZE..],
-                &buf[..format::CSUM_SIZE],
-            )?
-        {
-            return Err(FsError::InvalidData);
-        }
-        Ok(buf)
+        Err(FsError::InvalidData)
     }
 
     // ── Mount ──────────────────────────────────────────────────────
@@ -338,25 +385,66 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             block_size: logical,
         });
 
-        // Read + decode the primary superblock at 64 KiB.
-        let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
-        read_exact_from(&*device, &io, capacity, format::SUPERBLOCK_OFFSET, &mut raw).await?;
-        let csum_type = Superblock::checksum_type(&raw)?;
-        if !crate::checksum::is_supported(csum_type) {
-            return Err(FsError::Unsupported);
+        // Validate every superblock copy that fits, then choose the newest
+        // generation. On a tie the earlier mirror wins, so a healthy primary
+        // remains preferred. Unsupported feature sets are reported distinctly
+        // when no usable copy remains.
+        let mut selected: Option<(u64, Vec<u8>, Superblock)> = None;
+        let mut saw_unsupported = false;
+        for &offset in &format::SUPERBLOCK_MIRROR_OFFSETS {
+            if offset + format::SUPERBLOCK_SIZE as u64 > capacity {
+                continue;
+            }
+            let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
+            if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            if format::le64(&candidate, format::SUPERBLOCK_BYTENR_OFFSET) != Ok(offset) {
+                continue;
+            }
+            let candidate_csum = match Superblock::checksum_type(&candidate) {
+                Ok(kind) if crate::checksum::is_supported(kind) => kind,
+                Ok(_) => {
+                    saw_unsupported = true;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if verify_checksums {
+                match crate::checksum::verify(
+                    candidate_csum,
+                    &candidate[format::CSUM_SIZE..format::SUPERBLOCK_SIZE],
+                    &candidate[..format::CSUM_SIZE],
+                ) {
+                    Ok(true) => {}
+                    _ => continue,
+                }
+            }
+            let decoded = match Superblock::decode(&candidate) {
+                Ok(sb) if sb.total_bytes <= capacity => sb,
+                Ok(_) => continue,
+                Err(FsError::Unsupported) => {
+                    saw_unsupported = true;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let replace = selected
+                .as_ref()
+                .is_none_or(|(_, _, current)| decoded.generation > current.generation);
+            if replace {
+                selected = Some((offset, candidate, decoded));
+            }
         }
-        // The superblock checksum covers everything after the 32-byte checksum
-        // field, up to the 4096-byte block.
-        if verify_checksums
-            && !crate::checksum::verify(
-                csum_type,
-                &raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE],
-                &raw[..format::CSUM_SIZE],
-            )?
-        {
-            return Err(FsError::InvalidData);
-        }
-        let superblock = Superblock::decode(&raw)?;
+        let (superblock_source, _raw, superblock) = match selected {
+            Some(candidate) => candidate,
+            None if saw_unsupported => return Err(FsError::Unsupported),
+            None => return Err(FsError::InvalidData),
+        };
+        let csum_type = superblock.csum_type;
 
         // Seed the chunk map so the chunk tree is reachable by logical address.
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
@@ -375,6 +463,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             device_capacity: capacity,
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
+                superblock_source,
                 chunk_map: seed,
                 fs_tree_id: format::FS_TREE_OBJECTID,
                 fs_tree_root: 0,
@@ -608,6 +697,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             self.write_physical(offset, block).await?;
             self.device.flush().await; // each copy durable before the next
         }
+        self.state.lock().superblock_source = format::SUPERBLOCK_OFFSET;
         Ok(())
     }
 
@@ -616,11 +706,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.device.flush().await;
     }
 
-    /// Read the raw 4096-byte superblock block from disk.
+    /// Read the selected raw superblock and normalize it to primary-copy form.
+    /// Transaction code can therefore heal a damaged primary without knowing
+    /// which mirror supplied the mounted generation.
     pub async fn read_raw_superblock(&self) -> Result<Vec<u8>, FsError> {
+        let source = self.state.lock().superblock_source;
         let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
-        self.read_physical(format::SUPERBLOCK_OFFSET, &mut raw)
-            .await?;
+        self.read_physical(source, &mut raw).await?;
+        if source != format::SUPERBLOCK_OFFSET {
+            let at = format::SUPERBLOCK_BYTENR_OFFSET;
+            raw[at..at + 8].copy_from_slice(&format::SUPERBLOCK_OFFSET.to_le_bytes());
+            crate::checksum::stamp_block(self.csum_type, &mut raw)?;
+        }
         Ok(raw)
     }
 

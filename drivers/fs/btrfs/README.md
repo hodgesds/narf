@@ -14,7 +14,9 @@ real laptop's btrfs root looks like.
 
 ## Supported
 
-- Single-device volumes, **SINGLE** and **DUP** chunk profiles.
+- Single-device volumes, **SINGLE** and **DUP** chunk profiles. Both DUP copies
+  are retained: metadata and checksummed data retry the second stripe after an
+  I/O error or checksum failure.
 - **CRC32C, xxhash64, SHA-256, and BLAKE2b-256** checksums, verified on the
   superblock, every tree node, and regular data. The COW writer emits the
   mounted volume's selected algorithm and its format-defined CSUM item width.
@@ -100,6 +102,8 @@ than mis-read:
 
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
+- Unknown or unsupported incompat/compat-ro feature flags (including RAID56,
+  RAID1C3/4, zoned, extent-tree-v2, stripe-tree, verity and block-group-tree).
 - Mutations reached by traversing a child subvolume from its parent (mount that
   child explicitly to write it). Snapshot creation or deletion of a child that
   itself contains nested subvolume mount points is not yet supported.
@@ -199,7 +203,10 @@ yet in the tree, so they stay unavailable until it commits — preserving COW.
 (Without a free-space tree the allocator falls back to appending past the
 extent-tree high-water; freed space is then not reused.)
 
-Every **superblock copy** is rewritten on each commit: btrfs keeps up to three
+Mount validates every **superblock copy** that fits, selects the valid copy with
+the newest generation (preferring the primary on a tie), and normalizes a
+selected mirror before the next transaction so that commit heals a damaged or
+stale primary. Every copy is then rewritten on each commit: btrfs keeps up to three
 (the primary at 64 KiB, then mirrors at 64 MiB and 256 GiB), and a real kernel
 recovers from whichever copy has the newest generation — so on a device large
 enough to carry a mirror, all copies must advance together or `btrfs check`

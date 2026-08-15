@@ -445,6 +445,34 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
         return TestResult::Fail("num_devices != 1 must be Unsupported");
     }
 
+    // Features that change tree or allocation semantics must be rejected at
+    // mount/decode, rather than failing later after metadata has been touched.
+    let mut raid56 = good.clone();
+    raid56[188..196].copy_from_slice(&(1u64 << 7).to_le_bytes());
+    if !matches!(Superblock::decode(&raid56), Err(FsError::Unsupported)) {
+        return TestResult::Fail("RAID56 incompat feature must be Unsupported");
+    }
+    let mut unknown_incompat = good.clone();
+    unknown_incompat[188..196].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    if !matches!(
+        Superblock::decode(&unknown_incompat),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("unknown incompat feature must be Unsupported");
+    }
+    let mut verity = good.clone();
+    verity[180..188].copy_from_slice(&(1u64 << 2).to_le_bytes());
+    if !matches!(Superblock::decode(&verity), Err(FsError::Unsupported)) {
+        return TestResult::Fail("unsupported compat-ro feature must be Unsupported");
+    }
+
+    let mut supported = good;
+    supported[180..188].copy_from_slice(&format::SUPPORTED_COMPAT_RO_FLAGS.to_le_bytes());
+    supported[188..196].copy_from_slice(&format::SUPPORTED_INCOMPAT_FLAGS.to_le_bytes());
+    if Superblock::decode(&supported).is_err() {
+        return TestResult::Fail("supported feature masks were rejected");
+    }
+
     TestResult::Pass
 }
 
@@ -511,10 +539,23 @@ fn smoke_btrfs_sys_chunk_array_parse() -> TestResult {
         return TestResult::Fail("out-of-range logical must be NotFound");
     }
 
-    // DUP (2 stripes, same device) is accepted; stripe 0 is authoritative.
+    // DUP (2 stripes, same device) preserves both physical copies.
     let dup = build_sys_chunk(0, 0x10_0000, 0x80_0000, format::BLOCK_GROUP_DUP, 2);
-    if ChunkMap::seed_from_sys_array(&dup).and_then(|m| m.map_logical(0)) != Ok(0x80_0000) {
-        return TestResult::Fail("DUP chunk should map to stripe 0");
+    let dup_map = match ChunkMap::seed_from_sys_array(&dup) {
+        Ok(map) => map,
+        Err(_) => return TestResult::Fail("DUP chunk failed to parse"),
+    };
+    if dup_map.map_logical_copies(0x1000) != Ok((0x80_1000, Some(0x90_1000))) {
+        return TestResult::Fail("DUP chunk did not preserve both stripes");
+    }
+
+    // Profile/stripe-count mismatches are corrupt, not silently truncated.
+    let bad_single = build_sys_chunk(0, 0x10_0000, 0x80_0000, 0, 2);
+    if !matches!(
+        ChunkMap::seed_from_sys_array(&bad_single),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("two-stripe SINGLE chunk must be InvalidData");
     }
 
     // A RAID1 profile is rejected.
@@ -949,6 +990,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_registration);
 
 fn smoke_btrfs_checksum_enforced() -> TestResult {
     use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
     let sb_off = format::SUPERBLOCK_OFFSET as usize;
 
     // Corrupt a checksum-covered (but non-magic) superblock byte.
@@ -992,6 +1034,43 @@ fn smoke_btrfs_checksum_enforced() -> TestResult {
         .unwrap_or(false)
     {
         return TestResult::Fail("corrupt node csum should fail with verify on");
+    }
+
+    // Data checksums are enforced by ordinary FileOps reads too (not only the
+    // explicit verifier used by checksum tests).
+    let clean = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("clean fixture remount failed"),
+    };
+    let big = match poll_once(clean.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup big.dat for corruption test failed"),
+    };
+    let (data_logical, _) = match file_data_extent(&clean, big.ino()) {
+        Some(extent) => extent,
+        None => return TestResult::Fail("big.dat data extent missing"),
+    };
+    let data_physical = match clean.map_logical(data_logical) {
+        Ok(physical) => physical as usize,
+        Err(_) => return TestResult::Fail("big.dat data extent not mappable"),
+    };
+    let mut img3 = decode_sparse(FIXTURE_SPARSE);
+    img3[data_physical + 100] ^= 0x40;
+    let dev = RamBlockDevice::from_image(512, img3);
+    let corrupt = match poll_once(BtrfsVolume::mount(dev, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("data corruption should not prevent metadata mount"),
+    };
+    let big = match poll_once(corrupt.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("corrupt-data lookup failed"),
+    };
+    let mut buf = [0u8; 512];
+    if !matches!(
+        poll_once(big.read(0, &mut buf)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("ordinary file read accepted bad data checksum");
     }
     TestResult::Pass
 }
@@ -3441,6 +3520,111 @@ fn smoke_btrfs_superblock_mirror() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_mirror);
+
+/// Mount chooses the newest valid superblock copy, not unconditionally the
+/// primary. The next transaction then rewrites every copy and heals the stale
+/// primary so a subsequent mount no longer depends on the mirror.
+fn smoke_btrfs_superblock_recovery() -> TestResult {
+    use narf_block::BlockDeviceSync;
+    use narf_filesystem::FsInstance;
+
+    let dev = writable_sparse(FIXTURE_MIRROR_SPARSE);
+    let mut primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    let mirror = read_super_at(&dev, 64 << 20);
+    let field = |sb: &[u8], off: usize| u64::from_le_bytes(sb[off..off + 8].try_into().unwrap());
+    let mirror_gen = field(&mirror, 72);
+    if mirror_gen == 0 || field(&primary, 72) != mirror_gen {
+        return TestResult::Fail("fixture superblock mirrors do not start in sync");
+    }
+
+    primary[72..80].copy_from_slice(&(mirror_gen - 1).to_le_bytes());
+    if checksum::stamp_block(format::CSUM_TYPE_CRC32, &mut primary).is_err() {
+        return TestResult::Fail("failed to restamp stale primary");
+    }
+    let lba = format::SUPERBLOCK_OFFSET / u64::from(dev.lba_size());
+    let blocks = (format::SUPERBLOCK_SIZE / dev.lba_size() as usize) as u16;
+    if dev.write(lba, blocks, &primary).is_err() {
+        return TestResult::Fail("failed to install stale primary");
+    }
+
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("newer mirror was not mountable"),
+    };
+    if vol.superblock().generation != mirror_gen {
+        return TestResult::Fail("mount selected the stale primary generation");
+    }
+
+    let big = match poll_once(vol.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup after mirror recovery failed"),
+    };
+    let payload = replacement_big();
+    match poll_once(big.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("healing transaction failed"),
+    }
+
+    let healed_primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
+    let healed_mirror = read_super_at(&dev, 64 << 20);
+    if field(&healed_primary, 72) <= mirror_gen
+        || field(&healed_primary, 72) != field(&healed_mirror, 72)
+        || field(&healed_primary, 80) != field(&healed_mirror, 80)
+    {
+        return TestResult::Fail("transaction did not heal the stale primary");
+    }
+    match mount_writable(dev) {
+        Ok(_) => TestResult::Pass,
+        Err(_) => TestResult::Fail("healed volume did not remount"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_recovery);
+
+/// A checksum-bad primary metadata stripe in a DUP chunk is recovered from the
+/// second same-device copy. This uses the realistic non-mixed laptop fixture,
+/// whose metadata profile is DUP, and corrupts only the mounted FS-tree root's
+/// first physical copy.
+fn smoke_btrfs_dup_metadata_recovery() -> TestResult {
+    use narf_block::BlockDeviceSync;
+
+    let dev = writable_sparse(FIXTURE_LAPTOP_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("laptop fixture failed to mount writable"),
+    };
+    let (fs_root, _) = vol.fs_tree_root();
+    let (primary, mirror) = match vol.map_logical_copies(fs_root) {
+        Ok((primary, Some(mirror))) => (primary, mirror),
+        _ => return TestResult::Fail("laptop metadata root is not mapped as DUP"),
+    };
+    if primary == mirror {
+        return TestResult::Fail("DUP metadata copies alias each other");
+    }
+
+    let blocks = (vol.nodesize() / dev.lba_size() as usize) as u16;
+    let mut node = alloc::vec![0u8; vol.nodesize()];
+    if dev
+        .read(primary / u64::from(dev.lba_size()), blocks, &mut node)
+        .is_err()
+    {
+        return TestResult::Fail("failed to read primary metadata stripe");
+    }
+    node[0] ^= 0x80; // invalidate only the stored checksum
+    if dev
+        .write(primary / u64::from(dev.lba_size()), blocks, &node)
+        .is_err()
+    {
+        return TestResult::Fail("failed to corrupt primary metadata stripe");
+    }
+
+    match mount_writable(dev) {
+        Ok(recovered) if recovered.root_inode().is_some() => TestResult::Pass,
+        _ => TestResult::Fail("mount did not recover metadata from DUP mirror"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_dup_metadata_recovery);
 
 /// A new chunk never overlaps a superblock mirror: the span helper caps a chunk
 /// that would cross the 64 MiB mirror, and bumps a start landing inside its band.

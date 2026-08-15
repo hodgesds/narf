@@ -54,6 +54,45 @@ pub async fn find_csum<B: BlockDevice + 'static>(
     Ok(None)
 }
 
+/// Read an arbitrary byte range of data through sector checksums. Every sector
+/// with a CSUM-tree entry is accepted from the first SINGLE/DUP copy matching
+/// that digest; sectors without entries retain btrfs `nodatasum` semantics and
+/// are read without verification.
+pub async fn read_checked<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: u64,
+    logical: u64,
+    len: usize,
+) -> Result<Vec<u8>, FsError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let sectorsize = u64::from(vol.sectorsize());
+    let start = logical / sectorsize * sectorsize;
+    let end = logical
+        .checked_add(len as u64)
+        .ok_or(FsError::InvalidData)?
+        .div_ceil(sectorsize)
+        .checked_mul(sectorsize)
+        .ok_or(FsError::InvalidData)?;
+    let total = usize::try_from(end - start).map_err(|_| FsError::InvalidData)?;
+    let mut checked = Vec::with_capacity(total);
+    let mut sector = start;
+    while sector < end {
+        let bytes = match find_csum(vol, csum_root, sector, sectorsize).await? {
+            Some(stored) => {
+                vol.read_logical_checked(sector, sectorsize as usize, &stored)
+                    .await?
+            }
+            None => vol.read_logical(sector, sectorsize as usize).await?,
+        };
+        checked.extend_from_slice(&bytes);
+        sector += sectorsize;
+    }
+    let offset = usize::try_from(logical - start).map_err(|_| FsError::InvalidData)?;
+    Ok(checked[offset..offset + len].to_vec())
+}
+
 /// Verify that every physical `sectorsize` block of a file's regular extents
 /// matches its stored data checksum. For compressed extents btrfs checksums the
 /// sector-padded compressed payload, not the inflated bytes. `Ok(true)` if all
@@ -78,11 +117,12 @@ pub async fn verify_file_data_csums<B: BlockDevice + 'static>(
         let mut off = 0u64;
         while off < disk_num_bytes {
             let logical = disk_bytenr + off;
-            let sector = vol.read_logical(logical, sectorsize as usize).await?;
-            let want = crate::checksum::digest(vol.csum_type(), &sector)?;
-            let csum_bytes = crate::checksum::size(vol.csum_type())?;
             match find_csum(vol, csum_root, logical, sectorsize).await? {
-                Some(stored) if stored == want[..csum_bytes] => {}
+                Some(stored)
+                    if vol
+                        .read_logical_checked(logical, sectorsize as usize, &stored)
+                        .await
+                        .is_ok() => {}
                 _ => return Ok(false),
             }
             off += sectorsize;

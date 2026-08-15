@@ -227,10 +227,40 @@ const OFF_NUM_DEVICES: usize = 136;
 const OFF_SECTORSIZE: usize = 144;
 const OFF_NODESIZE: usize = 148;
 const OFF_SYS_CHUNK_ARRAY_SIZE: usize = 160;
+const OFF_COMPAT_RO_FLAGS: usize = 180;
 const OFF_INCOMPAT_FLAGS: usize = 188;
 const OFF_CSUM_TYPE: usize = 196;
 const OFF_ROOT_LEVEL: usize = 198;
 const OFF_CHUNK_ROOT_LEVEL: usize = 199;
+
+// Features whose on-disk shapes are understood by this driver. Read-only
+// compatibility bits are not safe to ignore here because this implementation
+// can mount writable and does not yet have a read-only fallback mount mode.
+pub const COMPAT_RO_FREE_SPACE_TREE: u64 = 1 << 0;
+pub const COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+pub const SUPPORTED_COMPAT_RO_FLAGS: u64 =
+    COMPAT_RO_FREE_SPACE_TREE | COMPAT_RO_FREE_SPACE_TREE_VALID;
+
+pub const INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
+pub const INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
+pub const INCOMPAT_MIXED_GROUPS: u64 = 1 << 2;
+pub const INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
+pub const INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
+pub const INCOMPAT_BIG_METADATA: u64 = 1 << 5;
+pub const INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
+pub const INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
+pub const INCOMPAT_NO_HOLES: u64 = 1 << 9;
+pub const INCOMPAT_METADATA_UUID: u64 = 1 << 10;
+pub const SUPPORTED_INCOMPAT_FLAGS: u64 = INCOMPAT_MIXED_BACKREF
+    | INCOMPAT_DEFAULT_SUBVOL
+    | INCOMPAT_MIXED_GROUPS
+    | INCOMPAT_COMPRESS_LZO
+    | INCOMPAT_COMPRESS_ZSTD
+    | INCOMPAT_BIG_METADATA
+    | INCOMPAT_EXTENDED_IREF
+    | INCOMPAT_SKINNY_METADATA
+    | INCOMPAT_NO_HOLES
+    | INCOMPAT_METADATA_UUID;
 
 /// Decoded btrfs superblock — only the fields the driver consumes.
 #[derive(Clone, Debug)]
@@ -251,6 +281,8 @@ pub struct Superblock {
     pub total_bytes: u64,
     pub bytes_used: u64,
     pub num_devices: u64,
+    pub compat_ro_flags: u64,
+    pub incompat_flags: u64,
     pub sectorsize: u32,
     pub nodesize: u32,
     pub csum_type: u16,
@@ -304,10 +336,13 @@ impl Superblock {
         let mut csum = [0u8; CSUM_SIZE];
         csum.copy_from_slice(&buf[OFF_CSUM..OFF_CSUM + CSUM_SIZE]);
 
-        // incompat_flags is decoded for future gating; unknown bits are
-        // tolerated because the driver rejects the specific on-disk shapes it
-        // cannot handle (RAID chunks, compressed extents) at point of use.
-        let _incompat = le64(buf, OFF_INCOMPAT_FLAGS)?;
+        let compat_ro_flags = le64(buf, OFF_COMPAT_RO_FLAGS)?;
+        let incompat_flags = le64(buf, OFF_INCOMPAT_FLAGS)?;
+        if compat_ro_flags & !SUPPORTED_COMPAT_RO_FLAGS != 0
+            || incompat_flags & !SUPPORTED_INCOMPAT_FLAGS != 0
+        {
+            return Err(FsError::Unsupported);
+        }
 
         Ok(Superblock {
             csum,
@@ -320,6 +355,8 @@ impl Superblock {
             total_bytes: le64(buf, OFF_TOTAL_BYTES)?,
             bytes_used: le64(buf, OFF_BYTES_USED)?,
             num_devices,
+            compat_ro_flags,
+            incompat_flags,
             sectorsize,
             nodesize,
             csum_type,
