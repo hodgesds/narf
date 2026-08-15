@@ -410,3 +410,59 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_move_pages_self_pid_in_caller_pid_ns
 );
+
+// ── #22 get_robust_list(pid) — Linux kernel/futex/syscalls.c:59 ──
+//
+// `let task = if arg0 == 0 { current } else { arg0 };` used the caller-namespace
+// pid directly as the ROBUST_LIST_TABLE key. Seed only the worker's list head,
+// then read it by inner pid 2: the fix returns the worker's head, the bug reads
+// the raw-`2` slot (a different key) → not the worker's head.
+fn smoke_abi_pidns_get_robust_list_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xA100;
+        const MANAGER_PID: u64 = 0xA000;
+        const WORKER_TASK: u64 = 0xA101;
+        const WORKER_PID: u64 = 0xA001;
+        const WORKER_HEAD: u64 = 0xAAAA_0000;
+        const ROBUST_LEN: u64 = 24;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
+
+            set_task(WORKER_TASK);
+            if call(Syscall::SetRobustList.raw(), a1(WORKER_HEAD, ROBUST_LEN)) != Some(0) {
+                return Err("seeding the worker robust list failed");
+            }
+            set_task(MANAGER_TASK);
+            let mut head_out = 0u64;
+            let mut len_out = 0u64;
+            if call(
+                Syscall::GetRobustList.raw(),
+                a2(
+                    2,
+                    &mut head_out as *mut u64 as u64,
+                    &mut len_out as *mut u64 as u64,
+                ),
+            ) != Some(0)
+            {
+                return Err("get_robust_list(inner 2) did not succeed");
+            }
+            if head_out == WORKER_HEAD {
+                Ok(())
+            } else {
+                Err("get_robust_list used the inner pid directly as a TaskId key (read the wrong head) — accept_pid_from -> pid_to_task_raw missing")
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, WORKER_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_get_robust_list_resolves_in_caller_pid_ns
+);
