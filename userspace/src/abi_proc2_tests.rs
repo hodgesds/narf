@@ -1183,3 +1183,140 @@ fn smoke_abi_proc2_pid_root_symlink_default() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_root_symlink_default);
+
+// setpgid/getpgid interpret their pid AND pgid arguments in the CALLER's pid
+// namespace (Linux find_task_by_vpid). `pgid_from_user` translates them to
+// the TaskId the PGID_TABLE keys on; the container variant skipped the
+// inner->outer hop and did `pid_to_task_raw(inner)` directly, so an
+// in-namespace pgid resolved to whatever ROOT-namespace process owns the same
+// small number. Job control (bash, `kill -TERM -$pgid`, systemd
+// KillMode=control-group) all route through here.
+//
+// Exposed with a collision victim: a root-ns process registered at OUTER pid 2
+// == the worker's INNER pid. The bug resolves the worker's inner pgid 2 to the
+// victim; the fix resolves it to the worker.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_setpgid_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB100;
+        const MANAGER_PID: u64 = 0xB000;
+        const WORKER_TASK: u64 = 0xB101;
+        const WORKER_PID: u64 = 0xB001;
+        const VICTIM_TASK: u64 = 0xB102;
+        const VICTIM_PID: u64 = 2; // collides with the worker's INNER pid
+
+        crate::pid_ns::__test_reset();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(VICTIM_TASK, VICTIM_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
+                return Err("worker was not assigned inner pid 2");
+            }
+
+            set_task(MANAGER_TASK);
+            // setpgid(inner worker 2, inner pgid 2): make the worker its own
+            // group leader, addressed entirely in the manager's namespace.
+            if call(Syscall::Setpgid.raw(), a1(2, 2)) != Some(0) {
+                return Err("setpgid(2, 2) did not succeed");
+            }
+            // getpgid(inner 2) must read back the worker's group as inner 2 —
+            // NOT the victim's, and not 0.
+            match call(Syscall::Getpgid.raw(), a0(2)) {
+                Some(2) => Ok(()),
+                Some(0) => Err(
+                    "getpgid resolved the in-namespace pgid to a ROOT-namespace collision victim (setpgid keyed the wrong task) — inner->outer translation missing",
+                ),
+                Some(_) => Err("getpgid returned an unexpected pgid after setpgid"),
+                None => Err("getpgid returned a non-Ok status"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        for t in [MANAGER_TASK, WORKER_TASK, VICTIM_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_setpgid_resolves_in_caller_pid_ns
+);
+
+// kill(-pgid) resolves the process group in the CALLER's pid namespace
+// (Linux find_vpid(-pid)). The kill(2) handler's pid < -1 arm passed the raw
+// in-namespace pgid straight to deliver_signal_to_pgrp, which compares
+// against TaskId-space group ids — so a container's `kill -TERM -$pgid`
+// (bash job control, systemd KillMode=control-group) signalled whatever
+// ROOT-namespace group owned the same number, or nobody.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_kill_pgrp_resolves_in_caller_pid_ns() -> TestResult {
+    const SIGUSR1: u64 = 10;
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xB200;
+        const MANAGER_PID: u64 = 0xB000;
+        const WORKER_TASK: u64 = 0xB201;
+        const WORKER_PID: u64 = 0xB001;
+        const VICTIM_TASK: u64 = 0xB202;
+        const VICTIM_PID: u64 = 2; // collides with the worker's INNER pid
+
+        crate::pid_ns::__test_reset();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(WORKER_TASK, WORKER_PID);
+            register(VICTIM_TASK, VICTIM_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
+                return Err("worker was not assigned inner pid 2");
+            }
+            set_task(MANAGER_TASK);
+            // Put the worker in its own group (inner pgid 2).
+            if call(Syscall::Setpgid.raw(), a1(2, 2)) != Some(0) {
+                return Err("setpgid(2, 2) failed");
+            }
+            // Signal that group by its IN-NAMESPACE pgid.
+            if call(Syscall::Kill.raw(), a1((-2i64) as u64, SIGUSR1)) != Some(0) {
+                return Err("kill(-2, SIGUSR1) did not report success");
+            }
+            let worker_pending =
+                crate::handlers::signal_pending_of(WORKER_TASK) & (1u64 << (SIGUSR1 - 1)) != 0;
+            let victim_pending =
+                crate::handlers::signal_pending_of(VICTIM_TASK) & (1u64 << (SIGUSR1 - 1)) != 0;
+            if victim_pending {
+                return Err("kill(-2) signalled the ROOT-namespace collision victim");
+            }
+            if !worker_pending {
+                return Err(
+                    "kill(-2) did not reach the worker's group — the in-namespace pgid was not translated",
+                );
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        for t in [MANAGER_TASK, WORKER_TASK, VICTIM_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_kill_pgrp_resolves_in_caller_pid_ns
+);

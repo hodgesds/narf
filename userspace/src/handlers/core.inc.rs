@@ -7619,7 +7619,20 @@ pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
     if user_pid == 0 {
         return 0;
     }
-    pid_to_task_raw(user_pid).unwrap_or(user_pid)
+    // `user_pid` is a pid/pgid in the CALLER's pid namespace (Linux resolves
+    // both setpgid/getpgid/kill(-pgid)/TIOCSPGRP arguments via
+    // find_task_by_vpid — a virtual lookup). The pgid/sid/tty tables key on
+    // TaskId, reached through the OUTER ProcessId, so translate inner -> outer
+    // FIRST. Skipping this (the old `pid_to_task_raw(inner)`) resolved an
+    // in-namespace pgid to whatever ROOT-namespace process owned the same
+    // number — which for job control means signalling a host process group.
+    // An inner pid not bound in the caller's namespace has no valid target;
+    // return 0 (matches no real task) so delivery fails safe rather than
+    // aliasing a same-numbered host task.
+    match accept_pid_from(current_task_id(), user_pid) {
+        Some(outer) => pid_to_task_raw(outer).unwrap_or(outer),
+        None => 0,
+    }
 }
 #[cfg(not(feature = "container"))]
 #[inline]

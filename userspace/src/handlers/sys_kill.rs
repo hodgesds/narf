@@ -93,9 +93,18 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             any
         }
         _ => {
-            let pgrp = (-spec) as u64;
-            if signum == 0 {
-                pgrp != 0
+            // pid < -1: signal every process in process group -pid. Linux
+            // resolves the pgid via find_vpid(-pid) — a lookup in the CALLER's
+            // pid namespace — so translate the in-namespace pgid to the
+            // TaskId-space group id `deliver_signal_to_pgrp` compares against.
+            // Passing the raw inner pgid signalled whatever ROOT-namespace
+            // group owned the same number. An unmapped in-namespace pgid
+            // resolves to 0 -> ESRCH.
+            let pgrp = pgid_from_user((-spec) as u64);
+            if pgrp == 0 {
+                false
+            } else if signum == 0 {
+                true
             } else {
                 deliver_signal_to_pgrp(pgrp, signum)
             }
