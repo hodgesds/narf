@@ -51,6 +51,7 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
                 kill_process(target, signum)
             } else {
                 // Raw-tid fallback (boot-init spawned tasks).
+                queue_sender_siginfo(target, signum);
                 signal_stopcont_interaction(target, signum);
                 raise_signal_pending(target, signum);
                 wake_signal(target);

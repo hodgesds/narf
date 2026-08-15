@@ -4300,6 +4300,23 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// POSIX timer expiries to queue a signal without going through
 /// `sys_kill` (which expects a syscall trap frame). Mirrors the
 /// `*slot |= 1 << signum` step inside `sys_kill`.
+/// Record the sender's identity for a user-initiated signal (kill / tkill /
+/// tgkill) so the receiver's `signalfd` record and any `SA_SIGINFO` handler
+/// see `si_code == SI_USER` and `si_pid` = the sender's pid IN THE RECEIVER's
+/// pid namespace. Linux fills this unconditionally at `kernel/signal.c:1097`
+/// (`si_pid = task_tgid_nr_ns(current, task_active_pid_ns(t))`); NARF set only
+/// the pending bit, so every plain-kill receiver read `ssi_pid == 0` —
+/// indistinguishable from a kernel signal, which is what systemd PID 1's and
+/// udevd's signalfd dispatchers reject or misattribute. Standard signals
+/// coalesce, so this overwrites any prior queued instance (Linux does too).
+pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
+    const SI_USER: i32 = 0;
+    let sender = current_task_id();
+    let sender_outer = task_to_pid_raw(sender).unwrap_or(sender);
+    let si_pid = report_pid_to(target, sender_outer) as u32;
+    let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
+}
+
 pub fn raise_signal_pending(task: u64, signum: u32) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
@@ -4640,6 +4657,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     if signum == 9 {
         // Fatal group kill: every live thread dies.
         for t in members {
+            queue_sender_siginfo(t, signum);
             signal_stopcont_interaction(t, signum);
             raise_signal_pending(t, signum);
             wake_signal(t);
@@ -4654,6 +4672,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     } else {
         members[0]
     };
+    queue_sender_siginfo(target, signum);
     signal_stopcont_interaction(target, signum);
     raise_signal_pending(target, signum);
     wake_signal(target);

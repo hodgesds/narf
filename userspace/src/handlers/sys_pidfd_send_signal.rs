@@ -46,11 +46,17 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         target = tid;
     }
     signal_stopcont_interaction(target, signum);
-    // Stash the payload BEFORE the pending bit is visible, so a consumer that
-    // observes the bit never races ahead of its own siginfo. A full queue is
-    // -EAGAIN with nothing delivered (RLIMIT_SIGPENDING shape), matching
-    // rt_sigqueueinfo.
-    if !capture_queued_siginfo(target, signum, a.arg2) {
+    if a.arg2 == 0 {
+        // NULL info is a kill(2)-shaped send: Linux's prepare_kill_siginfo
+        // fills SI_USER with the sender's pid in the receiver's namespace
+        // (do_pidfd_send_signal). Record it so the receiver's signalfd names
+        // the sender, matching kill/tkill/tgkill.
+        queue_sender_siginfo(target, signum);
+    } else if !capture_queued_siginfo(target, signum, a.arg2) {
+        // Non-NULL info: the caller's own siginfo (systemd's pidref_sigqueue
+        // sends SI_QUEUE). Stashed BEFORE the pending bit is visible so a
+        // consumer that observes the bit never races ahead of its siginfo. A
+        // full queue is -EAGAIN with nothing delivered (rt_sigqueueinfo shape).
         ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
         return;
     }

@@ -386,6 +386,69 @@ fn smoke_abi_signal_signalfd_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_pos);
 
+// A signal sent by kill(2) must carry the SENDER's pid in the receiver's
+// namespace — Linux fills si_pid = task_tgid_nr_ns(current, receiver_ns) at
+// kernel/signal.c:1097. NARF's plain kill/tkill/tgkill path set only the
+// pending bit and queued no siginfo, so the receiver's signalfd read
+// ssi_pid == 0 — indistinguishable from a kernel-originated signal. systemd
+// PID 1 and udevd read $signalfd and key on ssi_pid; a sender of 0 is
+// dropped or misattributed.
+fn smoke_abi_signal_kill_signalfd_reports_sender_pid() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SENDER_TASK: u64 = 0x7710;
+        const SENDER_PID: u64 = 0x7700;
+
+        // Receiver (FAKE_TASK) installs a signalfd watching SIGUSR1.
+        let mask = (1u64 << (SIGUSR1 - 1)).to_le_bytes();
+        let sfd = match call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("signalfd(-1, &mask, 8, 0) did not return a fd"),
+        };
+
+        // A distinct sender task kills the receiver.
+        crate::handlers::register_task_to_pid(SENDER_TASK, SENDER_PID);
+        crate::handlers::register_pid_task_mapping(SENDER_PID, SENDER_TASK);
+        if crate::task::task_get(SENDER_TASK).is_none() {
+            let _ = crate::task::Task::new_registered(SENDER_TASK, SENDER_PID);
+        }
+        set_task(SENDER_TASK);
+        let sent = call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGUSR1 as u64));
+        set_task(FAKE_TASK);
+        if sent != Some(0) {
+            crate::task::release_task(SENDER_TASK);
+            return Err("kill(receiver, SIGUSR1) did not succeed");
+        }
+
+        // The receiver's signalfd record must name the sender.
+        let mut rec = [0u8; 128];
+        let n = call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        );
+        crate::task::release_task(SENDER_TASK);
+        if n != Some(128) {
+            return Err("signalfd read did not return one record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // ssi_pid @ offset 12.
+        match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
+            SENDER_PID => Ok(()),
+            0 => Err("kill delivered ssi_pid == 0 — the sender pid was not recorded"),
+            _ => Err("kill recorded the wrong sender pid"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_kill_signalfd_reports_sender_pid
+);
+
 fn smoke_abi_signal_signalfd_neg() -> TestResult {
     with_setup(|| {
         // fd_arg = 0 (>=0) but fd 0 is not a registered signalfd →
@@ -520,18 +583,18 @@ fn smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload() -> TestResult {
         if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
             return Err("signalfd record named the wrong signal");
         }
-        // LINUX-GAP: a payload-less send is `kill(2)` shape, and Linux
-        // synthesizes si_code = SI_USER (0) with si_pid/si_uid naming the
-        // SENDER. NARF's kill-family paths queue no siginfo at all, so
-        // ssi_pid reads 0 — indistinguishable from "sent by the kernel".
-        // Pinned here so the divergence goes red when it is closed, rather
-        // than drifting silently: the whole class (kill/tkill/tgkill and
-        // this NULL-info arm) has to move together.
-        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != 0 {
-            return Err("payload-less pidfd_send_signal should report ssi_code 0");
+        // A payload-less send is `kill(2)` shape: Linux's prepare_kill_siginfo
+        // synthesizes si_code = SI_USER (0) with si_pid naming the SENDER in
+        // the receiver's namespace. This test targets self, so ssi_pid is the
+        // caller's own pid. The whole class (kill/tkill/tgkill and this
+        // NULL-info arm) reports the sender together now — it used to read 0.
+        const SI_USER: i32 = 0;
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != SI_USER {
+            return Err("payload-less pidfd_send_signal should report ssi_code SI_USER");
         }
-        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != 0 {
-            return Err("payload-less pidfd_send_signal should report ssi_pid 0");
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != my_pid {
+            return Err("payload-less pidfd_send_signal did not report the sender pid");
         }
         Ok(())
     })
