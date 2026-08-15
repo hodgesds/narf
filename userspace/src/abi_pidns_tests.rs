@@ -113,3 +113,60 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_prlimit64_resolves_in_caller_pid_ns
 );
+
+// ── #12 kcmp(pid1, pid2) — Linux kernel/kcmp.c:146 `find_task_by_vpid` ──
+//
+// `resolve()` did `pid_to_task_raw(pid)` on the raw inner pids, so an
+// in-namespace pid resolved to whatever ROOT-namespace process owned the same
+// number. Two workers (inner 2 / inner 3) plus two collision victims registered
+// at OUTER pids 2 / 3. TaskIds are chosen so the CORRECT comparison (worker2 vs
+// worker3) orders `2` while the BUGGY comparison (victim@2 vs victim@3) orders
+// `1` — a clean 2-vs-1 discriminator that also proves BOTH args are translated.
+fn smoke_abi_pidns_kcmp_resolves_in_caller_pid_ns() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC100;
+        const MANAGER_PID: u64 = 0xC000;
+        const W1_TASK: u64 = 0xC201; // inner 2; LARGER than W2_TASK
+        const W1_PID: u64 = 0xC001;
+        const W2_TASK: u64 = 0xC102; // inner 3; SMALLER than W1_TASK
+        const W2_PID: u64 = 0xC002;
+        const V1_TASK: u64 = 0xC300; // registered at OUTER pid 2; SMALLER than V2
+        const V1_PID: u64 = 2;
+        const V2_TASK: u64 = 0xC400; // registered at OUTER pid 3; LARGER than V1
+        const V2_PID: u64 = 3;
+        const KCMP_FILE: u64 = 0;
+
+        crate::pid_ns::__test_reset();
+        let result = (|| {
+            register(MANAGER_TASK, MANAGER_PID);
+            register(W1_TASK, W1_PID);
+            register(W2_TASK, W2_PID);
+            register(V1_TASK, V1_PID);
+            register(V2_TASK, V2_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, W1_TASK, W1_PID) != Some(2) {
+                return Err("worker1 was not assigned inner pid 2");
+            }
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, W2_TASK, W2_PID) != Some(3) {
+                return Err("worker2 was not assigned inner pid 3");
+            }
+            set_task(MANAGER_TASK);
+            // Correct: cmp(W1_TASK=0xC201, W2_TASK=0xC102) -> t1>t2 -> 2.
+            // Buggy:   cmp(V1_TASK=0xC300, V2_TASK=0xC400) -> t1<t2 -> 1.
+            match call(Syscall::Kcmp.raw(), a3(2, 3, KCMP_FILE, 0)) {
+                Some(2) => Ok(()),
+                Some(1) => Err("kcmp compared ROOT-namespace collision victims — raw pid_to_task_raw on the inner pids instead of accept_pid_from"),
+                Some(-3) => Err("kcmp returned ESRCH for resolvable in-namespace pids"),
+                _ => Err("kcmp returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        release_all(&[MANAGER_TASK, W1_TASK, W2_TASK, V1_TASK, V2_TASK]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pidns_kcmp_resolves_in_caller_pid_ns
+);

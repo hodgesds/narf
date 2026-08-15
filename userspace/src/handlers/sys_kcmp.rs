@@ -15,12 +15,15 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
         return;
     }
     let me = current_task_id();
+    // kcmp interprets pid1/pid2 in the CALLER's pid namespace (Linux
+    // kernel/kcmp.c:146 find_task_by_vpid). Translate each inner pid to its
+    // outer ProcessId first, then resolve to the scheduler TaskId the
+    // comparison keys on. Passing the raw inner pid ordered against whatever
+    // ROOT-namespace process owned the same small number. An inner pid not
+    // bound in the caller's namespace has no target -> ESRCH. Audit finding #12.
     let resolve = |pid: u64| -> Option<u64> {
-        if pid == me {
-            Some(me)
-        } else {
-            pid_to_task_raw(pid)
-        }
+        let outer = accept_pid_from(me, pid)?;
+        Some(pid_to_task_raw(outer).unwrap_or(outer))
     };
     let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
         (Some(x), Some(y)) => (x, y),
