@@ -97,3 +97,62 @@ pub fn decode_dir_items(body: &[u8]) -> Result<Vec<DirEntry>, FsError> {
     }
     Ok(entries)
 }
+
+/// Return the entry named `name` from a possibly hash-colliding item body.
+pub fn find_dir_item(body: &[u8], name: &str) -> Result<DirEntry, FsError> {
+    decode_dir_items(body)?
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or(FsError::NotFound)
+}
+
+/// Remove exactly the record named `name` from a packed item body while
+/// preserving every other record byte-for-byte. The returned body is empty when
+/// the removed record was the bucket's only entry.
+pub fn remove_dir_item(body: &[u8], name: &str) -> Result<Vec<u8>, FsError> {
+    let mut remaining = Vec::with_capacity(body.len());
+    let mut pos = 0usize;
+    let mut found = false;
+    while pos < body.len() {
+        if body.len() - pos < DIR_ITEM_HEADER {
+            return Err(FsError::InvalidData);
+        }
+        let data_len = le16(body, pos + format::DISK_KEY_SIZE + 8)? as usize;
+        let name_len = le16(body, pos + format::DISK_KEY_SIZE + 10)? as usize;
+        let name_start = pos + DIR_ITEM_HEADER;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or(FsError::InvalidData)?;
+        let record_end = name_end.checked_add(data_len).ok_or(FsError::InvalidData)?;
+        let name_bytes = body.get(name_start..name_end).ok_or(FsError::InvalidData)?;
+        body.get(pos..record_end).ok_or(FsError::InvalidData)?;
+        if name_bytes == name.as_bytes() {
+            if found {
+                return Err(FsError::InvalidData); // duplicate name in one bucket
+            }
+            found = true;
+        } else {
+            remaining.extend_from_slice(&body[pos..record_end]);
+        }
+        pos = record_end;
+    }
+    if found {
+        Ok(remaining)
+    } else {
+        Err(FsError::NotFound)
+    }
+}
+
+/// Append `record` to an existing collision bucket. An exact duplicate name is
+/// rejected; a different name with the same hash is the normal append case.
+pub fn append_dir_item(body: Option<&[u8]>, name: &str, record: &[u8]) -> Result<Vec<u8>, FsError> {
+    let mut out = body.unwrap_or_default().to_vec();
+    if decode_dir_items(&out)?
+        .iter()
+        .any(|entry| entry.name == name)
+    {
+        return Err(FsError::InvalidData);
+    }
+    out.extend_from_slice(record);
+    Ok(out)
+}

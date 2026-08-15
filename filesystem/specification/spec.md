@@ -344,6 +344,8 @@ pub trait DirOps: Send + Sync {
     async fn set_dir_mode_async(&self, perms: u16) -> Result<(), FsError>;
     async fn fsync(&self, data_only: bool) -> Result<(), FsError>;
     async fn syncfs(&self) -> Result<(), FsError>;
+    async fn ioctl_async(&self, cmd: u32, arg: u64, input: &[u8], out_size: usize)
+        -> Result<FsIoctlReply, FsError>;
     /* … */
 }
 
@@ -489,8 +491,10 @@ SEEK_HOLE), and COPY_FILE_RANGE when both files share one connection;
 the syscall layer retains truncate/zero, generic seek, and buffered-copy
 fallbacks for filesystems that return `Unsupported`.
 
-`FileOps::ioctl_async` carries Linux `_IOC`-described input and output
-buffers to remote filesystems. FUSE maps it to restricted `FUSE_IOCTL`,
+`FileOps::ioctl_async` and `DirOps::ioctl_async` carry Linux
+`_IOC`-described input and output buffers. Open-directory wrappers forward
+the latter so filesystem-specific directory ioctls retain their inode context.
+FUSE maps file ioctls to restricted `FUSE_IOCTL`,
 copies no more than the encoded `_IOC_SIZE`, rejects oversized replies,
 and rejects `FUSE_IOCTL_RETRY`; daemon-selected retry iovecs are reserved
 for the separately privileged CUSE unrestricted-ioctl contract.

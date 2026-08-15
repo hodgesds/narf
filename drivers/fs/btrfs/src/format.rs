@@ -43,9 +43,11 @@ pub const SYS_CHUNK_ARRAY_SIZE: usize = 2048;
 /// array stays at `0x32b`.
 pub const SYS_CHUNK_ARRAY_OFFSET: usize = 811;
 
-/// `csum_type` value for CRC32C (`BTRFS_CSUM_TYPE_CRC32`); the only algorithm
-/// this driver supports.
+/// `csum_type` values from `enum btrfs_csum_type`.
 pub const CSUM_TYPE_CRC32: u16 = 0;
+pub(crate) const CSUM_TYPE_XXHASH: u16 = 1;
+pub(crate) const CSUM_TYPE_SHA256: u16 = 2;
+pub(crate) const CSUM_TYPE_BLAKE2: u16 = 3;
 
 // ── Well-known object ids ──────────────────────────────────────────
 
@@ -53,6 +55,8 @@ pub const ROOT_TREE_OBJECTID: u64 = 1;
 pub const EXTENT_TREE_OBJECTID: u64 = 2;
 pub const CHUNK_TREE_OBJECTID: u64 = 3;
 pub const FS_TREE_OBJECTID: u64 = 5;
+/// `btrfs_root_item.flags`: the subvolume must not be mutated.
+pub const ROOT_SUBVOL_RDONLY: u64 = 1;
 /// Directory objectid inside the root tree that holds the "default" subvolume
 /// `DIR_ITEM` (`BTRFS_ROOT_TREE_DIR_OBJECTID`).
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
@@ -81,6 +85,12 @@ pub const LAST_FREE_OBJECTID: u64 = (-256i64) as u64;
 pub const INODE_ITEM_KEY: u8 = 1;
 pub const INODE_REF_KEY: u8 = 12;
 pub const XATTR_ITEM_KEY: u8 = 24;
+/// Legacy directory-log range key (defined by the format, no longer emitted by
+/// current Linux kernels). Kept so replay never copies it into the FS tree.
+pub const DIR_LOG_ITEM_KEY: u8 = 60;
+/// Modern directory-log authoritative range. The key offset is the inclusive
+/// start and its `btrfs_dir_log_item.end` body is the inclusive end.
+pub const DIR_LOG_INDEX_KEY: u8 = 72;
 pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
@@ -220,7 +230,7 @@ const OFF_CHUNK_ROOT_LEVEL: usize = 199;
 /// Decoded btrfs superblock — only the fields the driver consumes.
 #[derive(Clone, Debug)]
 pub struct Superblock {
-    /// Stored block checksum (low 4 bytes are the CRC32C).
+    /// Stored block checksum (the algorithm determines how many bytes are used).
     pub csum: [u8; CSUM_SIZE],
     pub magic: u64,
     pub generation: u64,
@@ -246,6 +256,12 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Read the checksum selector before decoding the rest of a raw superblock.
+    /// Mount needs this field in order to verify the block that contains it.
+    pub(crate) fn checksum_type(buf: &[u8]) -> Result<u16, FsError> {
+        le16(buf, OFF_CSUM_TYPE)
+    }
+
     /// Decode a superblock from a ≥4096-byte buffer read at
     /// [`SUPERBLOCK_OFFSET`]. Validates magic and the driver's hard limits.
     pub fn decode(buf: &[u8]) -> Result<Self, FsError> {
@@ -256,9 +272,8 @@ impl Superblock {
         if magic != BTRFS_MAGIC {
             return Err(FsError::InvalidData);
         }
-        let csum_type = le16(buf, OFF_CSUM_TYPE)?;
-        if csum_type != CSUM_TYPE_CRC32 {
-            // xxhash/sha256/blake2 volumes are not supported.
+        let csum_type = Self::checksum_type(buf)?;
+        if !crate::checksum::is_supported(csum_type) {
             return Err(FsError::Unsupported);
         }
         let num_devices = le64(buf, OFF_NUM_DEVICES)?;

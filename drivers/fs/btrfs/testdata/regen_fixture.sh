@@ -14,6 +14,8 @@
 #   fixture-zlib.img.sparse  --compress zlib (exercises the zlib read path)
 #   fixture-zstd.img.sparse  --compress zstd (exercises the zstd read path)
 #   fixture-lzo.img.sparse   --compress lzo (exercises the LZO read path)
+#   fixture-{xxhash,sha256,blake2}.img.sparse  alternate checksum algorithms
+#   fixture-nestedsubvol.img.sparse  normal-dir/subvolume/subvolume path
 #   fixture-manyfiles.img.sparse  400 files -> a multi-level FS b-tree
 #   fixture-defaultsubvol.img.sparse  default subvolume set to `def`
 #   fixture-fst.img.sparse   like fixture.img but WITH a free-space tree
@@ -27,7 +29,8 @@
 # nested subvolume (its dir entry resolves to a ROOT_ITEM).
 #
 # Pinned so a future btrfs-progs can't silently drift the layout:
-#   --csum crc32c            driver only supports CRC32C
+#   --csum crc32c            writable fixture checksum (alternate read-only
+#                            checksum fixtures are generated separately)
 #   --sectorsize 4096        page-sized sectors
 #   --nodesize 4096          required by mixed mode; keeps the image at 16 MiB
 #   -M                       mixed block groups (small-image layout)
@@ -42,7 +45,12 @@ img="$(mktemp)"
 imgz="$(mktemp)"
 imgzst="$(mktemp)"
 imglzo="$(mktemp)"
-trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo"' EXIT
+imgxx="$(mktemp)"
+imgsha="$(mktemp)"
+imgblake="$(mktemp)"
+nestedstage="$(mktemp -d)"
+imgnested="$(mktemp)"
+trap 'rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$nestedstage" "$imgnested"' EXIT
 
 mkdir -p "$stage/subdir" "$stage/snap"
 printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
@@ -86,6 +94,50 @@ print("wrote %s: total=%d runs=%d payload=%d"
       % (dst, len(data), len(runs), sum(len(b) for _, b in runs)))
 PY
 }
+
+# A normal directory followed by two nested subvolume roots. This distinguishes
+# path walking from the old one-component lookup and exercises tree changes at
+# both `container/outer` and `container/outer/inner`.
+mkdir -p "$nestedstage/container/outer/inner" "$nestedstage/container/outer/rochild"
+printf 'container file\n' > "$nestedstage/container/top.txt"
+printf 'outer subvolume file\n' > "$nestedstage/container/outer/outer.txt"
+printf 'deep subvolume file\n' > "$nestedstage/container/outer/inner/deep.txt"
+printf 'read-only subvolume file\n' > "$nestedstage/container/outer/rochild/readonly.txt"
+truncate -s 16M "$imgnested"
+mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+    -O ^free-space-tree,^no-holes \
+    --subvol rw:container/outer --subvol rw:container/outer/inner \
+    --subvol ro:container/outer/rochild \
+    --rootdir "$nestedstage" "$imgnested" >/dev/null
+btrfs check "$imgnested" >/dev/null
+sparse_encode "$imgnested" fixture-nestedsubvol.img.sparse
+rm -rf "$nestedstage"
+rm -f "$imgnested"
+
+if [[ "${NARF_BTRFS_NESTED_ONLY:-0}" == 1 ]]; then
+    exit 0
+fi
+
+# Real mkfs images for every non-default checksum algorithm. These are mounted
+# read-only by NARF; keeping them genuine also covers their CSUM_ITEM widths.
+# Set NARF_BTRFS_CSUM_ONLY=1 to regenerate just these three fixtures.
+for spec in \
+    "xxhash:$imgxx:fixture-xxhash.img.sparse" \
+    "sha256:$imgsha:fixture-sha256.img.sparse" \
+    "blake2:$imgblake:fixture-blake2.img.sparse"
+do
+    IFS=: read -r algorithm checksum_img output <<<"$spec"
+    truncate -s 16M "$checksum_img"
+    mkfs.btrfs --csum "$algorithm" --sectorsize 4096 --nodesize 4096 -M \
+        -O ^free-space-tree,^no-holes --subvol rw:snap --rootdir "$stage" "$checksum_img" >/dev/null
+    btrfs check "$checksum_img" >/dev/null
+    sparse_encode "$checksum_img" "$output"
+done
+rm -f "$imgxx" "$imgsha" "$imgblake"
+
+if [[ "${NARF_BTRFS_CSUM_ONLY:-0}" == 1 ]]; then
+    exit 0
+fi
 
 truncate -s 16M "$img"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \

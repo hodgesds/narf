@@ -1,5 +1,5 @@
 //! Copy-on-write mutations: file writes (overwrite / partial / append / grow)
-//! and namespace operations (`create` / `unlink`) in the default subvolume.
+//! and namespace operations (`create` / `unlink`) in the mounted subvolume.
 //!
 //! All mutations share one closed-form COW mini-transaction ([`commit_txn`]):
 //! given the fully-edited fs leaf, it reads the extent/csum/root/free-space
@@ -13,15 +13,15 @@
 //! counts, re-handing-out node addresses from the same base each round until they
 //! stabilise. This replaces the delayed-ref loop real btrfs uses.
 //!
-//! Scope: a regular file in the default subvolume with any number of existing
-//! extents (each exclusively owned + uncompressed, or a hole/inline). A write
+//! Scope: a regular file in the mounted writable subvolume with any number of existing
+//! extents (each exclusively owned, or a hole/inline). A write
 //! reads the current file, applies the new bytes at any offset (growing past EOF
 //! as needed), then re-tiles the whole content into fresh data extents of at most
 //! 128 KiB, freeing the old ones — a genuine copy-on-write mini-transaction that
 //! never mutates live data or metadata in place. Per write it:
 //!
-//! 1. allocates + writes the new data extents, and their per-sector CRC32C **data
-//!    checksums** (updated in the CSUM tree; the old extent's csums removed);
+//! 1. allocates + writes the new data extents, and their per-sector selected
+//!    **data checksums** (updated in the CSUM tree; old csums removed);
 //! 2. rebuilds the fs leaf (`EXTENT_DATA` repointed/resized, `INODE_ITEM`
 //!    size/generation updated);
 //! 3. rebuilds the **extent tree** leaf: frees the old data extent + old COWed
@@ -60,6 +60,7 @@
 //! check`-clean, and a grown chunk is placed clear of the mirror bands
 //! (`chunk_span_avoiding_supers`).
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -71,8 +72,8 @@ use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
     leaf_item_span, leaf_lower_bound, level, nritems, HEADER_SIZE,
 };
-use crate::checksum::{block_csum, name_hash};
-use crate::dir::decode_dir_items;
+use crate::checksum::name_hash;
+use crate::dir::{append_dir_item, decode_dir_items, find_dir_item, remove_dir_item};
 use crate::format::{self, le64, BtrfsKey};
 use crate::inode::InodeItem;
 use crate::roots;
@@ -203,16 +204,17 @@ fn leaf_insert_sorted(buf: &mut [u8], key: &BtrfsKey, body: &[u8]) -> Result<(),
     leaf_insert(buf, slot, key, body)
 }
 
-/// Stamp a node buffer with `addr`/`gen`/CRC32C in place (no allocation, no
-/// write) — used by the pre-allocated mini-transaction.
-pub(crate) fn stamp_node(buf: &mut [u8], addr: u64, gen: u64) {
+/// Stamp a node buffer with `addr`, `gen`, and the filesystem's selected
+/// checksum in place (no allocation, no write).
+pub(crate) fn stamp_node(
+    buf: &mut [u8],
+    addr: u64,
+    gen: u64,
+    csum_type: u16,
+) -> Result<(), FsError> {
     buf[HDR_BYTENR..HDR_BYTENR + 8].copy_from_slice(&addr.to_le_bytes());
     buf[HDR_GENERATION..HDR_GENERATION + 8].copy_from_slice(&gen.to_le_bytes());
-    let csum = block_csum(&buf[format::CSUM_SIZE..]);
-    buf[0..4].copy_from_slice(&csum.to_le_bytes());
-    for b in &mut buf[4..format::CSUM_SIZE] {
-        *b = 0;
-    }
+    crate::checksum::stamp_block(csum_type, buf)
 }
 
 // Inline backref types within an extent item.
@@ -557,6 +559,31 @@ fn align_up(x: u64, align: u64) -> u64 {
     (x + (align - 1)) & !(align - 1)
 }
 
+/// Encode one zlib stream without placing miniz's 64 KiB LZ code buffer on
+/// the kernel stack. `compress_to_vec_zlib` constructs `CompressorOxide`
+/// locally; that exceeds the aarch64 test-task stack before compression even
+/// starts. `Box::default` initializes the compressor in its heap allocation.
+pub(crate) fn compress_zlib_heap(input: &[u8], level: u8) -> Result<Vec<u8>, FsError> {
+    use miniz_oxide::deflate::core::{
+        compress_to_output, CompressorOxide, TDEFLFlush, TDEFLStatus,
+    };
+    use miniz_oxide::DataFormat;
+
+    let mut compressor = Box::<CompressorOxide>::default();
+    compressor.set_format_and_level(DataFormat::Zlib, level);
+    let mut output = Vec::new();
+    let (status, consumed) =
+        compress_to_output(&mut compressor, input, TDEFLFlush::Finish, |chunk| {
+            output.extend_from_slice(chunk);
+            true
+        });
+    if status == TDEFLStatus::Done && consumed == input.len() {
+        Ok(output)
+    } else {
+        Err(FsError::InvalidData)
+    }
+}
+
 /// One stripe reserved around each superblock mirror so a chunk never overlaps it.
 const SUPER_MIRROR_BAND: u64 = 65536;
 
@@ -585,17 +612,18 @@ pub(crate) fn chunk_span_avoiding_supers(mut start: u64, avail_end: u64) -> (u64
 /// Matches btrfs's preference for bounded, contiguous data extents.
 const MAX_WRITE_EXTENT: u64 = 128 * 1024;
 
-/// Write `data` at byte `offset` into file `ino` via COW: read-modify-write the
-/// whole file, then re-tile it into fresh data extents (each at most
-/// [`MAX_WRITE_EXTENT`]), freeing the old ones. Supports overwrite, partial write,
-/// append and grow of a file with **any number** of existing extents.
+/// Write `data` at byte `offset` into file `ino` via COW. Only the sector-aligned
+/// write window and the existing extents it intersects are read, freed and
+/// re-tiled (each new extent is at most [`MAX_WRITE_EXTENT`]); non-overlapping
+/// extents keep their original `EXTENT_DATA`, extent-tree ref and checksums.
 ///
-/// The whole file is rewritten each time (so a small write to a large file still
-/// costs the file's size); incremental extent splitting is a later optimization.
-/// Each existing extent must be exclusively owned and uncompressed (regular or
-/// prealloc, `extent_offset == 0`, covering its whole disk extent) or a hole /
-/// inline extent — a shared, partial or compressed extent is out of scope
-/// (`Unsupported`), since freeing it wholesale would be wrong.
+/// An intersected disk extent must be exclusively owned and cover its whole
+/// backing extent (`extent_offset == 0`; uncompressed `num_bytes ==
+/// disk_num_bytes`, or compressed `num_bytes == ram_bytes`). Recognized
+/// zlib/zstd/LZO extents are decompressed by the read phase and rewritten as
+/// ordinary uncompressed extents. An intersected shared/partial reference remains
+/// out of scope (`Unsupported`), since freeing its backing extent wholesale is
+/// wrong; a non-overlapping one is preserved without modification.
 pub async fn cow_write_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
@@ -611,58 +639,136 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         return Ok(0);
     }
 
-    // ── Classify the existing extents: the disk extents to free, and the old
-    //    EXTENT_DATA keys to delete. Reject anything not exclusively owned. ──
-    let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
-    let mut freed_data: Vec<(u64, u64)> = Vec::new();
-    for (_key, body) in &extents {
-        // btrfs_file_extent_item: compression@16, type@20, disk_bytenr@21,
-        // disk_num_bytes@29, extent_offset@37, num_bytes@45.
-        if body.len() < 21 {
-            return Err(FsError::InvalidData);
-        }
-        if body[20] == format::FILE_EXTENT_INLINE {
-            continue; // data lives in the item; no disk extent to free
-        }
-        if body.len() < 53 {
-            return Err(FsError::InvalidData);
-        }
-        if body[16] != 0 {
-            return Err(FsError::Unsupported); // compressed: out of scope
-        }
-        let disk_bytenr = le64(body, 21)?;
-        if disk_bytenr == 0 {
-            continue; // a hole: no disk extent
-        }
-        let disk_num = le64(body, 29)?;
-        if le64(body, 37)? != 0 || le64(body, 45)? != disk_num {
-            return Err(FsError::Unsupported); // partial / shared reference
-        }
-        freed_data.push((disk_bytenr, disk_num));
-    }
-
-    // ── Read-modify-write the whole file into one buffer ───────────
     let old_size = inode.size;
     let end = offset
         .checked_add(data.len() as u64)
         .ok_or(FsError::InvalidData)?;
     let new_size = old_size.max(end);
     let sectorsize = u64::from(vol.sectorsize());
-    let disk_total = align_up(new_size, sectorsize).max(sectorsize);
 
-    let mut buf = alloc::vec![0u8; new_size as usize];
-    if old_size > 0 {
+    // Start with the sectors touched by the write. If that cuts through an
+    // existing extent, absorb that entire extent; repeat because widening the
+    // window can meet another item. This avoids creating two file references to
+    // one backing extent (which would require multi-ref delayed-ref handling).
+    let mut rewrite_start = offset & !(sectorsize - 1);
+    let mut rewrite_end = align_up(end, sectorsize);
+    let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
+    let mut file_ranges: Vec<(u64, u64)> = Vec::with_capacity(extents.len());
+    for (key, body) in &extents {
+        if body.len() < 21 {
+            return Err(FsError::InvalidData);
+        }
+        let file_len = match body[20] {
+            format::FILE_EXTENT_INLINE => le64(body, 8)?,
+            format::FILE_EXTENT_REG | format::FILE_EXTENT_PREALLOC => {
+                if body.len() < 53 {
+                    return Err(FsError::InvalidData);
+                }
+                le64(body, 45)?
+            }
+            _ => return Err(FsError::InvalidData),
+        };
+        file_ranges.push((key.offset, key.offset.saturating_add(file_len)));
+    }
+
+    let mut affected = alloc::vec![false; extents.len()];
+    loop {
+        let mut widened = false;
+        for (i, &(start, finish)) in file_ranges.iter().enumerate() {
+            if affected[i] || start >= rewrite_end || finish <= rewrite_start {
+                continue;
+            }
+            affected[i] = true;
+            let new_start = rewrite_start.min(start & !(sectorsize - 1));
+            let new_end = rewrite_end.max(align_up(finish, sectorsize));
+            widened |= new_start != rewrite_start || new_end != rewrite_end;
+            rewrite_start = new_start;
+            rewrite_end = new_end;
+        }
+        if !widened {
+            break;
+        }
+    }
+
+    // Classify only the intersected extents. Non-overlapping shared/partial
+    // extents are deliberately left alone.
+    let mut freed_data: Vec<(u64, u64)> = Vec::new();
+    let mut removed_nbytes = 0u64;
+    let mut saw_zlib = false;
+    let mut zlib_only = true;
+    for (i, (_key, body)) in extents.iter().enumerate() {
+        if !affected[i] {
+            continue;
+        }
+        // btrfs_file_extent_item: ram_bytes@8, compression@16, type@20,
+        // disk_bytenr@21, disk_num_bytes@29, extent_offset@37, num_bytes@45.
+        if body[20] == format::FILE_EXTENT_INLINE {
+            zlib_only = false;
+            removed_nbytes = removed_nbytes
+                .checked_add(le64(body, 8)?)
+                .ok_or(FsError::InvalidData)?;
+            continue; // data lives in the item; no disk extent to free
+        }
+        let compression = body[16];
+        if !matches!(
+            compression,
+            format::COMPRESS_NONE
+                | format::COMPRESS_ZLIB
+                | format::COMPRESS_LZO
+                | format::COMPRESS_ZSTD
+        ) {
+            return Err(FsError::Unsupported);
+        }
+        if compression != format::COMPRESS_NONE && body[20] != format::FILE_EXTENT_REG {
+            return Err(FsError::Unsupported);
+        }
+        let disk_bytenr = le64(body, 21)?;
+        if disk_bytenr == 0 {
+            continue; // a hole: no disk extent
+        }
+        saw_zlib |= compression == format::COMPRESS_ZLIB;
+        zlib_only &= compression == format::COMPRESS_ZLIB;
+        let disk_num = le64(body, 29)?;
+        let whole_num = if compression == format::COMPRESS_NONE {
+            disk_num
+        } else {
+            le64(body, 8)? // uncompressed size of the whole compressed extent
+        };
+        if le64(body, 37)? != 0 || le64(body, 45)? != whole_num {
+            return Err(FsError::Unsupported); // partial / shared reference
+        }
+        freed_data.push((disk_bytenr, disk_num));
+        removed_nbytes = removed_nbytes
+            .checked_add(le64(body, 45)?)
+            .ok_or(FsError::InvalidData)?;
+    }
+    // Preserve an existing zlib policy when the complete replacement window is
+    // made solely from zlib extents (plus holes). Mixed-codec/uncompressed
+    // windows fall back to ordinary extents.
+    let emit_zlib = saw_zlib && zlib_only;
+
+    // Read-modify-write only the closed-over window. Bytes past the old EOF and
+    // implicit/explicit holes remain zero-filled.
+    let rewrite_len = rewrite_end
+        .checked_sub(rewrite_start)
+        .ok_or(FsError::InvalidData)?;
+    let rewrite_len_usize = usize::try_from(rewrite_len).map_err(|_| FsError::InvalidData)?;
+    let mut buf = alloc::vec![0u8; rewrite_len_usize];
+    if rewrite_start < old_size {
+        let old_window_end = rewrite_end.min(old_size);
+        let old_window_len =
+            usize::try_from(old_window_end - rewrite_start).map_err(|_| FsError::InvalidData)?;
         crate::extent::read_file(
             vol,
             fs_root,
             ino,
             old_size,
-            0,
-            &mut buf[..old_size as usize],
+            rewrite_start,
+            &mut buf[..old_window_len],
         )
         .await?;
     }
-    let o = offset as usize;
+    let o = usize::try_from(offset - rewrite_start).map_err(|_| FsError::InvalidData)?;
     buf[o..o + data.len()].copy_from_slice(data);
 
     let gen = vol.superblock().generation + 1;
@@ -671,39 +777,56 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     // ── Tile the content into fresh extents; write each + its checksums ─
     let mut new_data: Vec<DataRef> = Vec::new();
     let mut new_eds: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
-    let mut file_off = 0u64;
-    while file_off < disk_total {
-        let ext_len = (disk_total - file_off).min(MAX_WRITE_EXTENT);
-        let e_data = alloc.alloc_data(vol, ext_len)?;
-        let mut payload = alloc::vec![0u8; ext_len as usize];
-        let copy_end = (file_off + ext_len).min(new_size);
-        if file_off < new_size {
-            let (s, e) = (file_off as usize, copy_end as usize);
-            payload[..e - s].copy_from_slice(&buf[s..e]);
-        }
-        vol.write_logical(e_data, &payload).await?;
-        let csums = crate::csum::compute_csums(&payload, sectorsize as usize);
+    let mut window_off = 0u64;
+    while window_off < rewrite_len {
+        let ext_len = (rewrite_len - window_off).min(MAX_WRITE_EXTENT);
+        let s = window_off as usize;
+        let e = s + ext_len as usize;
+        let plain = &buf[s..e];
+        let compressed = if emit_zlib {
+            let mut encoded = compress_zlib_heap(plain, 6)?;
+            let disk_len = align_up(encoded.len() as u64, sectorsize);
+            if disk_len < ext_len {
+                encoded.resize(disk_len as usize, 0);
+                Some(encoded)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (payload, compression) = match &compressed {
+            Some(encoded) => (encoded.as_slice(), format::COMPRESS_ZLIB),
+            None => (plain, format::COMPRESS_NONE),
+        };
+        let disk_len = payload.len() as u64;
+        let e_data = alloc.alloc_data(vol, disk_len)?;
+        vol.write_logical(e_data, payload).await?;
+        let csums = crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?;
+        let file_off = rewrite_start + window_off;
         new_data.push(DataRef {
             bytenr: e_data,
-            len: ext_len,
-            ref_root: format::FS_TREE_OBJECTID,
+            len: disk_len,
+            ref_root: vol.fs_tree_id(),
             objectid: ino,
             offset: file_off,
             csums,
         });
         new_eds.push((
             BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
-            file_extent_reg(gen, e_data, ext_len),
+            file_extent_reg_encoded(gen, e_data, disk_len, ext_len, compression),
         ));
-        file_off += ext_len;
+        window_off += ext_len;
     }
 
-    // ── Path-COW the fs tree: drop every old EXTENT_DATA, add the new tiling,
+    // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
     //    and update the inode (found via a lookup, not a full tree read) —
     //    COWing only the touched paths rather than rebuilding the whole tree. ──
     let mut edits: Vec<Edit> = Vec::new();
-    for (key, _) in &extents {
-        edits.push(Edit::Delete(*key));
+    for (i, (key, _)) in extents.iter().enumerate() {
+        if affected[i] {
+            edits.push(Edit::Delete(*key));
+        }
     }
     for (key, body) in &new_eds {
         edits.push(Edit::Upsert(*key, body.clone()));
@@ -715,14 +838,19 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     new_inode[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
     new_inode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
     new_inode[16..24].copy_from_slice(&new_size.to_le_bytes()); // size
-    new_inode[24..32].copy_from_slice(&disk_total.to_le_bytes()); // nbytes
+    let old_nbytes = le64(&new_inode, 24)?;
+    let new_nbytes = old_nbytes
+        .checked_sub(removed_nbytes)
+        .and_then(|n| n.checked_add(rewrite_len))
+        .ok_or(FsError::InvalidData)?;
+    new_inode[24..32].copy_from_slice(&new_nbytes.to_le_bytes()); // nbytes
     edits.push(Edit::Upsert(inode_key, new_inode));
 
     let out = PathCow::new(vol, gen, fs_root, fs_level)
         .await?
         .apply(&mut alloc, &edits)
         .await?;
-    let fs = fs_commit_from(out, gen);
+    let fs = fs_commit_from(out, gen, vol.csum_type())?;
 
     commit_txn(
         vol,
@@ -732,6 +860,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             fs,
             freed_data,
             new_data,
+            root_flags: None,
         },
     )
     .await?;
@@ -739,20 +868,20 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
 }
 
 /// Stamp a path-COW's new nodes and package them as an [`FsCommit`].
-fn fs_commit_from(out: CowOut, gen: u64) -> FsCommit {
+fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsError> {
     let new_blocks: Vec<(u64, u8)> = out.nodes.iter().map(|&(a, _, l)| (a, l)).collect();
     let mut nodes = Vec::with_capacity(out.nodes.len());
     for (addr, mut buf, _lvl) in out.nodes {
-        stamp_node(&mut buf, addr, gen);
+        stamp_node(&mut buf, addr, gen, csum_type)?;
         nodes.push((addr, buf));
     }
-    FsCommit {
+    Ok(FsCommit {
         nodes,
         new_blocks,
         freed: out.freed,
         root: out.root_addr,
         level: out.root_level,
-    }
+    })
 }
 
 // ── Shared COW mini-transaction ────────────────────────────────────
@@ -779,9 +908,10 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
         gen,
         alloc,
         Txn {
-            fs: fs_commit_from(out, gen),
+            fs: fs_commit_from(out, gen, vol.csum_type())?,
             freed_data,
             new_data,
+            root_flags: None,
         },
     )
     .await
@@ -792,8 +922,8 @@ const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
 
 /// A data extent recorded into the extent tree as an `EXTENT_ITEM` +
 /// `EXTENT_DATA_REF{root, objectid, offset, count=1}`, with the per-sector
-/// CRC32C `csums` the csum tree records for it. `offset` is the extent's position
-/// in the file (its `EXTENT_DATA` key offset).
+/// selected-algorithm `csums` the csum tree records for it. `offset` is the
+/// extent's position in the file (its `EXTENT_DATA` key offset).
 struct DataRef {
     bytenr: u64,
     len: u64,
@@ -826,6 +956,44 @@ struct Txn {
     freed_data: Vec<(u64, u64)>,
     /// Data extents whose `EXTENT_ITEM` + csums are added.
     new_data: Vec<DataRef>,
+    /// Replacement `btrfs_root_item.flags` for the mounted subvolume. This is a
+    /// root-tree-only administration transaction: the fs tree itself remains
+    /// byte-for-byte unchanged.
+    root_flags: Option<u64>,
+}
+
+/// Persist replacement on-disk flags for the explicitly mounted subvolume.
+/// This deliberately builds a root-tree-only transaction: changing read-only
+/// state must not COW or advance the unchanged fs tree's root item.
+pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    flags: u64,
+) -> Result<(), FsError> {
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let alloc = Allocator::build(vol).await?;
+    let (root, level) = vol.fs_tree_root();
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: FsCommit {
+                nodes: Vec::new(),
+                new_blocks: Vec::new(),
+                freed: Vec::new(),
+                root,
+                level,
+            },
+            freed_data: Vec::new(),
+            new_data: Vec::new(),
+            root_flags: Some(flags),
+        },
+    )
+    .await
 }
 
 /// Pack `items` (key-ordered) into a leaf buffer built on `header` (a
@@ -856,7 +1024,7 @@ fn pack_leaf(header: &[u8], items: &[(BtrfsKey, &[u8])], capacity: usize) -> Vec
 //
 // These re-tile the contents of ONE node that a path-COW edit touched into as
 // many `nodesize` nodes as they need (a node that overflows an edit is split,
-// possibly into several). They are pure — addresses and CRC32C stamps are
+// possibly into several). They are pure — addresses and checksum stamps are
 // assigned by the walk that COWs the path (Stage 2). Re-tiling reuses the same
 // greedy grouping the whole-tree builder uses, so a produced node is always a
 // valid, bounds-respecting node, for any item sizes.
@@ -1337,7 +1505,7 @@ pub(crate) fn tree_block_count(leaves: usize, nodesize: usize) -> usize {
 /// then build internal nodes over them level by level up to a single root —
 /// producing a tree of **any height**. `addrs` is consumed bottom-up (all leaves,
 /// then all level-1 nodes, …, then the root), matching [`tree_levels`] /
-/// [`collect_tree_meta`]. Every node's bytenr/generation/CRC32C is stamped.
+/// [`collect_tree_meta`]. Every node's bytenr/generation/checksum is stamped.
 /// Returns the new nodes `(addr, bytes)`, the root address, and its level. A tree
 /// taller than `BTRFS_MAX_LEVEL` is out of scope (`NoSpace`).
 #[allow(clippy::type_complexity)]
@@ -1368,7 +1536,7 @@ fn pack_tree_at<B: BlockDevice + 'static>(
             .map(|i| Ok((leaf_item_key(logical, i)?, leaf_item_data(logical, i)?)))
             .collect::<Result<_, FsError>>()?;
         let mut leaf = pack_leaf(logical, &refs, nodesize);
-        stamp_node(&mut leaf, addr, gen);
+        stamp_node(&mut leaf, addr, gen, vol.csum_type())?;
         let first = if e > s {
             leaf_item_key(logical, s)?
         } else {
@@ -1399,7 +1567,7 @@ fn pack_tree_at<B: BlockDevice + 'static>(
                 node[kp + 17..kp + 25].copy_from_slice(&caddr.to_le_bytes());
                 node[kp + 25..kp + 33].copy_from_slice(&gen.to_le_bytes()); // key-ptr gen
             }
-            stamp_node(&mut node, addr, gen);
+            stamp_node(&mut node, addr, gen, vol.csum_type())?;
             next.push((chunk[0].0, addr));
             nodes.push((addr, node));
         }
@@ -1611,6 +1779,17 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
     // Whole-repacked trees: read them as oversized logical leaves (+ old blocks).
     let (mut root_logical, root_old) = read_fs_oversized(vol, root_tree).await?;
+    if let Some(flags) = txn.root_flags {
+        let slot = leaf_find_by_type(&root_logical, vol.fs_tree_id(), format::ROOT_ITEM_KEY)?
+            .ok_or(FsError::NotFound)?;
+        let mut root_item = leaf_item_data(&root_logical, slot)?.to_vec();
+        let end = roots::ROOT_ITEM_FLAGS + core::mem::size_of::<u64>();
+        let field = root_item
+            .get_mut(roots::ROOT_ITEM_FLAGS..end)
+            .ok_or(FsError::InvalidData)?;
+        field.copy_from_slice(&flags.to_le_bytes());
+        leaf_replace_inplace(&mut root_logical, slot, &root_item)?;
+    }
     let (csum_logical, csum_old) = match old_csum {
         Some(c) => {
             let (l, o) = read_fs_oversized(vol, c).await?;
@@ -1659,7 +1838,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let fs_new_meta: Vec<(u64, u64, u8)> = c
         .new_blocks
         .iter()
-        .map(|&(a, l)| (a, format::FS_TREE_OBJECTID, l))
+        .map(|&(a, l)| (a, vol.fs_tree_id(), l))
         .collect();
     let (fs_nodes, fs_freed, fs_root_addr, fs_level) =
         (c.nodes.clone(), c.freed.clone(), c.root, c.level);
@@ -1851,10 +2030,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
             ri[239..247].copy_from_slice(&gen.to_le_bytes());
         }
     };
-    let mut root_updates = alloc::vec![
-        (format::FS_TREE_OBJECTID, fs_root_addr, fs_level),
-        (format::EXTENT_TREE_OBJECTID, ext_root, ext_level),
-    ];
+    let fs_tree_changed = !c.nodes.is_empty() || !c.new_blocks.is_empty() || !c.freed.is_empty();
+    let mut root_updates = alloc::vec![(format::EXTENT_TREE_OBJECTID, ext_root, ext_level)];
+    if fs_tree_changed {
+        root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
+    }
     if csum_logical.is_some() {
         root_updates.push((format::CSUM_TREE_OBJECTID, csum_root.0, csum_root.1));
     }
@@ -1877,7 +2057,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         nodes.extend(pack_tree_at(vol, c, g, &csum_addrs, gen)?.0);
     }
     for (addr, mut buf, _lvl) in ext_nodes {
-        stamp_node(&mut buf, addr, gen);
+        stamp_node(&mut buf, addr, gen, vol.csum_type())?;
         nodes.push((addr, buf));
     }
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
@@ -1885,7 +2065,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
         nodes.extend(pack_tree_at(vol, f, g, &fst_addrs, gen)?.0);
     }
     for (addr, buf) in &nodes {
-        vol.write_logical(*addr, buf).await?;
+        if txn.root_flags.is_some() {
+            vol.write_logical_root_admin(*addr, buf).await?;
+        } else {
+            vol.write_logical(*addr, buf).await?;
+        }
     }
 
     // Superblock `bytes_used` is the sum of every block group's `used`, read back
@@ -1897,18 +2081,18 @@ async fn commit_txn<B: BlockDevice + 'static>(
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
     raw[120..128].copy_from_slice(&bytes_used.to_le_bytes());
-    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
-    raw[0..4].copy_from_slice(&csum.to_le_bytes());
-    for b in &mut raw[4..format::CSUM_SIZE] {
-        *b = 0;
-    }
+    crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
-    vol.write_superblock(&raw).await?;
+    if txn.root_flags.is_some() {
+        vol.write_superblock_root_admin(&raw).await?;
+    } else {
+        vol.write_superblock(&raw).await?;
+    }
 
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);
     }
-    vol.commit_roots(root_root_addr, fs_root_addr, gen);
+    vol.commit_roots(root_root_addr, fs_root_addr, fs_level, gen, txn.root_flags);
     Ok(())
 }
 
@@ -1972,18 +2156,26 @@ fn dir_item_body(child_ino: u64, gen: u64, ft: u8, name: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Build a 53-byte regular `btrfs_file_extent_item` pointing at a data extent of
-/// `len` bytes at logical `disk_bytenr` (uncompressed, extent_offset 0).
-fn file_extent_reg(gen: u64, disk_bytenr: u64, len: u64) -> Vec<u8> {
+/// Build a 53-byte regular extent item whose physical payload may be compressed.
+/// `disk_len` is the sector-aligned stored length; `ram_len` is the logical
+/// uncompressed range covered by the item.
+fn file_extent_reg_encoded(
+    gen: u64,
+    disk_bytenr: u64,
+    disk_len: u64,
+    ram_len: u64,
+    compression: u8,
+) -> Vec<u8> {
     let mut v = alloc::vec![0u8; 53];
     v[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
-    v[8..16].copy_from_slice(&len.to_le_bytes()); // ram_bytes
-                                                  // compression@16 / encryption@17 / other_encoding@18 = 0
+    v[8..16].copy_from_slice(&ram_len.to_le_bytes()); // ram_bytes
+    v[16] = compression;
+    // encryption@17 / other_encoding@18 = 0
     v[20] = format::FILE_EXTENT_REG; // type
     v[21..29].copy_from_slice(&disk_bytenr.to_le_bytes()); // disk_bytenr
-    v[29..37].copy_from_slice(&len.to_le_bytes()); // disk_num_bytes
-                                                   // extent_offset@37 = 0
-    v[45..53].copy_from_slice(&len.to_le_bytes()); // num_bytes
+    v[29..37].copy_from_slice(&disk_len.to_le_bytes()); // disk_num_bytes
+                                                        // extent_offset@37 = 0
+    v[45..53].copy_from_slice(&ram_len.to_le_bytes()); // num_bytes
     v
 }
 
@@ -2105,7 +2297,7 @@ pub async fn symlink_node<B: BlockDevice + 'static>(
 }
 
 /// Create a special file `name` (char/block device, FIFO or socket) in directory
-/// `parent_ino` (default subvolume). `mode` carries the `S_IF*` type bits; `rdev`
+/// `parent_ino` (mounted subvolume). `mode` carries the `S_IF*` type bits; `rdev`
 /// is the Linux `dev_t` (0 for FIFO/socket).
 pub async fn mknod_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
@@ -2129,7 +2321,7 @@ pub async fn mknod_node<B: BlockDevice + 'static>(
     .await
 }
 
-/// Create a new inode named `name` in directory `parent_ino` (default subvolume)
+/// Create a new inode named `name` in directory `parent_ino` (mounted subvolume)
 /// via a COW mini-transaction. Single-leaf trees only (like all mutations here).
 async fn create_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
@@ -2144,20 +2336,19 @@ async fn create_node<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
 
-    // The name's `DIR_ITEM` key must be free: an existing key means either the
-    // name already exists (the VFS pre-checks, so this is defensive) or a hash
-    // collision, which would need appending to the shared item body (out of
-    // scope — a fresh insert at a duplicate key would corrupt leaf order).
+    // A different name with the same hash shares this DIR_ITEM body. The VFS
+    // pre-checks exact duplicates; keep a defensive check here as well.
     let dir_item_key = BtrfsKey::new(
         parent_ino,
         format::DIR_ITEM_KEY,
         u64::from(name_hash(name_bytes)),
     );
-    if btree::find_item(vol, fs_root, &dir_item_key)
-        .await?
-        .is_some()
+    let existing_dir_item = btree::find_item(vol, fs_root, &dir_item_key).await?;
+    if existing_dir_item
+        .as_deref()
+        .is_some_and(|body| find_dir_item(body, name).is_ok())
     {
-        return Err(FsError::Unsupported);
+        return Err(FsError::InvalidData);
     }
 
     let new_ino = next_inode_number(vol, fs_root).await?;
@@ -2195,6 +2386,7 @@ async fn create_node<B: BlockDevice + 'static>(
         gen, spec.mode, size, size, 1, 0, 0, spec.rdev, ptime_sec, ptime_nsec,
     );
     let di = dir_item_body(new_ino, gen, spec.ftype, name_bytes);
+    let di_bucket = append_dir_item(existing_dir_item.as_deref(), name, &di)?;
     let mut edits = alloc::vec![
         Edit::Upsert(BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0), pinode),
         Edit::Upsert(BtrfsKey::new(new_ino, format::INODE_ITEM_KEY, 0), ii),
@@ -2202,7 +2394,7 @@ async fn create_node<B: BlockDevice + 'static>(
             BtrfsKey::new(new_ino, format::INODE_REF_KEY, parent_ino),
             inode_ref(new_index, name_bytes),
         ),
-        Edit::Upsert(dir_item_key, di.clone()),
+        Edit::Upsert(dir_item_key, di_bucket),
         Edit::Upsert(
             BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
             di,
@@ -2295,15 +2487,14 @@ fn inode_ref_remove(body: &[u8], name: &[u8]) -> Result<(u64, Vec<u8>), FsError>
     Ok((found.ok_or(FsError::NotFound)?, remaining))
 }
 
-/// Remove the entry `name` from directory `parent_ino` (default subvolume) via a
+/// Remove the entry `name` from directory `parent_ino` (mounted subvolume) via a
 /// COW mini-transaction. On the inode's **last** link the inode is freed (its
 /// `INODE_ITEM` + `EXTENT_DATA` removed, its regular data extents + checksums
 /// released); a still-linked inode keeps its data and just loses this name and one
 /// `INODE_REF` entry, its `nlink` decremented.
 ///
-/// Scope (else `Unsupported`): a regular file reached by a non-colliding
-/// `DIR_ITEM`. Directories (use `rmdir`), subvolume mounts, and hash collisions
-/// are rejected.
+/// Directories (use `rmdir`) and subvolume mount points remain out of scope;
+/// hash-colliding peer names in the same `DIR_ITEM` are preserved.
 pub async fn unlink_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -2316,7 +2507,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
 
-    // Resolve the name to a single, non-colliding directory entry.
+    // Resolve the exact name inside its possibly colliding hash bucket.
     let dir_item_key = BtrfsKey::new(
         parent_ino,
         format::DIR_ITEM_KEY,
@@ -2325,14 +2516,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     let di_body = btree::find_item(vol, fs_root, &dir_item_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let di_entries = decode_dir_items(&di_body)?;
-    if di_entries.len() != 1 {
-        return Err(FsError::Unsupported); // hash collision: shared item body
-    }
-    let entry = &di_entries[0];
-    if entry.name != name {
-        return Err(FsError::NotFound);
-    }
+    let entry = find_dir_item(&di_body, name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported); // subvolume mount point
     }
@@ -2340,6 +2524,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         return Err(FsError::InvalidData); // a directory: use rmdir
     }
     let child_ino = entry.location.objectid;
+    let di_remaining = remove_dir_item(&di_body, name)?;
 
     // Load the child inode; directories use rmdir.
     let ci_body = btree::find_item(
@@ -2426,7 +2611,11 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     // Delete this name's DIR_ITEM + DIR_INDEX; on the last link also the
     // INODE_ITEM + EXTENT_DATA. The INODE_REF is dropped when no entry for this
     // parent survives, else re-written to just the surviving entries.
-    edits.push(Edit::Delete(dir_item_key));
+    edits.push(if di_remaining.is_empty() {
+        Edit::Delete(dir_item_key)
+    } else {
+        Edit::Upsert(dir_item_key, di_remaining)
+    });
     edits.push(Edit::Delete(BtrfsKey::new(
         parent_ino,
         format::DIR_INDEX_KEY,
@@ -2461,8 +2650,9 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
 ///
 /// Scope (else the noted error): the child must be a directory (`InvalidData`
 /// otherwise — use `unlink`), reached by a single `INODE_REF` and a
-/// non-colliding `DIR_ITEM`, and **empty** — any `DIR_ITEM`/`DIR_INDEX` child
-/// makes it `Busy`, any other item (e.g. an xattr) makes it `Unsupported`.
+/// a `DIR_ITEM`, and **empty** — any `DIR_ITEM`/`DIR_INDEX` child makes it
+/// `Busy`. Hash-colliding peer names in the parent bucket are preserved. Xattrs
+/// are deleted with the inode; other item types remain unsupported.
 /// btrfs directories carry `nlink == 1`, so the parent's link count is unchanged
 /// (only its `i_size` shrinks).
 pub async fn rmdir_dir<B: BlockDevice + 'static>(
@@ -2477,7 +2667,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
 
-    // Resolve the name to a single, non-colliding directory entry.
+    // Resolve the exact name inside its possibly colliding hash bucket.
     let dir_item_key = BtrfsKey::new(
         parent_ino,
         format::DIR_ITEM_KEY,
@@ -2486,14 +2676,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     let di_body = btree::find_item(vol, fs_root, &dir_item_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let di_entries = decode_dir_items(&di_body)?;
-    if di_entries.len() != 1 {
-        return Err(FsError::Unsupported);
-    }
-    let entry = &di_entries[0];
-    if entry.name != name {
-        return Err(FsError::NotFound);
-    }
+    let entry = find_dir_item(&di_body, name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported); // subvolume mount point
     }
@@ -2501,6 +2684,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         return Err(FsError::InvalidData); // not a directory: use unlink
     }
     let child_ino = entry.location.objectid;
+    let di_remaining = remove_dir_item(&di_body, name)?;
 
     let ci_body = btree::find_item(
         vol,
@@ -2513,9 +2697,10 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         return Err(FsError::InvalidData);
     }
 
-    // The directory must be empty: it may own only its INODE_ITEM and the single
-    // INODE_REF back to the parent. A DIR_ITEM/DIR_INDEX child means non-empty
-    // (`Busy`); anything else (an xattr) is out of scope (`Unsupported`).
+    // The directory must be empty. A DIR_ITEM/DIR_INDEX child means non-empty
+    // (`Busy`). XATTR_ITEMs belong solely to this inode and are removed in the
+    // same transaction; any other per-inode item remains out of scope.
+    let mut xattr_keys = Vec::new();
     let mut cursor = btree::Cursor::seek(vol, fs_root, &BtrfsKey::new(child_ino, 0, 0)).await?;
     while let Some((k, _)) = cursor.current()? {
         if k.objectid != child_ino {
@@ -2523,6 +2708,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         }
         match k.item_type {
             format::INODE_ITEM_KEY | format::INODE_REF_KEY => {}
+            format::XATTR_ITEM_KEY => xattr_keys.push(k),
             format::DIR_ITEM_KEY | format::DIR_INDEX_KEY => return Err(FsError::Busy),
             _ => return Err(FsError::Unsupported),
         }
@@ -2563,13 +2749,18 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 
     // Delete the child's INODE_ITEM + INODE_REF and the parent's DIR_ITEM +
     // DIR_INDEX.
-    let edits = alloc::vec![
+    let mut edits = alloc::vec![
         Edit::Upsert(BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0), pinode,),
-        Edit::Delete(dir_item_key),
+        if di_remaining.is_empty() {
+            Edit::Delete(dir_item_key)
+        } else {
+            Edit::Upsert(dir_item_key, di_remaining)
+        },
         Edit::Delete(BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index)),
         Edit::Delete(ref_key),
         Edit::Delete(BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0)),
     ];
+    edits.extend(xattr_keys.into_iter().map(Edit::Delete));
 
     commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
     Ok(())
@@ -2582,11 +2773,10 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
 /// atomically replaced (its inode removed and, for a file, its data extents +
 /// checksums freed) — the `QSaveFile`/`rename`-onto-target pattern.
 ///
-/// Scope (else the noted error): same directory only; source and destination
-/// reached by a single `INODE_REF` and a non-colliding `DIR_ITEM`. Overwrite
-/// requires the same kind (dir↔dir / file↔file, else `InvalidData`), an unshared
-/// target (`nlink == 1`), and — for a directory target — that it is empty
-/// (`Busy`) and free of xattrs (`Unsupported`).
+/// Scope (else the noted error): same directory only. Overwrite requires the
+/// same kind (dir↔dir / file↔file, else `InvalidData`), an unshared target
+/// (`nlink == 1`), and — for a directory target — that it is empty (`Busy`) and
+/// free of xattrs (`Unsupported`). Colliding peer names are preserved.
 pub async fn rename_same_dir<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     parent_ino: u64,
@@ -2606,7 +2796,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
 
     let (fs_root, _) = vol.fs_tree_root();
 
-    // Resolve the source to a single, non-colliding entry.
+    // Resolve the exact source record inside its hash bucket.
     let old_di_key = BtrfsKey::new(
         parent_ino,
         format::DIR_ITEM_KEY,
@@ -2615,14 +2805,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let old_di_body = btree::find_item(vol, fs_root, &old_di_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let old_entries = decode_dir_items(&old_di_body)?;
-    if old_entries.len() != 1 {
-        return Err(FsError::Unsupported); // hash collision on the source
-    }
-    let entry = &old_entries[0];
-    if entry.name != old_name {
-        return Err(FsError::NotFound);
-    }
+    let entry = find_dir_item(&old_di_body, old_name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported); // subvolume mount point
     }
@@ -2639,15 +2822,14 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     );
     let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
     let mut freed_data: Vec<(u64, u64)> = Vec::new();
-    if let Some(t_body) = btree::find_item(vol, fs_root, &new_di_key).await? {
-        let t_entries = decode_dir_items(&t_body)?;
-        if t_entries.len() != 1 {
-            return Err(FsError::Unsupported); // hash collision at the destination
-        }
-        let t = &t_entries[0];
-        if t.name != new_name {
-            return Err(FsError::Unsupported);
-        }
+    let new_di_body = btree::find_item(vol, fs_root, &new_di_key).await?;
+    let target_entry = match &new_di_body {
+        Some(body) => decode_dir_items(body)?
+            .into_iter()
+            .find(|candidate| candidate.name == new_name),
+        None => None,
+    };
+    if let Some(t) = target_entry {
         if t.location.item_type != format::INODE_ITEM_KEY {
             return Err(FsError::Unsupported); // subvolume mount point
         }
@@ -2740,21 +2922,39 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let pseq = le64(&pinode, 72)?;
     pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
 
-    // Re-key the source into the new name (its DIR_ITEM Upsert also replaces an
-    // overwritten target's DIR_ITEM at the same key), remove the source's old
-    // name, and — on overwrite — drop the target's other items.
+    // Re-key the source into the new name at record granularity. Source and
+    // destination can even be different names in the same collision bucket.
     let di = dir_item_body(child_ino, gen, ftype, new_bytes);
     let mut edits = alloc::vec![
         Edit::Upsert(BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0), pinode),
-        Edit::Delete(old_di_key),
         Edit::Delete(BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, old_index)),
-        Edit::Upsert(new_di_key, di.clone()),
         Edit::Upsert(
             BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
-            di
+            di.clone()
         ),
         Edit::Upsert(ref_key, inode_ref(new_index, new_bytes)),
     ];
+    if old_di_key == new_di_key {
+        let mut bucket = remove_dir_item(&old_di_body, old_name)?;
+        if overwrite {
+            bucket = remove_dir_item(&bucket, new_name)?;
+        }
+        bucket = append_dir_item(Some(&bucket), new_name, &di)?;
+        edits.push(Edit::Upsert(old_di_key, bucket));
+    } else {
+        let old_bucket = remove_dir_item(&old_di_body, old_name)?;
+        edits.push(if old_bucket.is_empty() {
+            Edit::Delete(old_di_key)
+        } else {
+            Edit::Upsert(old_di_key, old_bucket)
+        });
+        let mut new_bucket = new_di_body.unwrap_or_default();
+        if overwrite {
+            new_bucket = remove_dir_item(&new_bucket, new_name)?;
+        }
+        new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
+        edits.push(Edit::Upsert(new_di_key, new_bucket));
+    }
     if let Some((t_ino, t_index, ed_offsets)) = &target {
         edits.push(Edit::Delete(BtrfsKey::new(
             parent_ino,
@@ -2817,7 +3017,7 @@ async fn is_ancestor_or_self<B: BlockDevice + 'static>(
 }
 
 /// Move entry `old_name` from directory `old_parent` to `new_name` in a
-/// *different* directory `new_parent` (both in the default subvolume) via one COW
+/// *different* directory `new_parent` (both in the mounted subvolume) via one COW
 /// mini-transaction. Re-keys the moved inode's `INODE_REF` from the old parent to
 /// the new, moves its directory entries, and adjusts both parents' `i_size`. If
 /// `new_name` already exists it is atomically replaced (same rules as the
@@ -2825,10 +3025,9 @@ async fn is_ancestor_or_self<B: BlockDevice + 'static>(
 /// fs leaf.
 ///
 /// Scope (else the noted error): `new_parent != old_parent`; a directory may not
-/// move into its own subtree (`InvalidData`); source/target reached by a single
-/// `INODE_REF` and a non-colliding `DIR_ITEM`; an overwrite target must match kind
+/// move into its own subtree (`InvalidData`); an overwrite target must match kind
 /// (`InvalidData`), be unshared (`nlink == 1`), and — for a directory — be empty
-/// (`Busy`) and xattr-free (`Unsupported`).
+/// (`Busy`) and xattr-free (`Unsupported`). Colliding peer names are preserved.
 pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     old_parent: u64,
@@ -2858,14 +3057,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     let old_di_body = btree::find_item(vol, fs_root, &old_di_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let old_entries = decode_dir_items(&old_di_body)?;
-    if old_entries.len() != 1 {
-        return Err(FsError::Unsupported);
-    }
-    let entry = &old_entries[0];
-    if entry.name != old_name {
-        return Err(FsError::NotFound);
-    }
+    let entry = find_dir_item(&old_di_body, old_name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported);
     }
@@ -2896,15 +3088,14 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     );
     let mut target: Option<(u64, u64, Vec<u64>)> = None; // (ino, dir_index, ed_offsets)
     let mut freed_data: Vec<(u64, u64)> = Vec::new();
-    if let Some(t_body) = btree::find_item(vol, fs_root, &new_di_key).await? {
-        let t_entries = decode_dir_items(&t_body)?;
-        if t_entries.len() != 1 {
-            return Err(FsError::Unsupported);
-        }
-        let t = &t_entries[0];
-        if t.name != new_name {
-            return Err(FsError::Unsupported);
-        }
+    let new_di_body = btree::find_item(vol, fs_root, &new_di_key).await?;
+    let target_entry = match &new_di_body {
+        Some(body) => decode_dir_items(body)?
+            .into_iter()
+            .find(|candidate| candidate.name == new_name),
+        None => None,
+    };
+    if let Some(t) = target_entry {
         if t.location.item_type != format::INODE_ITEM_KEY {
             return Err(FsError::Unsupported);
         }
@@ -2997,9 +3188,8 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         },
     )?;
 
-    // Re-key the source under the new parent (its DIR_ITEM Upsert also replaces an
-    // overwritten target's DIR_ITEM), remove the source's old entries + old
-    // INODE_REF, and — on overwrite — drop the target's other items.
+    // Re-key the source under the new parent at record granularity, retaining
+    // collision peers in both parent buckets.
     let di = dir_item_body(child_ino, gen, ftype, new_bytes);
     let mut edits = alloc::vec![
         Edit::Upsert(
@@ -3010,19 +3200,29 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
             BtrfsKey::new(new_parent, format::INODE_ITEM_KEY, 0),
             new_pinode
         ),
-        Edit::Delete(old_di_key),
         Edit::Delete(BtrfsKey::new(old_parent, format::DIR_INDEX_KEY, old_index)),
         Edit::Delete(old_ref_key),
-        Edit::Upsert(new_di_key, di.clone()),
         Edit::Upsert(
             BtrfsKey::new(new_parent, format::DIR_INDEX_KEY, new_index),
-            di
+            di.clone()
         ),
         Edit::Upsert(
             BtrfsKey::new(child_ino, format::INODE_REF_KEY, new_parent),
             inode_ref(new_index, new_bytes),
         ),
     ];
+    let old_bucket = remove_dir_item(&old_di_body, old_name)?;
+    edits.push(if old_bucket.is_empty() {
+        Edit::Delete(old_di_key)
+    } else {
+        Edit::Upsert(old_di_key, old_bucket)
+    });
+    let mut new_bucket = new_di_body.unwrap_or_default();
+    if overwrite {
+        new_bucket = remove_dir_item(&new_bucket, new_name)?;
+    }
+    new_bucket = append_dir_item(Some(&new_bucket), new_name, &di)?;
+    edits.push(Edit::Upsert(new_di_key, new_bucket));
     if let Some((t_ino, t_index, ed_offsets)) = &target {
         edits.push(Edit::Delete(BtrfsKey::new(
             new_parent,
@@ -3053,16 +3253,15 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
 }
 
 /// Create a hard link `new_name` in directory `target_parent` to the inode that
-/// `old_name` names in directory `source_parent` (both in the default subvolume)
+/// `old_name` names in directory `source_parent` (both in the mounted subvolume)
 /// via one COW mini-transaction: a new DIR_ITEM + DIR_INDEX in the target dir, an
 /// added `INODE_REF` entry (appended to the existing item when the inode already
 /// links into that dir, else a fresh item), the inode's `nlink` bumped, and the
 /// target dir's `i_size` grown.
 ///
-/// Scope (else the noted error): default subvolume, single leaf; the source must
-/// not be a directory (`PermissionDenied` — hard-linking a directory is EPERM),
-/// reached by a non-colliding `DIR_ITEM`; `new_name` must be free and not collide
-/// in the target's `DIR_ITEM` hash space.
+/// Scope (else the noted error): one mounted subvolume; the source must not be a
+/// directory (`PermissionDenied` — hard-linking a directory is EPERM) and
+/// `new_name` must be free. Hash-colliding peer names are preserved.
 pub async fn link_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     source_parent: u64,
@@ -3089,14 +3288,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
     let old_di_body = btree::find_item(vol, fs_root, &old_di_key)
         .await?
         .ok_or(FsError::NotFound)?;
-    let old_entries = decode_dir_items(&old_di_body)?;
-    if old_entries.len() != 1 {
-        return Err(FsError::Unsupported);
-    }
-    let entry = &old_entries[0];
-    if entry.name != old_name {
-        return Err(FsError::NotFound);
-    }
+    let entry = find_dir_item(&old_di_body, old_name)?;
     if entry.location.item_type != format::INODE_ITEM_KEY {
         return Err(FsError::Unsupported);
     }
@@ -3106,14 +3298,18 @@ pub async fn link_node<B: BlockDevice + 'static>(
     let child_ino = entry.location.objectid;
     let child_ftype = entry.ftype;
 
-    // The destination name must be free (no overwrite; also rejects a collision).
+    // The destination name must be free; a different colliding name is retained.
     let new_di_key = BtrfsKey::new(
         target_parent,
         format::DIR_ITEM_KEY,
         u64::from(name_hash(new_bytes)),
     );
-    if btree::find_item(vol, fs_root, &new_di_key).await?.is_some() {
-        return Err(FsError::Unsupported);
+    let target_bucket = btree::find_item(vol, fs_root, &new_di_key).await?;
+    if target_bucket
+        .as_deref()
+        .is_some_and(|body| find_dir_item(body, new_name).is_ok())
+    {
+        return Err(FsError::InvalidData);
     }
 
     let new_index = next_dir_index(vol, fs_root, target_parent).await?;
@@ -3156,6 +3352,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
 
     // Add the directory entries pointing at the linked inode.
     let di = dir_item_body(child_ino, gen, child_ftype, new_bytes);
+    let di_bucket = append_dir_item(target_bucket.as_deref(), new_name, &di)?;
     let edits = alloc::vec![
         Edit::Upsert(BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0), cinode),
         Edit::Upsert(
@@ -3163,7 +3360,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
             pinode
         ),
         Edit::Upsert(ref_key, ref_body),
-        Edit::Upsert(new_di_key, di.clone()),
+        Edit::Upsert(new_di_key, di_bucket),
         Edit::Upsert(
             BtrfsKey::new(target_parent, format::DIR_INDEX_KEY, new_index),
             di
@@ -3190,7 +3387,7 @@ fn xattr_entry(gen: u64, name: &[u8], value: &[u8]) -> Vec<u8> {
 }
 
 /// Set (create or replace) extended attribute `name` = `value` on inode `ino`
-/// (default subvolume). `flags` honours Linux `XATTR_CREATE` (1) / `XATTR_REPLACE`
+/// (mounted subvolume). `flags` honours Linux `XATTR_CREATE` (1) / `XATTR_REPLACE`
 /// (2). Attributes sharing a name hash coexist in one `XATTR_ITEM` body, so the
 /// item is rebuilt preserving the others.
 pub async fn set_xattr_item<B: BlockDevice + 'static>(
@@ -3249,7 +3446,7 @@ pub async fn set_xattr_item<B: BlockDevice + 'static>(
     .await
 }
 
-/// Remove extended attribute `name` from inode `ino` (default subvolume). Deletes
+/// Remove extended attribute `name` from inode `ino` (mounted subvolume). Deletes
 /// the `XATTR_ITEM`, or rebuilds it without this name when others share its hash.
 pub async fn remove_xattr_item<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
@@ -3338,7 +3535,8 @@ async fn write_owned_tree<B: BlockDevice + 'static>(
 /// Write a tree-log recording `items` for the default subvolume and point the
 /// superblock at it **without** committing them to the fs tree — the fsync fast
 /// path a subsequent mount replays ([`replay_log`]). `items` are fs-tree items
-/// (keyed the same) to merge into the fs tree on replay.
+/// (keyed the same) to merge into the fs tree on replay, plus optional standard
+/// `DIR_LOG_INDEX` authoritative ranges used to represent directory deletions.
 ///
 /// The log's blocks come from currently-free space (like real btrfs's pinned log
 /// extents) and are deliberately *not* recorded in the extent/free-space trees, so
@@ -3348,6 +3546,12 @@ pub async fn write_log<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     items: &[(BtrfsKey, Vec<u8>)],
 ) -> Result<(), FsError> {
+    // Log replay currently runs before mount-option subvolume selection and
+    // therefore consumes only the top-level FS_TREE mapping. Refuse to emit a
+    // nested-subvolume log that the next mount could not replay correctly.
+    if vol.fs_tree_id() != format::FS_TREE_OBJECTID {
+        return Err(FsError::Unsupported);
+    }
     let gen = vol.superblock().generation + 1;
     let mut alloc = Allocator::build(vol).await?;
 
@@ -3371,8 +3575,7 @@ pub async fn write_log<B: BlockDevice + 'static>(
     raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
         .copy_from_slice(&gen.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = log_root_tree_level;
-    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
-    raw[0..4].copy_from_slice(&csum.to_le_bytes());
+    crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
     vol.write_superblock(&raw).await?;
     Ok(())
@@ -3382,11 +3585,11 @@ pub async fn write_log<B: BlockDevice + 'static>(
 /// clear the pointer — btrfs crash recovery, run once at mount. Returns whether a
 /// log was replayed.
 ///
-/// Items are applied **additively** (each `Upsert`ed into the fs tree), covering
-/// the fsync-after-write / -create case. Log-only deletion ranges (`DIR_LOG_*`)
-/// are not synthesised, so a log that also encoded unlinks would replay its
-/// additions only — a documented scope limit, sufficient for NARF-written logs and
-/// the common append case.
+/// Ordinary items are `Upsert`ed into the fs tree. Before those upserts, modern
+/// `DIR_LOG_INDEX` authoritative ranges remove each committed `DIR_INDEX` entry
+/// whose index/name is absent from the log, using the normal unlink/rmdir COW
+/// paths so inode refs, link counts, data extents, checksums and parent metadata
+/// stay consistent. Log-only range items are never copied into the FS tree.
 pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<bool, FsError> {
     let sb = vol.superblock();
     if sb.log_root == 0 {
@@ -3403,16 +3606,133 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
         .ok_or(FsError::InvalidData)?;
     let fs_log_root = le64(&ri, 176)?;
 
-    // Read every logged item first (the commit below may reuse the log's blocks),
-    // then merge them into the fs tree in one path-COW commit.
-    let mut edits = Vec::new();
+    // Read every logged item first: any deletion commit below may reuse the
+    // unaccounted/pinned log blocks.
+    let mut log_items = Vec::new();
     let mut cursor = btree::Cursor::seek(vol, fs_log_root, &BtrfsKey::new(0, 0, 0)).await?;
     while let Some((k, body)) = cursor.current()? {
-        edits.push(Edit::Upsert(k, body.to_vec()));
+        log_items.push((k, body.to_vec()));
         cursor.advance().await?;
     }
+
+    // Current Linux kernels log directory indexes only. Decode them once up
+    // front both to validate the log before applying ranges and to make
+    // same-index/name authority checks unambiguous.
+    let mut logged_dir_indexes = Vec::new();
+    for (key, body) in &log_items {
+        if key.item_type != format::DIR_INDEX_KEY {
+            continue;
+        }
+        let entries = decode_dir_items(body)?;
+        if entries.len() != 1 {
+            return Err(FsError::InvalidData);
+        }
+        logged_dir_indexes.push((key.objectid, key.offset, entries[0].name.clone()));
+    }
+
+    // Linux tree logs describe directory removals indirectly: each range says
+    // the log is authoritative for DIR_INDEX offsets [start, end]. A committed
+    // entry in that range which has no same-index/name entry in the log was
+    // deleted before fsync and must be unlinked during recovery.
+    let mut deletions = Vec::new();
+    for (range_key, range_body) in &log_items {
+        if range_key.item_type != format::DIR_LOG_INDEX_KEY {
+            continue;
+        }
+        if range_body.len() != 8 {
+            return Err(FsError::InvalidData);
+        }
+        let range_end = le64(range_body, 0)?;
+        if range_end < range_key.offset {
+            return Err(FsError::InvalidData);
+        }
+        let (fs_root, _) = vol.fs_tree_root();
+        for (key, body) in
+            btree::collect_for(vol, fs_root, range_key.objectid, format::DIR_INDEX_KEY).await?
+        {
+            if key.offset < range_key.offset || key.offset > range_end {
+                continue;
+            }
+            let entries = decode_dir_items(&body)?;
+            if entries.len() != 1 {
+                return Err(FsError::InvalidData); // DIR_INDEX offsets are unique
+            }
+            let entry = &entries[0];
+            let present = logged_dir_indexes.iter().any(|(dir, index, name)| {
+                *dir == key.objectid && *index == key.offset && *name == entry.name
+            });
+            if !present
+                && !deletions
+                    .iter()
+                    .any(|(dir, index, _, _)| *dir == key.objectid && *index == key.offset)
+            {
+                deletions.push((key.objectid, key.offset, entry.name.clone(), entry.ftype));
+            }
+        }
+    }
+    deletions.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    for (parent, _index, name, ftype) in deletions {
+        let result = if ftype == format::FT_DIR {
+            rmdir_dir(vol, parent, &name).await
+        } else {
+            unlink_file(vol, parent, &name).await
+        };
+        match result {
+            Ok(()) | Err(FsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Merge ordinary logged items after deletions. Range markers are log-only
+    // metadata and must never appear in the committed FS tree.
+    let mut edits = Vec::new();
+    for (key, body) in log_items {
+        if key.item_type == format::DIR_LOG_ITEM_KEY || key.item_type == format::DIR_LOG_INDEX_KEY {
+            continue;
+        }
+        edits.push(Edit::Upsert(key, body.clone()));
+        if key.item_type != format::DIR_INDEX_KEY {
+            continue;
+        }
+
+        // Linux no longer logs the hash-keyed DIR_ITEM twin. Reconstruct it
+        // from the logged DIR_INDEX body so lookup and readdir remain coherent.
+        // Merge at record granularity because multiple logged/existing names can
+        // share the same CRC32C hash bucket.
+        let entries = decode_dir_items(&body)?;
+        if entries.len() != 1 {
+            return Err(FsError::InvalidData);
+        }
+        let entry = &entries[0];
+        let dir_item_key = BtrfsKey::new(
+            key.objectid,
+            format::DIR_ITEM_KEY,
+            u64::from(name_hash(entry.name.as_bytes())),
+        );
+        let (fs_root, _) = vol.fs_tree_root();
+        let pending = edits.iter().rposition(|edit| edit.key() == &dir_item_key);
+        let mut bucket = match pending.map(|slot| match &edits[slot] {
+            Edit::Upsert(_, pending_body) => pending_body.clone(),
+            Edit::Delete(_) => Vec::new(),
+        }) {
+            Some(body) => body,
+            None => btree::find_item(vol, fs_root, &dir_item_key)
+                .await?
+                .unwrap_or_default(),
+        };
+        if find_dir_item(&bucket, &entry.name).is_ok() {
+            bucket = remove_dir_item(&bucket, &entry.name)?;
+        }
+        bucket = append_dir_item(Some(&bucket), &entry.name, &body)?;
+        let edit = Edit::Upsert(dir_item_key, bucket);
+        if let Some(slot) = pending {
+            edits[slot] = edit;
+        } else {
+            edits.push(edit);
+        }
+    }
     if !edits.is_empty() {
-        let gen = sb.generation + 1;
+        let gen = vol.superblock().generation + 1;
         let alloc = Allocator::build(vol).await?;
         commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
     }
@@ -3424,8 +3744,7 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
     raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
         .copy_from_slice(&0u64.to_le_bytes());
     raw[format::OFF_LOG_ROOT_LEVEL] = 0;
-    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
-    raw[0..4].copy_from_slice(&csum.to_le_bytes());
+    crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
     vol.write_superblock(&raw).await?;
     vol.clear_log_root();
@@ -3818,11 +4137,7 @@ pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> R
     raw[164..172].copy_from_slice(&gen.to_le_bytes()); // chunk_root_generation
                                                        // Embedded dev_item.bytes_used (dev_item@201, bytes_used@+16).
     raw[217..225].copy_from_slice(&dev_used.to_le_bytes());
-    let csum = block_csum(&raw[format::CSUM_SIZE..format::SUPERBLOCK_SIZE]);
-    raw[0..4].copy_from_slice(&csum.to_le_bytes());
-    for b in &mut raw[4..format::CSUM_SIZE] {
-        *b = 0;
-    }
+    crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
     vol.flush().await;
     vol.write_superblock(&raw).await?;
     vol.commit_chunk_root(chunk_root_addr, root_root_addr, gen);

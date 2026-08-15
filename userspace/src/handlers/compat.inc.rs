@@ -512,6 +512,15 @@ impl narf_filesystem::FileOps for DirFdFile {
     fn syncfs<'a>(&'a self) -> narf_filesystem::FsFuture<'a, ()> {
         self.dir.syncfs()
     }
+    fn ioctl_async<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        input: &'a [u8],
+        out_size: usize,
+    ) -> narf_filesystem::FsFuture<'a, narf_filesystem::FsIoctlReply> {
+        self.dir.ioctl_async(cmd, arg, input, out_size)
+    }
     /// A directory fd has no readable/writable stream (read/write are
     /// EISDIR; enumeration is getdents64). Report NOT ready so a poll/epoll
     /// consumer never spuriously wakes on it — the always-ready FileOps
