@@ -2526,6 +2526,270 @@ pub(crate) async fn create_subvolume<B: BlockDevice + 'static>(
     Ok(new_id)
 }
 
+/// Create a point-in-time subvolume snapshot below the parent inode.
+///
+/// The current delayed-ref engine only models exclusive extents. To preserve
+/// correct independent writes, this first implementation eagerly copies every
+/// referenced disk extent and rebuilds the source fs tree under a fresh owner
+/// instead of publishing shared metadata/data references. The root item still
+/// records normal snapshot ancestry, and the entire namespace, clone tree,
+/// extent/csum/UUID/root/free-space update commits atomically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_snapshot<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent_ino: u64,
+    source_root: u64,
+    source_id: u64,
+    name: &str,
+    readonly: bool,
+) -> Result<u64, FsError> {
+    let name_bytes = name.as_bytes();
+    if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
+        return Err(FsError::InvalidData);
+    }
+    let (fs_root, fs_level) = vol.fs_tree_root();
+    let (root_tree, _) = vol.root_tree_root();
+    let dir_item_key = BtrfsKey::new(
+        parent_ino,
+        format::DIR_ITEM_KEY,
+        u64::from(name_hash(name_bytes)),
+    );
+    let existing_dir_item = btree::find_item(vol, fs_root, &dir_item_key).await?;
+    if existing_dir_item
+        .as_deref()
+        .is_some_and(|body| find_dir_item(body, name).is_ok())
+    {
+        return Err(FsError::InvalidData);
+    }
+
+    let gen = vol
+        .superblock()
+        .generation
+        .checked_add(1)
+        .ok_or(FsError::InvalidData)?;
+    let new_id = next_subvol_id(vol, root_tree).await?;
+    let new_index = next_dir_index(vol, fs_root, parent_ino).await?;
+    let mut alloc = Allocator::build(vol).await?;
+
+    let (mut child_logical, _) = read_fs_oversized(vol, source_root).await?;
+    let item_count = nritems(&child_logical)? as usize;
+    for slot in 0..item_count {
+        let key = leaf_item_key(&child_logical, slot)?;
+        if key.item_type == format::DIR_INDEX_KEY {
+            for entry in decode_dir_items(leaf_item_data(&child_logical, slot)?)? {
+                if entry.location.item_type == format::ROOT_ITEM_KEY {
+                    return Err(FsError::Unsupported);
+                }
+            }
+        }
+    }
+
+    let sectorsize = u64::from(vol.sectorsize());
+    let mut new_data = Vec::new();
+    for slot in 0..item_count {
+        let key = leaf_item_key(&child_logical, slot)?;
+        if key.item_type != format::EXTENT_DATA_KEY {
+            continue;
+        }
+        let mut body = leaf_item_data(&child_logical, slot)?.to_vec();
+        if body.len() < 21 {
+            return Err(FsError::InvalidData);
+        }
+        if body[20] == format::FILE_EXTENT_INLINE {
+            continue;
+        }
+        if !matches!(
+            body[20],
+            format::FILE_EXTENT_REG | format::FILE_EXTENT_PREALLOC
+        ) || body.len() < 53
+        {
+            return Err(FsError::InvalidData);
+        }
+        let old_bytenr = le64(&body, 21)?;
+        if old_bytenr == 0 {
+            continue;
+        }
+        let disk_len = le64(&body, 29)?;
+        if disk_len == 0 || disk_len % sectorsize != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let encoded_len = usize::try_from(disk_len).map_err(|_| FsError::InvalidData)?;
+        let payload = vol.read_logical(old_bytenr, encoded_len).await?;
+        let new_bytenr = alloc.alloc_data(vol, disk_len)?;
+        vol.write_logical(new_bytenr, &payload).await?;
+        body[21..29].copy_from_slice(&new_bytenr.to_le_bytes());
+        leaf_replace_inplace(&mut child_logical, slot, &body)?;
+        let extent_offset = le64(&body, 37)?;
+        let backref_offset = key
+            .offset
+            .checked_sub(extent_offset)
+            .ok_or(FsError::InvalidData)?;
+        new_data.push(DataRef {
+            bytenr: new_bytenr,
+            len: disk_len,
+            ref_root: new_id,
+            objectid: key.objectid,
+            offset: backref_offset,
+            csums: crate::csum::compute_csums(vol.csum_type(), &payload, sectorsize as usize)?,
+        });
+    }
+
+    child_logical[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&new_id.to_le_bytes());
+    let child_groups = group_items(vol, &child_logical)?;
+    let child_addrs = alloc_nodes(
+        &mut alloc,
+        vol,
+        tree_block_count(child_groups.len(), vol.nodesize()),
+    )?;
+    let (child_nodes, child_root, child_level) =
+        pack_tree_at(vol, &child_logical, &child_groups, &child_addrs, gen)?;
+    let mut child_blocks = Vec::new();
+    collect_tree_meta(
+        &child_addrs,
+        child_groups.len(),
+        vol.nodesize(),
+        new_id,
+        &mut child_blocks,
+    );
+
+    let mut pinode = btree::find_item(
+        vol,
+        fs_root,
+        &BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0),
+    )
+    .await?
+    .ok_or(FsError::NotFound)?;
+    let psize = le64(&pinode, 16)?;
+    let ptime_sec = le64(&pinode, 136)? as i64;
+    let ptime_nsec = format::le32(&pinode, 144)?;
+    pinode[8..16].copy_from_slice(&gen.to_le_bytes());
+    pinode[16..24].copy_from_slice(&(psize + 2 * name_bytes.len() as u64).to_le_bytes());
+    let pseq = le64(&pinode, 72)?;
+    pinode[72..80].copy_from_slice(&(pseq + 1).to_le_bytes());
+
+    let location = BtrfsKey::new(new_id, format::ROOT_ITEM_KEY, 0);
+    let di = dir_item_body_at(location, gen, format::FT_DIR, name_bytes);
+    let parent_edits = alloc::vec![
+        Edit::Upsert(BtrfsKey::new(parent_ino, format::INODE_ITEM_KEY, 0), pinode),
+        Edit::Upsert(
+            dir_item_key,
+            append_dir_item(existing_dir_item.as_deref(), name, &di)?,
+        ),
+        Edit::Upsert(
+            BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, new_index),
+            di,
+        ),
+    ];
+    let parent_out = PathCow::new(vol, gen, fs_root, fs_level)
+        .await?
+        .apply(&mut alloc, &parent_edits)
+        .await?;
+    let parent_commit = fs_commit_from(parent_out, gen, vol.csum_type())?;
+
+    let source_key = BtrfsKey::new(source_id, format::ROOT_ITEM_KEY, 0);
+    let source_cursor = btree::Cursor::seek(vol, root_tree, &source_key).await?;
+    let source_item = match source_cursor.current()? {
+        Some((key, body))
+            if key.objectid == source_id && key.item_type == format::ROOT_ITEM_KEY =>
+        {
+            body.to_vec()
+        }
+        _ => return Err(FsError::NotFound),
+    };
+    let raw_super = vol.read_raw_superblock().await?;
+    let fsid = raw_super.get(32..48).ok_or(FsError::InvalidData)?;
+    let uuid = subvol_uuid(fsid, gen, new_id)?;
+    let flags = if readonly {
+        format::ROOT_SUBVOL_RDONLY
+    } else {
+        0
+    };
+    let tree_bytes = (child_blocks.len() as u64)
+        .checked_mul(vol.nodesize() as u64)
+        .ok_or(FsError::InvalidData)?;
+    let mut root_item = subvol_root_item(
+        gen, child_root, tree_bytes, flags, &uuid, ptime_sec, ptime_nsec,
+    );
+    root_item[238] = child_level;
+    if let Some(root_inode) = (0..item_count).find_map(|slot| {
+        let key = leaf_item_key(&child_logical, slot).ok()?;
+        if key == BtrfsKey::new(format::FIRST_FREE_OBJECTID, format::INODE_ITEM_KEY, 0) {
+            Some(leaf_item_data(&child_logical, slot).ok()?.to_vec())
+        } else {
+            None
+        }
+    }) {
+        if root_inode.len() >= 160 {
+            root_item[..160].copy_from_slice(&root_inode[..160]);
+        }
+    }
+    if let Some(parent_uuid) = source_item.get(247..263) {
+        root_item[263..279].copy_from_slice(parent_uuid);
+    }
+    let ref_body = root_ref(parent_ino, new_index, name_bytes);
+    let root_inserts = alloc::vec![
+        (BtrfsKey::new(new_id, format::ROOT_ITEM_KEY, 0), root_item),
+        (
+            BtrfsKey::new(new_id, format::ROOT_BACKREF_KEY, vol.fs_tree_id()),
+            ref_body.clone(),
+        ),
+        (
+            BtrfsKey::new(vol.fs_tree_id(), format::ROOT_REF_KEY, new_id),
+            ref_body,
+        ),
+    ];
+
+    let mut extra_trees = alloc::vec![ExtraTree {
+        owner: new_id,
+        commit: FsCommit {
+            nodes: child_nodes,
+            new_blocks: child_blocks
+                .into_iter()
+                .map(|(addr, _owner, level)| (addr, level))
+                .collect(),
+            freed: Vec::new(),
+            root: child_root,
+            level: child_level,
+        },
+    }];
+    if let Ok((uuid_root, uuid_level)) =
+        roots::find_root(vol, root_tree, format::UUID_TREE_OBJECTID).await
+    {
+        let uuid_key = BtrfsKey::new(
+            u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+            format::UUID_KEY_SUBVOL,
+            u64::from_le_bytes(uuid[8..].try_into().unwrap()),
+        );
+        let uuid_out = PathCow::new(vol, gen, uuid_root, uuid_level)
+            .await?
+            .apply(
+                &mut alloc,
+                &[Edit::Upsert(uuid_key, new_id.to_le_bytes().to_vec())],
+            )
+            .await?;
+        extra_trees.push(ExtraTree {
+            owner: format::UUID_TREE_OBJECTID,
+            commit: fs_commit_from(uuid_out, gen, vol.csum_type())?,
+        });
+    }
+
+    commit_txn(
+        vol,
+        gen,
+        alloc,
+        Txn {
+            fs: parent_commit,
+            freed_data: Vec::new(),
+            new_data,
+            root_flags: None,
+            extra_trees,
+            root_inserts,
+        },
+    )
+    .await?;
+    Ok(new_id)
+}
+
 /// What kind of inode [`create_node`] materialises: mode + directory-entry type,
 /// an optional device number (`mknod`), and optional inline content (a symlink
 /// target, stored as one inline `EXTENT_DATA`).

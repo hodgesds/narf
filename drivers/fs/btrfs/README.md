@@ -76,6 +76,13 @@ real laptop's btrfs root looks like.
   directory, including read-only creation. The parent fs tree, new empty child
   tree, UUID index, root refs/backrefs, extent/free-space accounting and
   superblock are committed atomically.
+- Legacy `BTRFS_IOC_SNAP_CREATE` and `BTRFS_IOC_SNAP_CREATE_V2`, including
+  writable/read-only snapshots selected by source directory fd. Snapshot
+  ancestry is recorded through `parent_uuid`; source data, metadata, UUID/root
+  refs and the destination entry commit atomically. Until shared delayed refs
+  land, snapshot creation eagerly gives every disk extent private storage, so
+  source and snapshot are independently writable but creation is O(tree + data)
+  rather than the usual O(1) shared-root operation.
 - **statfs** reports total/free blocks (free approximated from the superblock's
   `bytes_used`).
 
@@ -86,9 +93,11 @@ than mis-read:
 
 - RAID profiles / multi-device — any chunk profile other than SINGLE/DUP, or
   `num_devices != 1`.
-- Snapshot creation, and subvolume/snapshot deletion; mutations reached by
-  traversing a child subvolume from its parent (mount that child explicitly to
-  write it). `SUBVOL_CREATE_V2` qgroup inheritance is not supported.
+- Subvolume/snapshot deletion; mutations reached by traversing a child subvolume
+  from its parent (mount that child explicitly to write it). Snapshotting a
+  source that itself contains nested subvolume mount points is not yet
+  supported. `SUBVOL_CREATE_V2` / `SNAP_CREATE_V2` qgroup inheritance is not
+  supported.
 - A symlink target `>= sectorsize`; a `rename`/`link` across subvolumes/volumes,
   or a `rename` that overwrites a hardlinked or non-empty-directory target.
 - `sectorsize != 4096` or a `nodesize` that is not a power-of-two ≥ sectorsize.

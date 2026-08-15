@@ -75,6 +75,7 @@ macro_rules! autogrow {
 pub struct BtrfsNode<B: BlockDevice + 'static> {
     vol: Weak<BtrfsVolume<B>>,
     tree_root: Option<u64>,
+    tree_id: Option<u64>,
     ino: u64,
     inode: InodeItem,
 }
@@ -89,6 +90,23 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         Arc::new(BtrfsNode {
             vol,
             tree_root,
+            tree_id: None,
+            ino,
+            inode,
+        })
+    }
+
+    fn new_in_subvolume(
+        vol: Weak<BtrfsVolume<B>>,
+        tree_root: u64,
+        tree_id: u64,
+        ino: u64,
+        inode: InodeItem,
+    ) -> Arc<Self> {
+        Arc::new(BtrfsNode {
+            vol,
+            tree_root: Some(tree_root),
+            tree_id: Some(tree_id),
             ino,
             inode,
         })
@@ -243,12 +261,17 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                 let ino = entry.child_objectid();
                 let child = vol.load_inode_in(self.root(vol), ino).await?;
                 // Inherit this node's tree (default or a pinned subvolume).
-                Ok(BtrfsNode::new(
-                    vol.self_weak.clone(),
-                    self.tree_root,
-                    ino,
-                    child,
-                ))
+                match (self.tree_root, self.tree_id) {
+                    (Some(root), Some(id)) => Ok(BtrfsNode::new_in_subvolume(
+                        vol.self_weak.clone(),
+                        root,
+                        id,
+                        ino,
+                        child,
+                    )),
+                    (None, None) => Ok(BtrfsNode::new(vol.self_weak.clone(), None, ino, child)),
+                    _ => Err(FsError::InvalidData),
+                }
             }
             format::ROOT_ITEM_KEY => {
                 let (root_tree, _) = vol.root_tree_root();
@@ -256,9 +279,10 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
                     crate::roots::find_root(&**vol, root_tree, entry.location.objectid).await?;
                 let ino = format::FIRST_FREE_OBJECTID;
                 let child = vol.load_inode_in(subvol_root, ino).await?;
-                Ok(BtrfsNode::new(
+                Ok(BtrfsNode::new_in_subvolume(
                     vol.self_weak.clone(),
-                    Some(subvol_root),
+                    subvol_root,
+                    entry.location.objectid,
                     ino,
                     child,
                 ))
@@ -492,6 +516,53 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         out_size: usize,
     ) -> FsFuture<'a, FsIoctlReply> {
         self.ioctl_async_impl(cmd, input, out_size)
+    }
+
+    fn snapshot_async<'a>(
+        &'a self,
+        source: Arc<dyn DirOps>,
+        name: &'a str,
+        readonly: bool,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            // The destination must be in the explicitly mounted live tree: it
+            // is the parent namespace the transaction path-COWs.
+            if self.tree_root.is_some() || self.inode.file_type() != FileType::Dir {
+                return Err(FsError::ReadOnly);
+            }
+            let source = source
+                .as_any()
+                .and_then(|a| a.downcast_ref::<BtrfsNode<B>>())
+                .ok_or(FsError::CrossDevice)?;
+            if source.ino != format::FIRST_FREE_OBJECTID
+                || source.inode.file_type() != FileType::Dir
+            {
+                return Err(FsError::InvalidData);
+            }
+            let vol = self.volume()?;
+            let source_vol = source.volume()?;
+            if !Arc::ptr_eq(&vol, &source_vol) {
+                return Err(FsError::CrossDevice);
+            }
+            let (source_root, source_id) = match (source.tree_root, source.tree_id) {
+                (Some(root), Some(id)) => (root, id),
+                (None, None) => (vol.fs_tree_root().0, vol.fs_tree_id()),
+                _ => return Err(FsError::InvalidData),
+            };
+            autogrow!(
+                vol,
+                crate::write::create_snapshot(
+                    &vol,
+                    self.ino,
+                    source_root,
+                    source_id,
+                    name,
+                    readonly,
+                )
+                .await
+            )?;
+            Ok(())
+        })
     }
 
     fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {

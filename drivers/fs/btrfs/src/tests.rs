@@ -4996,6 +4996,179 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_create_ioctl);
 
+fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    {
+        let vol = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("snapshot fixture mount failed"),
+        };
+        let root = vol.root();
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "snap", false)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("writable snapshot creation failed");
+        }
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "snap", false)),
+            Some(Err(FsError::InvalidData))
+        ) {
+            return TestResult::Fail("duplicate snapshot name was accepted");
+        }
+    }
+
+    let snapshot_id;
+    {
+        let snap = match poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("snap".into())),
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("created snapshot did not remount"),
+        };
+        if !snap.supports_writes() {
+            return TestResult::Fail("writable snapshot remounted read-only");
+        }
+        snapshot_id = snap.fs_tree_id();
+        let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot lost inline file"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"narf\n") {
+            return TestResult::Fail("snapshot inline content was wrong");
+        }
+        let big = match poll_once(snap.root().lookup_async("big.dat")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot lost regular extent file"),
+        };
+        if read_all(&big, expected_big().len() + 8).as_deref() != Some(expected_big().as_slice()) {
+            return TestResult::Fail("snapshot regular extent content was wrong");
+        }
+    }
+
+    // Mutating the source after snapshot creation must not alter the snapshot.
+    {
+        let source = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("source remount after snapshot failed"),
+        };
+        let hello = match poll_once(source.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source hello lookup failed"),
+        };
+        if !matches!(poll_once(hello.write(0, b"source\n")), Some(Ok(7))) {
+            return TestResult::Fail("source mutation after snapshot failed");
+        }
+    }
+    {
+        let snap = match poll_once(BtrfsVolume::mount_subvol(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Id(snapshot_id)),
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("snapshot id remount failed"),
+        };
+        let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("snapshot hello lookup failed"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"narf\n") {
+            return TestResult::Fail("source write leaked into snapshot");
+        }
+        if !matches!(poll_once(hello.write(0, b"snapshot\n")), Some(Ok(9))) {
+            return TestResult::Fail("snapshot mutation failed");
+        }
+    }
+    {
+        let source = match poll_once(BtrfsVolume::mount_opts(
+            device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("source final remount failed"),
+        };
+        let hello = match poll_once(source.root().lookup_async("hello.txt")) {
+            Some(Ok(f)) => f,
+            _ => return TestResult::Fail("source final hello lookup failed"),
+        };
+        if read_all(&hello, 16).as_deref() != Some(b"source\n") {
+            return TestResult::Fail("snapshot write leaked into source");
+        }
+
+        let root_tree = source.root_tree_root().0;
+        let source_item = match poll_once(btree::find_item(
+            &*source,
+            root_tree,
+            &BtrfsKey::new(source.fs_tree_id(), format::ROOT_ITEM_KEY, 0),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 263 => body,
+            _ => return TestResult::Fail("source root item UUID missing"),
+        };
+        let snapshot_item = match poll_once(btree::find_item(
+            &*source,
+            root_tree,
+            &BtrfsKey::new(snapshot_id, format::ROOT_ITEM_KEY, 0),
+        )) {
+            Some(Ok(Some(body))) if body.len() >= 279 => body,
+            _ => return TestResult::Fail("snapshot root item ancestry missing"),
+        };
+        if snapshot_item[263..279] != source_item[247..263] {
+            return TestResult::Fail("snapshot parent UUID did not name the source");
+        }
+    }
+
+    // Read-only creation uses the same transaction but persists the root flag.
+    let ro_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    {
+        let vol = match poll_once(BtrfsVolume::mount_opts(
+            ro_device.clone(),
+            DomainId::DRIVER_0,
+            true,
+        )) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("read-only snapshot fixture mount failed"),
+        };
+        let root = vol.root();
+        if !matches!(
+            poll_once(root.snapshot_async(root.clone(), "frozen-snap", true)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("read-only snapshot creation failed");
+        }
+    }
+    if !matches!(
+        poll_once(BtrfsVolume::mount_subvol(
+            ro_device,
+            DomainId::DRIVER_0,
+            true,
+            Some(crate::volume::Subvol::Name("frozen-snap".into())),
+        )),
+        Some(Ok(ref snap)) if !snap.supports_writes()
+    ) {
+        return TestResult::Fail("read-only snapshot flag did not persist");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_snapshot_create_and_isolate);
+
 /// A writable multi-component `subvol=` mount commits into that subvolume's
 /// own tree id. The new root must be published through its `ROOT_ITEM`, data
 /// backrefs must name the subvolume rather than tree 5, and both an explicit
