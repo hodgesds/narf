@@ -5305,6 +5305,73 @@ kernel_test_in!(
     smoke_systemd_netlink_replays_boot_coldplug_only
 );
 
+/// EVERY replay-eligible monitor must receive the bounded boot-coldplug
+/// window — including the second one a single task opens.
+///
+/// PID 1 opens two `NETLINK_KOBJECT_UEVENT` sockets and they have different
+/// jobs: one is its own device manager's monitor, the other is the listening
+/// fd for `systemd-udevd-kernel.socket`, which is handed to `systemd-udevd`
+/// by socket activation. They are indistinguishable at `socket()` time — same
+/// task, same comm, same protocol — so any rule that grants the replay window
+/// "once per consumer" starves whichever one happens to be created second.
+///
+/// That is not hypothetical: an earlier attempt at a once-per-consumer grant
+/// did exactly this. udevd's inherited socket started at the ring TAIL
+/// (seqnum 11 in the Fedora gate) instead of the replay boundary (2), so it
+/// never saw `add@/devices/platform/narf-drm/card0` at seqnum 3 — the single
+/// event the whole udev seat gate depends on. Reverted, and pinned here.
+///
+/// Duplicate delivery to a FRESH monitor is harmless — it has consumed
+/// nothing — so erring toward re-delivery is the safe direction. If a udevd
+/// monitor-churn fix is ever needed, it must key on something that actually
+/// distinguishes these two sockets, not on the opening task.
+fn smoke_boot_coldplug_replay_reaches_every_eligible_monitor() -> TestResult {
+    use crate::handlers::{current_task_id, set_proc_comm};
+
+    narf_filesystem::uevent::__reset_for_test();
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/platform/narf-drm/card0"),
+        alloc::string::String::from("drm"),
+    );
+
+    let task = current_task_id();
+    set_proc_comm(task, "systemd");
+
+    // PID 1's own device-manager monitor.
+    let manager = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    // The listening fd for systemd-udevd-kernel.socket, opened by the SAME
+    // task moments later and later handed to udevd.
+    let activation = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+
+    let first = match &*manager.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+    let second = match &*activation.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
+    narf_filesystem::uevent::__reset_for_test();
+    set_proc_comm(task, "");
+
+    if first.as_ref().map(|e| e.devpath.as_str()) != Some("/devices/platform/narf-drm/card0") {
+        return TestResult::Fail("PID 1's own uevent monitor missed the boot coldplug window");
+    }
+    if second.as_ref().map(|e| e.devpath.as_str()) != Some("/devices/platform/narf-drm/card0") {
+        return TestResult::Fail(
+            "the socket-activation uevent fd missed the boot coldplug window (udevd would never see the DRM ADD)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_boot_coldplug_replay_reaches_every_eligible_monitor
+);
+
 /// A userspace multicast send must REACH the group's subscribers.
 ///
 /// This is task #12's root cause. `send_netlink_user` used to answer any
