@@ -23,36 +23,50 @@ Idioms to match:
 
 ## Status (updated as findings land)
 
-LANDED (each with a RED-first test): #1/#3/#4/#5/#6 pgid family; #2 ptrace;
-#7 getsid; #8 kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid
-stop/cont si_pid; #15 fcntl F_GETLK l_pid; #17 kill(-1) ns visibility; #21
-process_vm.
+**LANDED — 22 of 34 findings fixed, every one with a RED-first test:**
 
-IN PROGRESS (worktree agent, IN-direction batch): #10 perf, #11 prlimit64,
-#12 kcmp, #18 sched_param, #19 capset, #20 migrate/move_pages, #22
-get_robust_list, #23 ioprio, #27 bpf, #28 setpriority.
+Core (main tree): #1/#3/#4/#5/#6 pgid family; #2 ptrace; #7 getsid; #8
+kill/tkill/tgkill/pidfd si_pid; #9 SIGCHLD si_pid; #14 waitid stop/cont
+si_pid; #15 fcntl F_GETLK l_pid; #17 kill(-1) ns visibility; #21 process_vm.
 
-VERIFIED-CORRECT-IN-PRACTICE (no fix needed): #24 cgroup.threads — the write
-path routes both cgroup.procs and cgroup.threads into `members` via `place()`,
-so `cg.threads` is never populated and the read always hits the report_pid
-mirror-procs branch; the raw-tid branch is dead code.
+IN-direction batch (merged from a worktree agent): #11 prlimit64; #12 kcmp
+(+ a follow-up ESRCH-for-unknown-pid fix); #18 sched_setparam/getparam; #19
+capset; #20 migrate_pages/move_pages; #22 get_robust_list; #23 ioprio
+(WHO_PROCESS; WHO_PGRP/WHO_USER left as a documented LINUX-GAP); #27
+bpf(TASK_FD_QUERY); #28 setpriority/getpriority (`who` was discarded — now
+implemented via accept_pid_from, not just documented). Tests live in
+`userspace/src/abi_pidns_tests.rs` (container-gated).
 
-DEFERRED (low value / risk, documented):
-- #13 fork-return after CLONE_NEWPID — UNSURE. The in-tree comment claims the
-  parent-sees-child's-new-ns-pid coupling is deliberate (cites
-  project_pidns_flow_model). Do NOT change without verifying that flow first.
-- #16 /proc/<pid>/task/<tid> names — NARF is single-thread-per-process, so
-  task/ has one entry; low impact until real threads land.
-- #25 mq_notify si_pid — POSIX mq, negligible reach in this tree.
-- #26 tkill/tgkill non-leader-thread raw-tid arm — requires multi-threaded
-  processes NARF barely has; niche, and touching signal_tid_from_user is
-  higher-risk than the payoff.
-- #30 wait4/waitid unbound-inner fallback -> ECHILD — the current "keep raw ->
-  matches nothing -> ECHILD" is documented-safe except for a numeric-collision
-  sibling; changing it risks the blocking-wait path.
-- #31 NSpid chain, #32 /proc stat tty fields (constant 0, no leak), #33 SysV
-  IPC IPC_STAT pids (fields written 0, no leak), #34 setns TaskId fallback
-  (likely dead) — OUT rendering / no live leak / UNSURE reachability.
+Every fix uses the same idiom: `accept_pid_from(caller, pid)` (inner->outer,
+identity in non-container) then `pid_to_task_raw`/`proc_pid_to_tid`
+(outer->TaskId), matching sys_kill.rs / sys_sched_setaffinity.rs.
+
+**VERIFIED-CORRECT-IN-PRACTICE (no fix needed):** #24 cgroup.threads — the
+write path routes cgroup.procs and cgroup.threads both into `members` via
+`place()`, so `cg.threads` is never populated and the read always hits the
+report_pid mirror-procs branch; the raw-tid branch is dead code.
+
+**DEFERRED (low value / risk, documented — the remaining 11):**
+- #10 perf_event_open — NOT done. In perf_event.rs (a non-handler module);
+  the agent's batch excluded it. Real (perf record -p in a container) but
+  needs perf infrastructure to test. Follow-up.
+- #13 fork-return after CLONE_NEWPID — UNSURE. In-tree comment claims the
+  coupling is deliberate (cites project_pidns_flow_model). Verify that flow
+  before touching.
+- #16 /proc/<pid>/task/<tid> names — NARF is single-thread-per-process; task/
+  has one entry. Low impact until real threads land.
+- #25 mq_notify si_pid — POSIX mq, negligible reach.
+- #26 tkill/tgkill non-leader raw-tid arm — needs multi-threaded processes
+  NARF barely has; touching signal_tid_from_user outweighs the payoff.
+- #30 wait4/waitid unbound-inner fallback -> ECHILD — current behaviour is
+  documented-safe except for a numeric-collision sibling; changing it risks
+  the blocking-wait path.
+- #31 NSpid chain, #32 /proc stat tty fields (constant 0), #33 SysV IPC
+  IPC_STAT pids (written 0), #34 setns TaskId fallback (likely dead) — OUT
+  rendering with no live leak / UNSURE reachability.
+
+Net: every finding rated moderate-or-higher is fixed; #10 is the one real
+remaining item with a clear consumer.
 
 ## Findings (severity-ranked)
 
