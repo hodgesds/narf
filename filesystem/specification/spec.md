@@ -178,6 +178,12 @@ modes, and identical synchronous/asynchronous directory snapshots. Root-only
 and non-root-only controller files follow the Linux cftype placement rules.
 The root owns state for every registered controller even before delegation, so
 hierarchical accounting reaches the root while limit files remain absent there.
+`cgroup.events` advances its `POLLPRI` generation and emits inotify
+`IN_MODIFY` whenever its `populated` value changes, including changes caused
+by descendants. Kernel-side content changes cross the filesystem/userspace
+dependency boundary through `set_modify_notifier(fn(&str))`; the boot-installed
+notifier queues the event for watches on the absolute `cgroup.events` path.
+The callback runs after the filesystem notifier lock is released.
 
 `cgroup.subtree_control` validates a write atomically, applies repeated
 controller operations in input order (the last operation wins), enforces the
