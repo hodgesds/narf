@@ -120,11 +120,12 @@ pub fn forget_pid(pid: u64) {
 /// Linux: `kernel/fork.c::do_notify_pidfd` walks the pid's waiter
 /// list. Our table is shallow: every pidfd for the pid shares one
 /// `PidFdState`, so a single store is sufficient.
-pub fn notify_exit(pid: u64) {
+pub fn notify_exit(pid: u64) -> bool {
     let st = {
         let g = PIDFD_TABLE.lock();
         g.as_ref().and_then(|m| m.get(&pid).cloned())
     };
+    let found = st.is_some();
     if let Some(st) = st {
         st.exited.store(true, Ordering::Release);
     }
@@ -137,6 +138,7 @@ pub fn notify_exit(pid: u64) {
     // Unconditional so a pidfd minted AFTER this exit still races correctly via
     // its own already-exited state.
     narf_net::readiness::notify(0);
+    found
 }
 
 /// `FileOps` impl for the fd handed back by `sys_pidfd_open`.

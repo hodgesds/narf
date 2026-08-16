@@ -5419,6 +5419,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     } else {
         None
     };
+    // Diagnostic: pid the CLONE_PIDFD pidfd is minted under. Compare with the
+    // PIDFD-EXIT line for the same process's exit — a mismatch (or a
+    // pidfd_found=false there) is the reap-hang root cause.
+    #[cfg(feature = "syscall-trace")]
+    if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-MINT child_visible_pid={}",
+            child_visible_pid
+        );
+    }
 
     let proc = crate::UserProcess {
         pid: crate::ProcessId(child_visible_pid),
@@ -7574,7 +7586,24 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
 
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
-    crate::pidfd::notify_exit(child_pid);
+    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
+    // Diagnostic: does the exiting process's pid match a minted pidfd? A
+    // `pidfd_found=false` for a comm that systemd pidfd_spawn'd (e.g.
+    // systemd-user-ru) means the pidfd was minted under a DIFFERENT pid than
+    // the one the exit path reports — so its POLLIN-on-exit never fires and
+    // systemd supervises a ghost (start job hangs "running"). Pair with the
+    // PIDFD-MINT line at the CLONE_PIDFD site.
+    #[cfg(feature = "syscall-trace")]
+    {
+        use core::fmt::Write as _;
+        let comm =
+            proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
+            child_pid, child_tid, comm, _pidfd_found
+        );
+    }
 
     let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
