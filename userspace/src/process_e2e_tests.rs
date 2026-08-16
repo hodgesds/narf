@@ -276,6 +276,38 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_fork_basic_wait4_reap);
 
+/// Regression guard (mmap-scalability rebase, PR #161 commit 289ba96a): the
+/// perms the REAL vDSO region is mapped with (`vdso::VDSO_CODE_PERMS`, used by
+/// `vdso::map_into`) MUST satisfy `cow_split_on_write`'s precondition — WRITE
+/// and COW — plus stay READ|EXEC. glibc's ld.so patches the vDSO dynamic
+/// section in place; cow_split recovers that present-RO write only when both
+/// WRITE and COW are set. The pre-rebase `READ|EXEC` mapping failed this once
+/// the rewrite tightened cow_split, so systemd PID 1's first vDSO write took a
+/// fatal #PF at boot. Bound to the SAME constant `map_into` uses, so a
+/// perm-drop is caught here — invisible to GHA CI, which runs no desktop/
+/// systemd boot. The split MECHANISM is covered end-to-end by
+/// `smoke_memory_vdso_shaped_cow_region_splits_on_write`. (Can't drive the
+/// real `map_into` in a unit test: it reads a global vDSO image that the
+/// xtask-test kernel never registers, and its AS teardown would touch the
+/// live kernel's shared master/vvar frames.)
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_vdso_region_perms_are_cow_writable() -> TestResult {
+    use narf_memory::RegionPerms;
+    let p = crate::vdso::VDSO_CODE_PERMS;
+    if !p.contains(RegionPerms::WRITE) {
+        return TestResult::Fail("vDSO perms lost WRITE — cow_split declines ld.so's write, #PF at boot");
+    }
+    if !p.contains(RegionPerms::COW) {
+        return TestResult::Fail("vDSO perms lost COW — cow_split declines ld.so's write, #PF at boot");
+    }
+    if !p.contains(RegionPerms::READ) || !p.contains(RegionPerms::EXEC) {
+        return TestResult::Fail("vDSO perms must stay READ|EXEC (it is executed read-only until patched)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_vdso_region_perms_are_cow_writable);
+
 // ── Smoke 2: fork return values — parent sees child PID, not zero ─────
 //
 // POSIX: fork() returns the child's PID in the parent and 0 in the

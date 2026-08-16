@@ -40,6 +40,17 @@ const VVAR_VADDR: u64 = VDSO_MAP_BASE;
 /// The vDSO ELF base — the value placed in `AT_SYSINFO_EHDR`.
 pub const VDSO_VADDR: u64 = VDSO_MAP_BASE + 0x1000;
 
+/// Perms for the vDSO code region (see `map_into`). WRITE|COW are load-bearing,
+/// not decorative: `AddressSpace::cow_split_on_write` only recovers a present-RO
+/// write fault — which is how glibc's ld.so patches the vDSO dynamic section in
+/// place — when the region carries BOTH WRITE (logical write authority) and COW
+/// (sharing exists). Dropping them (the pre-mmap-scalability `READ|EXEC`
+/// mapping) makes the first vDSO write a fatal #PF that kills systemd PID 1 at
+/// boot. Built from raw bits so it stays `const`.
+pub(crate) const VDSO_CODE_PERMS: RegionPerms = RegionPerms(
+    RegionPerms::READ.0 | RegionPerms::WRITE.0 | RegionPerms::EXEC.0 | RegionPerms::COW.0,
+);
+
 // vvar field byte offsets (must match `struct vvar` in data/vdso/vdso.c).
 const VVAR_SEQ: usize = 0; // u32
 const VVAR_CPNS: usize = 4; // u32
@@ -142,6 +153,19 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
     // `d_un`) for the next process. `inc_ref` per mapping keeps the
     // master's refcount > 1 so the split path (not the sole-owner
     // shortcut) is taken; the teardown's `free_frame` dec_refs it back.
+    //
+    // WRITE|COW are REQUIRED, not decorative: `cow_split_on_write` only
+    // recovers a present-RO write fault when the region carries BOTH
+    // WRITE (logical write authority) and COW (sharing exists). It's the
+    // permanent `inc_ref` above — NOT a WRITE-clear leaf — that keeps the
+    // per-process leaf read-only until the write: `user_page_writable`
+    // returns false while the master refcount stays > 1, so the vDSO
+    // executes read-only and ld.so's store faults into the COW split. The
+    // split then hands the writer a refcount-1 private frame whose leaf
+    // becomes writable+executable (map_region/materialize do not apply the
+    // syscall-level W^X gate). Omitting these flags — as the pre-
+    // mmap-scalability `READ|EXEC` mapping did — makes cow_split decline
+    // the fault and systemd's first vDSO write take a fatal #PF at boot.
     let vdso_len = (img.vdso_frames.len() as u64) << 12;
     for &f in &img.vdso_frames {
         let _ = narf_memory::frame::cow::inc_ref(f);
@@ -150,7 +174,7 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
         .map_region(Region {
             base: VirtAddr::new(VDSO_VADDR),
             len: vdso_len,
-            perms: RegionPerms::READ | RegionPerms::EXEC,
+            perms: VDSO_CODE_PERMS,
             phys: img.vdso_frames.clone(),
         })
         .ok()?;

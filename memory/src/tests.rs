@@ -4031,6 +4031,125 @@ kernel_test_in!(
     "memory",
     smoke_memory_nested_fork_teardown_preserves_allocator_progress
 );
+/// Regression (mmap-scalability rebase, PR #161 commit 289ba96a): the vDSO
+/// code page is mapped as a PRIVATE copy-on-write region backed by a
+/// permanently shared master frame (refcount > 1 via `cow::inc_ref`), and
+/// glibc's ld.so writes the vDSO's dynamic section in place. That write MUST
+/// COW-split into a private page, not take a fatal fault. The rewrite
+/// tightened `cow_split_on_write` to require the region carry BOTH WRITE and
+/// COW; the vDSO mapping in `userspace/src/vdso.rs` still declared only
+/// `READ | EXEC`, so cow_split declined the fault and systemd's first vDSO
+/// write #PF-killed PID 1 at boot — invisible to CI because no desktop/systemd
+/// boot runs in GHA. This mirrors the vDSO's mapping shape and pins the
+/// invariant: a `READ|WRITE|EXEC|COW` region over a refcount>1 master
+/// materializes read-only (executes, but writes fault), then COW-splits on
+/// write into a writable private copy while the shared master stays pristine.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::VirtAddr;
+
+    const SENTINEL: u32 = 0x5D50_C0DE;
+    // Above the low-4-GiB identity window so the executable leaf doesn't
+    // collide with the kernel's shared huge PML4[0] mapping.
+    const VADDR: u64 = 0x0000_0080_0000_0000;
+
+    cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let master_frame = match crate::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame master"),
+    };
+    let master = master_frame.start_address();
+    // Permanent baseline reference: the vDSO master is shared across every
+    // process and never sole-owned, so its refcount stays > 1 and the leaf
+    // stays read-only until a private split. 0 -> 2 (owner + sharer).
+    if cow::inc_ref(master) != 2 {
+        return TestResult::Fail("inc_ref master should produce 2");
+    }
+    // Sentinel in the master to prove the split COPIES it and never writes
+    // through to the shared master.
+    // SAFETY: identity-mapped freshly-allocated frame.
+    unsafe {
+        *(master.raw() as *mut u32) = SENTINEL;
+    }
+
+    if as_
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::EXEC
+                | RegionPerms::COW,
+            phys: alloc::vec![master],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region vdso-shaped");
+    }
+
+    // Materialize: while the master refcount is > 1, the leaf must be
+    // read-only (`user_page_writable` == false), so the vDSO executes yet a
+    // write faults into the COW path rather than writing the shared master.
+    // SAFETY: root is live per new_for_user.
+    if unsafe { as_.materialize() }.is_err() {
+        return TestResult::Fail("materialize");
+    }
+
+    // THE REGRESSION: cow_split_on_write must accept the vDSO write. Before
+    // the fix (region was READ|EXEC only) this returned Err and the caller
+    // took a fatal #PF.
+    // SAFETY: VADDR names the just-mapped present region.
+    if unsafe { as_.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("cow_split_on_write rejected the vDSO write (the boot regression)");
+    }
+    // Mirror the production #PF flow: cow_split only repoints region.phys;
+    // remap_page rewrites the live leaf.
+    // SAFETY: same identity-map contract as cow_split_on_write.
+    if unsafe { as_.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page");
+    }
+
+    let split = as_.lookup(VirtAddr::new(VADDR)).expect("post-split region");
+    let private_phys = split.phys[0];
+    if private_phys == master {
+        return TestResult::Fail("split must allocate a private frame, not write through the master");
+    }
+    // The private copy carries the master's bytes (memcpy proof).
+    // SAFETY: identity-mapped.
+    if unsafe { *(private_phys.raw() as *const u32) } != SENTINEL {
+        return TestResult::Fail("split didn't copy the master's bytes");
+    }
+    // The shared master is untouched — a write-through would corrupt every
+    // other process's vDSO.
+    // SAFETY: identity-mapped.
+    if unsafe { *(master.raw() as *const u32) } != SENTINEL {
+        return TestResult::Fail("master frame was written through (COW violated)");
+    }
+    // cow_split dec_ref'd the master once (2 -> 1) when it privatised.
+    if cow::count(master) != 1 {
+        return TestResult::Fail("master refcount should be 1 after the split");
+    }
+
+    // Cleanup: the AS Drop frees the private frame it now points at. The
+    // master carries only our baseline ref and is no longer referenced by
+    // any AS, so return it to the allocator explicitly.
+    drop(as_);
+    if cow::dec_ref(master) != 0 {
+        return TestResult::Fail("final dec_ref of master should reach 0");
+    }
+    crate::frame::free_frame(master_frame);
+    cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_vdso_shaped_cow_region_splits_on_write);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
