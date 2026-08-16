@@ -597,6 +597,20 @@ jobs:
           restore-keys: target-${{ runner.os }}-x86_64-
       - name: Build stress-ng Alpine rootfs
         run: sh verification/data/musl-demo/REGEN_stress_rootfs.sh
+      - name: mmapfork completion regression
+        env:
+          NARF_QEMU_SMP: "4"
+          NARF_QEMU_MEM_MB: "2048"
+          XTASK_QEMU_SNAPSHOT: "1"
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "600"
+          # This is a forward-progress gate. stress-ng's own timeout could not
+          # unwind the allocator regression, so the VM harness supplies the
+          # independent deadline and requires the completion marker.
+          XTASK_RI_ECHO_TIMEOUT_SECS: "120"
+        run: |
+          XTASK_QEMU_NO_BALLOON=1 \
+            cargo xtask run-interactive --cmd chroot_run \
+              --expect MMAPFORK-DONE
       - name: stress-ng under KASAN
         env:
           # SMP>1 + the KASAN kernel + heavy churn = the coverage window.

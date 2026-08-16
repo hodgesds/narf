@@ -57,6 +57,13 @@ echo "installing stress-ng + perf + base userland into rootfs"
 cat > "$RD/probe.sh" <<'PROBE'
 echo "STRESS-START pid=$$"
 DUR="${STRESS_DUR:-6s}"
+echo "=== required regression: mmapfork completion ==="
+if ! /usr/bin/stress-ng --mmapfork 1 --mmapfork-bytes 4M \
+        --mmapfork-ops 1 --timeout 30s --verify --metrics-brief 2>&1; then
+  echo "MMAPFORK-FAIL"
+  exit 1
+fi
+echo "MMAPFORK-DONE"
 for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
          "--pthread 4" "--pipe 2" "--sock 2" "--switch 4" "--clone 2" \
          "--sigrt 4" "--cpu 2"; do

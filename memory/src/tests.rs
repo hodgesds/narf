@@ -3878,6 +3878,114 @@ kernel_test_in!(
     smoke_memory_clone_for_fork_shares_frames_then_splits
 );
 
+fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResult {
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::{self, cow};
+    use crate::VirtAddr;
+
+    const PAGES: usize = 128;
+    const BASE: u64 = 0x0000_0080_0000_0000;
+
+    // Match stress-ng --mmapfork's troublesome ownership shape: a resident
+    // private mapping is shared through two fork generations, every address
+    // space exits, and the allocator must immediately make forward progress
+    // for the next fork. The 128 pages fill/spill the order-0 cache repeatedly;
+    // the userspace stress gate separately retains the exact 4 MiB workload.
+    // SAFETY: paging and the frame allocator are live in kernel tests.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let mut owned = alloc::vec::Vec::with_capacity(PAGES);
+    for _ in 0..PAGES {
+        match frame::alloc_frame() {
+            Ok(frame) => owned.push(frame),
+            Err(_) => {
+                frame::free_frame_batch(&owned);
+                return TestResult::Skip("not enough frames for nested-fork teardown");
+            }
+        }
+    }
+    let phys: alloc::vec::Vec<_> = owned.iter().map(|frame| frame.start_address()).collect();
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(BASE),
+            len: (PAGES as u64) << 12,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys.clone(),
+        })
+        .is_err()
+    {
+        frame::free_frame_batch(&owned);
+        return TestResult::Fail("map_region nested-fork parent");
+    }
+    // Region metadata now owns every physical frame. PhysFrame is a copyable
+    // handle, so dropping this temporary vector does not return its entries.
+    drop(owned);
+
+    // SAFETY: all roots are fresh, inactive user roots and BASE names the
+    // test-owned resident mapping.
+    if unsafe { parent.materialize() }.is_err() {
+        return TestResult::Fail("materialize nested-fork parent");
+    }
+    // SAFETY: same live-paging contract as materialize above.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("first nested clone_for_fork"),
+    };
+    // SAFETY: child is a fresh inactive user root; parent rewrite applies COW
+    // permissions to its existing leaves.
+    if unsafe { child.materialize() }.is_err() || unsafe { parent.rematerialize() }.is_err() {
+        return TestResult::Fail("materialize first fork generation");
+    }
+    // SAFETY: same fork construction contract, now with an already-COW child.
+    let grandchild = match unsafe { child.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("second nested clone_for_fork"),
+    };
+    // SAFETY: grandchild is fresh and child owns the leaves being rewritten.
+    if unsafe { grandchild.materialize() }.is_err() || unsafe { child.rematerialize() }.is_err() {
+        return TestResult::Fail("materialize second fork generation");
+    }
+    if cow::count(phys[0]) != 3 || cow::count(phys[PAGES - 1]) != 3 {
+        return TestResult::Fail("nested fork lost COW owner cardinality");
+    }
+
+    drop(parent);
+    if cow::count(phys[0]) != 2 || cow::count(phys[PAGES - 1]) != 2 {
+        return TestResult::Fail("parent teardown lost a nested COW owner");
+    }
+    drop(child);
+    if cow::count(phys[0]) != 1 || cow::count(phys[PAGES - 1]) != 1 {
+        return TestResult::Fail("child teardown lost the final nested COW owner");
+    }
+    drop(grandchild);
+    if cow::count(phys[0]) != 0 || cow::count(phys[PAGES - 1]) != 0 {
+        return TestResult::Fail("final nested teardown retained stale COW owners");
+    }
+
+    // The regression in 0239c302 made a later fork stop inside allocator-backed
+    // address-space construction. A fresh root and clone are the progress
+    // assertion; the harness timeout turns any allocator wedge into a failure.
+    // SAFETY: allocator and paging remain live after the complete teardown.
+    let probe = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("allocator made no post-teardown progress"),
+    };
+    // SAFETY: probe is a fresh, inactive user root with no mappings.
+    let probe_child = match unsafe { probe.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("post-teardown clone_for_fork failed"),
+    };
+    drop(probe_child);
+    drop(probe);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_nested_fork_teardown_preserves_allocator_progress
+);
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     // After cow_split_on_write rewrites a region's per-page phys

@@ -237,10 +237,6 @@ static REBALANCE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 const FRAME_CACHE_CAPACITY: usize = 16;
 const FRAME_CACHE_BATCH: usize = 8;
-/// Maximum number of returned frames handled while one per-CPU cache lock
-/// masks local IRQs. This amortises lock traffic without making a very large
-/// unmap hold the IRQ-safe lock for its entire extent.
-const FRAME_CACHE_FREE_BATCH: usize = 64;
 
 #[derive(Copy, Clone)]
 struct NodeFrameCache {
@@ -286,8 +282,6 @@ static FRAME_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_REFILLS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_SPILLS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "kernel-test")]
-static FRAME_CACHE_BATCH_FREE_LOCKS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(align(64))]
@@ -938,71 +932,6 @@ fn free_order0_to_cache(node: usize, frame: u64) -> bool {
     true
 }
 
-/// Return order-0 frames grouped by NUMA node. Each bounded chunk acquires the
-/// current CPU's cache lock once; frames displaced from that cache are then
-/// coalesced behind one buddy-zone lock per node. Direct returns caused by a
-/// drain/hotplug bypass remain distinct because they have not passed through
-/// the cached-free audit transition.
-fn free_order0_batch_to_zones(by_zone: &[Vec<u64>; MAX_NUMA_NODES]) {
-    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
-
-    for (node, frames) in by_zone.iter().enumerate() {
-        if frames.is_empty() {
-            continue;
-        }
-        // Reserve before taking an IRQ-safe cache lock: pushing a spill must
-        // never recurse into the frame-backed heap while that lock is held.
-        let mut direct = Vec::with_capacity(frames.len());
-        let mut cached_spills =
-            Vec::with_capacity(frames.len().saturating_add(FRAME_CACHE_CAPACITY));
-
-        for chunk in frames.chunks(FRAME_CACHE_FREE_BATCH) {
-            if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-                direct.extend_from_slice(chunk);
-                continue;
-            }
-
-            let mut cache = FRAME_CACHES[cpu].0.lock();
-            #[cfg(feature = "kernel-test")]
-            FRAME_CACHE_BATCH_FREE_LOCKS.fetch_add(1, Ordering::Relaxed);
-            // A coordinated drain may have published bypass after the
-            // optimistic check. Recheck while excluding the drainer from this
-            // CPU cache so it cannot miss newly inserted frames.
-            if frame_cache_bypassed(node) {
-                direct.extend_from_slice(chunk);
-                continue;
-            }
-
-            let local = &mut cache.nodes[node];
-            for &frame in chunk {
-                buddy::audit_cached_free(frame);
-                if local.len == FRAME_CACHE_CAPACITY {
-                    for _ in 0..FRAME_CACHE_BATCH {
-                        local.len -= 1;
-                        cached_spills.push(local.frames[local.len]);
-                    }
-                    FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
-                    FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
-                }
-                local.frames[local.len] = frame;
-                local.len += 1;
-                FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        if direct.is_empty() && cached_spills.is_empty() {
-            continue;
-        }
-        let mut zone = ZONES[node].0.lock();
-        for frame in direct {
-            zone.free(frame, 0);
-        }
-        for frame in cached_spills {
-            zone.free_cached(frame, 0);
-        }
-    }
-}
-
 /// Drain every CPU's cache for one node and run `f` while new cache entries
 /// are bypassed. Lock order is drain -> per-CPU cache -> zone; ordinary paths
 /// take at most one per-CPU cache before the zone and never take a drain lock.
@@ -1415,28 +1344,9 @@ fn buddy_free_frame_batch(frames: &[PhysFrame]) {
         .map(|frame| frame.start_address())
         .filter(|phys| phys.raw() >= LOW_RESERVED_BYTES)
         .collect();
-    let released = cow::dec_ref_batch(&valid);
-    let mut by_zone: [Vec<u64>; MAX_NUMA_NODES] = core::array::from_fn(|_| Vec::new());
-    let initialised = ALLOC.initialised.load(Ordering::Acquire);
-    let numa_aware = ALLOC.numa_aware.load(Ordering::Acquire);
-
-    for phys in released {
-        // Match the scalar final-owner path: accounting and scrubbing happen
-        // before the frame is published to either a CPU cache or buddy zone.
-        #[cfg(feature = "cgroup")]
-        crate::cgroup_charge::uncharge(PAGE_SIZE);
-        scrub_freed_frame(phys);
-        if !initialised {
-            continue;
-        }
-        let node = if numa_aware {
-            phys_to_node(phys.raw())
-        } else {
-            0
-        };
-        by_zone[node].push(buddy::frame_no(PhysFrame::new(phys)));
+    for phys in cow::dec_ref_batch(&valid) {
+        buddy_return_unreferenced_frame(PhysFrame::new(phys));
     }
-    free_order0_batch_to_zones(&by_zone);
 }
 
 /// Optionally overwrite a frame's bytes as it returns to the buddy
@@ -1960,61 +1870,6 @@ fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_round_trip);
-
-#[cfg(feature = "kernel-test")]
-fn smoke_order0_frame_cache_batch_free() -> narf_kernel_test::TestResult {
-    use narf_kernel_test::TestResult;
-
-    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
-        return TestResult::Skip("frame caches not published");
-    }
-    let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
-        current_cpu_node().min(MAX_NUMA_NODES - 1)
-    } else {
-        0
-    };
-    if frame_cache_bypassed(node) {
-        return TestResult::Skip("frame cache drain/hotplug bypass is active");
-    }
-
-    let free_before = node_free(node);
-    let mut frames = Vec::with_capacity(FRAME_CACHE_BATCH);
-    for _ in 0..FRAME_CACHE_BATCH {
-        let frame = match alloc_pages_on(node, 0) {
-            Ok(frame) => frame,
-            Err(_) => {
-                buddy_free_frame_batch(&frames);
-                return TestResult::Skip("not enough order-0 frames for batch-free smoke");
-            }
-        };
-        let release_node = if ALLOC.numa_aware.load(Ordering::Acquire) {
-            phys_to_node(frame.start_address().raw())
-        } else {
-            0
-        };
-        if release_node != node {
-            frames.push(frame);
-            buddy_free_frame_batch(&frames);
-            return TestResult::Skip("allocation fell back to another NUMA node");
-        }
-        frames.push(frame);
-    }
-
-    let locks_before = FRAME_CACHE_BATCH_FREE_LOCKS.load(Ordering::Relaxed);
-    buddy_free_frame_batch(&frames);
-    let locks = FRAME_CACHE_BATCH_FREE_LOCKS
-        .load(Ordering::Relaxed)
-        .saturating_sub(locks_before);
-    if locks != 1 {
-        return TestResult::Fail("batch free did not amortise the per-CPU cache lock");
-    }
-    if node_free(node) != free_before {
-        return TestResult::Fail("batch free changed free-page accounting");
-    }
-    TestResult::Pass
-}
-#[cfg(feature = "kernel-test")]
-narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_batch_free);
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {
