@@ -845,6 +845,40 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
             return TestResult::Fail("aarch64 scatter translation mismatch");
         }
     }
+    let barriers_before_rewrite = __batch_barrier_counts_for_test();
+    // SAFETY: this is a permission-only replacement of the same live backing
+    // in the isolated root. The helper must perform one break-before-make
+    // transaction for both present leaves while preserving the lazy hole.
+    if unsafe {
+        crate::aarch64::paging::rewrite_4kb_scatter_range(root, base, &backing, |_, _| {
+            PtFlags::AP_RO_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    }
+    .is_err()
+    {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter permission rewrite failed");
+    }
+    let barriers_after_rewrite = __batch_barrier_counts_for_test();
+    if barriers_after_rewrite.0 != barriers_before_rewrite.0 + 1
+        || barriers_after_rewrite.1 != barriers_before_rewrite.1 + 1
+    {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 rewrite did not batch break-before-make barriers");
+    }
+    for page in [0_u64, 2] {
+        let va = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: read-only walk of the isolated live root.
+        let read_only = unsafe { crate::aarch64::paging::flags_at(root, va) }
+            .is_some_and(|flags| flags.bits() & (0b11 << 6) == PtFlags::AP_RO_EL0.bits());
+        if !read_only {
+            let _ = unsafe { unmap_4kb_range(root, base, 3) };
+            unsafe { free_user_ttbr0_tree(root) };
+            return TestResult::Fail("aarch64 rewrite left a writable leaf");
+        }
+    }
     // SAFETY: all pages belong to the isolated root; the lazy middle leaf is a
     // benign miss and the hardware broadcast is safe even though the root was
     // never active.
@@ -6564,6 +6598,23 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     if unsafe { parent.rematerialize() }.is_err() {
         return TestResult::Fail("parent rematerialize");
     }
+    #[cfg(target_arch = "x86_64")]
+    let parent_read_only = {
+        // SAFETY: the parent owns this live root and the region lock is not
+        // concurrently mutated by the isolated test.
+        unsafe { crate::x86_64::paging::flags_at(parent.root, VirtAddr::new(VADDR)) }
+            .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE))
+    };
+    #[cfg(target_arch = "aarch64")]
+    let parent_read_only = {
+        // SAFETY: same isolated live-root contract as the x86_64 check.
+        unsafe { crate::aarch64::paging::flags_at(parent.root, VirtAddr::new(VADDR)) }.is_some_and(
+            |flags| flags.bits() & (0b11 << 6) == crate::aarch64::paging::PtFlags::AP_RO_EL0.bits(),
+        )
+    };
+    if !parent_read_only {
+        return TestResult::Fail("parent rematerialize left the COW leaf writable");
+    }
 
     // ── Replay the #PF handler's COW recovery on the child ──
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -6916,7 +6967,10 @@ kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
 // 3. `madvise_dontneed` releases backed frames + zeros the per-page
 //    phys list so the next access takes the demand-paging path.
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn smoke_memory_mprotect_splits_region() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -6983,8 +7037,14 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
     // Bookkeeping alone is insufficient: stress-ng caught a real regression
     // where mprotect returned success but the live leaf remained writable.
     // SAFETY: `a.root` is the live test-owned PML4 and `mid` is mapped above.
+    #[cfg(target_arch = "x86_64")]
     let leaf_read_only = unsafe { crate::x86_64::paging::flags_at(a.root, mid) }
         .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE));
+    #[cfg(target_arch = "aarch64")]
+    let leaf_read_only =
+        unsafe { crate::aarch64::paging::flags_at(a.root, mid) }.is_some_and(|flags| {
+            flags.bits() & (0b11 << 6) == crate::aarch64::paging::PtFlags::AP_RO_EL0.bits()
+        });
     core::mem::forget(a);
     if ok && leaf_read_only {
         TestResult::Pass
@@ -6994,7 +7054,10 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         TestResult::Fail("split layout / perms / phys did not match expectation")
     }
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
 
 /// Rewriting permissions on a lazy mapping must leave its zero backing

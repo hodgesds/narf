@@ -4308,45 +4308,38 @@ impl AddressSpace {
 
     #[cfg(target_arch = "aarch64")]
     unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
-        use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+        use crate::aarch64::paging::{rewrite_4kb_scatter_range, unmap_4kb_range, PtFlags};
         if self.root.as_u64() == 0 {
             return;
         }
         for r in regions {
             if r.perms.prot_only().0 == 0 {
-                for i in 0..r.phys.len() {
-                    let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
-                    // SAFETY: see x86_64 variant.
-                    let _ = unsafe { unmap_4kb(self.root, v) };
-                }
+                // SAFETY: see x86_64 variant. The helper clears every leaf
+                // under one root lock and one inner-shareable TLBI sequence.
+                let _ = unsafe { unmap_4kb_range(self.root, r.base, r.phys.len() as u64) };
                 continue;
             }
             let cow_counts = r
                 .perms
                 .contains(RegionPerms::COW)
                 .then(|| crate::frame::cow::count_batch(&r.phys));
-            for (i, p) in r.phys.iter().enumerate() {
-                // Lazy pages have no leaf to rewrite. Mapping the zero
-                // sentinel here would expose physical address zero after an
-                // otherwise-unrelated mprotect/mlock operation.
-                if p.raw() == 0 {
-                    continue;
-                }
-                let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
-                // SAFETY: see x86_64 variant.
-                let _ = unsafe { unmap_4kb(self.root, v) };
-                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
-                let mut flags = if user_page_writable_at_count(r.perms, *p, cow_count) {
-                    PtFlags::AP_RW_EL0
-                } else {
-                    PtFlags::AP_RO_EL0
-                };
-                if !r.perms.contains(RegionPerms::EXEC) {
-                    flags = flags | PtFlags::UXN | PtFlags::PXN;
-                }
-                // SAFETY: same.
-                let _ = unsafe { map_4kb(self.root, v, *p, flags) };
-            }
+            // SAFETY: region ownership stays stable under the caller's region
+            // lock. The helper performs one complete break-before-make
+            // transaction and leaves zero backing sentinels unmapped.
+            let _ = unsafe {
+                rewrite_4kb_scatter_range(self.root, r.base, &r.phys, |i, p| {
+                    let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                    let mut flags = if user_page_writable_at_count(r.perms, p, cow_count) {
+                        PtFlags::AP_RW_EL0
+                    } else {
+                        PtFlags::AP_RO_EL0
+                    };
+                    if !r.perms.contains(RegionPerms::EXEC) {
+                        flags = flags | PtFlags::UXN | PtFlags::PXN;
+                    }
+                    flags
+                })
+            };
         }
     }
 
@@ -4595,10 +4588,10 @@ impl AddressSpace {
     /// - Identity map of the low 4 GiB must be live.
     /// - `self.root` must be a valid page-table root allocated by
     ///   `new_for_user`.
-    /// - May be called while `self` is the active CR3 — the `invlpg`
-    ///   issued by `unmap_4kb` / `map_4kb` flushes each TLB entry.
-    ///   Single-CPU Stage-4 BSP-only.
-    #[cfg(target_arch = "x86_64")]
+    /// - May be called while `self` is the active translation root — the
+    ///   architecture permission-rewrite helper invalidates every changed
+    ///   leaf before installing its replacement.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
         // Hold the regions lock across the rewrite: cloning a snapshot and
         // rewriting after the drop (the previous shape) let a racing
@@ -4615,9 +4608,9 @@ impl AddressSpace {
     }
 
     /// # Safety
-    /// Non-x86_64 stub: a no-op that never touches page tables, so it has
-    /// no preconditions. Present only to keep the per-arch API uniform.
-    #[cfg(not(target_arch = "x86_64"))]
+    /// Unsupported-architecture stub: a no-op that never touches page tables,
+    /// so it has no preconditions. Present only to keep the API uniform.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
         Ok(())
     }

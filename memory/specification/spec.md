@@ -88,6 +88,14 @@ pub unsafe fn aarch64::paging::map_4kb_scatter_range(
     backing: &[PhysAddr],
     flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
+/// Permission/backing rewrite twin: clear the complete span, finish one
+/// all-ASID break-before-make invalidation, then publish non-zero replacements.
+pub unsafe fn aarch64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 pub fn map(va: VirtAddr, pf: PhysFrame, flags: MapFlags, domain: DomainId);
 pub fn map_folio(va: VirtAddr, folio: Folio, flags: MapFlags, domain: DomainId);
 pub fn map_huge(va: VirtAddr, folio: Folio, size: PageSize, flags: MapFlags, domain: DomainId);
@@ -369,6 +377,16 @@ pub unsafe fn aarch64::paging::map_4kb_scatter_range(
     flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
 
+/// Rewrite a contiguous scatter-backed aarch64 run under one root lock. All
+/// old leaves are cleared and invalidated before any replacement is installed;
+/// zero backing entries remain lazy holes.
+pub unsafe fn aarch64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
 /// Clear a contiguous aarch64 leaf run under one root lock, issuing one
 /// last-level all-ASID TLBI per VA bracketed by one shared barrier sequence.
 pub unsafe fn aarch64::paging::unmap_4kb_range(
@@ -614,6 +632,12 @@ x86_64 is rejected at runtime.
   MAP_FIXED punching, MADV_DONTNEED, region teardown, and fresh huge-region
   installation use those root transactions, so unrelated address spaces do
   not serialize and a same-root intermediate-table race cannot orphan leaves.
+  Permission and COW write-protect rewrites use one break-before-make
+  transaction per region: all old leaves are cleared, one batched all-ASID
+  invalidation completes, then all non-zero replacements are installed and
+  published once. Parent `rematerialize` is a real rewrite on both supported
+  architectures; it may not be a no-op after fork while the parent's live leaf
+  is still writable.
 - A swap-out batch reserves one contiguous slot run, performs one backend
   vector write, validates every same-root leaf before publishing any swap PTE,
   and retires stale translations once before returning any victim frame to the
@@ -668,7 +692,10 @@ x86_64 is rejected at runtime.
   Mutators take a 64-way root-physical lock; contiguous base-page teardown
   batches the required barrier sequence around the complete run rather than
   paying it once per leaf, while still issuing one last-level TLBI operand per
-  page for CPUs that do not implement range TLBI.
+  page for CPUs that do not implement range TLBI. Permission changes obey
+  break-before-make across the whole run: the invalidate barrier sequence
+  completes before replacement descriptors are stored, and one publication
+  barrier makes the replacement run visible.
 - MTE: memory tag is 4 bits, stored in the top byte of the address plus
   tag storage. We assign one tag per domain.
 - TBI1/TBI0 enabled; TCR_EL1 configured for MTE.

@@ -427,3 +427,11 @@ argument = "aarch64 map, unmap, huge-leaf, and final user-root teardown paths no
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The aarch64 root-sharded locks and batched descriptor/TLBI helpers remain entirely inside the existing memory domain manager TCB. They add no capability, domain identifier, cross-domain path, or accessible mapping; they serialize and batch the architecture operations already required for the same page-table authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 scatter permission rewriter holds the live root's existing mutation shard across the complete architecture break-before-make transaction. It clears every old leaf before issuing one all-ASID inner-shareable invalidation whose trailing DSB/ISB completes before any replacement descriptor is stored, then publishes all non-zero replacement leaves with one DSB/ISB sequence. Address-space permission changes retain the authoritative region lock and backing ownership through that transaction; zero lazy sentinels remain unmapped. Parent rematerialization now applies the same rewrite after fork, so both parent and child lose write permission before shared COW backing can be modified without a fault."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Batched aarch64 permission rewriting and parent COW write protection stay within the existing memory domain manager and reuse its root lock, region ownership, and translation-invalidation authority. They add no capability, domain identifier, trusted subsystem, cross-domain data path, or new accessible mapping."

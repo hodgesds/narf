@@ -968,6 +968,104 @@ pub unsafe fn map_4kb_scatter_range(
     result
 }
 
+/// Rewrite a scatter-backed 4 KiB run with one break-before-make transaction.
+///
+/// Every old leaf in the virtual span is cleared first, then one inner-
+/// shareable TLBI sequence invalidates the complete run before any replacement
+/// descriptor is installed. Non-zero backing entries are subsequently mapped
+/// under the same root lock and published with one descriptor barrier. Zero
+/// entries remain lazy holes.
+///
+/// This is the batched permission-rewrite primitive used by `mprotect` and the
+/// parent-side COW write-protect pass after `fork`. On failure, descriptors
+/// already installed during the make phase remain present, matching
+/// [`map_4kb_scatter_range`]'s partial-progress contract.
+///
+/// # Safety
+/// Same live-root and identity-map contract as [`map_4kb_scatter_range`]. The
+/// caller must keep every non-zero backing frame live through the complete
+/// break-before-make transaction.
+pub unsafe fn rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(base) || base.as_u64() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let pages = backing.len() as u64;
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base
+        .as_u64()
+        .checked_add(span)
+        .ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.as_u64() ^ last.as_u64()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+    if backing
+        .iter()
+        .any(|phys| phys.raw() != 0 && phys.raw() & 0xFFF != 0)
+    {
+        return Err(MapError::UnalignedPhys);
+    }
+
+    let _guard = pt_lock_for(root).lock();
+    let mut removed = 0;
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: the complete range was validated and the root lock remains
+        // held for both halves of break-before-make.
+        match unsafe { unmap_4kb_locked(root, virt, false) } {
+            Ok(_) => removed += 1,
+            Err(MapError::AlreadyMapped) => {}
+            Err(error) => {
+                if removed != 0 {
+                    // SAFETY: all descriptors cleared so far precede this
+                    // invalidation; covering untouched suffix pages is benign.
+                    unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };
+                }
+                return Err(error);
+            }
+        }
+    }
+    if removed != 0 {
+        // SAFETY: all old valid leaves are now clear. This is the break half;
+        // the helper's trailing DSB/ISB completes it before any make store.
+        unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };
+    }
+
+    let mut attempted = false;
+    let mut result = Ok(());
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        attempted = true;
+        let virt = VirtAddr::new(base.as_u64() + index as u64 * 4096);
+        // SAFETY: validated backing stays live and the root lock is held.
+        if let Err(error) =
+            unsafe { map_4kb_locked(root, virt, phys, flags_for(index, phys), false) }
+        {
+            result = Err(error);
+            break;
+        }
+    }
+    if attempted {
+        // SAFETY: publish every replacement descriptor (and any intermediate
+        // table created before an error) as the make half of the transaction.
+        unsafe { publish_table_write() };
+    }
+    result
+}
+
 /// Tear down a 4 KiB mapping at `virt` under `root`. Returns the
 /// physical address that was mapped, or `MapError::AlreadyMapped`
 /// if no leaf entry was present (overloaded for symmetry with
