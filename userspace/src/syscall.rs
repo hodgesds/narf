@@ -3267,6 +3267,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
 static TRACE_COMM: narf_lib::sync::OnceLock<alloc::string::String> =
     narf_lib::sync::OnceLock::new();
 
+/// syscall-trace park-dedup: `(tid<<12 | raw_num)` of the syscall the last
+/// traced park re-executed, or 0. A blocking syscall RIP-rewinds and
+/// re-executes on every ~10 ms backstop tick; this suppresses the identical
+/// re-execution lines (which flood the serial and slow the very boot being
+/// traced). Deliberately a single trace-only global — NOT a `UserTaskCtx` field
+/// — since `trace_comm` usually narrows the trace to one hot parker; an SMP
+/// race just costs an occasional un-deduped line, which is fine for a probe.
+#[cfg(feature = "syscall-trace")]
+static TRACE_LAST_PARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pack `(tid, raw syscall num)` into the [`TRACE_LAST_PARK`] key. tid=0 never
+/// occurs (TaskIds start at 1), so a packed key is never the 0 = "none" sentinel.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+fn trace_park_key(num: u32) -> u64 {
+    (crate::handlers::current_task_id() << 12) | (num as u64 & 0xFFF)
+}
+
 /// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
 /// A comma-separated list matches any of the listed prefixes.
 #[cfg(feature = "syscall-trace")]
@@ -3486,9 +3504,18 @@ pub fn kernel_syscall_entry_plain_with_state(
     // instead of execve()'ing the service binary, so this one line names the
     // failing category (226=NAMESPACE, 227=CGROUP, 209=STDIN, …) for a service
     // whose start job fails with no reportable syscall errno.
+    // syscall-trace park-dedup: a blocking syscall RIP-rewinds and re-executes
+    // on every ~10 ms backstop tick. Log its FIRST park and its eventual wake,
+    // but suppress the hundreds of identical re-executions in between — they
+    // flood the serial (slowing the very boot being traced) and bury the real
+    // syscalls. A TRACE_LAST_PARK key matching this (tid,num) = a re-execution.
     #[cfg(feature = "syscall-trace")]
-    let show_entry =
-        syscall_trace_relevant(n) && (!trace_errors_only() || is_sandbox_syscall(table.name_of(n)));
+    let trace_was_parked =
+        TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed) == trace_park_key(num);
+    #[cfg(feature = "syscall-trace")]
+    let show_entry = syscall_trace_relevant(n)
+        && !trace_was_parked
+        && (!trace_errors_only() || is_sandbox_syscall(table.name_of(n)));
     #[cfg(feature = "syscall-trace")]
     if show_entry {
         use core::fmt::Write as _;
@@ -3529,24 +3556,34 @@ pub fn kernel_syscall_entry_plain_with_state(
     // handler answering a bare -1 that glibc renders as EPERM). Printed as
     // a signed decimal so negative errnos are readable at a glance.
     #[cfg(feature = "syscall-trace")]
-    if syscall_trace_relevant(n) {
-        use core::fmt::Write as _;
+    {
         let r = ctx.ret;
-        let errors_only = trace_errors_only();
-        if !errors_only || is_reportable_syscall_error(r.value) {
-            let _ = writeln!(
-                narf_console::Writer,
-                "SYSR t={} {} = {} ({:#x}) st={:?}",
-                crate::handlers::current_task_id(),
-                table.name_of(n).unwrap_or("?"),
-                r.value as i64,
-                r.value,
-                r.status,
-            );
-            // Errors-only mode suppresses the SYSC entry line, so decode the
-            // path args HERE to show which file/mount the failing op targeted.
-            if errors_only {
-                trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+        // A park re-executes with exactly `invalid_op()` (value 0, InvalidOp).
+        let parked_now = r == SyscallReturn::invalid_op();
+        TRACE_LAST_PARK.store(
+            if parked_now { trace_park_key(num) } else { 0 },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // Suppress ONLY a re-execution that parked again; the first park and any
+        // real return (including the wake) still log.
+        if syscall_trace_relevant(n) && !(parked_now && trace_was_parked) {
+            use core::fmt::Write as _;
+            let errors_only = trace_errors_only();
+            if !errors_only || is_reportable_syscall_error(r.value) {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "SYSR t={} {} = {} ({:#x}) st={:?}",
+                    crate::handlers::current_task_id(),
+                    table.name_of(n).unwrap_or("?"),
+                    r.value as i64,
+                    r.value,
+                    r.status,
+                );
+                // Errors-only mode suppresses the SYSC entry line, so decode the
+                // path args HERE to show which file/mount the failing op targeted.
+                if errors_only {
+                    trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+                }
             }
         }
     }
