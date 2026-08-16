@@ -3320,6 +3320,40 @@ fn is_reportable_syscall_error(value: u64) -> bool {
         && v != -10 /* ECHILD */
 }
 
+/// Sandbox/exec setup syscalls. In errors-only mode these are ALSO logged at
+/// ENTRY (with decoded paths) even when they succeed, so the trace shows a
+/// service's mount/namespace/exec SEQUENCE and exactly where it stops — the
+/// key when a start job fails with no errno because the setup process runs
+/// under a comm the `trace_comm=` filter never matched (systemd's per-exec
+/// helper renames its comm), or blocks/bails on a semantically-wrong success.
+#[cfg(feature = "syscall-trace")]
+fn is_sandbox_syscall(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "mount"
+                | "umount2"
+                | "move_mount"
+                | "mount_setattr"
+                | "open_tree"
+                | "fsopen"
+                | "fsconfig"
+                | "fsmount"
+                | "fspick"
+                | "pivot_root"
+                | "chroot"
+                | "unshare"
+                | "setns"
+                | "clone"
+                | "clone3"
+                | "execve"
+                | "execveat"
+                | "exit_group"
+                | "exit"
+        )
+    )
+}
+
 /// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
 /// are deliberately comm-scoped: tracing every process perturbs scheduling
 /// and buries the first failing syscall under unrelated boot traffic. Every
@@ -3453,9 +3487,8 @@ pub fn kernel_syscall_entry_plain_with_state(
     // failing category (226=NAMESPACE, 227=CGROUP, 209=STDIN, …) for a service
     // whose start job fails with no reportable syscall errno.
     #[cfg(feature = "syscall-trace")]
-    let show_entry = syscall_trace_relevant(n)
-        && (!trace_errors_only()
-            || matches!(table.name_of(n), Some("exit_group") | Some("exit")));
+    let show_entry =
+        syscall_trace_relevant(n) && (!trace_errors_only() || is_sandbox_syscall(table.name_of(n)));
     #[cfg(feature = "syscall-trace")]
     if show_entry {
         use core::fmt::Write as _;
