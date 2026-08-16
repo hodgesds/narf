@@ -968,6 +968,68 @@ fn smoke_abi_async_inotify_fire_modify() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_modify);
 
+/// A kernel-side `cgroup.events` transition must traverse the same inotify
+/// queue that systemd reads.  Unlike an ordinary file write, moving a task
+/// into or out of a cgroup has no syscall write path on which to emit
+/// `IN_MODIFY`; cgroupfs therefore calls the filesystem modify notifier.
+///
+/// Exercise both edges because the populated-to-empty edge is the one a
+/// `Type=forking` start job waits for after its parent process exits.
+#[cfg(feature = "cgroup")]
+fn smoke_abi_async_inotify_cgroup_events_modify() -> TestResult {
+    with_setup(|| {
+        const PID: u64 = 909_102;
+        let dir = b"/sys/fs/cgroup/t_ino_events\0";
+        let events = b"/sys/fs/cgroup/t_ino_events/cgroup.events\0";
+
+        // A filesystem-only test may have installed its observation callback
+        // earlier in the shared kernel-test image. Restore the production
+        // userspace bridge so this test covers actual inotify delivery.
+        narf_filesystem::set_modify_notifier(crate::mqueue::notify_modify_path);
+
+        narf_filesystem::cgroupfs::task_exited(PID);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of inotify test cgroup failed");
+        }
+
+        let outcome = (|| {
+            let (ifd, wd) = watch(events, IN_MODIFY)?;
+
+            narf_filesystem::cgroupfs::attach_by_path("/t_ino_events", PID)
+                .map_err(|_| "attaching pid to inotify test cgroup failed")?;
+            let populated = read_events(ifd);
+            if !populated
+                .iter()
+                .any(|e| e.wd == wd && e.mask & IN_MODIFY as u32 != 0 && e.name.is_empty())
+            {
+                return Err("cgroup populated transition did not queue IN_MODIFY");
+            }
+
+            narf_filesystem::cgroupfs::task_exited(PID);
+            let empty = read_events(ifd);
+            if !empty
+                .iter()
+                .any(|e| e.wd == wd && e.mask & IN_MODIFY as u32 != 0 && e.name.is_empty())
+            {
+                return Err("cgroup empty transition did not queue IN_MODIFY");
+            }
+            Ok(())
+        })();
+
+        // Keep the global cgroup hierarchy clean even if an assertion above
+        // fails after attaching the synthetic process.
+        narf_filesystem::cgroupfs::task_exited(PID);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        outcome
+    })
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_cgroup_events_modify
+);
+
 // (c) delete a file in a watched dir → IN_DELETE with the child's name.
 fn smoke_abi_async_inotify_fire_delete() -> TestResult {
     with_memfs("/ino", "ino", &[("gone", b"x")], || {
