@@ -56,6 +56,47 @@ the v1 native `OpCode::Munmap` contract: that base-only ring operation still
 removes the whole VMA beginning at `inline[0]` through its compatibility
 bridge; changing it requires the ABI versioning process in `abi/` §4.
 
+Linux-compatible anonymous private `mmap(2)` records lazy zero-backed VMAs;
+the mapping syscall does not walk unrelated regions or allocate resident data
+pages. Anonymous `MAP_SHARED` mappings eagerly allocate registry-owned frames,
+retain them through the VMA and any fork aliases, and immediately remove their
+internal shmem name; the last alias unmap reclaims the backing without retaining
+one public registry entry per completed mapping until process exit. `mremap(2)`
+supports no-op resize, real tail shrink, in-place lazy grow,
+`MREMAP_MAYMOVE`, and disjoint `MREMAP_FIXED` replacement while preserving
+resident backing without copying it. The current operation requires one
+complete private base-page VMA. Shared/huge/sub-VMA moves and
+`MREMAP_DONTUNMAP` fail explicitly; retaining an ordinary private alias would
+not implement Linux's old-range fault/userfaultfd contract safely.
+
+`mlock(2)` and `munlock(2)` round byte intervals outward to pages, reject a
+non-empty range containing any unmapped page, and split VMAs so LOCKED applies
+exactly to the request; a zero length is a successful no-op. Plain `mlock`
+eagerly populates anonymous and file-demand
+pages. `mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;
+their ordinary first fault supplies backing that reclaim must then retain.
+`munlock` clears the marker without discarding resident contents.
+`mlockall(MCL_CURRENT|MCL_ONFAULT)` applies the same lazy pinning to existing
+VMAs. `MCL_FUTURE` is accepted for compatibility but is not yet retained as a
+policy on subsequently created VMAs.
+
+`mprotect(2)` requires a page-aligned address, rounds a nonzero length
+upward, and validates complete coverage across base and hardware-huge VMAs
+before changing any permission. `madvise(MADV_DONTNEED|MADV_FREE)` applies the
+same length rounding and full-coverage rule to base-page mappings before
+discarding resident private backing. Both treat a page-aligned zero-length
+request as a successful no-op; failed hole validation leaves every mapped
+fragment unchanged. `mincore(2)` samples the complete range under one coherent
+address-space metadata snapshot, reports lazy pages as nonresident and
+hardware-huge pages as resident base-page equivalents, and returns `ENOMEM`
+for any hole without quadratically cloning a VMA's complete backing list once
+per queried page.
+`msync(2)` validates its complete rounded mapping, rejects unknown flags and
+the mutually exclusive `MS_ASYNC|MS_SYNC` combination, then flushes retained
+shared-file pages. `madvise(2)` accepts unimplemented performance-only hints
+as no-ops, but unknown advice and semantic state controls such as DONTFORK or
+WIPEONFORK fail with `EINVAL` until their observable behavior exists.
+
 The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint

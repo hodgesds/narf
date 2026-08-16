@@ -1,9 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `mlock2(addr, len, flags)` — like mlock with the MLOCK_ONFAULT
-/// flag. NARF force-backs the range either way, so the flag is
-/// accepted but doesn't change behaviour.
+/// `mlock2(addr, len, flags)` — eager mlock with flags=0, or mark pages to
+/// become locked when faulted with MLOCK_ONFAULT.
 pub(crate) fn sys_mlock2(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     const MLOCK_ONFAULT: u32 = 1;
@@ -18,7 +17,12 @@ pub(crate) fn sys_mlock2(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    match as_ref.mlock_range(VirtAddr::new(a.arg0), a.arg1) {
+    let result = if a.arg2 as u32 & MLOCK_ONFAULT != 0 {
+        as_ref.mlock_range_onfault(VirtAddr::new(a.arg0), a.arg1)
+    } else {
+        as_ref.mlock_range(VirtAddr::new(a.arg0), a.arg1)
+    };
+    match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
     }

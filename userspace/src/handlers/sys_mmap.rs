@@ -39,40 +39,19 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
     const MAP_FIXED: u32 = 0x10;
     const MAP_ANONYMOUS: u32 = 0x20;
-    let pages = (len >> 12) as usize;
-    let perms = perms_of_prot(prot);
 
-    // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
-    // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
-    // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
-    // per-AS mmap cursor.
-    let base = if flags & MAP_FIXED != 0 {
+    // Reject an impossible fixed hint before taking the scheduler's current-AS
+    // lock and cloning its Arc. stress-ng deliberately probes the complete
+    // power-of-two address space; most of those calls can never reach a NARF
+    // user page table, and making every miss enter shared scheduler state made
+    // the rejection path dominate the useful MAP_FIXED work.
+    if flags & MAP_FIXED != 0 {
         if hint == 0 || hint & (page_size - 1) != 0 {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
-        // The fixed hint is fully user-controlled — bound it to the
-        // user-mappable window [USER_FIXED_FLOOR, USER_HALF_END) before
-        // touching the region table. Above the ceiling the VA is
-        // non-canonical / kernel-half (x86_64 map_4kb returns
-        // NonCanonical — pre-check, materialize() PANICKED on it, which
-        // is how stress-ng --mmapfixed wedged the whole VM: it walks
-        // MAP_FIXED|MAP_SHARED hints down from 1 << 63). Below the
-        // floor lies PML4[0], the kernel low-identity window every user
-        // PML4 shares — mapping there would plant user PTEs in
-        // kernel-shared page tables (visible to every process) or trip
-        // its huge pages. Linux answers an out-of-range MAP_FIXED addr
-        // with -ENOMEM; do the same.
         let fixed_ok = hint
             .checked_add(len)
             .map(|end| hint >= AddressSpace::USER_FIXED_FLOOR && end <= AddressSpace::USER_HALF_END)
@@ -82,6 +61,23 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
             return;
         }
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+
+    let pages = (len >> 12) as usize;
+    let perms = perms_of_prot(prot);
+
+    // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
+    // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
+    // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
+    // per-AS mmap cursor.
+    let base = if flags & MAP_FIXED != 0 {
         // Punch out exactly [hint, hint+len), splitting (not destroying)
         // any region it overlaps so the non-replaced pages survive — the
         // dynamic linker overlays DSO segments onto its whole-file mapping
@@ -210,7 +206,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // SAFETY: `as_ref` is the calling task's AddressSpace (valid
                 // root); the region was just registered via map_region, so
                 // materialize installs only its PTEs over borrowed frames.
-                if unsafe { as_ref.materialize() }.is_err() {
+                if unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_err() {
                     // Roll back so the failed region can't poison later
                     // materialize() calls (SHARED → PTE-clear only, the
                     // device keeps its frames).
@@ -316,7 +312,22 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // (valid root); the region was just registered, so
                     // materialize installs only its PTEs over the registry
                     // frames.
-                    if unsafe { as_ref.materialize() }.is_ok() {
+                    if unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_ok() {
+                        // This handle is an implementation detail, not a name
+                        // userspace can ever attach again. Remove it as soon
+                        // as the VMA has retained every frame: the registry's
+                        // per-page refs keep the backing alive across fork and
+                        // until the last unmap, while retired mappings no
+                        // longer accumulate as public entries and turn every
+                        // later retain/release into an ever-longer linear
+                        // scan. This is the anonymous-mapping equivalent of
+                        // creating a shm object and immediately IPC_RMID'ing
+                        // it after the first attachment.
+                        if !(v.destroy)(handle) {
+                            let _ = as_ref.unmap_region(VirtAddr::new(base));
+                            ctx.set_return(SyscallReturn::invalid_op());
+                            return;
+                        }
                         #[cfg(feature = "linux-compat")]
                         crate::perf_event::on_mmap(
                             current_task_id(),
@@ -434,6 +445,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         phys_list = crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
     }
 
+    // Only the shared-file rollback path needs a second owner-side list.
+    // Anonymous mmap previously cloned its potentially huge all-zero vector
+    // solely to keep `phys_list` available for an error arm that can never use
+    // it, adding another O(pages) copy before returning the lazy VMA.
+    let shared_rollback_phys = shared_file_ops
+        .as_ref()
+        .map(|_| phys_list.clone());
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
@@ -447,20 +465,30 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             } else {
                 perms
             },
-            phys: phys_list.clone(),
+            phys: phys_list,
         })
         .is_err()
     {
-        if shared_file_ops.is_some() {
-            crate::mapped_file::discard_unmapped_shared_file_pages(&phys_list);
+        if let Some(phys) = shared_rollback_phys.as_deref() {
+            crate::mapped_file::discard_unmapped_shared_file_pages(phys);
         }
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
-    // was just registered via `map_region`, so materialize installs only its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
+    // Anonymous private mappings are entirely lazy (`phys[i] == 0`), so there
+    // is nothing to install. Walking every slot here made mmap cost O(length)
+    // once to discover that fact, before the demand-fault path did the real
+    // per-page work; stress-ng's 64 MiB mmap churn paid a 16K-slot no-op walk
+    // on every iteration. File-backed mappings have resident frames and still
+    // materialize exactly this range.
+    let materialize_failed = if anonymous {
+        false
+    } else {
+        // SAFETY: `as_ref` is the calling task's live AddressSpace and the
+        // region was just registered via `map_region`.
+        unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_err()
+    };
+    if materialize_failed {
         // Roll the region back — leaving it registered poisons every
         // later materialize() in this AS (each re-walks the region,
         // hits the same map error, and the whole mmap surface goes
@@ -585,6 +613,172 @@ mod tests {
             false
         }
     }
+
+    /// The syscall must materialize only the VMA it just registered. A full
+    /// address-space walk would revisit this deliberately conflicting VMA,
+    /// fail on its test-owned huge leaf, and reject an otherwise independent
+    /// anonymous mmap.
+    fn smoke_sys_mmap_does_not_revisit_unrelated_vmas() -> TestResult {
+        // SAFETY: paging is active; the root remains owned by this test.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        let conflict = narf_memory::VirtAddr::new(0x0000_3000_0000_0000);
+        // SAFETY: this inactive root belongs exclusively to the test. Physical
+        // zero is never accessed; the leaf creates only a structural conflict.
+        if unsafe {
+            narf_memory::x86_64::paging::map_2mb(
+                aspace.root,
+                conflict,
+                narf_memory::PhysAddr::new(0),
+                narf_memory::x86_64::paging::PtFlags::USER
+                    | narf_memory::x86_64::paging::PtFlags::NO_EXEC,
+            )
+        }
+        .is_err()
+        {
+            return TestResult::Fail("could not install structural conflict leaf");
+        }
+        let low_frame = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Fail("frame allocation failed"),
+        };
+        if aspace
+            .map_region(narf_memory::Region {
+                base: conflict,
+                len: 4096,
+                perms: narf_memory::RegionPerms::READ,
+                phys: vec![low_frame],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("could not register the unrelated VMA");
+        }
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+                arg4: u64::MAX,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => {
+                *USER_AS.lock() = None;
+                return TestResult::Fail("an unrelated VMA poisoned sys_mmap");
+            }
+        };
+        if aspace.lookup(narf_memory::VirtAddr::new(base)).is_none() {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("sys_mmap returned an unregistered range");
+        }
+        // The control proves why this catches a regression to `materialize()`.
+        // SAFETY: the test-owned user root is still live.
+        if unsafe { aspace.materialize() } != Err(narf_memory::AddressSpaceError::Overlap) {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("control VMA no longer rejects a full materialization");
+        }
+        *USER_AS.lock() = None;
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_sys_mmap_does_not_revisit_unrelated_vmas
+    );
+
+    /// Anonymous shared mappings have no userspace-visible shmem handle. The
+    /// backing entry must therefore be name-removed after the first VMA has
+    /// retained it, and reclaimed by that VMA's final unmap rather than being
+    /// kept in the global registry until process exit.
+    fn smoke_mmap_shared_anon_retires_hidden_handle_on_success() -> TestResult {
+        // SAFETY: paging and the frame allocator are live in the kernel-test
+        // harness; this test owns the new root until `aspace` is dropped.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+
+        let Some(vtable) = shmem_vtable() else {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("shmem vtable is not installed");
+        };
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 3,    // PROT_READ | PROT_WRITE
+                arg3: 0x21, // MAP_SHARED | MAP_ANONYMOUS
+                arg4: u64::MAX,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => {
+                *USER_AS.lock() = None;
+                return TestResult::Fail("anonymous MAP_SHARED mmap failed");
+            }
+        };
+        let region = match aspace.lookup(VirtAddr::new(base)) {
+            Some(region)
+                if region.perms.contains(RegionPerms::SHARED)
+                    && region.phys.len() == 1
+                    && region.phys[0].raw() != 0 =>
+            {
+                region
+            }
+            _ => {
+                *USER_AS.lock() = None;
+                return TestResult::Fail("anonymous MAP_SHARED has no retained frame");
+            }
+        };
+
+        // NEXT_HANDLE is monotonic and kernel tests are serialized. Creating
+        // one probe handle reveals the immediately preceding hidden handle
+        // without adding a registry-enumeration API solely for this test.
+        let probe = (vtable.create)(TASK, 4096);
+        if probe == 0 {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("could not allocate probe shmem handle");
+        }
+        let hidden = probe - 1;
+        let hidden_is_public = (vtable.pid_of)(hidden) != 0;
+        let backing_live = (vtable.owns_frame)(region.phys[0].raw());
+        let _ = (vtable.destroy)(probe);
+        if hidden_is_public || !backing_live {
+            let _ = aspace.unmap_region(VirtAddr::new(base));
+            *USER_AS.lock() = None;
+            return TestResult::Fail("hidden handle lifecycle is not remove-then-retain");
+        }
+
+        if aspace.unmap_region(VirtAddr::new(base)).is_err()
+            || (vtable.owns_frame)(region.phys[0].raw())
+        {
+            *USER_AS.lock() = None;
+            return TestResult::Fail("final anonymous shared unmap did not reclaim backing");
+        }
+        *USER_AS.lock() = None;
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_shared_anon_retires_hidden_handle_on_success
+    );
 
     // `MAP_SHARED` promises that modifications become file data once the
     // caller synchronizes the mapped file. The synchronizing thread need not

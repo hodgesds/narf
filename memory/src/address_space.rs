@@ -15,6 +15,7 @@
 //! but the shape is stable enough that Stage-4 loader code can
 //! compile and test against it.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -135,9 +136,10 @@ impl RegionPerms {
     pub const WRITE: RegionPerms = RegionPerms(1 << 1);
     pub const READ: RegionPerms = RegionPerms(1 << 2);
 
-    /// Internal flag: this region is `mlock`'d. The kernel ensures
-    /// every page is backed (no zero entries in `phys`) and a
-    /// future swap / page-reclaim pass will leave it alone.
+    /// Internal flag: this region is `mlock`'d and a future swap /
+    /// page-reclaim pass must leave it alone. Plain `mlock` eagerly backs
+    /// every page; `mlock2(MLOCK_ONFAULT)` may leave zero entries that become
+    /// resident on first access and remain pinned thereafter.
     /// Stored in `RegionPerms` rather than as a separate `Region`
     /// field so existing `Region { ... }` constructors keep
     /// compiling — the bit lives outside the POSIX prot range
@@ -180,6 +182,16 @@ impl RegionPerms {
     /// POSIX prot mask like the other internal flags.
     pub const FILE_DEMAND: RegionPerms = RegionPerms(1 << 11);
 
+    /// Internal flag: at least one resident page in this private region may
+    /// still be shared with a fork sibling.  The POSIX WRITE bit remains the
+    /// authoritative permission; COW only forces a hardware read-only leaf
+    /// while that page's frame refcount is greater than one.  Keeping the two
+    /// states separate is load-bearing: `mprotect(PROT_READ)` must not be
+    /// mistaken for a recoverable COW write fault, while a later
+    /// `mprotect(PROT_WRITE)` on a fork-shared page must still split first.
+    /// Bit 12; stripped by the POSIX prot mask.
+    pub const COW: RegionPerms = RegionPerms(1 << 12);
+
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
     /// caring about the internal LOCKED bit.
@@ -201,6 +213,21 @@ impl core::ops::BitOr for RegionPerms {
     fn bitor(self, rhs: RegionPerms) -> Self {
         RegionPerms(self.0 | rhs.0)
     }
+}
+
+/// Whether a user leaf may carry a hardware writable bit.
+///
+/// Normal and externally shared mappings take their authority directly from
+/// the POSIX WRITE bit.  Fork-private mappings additionally remain read-only
+/// while their particular backing frame has more than one COW owner.  A zero
+/// backing slot is independently demand-allocated in each address space and
+/// therefore needs no split.
+#[inline]
+fn user_page_writable(perms: RegionPerms, phys: PhysAddr) -> bool {
+    perms.contains(RegionPerms::WRITE)
+        && (!perms.contains(RegionPerms::COW)
+            || phys.raw() == 0
+            || crate::frame::cow::count(phys) <= 1)
 }
 
 /// A user-mode mapping. The virtual range is contiguous; the
@@ -228,6 +255,177 @@ pub struct Region {
     /// empty Vec is a structural error rejected by `map_region`.
     /// `PhysAddr::new(0)` slots are unbacked (demand paging).
     pub phys: Vec<PhysAddr>,
+}
+
+/// Ordered base-page VMA index.
+///
+/// The virtual base is stored both as the tree key and in [`Region`] because
+/// `Region` is part of the public snapshot/interface shape. All structural
+/// mutation goes through this wrapper so those values cannot diverge. The
+/// tree replaces the previous sorted `Vec`: lookup and random `MAP_FIXED`
+/// insertion are O(log VMA), while ordered iteration remains linear.
+#[derive(Clone, Debug, Default)]
+struct RegionTable {
+    by_base: BTreeMap<u64, Region>,
+}
+
+impl RegionTable {
+    const fn new() -> Self {
+        Self {
+            by_base: BTreeMap::new(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.by_base.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> alloc::collections::btree_map::Values<'_, u64, Region> {
+        self.by_base.values()
+    }
+
+    #[inline]
+    fn iter_mut(&mut self) -> alloc::collections::btree_map::ValuesMut<'_, u64, Region> {
+        self.by_base.values_mut()
+    }
+
+    #[inline]
+    fn get(&self, base: u64) -> Option<&Region> {
+        self.by_base.get(&base)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, base: u64) -> Option<&mut Region> {
+        self.by_base.get_mut(&base)
+    }
+
+    #[inline]
+    fn predecessor(&self, base: u64) -> Option<&Region> {
+        self.by_base
+            .range(..base)
+            .next_back()
+            .map(|(_, region)| region)
+    }
+
+    #[inline]
+    fn successor(&self, base: u64) -> Option<&Region> {
+        self.by_base.range(base..).next().map(|(_, region)| region)
+    }
+
+    fn containing(&self, address: u64) -> Option<&Region> {
+        self.by_base
+            .range(..=address)
+            .next_back()
+            .map(|(_, region)| region)
+            .filter(|region| address < region.base.as_u64().saturating_add(region.len))
+    }
+
+    fn containing_mut(&mut self, address: u64) -> Option<&mut Region> {
+        let base = *self.by_base.range(..=address).next_back()?.0;
+        let region = self.by_base.get_mut(&base)?;
+        (address < region.base.as_u64().saturating_add(region.len)).then_some(region)
+    }
+
+    fn insert(&mut self, region: Region) -> Option<Region> {
+        self.by_base.insert(region.base.as_u64(), region)
+    }
+
+    #[inline]
+    fn remove(&mut self, base: u64) -> Option<Region> {
+        self.by_base.remove(&base)
+    }
+
+    fn has_overlap(&self, lo: u64, hi: u64) -> bool {
+        self.predecessor(lo)
+            .is_some_and(|region| region.base.as_u64().saturating_add(region.len) > lo)
+            || self.by_base.range(lo..hi).next().is_some()
+    }
+
+    fn overlapping_any(&self, lo: u64, hi: u64, predicate: impl Fn(&Region) -> bool) -> bool {
+        if self.predecessor(lo).is_some_and(|region| {
+            region.base.as_u64().saturating_add(region.len) > lo && predicate(region)
+        }) {
+            return true;
+        }
+        self.by_base
+            .range(lo..hi)
+            .any(|(_, region)| predicate(region))
+    }
+
+    /// Visit only VMAs intersecting `[lo, hi)`, in virtual order.
+    fn for_each_overlapping(&self, lo: u64, hi: u64, mut visit: impl FnMut(&Region)) {
+        if let Some(region) = self.predecessor(lo) {
+            if region.base.as_u64().saturating_add(region.len) > lo {
+                visit(region);
+            }
+        }
+        for (_, region) in self.by_base.range(lo..hi) {
+            visit(region);
+        }
+    }
+
+    /// Mutable counterpart of [`Self::for_each_overlapping`].
+    fn for_each_overlapping_mut(&mut self, lo: u64, hi: u64, mut visit: impl FnMut(&mut Region)) {
+        let start = self
+            .by_base
+            .range(..lo)
+            .next_back()
+            .filter(|(_, region)| region.base.as_u64().saturating_add(region.len) > lo)
+            .map_or(lo, |(&base, _)| base);
+        for (_, region) in self.by_base.range_mut(start..hi) {
+            visit(region);
+        }
+    }
+
+    /// Remove and return every VMA intersecting `[lo, hi)`, in virtual order.
+    fn drain_overlapping(&mut self, lo: u64, hi: u64) -> Vec<Region> {
+        let mut keys = Vec::new();
+        if let Some((&base, region)) = self.by_base.range(..lo).next_back() {
+            if region.base.as_u64().saturating_add(region.len) > lo {
+                keys.push(base);
+            }
+        }
+        keys.extend(self.by_base.range(lo..hi).map(|(&base, _)| base));
+        keys.into_iter()
+            .filter_map(|base| self.by_base.remove(&base))
+            .collect()
+    }
+
+    fn covers_range(&self, lo: u64, hi: u64) -> bool {
+        let mut cursor = lo;
+        if let Some(region) = self
+            .by_base
+            .range(..=lo)
+            .next_back()
+            .map(|(_, region)| region)
+        {
+            let begin = region.base.as_u64();
+            let end = begin.saturating_add(region.len);
+            if begin <= cursor && end > cursor {
+                cursor = end;
+                if cursor >= hi {
+                    return true;
+                }
+            }
+        }
+        for (_, region) in self.by_base.range(cursor..hi) {
+            let begin = region.base.as_u64();
+            if begin > cursor {
+                return false;
+            }
+            cursor = cursor.max(begin.saturating_add(region.len));
+            if cursor >= hi {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn snapshot(&self) -> Vec<Region> {
+        self.iter().cloned().collect()
+    }
 }
 
 /// An owned hardware huge-page mapping. Each backing entry is installed as
@@ -314,7 +512,7 @@ pub struct AddressSpace {
     /// `new_table` primitive once it lands; `PhysAddr::new(0)`
     /// acts as "not-yet-initialised" sentinel.
     pub root: PhysAddr,
-    regions: IrqSafeSpinLock<Vec<Region>>,
+    regions: IrqSafeSpinLock<RegionTable>,
     huge_regions: IrqSafeSpinLock<Vec<HugeRegion>>,
     /// Per-AS mmap cursor: next free virt for a no-hint mmap.
     /// Lives here (not on a single global) so each process gets its
@@ -390,7 +588,7 @@ impl AddressSpace {
     pub const fn empty() -> Self {
         Self {
             root: PhysAddr::new(0),
-            regions: IrqSafeSpinLock::new(Vec::new()),
+            regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -413,10 +611,7 @@ impl AddressSpace {
     ) -> Result<bool, AddressSpaceError> {
         let page = VirtAddr::new(vaddr.as_u64() & !0xFFF);
         let regions = self.regions.lock();
-        let Some(region) = regions.iter().find(|region| {
-            let base = region.base.as_u64();
-            page.as_u64() >= base && page.as_u64() < base.saturating_add(region.len)
-        }) else {
+        let Some(region) = regions.containing(page.as_u64()) else {
             return Ok(false);
         };
         if region.perms.contains(RegionPerms::SHARED) || region.perms.contains(RegionPerms::LOCKED)
@@ -628,7 +823,7 @@ impl AddressSpace {
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         Ok(Self {
             root: phys,
-            regions: IrqSafeSpinLock::new(Vec::new()),
+            regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -651,7 +846,7 @@ impl AddressSpace {
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         Ok(Self {
             root: phys,
-            regions: IrqSafeSpinLock::new(Vec::new()),
+            regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
@@ -707,11 +902,22 @@ impl AddressSpace {
             }
         }
         let mut regions = self.regions.lock();
-        for r in regions.iter() {
-            let r_end = r.base.as_u64() + r.len;
-            if region.base.as_u64() < r_end && r.base.as_u64() < end {
+        // Base-page VMAs are keyed by base. A new interval can overlap only
+        // its immediate predecessor or successor, so both admission and
+        // insertion remain O(log VMA) under random MAP_FIXED churn.
+        if let Some(predecessor) = regions.predecessor(region.base.as_u64()) {
+            if predecessor.base.as_u64().saturating_add(predecessor.len) > region.base.as_u64() {
                 return Err(AddressSpaceError::Overlap);
             }
+        }
+        if regions
+            .successor(region.base.as_u64())
+            .is_some_and(|successor| successor.base.as_u64() < end)
+        {
+            return Err(AddressSpaceError::Overlap);
+        }
+        #[cfg(debug_assertions)]
+        for r in regions.iter() {
             // Diagnostic double-free guard (debug builds only): a non-SHARED
             // region must not point at a phys frame already mapped by another
             // region in this AS, or `AddressSpace::drop` would unmap it twice
@@ -722,7 +928,6 @@ impl AddressSpace {
             // is fixed (frame-zero-on-free repro), so it is now debug-only; the
             // overlap check above stays in every build. SHARED regions borrow
             // registry-owned frames (aliasing is expected + safe), so skip them.
-            #[cfg(debug_assertions)]
             if !region.perms.contains(RegionPerms::SHARED) {
                 for new_p in &region.phys {
                     if new_p.raw() == 0 {
@@ -745,7 +950,7 @@ impl AddressSpace {
         if region.perms.contains(RegionPerms::SHARED) {
             retain_shared_frames(&region);
         }
-        regions.push(region);
+        assert!(regions.insert(region).is_none());
         drop(regions);
         // Keep the mmap-allocation cursor past anything mapped into the
         // mmap range so a later `reserve_mmap_va` can't collide with it.
@@ -784,10 +989,10 @@ impl AddressSpace {
         new_phys: PhysAddr,
     ) -> Result<usize, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        let aliases: Vec<(usize, usize, VirtAddr, RegionPerms)> = regions
+        let aliases: Vec<(u64, usize, VirtAddr, RegionPerms)> = regions
             .iter()
-            .enumerate()
-            .flat_map(|(region_idx, region)| {
+            .flat_map(|region| {
+                let region_base = region.base.as_u64();
                 region
                     .phys
                     .iter()
@@ -797,7 +1002,7 @@ impl AddressSpace {
                     })
                     .map(move |(page_idx, _)| {
                         (
-                            region_idx,
+                            region_base,
                             page_idx,
                             VirtAddr::new(region.base.as_u64() + page_idx as u64 * 4096),
                             region.perms,
@@ -807,7 +1012,7 @@ impl AddressSpace {
             .collect();
 
         let mut replaced = 0usize;
-        for &(region_idx, page_idx, page_va, perms) in &aliases {
+        for &(region_base, page_idx, page_va, perms) in &aliases {
             // SAFETY: the caller guarantees a live root and both physical
             // frames; each alias was revalidated under the region lock.
             let result = unsafe {
@@ -827,7 +1032,11 @@ impl AddressSpace {
                 #[cfg(target_arch = "aarch64")]
                 {
                     use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
-                    let mut flags = PtFlags::AP_RW_EL1;
+                    let mut flags = if perms.contains(RegionPerms::WRITE) {
+                        PtFlags::AP_RW_EL0
+                    } else {
+                        PtFlags::AP_RO_EL0
+                    };
                     if !perms.contains(RegionPerms::EXEC) {
                         flags = flags | PtFlags::UXN | PtFlags::PXN;
                     }
@@ -836,7 +1045,7 @@ impl AddressSpace {
                 }
             };
             if result.is_err() {
-                for &(rollback_region, rollback_page, rollback_va, rollback_perms) in
+                for &(rollback_base, rollback_page, rollback_va, rollback_perms) in
                     aliases[..replaced].iter().rev()
                 {
                     #[cfg(target_arch = "x86_64")]
@@ -859,7 +1068,11 @@ impl AddressSpace {
                     #[cfg(target_arch = "aarch64")]
                     {
                         use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
-                        let mut flags = PtFlags::AP_RW_EL1;
+                        let mut flags = if rollback_perms.contains(RegionPerms::WRITE) {
+                            PtFlags::AP_RW_EL0
+                        } else {
+                            PtFlags::AP_RO_EL0
+                        };
                         if !rollback_perms.contains(RegionPerms::EXEC) {
                             flags = flags | PtFlags::UXN | PtFlags::PXN;
                         }
@@ -870,12 +1083,18 @@ impl AddressSpace {
                         // at the same leaf before the old translation is flushed.
                         let _ = unsafe { map_4kb(self.root, rollback_va, old_phys, flags) };
                     }
-                    regions[rollback_region].phys[rollback_page] = old_phys;
+                    regions
+                        .get_mut(rollback_base)
+                        .expect("shared alias region disappeared under lock")
+                        .phys[rollback_page] = old_phys;
                     self.flush_region_broadcast(rollback_va, 1);
                 }
                 return Err(AddressSpaceError::NotImplemented);
             }
-            regions[region_idx].phys[page_idx] = new_phys;
+            regions
+                .get_mut(region_base)
+                .expect("shared alias region disappeared under lock")
+                .phys[page_idx] = new_phys;
             self.flush_region_broadcast(page_va, 1);
             replaced += 1;
         }
@@ -1092,11 +1311,10 @@ impl AddressSpace {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         let mut regions = self.regions.lock();
-        let idx = regions
-            .iter()
-            .position(|r| r.base == base)
-            .ok_or(AddressSpaceError::Unmapped)?;
-        let old_len = regions[idx].len;
+        let old_len = regions
+            .get(base.as_u64())
+            .ok_or(AddressSpaceError::Unmapped)?
+            .len;
         if new_len <= old_len {
             return Ok(());
         }
@@ -1109,21 +1327,18 @@ impl AddressSpace {
         if new_end > Self::USER_HALF_END {
             return Err(AddressSpaceError::OutOfRange);
         }
-        // The grown tail [base+old_len, base+new_len) must not collide
-        // with any OTHER region.
-        let grow_lo = base.as_u64() + old_len;
-        for (i, r) in regions.iter().enumerate() {
-            if i == idx {
-                continue;
-            }
-            let rb = r.base.as_u64();
-            let re = rb + r.len;
-            if rb < new_end && grow_lo < re {
-                return Err(AddressSpaceError::Overlap);
-            }
+        // Since the tree is non-overlapping and keyed by base, only the
+        // immediate successor can collide with the grown tail.
+        if regions
+            .successor(base.as_u64().saturating_add(1))
+            .is_some_and(|successor| successor.base.as_u64() < new_end)
+        {
+            return Err(AddressSpaceError::Overlap);
         }
         let add_pages = ((new_len - old_len) >> 12) as usize;
-        let region = &mut regions[idx];
+        let region = regions
+            .get_mut(base.as_u64())
+            .ok_or(AddressSpaceError::Unmapped)?;
         for _ in 0..add_pages {
             region.phys.push(PhysAddr::new(0));
         }
@@ -1138,6 +1353,135 @@ impl AddressSpace {
         // spurious `mmap`/`malloc` failure (musl's mallocng grows arenas
         // this way, so a heavy client like weston's desktop-shell hits it).
         self.bump_mmap_cursor_past(rb, rl);
+        Ok(())
+    }
+
+    /// Move one complete private base-page region to a disjoint virtual range,
+    /// optionally resizing it at the same time (`mremap(MREMAP_MAYMOVE)`).
+    ///
+    /// Resident frames are re-addressed, not copied. A grown tail remains
+    /// lazily unbacked; a truncated tail is released only after the old leaf
+    /// translations have been removed and cross-CPU invalidation has
+    /// completed. The target must already be free (the `MREMAP_FIXED` syscall
+    /// path punches its replacement window first).
+    ///
+    /// This deliberately accepts only an exact, complete region. Linux can
+    /// move a subrange spanning VMA fragments, but silently approximating that
+    /// operation would lose per-fragment permissions and backing metadata.
+    ///
+    /// # Safety
+    /// If `self.root` is non-zero it must remain a live user page-table root;
+    /// the normal direct-map prerequisites for materialization and teardown
+    /// apply.
+    pub unsafe fn relocate_region(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let old_lo = old_base.as_u64();
+        let new_lo = new_base.as_u64();
+        if old_lo & 0xFFF != 0
+            || new_lo & 0xFFF != 0
+            || old_len == 0
+            || new_len == 0
+            || old_len & 0xFFF != 0
+            || new_len & 0xFFF != 0
+        {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let old_hi = old_lo
+            .checked_add(old_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let new_hi = new_lo
+            .checked_add(new_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        if old_lo < new_hi && new_lo < old_hi {
+            return Err(AddressSpaceError::Overlap);
+        }
+
+        // Preserve the established huge -> regular lock ordering. Keeping
+        // both tables locked through leaf installation makes the region table
+        // the authority for the entire move: no sibling can map or tear down
+        // either range between validation and publication.
+        let huge = self.huge_regions.lock();
+        if huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            rb < new_hi && new_lo < re
+        }) {
+            return Err(AddressSpaceError::Overlap);
+        }
+        let mut regions = self.regions.lock();
+        let source = regions
+            .get(old_lo)
+            .filter(|region| region.len == old_len)
+            .ok_or(AddressSpaceError::Unmapped)?
+            .clone();
+        if source.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        if regions.has_overlap(new_lo, new_hi) {
+            return Err(AddressSpaceError::Overlap);
+        }
+
+        let kept_pages = core::cmp::min(old_len, new_len) as usize >> 12;
+        let mut moved = source.clone();
+        moved.base = new_base;
+        moved.len = new_len;
+        moved.phys.truncate(kept_pages);
+        moved
+            .phys
+            .resize((new_len >> 12) as usize, PhysAddr::new(0));
+
+        if self.root.as_u64() != 0 {
+            // Preinstall the complete destination while the source remains
+            // valid. Region removal and MAP_FIXED punching retire their leaves
+            // before deleting metadata, so the validated-free destination is
+            // also PTE-free; an unexpected stale leaf makes installation fail
+            // loudly instead of paying an absent-range page-table walk on
+            // every move. If page-table allocation fails, removing the partial
+            // destination is a lossless rollback because source bookkeeping
+            // and leaves have not changed yet.
+            // SAFETY: `moved` is the validated, disjoint destination region
+            // and the address space owns the live page-table root.
+            if unsafe { self.install_region_leaves_local(&moved) }.is_err() {
+                // SAFETY: only leaves belonging to the validated destination
+                // region can have been installed by the failed operation.
+                unsafe { self.unmap_region_leaves_local(&moved) };
+                return Err(AddressSpaceError::OutOfRange);
+            }
+            // Destination is complete; retire the source leaves before
+            // publishing the new region coordinates.
+            // SAFETY: `source` remains owned by this address space under the
+            // region locks, and its validated user range is still mapped.
+            unsafe { self.unmap_region_leaves_local(&source) };
+        }
+        let removed = regions
+            .remove(old_lo)
+            .expect("relocation source disappeared under region lock");
+        debug_assert_eq!(removed, source);
+        assert!(regions.insert(moved).is_none());
+        drop(regions);
+        drop(huge);
+
+        // Invalidate both sides after publishing. The source flush is
+        // load-bearing before truncated backing is returned to the allocator;
+        // the destination flush discards any stale logically-unmapped entry a
+        // CLONE_VM peer might have cached before this move.
+        self.flush_region_broadcast(old_base, old_len >> 12);
+        self.flush_region_broadcast(new_base, new_len >> 12);
+        if self.root.as_u64() != 0 {
+            for phys in source.phys.into_iter().skip(kept_pages) {
+                if phys.raw() != 0 {
+                    crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+                }
+            }
+        }
+        self.bump_mmap_cursor_past(new_lo, new_len);
         Ok(())
     }
 
@@ -1167,8 +1511,7 @@ impl AddressSpace {
         // the owner's release hook below.
         let mut regions = self.regions.lock();
         let shared = regions
-            .iter()
-            .find(|region| region.base == base)
+            .get(base.as_u64())
             .ok_or(AddressSpaceError::Unmapped)?
             .perms
             .contains(RegionPerms::SHARED);
@@ -1182,11 +1525,9 @@ impl AddressSpace {
         };
         record_unmap_path(shared);
         let region = {
-            let idx = regions
-                .iter()
-                .position(|r| r.base == base)
+            let region = regions
+                .remove(base.as_u64())
                 .ok_or(AddressSpaceError::Unmapped)?;
-            let region = regions.swap_remove(idx);
             // Tear down the leaf PTEs BEFORE dropping the lock (local
             // invalidation only; the batched cross-CPU flush + the frame
             // frees run below, outside the lock). Deferring the whole walk
@@ -1203,7 +1544,7 @@ impl AddressSpace {
             if self.root.as_u64() != 0 {
                 // SAFETY: same identity-mapping precondition as
                 // `materialize`; the pages lie inside `region`, which this
-                // AS owned until the `swap_remove` above.
+                // AS owned until the `remove` above.
                 unsafe { self.unmap_region_leaves_local(&region) };
             }
             region
@@ -1243,11 +1584,8 @@ impl AddressSpace {
         // invalidation and the external owner's release hook.
         let mut huge = self.huge_regions.lock();
         let mut regions = self.regions.lock();
-        let shared = regions.iter().any(|region| {
-            let rb = region.base.as_u64();
-            let re = rb + region.len;
-            re > lo && rb < hi && region.perms.contains(RegionPerms::SHARED)
-        });
+        let shared =
+            regions.overlapping_any(lo, hi, |region| region.perms.contains(RegionPerms::SHARED));
         let _shared_transaction = if shared {
             drop(regions);
             drop(huge);
@@ -1301,6 +1639,15 @@ impl AddressSpace {
             }
         }
 
+        // The ordered VMA index makes a hole query logarithmic. This is
+        // the dominant MAP_FIXED stress pattern: after a large unmap,
+        // stress-ng recreates its pages in random order. Rebuilding every
+        // existing VMA for each still-empty page made that phase quadratic.
+        if !regions.has_overlap(lo, hi) {
+            drop(regions);
+            return Ok(());
+        }
+
         // Frames to free once the punched window's PTEs are gone from every
         // CPU. Snapshotted from each region's AUTHORITATIVE backing list
         // (`old.phys[pg]`) under the lock — NEVER read back from the PTE
@@ -1318,15 +1665,11 @@ impl AddressSpace {
         let mut to_free: Vec<PhysAddr> = Vec::new();
         let mut punched_pages: u64 = 0;
         {
-            let old_regions = core::mem::take(&mut *regions);
-            let mut kept: Vec<Region> = Vec::with_capacity(old_regions.len());
+            let old_regions = regions.drain_overlapping(lo, hi);
+            let mut kept: Vec<Region> = Vec::with_capacity(old_regions.len() + 1);
             for old in old_regions {
                 let rb = old.base.as_u64();
                 let re = rb + old.len;
-                if re <= lo || rb >= hi {
-                    kept.push(old); // no overlap
-                    continue;
-                }
                 let shared = old.perms.contains(RegionPerms::SHARED);
                 let total = (old.len >> 12) as usize;
                 let first = ((lo.max(rb) - rb) >> 12) as usize;
@@ -1396,7 +1739,9 @@ impl AddressSpace {
                     });
                 }
             }
-            *regions = kept;
+            for region in kept {
+                assert!(regions.insert(region).is_none());
+            }
         }
         drop(regions);
         // ONE cross-CPU invalidation covering the punched window, BEFORE any
@@ -1523,6 +1868,67 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe fn unmap_region_leaves_local(&self, _region: &Region) {}
 
+    /// Install every resident leaf of one already-validated region without
+    /// consulting or locking the region table. Callers hold the table lock so
+    /// backing, permissions, and ownership cannot change during the walk.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn install_region_leaves_local(&self, region: &Region) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_4kb_scatter_range, PtFlags};
+        if region.perms.prot_only().0 == 0 {
+            return Ok(());
+        }
+        // SAFETY: caller guarantees a live root and validated disjoint region;
+        // the scatter list is authoritative backing and the paging helper
+        // serialises the complete run with one per-root lock acquisition.
+        unsafe {
+            map_4kb_scatter_range(self.root, region.base, &region.phys, |phys| {
+                let mut flags = PtFlags::USER;
+                if user_page_writable(region.perms, phys) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                flags
+            })
+        }
+        .map_err(|_| AddressSpaceError::OutOfRange)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn install_region_leaves_local(&self, region: &Region) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_4kb, PtFlags};
+        if region.perms.prot_only().0 == 0 {
+            return Ok(());
+        }
+        for (index, phys) in region.phys.iter().copied().enumerate() {
+            if phys.raw() == 0 {
+                continue;
+            }
+            let mut flags = if user_page_writable(region.perms, phys) {
+                PtFlags::AP_RW_EL0
+            } else {
+                PtFlags::AP_RO_EL0
+            };
+            if !region.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::UXN | PtFlags::PXN;
+            }
+            let va = VirtAddr::new(region.base.as_u64() + index as u64 * 4096);
+            // SAFETY: same contract as the x86_64 implementation.
+            unsafe { map_4kb(self.root, va, phys, flags) }
+                .map_err(|_| AddressSpaceError::OutOfRange)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe fn install_region_leaves_local(
+        &self,
+        _region: &Region,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
     /// Free the frames `region` owns, consulting the region's OWN backing
     /// list. We deliberately IGNORE what the PTE walk returned and free
     /// `region.phys[i]` instead — the region's backing list is
@@ -1578,10 +1984,7 @@ impl AddressSpace {
         }) {
             return true;
         }
-        self.regions.lock().iter().any(|region| {
-            let base = region.base.as_u64();
-            v >= base && v < base.saturating_add(region.len)
-        })
+        self.regions.lock().containing(v).is_some()
     }
 
     /// Return the hardware leaf size covering `vaddr`.
@@ -1599,14 +2002,77 @@ impl AddressSpace {
                 crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
             });
         }
-        self.regions
-            .lock()
-            .iter()
-            .any(|region| {
-                let base = region.base.as_u64();
-                v >= base && v < base.saturating_add(region.len)
-            })
-            .then_some(4096)
+        self.regions.lock().containing(v).map(|_| 4096)
+    }
+
+    /// Return one Linux-mincore-shaped residency byte per base page.
+    ///
+    /// The complete rounded range is sampled under the huge -> regular region
+    /// locks, so a racing VMA operation cannot mix metadata generations.
+    /// Hardware huge leaves are resident for every base-page equivalent;
+    /// lazy base-page slots report zero. Any unmapped page rejects the whole
+    /// request without exposing a partial vector.
+    pub fn residency_range(&self, base: VirtAddr, len: u64) -> Result<Vec<u8>, AddressSpaceError> {
+        let lo = base.as_u64();
+        if lo & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let rounded_len = len
+            .checked_add(0xFFF)
+            .map(|value| value & !0xFFF)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let hi = lo
+            .checked_add(rounded_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let pages: usize = (rounded_len >> 12)
+            .try_into()
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        // Bit 7 is an internal "mapped" marker; bit 0 is the Linux residency
+        // result. Keeping both in one vector avoids a second pages-sized
+        // allocation on this observability path.
+        let mut state = alloc::vec![0u8; pages];
+        let huge = self.huge_regions.lock();
+        let regular = self.regions.lock();
+        regular.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            let begin = lo.max(rb);
+            let end = hi.min(re);
+            if begin >= end {
+                return;
+            }
+            let first = ((begin - rb) >> 12) as usize;
+            let last = ((end - rb) >> 12) as usize;
+            for index in first..last {
+                let out = ((rb + index as u64 * 4096 - lo) >> 12) as usize;
+                state[out] = 0x80 | u8::from(region.phys[index].raw() != 0);
+            }
+        });
+        for region in huge.iter() {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            let begin = lo.max(rb);
+            let end = hi.min(re);
+            if begin >= end {
+                continue;
+            }
+            let first = ((begin - lo) >> 12) as usize;
+            let last = ((end - lo) >> 12) as usize;
+            state[first..last].fill(0x81);
+        }
+        drop(regular);
+        drop(huge);
+        if state.iter().any(|value| value & 0x80 == 0) {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        for value in &mut state {
+            *value &= 1;
+        }
+        Ok(state)
     }
 
     /// Copy resident user bytes through the kernel direct map without taking a
@@ -1620,10 +2086,7 @@ impl AddressSpace {
         while copied < dst.len() {
             let address = vaddr.as_u64().saturating_add(copied as u64);
             let base_regions = self.regions.lock();
-            if let Some(region) = base_regions.iter().find(|region| {
-                address >= region.base.as_u64()
-                    && address < region.base.as_u64().saturating_add(region.len)
-            }) {
+            if let Some(region) = base_regions.containing(address) {
                 let offset = address - region.base.as_u64();
                 let page = (offset / 4096) as usize;
                 let in_page = (offset % 4096) as usize;
@@ -1750,10 +2213,9 @@ impl AddressSpace {
     /// might take, on a path that runs from the page-fault handler.
     fn file_demand_miss(&self, v: u64) -> bool {
         let regions = self.regions.lock();
-        regions.iter().any(|r| {
+        regions.containing(v).is_some_and(|r| {
             let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if v < rb || v >= re || !r.perms.contains(RegionPerms::FILE_DEMAND) {
+            if !r.perms.contains(RegionPerms::FILE_DEMAND) {
                 return false;
             }
             // PROT_NONE is a real access violation, not a miss — same rule as
@@ -1775,11 +2237,10 @@ impl AddressSpace {
     /// would strand the alias the peer may already have installed in a PTE.
     fn record_file_demand_frame(&self, v: u64, phys: PhysAddr) {
         let mut regions = self.regions.lock();
-        for r in regions.iter_mut() {
+        if let Some(r) = regions.containing_mut(v) {
             let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if v < rb || v >= re || !r.perms.contains(RegionPerms::FILE_DEMAND) {
-                continue;
+            if !r.perms.contains(RegionPerms::FILE_DEMAND) {
+                return;
             }
             let i = ((v - rb) >> 12) as usize;
             if let Some(slot) = r.phys.get_mut(i) {
@@ -1787,7 +2248,6 @@ impl AddressSpace {
                     *slot = phys;
                 }
             }
-            return;
         }
     }
 
@@ -1834,106 +2294,102 @@ impl AddressSpace {
             self.record_file_demand_frame(v, PhysAddr::new(phys));
         }
         let mut regions = self.regions.lock();
-        for r in regions.iter_mut() {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if v < rb || v >= re {
-                continue;
-            }
-            // PROT_NONE: the fault is a real access violation, not
-            // a demand-paging miss. Surface as Unmapped so the
-            // trap handler reports the SEGV cleanly.
-            if r.perms.prot_only().0 == 0 {
-                return Err(AddressSpaceError::Unmapped);
-            }
-            let i = ((v - rb) >> 12) as usize;
-            if i >= r.phys.len() {
-                return Err(AddressSpaceError::OutOfRange);
-            }
-            if r.phys[i].raw() != 0 {
-                // Already backed, yet this CPU took a not-present #PF for it.
-                // Two distinct causes, distinguished by whether the leaf PTE
-                // in memory is actually present:
-                //
-                // (a) Leaf PRESENT — a peer CPU demand-faulted this page
-                //     and, installing its leaf, allocated a fresh
-                //     intermediate page-table page; THIS CPU's paging-
-                //     structure cache still holds the pre-fault "not
-                //     present" intermediate entry (x86 issues no shootdown
-                //     for a not-present→present transition). INVLPG flushes
-                //     this CPU's TLB + walk caches; the retry re-walks and
-                //     observes the present PTE. (Before this branch existed
-                //     the spurious fault fell through to try_grow_stack →
-                //     fatal — the SMP-only mallocng heap crash.)
-                //
-                // (b) Leaf ABSENT — the bookkeeping says "backed" but the
-                //     page table genuinely has no entry. Reachable when a
-                //     racing VMA op strips the leaf after this region (or a
-                //     replacement mapping) was registered — e.g. the
-                //     map_region→materialize gap in sys_mmap, or a sibling
-                //     thread's munmap/MAP_FIXED overlapping teardown.
-                //     Blindly returning Ok here (the old shape) made the
-                //     faulting instruction retry against a still-absent PTE
-                //     forever: an unkillable, silent infinite-#PF loop —
-                //     the stress-ng --vma SMP wedge. Self-heal instead:
-                //     install the leaf for the frame the region owns.
-                let va = VirtAddr::new(v);
-                // SAFETY: `self.root` is this AS's valid live root; translate
-                // only reads the tables through the identity map.
-                if unsafe { crate::x86_64::paging::translate(self.root, va) }.is_some() {
-                    // SAFETY: INVLPG is always safe; `v` is the page-aligned
-                    // faulting VA whose leaf PTE this AS owns.
-                    unsafe {
-                        crate::x86_64::paging::invlpg(va);
-                    }
-                    return Ok(());
+        let r = regions
+            .containing_mut(v)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let rb = r.base.as_u64();
+        // PROT_NONE: the fault is a real access violation, not
+        // a demand-paging miss. Surface as Unmapped so the
+        // trap handler reports the SEGV cleanly.
+        if r.perms.prot_only().0 == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let i = ((v - rb) >> 12) as usize;
+        if i >= r.phys.len() {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        if r.phys[i].raw() != 0 {
+            // Already backed, yet this CPU took a not-present #PF for it.
+            // Two distinct causes, distinguished by whether the leaf PTE
+            // in memory is actually present:
+            //
+            // (a) Leaf PRESENT — a peer CPU demand-faulted this page
+            //     and, installing its leaf, allocated a fresh
+            //     intermediate page-table page; THIS CPU's paging-
+            //     structure cache still holds the pre-fault "not
+            //     present" intermediate entry (x86 issues no shootdown
+            //     for a not-present→present transition). INVLPG flushes
+            //     this CPU's TLB + walk caches; the retry re-walks and
+            //     observes the present PTE. (Before this branch existed
+            //     the spurious fault fell through to try_grow_stack →
+            //     fatal — the SMP-only mallocng heap crash.)
+            //
+            // (b) Leaf ABSENT — the bookkeeping says "backed" but the
+            //     page table genuinely has no entry. Reachable when a
+            //     racing VMA op strips the leaf after this region (or a
+            //     replacement mapping) was registered — e.g. the
+            //     map_region→materialize gap in sys_mmap, or a sibling
+            //     thread's munmap/MAP_FIXED overlapping teardown.
+            //     Blindly returning Ok here (the old shape) made the
+            //     faulting instruction retry against a still-absent PTE
+            //     forever: an unkillable, silent infinite-#PF loop —
+            //     the stress-ng --vma SMP wedge. Self-heal instead:
+            //     install the leaf for the frame the region owns.
+            let va = VirtAddr::new(v);
+            // SAFETY: `self.root` is this AS's valid live root; translate
+            // only reads the tables through the identity map.
+            if unsafe { crate::x86_64::paging::translate(self.root, va) }.is_some() {
+                // SAFETY: INVLPG is always safe; `v` is the page-aligned
+                // faulting VA whose leaf PTE this AS owns.
+                unsafe {
+                    crate::x86_64::paging::invlpg(va);
                 }
-                let phys = r.phys[i];
-                let mut flags = PtFlags::USER;
-                if r.perms.contains(RegionPerms::WRITE) {
-                    flags |= PtFlags::WRITABLE;
-                }
-                if !r.perms.contains(RegionPerms::EXEC) {
-                    flags |= PtFlags::NO_EXEC;
-                }
-                // SAFETY: identity map + AS live (active CR3's #PF handler);
-                // `phys` is the frame this region owns for the page.
-                match unsafe { map_4kb(self.root, va, phys, flags) } {
-                    Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
-                    Err(_) => return Err(AddressSpaceError::NotImplemented),
-                }
+                return Ok(());
             }
-            // Allocate + zero the fresh frame, honoring the faulting
-            // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
-            // resolves to the local node — today's behavior.
-            let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
-                .map_err(|_| AddressSpaceError::OutOfRange)?
-                .start_address();
-            // SAFETY: identity-mapped DMA-equivalent; frame just
-            // returned by allocator is exclusively ours.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-            }
-            r.phys[i] = phys;
-
-            // Build PTE flags from region perms.
+            let phys = r.phys[i];
             let mut flags = PtFlags::USER;
-            if r.perms.contains(RegionPerms::WRITE) {
+            if user_page_writable(r.perms, phys) {
                 flags |= PtFlags::WRITABLE;
             }
             if !r.perms.contains(RegionPerms::EXEC) {
                 flags |= PtFlags::NO_EXEC;
             }
-            // SAFETY: identity map + AS is live (we're being
-            // called from the active CR3's #PF handler).
-            // SAFETY: Valid memory or trusted environment
-            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+            // SAFETY: identity map + AS live (active CR3's #PF handler);
+            // `phys` is the frame this region owns for the page.
+            match unsafe { map_4kb(self.root, va, phys, flags) } {
                 Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
                 Err(_) => return Err(AddressSpaceError::NotImplemented),
             }
         }
-        Err(AddressSpaceError::Unmapped)
+        // Allocate + zero the fresh frame, honoring the faulting
+        // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
+        // resolves to the local node — today's behavior.
+        let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
+            .map_err(|_| AddressSpaceError::OutOfRange)?
+            .start_address();
+        // SAFETY: identity-mapped DMA-equivalent; frame just
+        // returned by allocator is exclusively ours.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+        }
+        r.phys[i] = phys;
+
+        // Build PTE flags from region perms.
+        let mut flags = PtFlags::USER;
+        if user_page_writable(r.perms, phys) {
+            flags |= PtFlags::WRITABLE;
+        }
+        if !r.perms.contains(RegionPerms::EXEC) {
+            flags |= PtFlags::NO_EXEC;
+        }
+        // SAFETY: identity map + AS is live (we're being
+        // called from the active CR3's #PF handler).
+        // SAFETY: Valid memory or trusted environment
+        match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+            Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+            Err(_) => Err(AddressSpaceError::NotImplemented),
+        }
     }
 
     /// # Safety
@@ -1953,69 +2409,73 @@ impl AddressSpace {
             self.record_file_demand_frame(v, PhysAddr::new(phys));
         }
         let mut regions = self.regions.lock();
-        for r in regions.iter_mut() {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if v < rb || v >= re {
-                continue;
-            }
-            if r.perms.prot_only().0 == 0 {
-                return Err(AddressSpaceError::Unmapped);
-            }
-            let i = ((v - rb) >> 12) as usize;
-            if i >= r.phys.len() {
-                return Err(AddressSpaceError::OutOfRange);
-            }
-            if r.phys[i].raw() != 0 {
-                // Already backed, yet this CPU faulted. Present leaf → a
-                // peer installed it while this CPU's TLB / walk caches still
-                // held the pre-fault miss: invalidate locally and retry.
-                // ABSENT leaf → a racing VMA op stripped it after the
-                // backing was registered; re-install the region's own frame
-                // instead of retrying forever. See the x86_64 twin for the
-                // full spurious-vs-raced rationale.
-                let va = VirtAddr::new(v);
-                // SAFETY: `self.root` is this AS's valid TTBR0 root;
-                // translate only reads the tables.
-                if unsafe { crate::aarch64::paging::translate(self.root, va) }.is_some() {
-                    // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
-                    // page-aligned faulting VA owned by this AS.
-                    unsafe {
-                        crate::aarch64::paging::tlb_invalidate_vae1is(va);
-                    }
-                    return Ok(());
+        let r = regions
+            .containing_mut(v)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let rb = r.base.as_u64();
+        if r.perms.prot_only().0 == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let i = ((v - rb) >> 12) as usize;
+        if i >= r.phys.len() {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        if r.phys[i].raw() != 0 {
+            // Already backed, yet this CPU faulted. Present leaf → a
+            // peer installed it while this CPU's TLB / walk caches still
+            // held the pre-fault miss: invalidate locally and retry.
+            // ABSENT leaf → a racing VMA op stripped it after the
+            // backing was registered; re-install the region's own frame
+            // instead of retrying forever. See the x86_64 twin for the
+            // full spurious-vs-raced rationale.
+            let va = VirtAddr::new(v);
+            // SAFETY: `self.root` is this AS's valid TTBR0 root;
+            // translate only reads the tables.
+            if unsafe { crate::aarch64::paging::translate(self.root, va) }.is_some() {
+                // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
+                // page-aligned faulting VA owned by this AS.
+                unsafe {
+                    crate::aarch64::paging::tlb_invalidate_vae1is(va);
                 }
-                let phys = r.phys[i];
-                let mut flags = PtFlags::AP_RW_EL1;
-                if !r.perms.contains(RegionPerms::EXEC) {
-                    flags = flags | PtFlags::UXN | PtFlags::PXN;
-                }
-                // SAFETY: root valid + frame owned by this region (same
-                // contract as the fresh-allocation path below).
-                match unsafe { map_4kb(self.root, va, phys, flags) } {
-                    Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
-                    Err(_) => return Err(AddressSpaceError::NotImplemented),
-                }
+                return Ok(());
             }
-            let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
-                .map_err(|_| AddressSpaceError::OutOfRange)?
-                .start_address();
-            // SAFETY: identity-mapped per allocator contract.
-            unsafe {
-                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
-            }
-            r.phys[i] = phys;
-            let mut flags = PtFlags::AP_RW_EL1;
+            let phys = r.phys[i];
+            let mut flags = if user_page_writable(r.perms, phys) {
+                PtFlags::AP_RW_EL0
+            } else {
+                PtFlags::AP_RO_EL0
+            };
             if !r.perms.contains(RegionPerms::EXEC) {
                 flags = flags | PtFlags::UXN | PtFlags::PXN;
             }
-            // SAFETY: same.
-            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+            // SAFETY: root valid + frame owned by this region (same
+            // contract as the fresh-allocation path below).
+            match unsafe { map_4kb(self.root, va, phys, flags) } {
                 Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
                 Err(_) => return Err(AddressSpaceError::NotImplemented),
             }
         }
-        Err(AddressSpaceError::Unmapped)
+        let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
+            .map_err(|_| AddressSpaceError::OutOfRange)?
+            .start_address();
+        // SAFETY: identity-mapped per allocator contract.
+        unsafe {
+            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+        }
+        r.phys[i] = phys;
+        let mut flags = if user_page_writable(r.perms, phys) {
+            PtFlags::AP_RW_EL0
+        } else {
+            PtFlags::AP_RO_EL0
+        };
+        if !r.perms.contains(RegionPerms::EXEC) {
+            flags = flags | PtFlags::UXN | PtFlags::PXN;
+        }
+        // SAFETY: same.
+        match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+            Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+            Err(_) => Err(AddressSpaceError::NotImplemented),
+        }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -2060,16 +2520,16 @@ impl AddressSpace {
         // page in one shot. The bound keeps a wild pointer far below the stack
         // a real SEGV rather than silently mapping a huge gap.
         const MAX_GROW: u64 = 256 * 1024; // 64 pages
-        let idx = regions
+        let guard_base = regions
             .iter()
-            .position(|r| {
+            .find(|r| {
                 r.perms.contains(RegionPerms::STACK_GUARD) && {
                     let gb = r.base.as_u64();
                     gb >= v_page && gb - v_page <= MAX_GROW
                 }
             })
+            .map(|region| region.base.as_u64())
             .ok_or(AddressSpaceError::Unmapped)?;
-        let guard_base = regions[idx].base.as_u64();
         // New guard sits one page below the lowest page we are about to map.
         let new_guard_base = match v_page.checked_sub(0x1000) {
             Some(b) => b,
@@ -2091,15 +2551,8 @@ impl AddressSpace {
         // including) the old guard page — which stays region `idx`. Reject if
         // any OTHER region intersects it: the stack arena has run into the
         // heap / mmap window and the user gets a real SEGV.
-        for (i, r) in regions.iter().enumerate() {
-            if i == idx {
-                continue;
-            }
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if rb < guard_base && re > new_guard_base {
-                return Err(AddressSpaceError::Overlap);
-            }
+        if regions.has_overlap(new_guard_base, guard_base) {
+            return Err(AddressSpaceError::Overlap);
         }
 
         // Promote: map every page from `v_page` up to and including the old
@@ -2129,20 +2582,26 @@ impl AddressSpace {
         }
         // Replace the one-page guard region with the expanded mapped stack
         // span [v_page, guard_base + 0x1000).
-        regions[idx].base = VirtAddr::new(v_page);
-        regions[idx].len = npages * 0x1000;
-        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
-        regions[idx].phys = new_phys;
+        let mut promoted = regions
+            .remove(guard_base)
+            .expect("stack guard disappeared under region lock");
+        promoted.base = VirtAddr::new(v_page);
+        promoted.len = npages * 0x1000;
+        promoted.perms = RegionPerms::READ | RegionPerms::WRITE;
+        promoted.phys = new_phys;
+        assert!(regions.insert(promoted).is_none());
 
         // Install a fresh one-page guard region below. Lazy phys
         // (the slot stays unbacked — guard pages never need a
         // backing frame until they themselves get promoted).
-        regions.push(Region {
-            base: VirtAddr::new(new_guard_base),
-            len: 0x1000,
-            perms: RegionPerms::STACK_GUARD,
-            phys: alloc::vec![crate::PhysAddr::new(0)],
-        });
+        assert!(regions
+            .insert(Region {
+                base: VirtAddr::new(new_guard_base),
+                len: 0x1000,
+                perms: RegionPerms::STACK_GUARD,
+                phys: alloc::vec![crate::PhysAddr::new(0)],
+            })
+            .is_none());
         Ok(())
     }
 
@@ -2161,16 +2620,16 @@ impl AddressSpace {
         // frame allocation touches a page several pages below the stack bottom
         // in one step, landing below the one-page guard. Grow down to cover it.
         const MAX_GROW: u64 = 256 * 1024; // 64 pages
-        let idx = regions
+        let guard_base = regions
             .iter()
-            .position(|r| {
+            .find(|r| {
                 r.perms.contains(RegionPerms::STACK_GUARD) && {
                     let gb = r.base.as_u64();
                     gb >= v_page && gb - v_page <= MAX_GROW
                 }
             })
+            .map(|region| region.base.as_u64())
             .ok_or(AddressSpaceError::Unmapped)?;
-        let guard_base = regions[idx].base.as_u64();
         let new_guard_base = match v_page.checked_sub(0x1000) {
             Some(b) => b,
             None => return Err(AddressSpaceError::OutOfRange),
@@ -2186,18 +2645,11 @@ impl AddressSpace {
         if guard_base >= Self::MMAP_WINDOW_TOP && new_guard_base < Self::MMAP_WINDOW_TOP {
             return Err(AddressSpaceError::OutOfRange);
         }
-        for (i, r) in regions.iter().enumerate() {
-            if i == idx {
-                continue;
-            }
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if rb < guard_base && re > new_guard_base {
-                return Err(AddressSpaceError::Overlap);
-            }
+        if regions.has_overlap(new_guard_base, guard_base) {
+            return Err(AddressSpaceError::Overlap);
         }
 
-        let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
+        let flags = PtFlags::AP_RW_EL0 | PtFlags::UXN | PtFlags::PXN;
         let npages = ((guard_base - v_page) / 0x1000) + 1;
         let mut new_phys: alloc::vec::Vec<crate::PhysAddr> =
             alloc::vec::Vec::with_capacity(npages as usize);
@@ -2220,17 +2672,23 @@ impl AddressSpace {
             new_phys.push(phys);
             p += 0x1000;
         }
-        regions[idx].base = VirtAddr::new(v_page);
-        regions[idx].len = npages * 0x1000;
-        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
-        regions[idx].phys = new_phys;
+        let mut promoted = regions
+            .remove(guard_base)
+            .expect("stack guard disappeared under region lock");
+        promoted.base = VirtAddr::new(v_page);
+        promoted.len = npages * 0x1000;
+        promoted.perms = RegionPerms::READ | RegionPerms::WRITE;
+        promoted.phys = new_phys;
+        assert!(regions.insert(promoted).is_none());
 
-        regions.push(Region {
-            base: VirtAddr::new(new_guard_base),
-            len: 0x1000,
-            perms: RegionPerms::STACK_GUARD,
-            phys: alloc::vec![crate::PhysAddr::new(0)],
-        });
+        assert!(regions
+            .insert(Region {
+                base: VirtAddr::new(new_guard_base),
+                len: 0x1000,
+                perms: RegionPerms::STACK_GUARD,
+                phys: alloc::vec![crate::PhysAddr::new(0)],
+            })
+            .is_none());
         Ok(())
     }
 
@@ -2239,12 +2697,156 @@ impl AddressSpace {
         Err(AddressSpaceError::NotImplemented)
     }
 
-    /// `mlock(base, len)` — force-back every lazy page in regions
-    /// intersecting `[base, base + len)` and set the LOCKED flag.
-    /// Returns Unmapped if no region intersects.
+    /// Return whether base-page regions cover every byte in `[lo, hi)`.
+    ///
+    /// The region table is ordered by base, so coverage starts at the one
+    /// predecessor that can contain `lo` and walks only the requested span.
+    /// This helper is used before changing residency state: Linux returns
+    /// `ENOMEM` when an `mlock`/`munlock` range contains a hole rather than
+    /// partially changing the mapped fragments on either side.
+    fn regions_cover_range(regions: &RegionTable, lo: u64, hi: u64) -> bool {
+        regions.covers_range(lo, hi)
+    }
+
+    /// Coverage check across both base-page VMAs and hardware huge mappings.
+    /// Lock order is huge -> regular, matching every mutating path.
+    fn mappings_cover_range(&self, lo: u64, hi: u64) -> bool {
+        let huge = self.huge_regions.lock();
+        let regular = self.regions.lock();
+        let mut coverage = Vec::new();
+        regular.for_each_overlapping(lo, hi, |region| {
+            let begin = lo.max(region.base.as_u64());
+            let end = hi.min(region.base.as_u64().saturating_add(region.len));
+            if begin < end {
+                coverage.push((begin, end));
+            }
+        });
+        coverage.extend(huge.iter().filter_map(|region| {
+            let begin = lo.max(region.base.as_u64());
+            let end = hi.min(region.base.as_u64().saturating_add(region.len));
+            (begin < end).then_some((begin, end))
+        }));
+        coverage.sort_unstable_by_key(|&(begin, _)| begin);
+        let mut cursor = lo;
+        for (begin, end) in coverage {
+            if begin > cursor {
+                return false;
+            }
+            cursor = cursor.max(end);
+            if cursor >= hi {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Split every base-page region intersecting `[lo, hi)` and set or clear
+    /// `flag` on only the middle fragments.  Physical backing is moved into
+    /// the new vectors rather than cloned, so ownership/refcounts are
+    /// unchanged even for SHARED and COW mappings.
+    fn set_region_flag_range(
+        regions: &mut RegionTable,
+        lo: u64,
+        hi: u64,
+        flag: RegionPerms,
+        set: bool,
+    ) {
+        // Drain only the tree entries that intersect the request. Tiny
+        // mlock/munlock calls therefore touch O(log VMA + intersections)
+        // metadata rather than rebuilding a process-wide list.
+        let originals = regions.drain_overlapping(lo, hi);
+        if originals.is_empty() {
+            return;
+        }
+        let mut rebuilt = Vec::with_capacity(originals.len() + 2);
+        for region in originals {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            if rb >= hi || re <= lo {
+                rebuilt.push(region);
+                continue;
+            }
+
+            let split_lo = lo.max(rb);
+            let split_hi = hi.min(re);
+            // LOCKED has no hardware-PTE representation. If this VMA already
+            // has the requested state, a subrange operation is a metadata
+            // no-op and must not fragment/reallocate it. This matters for
+            // repeated mlockall(MCL_CURRENT), which otherwise rebuilds every
+            // already-locked VMA on every call.
+            if region.perms.contains(flag) == set {
+                rebuilt.push(region);
+                continue;
+            }
+            let head_pages = ((split_lo - rb) >> 12) as usize;
+            let middle_pages = ((split_hi - split_lo) >> 12) as usize;
+            let mut phys = region.phys.into_iter();
+            let head_phys: Vec<_> = (&mut phys).take(head_pages).collect();
+            let middle_phys: Vec<_> = (&mut phys).take(middle_pages).collect();
+            let tail_phys: Vec<_> = phys.collect();
+
+            if !head_phys.is_empty() {
+                rebuilt.push(Region {
+                    base: region.base,
+                    len: head_phys.len() as u64 * 4096,
+                    perms: region.perms,
+                    phys: head_phys,
+                });
+            }
+            let middle_perms = if set {
+                RegionPerms(region.perms.0 | flag.0)
+            } else {
+                RegionPerms(region.perms.0 & !flag.0)
+            };
+            let middle = Region {
+                base: VirtAddr::new(split_lo),
+                len: middle_phys.len() as u64 * 4096,
+                perms: middle_perms,
+                phys: middle_phys,
+            };
+            rebuilt.push(middle);
+            if !tail_phys.is_empty() {
+                rebuilt.push(Region {
+                    base: VirtAddr::new(split_hi),
+                    len: tail_phys.len() as u64 * 4096,
+                    perms: region.perms,
+                    phys: tail_phys,
+                });
+            }
+        }
+        for region in rebuilt {
+            assert!(regions.insert(region).is_none());
+        }
+    }
+
+    /// Linux accepts an unaligned mlock address and rounds the complete byte
+    /// interval out to pages.  Keep that validation identical for mlock,
+    /// mlock2(MLOCK_ONFAULT), and munlock.
+    fn rounded_lock_range(base: VirtAddr, len: u64) -> Result<(u64, u64), AddressSpaceError> {
+        let requested_hi = base
+            .as_u64()
+            .checked_add(len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let lo = base.as_u64() & !0xFFF;
+        let hi = requested_hi
+            .checked_add(0xFFF)
+            .map(|end| end & !0xFFF)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        Ok((lo, hi))
+    }
+
+    /// `mlock(base, len)` — force-back every lazy page in the rounded
+    /// `[base, base + len)` range and set LOCKED on exactly that range.
+    /// Returns Unmapped if any page in the request is unmapped.
     pub fn mlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
-        let lo = base.as_u64();
-        let hi = lo.saturating_add(len);
+        let (lo, hi) = Self::rounded_lock_range(base, len)?;
+        // For a page-aligned address Linux treats zero bytes as a no-op. An
+        // unaligned zero-byte request rounds over its containing page and is
+        // validated normally.
+        if lo == hi {
+            return Ok(());
+        }
         // Force-back any zero phys entries first; do this with
         // the lock dropped so frame allocation doesn't recurse
         // on an IRQ-safe lock. Snapshot the pages that need backing BY
@@ -2257,34 +2859,57 @@ impl AddressSpace {
         // IRQs-off forever, wedging the whole machine under stress-ng
         // --vma's mlock-vs-mprotect churn) or stamped a frame into the
         // wrong region. VAs stay meaningful across any reshuffle.
-        let mut touched_any = false;
-        let mut needed_vas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut anonymous_vas: Vec<u64> = Vec::new();
+        let mut file_vas: Vec<u64> = Vec::new();
         {
             let g = self.regions.lock();
-            for r in g.iter() {
+            if !Self::regions_cover_range(&g, lo, hi) {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            g.for_each_overlapping(lo, hi, |r| {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
                 if rb >= hi || re <= lo {
-                    continue;
+                    return;
                 }
-                touched_any = true;
-                for (i, p) in r.phys.iter().enumerate() {
-                    if p.raw() == 0 {
-                        needed_vas.push(rb + ((i as u64) << 12));
+                let first = ((lo.max(rb) - rb) >> 12) as usize;
+                let last = ((hi.min(re) - rb) >> 12) as usize;
+                for i in first..last {
+                    if r.phys[i].raw() == 0 {
+                        let va = rb + ((i as u64) << 12);
+                        if r.perms.contains(RegionPerms::FILE_DEMAND) {
+                            file_vas.push(va);
+                        } else {
+                            anonymous_vas.push(va);
+                        }
                     }
                 }
-            }
+            });
         }
-        if !touched_any {
-            return Err(AddressSpaceError::Unmapped);
+
+        // FILE_DEMAND pages are borrowed from their backing file.  Routing
+        // them through the normal fault path is essential: allocating an
+        // anonymous zero page here would both hide file contents and leak it
+        // because SHARED teardown correctly never frees borrowed frames.
+        for va in file_vas {
+            // SAFETY: mlock is invoked for the current live address space;
+            // demand_alloc_page has the same MMU/frame-allocator contract.
+            unsafe { self.demand_alloc_page(VirtAddr::new(va))? };
         }
+
         // Allocate frames outside the lock.
         let mut allocations: alloc::vec::Vec<(u64, PhysAddr)> =
-            alloc::vec::Vec::with_capacity(needed_vas.len());
-        for va in needed_vas {
-            let phys = crate::frame::alloc_frame()
-                .map_err(|_| AddressSpaceError::OutOfRange)?
-                .start_address();
+            alloc::vec::Vec::with_capacity(anonymous_vas.len());
+        for va in anonymous_vas {
+            let phys = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
+                Ok(frame) => frame.start_address(),
+                Err(_) => {
+                    for (_, allocated) in allocations {
+                        crate::frame::free_frame(crate::frame::PhysFrame::new(allocated));
+                    }
+                    return Err(AddressSpaceError::OutOfRange);
+                }
+            };
             // SAFETY: identity-mapped on x86_64; aarch64
             // uses kernel_mut_ptr for the same purpose.
             // SAFETY: Valid memory or trusted environment
@@ -2296,29 +2921,70 @@ impl AddressSpace {
             }
             allocations.push((va, phys));
         }
+        allocations.sort_unstable_by_key(|&(va, _)| va);
+
         // Re-acquire the lock, stamp the new frames by VA + set the
         // LOCKED flag, then re-materialise (still under the lock — see
         // `change_perms_range` for why the rewrite must not run after the
         // lock drop) so PTEs land for the freshly-backed pages.
         let mut g = self.regions.lock();
-        let mut stamped_bases: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for (va, phys) in allocations {
-            let mut consumed = false;
-            for r in g.iter_mut() {
-                let rb = r.base.as_u64();
-                let re = rb.saturating_add(r.len);
-                if va < rb || va >= re {
+        if !Self::regions_cover_range(&g, lo, hi) {
+            drop(g);
+            for (_, phys) in allocations {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+            }
+            return Err(AddressSpaceError::Unmapped);
+        }
+
+        // Ensure every still-lazy slot can be satisfied by the anonymous
+        // allocation snapshot before publishing any of those frames.  If a
+        // concurrent VMA replacement changed the range while the lock was
+        // dropped, fail without partially setting LOCKED or placing an
+        // anonymous frame in a newly-created FILE_DEMAND mapping.
+        let mut restamp_valid = true;
+        g.for_each_overlapping(lo, hi, |r| {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if rb >= hi || re <= lo {
+                return;
+            }
+            let first = ((lo.max(rb) - rb) >> 12) as usize;
+            let last = ((hi.min(re) - rb) >> 12) as usize;
+            for i in first..last {
+                if r.phys[i].raw() != 0 {
                     continue;
                 }
+                let va = rb + ((i as u64) << 12);
+                if r.perms.contains(RegionPerms::FILE_DEMAND)
+                    || allocations.binary_search_by_key(&va, |&(v, _)| v).is_err()
+                {
+                    restamp_valid = false;
+                    return;
+                }
+            }
+        });
+        if !restamp_valid {
+            drop(g);
+            for (_, phys) in allocations {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+            }
+            return Err(AddressSpaceError::Unmapped);
+        }
+
+        let mut stamped_vas = Vec::new();
+        for (va, phys) in allocations {
+            let mut consumed = false;
+            if let Some(r) = g.containing_mut(va) {
+                let rb = r.base.as_u64();
                 let i = ((va - rb) >> 12) as usize;
-                if i < r.phys.len() && r.phys[i].raw() == 0 {
+                if i < r.phys.len()
+                    && r.phys[i].raw() == 0
+                    && !r.perms.contains(RegionPerms::FILE_DEMAND)
+                {
                     r.phys[i] = phys;
                     consumed = true;
-                    if !stamped_bases.contains(&rb) {
-                        stamped_bases.push(rb);
-                    }
+                    stamped_vas.push(va);
                 }
-                break;
             }
             if !consumed {
                 // Raced with a demand fault (or an unmap) that beat us to
@@ -2326,18 +2992,21 @@ impl AddressSpace {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
-        // Flag every intersecting region LOCKED; collect the ones that
-        // received fresh backing for the PTE rewrite.
-        let mut to_materialise = alloc::vec::Vec::new();
-        for r in g.iter_mut() {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if rb >= hi || re <= lo {
-                continue;
-            }
-            r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
-            if stamped_bases.contains(&rb) {
-                to_materialise.push(r.clone());
+        Self::set_region_flag_range(&mut g, lo, hi, RegionPerms::LOCKED, true);
+        // LOCKED itself does not change page permissions, so only anonymous
+        // pages newly backed above need PTE installation. Rewriting every
+        // resident page made repeated mlock/mlockall proportional to the
+        // entire locked working set even when no residency changed.
+        let mut to_materialise = Vec::with_capacity(stamped_vas.len());
+        for va in stamped_vas {
+            if let Some(region) = g.containing(va) {
+                let index = ((va - region.base.as_u64()) >> 12) as usize;
+                to_materialise.push(Region {
+                    base: VirtAddr::new(va),
+                    len: 4096,
+                    perms: region.perms,
+                    phys: alloc::vec![region.phys[index]],
+                });
             }
         }
         // SAFETY: same identity-map invariant; touched regions
@@ -2348,27 +3017,37 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// `munlock(base, len)` — clear the LOCKED flag on every
-    /// region intersecting `[base, base + len)`. Frames stay
-    /// backed (no swap exists yet to reclaim them). Returns
-    /// Unmapped if no region intersects.
-    pub fn munlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
-        let lo = base.as_u64();
-        let hi = lo.saturating_add(len);
-        let mut g = self.regions.lock();
-        let mut touched = false;
-        for r in g.iter_mut() {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if rb >= hi || re <= lo {
-                continue;
-            }
-            touched = true;
-            r.perms = RegionPerms(r.perms.0 & !RegionPerms::LOCKED.0);
+    /// `mlock2(base, len, MLOCK_ONFAULT)` — mark exactly the rounded range
+    /// LOCKED without populating lazy pages.  A later demand fault supplies
+    /// the backing normally, while reclaim observes LOCKED and leaves it
+    /// resident.  This differs intentionally from [`Self::mlock_range`],
+    /// whose eager population is the defining `mlock(2)` behaviour.
+    pub fn mlock_range_onfault(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let (lo, hi) = Self::rounded_lock_range(base, len)?;
+        if lo == hi {
+            return Ok(());
         }
-        if !touched {
+        let mut regions = self.regions.lock();
+        if !Self::regions_cover_range(&regions, lo, hi) {
             return Err(AddressSpaceError::Unmapped);
         }
+        Self::set_region_flag_range(&mut regions, lo, hi, RegionPerms::LOCKED, true);
+        Ok(())
+    }
+
+    /// `munlock(base, len)` — clear LOCKED on exactly the rounded range.
+    /// Frames stay backed (no swap exists yet to reclaim them). Returns
+    /// Unmapped if any page in the request is unmapped.
+    pub fn munlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let (lo, hi) = Self::rounded_lock_range(base, len)?;
+        if lo == hi {
+            return Ok(());
+        }
+        let mut g = self.regions.lock();
+        if !Self::regions_cover_range(&g, lo, hi) {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        Self::set_region_flag_range(&mut g, lo, hi, RegionPerms::LOCKED, false);
         Ok(())
     }
 
@@ -2410,15 +3089,15 @@ impl AddressSpace {
         // which has always broadcast under this lock).
         let mut g = self.regions.lock();
         let mut hits = Vec::new();
-        for r in g.iter_mut() {
+        g.for_each_overlapping_mut(lo, hi, |r| {
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
             if rb >= hi || re <= lo {
-                continue;
+                return;
             }
             r.perms = new_perms;
             hits.push(r.clone());
-        }
+        });
         if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
         }
@@ -2467,10 +3146,10 @@ impl AddressSpace {
     /// full perms field including those flags.
     ///
     /// Returns:
-    /// - `Ok(())` on a successful change covering ≥ 1 page.
-    /// - `Err(Unmapped)` if no region intersects the request.
-    /// - `Err(AlignmentMismatch)` if `base` or `len` is not page-
-    ///   aligned, or if `new_perms` carries `WRITE | EXEC` (W^X).
+    /// - `Ok(())` on a successful change or zero-length no-op.
+    /// - `Err(Unmapped)` if any page in a non-empty request is unmapped.
+    /// - `Err(AlignmentMismatch)` if `base` is not page-aligned, or if
+    ///   `new_perms` carries `WRITE | EXEC` (W^X). Length rounds upward.
     #[cfg(feature = "linux-compat")]
     pub fn mprotect_range(
         &self,
@@ -2478,6 +3157,12 @@ impl AddressSpace {
         len: u64,
         new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        if len == 0 {
+            return Ok(());
+        }
         // W^X: reject WRITE | EXEC outright. This is sys_mprotect's cap-free
         // fast path; the `Cap<Jit, Grant>`-gated transitions go through
         // `wx::jit_mprotect`, which classifies the change and then calls
@@ -2559,18 +3244,25 @@ impl AddressSpace {
         new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError> {
         let prot = new_perms.prot_only();
-        // Page-align the request. Linux mprotect(2) requires
-        // `addr` to be page-aligned; `len` is rounded up by the
-        // libc caller but we reject silently-misaligned lengths
-        // so callers learn early.
-        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+        // Linux requires `addr` to be page-aligned and rounds length upward.
+        if base.as_u64() & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         if len == 0 {
-            return Err(AddressSpaceError::Unmapped);
+            return Ok(());
         }
         let lo = base.as_u64();
-        let hi = lo.saturating_add(len);
+        let rounded_len = len
+            .checked_add(0xFFF)
+            .map(|value| value & !0xFFF)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let hi = lo
+            .checked_add(rounded_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        if !self.mappings_cover_range(lo, hi) {
+            return Err(AddressSpaceError::Unmapped);
+        }
 
         let huge_touched = {
             let mut huge = self.huge_regions.lock();
@@ -2671,22 +3363,14 @@ impl AddressSpace {
         // under-lock broadcast is deadlock-safe).
         let mut g = self.regions.lock();
         let touched: Vec<Region> = {
-            // Collect indices that intersect [lo, hi). Walk forward
-            // and split in place — we drain the original Vec into
-            // `new_list` so the bookkeeping stays consistent even
-            // if a region's head fragment is empty (drop entirely).
-            let originals: Vec<Region> = core::mem::take(&mut *g);
+            // Drain only the entries intersecting [lo, hi), split them, and
+            // reinsert their disjoint fragments under the same lock.
+            let originals = g.drain_overlapping(lo, hi);
             let mut new_list: Vec<Region> = Vec::with_capacity(originals.len() + 2);
             let mut hits: Vec<Region> = Vec::new();
             for r in originals.into_iter() {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
-                if rb >= hi || re <= lo {
-                    // No intersection — keep verbatim.
-                    new_list.push(r);
-                    continue;
-                }
-
                 // Intersection. Split into up to three pieces.
                 // The old region owns r.phys; we slice it
                 // disjointly into the new fragments so the Drop
@@ -2741,7 +3425,9 @@ impl AddressSpace {
                     });
                 }
             }
-            *g = new_list;
+            for region in new_list {
+                assert!(g.insert(region).is_none());
+            }
             hits
         };
 
@@ -2790,19 +3476,36 @@ impl AddressSpace {
     ///   no-op for those.
     ///
     /// Returns:
-    /// - `Ok(())` on a successful pass over ≥ 1 region.
-    /// - `Err(Unmapped)` if no region intersects the request.
-    /// - `Err(AlignmentMismatch)` for misaligned `base` / `len`.
+    /// - `Ok(())` on a successful pass or zero-length no-op.
+    /// - `Err(Unmapped)` if any page in a non-empty request is unmapped.
+    /// - `Err(AlignmentMismatch)` for misaligned `base`; length rounds up.
     #[cfg(feature = "linux-compat")]
     pub fn madvise_dontneed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
-        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+        if base.as_u64() & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         if len == 0 {
-            return Err(AddressSpaceError::Unmapped);
+            return Ok(());
         }
         let lo = base.as_u64();
-        let hi = lo.saturating_add(len);
+        let rounded_len = len
+            .checked_add(0xFFF)
+            .map(|value| value & !0xFFF)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let hi = lo
+            .checked_add(rounded_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+
+        // Reject holes before clearing any backing. madvise is a hint, but
+        // Linux still reports ENOMEM when part of the requested range is not
+        // mapped; partial release before that error would be observable.
+        {
+            let regions = self.regions.lock();
+            if !Self::regions_cover_range(&regions, lo, hi) {
+                return Err(AddressSpaceError::Unmapped);
+            }
+        }
 
         // Collect the frames to free outside the lock. We stamp
         // `phys[i] = 0` AND tear down the leaf PTE while we hold the
@@ -2818,17 +3521,17 @@ impl AddressSpace {
         let mut touched = false;
         {
             let mut g = self.regions.lock();
-            for r in g.iter_mut() {
+            g.for_each_overlapping_mut(lo, hi, |r| {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
                 if rb >= hi || re <= lo {
-                    continue;
+                    return;
                 }
                 touched = true;
                 // LOCKED region — hint is honoured as a no-op so
                 // mlock'd pages stay resident.
                 if r.perms.contains(RegionPerms::LOCKED) {
-                    continue;
+                    return;
                 }
                 // SHARED region (vDSO / vvar / SysV shmem) — its frames
                 // are BORROWED from a global singleton / external
@@ -2841,7 +3544,7 @@ impl AddressSpace {
                 // exactly this reason; MADV_DONTNEED must too — treat it
                 // as a no-op over a borrowed mapping.
                 if r.perms.contains(RegionPerms::SHARED) {
-                    continue;
+                    return;
                 }
                 let start_v = lo.max(rb);
                 let end_v = hi.min(re);
@@ -2870,7 +3573,7 @@ impl AddressSpace {
                     to_release.push(p);
                     r.phys[i] = PhysAddr::new(0);
                 }
-            }
+            });
         }
         if !touched {
             return Err(AddressSpaceError::Unmapped);
@@ -2941,13 +3644,6 @@ impl AddressSpace {
                     let _ = unsafe { unmap_4kb_local(self.root, v) };
                 }
             } else {
-                let mut flags = PtFlags::USER;
-                if r.perms.contains(RegionPerms::WRITE) {
-                    flags |= PtFlags::WRITABLE;
-                }
-                if !r.perms.contains(RegionPerms::EXEC) {
-                    flags |= PtFlags::NO_EXEC;
-                }
                 for (i, p) in r.phys.iter().enumerate() {
                     // Skip demand-paged pages (phys == 0). They are
                     // NOT currently mapped (materialize skips them),
@@ -2959,6 +3655,13 @@ impl AddressSpace {
                     // first user-mode access — no action needed here.
                     if p.raw() == 0 {
                         continue;
+                    }
+                    let mut flags = PtFlags::USER;
+                    if user_page_writable(r.perms, *p) {
+                        flags |= PtFlags::WRITABLE;
+                    }
+                    if !r.perms.contains(RegionPerms::EXEC) {
+                        flags |= PtFlags::NO_EXEC;
                     }
                     let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                     // SAFETY: identity-mapped; v lies inside r which
@@ -2998,14 +3701,24 @@ impl AddressSpace {
                 }
                 continue;
             }
-            let mut flags = PtFlags::AP_RW_EL1;
-            if !r.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::UXN | PtFlags::PXN;
-            }
             for (i, p) in r.phys.iter().enumerate() {
+                // Lazy pages have no leaf to rewrite. Mapping the zero
+                // sentinel here would expose physical address zero after an
+                // otherwise-unrelated mprotect/mlock operation.
+                if p.raw() == 0 {
+                    continue;
+                }
                 let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: see x86_64 variant.
                 let _ = unsafe { unmap_4kb(self.root, v) };
+                let mut flags = if user_page_writable(r.perms, *p) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
+                if !r.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
                 // SAFETY: same.
                 let _ = unsafe { map_4kb(self.root, v, *p, flags) };
             }
@@ -3018,20 +3731,56 @@ impl AddressSpace {
     /// Snapshot of the region list — returns an owned `Vec<Region>`
     /// so callers can iterate without holding the lock.
     pub fn regions_snapshot(&self) -> Vec<Region> {
-        self.regions.lock().clone()
+        self.regions.lock().snapshot()
     }
 
     /// Materialise all pending regions into actual page-table entries.
-    /// Walks each region's pages and calls `map_4kb` on the AS's
-    /// root translation table — PML4 on x86_64, L0 on aarch64.
+    ///
+    /// This full walk is intended for address-space construction (exec/fork).
+    /// Incremental mapping paths should use [`Self::materialize_range`] so one
+    /// mmap does not revisit every page installed by every earlier mmap.
     ///
     /// # Safety
-    /// The AS must have been constructed via `new_for_user` (so
-    /// `root` points at a valid full-copy PML4). Repeated calls are
-    /// idempotent — `map_4kb` returns `AlreadyMapped` on the second
-    /// pass and this surface treats it as success.
-    #[cfg(target_arch = "x86_64")]
+    /// The AS must have been constructed via `new_for_user`; its architecture
+    /// page-table root must remain live for the duration of the call.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded from this method's contract.
+        unsafe { self.materialize_window(None) }
+    }
+
+    /// Materialise only recorded base-page mappings intersecting
+    /// `[base, base + len)`.
+    ///
+    /// The region lock stays held while current backing metadata is translated
+    /// into PTEs. This is load-bearing under `CLONE_VM`: taking a cloned Region
+    /// snapshot and installing it after dropping the lock would let a racing
+    /// munmap free its frames before this walk used them.
+    ///
+    /// # Safety
+    /// Same live-root requirement as [`Self::materialize`]. `base` and `len`
+    /// must describe a non-empty, page-aligned range in the user half.
+    pub unsafe fn materialize_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let lo = base.as_u64();
+        if lo & 0xFFF != 0 || len == 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let hi = lo
+            .checked_add(len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        // SAFETY: range validation above plus the caller's live-root contract.
+        unsafe { self.materialize_window(Some((lo, hi))) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn materialize_window(
+        &self,
+        window: Option<(u64, u64)>,
+    ) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
@@ -3046,15 +3795,22 @@ impl AddressSpace {
             if r.perms.prot_only().0 == 0 {
                 continue;
             }
-            let mut flags = PtFlags::USER;
-            if r.perms.contains(RegionPerms::WRITE) {
-                flags |= PtFlags::WRITABLE;
-            }
-            if !r.perms.contains(RegionPerms::EXEC) {
-                flags |= PtFlags::NO_EXEC;
-            }
+            let rb = r.base.as_u64();
+            let re = rb + r.len;
+            let (first, last) = match window {
+                Some((lo, hi)) => {
+                    let first = core::cmp::max(rb, lo);
+                    let last = core::cmp::min(re, hi);
+                    if first >= last {
+                        continue;
+                    }
+                    (((first - rb) >> 12) as usize, ((last - rb) >> 12) as usize)
+                }
+                None => (0, r.phys.len()),
+            };
 
-            for (i, p) in r.phys.iter().enumerate() {
+            for i in first..last {
+                let p = r.phys[i];
                 // Lazy / unbacked: phys[i] == 0 means the
                 // demand-paging path will allocate + install on
                 // first user-mode access. Skip here so the PTE
@@ -3062,13 +3818,20 @@ impl AddressSpace {
                 if p.raw() == 0 {
                     continue;
                 }
+                let mut flags = PtFlags::USER;
+                if user_page_writable(r.perms, p) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !r.perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
                 let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: `self.root` is a valid PML4 per the
                 // `new_for_user` contract; pages walked are within
                 // the region we're materialising. `phys[i]` was
                 // length-checked against `len/4096` at map_region.
                 // SAFETY: Valid memory or trusted environment
-                match unsafe { map_4kb(self.root, v, *p, flags) } {
+                match unsafe { map_4kb(self.root, v, p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {} // idempotent
                     // A user region VA that lands in the low-4 GiB window hits
@@ -3108,13 +3871,11 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// # Safety
-    /// The AS must have been constructed via `new_for_user` (so `root`
-    /// points at a valid `TTBR0_EL1` L0 table). Repeated calls are
-    /// idempotent — `map_4kb` returns `AlreadyMapped` on the second pass
-    /// and this surface treats it as success.
     #[cfg(target_arch = "aarch64")]
-    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+    unsafe fn materialize_window(
+        &self,
+        window: Option<(u64, u64)>,
+    ) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
@@ -3126,27 +3887,38 @@ impl AddressSpace {
             if r.perms.prot_only().0 == 0 {
                 continue;
             }
-            // aarch64 perm translation:
-            // - AP_RW_EL1 = kernel-writable; for user the AP field
-            //   changes to RW-EL1/EL0 (0b01<<6). For now Stage-4
-            //   structural keeps the kernel-mode bit; true EL0
-            //   access lands with full user-mode enablement.
-            // - UXN+PXN disable exec at the respective ELs; we set
-            //   UXN unless `perms.contains(EXEC)`.
-            let mut flags = PtFlags::AP_RW_EL1;
-            if !r.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::UXN | PtFlags::PXN;
-            }
-            for (i, p) in r.phys.iter().enumerate() {
+            let rb = r.base.as_u64();
+            let re = rb + r.len;
+            let (first, last) = match window {
+                Some((lo, hi)) => {
+                    let first = core::cmp::max(rb, lo);
+                    let last = core::cmp::min(re, hi);
+                    if first >= last {
+                        continue;
+                    }
+                    (((first - rb) >> 12) as usize, ((last - rb) >> 12) as usize)
+                }
+                None => (0, r.phys.len()),
+            };
+            for i in first..last {
+                let p = r.phys[i];
                 if p.raw() == 0 {
                     continue;
+                }
+                let mut flags = if user_page_writable(r.perms, p) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
+                if !r.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
                 }
                 let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: root is valid per `new_for_user`; pages
                 // covered are within the just-allocated region.
                 // `phys[i]` length was checked at map_region.
                 // SAFETY: Valid memory or trusted environment
-                match unsafe { map_4kb(self.root, v, *p, flags) } {
+                match unsafe { map_4kb(self.root, v, p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
                     // Any other map_4kb failure (frame exhaustion `NoFrame`, an
@@ -3166,16 +3938,17 @@ impl AddressSpace {
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+    unsafe fn materialize_window(
+        &self,
+        _window: Option<(u64, u64)>,
+    ) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
 
     /// Force-rewrite every existing PTE to match the current region
-    /// permission metadata. Unlike [`materialize`] (which skips
-    /// already-mapped pages), this tears down and reinstalls every
-    /// leaf PTE so stale permission bits (e.g. WRITE still set in
-    /// old PTEs after `clone_for_fork` stripped WRITE from regions)
-    /// are corrected.
+    /// permission and per-page COW metadata. Unlike [`materialize`] (which
+    /// skips already-mapped pages), this tears down and reinstalls every leaf
+    /// PTE so writable leaves shared by a new fork child become read-only.
     ///
     /// Called on the **parent** address space after [`clone_for_fork`]
     /// to install READ-ONLY PTEs on regions that previously had WRITE.
@@ -3198,8 +3971,9 @@ impl AddressSpace {
         // `change_perms_range` for why the under-lock batched flush is
         // deadlock-safe.
         let g = self.regions.lock();
+        let snapshot = g.snapshot();
         // SAFETY: identity-map live; `root` valid from `new_for_user`.
-        unsafe { self.rewrite_perms_pages(g.as_slice()) };
+        unsafe { self.rewrite_perms_pages(&snapshot) };
         drop(g);
         Ok(())
     }
@@ -3215,15 +3989,13 @@ impl AddressSpace {
     /// Duplicate this address space for a `fork(2)`-style child.
     ///
     /// **Copy-on-write.** Per region, the child shares the
-    /// parent's physical frames — `frame::cow::inc_ref(phys)` is
-    /// called on every page so the frame allocator knows two
-    /// owners (or more, for nested forks) share the page. The
-    /// returned `AddressSpace` carries the same `Region.phys` Vec
-    /// (cloned) as the parent and an extra cleared-WRITE flag in
-    /// `Region.perms`. The parent's regions are mutated in place
-    /// to also drop WRITE; both sides re-materialise lazily (the
-    /// caller's `materialize()` runs the page-table walk that
-    /// installs the read-only PTEs).
+    /// parent's physical frames — `frame::cow::inc_ref(phys)` is called on
+    /// every resident page so the frame allocator knows two owners (or more,
+    /// for nested forks) share the page. The returned `AddressSpace` carries
+    /// the same `Region.phys` Vec and both regions retain their authoritative
+    /// POSIX WRITE permission while gaining the internal COW marker. Page-table
+    /// materialization combines that marker with the per-frame refcount and
+    /// installs read-only leaves until each page has a sole owner.
     ///
     /// On the first user-mode write to a shared page, the page-
     /// fault handler calls [`Self::cow_split_on_write`] which
@@ -3247,10 +4019,10 @@ impl AddressSpace {
         // SAFETY: caller's contract — paging is live.
         let child = unsafe { Self::new_for_user() }?;
 
-        // Mutate the parent's region table in place: drop WRITE
-        // on every region so the next `materialize()` installs RO
-        // PTEs and the first write traps. Snapshot the resulting
-        // region list to clone into the child.
+        // Mark every private region as potentially COW-shared. Keep its POSIX
+        // WRITE permission authoritative; the PTE derivation consults this
+        // marker plus each frame's refcount to force only shared pages RO.
+        // Snapshot the resulting region list to clone into the child.
         let parent_regions: Vec<Region> = {
             let mut g = self.regions.lock();
             for r in g.iter_mut() {
@@ -3267,8 +4039,8 @@ impl AddressSpace {
                     continue;
                 }
                 // Private region: bump the COW refcount on every backing
-                // frame, then strip WRITE so both ASes start the post-fork
-                // window read-only and split on first write.
+                // frame, then mark the region so both ASes start shared pages
+                // read-only and split on first authorized write.
                 //
                 // Skip unbacked (phys == 0) demand-paged slots: there is no
                 // frame to share yet, so COW doesn't apply. `materialize`
@@ -3285,14 +4057,13 @@ impl AddressSpace {
                     }
                     let _ = crate::frame::cow::inc_ref(p);
                 }
-                r.perms = RegionPerms(r.perms.0 & !RegionPerms::WRITE.0);
+                r.perms = r.perms | RegionPerms::COW;
             }
-            g.clone()
+            g.snapshot()
         };
 
         // The child's regions are a deep clone of the parent's
-        // (post-strip) — same vaddr base, same phys list, same
-        // (now WRITE-stripped) perms.
+        // (post-mark) — same vaddr base, phys list, and logical permissions.
         for r in parent_regions.into_iter() {
             child.map_region_inner(r)?;
         }
@@ -3367,13 +4138,13 @@ impl AddressSpace {
     /// Find the region containing `vaddr`, allocate a fresh frame,
     /// memcpy the old shared frame's contents into it, replace the
     /// region's per-page phys entry with the new frame,
-    /// `dec_ref` the old frame, and re-mark the region's perms
-    /// with WRITE. The caller is responsible for re-materialising
+    /// `dec_ref` the old frame. The caller is responsible for re-materialising
     /// the affected page in the live page-table tree (a real
     /// page-fault handler would do that on the way back out of
     /// the trap).
     ///
-    /// Returns `Unmapped` if no region contains `vaddr`.
+    /// Returns `Unmapped` if no region contains `vaddr`, if WRITE is not an
+    /// authoritative permission, or if the region was not fork-COW marked.
     /// Returns `Ok(())` if the split succeeded OR if the frame
     /// already had refcount 1 (sole owner — no split needed,
     /// just regain WRITE).
@@ -3393,15 +4164,16 @@ impl AddressSpace {
     pub unsafe fn cow_split_on_write(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         let mut g = self.regions.lock();
         let v = vaddr.as_u64();
-        let region_idx = g
-            .iter()
-            .position(|r| {
-                let base = r.base.as_u64();
-                v >= base && v < base + r.len
-            })
-            .ok_or(AddressSpaceError::Unmapped)?;
-        let page_idx = ((v - g[region_idx].base.as_u64()) >> 12) as usize;
-        let old_phys = g[region_idx].phys[page_idx];
+        let region = g.containing_mut(v).ok_or(AddressSpaceError::Unmapped)?;
+        // A present write fault is recoverable only when fork explicitly
+        // made this logically-writable private mapping COW.  In particular,
+        // mprotect(PROT_READ) removes WRITE but leaves a present RO leaf; it
+        // must fall through to SIGSEGV instead of regaining write access.
+        if !region.perms.contains(RegionPerms::WRITE) || !region.perms.contains(RegionPerms::COW) {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+        let old_phys = region.phys[page_idx];
 
         // If this frame's refcount is 1 (we're sole owner), just
         // regain WRITE on the region. The dec_ref returns 0 in
@@ -3410,7 +4182,6 @@ impl AddressSpace {
         let count = crate::frame::cow::count(old_phys);
         if count <= 1 {
             // Sole owner — no copy needed.
-            g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
             return Ok(());
         }
 
@@ -3433,8 +4204,7 @@ impl AddressSpace {
             );
         }
         let _new_count = crate::frame::cow::dec_ref(old_phys);
-        g[region_idx].phys[page_idx] = new_phys;
-        g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
+        region.phys[page_idx] = new_phys;
         Ok(())
     }
 
@@ -3508,7 +4278,7 @@ impl AddressSpace {
             {
                 use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
                 let mut flags = PtFlags::USER;
-                if region.perms.contains(RegionPerms::WRITE) {
+                if user_page_writable(region.perms, new_phys) {
                     flags |= PtFlags::WRITABLE;
                 }
                 if !region.perms.contains(RegionPerms::EXEC) {
@@ -3520,7 +4290,11 @@ impl AddressSpace {
             #[cfg(target_arch = "aarch64")]
             {
                 use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
-                let mut flags = PtFlags::AP_RW_EL1;
+                let mut flags = if user_page_writable(region.perms, new_phys) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
                 if !region.perms.contains(RegionPerms::EXEC) {
                     flags = flags | PtFlags::UXN | PtFlags::PXN;
                 }
@@ -3539,7 +4313,7 @@ impl AddressSpace {
             {
                 use crate::x86_64::paging::{map_4kb, PtFlags};
                 let mut flags = PtFlags::USER;
-                if region.perms.contains(RegionPerms::WRITE) {
+                if user_page_writable(region.perms, old_phys) {
                     flags |= PtFlags::WRITABLE;
                 }
                 if !region.perms.contains(RegionPerms::EXEC) {
@@ -3551,7 +4325,11 @@ impl AddressSpace {
             #[cfg(target_arch = "aarch64")]
             {
                 use crate::aarch64::paging::{map_4kb, PtFlags};
-                let mut flags = PtFlags::AP_RW_EL1;
+                let mut flags = if user_page_writable(region.perms, old_phys) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
                 if !region.perms.contains(RegionPerms::EXEC) {
                     flags = flags | PtFlags::UXN | PtFlags::PXN;
                 }
@@ -3954,7 +4732,7 @@ impl AddressSpace {
         let phys = region.phys[page_idx];
 
         let mut flags = PtFlags::USER;
-        if region.perms.contains(RegionPerms::WRITE) {
+        if user_page_writable(region.perms, phys) {
             flags |= PtFlags::WRITABLE;
         }
         if !region.perms.contains(RegionPerms::EXEC) {
@@ -4020,7 +4798,11 @@ impl AddressSpace {
         let phys = region.phys[page_idx];
 
         // Mirror the materialize() flag derivation for aarch64.
-        let mut flags = PtFlags::AP_RW_EL1;
+        let mut flags = if user_page_writable(region.perms, phys) {
+            PtFlags::AP_RW_EL0
+        } else {
+            PtFlags::AP_RO_EL0
+        };
         if !region.perms.contains(RegionPerms::EXEC) {
             flags = flags | PtFlags::UXN | PtFlags::PXN;
         }

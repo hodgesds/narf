@@ -3,9 +3,9 @@ use super::*;
 
 /// `madvise(addr, len, advice)` — Linux syscall 28. The kernel honours
 /// MADV_DONTNEED (4) and MADV_FREE (8) as "release backing frames; next
-/// access reads zero." Every other advice value returns Ok(0) — `madvise`
-/// is a hint, not a contract, so silently accepting unknown advice values
-/// matches Linux's behaviour for callers that probe by value.
+/// access reads zero." Implemented performance-only hints are accepted as
+/// no-ops. Unknown values and semantic controls NARF cannot honor return
+/// EINVAL instead of claiming a state transition that did not happen.
 ///
 /// `arg0` = base, `arg1` = len, `arg2` = advice.
 ///
@@ -33,19 +33,33 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     // end up with "next access reads zero", which is what callers need.
     const MADV_DONTNEED: i32 = 4;
     const MADV_FREE: i32 = 8;
+    const MADV_NORMAL: i32 = 0;
+    const MADV_RANDOM: i32 = 1;
+    const MADV_SEQUENTIAL: i32 = 2;
+    const MADV_WILLNEED: i32 = 3;
+    const MADV_MERGEABLE: i32 = 12;
+    const MADV_UNMERGEABLE: i32 = 13;
+    const MADV_HUGEPAGE: i32 = 14;
+    const MADV_NOHUGEPAGE: i32 = 15;
+    const MADV_COLD: i32 = 20;
+    const MADV_PAGEOUT: i32 = 21;
 
     match advice {
         MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
         },
-        // Other advice values (MADV_NORMAL, MADV_RANDOM, MADV_WILLNEED,
-        // MADV_SEQUENTIAL, MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_DONTFORK,
-        // MADV_DOFORK, MADV_REMOVE, MADV_DONTDUMP, MADV_DODUMP, …) —
-        // accept and ignore. `madvise` is a hint; the contract is that
-        // the kernel does its best and the program runs correctly either
-        // way. Returning success here matches Linux's behaviour for
-        // architectures that don't implement a given advice.
-        _ => ctx.set_return(SyscallReturn::ok(0)),
+        // These values are performance hints only. NARF has no readahead,
+        // KSM, THP promotion, or active LRU aging policy to tune yet, so a
+        // successful no-op preserves their contract.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_MERGEABLE
+        | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_COLD | MADV_PAGEOUT => {
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        // DONTFORK/DOFORK, WIPEONFORK/KEEPONFORK, DONTDUMP/DODUMP,
+        // POPULATE_*, REMOVE, COLLAPSE, guard pages, and unknown values have
+        // observable semantics beyond a hint. Fail explicitly until those
+        // state machines exist.
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
     }
 }

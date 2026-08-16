@@ -562,22 +562,12 @@ pub fn set_full_shootdown_hook(hook: TlbFullShootdownHook) {
     FULL_SHOOTDOWN_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
-/// Flush EVERY non-global TLB entry — locally and (when the hook is
-/// installed) on every peer CPU with a single broadcast IPI. User
-/// PTEs are never GLOBAL, so this covers any stale user-half entry
-/// regardless of which address space / PCID it belongs to. This is
-/// the Linux `flush_tlb_mm` analogue used by whole-AS batch
-/// operations (fork's COW WRITE-strip `rematerialize`, exit-path
-/// region teardown) after a `*_local` PTE walk.
+/// Flush every non-global TLB entry on the current CPU.
 ///
 /// # Safety
-/// CPL=0 only. Callers relying on this for frame-reuse safety must
-/// call it BEFORE freeing the frames the walk unmapped.
-pub unsafe fn flush_user_tlb_all_cpus() {
-    // Local flush first: INVPCID type-3 (all contexts, non-global)
-    // when available — a plain CR3 reload only drops the CURRENT
-    // PCID's entries when CR4.PCIDE=1, which would leave stale
-    // entries under other PCID tags.
+/// CPL=0 only.
+pub(crate) unsafe fn flush_user_tlb_local() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     if narf_arch::x86_64::pcid::invpcid_supported() && narf_arch::x86_64::pcid::pcide_enabled() {
         // SAFETY: INVPCID gated on support + PCIDE.
         unsafe { narf_arch::x86_64::pcid::invpcid_all_without_globals() };
@@ -590,6 +580,23 @@ pub unsafe fn flush_user_tlb_all_cpus() {
             core::arch::asm!("mov cr3, {0}", in(reg) c, options(nomem, nostack, preserves_flags));
         }
     }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Flush EVERY non-global TLB entry — locally and (when the hook is
+/// installed) on every peer CPU with a single broadcast IPI. User
+/// PTEs are never GLOBAL, so this covers any stale user-half entry
+/// regardless of which address space / PCID it belongs to. This is
+/// the Linux `flush_tlb_mm` analogue used by whole-AS batch
+/// operations (fork's COW WRITE-strip `rematerialize`, exit-path
+/// region teardown) after a `*_local` PTE walk.
+///
+/// # Safety
+/// CPL=0 only. Callers relying on this for frame-reuse safety must
+/// call it BEFORE freeing the frames the walk unmapped.
+pub unsafe fn flush_user_tlb_all_cpus() {
+    // SAFETY: forwarded CPL=0 contract.
+    unsafe { flush_user_tlb_local() };
     let h = FULL_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if h != 0 {
         // SAFETY: stored as `TlbFullShootdownHook as usize`.
@@ -885,6 +892,17 @@ pub unsafe fn map_4kb(
     // root (held across the whole RMW + INVLPG). See `pt_lock_for`.
     let _pt_guard = pt_lock_for(pml4_phys).lock();
 
+    // SAFETY: validation and lock acquisition are immediately above.
+    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags) }
+}
+
+/// Install one validated leaf with the per-root page-table lock held.
+unsafe fn map_4kb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     let idx = WalkIndices::from_virt(virt);
     // Intermediate tables need `USER` whenever the leaf does — the
     // CPU AND's the USER bits across every level of the walk, so a
@@ -950,6 +968,60 @@ pub unsafe fn map_4kb(
     Ok(())
 }
 
+/// Map a contiguous virtual run from scatter-list backing while acquiring the
+/// per-root mutation lock once. Zero physical entries are lazy holes and are
+/// skipped. `flags_for` derives each leaf's permissions from its backing.
+///
+/// On failure, leaves installed earlier in the run remain present; callers
+/// that need transactionality must tear the destination range down before
+/// returning the error.
+///
+/// # Safety
+/// Same identity-map and live-root contract as [`map_4kb`] for the complete
+/// virtual run and every non-zero physical entry.
+pub unsafe fn map_4kb_scatter_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    mut flags_for: impl FnMut(PhysAddr) -> PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(base) || base.raw() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let span = (backing.len() as u64)
+        .checked_mul(4096)
+        .ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if !backing.is_empty() {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+    if backing
+        .iter()
+        .any(|phys| phys.raw() != 0 && phys.raw() & 0xFFF != 0)
+    {
+        return Err(MapError::UnalignedPhys);
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
+        // SAFETY: the complete range was validated above and the root lock is
+        // held for this whole loop.
+        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(phys))? };
+    }
+    Ok(())
+}
+
 /// Tear down a 4 KiB mapping. Intermediate tables are left intact —
 /// Wave 2+'s refcounted-table work adds the "delete if empty" sweep.
 ///
@@ -980,9 +1052,10 @@ pub unsafe fn unmap_4kb_local(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<Phy
 }
 
 /// Tear down a contiguous run of 4 KiB leaves while acquiring the per-root
-/// page-table mutation lock once. Every present leaf still receives its local
-/// INVLPG; the caller owns one later cross-CPU range/full invalidation before
-/// any removed backing can be reused.
+/// page-table mutation lock once. Small runs receive per-leaf INVLPG; large
+/// runs clear all leaves and perform one local non-global flush. The caller
+/// owns one later cross-CPU range/full invalidation before any removed backing
+/// can be reused.
 ///
 /// Returns the number of present leaves removed. Missing leaves are benign,
 /// matching repeated [`unmap_4kb_local`] calls.
@@ -1011,15 +1084,65 @@ pub unsafe fn unmap_4kb_local_range(
 
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     let mut removed = 0;
+    const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+    let per_page_invalidate = pages <= FULL_FLUSH_PAGE_CEILING;
+    // A contiguous range spends up to 512 pages in the same leaf table.
+    // Cache that table instead of repeating the PML4->PDPT->PD traversal for
+    // every 4 KiB entry; absent upper-level entries are cached too.
+    // SAFETY: root is identity-reachable per the caller's contract and the
+    // per-root mutation lock remains held for the complete walk.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
     for page in 0..pages {
         let virt = VirtAddr::new(base.raw() + page * 4096);
-        // SAFETY: the caller's range contract covers this page; the per-root
-        // mutation lock is held for the complete batch.
-        match unsafe { unmap_4kb_locked(pml4_phys, virt, false) } {
-            Ok(_) => removed += 1,
-            Err(MapError::AlreadyMapped) => {}
-            Err(error) => return Err(error),
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            let pml4e = pml4.entries[idx.pml4];
+            if pml4e.is_present() {
+                // SAFETY: present non-leaf entry points at an identity-mapped
+                // page table under this root.
+                let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+                let pdpte = pdpt.entries[idx.pdpt];
+                if pdpte.is_present() {
+                    if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                        return Err(MapError::EncounteredHugePage);
+                    }
+                    // SAFETY: same, one level lower.
+                    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+                    let pde = pd.entries[idx.pd];
+                    if pde.is_present() {
+                        if pde.flags().contains(PtFlags::HUGE_PAGE) {
+                            return Err(MapError::EncounteredHugePage);
+                        }
+                        cached_pt = pde.addr().as_mut_ptr::<PageTable>();
+                    }
+                }
+            }
         }
+        if cached_pt.is_null() {
+            continue;
+        }
+        // SAFETY: cached_pt was obtained from the present PDE for this key;
+        // the root lock prevents replacement during the batch.
+        let pt = unsafe { &mut *cached_pt };
+        if !pt.entries[idx.pt].is_present() {
+            continue;
+        }
+        pt.entries[idx.pt] = PageTableEntry::EMPTY;
+        removed += 1;
+        if per_page_invalidate {
+            // SAFETY: the just-cleared leaf owns this page-aligned VA.
+            unsafe { invlpg(virt) };
+        }
+    }
+    if removed != 0 && !per_page_invalidate {
+        // SAFETY: all affected leaves are already clear under the root lock;
+        // one non-global flush retires their local translations before return.
+        unsafe { flush_user_tlb_local() };
     }
     Ok(removed)
 }
@@ -1040,7 +1163,7 @@ unsafe fn unmap_4kb_impl(
     let _pt_guard = pt_lock_for(pml4_phys).lock();
 
     // SAFETY: validation and lock acquisition are immediately above.
-    unsafe { unmap_4kb_locked(pml4_phys, virt, broadcast) }
+    unsafe { unmap_4kb_locked(pml4_phys, virt, broadcast, true) }
 }
 
 /// Remove one already-validated leaf with `pt_lock_for(pml4_phys)` held.
@@ -1048,6 +1171,7 @@ unsafe fn unmap_4kb_locked(
     pml4_phys: PhysAddr,
     virt: VirtAddr,
     broadcast: bool,
+    invalidate_local: bool,
 ) -> Result<PhysAddr, MapError> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller promises identity reachability.
@@ -1089,12 +1213,15 @@ unsafe fn unmap_4kb_locked(
     // cached the prior PA. Use the cross-CPU invalidator so any
     // installed shootdown hook fires — unless the caller asked for
     // the local-only variant and owns the deferred batch broadcast.
-    // SAFETY: INVLPG always safe; hook call is gated by atomic load.
-    unsafe {
-        if broadcast {
-            invlpg_global(virt);
-        } else {
-            invlpg(virt);
+    if invalidate_local {
+        // SAFETY: INVLPG is valid for any canonical address, and the global
+        // helper gates its optional shootdown hook through an atomic load.
+        unsafe {
+            if broadcast {
+                invlpg_global(virt);
+            } else {
+                invlpg(virt);
+            }
         }
     }
 

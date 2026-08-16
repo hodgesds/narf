@@ -4,7 +4,7 @@ use super::*;
 /// `munlock(addr, len)` — clear LOCKED flag (frames stay backed
 /// since no swap exists yet to reclaim them). arg0 = base,
 /// arg1 = len. Ok(0) on success, InvalidOp if no region
-/// intersects.
+/// is not completely mapped.
 pub(crate) fn sys_munlock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let as_ref = match current_address_space() {

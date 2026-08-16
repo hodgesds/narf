@@ -151,7 +151,28 @@ pub struct HugeRegion {
     pub frames: Vec<HugeFrame>,
 }
 
+/// POSIX protection bits plus internal address-space state. COW preserves the
+/// logical WRITE authority while shared resident leaves remain hardware RO;
+/// LOCKED excludes a range from reclaim, including lazy MLOCK_ONFAULT pages.
+pub struct RegionPerms(u32);
+impl RegionPerms {
+    pub const READ: RegionPerms;
+    pub const WRITE: RegionPerms;
+    pub const EXEC: RegionPerms;
+    pub const LOCKED: RegionPerms;
+    pub const COW: RegionPerms;
+}
+
 impl AddressSpace {
+    /// Materialize every recorded base-page region; used for exec/fork build.
+    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
+    /// Materialize only current regions intersecting a page-aligned user range.
+    /// The region lock is held through the page-table walk.
+    pub unsafe fn materialize_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<(), AddressSpaceError>;
     /// Install real architecture huge/block leaves and take frame ownership.
     pub unsafe fn map_huge_region(
         &self,
@@ -169,6 +190,27 @@ impl AddressSpace {
         -> usize;
     /// Non-owning per-region resident-page counts grouped by SRAT node.
     pub fn numa_regions_snapshot(&self) -> Vec<NumaRegionSnapshot>;
+    /// One mincore-shaped residency byte per rounded base page; holes fail.
+    pub fn residency_range(&self, base: VirtAddr, len: u64)
+        -> Result<Vec<u8>, AddressSpaceError>;
+    /// Move one complete private base-page region without copying resident
+    /// bytes; shrink drops tail ownership, growth appends lazy pages.
+    pub unsafe fn relocate_region(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+    ) -> Result<(), AddressSpaceError>;
+    /// Eagerly populate and pin exactly the rounded mapped range.
+    pub fn mlock_range(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    /// Pin exactly the rounded mapped range without populating lazy pages.
+    pub fn mlock_range_onfault(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    /// Unpin exactly the rounded mapped range without discarding backing.
+    pub fn munlock_range(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
 }
 
 /// Install the external shared-page owner's per-alias lifetime hooks.
@@ -194,6 +236,15 @@ pub unsafe fn x86_64::paging::unmap_4kb_local_range(
     base: VirtAddr,
     pages: u64,
 ) -> Result<u64, MapError>;
+
+/// Install a contiguous virtual run from scatter-list backing under one
+/// per-root mutation-lock hold; zero entries remain lazy/unmapped.
+pub unsafe fn x86_64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
@@ -338,6 +389,25 @@ x86_64 is rejected at runtime.
   domain id + PKRS snapshot in `CpuLocal` on entry and restore on
   exit; a re-entrant call from within the same domain context is a
   bug, caught by an assertion.
+- A private fork preserves each VMA's logical POSIX WRITE bit and marks it
+  COW. Hardware leaves remain read-only while their backing-frame refcount is
+  greater than one. A write fault is recoverable only when both WRITE and COW
+  are present; `mprotect(PROT_READ)` therefore cannot be mistaken for COW.
+- Base-page relocation installs the disjoint destination before removing the
+  source, publishes backing ownership exactly once, invalidates source
+  translations before freeing a truncated tail, and leaves the source intact
+  when destination installation fails.
+- Base-page regions live in an ordered tree keyed by virtual base. The key and
+  `Region.base` remain equal after every insertion, removal, split, stack
+  growth, and relocation. Because regions never overlap, admission, point
+  lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
+  inspect only the predecessor/successor or intersecting tree range; backing
+  ownership and TLB ordering are unchanged by this metadata index invariant.
+- Every AS-private x86_64 page-table frame has one live entry in the fixed
+  atomic ownership registry. Open-addressed probing never overwrites a live
+  entry; deletion leaves a tombstone so colliding ownership remains visible;
+  lookup may stop only at a never-used slot. Kernel-shared page tables are not
+  registered and therefore are never reclaimed by user-address-space teardown.
 
 ## 5. Architecture notes
 
