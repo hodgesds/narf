@@ -251,6 +251,15 @@ pub fn set_wall_offset_uncapped(offset_ns: i64) {
     WALL_OFFSET_NS.store(offset_ns, Ordering::Release);
 }
 
+/// Current monotonic→wall offset in nanoseconds (`now_wall = monotonic_ns +
+/// offset`). Read by the vDSO builder so the vvar page publishes the real
+/// boot-anchored offset instead of a hard 0 (which would make the vDSO's
+/// `CLOCK_REALTIME` fast path report epoch 1970 even after the kernel anchored
+/// the wall clock to the RTC).
+pub fn wall_offset_ns() -> i64 {
+    WALL_OFFSET_NS.load(Ordering::Acquire)
+}
+
 /// Begin a leap-smear over `window_ns` — gradually fold a `delta_ns`
 /// correction into the wall offset instead of stepping. Negative
 /// deltas smear backwards; zero is rejected because it's nonsense.

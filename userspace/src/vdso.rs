@@ -113,7 +113,15 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
         let _ = narf_memory::frame::cow::inc_ref(f);
     }
 
-    write_vvar(vvar, cycles_per_ns.max(1), 0);
+    // Publish the wall-clock offset the kernel already anchored to the CMOS
+    // RTC at boot (bare_main), NOT a hard 0 — otherwise the vDSO's
+    // CLOCK_REALTIME fast path reports epoch 1970 until some process happens to
+    // call clock_settime, even though the syscall path reads real wall time.
+    write_vvar(
+        vvar,
+        cycles_per_ns.max(1),
+        narf_scheduler::narf_time::wall_offset_ns(),
+    );
     *g = Some(VdsoImage {
         vvar_frame: vvar,
         vdso_frames: frames,

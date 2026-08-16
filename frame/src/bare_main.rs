@@ -3798,6 +3798,44 @@ fn run_async_demo() -> ! {
                 "  tsc: calibration failed — running in raw-tick units"
             );
         }
+
+        // Anchor CLOCK_REALTIME to the CMOS RTC now that the TSC timebase is
+        // calibrated (so `monotonic_ns()` is accurate). Linux does this in
+        // `read_persistent_clock()` at boot. Without it the wall clock stays
+        // boot-relative — epoch 1970 — which makes PAM's `unix_chkpwd` see
+        // every account's password "changed in the future", derails
+        // `user@.service` (systemd --user) session setup so the user session
+        // bus never comes up, and skews every TLS/cert/mtime/timer check.
+        // Must run single-threaded (before SMP wake-ups: CMOS 0x70/0x71 is
+        // unsynchronised) and before the vDSO vvar is published, so both the
+        // kernel syscall and the vDSO fast path read real wall time.
+        // SAFETY: CPL=0, single-threaded here; CMOS ports 0x70/0x71 unowned.
+        match unsafe { narf_arch::x86_64::rtc::read_now() } {
+            Ok(rtc) => {
+                let unix_secs = rtc.to_unix_seconds();
+                if unix_secs > 0 {
+                    let target_ns = (unix_secs as i128) * 1_000_000_000;
+                    let mono_ns = narf_time::monotonic_ns() as i128;
+                    let offset_ns = (target_ns - mono_ns) as i64;
+                    narf_time::set_wall_offset_uncapped(offset_ns);
+                    let _ = writeln!(
+                        console::Writer,
+                        "  rtc: wall clock anchored to CMOS (unix {unix_secs}s, offset {offset_ns}ns)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  rtc: CMOS epoch <= 0 ({unix_secs}); wall clock left boot-relative"
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  rtc: CMOS read failed ({e:?}); wall clock left boot-relative"
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
