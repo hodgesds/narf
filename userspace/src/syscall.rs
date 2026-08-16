@@ -3278,6 +3278,48 @@ pub fn set_trace_comm(prefix: &str) {
     let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
 }
 
+/// Errors-only mode for the syscall trace (cmdline `trace_errors_only`). When
+/// set, the trace SKIPS the per-call SYSC entry line and only emits a SYSR
+/// line for calls that FAIL with a reportable errno (see
+/// `is_reportable_syscall_error`). This keeps the trace light enough to reach
+/// a late boot phase — the full trace floods the serial console so hard the
+/// boot never gets to e.g. the greeter's `locale1` activation (observer
+/// effect). Combine with a `trace_comm=` selector to watch one comm's failures
+/// (e.g. `trace_comm=systemd-executo trace_errors_only` shows exactly which
+/// sandbox-setup syscall makes a service's start job fail).
+#[cfg(feature = "syscall-trace")]
+static TRACE_ERRORS_ONLY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable errors-only trace mode (see [`TRACE_ERRORS_ONLY`]).
+#[cfg(feature = "syscall-trace")]
+pub fn set_trace_errors_only(v: bool) {
+    TRACE_ERRORS_ONLY.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "syscall-trace")]
+fn trace_errors_only() -> bool {
+    TRACE_ERRORS_ONLY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A syscall return worth reporting in errors-only mode: a negative value in
+/// the Linux errno band, EXCLUDING the high-frequency benign ones that flood a
+/// normal boot and are never the fatal step — EAGAIN (non-blocking I/O),
+/// EINTR (restart), ENOENT (path probing). The fatal sandbox op returns
+/// something else (EPERM/EINVAL/ENOSYS/EOPNOTSUPP/EACCES/…).
+#[cfg(feature = "syscall-trace")]
+fn is_reportable_syscall_error(value: u64) -> bool {
+    let v = value as i64;
+    v <= -1
+        && v >= -4095
+        && v != -11 /* EAGAIN */
+        && v != -4 /* EINTR */
+        && v != -2 /* ENOENT */
+        && v != -25 /* ENOTTY — terminal ioctl probes flood the trace */
+        && v != -3 /* ESRCH */
+        && v != -10 /* ECHILD */
+}
+
 /// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
 /// are deliberately comm-scoped: tracing every process perturbs scheduling
 /// and buries the first failing syscall under unrelated boot traffic. Every
@@ -3405,8 +3447,17 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    // In errors-only mode still surface exit_group/exit ENTRY lines: a systemd
+    // executor that fails sandbox setup calls exit_group(<EXIT_* category>)
+    // instead of execve()'ing the service binary, so this one line names the
+    // failing category (226=NAMESPACE, 227=CGROUP, 209=STDIN, …) for a service
+    // whose start job fails with no reportable syscall errno.
     #[cfg(feature = "syscall-trace")]
-    if syscall_trace_relevant(n) {
+    let show_entry = syscall_trace_relevant(n)
+        && (!trace_errors_only()
+            || matches!(table.name_of(n), Some("exit_group") | Some("exit")));
+    #[cfg(feature = "syscall-trace")]
+    if show_entry {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -3448,15 +3499,23 @@ pub fn kernel_syscall_entry_plain_with_state(
     if syscall_trace_relevant(n) {
         use core::fmt::Write as _;
         let r = ctx.ret;
-        let _ = writeln!(
-            narf_console::Writer,
-            "SYSR t={} {} = {} ({:#x}) st={:?}",
-            crate::handlers::current_task_id(),
-            table.name_of(n).unwrap_or("?"),
-            r.value as i64,
-            r.value,
-            r.status,
-        );
+        let errors_only = trace_errors_only();
+        if !errors_only || is_reportable_syscall_error(r.value) {
+            let _ = writeln!(
+                narf_console::Writer,
+                "SYSR t={} {} = {} ({:#x}) st={:?}",
+                crate::handlers::current_task_id(),
+                table.name_of(n).unwrap_or("?"),
+                r.value as i64,
+                r.value,
+                r.status,
+            );
+            // Errors-only mode suppresses the SYSC entry line, so decode the
+            // path args HERE to show which file/mount the failing op targeted.
+            if errors_only {
+                trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+            }
+        }
     }
     // PTRACE_SYSCALL exit-stop: after the syscall body, before returning to
     // user, stop again so the tracer can read the return value (rax). The

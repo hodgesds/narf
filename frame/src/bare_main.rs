@@ -4087,6 +4087,17 @@ fn boot_userspace_init() {
             "  boot-init: syscall-trace comm='{prefix}'"
         );
     }
+    // `trace_errors_only` (bare flag) restricts the syscall trace to calls that
+    // FAIL with a reportable errno — light enough to reach a late boot phase
+    // that the full trace's serial flood would never let the boot reach.
+    #[cfg(feature = "syscall-trace")]
+    if narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .any(|t| t == "trace_errors_only")
+    {
+        narf_userspace::syscall::set_trace_errors_only(true);
+        let _ = writeln!(console::Writer, "  boot-init: syscall-trace errors-only");
+    }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
     narf_userspace::vdso::register_vdso_image(
