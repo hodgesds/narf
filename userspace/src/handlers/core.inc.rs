@@ -5010,6 +5010,21 @@ fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
     g.as_mut().and_then(|m| m.remove(&task_id_raw))
 }
 
+/// Test-only: install a clear_child_tid entry with an explicit private-futex
+/// namespace and no AS root (the exit path then skips the word write but still
+/// fires the wake), modelling a real thread whose private namespace is a live
+/// AddressSpace Arc pointer (always nonzero in production).
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_namespace: u64) {
+    set_clear_child_tid_with_as(
+        task_id_raw,
+        uaddr,
+        narf_memory::PhysAddr::new(0),
+        futex_namespace,
+    );
+}
+
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
 /// without consuming it. Returns just the uaddr; AS root is
 /// internal bookkeeping.
@@ -5092,14 +5107,26 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     }
 
     // NOW bump the counter (lost-wakeup gen guard) AND fire every parked waiter
-    // in this address space's PRIVATE futex namespace — AFTER the word write
-    // above, so a joiner's wake→re-read observes the cleared (0) word and
-    // proceeds instead of re-parking. Linux's clear_child_tid exit wake is a
-    // private futex wake; publishing it in namespace 0 misses pthread_join's
-    // FUTEX_WAIT_PRIVATE queue and degrades every join to the timer backstop.
+    // on this uaddr — AFTER the word write above, so a joiner's wake→re-read
+    // observes the cleared (0) word and proceeds instead of re-parking.
+    //
+    // Wake BOTH namespaces. Linux's mm_release fires the exit wake as
+    // `do_futex(tidptr, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
+    // (kernel/fork.c) — i.e. SHARED (namespace 0) — and glibc's pthread_join
+    // (`lll_futex_wait` on `__default_pthread_attr`-cleared child_tid) and
+    // musl's `__tl_lock` both wait SHARED on that word. Waking only the
+    // recorded private namespace therefore missed every glibc/musl joiner and
+    // degraded each join to the ~10 ms timer backstop (a lost-wake-shaped
+    // stall). Keep the private wake too so any private waiter on the word is
+    // still served; over-waking a namespace with no waiter is a cheap no-op.
     let key = futex_key(entry.futex_namespace, uaddr);
     futex_bump_counter_key(key);
     futex_wake_waiters_key(key, u32::MAX);
+    if entry.futex_namespace != 0 {
+        let shared_key = futex_key(0, uaddr);
+        futex_bump_counter_key(shared_key);
+        futex_wake_waiters_key(shared_key, u32::MAX);
+    }
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]

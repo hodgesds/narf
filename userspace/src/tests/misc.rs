@@ -1670,6 +1670,232 @@ kernel_test_in!(
     smoke_userspace_private_futex_namespaces_isolate_same_uaddr
 );
 
+/// A `FUTEX_WAIT` that ends WITHOUT a `FUTEX_WAKE` (timeout expiry, pending
+/// signal, wheel-full bailout) must remove its waker from the per-uaddr wait
+/// queue, exactly like Linux: `__futex_wait` calls `futex_unqueue(&q)` on
+/// every non-woken exit path (kernel/futex/waitwake.c — "If we were woken
+/// (and unqueued), we succeeded"; otherwise unqueue → -ETIMEDOUT/-ERESTARTSYS),
+/// so a later `futex_wake(nr=1)` can only ever wake a CURRENT waiter.
+///
+/// NARF's park-loop unpark paths (`park_should_block`'s deadline-reached
+/// cleanup and `UserTaskFuture::poll`'s twin) clear `futex_uaddr` but never
+/// call `futex_drop_waiter_key`, leaving a GHOST entry. A later
+/// `FUTEX_WAKE(word, 1)` — e.g. glibc `pthread_cond_signal` — pops the ghost,
+/// reports 1 woken, force-clears the ghost task's CURRENT park deadline
+/// (`wake_one`), and does NOT wake the real waiter, which then rides the
+/// ~10 ms wheel backstop instead of the wake. Drives the REAL
+/// `park_should_block` (via `__test_park_should_block`) through a park and a
+/// timeout-expiry unpark, then pins the Linux invariant: nothing may remain
+/// on the queue.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_futex_timeout_unpark_unqueues_waiter() -> TestResult {
+    use crate::handlers::{
+        dbg_futex_waiter_registered, futex_gen, futex_wake_waiters_for_test, with_kernel_buffers,
+    };
+    use crate::user_task::{UserTaskCtx, __test_park_should_block};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw below; the temporary
+            // reconstruction is balanced by converting it back.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the strong reference owned by this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the waker retains its strong reference across this call.
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: releases the strong reference owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: vtable matches the Arc<AtomicU32> representation.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    // The futex word lives on the kernel stack; `with_kernel_buffers` lets
+    // `futex_read_user_word`'s copy_from_user accept it (same opt-in the ABI
+    // smokes use for their fixtures).
+    let word: u32 = 7;
+    let uaddr = &word as *const u32 as u64;
+    let woken = Arc::new(AtomicU32::new(0));
+    let waker = counting_waker(woken);
+    let uc = UserTaskCtx::new();
+    let now = narf_scheduler::narf_time::monotonic_ns();
+
+    // Publish the exact park state sys_futex's FUTEX_WAIT arm publishes
+    // (sys_futex.rs): expected value, gen snapshot, uaddr, finite deadline.
+    uc.futex_uaddr.store(uaddr, Ordering::Release);
+    uc.futex_namespace.store(0, Ordering::Release);
+    uc.futex_val.store(7, Ordering::Release);
+    uc.futex_park_gen.store(futex_gen(uaddr), Ordering::Release);
+    uc.sleep_deadline_ns
+        .store(now.saturating_add(60_000_000_000), Ordering::Release);
+
+    let mut sleep_handle = None;
+    let tid = crate::handlers::current_task_id();
+    let blocked = with_kernel_buffers(|| __test_park_should_block(&uc, &waker, &mut sleep_handle));
+    if blocked {
+        // Parked: the loop registered our waker on the word's wait queue.
+        if !dbg_futex_waiter_registered(0, uaddr, tid) {
+            let _ = futex_wake_waiters_for_test(uaddr, u32::MAX);
+            return TestResult::Fail("setup: park loop parked without registering the waiter");
+        }
+        // The timed wait expires (the wheel backstop re-poll re-runs the
+        // park decision with the deadline in the past).
+        uc.sleep_deadline_ns.store(1, Ordering::Release);
+        if with_kernel_buffers(|| __test_park_should_block(&uc, &waker, &mut sleep_handle)) {
+            let _ = futex_wake_waiters_for_test(uaddr, u32::MAX);
+            return TestResult::Fail("setup: park loop did not break at an expired deadline");
+        }
+    } else if !dbg_futex_waiter_registered(0, uaddr, tid) {
+        // Neither parked nor registered (e.g. a pending signal for the
+        // kernel-test tid broke the park before the futex arm ran) — the
+        // scenario under test was never reached.
+        return TestResult::Fail("setup: park loop never reached the futex arm");
+    }
+
+    // The wait ended with NO FUTEX_WAKE on the word. Linux parity
+    // (futex_unqueue): the queue is empty; a later FUTEX_WAKE finds nobody.
+    let leaked = dbg_futex_waiter_registered(0, uaddr, tid);
+    // (Also cleans up the ghost so later tests see a clean global table.)
+    let ghost_woken = futex_wake_waiters_for_test(uaddr, u32::MAX);
+    if let Some(h) = sleep_handle.take() {
+        narf_scheduler::narf_time::timer_wheel::cancel(h);
+    }
+    if leaked || ghost_woken != 0 {
+        return TestResult::Fail(
+            "timed-out FUTEX_WAIT left its waker enqueued — a later FUTEX_WAKE(1) \
+             wakes a ghost instead of a real waiter (Linux futex_unqueue removes it)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/futex",
+    smoke_userspace_futex_timeout_unpark_unqueues_waiter
+);
+
+/// The CLONE_CHILD_CLEARTID exit wake must reach a SHARED-namespace waiter.
+/// Linux fires it WITHOUT `FUTEX_PRIVATE_FLAG` — kernel/fork.c `mm_release`:
+/// `put_user(0, tsk->clear_child_tid); do_futex(tsk->clear_child_tid,
+/// FUTEX_WAKE, 1, ...)` — and glibc matches: `pthread_join` waits on the
+/// ctid word with `LLL_SHARED` ("The kernel [...] futex wake-up [...] is not
+/// private", nptl/pthread_join_common.c). musl's `__tl_lock` waiters on the
+/// ctid word (`&__thread_list_lock`) also wait with priv=0. A wake published
+/// ONLY in the private (AddressSpace-Arc) namespace therefore never finds
+/// these waiters, and every glibc pthread_join degrades to the ~10 ms wheel
+/// backstop (`fire_clear_child_tid_on_exit` currently wakes only
+/// `futex_key(entry.futex_namespace, uaddr)`).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_userspace_cleartid_exit_wake_reaches_shared_waiter() -> TestResult {
+    use crate::handlers::{
+        __test_futex_wake_counter, __test_set_clear_child_tid_scoped, futex_drop_waiter,
+        futex_register_waiter,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw below; balanced reconstruction.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the strong reference owned by this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the waker retains its strong reference across this call.
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: releases the strong reference owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: vtable matches the Arc<AtomicU32> representation.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    const TID: u64 = 71_101;
+    const PID: u64 = 71_100;
+    const JOINER_TID: u64 = 71_142;
+    // A word no other test touches (as_root=0 in the scoped entry skips the
+    // word write; the wake still fires — the subject of this test).
+    const UADDR: u64 = 0x5EC0_5000;
+    // Models the exiting thread's private namespace (an AddressSpace Arc
+    // pointer — always nonzero for a real task).
+    const PRIVATE_NS: u64 = 0xA51D_0001;
+
+    // Real exit-observer wiring, exactly like smoke_exit_sweeps_task_tables.
+    crate::user_task::__test_clear_exit_observers();
+    crate::handlers::wait_init();
+    crate::handlers::clear_child_tid_init();
+    crate::handlers::install_clear_child_tid_observer();
+
+    let task = crate::task::Task::new_registered(TID, PID);
+    __test_set_clear_child_tid_scoped(TID, UADDR, PRIVATE_NS);
+
+    // The glibc joiner: FUTEX_WAIT on the ctid word WITHOUT FUTEX_PRIVATE
+    // (LLL_SHARED) → registered in namespace 0.
+    let woken = Arc::new(AtomicU32::new(0));
+    futex_register_waiter(UADDR, JOINER_TID, counting_waker(woken.clone()));
+    let shared_gen_before = __test_futex_wake_counter(UADDR);
+
+    // Thread exit → fire_clear_child_tid_on_exit.
+    crate::task::mark_zombie(TID);
+    crate::user_task::notify_task_exited(PID, TID);
+
+    let fired = woken.load(Ordering::Acquire) == 1;
+    let shared_gen_bumped = __test_futex_wake_counter(UADDR) != shared_gen_before;
+
+    // Cleanup regardless of outcome: drop an un-woken joiner entry and the
+    // test observer wiring so later tests see clean global state.
+    futex_drop_waiter(UADDR, JOINER_TID);
+    crate::task::release_task(TID);
+    let _ = task;
+    crate::user_task::__test_clear_exit_observers();
+
+    if !shared_gen_bumped {
+        return TestResult::Fail(
+            "CLEARTID exit wake skipped the shared (namespace-0) gen — Linux's \
+             mm_release wake carries no FUTEX_PRIVATE_FLAG (kernel/fork.c)",
+        );
+    }
+    if !fired {
+        return TestResult::Fail(
+            "CLEARTID exit wake never fired the shared-namespace joiner — \
+             glibc pthread_join waits with LLL_SHARED and misses a private-only wake",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!(
+    "userspace/futex",
+    smoke_userspace_cleartid_exit_wake_reaches_shared_waiter
+);
+
 fn smoke_userspace_exited_pthread_does_not_remain_zombie() -> TestResult {
     const PID: u64 = 70_001;
     const LEADER: u64 = 70_101;

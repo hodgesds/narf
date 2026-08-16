@@ -3975,23 +3975,49 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
         }
     }
 
-    // pthread_join uses FUTEX_WAIT_PRIVATE, so clear_child_tid must publish
-    // its exit wake in the shared AddressSpace Arc's private namespace.
-    // A namespace-0 wake only appears to work through the timer backstop and
-    // strands under SMP thread churn.
-    let namespace = Arc::as_ptr(&parent_as) as usize as u64;
-    let pre = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
+    // clear_child_tid's exit wake (fire_clear_child_tid_on_exit) must reach a
+    // pthread_join()er parked on the child-tid word.
+    //
+    // CORRECT LINUX SEMANTICS (this area has bitten us repeatedly — read
+    // carefully before touching): the kernel's exit-time wake in `mm_release`
+    // is `do_futex(child_tid, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
+    // (linux kernel/fork.c) — i.e. a SHARED (namespace-0) wake. glibc's
+    // pthread_join and musl's __tl_lock both FUTEX_WAIT on that word SHARED.
+    // So the exit wake MUST bump the SHARED (namespace-0) counter. A PRIVATE-
+    // only wake (the old bug) missed every glibc/musl joiner and quietly
+    // degraded each join to the ~10 ms timer backstop — a lost-wake-shaped
+    // stall that surfaced as the CachyOS Plasma greeter hang (Qt threads never
+    // rejoining). `fire_clear_child_tid_on_exit` now wakes BOTH namespaces:
+    // the recorded PRIVATE one (serves any private waiter on the word) AND the
+    // SHARED (namespace 0) one (the real Linux/glibc/musl target). This test
+    // therefore asserts BOTH counters bump — the shared assertion is the
+    // regression guard for the private-only bug; don't remove it.
+    let private_ns = Arc::as_ptr(&parent_as) as usize as u64;
+    let pre_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
+    let pre_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
 
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
-    // ca.child_tid.
+    // ca.child_tid in both namespaces.
     crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
 
-    let post = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
-    if post <= pre {
+    let post_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
+    let post_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
+    if post_private <= pre_private {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
-        return TestResult::Fail("CLONE_CHILD_CLEARTID exit did not bump futex counter");
+        return TestResult::Fail(
+            "CLONE_CHILD_CLEARTID exit did not bump the PRIVATE futex counter",
+        );
+    }
+    if post_shared <= pre_shared {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail(
+            "CLONE_CHILD_CLEARTID exit did not bump the SHARED (namespace-0) futex \
+             counter — Linux's mm_release wake carries no FUTEX_PRIVATE_FLAG and \
+             glibc pthread_join waits shared, so a private-only wake strands the join",
+        );
     }
 
     // The slot should be drained (single-shot per Linux semantics).

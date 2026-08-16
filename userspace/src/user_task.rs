@@ -900,6 +900,19 @@ fn park_should_block(
         crate::handlers::drop_signal_waker(task_id);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
+        // Unqueue the futex waiter this park registered above. Linux's
+        // `futex_unqueue` removes the waiter on EVERY exit — woken, timed out,
+        // OR signal-interrupted. Leaving the entry queued makes a later
+        // FUTEX_WAKE(1) pop this now-dead "ghost", report a wake that reached
+        // no real waiter, and force-clear an unrelated park's deadline — the
+        // genuine waiter then only recovers on the ~10 ms backstop. That was
+        // the CachyOS greeter stall: Qt's timed condvar waits (pthread_cond_
+        // timedwait) each left a ghost, so pthread_cond_signal woke ghosts.
+        let fu = uc.futex_uaddr.load(Ordering::Acquire);
+        if fu != 0 {
+            let key = crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+            crate::handlers::futex_drop_waiter_key(key, task_id);
+        }
         uc.futex_uaddr.store(0, Ordering::Release);
         uc.futex_namespace.store(0, Ordering::Release);
         // The waiter-queue entry (if any) is dropped by the re-executed
@@ -947,6 +960,20 @@ fn park_should_block(
 
     // No park state set (shouldn't happen on a park site) → proceed.
     false
+}
+
+/// Test-only: drive one iteration of the own-stack park decision against a
+/// caller-supplied ctx, so kernel tests can pin the unpark paths' wait-queue
+/// hygiene (Linux `futex_unqueue` parity — kernel/futex/waitwake.c) without
+/// a live executor. Uses the production `park_should_block` unmodified.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_park_should_block(
+    uc: &UserTaskCtx,
+    waker: &core::task::Waker,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+) -> bool {
+    park_should_block(uc, waker, sleep_handle)
 }
 
 /// Own-stack blocking-syscall park: register the slot-waker + `kernel_switch`
@@ -1987,7 +2014,19 @@ impl core::future::Future for UserTaskFuture {
             crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            // Unqueue the futex waiter this park registered (see the own-stack
+            // twin above): Linux's futex_unqueue removes it on timeout/signal
+            // too, so a later FUTEX_WAKE(1) can't pop a ghost.
+            let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
+            if fu != 0 {
+                let key = crate::handlers::futex_key(
+                    this.task.uctx.futex_namespace.load(Ordering::Acquire),
+                    fu,
+                );
+                crate::handlers::futex_drop_waiter_key(key, crate::handlers::current_task_id());
+            }
             this.task.uctx.futex_uaddr.store(0, Ordering::Release);
+            this.task.uctx.futex_namespace.store(0, Ordering::Release);
             this.task.uctx.sigwait_set.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);
