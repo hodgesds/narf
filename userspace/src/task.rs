@@ -450,10 +450,18 @@ pub fn dbg_park_census(tag: &str) {
                 // has the same defect for the same reason.) `stat().file_type`
                 // is the real discriminator: Socket vs Fifo vs Special is
                 // exactly the distinction a starved poller turns on.
-                let kind = if fd >= 0 {
+                // `rdy` = the fd's CURRENT poll_readiness (POLL_* bits). This
+                // is the smoking-gun discriminator for a parked poller: a task
+                // parked in ppoll on an fd whose `rdy` shows the bit it asked
+                // for (e.g. an eventfd `rdy=0x1` while events wants POLLIN) is
+                // a KERNEL wake bug (it should have returned); a task parked on
+                // an fd with `rdy=0x0` is correctly asleep and waiting for a
+                // producer that never came (e.g. a Qt dispatcher eventfd whose
+                // wakeUp write was elided in userspace).
+                let (kind, rdy) = if fd >= 0 {
                     crate::fd::try_with_table(t.tid, |tab| {
-                        tab.get(fd as u32)
-                            .map(|e| match e.ops.stat().mode.file_type {
+                        tab.get(fd as u32).map(|e| {
+                            let k = match e.ops.stat().mode.file_type {
                                 narf_filesystem::FileType::Socket => "sock",
                                 narf_filesystem::FileType::Fifo => "fifo",
                                 narf_filesystem::FileType::Special => "chr",
@@ -461,20 +469,23 @@ pub fn dbg_park_census(tag: &str) {
                                 narf_filesystem::FileType::File => "reg",
                                 narf_filesystem::FileType::Dir => "dir",
                                 narf_filesystem::FileType::Symlink => "lnk",
-                            })
+                            };
+                            (k, e.ops.poll_readiness())
+                        })
                     })
                     .flatten()
-                    .unwrap_or("?")
+                    .unwrap_or(("?", 0))
                 } else {
-                    "-"
+                    ("-", 0)
                 };
                 let _ = write!(
                     narf_console::TrapWriter,
-                    "{}{}/{:#x}/{}",
+                    "{}{}/{:#x}/{}:rdy={:#x}",
                     if i == 0 { "" } else { "," },
                     fd,
                     (slot >> 32) as u32,
-                    kind
+                    kind,
+                    rdy
                 );
             }
             let _ = writeln!(
