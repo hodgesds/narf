@@ -267,6 +267,15 @@ pub struct Region {
 #[derive(Clone, Debug, Default)]
 struct RegionTable {
     by_base: BTreeMap<u64, Region>,
+    /// Page-scoped demand-fault ownership.  The thread holding a ticket may
+    /// drop the region lock while it allocates/zeros anonymous backing or
+    /// calls into a demand-pageable file.  Structural VMA removal cancels
+    /// every ticket in the removed region before a replacement can appear.
+    demand_pages: BTreeMap<u64, u64>,
+    /// Page-scoped COW-copy ownership. The owner pins the source frame before
+    /// dropping the region lock, so unrelated write faults can copy in
+    /// parallel without letting VMA teardown recycle either source.
+    cow_pages: BTreeMap<u64, u64>,
     /// Per-page swap ownership transitions, keyed by page-aligned user VA.
     /// Kept under the same lock as `Region::phys` so the two authorities can
     /// never disagree at a visible transaction boundary.
@@ -288,6 +297,8 @@ impl RegionTable {
     const fn new() -> Self {
         Self {
             by_base: BTreeMap::new(),
+            demand_pages: BTreeMap::new(),
+            cow_pages: BTreeMap::new(),
             swap_pages: BTreeMap::new(),
         }
     }
@@ -350,7 +361,13 @@ impl RegionTable {
 
     #[inline]
     fn remove(&mut self, base: u64) -> Option<Region> {
-        self.by_base.remove(&base)
+        let region = self.by_base.remove(&base)?;
+        let end = region.base.as_u64().saturating_add(region.len);
+        self.demand_pages
+            .retain(|&vaddr, _| vaddr < region.base.as_u64() || vaddr >= end);
+        self.cow_pages
+            .retain(|&vaddr, _| vaddr < region.base.as_u64() || vaddr >= end);
+        Some(region)
     }
 
     fn has_overlap(&self, lo: u64, hi: u64) -> bool {
@@ -405,7 +422,7 @@ impl RegionTable {
         }
         keys.extend(self.by_base.range(lo..hi).map(|(&base, _)| base));
         keys.into_iter()
-            .filter_map(|base| self.by_base.remove(&base))
+            .filter_map(|base| self.remove(base))
             .collect()
     }
 
@@ -443,6 +460,23 @@ impl RegionTable {
         self.iter().cloned().collect()
     }
 }
+
+/// Result of taking page-scoped ownership of a demand fault.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DemandPageClaim {
+    /// The leaf was already present or was repaired while the region lock was
+    /// held; the faulting instruction can retry immediately.
+    Resolved,
+    /// A peer owns the slow part of this exact page fault.  Retrying cannot
+    /// observe a half-published frame because publication also takes the
+    /// region lock.
+    InProgress,
+    /// This caller owns the slow path and may leave the region lock.
+    Owner { ticket: u64, file_backed: bool },
+}
+
+static NEXT_DEMAND_TICKET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_COW_TICKET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// An owned hardware huge-page mapping. Each backing entry is installed as
 /// one architecture block/huge leaf; it is never represented as base-page
@@ -2332,51 +2366,87 @@ impl AddressSpace {
         out
     }
 
-    /// Is the page at `v` an unbacked page of a demand-paged *file* mapping?
+    /// Claim the slow portion of one anonymous/file demand fault.
     ///
-    /// Split out of `demand_alloc_page` because the hook this gates **must**
-    /// run with the regions lock dropped: it re-enters the filesystem, which
-    /// allocates, takes its own locks, and — for a BPF arena — installs a
-    /// kernel page-table entry. Calling it under the regions lock would nest
-    /// this address space's lock beneath every lock a demand-pageable file
-    /// might take, on a path that runs from the page-fault handler.
-    fn file_demand_miss(&self, v: u64) -> bool {
-        let regions = self.regions.lock();
-        regions.containing(v).is_some_and(|r| {
-            let rb = r.base.as_u64();
-            if !r.perms.contains(RegionPerms::FILE_DEMAND) {
-                return false;
-            }
-            // PROT_NONE is a real access violation, not a miss — same rule as
-            // the anonymous path below, and checked here too so a PROT_NONE
-            // window over a file mapping never reaches the file at all.
-            if r.perms.prot_only().0 == 0 {
-                return false;
-            }
-            let i = ((v - rb) >> 12) as usize;
-            r.phys.get(i).is_some_and(|p| p.raw() == 0)
+    /// `repair_backed` runs under the region lock when metadata already owns a
+    /// frame but the leaf is absent or stale.  An unbacked page receives a
+    /// unique ticket; allocation, zeroing, and filesystem callbacks then run
+    /// without this address space's IRQ-disabling lock.  A peer faulting the
+    /// same page observes `InProgress`, while a different page gets its own
+    /// ticket and can progress concurrently.
+    fn claim_demand_page(
+        &self,
+        v: u64,
+        repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
+    ) -> Result<DemandPageClaim, AddressSpaceError> {
+        use core::sync::atomic::Ordering;
+
+        let mut regions = self.regions.lock();
+        let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+        let rb = region.base.as_u64();
+        if region.perms.prot_only().0 == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let index = ((v - rb) >> 12) as usize;
+        let phys = *region
+            .phys
+            .get(index)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let perms = region.perms;
+        if phys.raw() != 0 {
+            repair_backed(phys, perms)?;
+            return Ok(DemandPageClaim::Resolved);
+        }
+        if regions.demand_pages.contains_key(&v) {
+            return Ok(DemandPageClaim::InProgress);
+        }
+        let ticket = NEXT_DEMAND_TICKET.fetch_add(1, Ordering::Relaxed);
+        regions.demand_pages.insert(v, ticket);
+        Ok(DemandPageClaim::Owner {
+            ticket,
+            file_backed: perms.contains(RegionPerms::FILE_DEMAND),
         })
     }
 
-    /// Record a frame the backing file supplied for the page at `v`.
-    ///
-    /// Keeps the first answer: a peer CPU that faulted the same page while
-    /// this one was inside the file has already published an equivalent frame
-    /// (`FileOps::mmap_fault` is idempotent per offset), and overwriting it
-    /// would strand the alias the peer may already have installed in a PTE.
-    fn record_file_demand_frame(&self, v: u64, phys: PhysAddr) {
+    /// Publish a claimed frame and install its leaf as one region-lock
+    /// transaction.  `false` means a concurrent VMA removal cancelled the
+    /// ticket; the caller still owns anonymous backing and must free it.
+    fn finish_demand_page(
+        &self,
+        v: u64,
+        ticket: u64,
+        phys: PhysAddr,
+        install: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
+    ) -> Result<bool, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        if let Some(r) = regions.containing_mut(v) {
-            let rb = r.base.as_u64();
-            if !r.perms.contains(RegionPerms::FILE_DEMAND) {
-                return;
-            }
-            let i = ((v - rb) >> 12) as usize;
-            if let Some(slot) = r.phys.get_mut(i) {
-                if slot.raw() == 0 {
-                    *slot = phys;
-                }
-            }
+        if regions.demand_pages.get(&v).copied() != Some(ticket) {
+            return Ok(false);
+        }
+        let Some(region) = regions.containing_mut(v) else {
+            regions.demand_pages.remove(&v);
+            return Ok(false);
+        };
+        let rb = region.base.as_u64();
+        let index = ((v - rb) >> 12) as usize;
+        let Some(slot) = region.phys.get_mut(index) else {
+            regions.demand_pages.remove(&v);
+            return Ok(false);
+        };
+        if slot.raw() != 0 {
+            regions.demand_pages.remove(&v);
+            return Ok(false);
+        }
+        *slot = phys;
+        let perms = region.perms;
+        let result = install(phys, perms);
+        regions.demand_pages.remove(&v);
+        result.map(|()| true)
+    }
+
+    fn cancel_demand_page(&self, v: u64, ticket: u64) {
+        let mut regions = self.regions.lock();
+        if regions.demand_pages.get(&v).copied() == Some(ticket) {
+            regions.demand_pages.remove(&v);
         }
     }
 
@@ -2659,34 +2729,7 @@ impl AddressSpace {
             }
             return Err(AddressSpaceError::OutOfRange);
         }
-        // Demand-paged file mapping: the frame comes from the backing file,
-        // not from the frame allocator. Resolved with no lock held (see
-        // `file_demand_miss`), then published into the region's `phys` slot,
-        // after which the walk below takes its "backed but no leaf" branch and
-        // installs the PTE with the region's own permissions. Routing it that
-        // way rather than duplicating the leaf install is deliberate: the
-        // spurious-fault and racing-teardown reasoning in that branch is
-        // subtle, hard-won, and must not exist twice.
-        if self.file_demand_miss(v) {
-            let phys = file_fault_frame(v).ok_or(AddressSpaceError::Unmapped)?;
-            self.record_file_demand_frame(v, PhysAddr::new(phys));
-        }
-        let mut regions = self.regions.lock();
-        let r = regions
-            .containing_mut(v)
-            .ok_or(AddressSpaceError::Unmapped)?;
-        let rb = r.base.as_u64();
-        // PROT_NONE: the fault is a real access violation, not
-        // a demand-paging miss. Surface as Unmapped so the
-        // trap handler reports the SEGV cleanly.
-        if r.perms.prot_only().0 == 0 {
-            return Err(AddressSpaceError::Unmapped);
-        }
-        let i = ((v - rb) >> 12) as usize;
-        if i >= r.phys.len() {
-            return Err(AddressSpaceError::OutOfRange);
-        }
-        if r.phys[i].raw() != 0 {
+        let claim = self.claim_demand_page(v, |phys, perms| {
             // Already backed, yet this CPU took a not-present #PF for it.
             // Two distinct causes, distinguished by whether the leaf PTE
             // in memory is actually present:
@@ -2724,50 +2767,82 @@ impl AddressSpace {
                 }
                 return Ok(());
             }
-            let phys = r.phys[i];
             let mut flags = PtFlags::USER;
-            if user_page_writable(r.perms, phys) {
+            if user_page_writable(perms, phys) {
                 flags |= PtFlags::WRITABLE;
             }
-            if !r.perms.contains(RegionPerms::EXEC) {
+            if !perms.contains(RegionPerms::EXEC) {
                 flags |= PtFlags::NO_EXEC;
             }
             // SAFETY: identity map + AS live (active CR3's #PF handler);
             // `phys` is the frame this region owns for the page.
             match unsafe { map_4kb(self.root, va, phys, flags) } {
-                Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
-                Err(_) => return Err(AddressSpaceError::NotImplemented),
+                Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+                Err(_) => Err(AddressSpaceError::NotImplemented),
+            }
+        })?;
+        let DemandPageClaim::Owner {
+            ticket,
+            file_backed,
+        } = claim
+        else {
+            return Ok(());
+        };
+
+        // The ticket, not the region lock, excludes a duplicate slow path for
+        // this page.  Other pages in the same CLONE_VM address space can now
+        // allocate/zero or enter their backing file in parallel.
+        let phys = if file_backed {
+            match file_fault_frame(v) {
+                Some(phys) => PhysAddr::new(phys),
+                None => {
+                    self.cancel_demand_page(v, ticket);
+                    return Err(AddressSpaceError::Unmapped);
+                }
+            }
+        } else {
+            let frame = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    self.cancel_demand_page(v, ticket);
+                    return Err(AddressSpaceError::OutOfRange);
+                }
+            };
+            let phys = frame.start_address();
+            // SAFETY: identity-mapped DMA-equivalent; the frame is exclusively
+            // owned by this ticket until finish_demand_page publishes it.
+            unsafe {
+                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+            }
+            phys
+        };
+
+        let published = self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            let mut flags = PtFlags::USER;
+            if user_page_writable(perms, phys) {
+                flags |= PtFlags::WRITABLE;
+            }
+            if !perms.contains(RegionPerms::EXEC) {
+                flags |= PtFlags::NO_EXEC;
+            }
+            // SAFETY: finish_demand_page holds the authoritative region lock;
+            // `phys` has just become this page's backing and the root is live.
+            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+                Err(_) => Err(AddressSpaceError::NotImplemented),
+            }
+        })?;
+        if !published {
+            // The ticket was cancelled before publication, so ownership never
+            // left this fault path. A file hook supplies one external alias
+            // reference, balanced through the normal shared release hook.
+            if file_backed {
+                release_shared_phys(phys);
+            } else {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
-        // Allocate + zero the fresh frame, honoring the faulting
-        // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
-        // resolves to the local node — today's behavior.
-        let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
-            .map_err(|_| AddressSpaceError::OutOfRange)?
-            .start_address();
-        // SAFETY: identity-mapped DMA-equivalent; frame just
-        // returned by allocator is exclusively ours.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-        }
-        r.phys[i] = phys;
-
-        // Build PTE flags from region perms.
-        let mut flags = PtFlags::USER;
-        if user_page_writable(r.perms, phys) {
-            flags |= PtFlags::WRITABLE;
-        }
-        if !r.perms.contains(RegionPerms::EXEC) {
-            flags |= PtFlags::NO_EXEC;
-        }
-        // SAFETY: identity map + AS is live (we're being
-        // called from the active CR3's #PF handler).
-        // SAFETY: Valid memory or trusted environment
-        match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
-            Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
-            Err(_) => Err(AddressSpaceError::NotImplemented),
-        }
+        Ok(())
     }
 
     /// # Safety
@@ -2780,25 +2855,7 @@ impl AddressSpace {
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
-        // See the x86_64 twin: the backing file supplies the frame, resolved
-        // with no lock held, then the walk below installs the leaf.
-        if self.file_demand_miss(v) {
-            let phys = file_fault_frame(v).ok_or(AddressSpaceError::Unmapped)?;
-            self.record_file_demand_frame(v, PhysAddr::new(phys));
-        }
-        let mut regions = self.regions.lock();
-        let r = regions
-            .containing_mut(v)
-            .ok_or(AddressSpaceError::Unmapped)?;
-        let rb = r.base.as_u64();
-        if r.perms.prot_only().0 == 0 {
-            return Err(AddressSpaceError::Unmapped);
-        }
-        let i = ((v - rb) >> 12) as usize;
-        if i >= r.phys.len() {
-            return Err(AddressSpaceError::OutOfRange);
-        }
-        if r.phys[i].raw() != 0 {
+        let claim = self.claim_demand_page(v, |phys, perms| {
             // Already backed, yet this CPU faulted. Present leaf → a
             // peer installed it while this CPU's TLB / walk caches still
             // held the pre-fault miss: invalidate locally and retry.
@@ -2817,43 +2874,78 @@ impl AddressSpace {
                 }
                 return Ok(());
             }
-            let phys = r.phys[i];
-            let mut flags = if user_page_writable(r.perms, phys) {
+            let mut flags = if user_page_writable(perms, phys) {
                 PtFlags::AP_RW_EL0
             } else {
                 PtFlags::AP_RO_EL0
             };
-            if !r.perms.contains(RegionPerms::EXEC) {
+            if !perms.contains(RegionPerms::EXEC) {
                 flags = flags | PtFlags::UXN | PtFlags::PXN;
             }
             // SAFETY: root valid + frame owned by this region (same
             // contract as the fresh-allocation path below).
             match unsafe { map_4kb(self.root, va, phys, flags) } {
-                Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
-                Err(_) => return Err(AddressSpaceError::NotImplemented),
+                Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+                Err(_) => Err(AddressSpaceError::NotImplemented),
+            }
+        })?;
+        let DemandPageClaim::Owner {
+            ticket,
+            file_backed,
+        } = claim
+        else {
+            return Ok(());
+        };
+
+        let phys = if file_backed {
+            match file_fault_frame(v) {
+                Some(phys) => PhysAddr::new(phys),
+                None => {
+                    self.cancel_demand_page(v, ticket);
+                    return Err(AddressSpaceError::Unmapped);
+                }
+            }
+        } else {
+            let frame = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    self.cancel_demand_page(v, ticket);
+                    return Err(AddressSpaceError::OutOfRange);
+                }
+            };
+            let phys = frame.start_address();
+            // SAFETY: the frame is exclusively owned and reachable through
+            // the kernel TTBR1 RAM window while the ticket is outstanding.
+            unsafe {
+                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+            }
+            phys
+        };
+
+        let published = self.finish_demand_page(v, ticket, phys, |phys, perms| {
+            let mut flags = if user_page_writable(perms, phys) {
+                PtFlags::AP_RW_EL0
+            } else {
+                PtFlags::AP_RO_EL0
+            };
+            if !perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::UXN | PtFlags::PXN;
+            }
+            // SAFETY: as on x86_64, publication and leaf installation are one
+            // region-lock transaction against this live TTBR0 root.
+            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
+                Err(_) => Err(AddressSpaceError::NotImplemented),
+            }
+        })?;
+        if !published {
+            if file_backed {
+                release_shared_phys(phys);
+            } else {
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
             }
         }
-        let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
-            .map_err(|_| AddressSpaceError::OutOfRange)?
-            .start_address();
-        // SAFETY: identity-mapped per allocator contract.
-        unsafe {
-            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
-        }
-        r.phys[i] = phys;
-        let mut flags = if user_page_writable(r.perms, phys) {
-            PtFlags::AP_RW_EL0
-        } else {
-            PtFlags::AP_RO_EL0
-        };
-        if !r.perms.contains(RegionPerms::EXEC) {
-            flags = flags | PtFlags::UXN | PtFlags::PXN;
-        }
-        // SAFETY: same.
-        match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
-            Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
-            Err(_) => Err(AddressSpaceError::NotImplemented),
-        }
+        Ok(())
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -4617,32 +4709,55 @@ impl AddressSpace {
     /// - The frame allocator + COW refcount table are
     ///   initialised.
     pub unsafe fn cow_split_on_write(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-        let mut g = self.regions.lock();
-        let v = vaddr.as_u64();
-        let region = g.containing_mut(v).ok_or(AddressSpaceError::Unmapped)?;
-        // A present write fault is recoverable only when fork explicitly
-        // made this logically-writable private mapping COW.  In particular,
-        // mprotect(PROT_READ) removes WRITE but leaves a present RO leaf; it
-        // must fall through to SIGSEGV instead of regaining write access.
-        if !region.perms.contains(RegionPerms::WRITE) || !region.perms.contains(RegionPerms::COW) {
-            return Err(AddressSpaceError::Unmapped);
-        }
-        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
-        let old_phys = region.phys[page_idx];
+        // Tickets are page-scoped: faults at different byte offsets in one
+        // page must serialize behind the same copy operation.
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let (ticket, old_phys) = {
+            use core::sync::atomic::Ordering;
 
-        // If this frame's refcount is 1 (we're sole owner), just
-        // regain WRITE on the region. The dec_ref returns 0 in
-        // that case (post-decrement); we re-bump because we still
-        // own it.
-        let count = crate::frame::cow::count(old_phys);
-        if count <= 1 {
-            // Sole owner — no copy needed.
-            return Ok(());
-        }
+            let mut regions = self.regions.lock();
+            let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+            // A present write fault is recoverable only when fork explicitly
+            // made this logically-writable private mapping COW. In particular,
+            // mprotect(PROT_READ) must fall through to SIGSEGV.
+            if !region.perms.contains(RegionPerms::WRITE)
+                || !region.perms.contains(RegionPerms::COW)
+            {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+            let old_phys = *region
+                .phys
+                .get(page_idx)
+                .ok_or(AddressSpaceError::OutOfRange)?;
+            if crate::frame::cow::count(old_phys) <= 1 {
+                return Ok(());
+            }
+            if regions.cow_pages.contains_key(&v) {
+                // A peer owns this exact copy. The trap path retries the
+                // still-read-only leaf while unrelated pages keep progressing.
+                return Ok(());
+            }
+            let ticket = NEXT_COW_TICKET.fetch_add(1, Ordering::Relaxed);
+            regions.cow_pages.insert(v, ticket);
+            // VMA teardown may now remove its owner, but this temporary
+            // reference keeps the source alive until the copy completes.
+            crate::frame::cow::inc_ref(old_phys);
+            (ticket, old_phys)
+        };
 
-        // Multiple owners. Allocate a private frame, copy bytes,
-        // dec_ref the shared one.
-        let new_frame = crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
+        let new_frame = match crate::frame::alloc_frame() {
+            Ok(frame) => frame,
+            Err(_) => {
+                let mut regions = self.regions.lock();
+                if regions.cow_pages.get(&v).copied() == Some(ticket) {
+                    regions.cow_pages.remove(&v);
+                }
+                drop(regions);
+                crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+                return Err(AddressSpaceError::OutOfRange);
+            }
+        };
         let new_phys = new_frame.start_address();
         // SAFETY: kernel_ptr / kernel_mut_ptr resolve through the
         // kernel's identity map (x86_64) or TTBR1 high-half RAM
@@ -4658,8 +4773,41 @@ impl AddressSpace {
                 crate::frame::PAGE_SIZE as usize,
             );
         }
-        let _new_count = crate::frame::cow::dec_ref(old_phys);
-        region.phys[page_idx] = new_phys;
+
+        let published = {
+            let mut regions = self.regions.lock();
+            let owns_ticket = regions.cow_pages.get(&v).copied() == Some(ticket);
+            let current_matches = regions.containing(v).is_some_and(|region| {
+                let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+                region.perms.contains(RegionPerms::WRITE)
+                    && region.perms.contains(RegionPerms::COW)
+                    && region.phys.get(page_idx).copied() == Some(old_phys)
+            });
+            if owns_ticket && current_matches {
+                let region = regions
+                    .containing_mut(v)
+                    .expect("COW region disappeared under its lock");
+                let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+                region.phys[page_idx] = new_phys;
+                regions.cow_pages.remove(&v);
+                true
+            } else {
+                if owns_ticket {
+                    regions.cow_pages.remove(&v);
+                }
+                false
+            }
+        };
+
+        if published {
+            // Release both the region's old ownership and the temporary pin.
+            // Only the final decrement can actually return the source frame.
+            crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+            crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+        } else {
+            crate::frame::free_frame(new_frame);
+            crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+        }
         Ok(())
     }
 
@@ -5547,6 +5695,55 @@ fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
         true
     }
 }
+
+/// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
+/// outstanding ticket before its slow path can publish into the new mapping.
+fn smoke_memory_demand_tickets_are_page_scoped() -> TestResult {
+    let a = AddressSpace::empty();
+    let base = 0x0000_0080_0000_0000u64;
+    let lazy_region = || Region {
+        base: VirtAddr::new(base),
+        len: 0x2000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 2],
+    };
+    if a.map_region(lazy_region()).is_err() {
+        return TestResult::Fail("failed to install lazy ticket-test region");
+    }
+
+    let first = match a.claim_demand_page(base, |_, _| Err(AddressSpaceError::NotImplemented)) {
+        Ok(DemandPageClaim::Owner { ticket, .. }) => ticket,
+        _ => return TestResult::Fail("first page did not grant a demand ticket"),
+    };
+    if a.claim_demand_page(base, |_, _| Ok(())) != Ok(DemandPageClaim::InProgress) {
+        return TestResult::Fail("same page admitted two demand owners");
+    }
+    let second = match a.claim_demand_page(base + 0x1000, |_, _| Ok(())) {
+        Ok(DemandPageClaim::Owner { ticket, .. }) => ticket,
+        _ => return TestResult::Fail("unrelated page was serialized behind first page"),
+    };
+    if first == second {
+        return TestResult::Fail("different pages received the same live demand ticket");
+    }
+
+    if a.unmap_region(VirtAddr::new(base)).is_err() || a.map_region(lazy_region()).is_err() {
+        return TestResult::Fail("failed to replace ticket-test region");
+    }
+    let published = a.finish_demand_page(base, first, PhysAddr::new(0x1000), |_, _| Ok(()));
+    let replacement_stayed_lazy = a
+        .lookup(VirtAddr::new(base))
+        .is_some_and(|region| region.phys[0].raw() == 0);
+    a.cancel_demand_page(base + 0x1000, second);
+
+    if published != Ok(false) {
+        TestResult::Fail("cancelled ticket published into a replacement VMA")
+    } else if !replacement_stayed_lazy {
+        TestResult::Fail("cancelled ticket changed replacement backing")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!("memory", smoke_memory_demand_tickets_are_page_scoped);
 
 /// A `FILE_DEMAND` region's unbacked page is filled by the installed hook, not
 /// by the frame allocator, and the frame it names is the one that lands in the

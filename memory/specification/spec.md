@@ -499,6 +499,23 @@ x86_64 is rejected at runtime.
   lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
   inspect only the predecessor/successor or intersecting tree range; backing
   ownership and TLB ordering are unchanged by this metadata index invariant.
+- Anonymous and file-backed demand faults reserve a page-scoped ticket before
+  leaving the address-space region lock. Frame allocation, page zeroing, and
+  filesystem callbacks run without that IRQ-disabling lock, so faults on
+  distinct pages of one shared address space may progress concurrently. The
+  winning ticket republishes backing and installs its leaf while holding the
+  region lock; structural VMA removal cancels every covered ticket before a
+  replacement can appear. A cancelled anonymous allocation remains owned by
+  the fault path and returns to the frame allocator; a cancelled file alias is
+  released through its backing-owner hook.
+- COW write faults use the same page-scoped exclusion principle. The ticket
+  owner takes a temporary source-frame reference before releasing the region
+  lock, allocates and copies outside that lock, and republishes only if the
+  same VMA still owns the same source page with WRITE+COW authority. A
+  cancelled copy frees its unpublished destination and drops only the pin; a
+  successful copy drops both the old region ownership and the pin after the
+  new backing is visible. Faults on unrelated pages therefore do not serialize
+  on a 4 KiB allocation/copy, while teardown cannot recycle a source mid-copy.
 - Every AS-private x86_64 page-table frame has one live entry in the fixed
   atomic ownership registry. Open-addressed probing never overwrites a live
   entry; deletion leaves a tombstone so colliding ownership remains visible;
