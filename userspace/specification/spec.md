@@ -615,6 +615,11 @@ number is not.
 - Stack red-zone honoured.
 ### aarch64
 - EL0 entry; `eret`; TPIDR_EL0 for TLS.
+- The scheduler owns TTBR0 context save/activation/restoration around each user
+  future poll. Trap-back longjmp returns with the task's tagged TTBR0 still
+  installed; `UserTaskFuture` does not rewrite or flush it before returning to
+  the executor. This preserves lifetime-scoped process-ASID translations and
+  leaves exactly one component responsible for restoring the incoming root.
 
 ## 6. Dependencies
 

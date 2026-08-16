@@ -235,6 +235,11 @@ impl RegionPerms {
 }
 
 impl AddressSpace {
+    /// Allocate an architecture user root. On aarch64 this also reserves one
+    /// lifetime-scoped process ASID when the hardware pool has capacity.
+    pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// Install this address space's architecture root for the current CPU.
+    pub fn activate(&self) -> Result<(), AddressSpaceError>;
     /// One ownership-integrated same-root page-out submission.
     pub unsafe fn swap_out_private_batch(
         &self,
@@ -439,7 +444,16 @@ x86_64 is rejected at runtime.
 - `DomainId` 0 is reserved for the Frame's own data; no driver may claim it.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
-- Buddy allocator's free lists are per-NUMA-node once NUMA is introduced.
+- Buddy allocator free lists and their IRQ-safe locks are per-NUMA-node and
+  cache-line isolated. Order-0 allocation/free is fronted by a bounded,
+  cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
+  under one zone-lock acquisition, while cached pages remain included in
+  free-page and order-0 statistics. A base-page refill or folio allocation
+  holds only one zone lock at a time; nearest-node fallback releases the failed
+  zone before trying the next, so unrelated NUMA nodes do not serialize on a
+  global frame lock. Coordinated draining bypasses new cache insertion before
+  high-order retry; runtime-hotplug nodes bypass the cache so exact-range
+  offline admission continues to observe every free frame in the buddy.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range
@@ -548,6 +562,17 @@ x86_64 is rejected at runtime.
 ### aarch64
 - Paging: 4-level, 4 KiB granule (default) or 16 KiB / 64 KiB granules
   on platforms that prefer them, 48-bit VA.
+- `AddressSpace::activate` installs the address space's TTBR0 low-half root;
+  scheduler polling saves and restores the incoming TTBR0 so kernel tasks never
+  inherit a user root. Each live process root receives a unique ASID from the
+  hardware-supported namespace after tags 1..=16, which remain reserved for
+  domain roots. A switch to a nonzero lifetime tag does not flush; final
+  `AddressSpace` teardown broadcasts `TLBI ASIDE1IS` before making that tag
+  reusable. Pool exhaustion falls back safely to ASID 0 with a local full
+  invalidation on every distinct-root switch.
+- Page-table mutation invalidates by VA for every ASID across the
+  inner-shareable domain (`VAAE1IS` / `VAALE1IS`). This is required because
+  the mutated root need not be the TTBR0 context active on the issuing CPU.
 - MTE: memory tag is 4 bits, stored in the top byte of the address plus
   tag storage. We assign one tag per domain.
 - TBI1/TBI0 enabled; TCR_EL1 configured for MTE.

@@ -177,6 +177,11 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
 ## 4. Invariants & safety properties
 
 - A task always polls inside the domain it was spawned with.
+- A user task polls with its own address-space root active. On aarch64 the
+  executor saves the incoming TTBR0, installs the task's TTBR0 before polling,
+  and restores the saved `(root, ASID)` before any later kernel or user task is
+  polled. Lifetime-scoped ASIDs make both switches non-flushing; an ASID is not
+  reused until the memory subsystem completes a system-wide tag invalidation.
 - `donate_to` does not bypass capability checks; caller must hold a
   `Cap<Task, Invoke>` (Stage 3).
 - The executor never holds a lock across a poll boundary.

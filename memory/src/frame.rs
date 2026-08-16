@@ -1,18 +1,17 @@
 //! Physical frames + per-NUMA-node frame allocator.
 //!
 //! Wave-2 subset of `memory/` spec §3 with Wave-3 NUMA awareness:
-//! per-node free-stack allocators, classified by SRAT memory-range
-//! attribution. The allocator stays simple (free-stack, not buddy);
-//! the buddy allocator + magazines land later.
+//! per-node buddy allocators classified by SRAT memory-range attribution.
 //!
 //! Layout:
-//! - One `Vec<PhysFrame>` per NUMA node (`MAX_NUMA_NODES`). Boot
-//!   inits flat (everything goes to bin 0); `rebalance_to_topology`
-//!   redistributes the remaining frames to their proper bins once
-//!   SRAT data is available.
+//! - One cache-line-aligned buddy-zone lock per NUMA node
+//!   (`MAX_NUMA_NODES`). Boot inits flat (everything goes to zone 0);
+//!   `rebalance_to_topology` redistributes the remaining frames once SRAT
+//!   data is available.
 //! - `alloc_frame()` consults the current CPU's NUMA node first
-//!   (looked up via the weak-link `narf_cpu_to_node` hook), then
-//!   falls back round-robin to other nodes.
+//!   (looked up via the weak-link `narf_cpu_to_node` hook), then falls back
+//!   nearest-node-first. Order-0 traffic is batched through a bounded
+//!   per-CPU/per-node cache after buddy metadata capacity is frozen.
 //! - `alloc_frame_on(node)` is the explicit-node entry point.
 //! - `free_frame(f)` uses `narf_phys_to_node` to return the frame
 //!   to its rightful node bin.
@@ -23,7 +22,7 @@
 //! `#[no_mangle]` definitions calling into narf-acpi at boot.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
@@ -196,35 +195,114 @@ impl From<CapError> for FrameAllocError {
     }
 }
 
-/// Per-node buddy zone. Index 0 holds everything pre-
-/// `rebalance_to_topology`; post-rebalance each node has only the
-/// frames whose physical addresses map to its proximity domain.
+/// Global frame-accounting metadata. Buddy free lists are deliberately kept
+/// out of this object: each NUMA node has an independent cache-line-aligned
+/// lock, so allocations on unrelated nodes do not serialize.
 #[derive(Debug)]
 pub struct FrameAllocator {
-    zones: [BuddyZone; MAX_NUMA_NODES],
     /// Managed base pages per node, frozen when topology rebalance
     /// completes. Unlike the zone free counts this does not decrease on
     /// allocation, so it is suitable for sysfs MemTotal reporting.
-    node_total_frames: [usize; MAX_NUMA_NODES],
-    initialised: bool,
-    total_frames: usize,
-    reserved_frames: usize,
+    node_total_frames: [AtomicUsize; MAX_NUMA_NODES],
+    initialised: AtomicBool,
+    total_frames: AtomicUsize,
+    reserved_frames: AtomicUsize,
     /// Set after `rebalance_to_topology` completes; alloc + free
     /// honour per-node zones from this point on. Pre-flag, every
     /// allocation comes out of zones[0].
-    numa_aware: bool,
+    numa_aware: AtomicBool,
 }
 
-const NEW_ZONE: BuddyZone = BuddyZone::new();
+static ALLOC: FrameAllocator = FrameAllocator {
+    node_total_frames: [const { AtomicUsize::new(0) }; MAX_NUMA_NODES],
+    initialised: AtomicBool::new(false),
+    total_frames: AtomicUsize::new(0),
+    reserved_frames: AtomicUsize::new(0),
+    numa_aware: AtomicBool::new(false),
+};
 
-static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(FrameAllocator {
-    zones: [NEW_ZONE; MAX_NUMA_NODES],
-    node_total_frames: [0; MAX_NUMA_NODES],
-    initialised: false,
-    total_frames: 0,
-    reserved_frames: 0,
-    numa_aware: false,
-});
+#[repr(align(64))]
+struct BuddyZoneLock(IrqSafeSpinLock<BuddyZone>);
+
+impl BuddyZoneLock {
+    const fn new() -> Self {
+        Self(IrqSafeSpinLock::new(BuddyZone::new()))
+    }
+}
+
+/// One independently locked buddy free-list per NUMA node. The alignment
+/// prevents the lock words for adjacent nodes from sharing a cache line.
+static ZONES: [BuddyZoneLock; MAX_NUMA_NODES] = [const { BuddyZoneLock::new() }; MAX_NUMA_NODES];
+static REBALANCE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+
+const FRAME_CACHE_CAPACITY: usize = 16;
+const FRAME_CACHE_BATCH: usize = 8;
+
+#[derive(Copy, Clone)]
+struct NodeFrameCache {
+    frames: [u64; FRAME_CACHE_CAPACITY],
+    len: usize,
+}
+
+impl NodeFrameCache {
+    const fn new() -> Self {
+        Self {
+            frames: [0; FRAME_CACHE_CAPACITY],
+            len: 0,
+        }
+    }
+}
+
+struct CpuFrameCache {
+    nodes: [NodeFrameCache; MAX_NUMA_NODES],
+}
+
+impl CpuFrameCache {
+    const fn new() -> Self {
+        Self {
+            nodes: [NodeFrameCache::new(); MAX_NUMA_NODES],
+        }
+    }
+}
+
+#[repr(align(64))]
+struct CpuFrameCacheLock(IrqSafeSpinLock<CpuFrameCache>);
+
+impl CpuFrameCacheLock {
+    const fn new() -> Self {
+        Self(IrqSafeSpinLock::new(CpuFrameCache::new()))
+    }
+}
+
+static FRAME_CACHES: [CpuFrameCacheLock; narf_lib::percpu::MAX_CPUS] =
+    [const { CpuFrameCacheLock::new() }; narf_lib::percpu::MAX_CPUS];
+static FRAME_CACHE_FREE: [AtomicUsize; MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; MAX_NUMA_NODES];
+static FRAME_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FRAME_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FRAME_CACHE_REFILLS: AtomicU64 = AtomicU64::new(0);
+static FRAME_CACHE_SPILLS: AtomicU64 = AtomicU64::new(0);
+static FRAME_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[repr(align(64))]
+struct FrameCacheDrain {
+    lock: IrqSafeSpinLock<()>,
+    bypass: AtomicBool,
+}
+
+impl FrameCacheDrain {
+    const fn new() -> Self {
+        Self {
+            lock: IrqSafeSpinLock::new(()),
+            bypass: AtomicBool::new(false),
+        }
+    }
+}
+
+static FRAME_CACHE_DRAIN: [FrameCacheDrain; MAX_NUMA_NODES] =
+    [const { FrameCacheDrain::new() }; MAX_NUMA_NODES];
+static FRAME_CACHE_HOTPLUG_BYPASS: [AtomicBool; MAX_NUMA_NODES] =
+    [const { AtomicBool::new(false) }; MAX_NUMA_NODES];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct HotplugRange {
@@ -314,7 +392,7 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     }
     let mut total = 0usize;
     let mut reserved = 0usize;
-    let mut guard = ALLOC.lock();
+    let mut zone0 = ZONES[0].0.lock();
     // First pass: count total + reserved frames for stats.
     for r in usable {
         let start = r.start.raw();
@@ -340,27 +418,30 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
         if region_start >= region_end {
             continue;
         }
-        donate_around_excludes(&mut guard.zones[0], region_start, region_end, exclude);
+        donate_around_excludes(&mut zone0, region_start, region_end, exclude);
     }
-    guard.initialised = true;
-    guard.total_frames = total;
-    guard.reserved_frames = reserved;
-    guard.node_total_frames = [0; MAX_NUMA_NODES];
-    guard.node_total_frames[0] = guard.zones[0].free_frame_count();
-    guard.numa_aware = false;
+    for count in &ALLOC.node_total_frames {
+        count.store(0, Ordering::Relaxed);
+    }
+    ALLOC.node_total_frames[0].store(zone0.free_frame_count(), Ordering::Relaxed);
+    ALLOC.total_frames.store(total, Ordering::Relaxed);
+    ALLOC.reserved_frames.store(reserved, Ordering::Relaxed);
+    ALLOC.numa_aware.store(false, Ordering::Relaxed);
+    drop(zone0);
     // Opt the LIVE allocator's zones into frame-alloc-audit (no-op unless
     // the feature is set). Standalone unit-test `BuddyZone`s never call
     // this, so their synthetic frame numbers stay out of the global audit
     // bitmap (which would otherwise false-positive on their fabricated
     // 0x100-style frames).
     #[cfg(feature = "frame-alloc-audit")]
-    for z in guard.zones.iter_mut() {
-        z.enable_audit();
+    for zone in &ZONES {
+        zone.0.lock().enable_audit();
     }
-    // Drop the guard before installing the default `FrameAlloc` —
-    // `install_frame_alloc_default` takes its own lock and we don't
-    // want to risk an unrelated future reentrancy regression.
-    drop(guard);
+    // Publish only after every free list and accounting field is complete.
+    ALLOC.initialised.store(true, Ordering::Release);
+    // Zone locks are released before installing the default `FrameAlloc` —
+    // `install_frame_alloc_default` takes its own lock and we don't want to
+    // risk an unrelated future reentrancy regression.
     install_frame_alloc_default();
     // NOTE: we deliberately do NOT promote the global allocator to
     // the slab here, and we do not pre-reserve buddy Vec capacity
@@ -374,7 +455,7 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
 /// Pre-reserve buddy Vec capacity in every populated zone so that
 /// split / coalesce pushes never realloc-grow at runtime. Critical
 /// for deadlock-avoidance once the slab is the global allocator:
-/// a Vec growth would route through slab → buddy → `ALLOC.lock()`
+/// a Vec growth would route through slab → buddy → the same zone lock
 /// (already held by the buddy) → recursive deadlock.
 ///
 /// Call this once, AFTER `rebalance_to_topology` has populated
@@ -382,22 +463,25 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
 /// the global allocator. While we're still on bump, the
 /// reservation allocations themselves don't recurse.
 pub fn reserve_for_slab_promotion() {
-    // The reservation below runs under `ALLOC.lock()` and, on a large
+    // The reservation below runs one zone at a time and, on a large
     // machine, wants far more than the fixed 12 MiB `.bss` bootstrap
     // arena holds (~16 bytes/frame, so ~3 GiB was the hard ceiling —
     // an 8 GiB boot died right here). Buddy frames are already live, so
     // top the bootstrap arena up from the buddy FIRST, without holding
     // the lock, then reserve.
-    let need: usize = {
-        let g = ALLOC.lock();
-        g.zones.iter().map(|z| z.reservation_bytes()).sum()
-    };
+    let need: usize = ZONES
+        .iter()
+        .map(|zone| zone.0.lock().reservation_bytes())
+        .sum();
     ensure_bootstrap_headroom(need);
 
-    let mut g = ALLOC.lock();
-    for zone in g.zones.iter_mut() {
-        zone.reserve_growth_capacity();
+    for zone in &ZONES {
+        zone.0.lock().reserve_growth_capacity();
     }
+    // Free-list Vecs can no longer grow recursively through the slab. This is
+    // the safe publication point for order-0 caches even on UMA machines that
+    // never publish `numa_aware`.
+    FRAME_CACHE_ENABLED.store(true, Ordering::Release);
 }
 
 /// Make sure the bootstrap bump arena can satisfy `need` more bytes,
@@ -533,33 +617,38 @@ fn is_excluded(addr: u64, exclude: &[(u64, u64)]) -> bool {
 /// since SRAT memory ranges are typically aligned to large
 /// boundaries.)
 pub fn rebalance_to_topology() {
-    let mut g = ALLOC.lock();
-    if g.numa_aware || !g.initialised {
+    let _transition = REBALANCE_LOCK.lock();
+    debug_assert!(
+        !FRAME_CACHE_ENABLED.load(Ordering::Acquire),
+        "NUMA rebalance must precede frame-cache publication"
+    );
+    if ALLOC.numa_aware.load(Ordering::Acquire) || !ALLOC.initialised.load(Ordering::Acquire) {
         return;
     }
     // Move blocks from zones[0] to their proper node zones.
-    // Two-pass to avoid borrow-checker issues with simultaneous
-    // mutable access to two zone slots.
-    for target in 1..MAX_NUMA_NODES {
-        let (left, right) = g.zones.split_at_mut(target);
-        let dst = &mut right[0];
-        let src = &mut left[0];
-        src.drain_into(dst, |frame_no| {
+    // Always lock the lower node first. Rebalance is a boot-time,
+    // pre-SMP transition; publishing `numa_aware` after every move makes
+    // the completed topology visible atomically to later hot paths.
+    for (target, target_zone) in ZONES.iter().enumerate().skip(1) {
+        let mut src = ZONES[0].0.lock();
+        let mut dst = target_zone.0.lock();
+        src.drain_into(&mut dst, |frame_no| {
             let phys = frame_no << PAGE_SHIFT;
             phys_to_node(phys) == target
         });
     }
-    for node in 0..MAX_NUMA_NODES {
-        g.node_total_frames[node] = g.zones[node].free_frame_count();
+    for (node, zone) in ZONES.iter().enumerate() {
+        let total = zone.0.lock().free_frame_count();
+        ALLOC.node_total_frames[node].store(total, Ordering::Relaxed);
     }
     let mut online = 0u64;
     for node in 0..MAX_NUMA_NODES {
-        if g.node_total_frames[node] != 0 {
+        if ALLOC.node_total_frames[node].load(Ordering::Relaxed) != 0 {
             online |= 1u64 << node;
         }
     }
     ONLINE_NODE_MASK.store(online.max(1), Ordering::Release);
-    g.numa_aware = true;
+    ALLOC.numa_aware.store(true, Ordering::Release);
 }
 
 /// Dynamically add a real, kernel-addressable RAM range to one NUMA node.
@@ -603,11 +692,16 @@ pub unsafe fn online_memory_range(
         });
         false
     };
+    // Runtime ranges must remain wholly visible to `remove_free_range`.
+    // Disable page caching on this node before the new frames are donated;
+    // an in-flight cache operation that began earlier can only see pre-existing
+    // boot frames because the range is not in the buddy yet.
+    FRAME_CACHE_HOTPLUG_BYPASS[node].store(true, Ordering::Release);
+    synchronize_frame_cache_bypass();
 
     let first_frame = start.raw() >> PAGE_SHIFT;
     let frame_count = len >> PAGE_SHIFT;
-    let mut allocator = ALLOC.lock();
-    if !allocator.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         if reused {
             if let Some(range) = ranges
                 .iter_mut()
@@ -618,9 +712,14 @@ pub unsafe fn online_memory_range(
         } else {
             ranges.pop();
         }
+        let still_online = ranges
+            .iter()
+            .any(|range| range.node == node && range.online);
+        FRAME_CACHE_HOTPLUG_BYPASS[node].store(still_online, Ordering::Release);
         return Err(MemoryHotplugError::Uninitialised);
     }
-    if !allocator.zones[node].can_donate_without_growth(first_frame, frame_count) {
+    let mut zone = ZONES[node].0.lock();
+    if !zone.can_donate_without_growth(first_frame, frame_count) {
         if reused {
             if let Some(range) = ranges
                 .iter_mut()
@@ -631,13 +730,19 @@ pub unsafe fn online_memory_range(
         } else {
             ranges.pop();
         }
+        let still_online = ranges
+            .iter()
+            .any(|range| range.node == node && range.online);
+        FRAME_CACHE_HOTPLUG_BYPASS[node].store(still_online, Ordering::Release);
         return Err(MemoryHotplugError::MetadataCapacity);
     }
-    allocator.zones[node].donate(first_frame, frame_count);
-    allocator.node_total_frames[node] += frame_count as usize;
-    allocator.total_frames += frame_count as usize;
+    zone.donate(first_frame, frame_count);
+    ALLOC.node_total_frames[node].fetch_add(frame_count as usize, Ordering::Relaxed);
+    ALLOC
+        .total_frames
+        .fetch_add(frame_count as usize, Ordering::Relaxed);
     ONLINE_NODE_MASK.fetch_or(1u64 << node, Ordering::AcqRel);
-    drop(allocator);
+    drop(zone);
     drop(ranges);
     notify_memory_hotplug();
     Ok(())
@@ -660,17 +765,25 @@ pub fn offline_memory_range(start: PhysAddr, len: u64) -> Result<usize, MemoryHo
     let range = ranges[index];
     let first_frame = start.raw() >> PAGE_SHIFT;
     let frame_count = len >> PAGE_SHIFT;
-    let mut allocator = ALLOC.lock();
-    if !allocator.zones[range.node].remove_free_range(first_frame, frame_count) {
+    let mut zone = ZONES[range.node].0.lock();
+    if !zone.remove_free_range(first_frame, frame_count) {
         return Err(MemoryHotplugError::Busy);
     }
-    allocator.node_total_frames[range.node] -= frame_count as usize;
-    allocator.total_frames -= frame_count as usize;
+    let remaining = ALLOC.node_total_frames[range.node]
+        .fetch_sub(frame_count as usize, Ordering::Relaxed)
+        - frame_count as usize;
+    ALLOC
+        .total_frames
+        .fetch_sub(frame_count as usize, Ordering::Relaxed);
     ranges[index].online = false;
-    if allocator.node_total_frames[range.node] == 0 {
+    let still_online = ranges
+        .iter()
+        .any(|candidate| candidate.node == range.node && candidate.online);
+    FRAME_CACHE_HOTPLUG_BYPASS[range.node].store(still_online, Ordering::Release);
+    if remaining == 0 {
         ONLINE_NODE_MASK.fetch_and(!(1u64 << range.node), Ordering::AcqRel);
     }
-    drop(allocator);
+    drop(zone);
     drop(ranges);
     notify_memory_hotplug();
     Ok(range.node)
@@ -737,6 +850,124 @@ fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
     Some(buddy::frame_from_no(frame_no))
 }
 
+#[inline]
+fn frame_cache_bypassed(node: usize) -> bool {
+    FRAME_CACHE_DRAIN[node].bypass.load(Ordering::Acquire)
+        || FRAME_CACHE_HOTPLUG_BYPASS[node].load(Ordering::Acquire)
+}
+
+/// Order-0 allocator front-end. Once buddy metadata capacity is stable, each
+/// CPU keeps a small cache per node and refills it under one zone-lock
+/// acquisition. The per-CPU lock also masks local IRQs, preventing same-CPU
+/// re-entry from duplicating a frame.
+fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
+    let node = node.min(MAX_NUMA_NODES - 1);
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
+        return alloc_below_ceiling(&mut ZONES[node].0.lock());
+    }
+
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let mut cache = FRAME_CACHES[cpu].0.lock();
+    // A drain may have begun between the optimistic check and taking this
+    // CPU's lock. Bypass under that transition so the drainer cannot miss a
+    // newly cached frame.
+    if frame_cache_bypassed(node) {
+        drop(cache);
+        return alloc_below_ceiling(&mut ZONES[node].0.lock());
+    }
+    let local = &mut cache.nodes[node];
+    if local.len != 0 {
+        local.len -= 1;
+        let frame = local.frames[local.len];
+        FRAME_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
+        FRAME_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        buddy::audit_cached_alloc(frame);
+        return Some(buddy::frame_from_no(frame));
+    }
+
+    FRAME_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let mut zone = ZONES[node].0.lock();
+    let first = alloc_below_ceiling(&mut zone)?;
+    for _ in 1..FRAME_CACHE_BATCH {
+        let Some(extra) = alloc_below_ceiling(&mut zone) else {
+            break;
+        };
+        let frame = buddy::frame_no(extra);
+        buddy::audit_cached_free(frame);
+        local.frames[local.len] = frame;
+        local.len += 1;
+        FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
+    }
+    FRAME_CACHE_REFILLS.fetch_add(1, Ordering::Relaxed);
+    Some(first)
+}
+
+/// Cache an order-0 free. Returns `false` when caching is disabled or a
+/// coordinated drain is active; the caller then returns the frame directly to
+/// the node buddy.
+fn free_order0_to_cache(node: usize, frame: u64) -> bool {
+    let node = node.min(MAX_NUMA_NODES - 1);
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
+        return false;
+    }
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let mut cache = FRAME_CACHES[cpu].0.lock();
+    if frame_cache_bypassed(node) {
+        return false;
+    }
+    let local = &mut cache.nodes[node];
+    buddy::audit_cached_free(frame);
+    if local.len == FRAME_CACHE_CAPACITY {
+        let mut zone = ZONES[node].0.lock();
+        for _ in 0..FRAME_CACHE_BATCH {
+            local.len -= 1;
+            zone.free_cached(local.frames[local.len], 0);
+        }
+        FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
+        FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
+    }
+    local.frames[local.len] = frame;
+    local.len += 1;
+    FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Drain every CPU's cache for one node and run `f` while new cache entries
+/// are bypassed. Lock order is drain -> per-CPU cache -> zone; ordinary paths
+/// take at most one per-CPU cache before the zone and never take a drain lock.
+fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone) -> R) -> R {
+    let node = node.min(MAX_NUMA_NODES - 1);
+    let drain = &FRAME_CACHE_DRAIN[node];
+    let _drain_guard = drain.lock.lock();
+    drain.bypass.store(true, Ordering::Release);
+    for cpu_cache in &FRAME_CACHES {
+        let mut cache = cpu_cache.0.lock();
+        let local = &mut cache.nodes[node];
+        if local.len == 0 {
+            continue;
+        }
+        let mut zone = ZONES[node].0.lock();
+        let drained = local.len;
+        while local.len != 0 {
+            local.len -= 1;
+            zone.free_cached(local.frames[local.len], 0);
+        }
+        FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+    }
+    let result = f(&mut ZONES[node].0.lock());
+    drain.bypass.store(false, Ordering::Release);
+    result
+}
+
+/// Wait for every cache operation that may have observed the old bypass value.
+/// The caller publishes a persistent bypass first, then calls this before
+/// making newly hot-plugged frames visible in the buddy.
+fn synchronize_frame_cache_bypass() {
+    for cpu_cache in &FRAME_CACHES {
+        drop(cpu_cache.0.lock());
+    }
+}
+
 /// Allocate one 4 KiB frame, preferring `node`'s zone. Dispatches
 /// through the installed `FrameAlloc` impl — see `install_frame_alloc`.
 #[cfg_attr(feature = "frame-alloc-audit", track_caller)]
@@ -778,18 +1009,17 @@ fn buddy_alloc_frame_on_strict(
     node: usize,
     preferred: usize,
 ) -> Result<PhysFrame, FrameAllocError> {
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return Err(FrameAllocError::Uninitialised);
     }
-    let zone = if g.numa_aware {
+    let zone = if ALLOC.numa_aware.load(Ordering::Acquire) {
         node.min(MAX_NUMA_NODES - 1)
     } else if node == 0 {
         0
     } else {
         return Err(FrameAllocError::Exhausted);
     };
-    let frame = alloc_below_ceiling(&mut g.zones[zone]).ok_or(FrameAllocError::Exhausted)?;
+    let frame = alloc_order0_on(zone).ok_or(FrameAllocError::Exhausted)?;
     account_numa_allocation(preferred, zone, 1);
     Ok(frame)
 }
@@ -841,20 +1071,19 @@ pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
 /// `FrameAlloc` impls (e.g. `BumpFrameAlloc`) own their own paths
 /// and never touch the buddy.
 fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return Err(FrameAllocError::Uninitialised);
     }
 
-    if !g.numa_aware {
+    if !ALLOC.numa_aware.load(Ordering::Acquire) {
         // Pre-rebalance: everything's in zones[0].
-        let frame = alloc_below_ceiling(&mut g.zones[0]).ok_or(FrameAllocError::Exhausted)?;
+        let frame = alloc_order0_on(0).ok_or(FrameAllocError::Exhausted)?;
         account_numa_allocation(node, 0, 1);
         return Ok(frame);
     }
 
     let preferred = node.min(MAX_NUMA_NODES - 1);
-    if let Some(f) = alloc_below_ceiling(&mut g.zones[preferred]) {
+    if let Some(f) = alloc_order0_on(preferred) {
         account_numa_allocation(preferred, preferred, 1);
         return Ok(f);
     }
@@ -866,7 +1095,7 @@ fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let mut order = [0usize; MAX_NUMA_NODES];
     let n = fallback_order(preferred, &mut order);
     for &i in &order[..n] {
-        if let Some(f) = alloc_below_ceiling(&mut g.zones[i]) {
+        if let Some(f) = alloc_order0_on(i) {
             account_numa_allocation(preferred, i, 1);
             return Ok(f);
         }
@@ -876,13 +1105,12 @@ fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
 
 /// Buddy-backed implementation of `alloc_frame_anywhere`.
 fn buddy_alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return Err(FrameAllocError::Uninitialised);
     }
     let preferred = current_cpu_node().min(MAX_NUMA_NODES - 1);
-    for (node, zone) in g.zones.iter_mut().enumerate() {
-        if let Some(f) = alloc_below_ceiling(zone) {
+    for node in 0..MAX_NUMA_NODES {
+        if let Some(f) = alloc_order0_on(node) {
             account_numa_allocation(preferred, node, 1);
             return Ok(f);
         }
@@ -914,12 +1142,30 @@ pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocErr
 }
 
 fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocError> {
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return Err(FrameAllocError::Uninitialised);
     }
     let preferred = node.min(MAX_NUMA_NODES - 1);
-    let zone_idx = if g.numa_aware { preferred } else { 0 };
+    let numa_aware = ALLOC.numa_aware.load(Ordering::Acquire);
+    let zone_idx = if numa_aware { preferred } else { 0 };
+    if order == 0 {
+        if let Some(frame) = alloc_order0_on(zone_idx) {
+            account_numa_allocation(preferred, zone_idx, 1);
+            return Ok(frame);
+        }
+        if !numa_aware {
+            return Err(FrameAllocError::Exhausted);
+        }
+        let mut fallback_nodes = [0usize; MAX_NUMA_NODES];
+        let n = fallback_order(preferred, &mut fallback_nodes);
+        for &i in &fallback_nodes[..n] {
+            if let Some(frame) = alloc_order0_on(i) {
+                account_numa_allocation(preferred, i, 1);
+                return Ok(frame);
+            }
+        }
+        return Err(FrameAllocError::Exhausted);
+    }
     let ceil = buddy::early_ceiling_frame();
     let try_alloc = |z: &mut BuddyZone| -> Option<u64> {
         if ceil == u64::MAX {
@@ -928,18 +1174,30 @@ fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocE
             z.alloc_below(order, ceil)
         }
     };
-    if let Some(no) = try_alloc(&mut g.zones[zone_idx]) {
+    let first_try = {
+        let mut zone = ZONES[zone_idx].0.lock();
+        try_alloc(&mut zone)
+    };
+    if let Some(no) =
+        first_try.or_else(|| with_node_frame_caches_drained(zone_idx, |zone| try_alloc(zone)))
+    {
         account_numa_allocation(preferred, zone_idx, 1u64 << order);
         return Ok(buddy::frame_from_no(no));
     }
-    if !g.numa_aware {
+    if !numa_aware {
         return Err(FrameAllocError::Exhausted);
     }
     // Nearest-first cross-node fallback (see buddy_alloc_frame_on).
     let mut fallback_nodes = [0usize; MAX_NUMA_NODES];
     let n = fallback_order(preferred, &mut fallback_nodes);
     for &i in &fallback_nodes[..n] {
-        if let Some(no) = try_alloc(&mut g.zones[i]) {
+        let first_try = {
+            let mut zone = ZONES[i].0.lock();
+            try_alloc(&mut zone)
+        };
+        if let Some(no) =
+            first_try.or_else(|| with_node_frame_caches_drained(i, |zone| try_alloc(zone)))
+        {
             account_numa_allocation(preferred, i, 1u64 << order);
             return Ok(buddy::frame_from_no(no));
         }
@@ -965,12 +1223,19 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
         return;
     }
     let node = phys_to_node(phys);
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return;
     }
-    let zone_idx = if g.numa_aware { node } else { 0 };
-    g.zones[zone_idx].free(buddy::frame_no(frame), order);
+    let zone_idx = if ALLOC.numa_aware.load(Ordering::Acquire) {
+        node
+    } else {
+        0
+    };
+    let frame_no = buddy::frame_no(frame);
+    if order == 0 && free_order0_to_cache(zone_idx, frame_no) {
+        return;
+    }
+    ZONES[zone_idx].0.lock().free(frame_no, order);
 }
 
 /// Return a previously-allocated frame to the pool. Dispatches
@@ -1022,12 +1287,18 @@ fn buddy_free_frame(f: PhysFrame) {
     // no allocator can hand it out mid-scrub.
     scrub_freed_frame(f.start_address());
     let node = phys_to_node(f.start_address().raw());
-    let mut g = ALLOC.lock();
-    if !g.initialised {
+    if !ALLOC.initialised.load(Ordering::Acquire) {
         return;
     }
-    let zone_idx = if g.numa_aware { node } else { 0 };
-    g.zones[zone_idx].free(buddy::frame_no(f), 0);
+    let zone_idx = if ALLOC.numa_aware.load(Ordering::Acquire) {
+        node
+    } else {
+        0
+    };
+    let frame_no = buddy::frame_no(f);
+    if !free_order0_to_cache(zone_idx, frame_no) {
+        ZONES[zone_idx].0.lock().free(frame_no, 0);
+    }
 }
 
 /// Optionally overwrite a frame's bytes as it returns to the buddy
@@ -1329,12 +1600,17 @@ pub fn stats() -> FrameStats {
 
 /// Buddy-backed implementation of `stats`.
 fn buddy_stats() -> FrameStats {
-    let g = ALLOC.lock();
-    let free: usize = g.zones.iter().map(|z| z.free_frame_count()).sum();
+    let free: usize = ZONES
+        .iter()
+        .enumerate()
+        .map(|(node, zone)| {
+            zone.0.lock().free_frame_count() + FRAME_CACHE_FREE[node].load(Ordering::Relaxed)
+        })
+        .sum();
     FrameStats {
-        total: g.total_frames,
+        total: ALLOC.total_frames.load(Ordering::Relaxed),
         free,
-        reserved: g.reserved_frames,
+        reserved: ALLOC.reserved_frames.load(Ordering::Relaxed),
     }
 }
 
@@ -1344,8 +1620,7 @@ pub fn node_free(node: usize) -> usize {
     if node >= MAX_NUMA_NODES {
         return 0;
     }
-    let g = ALLOC.lock();
-    g.zones[node].free_frame_count()
+    ZONES[node].0.lock().free_frame_count() + FRAME_CACHE_FREE[node].load(Ordering::Relaxed)
 }
 
 /// Stable number of allocator-managed base pages assigned to `node`.
@@ -1356,7 +1631,7 @@ pub fn node_total(node: usize) -> usize {
     if node >= MAX_NUMA_NODES {
         return 0;
     }
-    ALLOC.lock().node_total_frames[node]
+    ALLOC.node_total_frames[node].load(Ordering::Relaxed)
 }
 
 /// Snapshot the number of free buddy blocks at every order for `node`.
@@ -1365,16 +1640,17 @@ pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT] {
     if node >= MAX_NUMA_NODES {
         return counts;
     }
-    let g = ALLOC.lock();
+    let zone = ZONES[node].0.lock();
     for (order, count) in counts.iter_mut().enumerate() {
-        *count = g.zones[node].free_block_count(order as u8);
+        *count = zone.free_block_count(order as u8);
     }
+    counts[0] += FRAME_CACHE_FREE[node].load(Ordering::Relaxed);
     counts
 }
 
 /// True once `rebalance_to_topology` has run.
 pub fn is_numa_aware() -> bool {
-    ALLOC.lock().numa_aware
+    ALLOC.numa_aware.load(Ordering::Acquire)
 }
 
 /// Diagnostic: walk every zone's free lists and confirm no frame
@@ -1383,14 +1659,61 @@ pub fn is_numa_aware() -> bool {
 /// overlap found. Intended for smoke-test instrumentation, not hot
 /// paths — O(N log N) per zone in total free-block count.
 pub fn validate_no_overlap() -> Result<(), (usize, u64, u8, u8)> {
-    let g = ALLOC.lock();
-    for (i, zone) in g.zones.iter().enumerate() {
-        if let Err((f, oa, ob)) = zone.validate_no_overlap() {
+    for (i, zone) in ZONES.iter().enumerate() {
+        if let Err((f, oa, ob)) = zone.0.lock().validate_no_overlap() {
             return Err((i, f, oa, ob));
         }
     }
     Ok(())
 }
+
+fn smoke_buddy_zone_locks_are_independent() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    let first = core::ptr::addr_of!(ZONES[0]) as usize;
+    let second = core::ptr::addr_of!(ZONES[1]) as usize;
+    if first & 63 != 0 || second.saturating_sub(first) < 64 {
+        return TestResult::Fail("buddy zone locks share a cache line");
+    }
+    let _held = ZONES[0].0.lock();
+    if ZONES[1].0.try_lock().is_none() {
+        return TestResult::Fail("locking one buddy zone blocks another zone");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_buddy_zone_locks_are_independent);
+
+fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return TestResult::Skip("frame caches not published");
+    }
+    let node = current_cpu_node();
+    if FRAME_CACHE_HOTPLUG_BYPASS[node].load(Ordering::Acquire) {
+        return TestResult::Skip("runtime hotplug intentionally bypasses frame cache");
+    }
+    let free_before = node_free(node);
+    let hits_before = FRAME_CACHE_HITS.load(Ordering::Relaxed);
+    let first = match alloc_pages_on(node, 0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("no order-0 frame available"),
+    };
+    free_pages(first, 0);
+    let second = match alloc_pages_on(node, 0) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("cached order-0 frame was not reusable"),
+    };
+    free_pages(second, 0);
+    if FRAME_CACHE_HITS.load(Ordering::Relaxed) <= hits_before {
+        return TestResult::Fail("order-0 round trip missed the per-CPU cache");
+    }
+    if node_free(node) != free_before {
+        return TestResult::Fail("frame cache changed free-page accounting");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_round_trip);
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {
@@ -1692,7 +2015,7 @@ impl CapType for MemAlloc {
 
 /// The default, today's per-NUMA buddy allocator wrapped behind the
 /// `FrameAlloc` seam. Zero-sized: the actual state lives in the
-/// module-private `ALLOC` lock + per-zone `BuddyZone` arrays.
+/// module-private cache-line-aligned per-zone `BuddyZone` locks.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BuddyFrameAlloc;
 
@@ -1798,12 +2121,9 @@ impl FrameAlloc for BumpFrameAlloc {
 
 // `&'static dyn FrameAlloc` is a fat pointer (data + vtable). An
 // `AtomicPtr` can only hold one word; we therefore park the trait
-// object behind an `IrqSafeSpinLock<Option<…>>`. The lock is taken
-// for the entire duration of a dispatched call, which keeps the
-// vtable load + the indirect call atomic with respect to a swap.
-// The cost is one uncontended lock per frame alloc; on the hot
-// alloc path this is the same cost the buddy was already paying
-// for `ALLOC.lock()`.
+// object behind an `IrqSafeSpinLock<Option<…>>`. Dispatch copies the
+// `'static` fat pointer and releases this lock before invoking it, so
+// buddy work is serialized only by the selected NUMA-zone lock.
 static FRAME_ALLOC_SLOT: IrqSafeSpinLock<Option<&'static dyn FrameAlloc>> =
     IrqSafeSpinLock::new(None);
 

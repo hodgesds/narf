@@ -528,6 +528,10 @@ pub struct AddressSpace {
     /// `new_table` primitive once it lands; `PhysAddr::new(0)`
     /// acts as "not-yet-initialised" sentinel.
     pub root: PhysAddr,
+    /// Lifetime-scoped aarch64 process ASID. Tag 0 is the safe fallback and
+    /// selects the flushing TTBR0 switch path.
+    #[cfg(target_arch = "aarch64")]
+    asid: crate::asid_alloc::DomainTag,
     regions: IrqSafeSpinLock<RegionTable>,
     huge_regions: IrqSafeSpinLock<Vec<HugeRegion>>,
     /// Per-AS mmap cursor: next free virt for a no-hint mmap.
@@ -604,6 +608,8 @@ impl AddressSpace {
     pub const fn empty() -> Self {
         Self {
             root: PhysAddr::new(0),
+            #[cfg(target_arch = "aarch64")]
+            asid: crate::asid_alloc::DomainTag::RESERVED,
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
@@ -862,6 +868,7 @@ impl AddressSpace {
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         Ok(Self {
             root: phys,
+            asid: crate::asid_alloc::allocate_process_asid(),
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
@@ -2803,10 +2810,10 @@ impl AddressSpace {
             // SAFETY: `self.root` is this AS's valid TTBR0 root;
             // translate only reads the tables.
             if unsafe { crate::aarch64::paging::translate(self.root, va) }.is_some() {
-                // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
+                // SAFETY: TLBI VAAE1IS at EL1 is always legal; `v` is the
                 // page-aligned faulting VA owned by this AS.
                 unsafe {
-                    crate::aarch64::paging::tlb_invalidate_vae1is(va);
+                    crate::aarch64::paging::tlb_invalidate_va_all_asids_inner_shareable(va);
                 }
                 return Ok(());
             }
@@ -5289,9 +5296,9 @@ impl AddressSpace {
 
     /// Make this address-space the active one. On x86_64 issues a
     /// `MOV CR3` with the right `compiler_fence` discipline; on
-    /// aarch64 issues `MSR TTBR0_EL1` with the architected
-    /// MSR + DSB + TLBI + ISB sequence (see
-    /// `aarch64::paging::write_ttbr0_el1`).
+    /// aarch64 installs the `(root, ASID)` TTBR0 context with the architected
+    /// DSB + MSR + ISB sequence. Nonzero lifetime-scoped ASIDs retain cached
+    /// translations; the ASID-0 exhaustion fallback flushes on root changes.
     ///
     /// # Safety invariants (x86_64)
     /// - `self.root` must have been constructed via `new_for_user`,
@@ -5345,23 +5352,19 @@ impl AddressSpace {
             // valid; user code's low-half mappings come from the
             // regions we materialise into `self.root`.
             //
-            // DIAGNOSTIC: write the CURRENT TTBR0 back to itself,
-            // exercising the MSR + TLBI path without actually
-            // changing the mapping. If this hangs, the issue is
-            // the asm sequence or the TLBI itself — not the new
-            // user-AS mapping.
-            // SAFETY: ttbr0 read is unconditional.
-            let cur = unsafe { crate::aarch64::paging::read_ttbr0_el1() };
-            // SAFETY: writes the value just read from `TTBR0_EL1` straight
-            // back, so the active low-half translation is unchanged; the
-            // accompanying TLBI only flushes entries that are re-derived
-            // identically. The kernel half lives in `TTBR1_EL1` and is
-            // untouched, so kernel fetches/loads stay valid across the MSR.
+            // Install this address space's low-half root. The scheduler saves
+            // the incoming TTBR0 around every user-task poll and restores it
+            // before polling another task; the kernel itself executes and
+            // accesses physical memory through the shared TTBR1 high half.
+            // A lifetime-scoped nonzero ASID keeps this address space's cached
+            // translations across switches. Pool exhaustion falls back to
+            // ASID 0 and the local full-invalidation path.
+            // SAFETY: `new_for_user` created `self.root` as a live L0 table;
+            // TTBR1 carries the executing kernel across this low-half switch.
             // SAFETY: Valid memory or trusted environment
             unsafe {
-                crate::aarch64::paging::write_ttbr0_el1(cur);
+                crate::aarch64::paging::write_ttbr0_el1_asid(self.root, self.asid.tag);
             }
-            let _ = self.root;
             Ok(())
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -5463,6 +5466,8 @@ impl Drop for AddressSpace {
                 crate::aarch64::paging::free_user_ttbr0_tree(self.root);
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        crate::asid_alloc::release_process_asid(self.asid);
     }
 }
 

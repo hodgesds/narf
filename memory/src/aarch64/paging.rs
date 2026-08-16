@@ -205,28 +205,71 @@ pub unsafe fn read_ttbr1_el1() -> PhysAddr {
 /// high half (TTBR1) so swapping TTBR0 is safe from the kernel's
 /// perspective.
 pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
+    // SAFETY: forwarded contract; ASID 0 selects the flushing fallback.
+    unsafe { write_ttbr0_el1_asid(root, 0) };
+}
+
+/// Install `root` in TTBR0_EL1 under a lifetime-scoped process ASID.
+///
+/// A nonzero ASID preserves cached translations belonging to other address
+/// spaces. ASID 0 is the exhaustion/bootstrap fallback and performs a local
+/// full EL1 invalidation whenever the root changes. Reinstalling the exact
+/// `(root, ASID)` pair is a no-op, which avoids duplicate work when both the
+/// scheduler and the user-task wrapper activate the same address space.
+///
+/// # Safety
+/// `root` must remain a valid low-half root for every CPU that can execute
+/// with `asid`. A nonzero `asid` must be owned exclusively by this root until
+/// a system-wide tag invalidation completes.
+pub(crate) unsafe fn write_ttbr0_el1_asid(root: PhysAddr, asid: u16) {
     use core::arch::asm;
     use core::sync::atomic::{compiler_fence, Ordering};
 
+    let next = (root.raw() & 0x0000_FFFF_FFFF_F000) | ((asid as u64) << 48);
+    let current: u64;
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: `MSR TTBR0_EL1, xN` at EL1 is the architected way to
-    // swap the low-half translation root; the ASID field in bits
-    // [63:48] stays zero (single-ASID mode for Stage-4 structural).
-    // Use the cheaper local `tlbi vmalle1` (current EL, NOT
-    // inner-shareable broadcast) — every CPU executes its own
-    // activate() before polling, so per-CPU TLB scoping suffices
-    // and avoids the cross-core synchronisation cost.
-    // SAFETY: Valid memory or trusted environment
+    // SAFETY: TTBR0_EL1 is readable at EL1 and has no memory side effects.
     unsafe {
         asm!(
-            "msr ttbr0_el1, {addr}",
-            "dsb nsh",
-            "tlbi vmalle1",
-            "dsb nsh",
-            "isb",
-            addr = in(reg) root.raw(),
-            options(nostack, preserves_flags),
+            "mrs {current}, ttbr0_el1",
+            current = out(reg) current,
+            options(nomem, nostack, preserves_flags),
         );
+    }
+    compiler_fence(Ordering::SeqCst);
+    if current == next {
+        return;
+    }
+
+    compiler_fence(Ordering::SeqCst);
+    if asid == 0 {
+        // SAFETY: ASID 0 may have described a different root on this CPU, so
+        // switching it requires invalidating every local EL1 translation.
+        unsafe {
+            asm!(
+                "dsb nsh",
+                "msr ttbr0_el1, {next}",
+                "isb",
+                "tlbi vmalle1",
+                "dsb nsh",
+                "isb",
+                next = in(reg) next,
+                options(nostack, preserves_flags),
+            );
+        }
+    } else {
+        // SAFETY: the caller guarantees that this ASID is exclusive to `root`.
+        // The pre-write DSB completes prior translation-table writes and the
+        // ISB makes the new translation context effective before later access.
+        unsafe {
+            asm!(
+                "dsb ish",
+                "msr ttbr0_el1, {next}",
+                "isb",
+                next = in(reg) next,
+                options(nostack, preserves_flags),
+            );
+        }
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -241,7 +284,7 @@ pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
 /// new mapping can be relied on.
 ///
 /// **This was missing from every `map_*` path** while `unmap_4kb` twelve lines
-/// below correctly issued `dsb ishst; tlbi vale1is; dsb ish; isb`. Callers
+/// below correctly issued `dsb ishst; tlbi vaale1is; dsb ish; isb`. Callers
 /// routinely map a page and write through the returned VA immediately —
 /// `bpf_arena`'s populate does exactly that — so on real silicon the access
 /// could be reordered ahead of the descriptor becoming visible and take a
@@ -268,8 +311,8 @@ unsafe fn publish_table_write() {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// Invalidate a single virtual address from the TLB via
-/// `TLBI VAE1IS, xN` with the required barrier dance.
+/// Invalidate a single virtual address for every ASID via
+/// `TLBI VAAE1IS, xN` with the required barrier dance.
 ///
 /// # The `IS` is load-bearing
 ///
@@ -291,22 +334,23 @@ unsafe fn publish_table_write() {
 ///     cannot alias a later mapping" was wrong in the direction that matters:
 ///     the *frame* is reissued, not the VA.
 ///
-/// The tree already knew the difference — `unmap_4kb` twelve lines below uses
-/// `tlbi vale1is`, and `ioremap`'s module doc explicitly noted that `vae1`
+/// The tree already knew the difference — `unmap_4kb` uses an
+/// inner-shareable invalidation, and `ioremap`'s module doc explicitly noted
+/// that the old `vae1`
 /// "covers the local CPU" while assuming a separate IPI paired with it. Nothing
 /// issued that IPI for these paths.
 ///
-/// `vae1is` broadcasts to the whole inner-shareable domain in hardware, so it
-/// needs no IPI plumbing and cannot deadlock against a held lock the way a
-/// shootdown IPI can. It is strictly *more* invalidation than the old form —
-/// never less correct, only marginally slower.
+/// `vaae1is` broadcasts to the whole inner-shareable domain and covers every
+/// ASID. The all-ASID form is required because callers mutate both shared
+/// TTBR1 mappings and arbitrary process TTBR0 roots while another ASID may be
+/// active; encoding ASID 0 would leave nonzero process translations stale.
 ///
 /// # Safety
 /// `TLBI`/`DSB`/`ISB` at EL1 are unconditional, but dropping a stale
 /// TLB entry only yields a coherent address space when `virt`'s
 /// page-table entry has already been updated; the caller must order
 /// the descriptor write before this call.
-pub unsafe fn tlb_invalidate_vae1is(virt: VirtAddr) {
+pub unsafe fn tlb_invalidate_va_all_asids_inner_shareable(virt: VirtAddr) {
     use core::arch::asm;
     use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -317,7 +361,7 @@ pub unsafe fn tlb_invalidate_vae1is(virt: VirtAddr) {
     unsafe {
         asm!(
             "dsb ishst",
-            "tlbi vae1is, {a}",
+            "tlbi vaae1is, {a}",
             "dsb ish",
             "isb",
             a = in(reg) (virt.as_u64() >> 12),
@@ -530,7 +574,7 @@ pub unsafe fn map_2mb(
     l2.entries[idx.l2] = PageTableEntry::new(phys, base | flags);
     // SAFETY: publish the descriptor before returning — see `publish_table_write`.
     unsafe { publish_table_write() };
-    unsafe { tlb_invalidate_vae1is(virt) };
+    unsafe { tlb_invalidate_va_all_asids_inner_shareable(virt) };
     Ok(())
 }
 
@@ -566,7 +610,7 @@ pub unsafe fn map_1gb(
     l1.entries[idx.l1] = PageTableEntry::new(phys, base | flags);
     // SAFETY: publish the descriptor before returning — see `publish_table_write`.
     unsafe { publish_table_write() };
-    unsafe { tlb_invalidate_vae1is(virt) };
+    unsafe { tlb_invalidate_va_all_asids_inner_shareable(virt) };
     Ok(())
 }
 
@@ -600,7 +644,7 @@ pub unsafe fn unmap_2mb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
         return Err(MapError::AlreadyMapped);
     }
     l2.entries[idx.l2] = PageTableEntry::EMPTY;
-    unsafe { tlb_invalidate_vae1is(virt) };
+    unsafe { tlb_invalidate_va_all_asids_inner_shareable(virt) };
     Ok(leaf.addr())
 }
 
@@ -629,7 +673,7 @@ pub unsafe fn unmap_1gb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
         return Err(MapError::AlreadyMapped);
     }
     l1.entries[idx.l1] = PageTableEntry::EMPTY;
-    unsafe { tlb_invalidate_vae1is(virt) };
+    unsafe { tlb_invalidate_va_all_asids_inner_shareable(virt) };
     Ok(leaf.addr())
 }
 
@@ -751,15 +795,15 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     }
     let prev_phys = leaf.addr();
     l3.entries[idx.l3] = PageTableEntry(0);
-    // TLB invalidation for the page (VAE1IS — by VA at EL1
-    // inner-shareable). Wrap in DSB to order the table mutation
-    // before the TLB op, and ISB after to drain.
+    // TLB invalidation for the page (VAALE1IS — by last-level VA for every
+    // ASID in the inner-shareable domain). The all-ASID form is required when
+    // the mutated root is not the one currently installed in TTBR0_EL1.
     let va_page = virt.as_u64() >> 12;
     // SAFETY: TLBI/DSB/ISB at EL1 are unconditional.
     unsafe {
         core::arch::asm!(
             "dsb ishst",
-            "tlbi vale1is, {va}",
+            "tlbi vaale1is, {va}",
             "dsb ish",
             "isb",
             va = in(reg) va_page,

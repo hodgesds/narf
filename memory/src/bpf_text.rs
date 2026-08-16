@@ -1392,7 +1392,7 @@ unsafe fn map_pack_page(root: PhysAddr, va: u64, phys: PhysAddr) -> Result<(), T
 /// aarch64 seal: read-only at EL1 (`AP_RO_EL1`), still `UXN`, and **clear**
 /// `PXN` so EL1 may fetch instructions from it.
 ///
-/// No IPI plumbing: `tlbi vae1is` is inner-shareable and self-broadcasts. That
+/// No IPI plumbing: `tlbi vaae1is` is inner-shareable and self-broadcasts. That
 /// asymmetry with x86_64 is worth remembering — the arch does the shootdown
 /// for us.
 ///
@@ -1401,13 +1401,15 @@ unsafe fn map_pack_page(root: PhysAddr, va: u64, phys: PhysAddr) -> Result<(), T
 /// the issuing PE only. So on SMP a peer CPU could keep the pre-flip leaf —
 /// PXN still set (instruction fetch at the entry faults at a PC with no
 /// extable entry) and AP=RW (a writable alias of live text). The primitive now
-/// issues `vae1is`, so the comment describes what runs.
+/// issues `vaae1is`, so the comment describes what runs.
 ///
 /// # Safety
 /// Same contract as the x86_64 arm.
 #[cfg(target_arch = "aarch64")]
 unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
-    use crate::aarch64::paging::{tlb_invalidate_vae1is, PageTable, PageTableEntry, PtFlags};
+    use crate::aarch64::paging::{
+        tlb_invalidate_va_all_asids_inner_shareable, PageTable, PageTableEntry, PtFlags,
+    };
 
     // AP[2:1] occupy bits 7:6; UXN is 54, PXN is 53. Clear the AP field and
     // PXN, then set RO-at-EL1 + UXN.
@@ -1463,13 +1465,13 @@ unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
         }
     }
 
-    // `tlbi vae1is` is inner-shareable; the hardware broadcasts it. Issue one
-    // per 4 KiB page of the pack — for a 2 MiB pack that is 512 `tlbi`s, but
-    // they are cheap local instructions, not IPI round-trips.
+    // `tlbi vaae1is` is inner-shareable and covers every ASID; the hardware
+    // broadcasts it. Issue one per 4 KiB page of the pack — for a 2 MiB pack
+    // that is 512 `tlbi`s, but they are instructions, not IPI round-trips.
     for i in 0..(p.len / 4096) {
         // SAFETY: TLB invalidation is always legal at EL1.
         unsafe {
-            tlb_invalidate_vae1is(VirtAddr::new(p.base + i * 4096));
+            tlb_invalidate_va_all_asids_inner_shareable(VirtAddr::new(p.base + i * 4096));
         }
     }
     Ok(())

@@ -2286,6 +2286,7 @@ pub fn run_until_empty() {
                 // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
                 // receives the register value.
                 // SAFETY: Valid memory or trusted environment
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 unsafe {
                     core::arch::asm!(
                         "mrs {0}, ttbr0_el1",
@@ -2293,6 +2294,7 @@ pub fn run_until_empty() {
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 raw
             } else {
                 0
@@ -2360,27 +2362,23 @@ pub fn run_until_empty() {
             #[cfg(target_arch = "aarch64")]
             if saved_ttbr0 != 0 {
                 // SAFETY: `saved_ttbr0` was just read from
-                // TTBR0_EL1 in kernel context above. The
-                // architected sequence for a TTBR swap is MSR +
-                // ISB; we also broadcast a TLBI VMALLE1IS to
-                // clear stale Stage-1 TLB entries from the
-                // intervening user-AS activation. This is the
-                // same dance `aarch64::paging::write_ttbr0_el1`
-                // performs internally, replicated here so we
-                // don't pull a circular dep on `narf-memory`
-                // from inside `narf-scheduler`'s hot path.
+                // TTBR0_EL1 in kernel context above. Process ASIDs are unique
+                // for the AddressSpace lifetime and are invalidated before
+                // reuse, so restoring the saved `(root, ASID)` context needs
+                // only the architected DSB + MSR + ISB sequence. Flushing here
+                // would discard the translations that ASIDs exist to retain.
                 // SAFETY: Valid memory or trusted environment
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 unsafe {
                     core::arch::asm!(
-                        "msr ttbr0_el1, {0}",
-                        "isb",
-                        "tlbi vmalle1is",
                         "dsb ish",
+                        "msr ttbr0_el1, {0}",
                         "isb",
                         in(reg) saved_ttbr0,
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
             let elapsed = Instant::now().cycles_since(start);
             let outcome = slot.account.charge(elapsed, &slot.spec.budget);
