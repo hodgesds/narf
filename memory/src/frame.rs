@@ -1486,6 +1486,7 @@ pub fn __pagetable_is_registered(phys: u64) -> bool {
 /// only for frames that go through `inc_ref`.
 pub mod cow {
     use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
     use core::sync::atomic::{AtomicU32, Ordering};
 
     use narf_lib::sync::IrqSafeSpinLock;
@@ -1534,6 +1535,35 @@ pub mod cow {
         // owner from `1` (representing the original sole owner) to
         // `2` (original + new sharer).
         entry.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Increment the COW reference for every non-zero frame in `frames`.
+    ///
+    /// Frames are grouped by refcount shard before any lock is taken, so a
+    /// fork of an N-page address space acquires each touched shard once rather
+    /// than disabling IRQs around N independent lock acquisitions. Duplicate
+    /// addresses are intentional: each occurrence represents another owner
+    /// and therefore contributes one reference.
+    pub fn inc_ref_batch(frames: &[PhysAddr]) {
+        let mut by_shard: [Vec<u64>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
+        for phys in frames {
+            let key = phys.raw();
+            if key != 0 {
+                by_shard[ref_shard(key)].push(key);
+            }
+        }
+
+        for (shard, keys) in by_shard.into_iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            let mut guard = REFCOUNTS[shard].map.lock();
+            let map = guard.get_or_insert_with(BTreeMap::new);
+            for key in keys {
+                let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
+                entry.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
 
     /// Decrement the refcount on `phys`. Returns the new count

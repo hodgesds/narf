@@ -355,6 +355,45 @@ impl RegionTable {
         (address < region.base.as_u64().saturating_add(region.len)).then_some(region)
     }
 
+    /// Find the first eligible resident private page at or after `start`.
+    ///
+    /// The old iterator pipeline visited every page in every VMA and selected
+    /// the minimum qualifying address. Since VMAs and their backing vectors
+    /// are already ordered, seek to the containing/successor VMA and stop at
+    /// the first resident slot instead. This bounds the IRQ-disabled timer
+    /// path by the forward distance from its persistent scan cursor.
+    fn next_numa_hint_candidate(&self, start: u64) -> Option<VirtAddr> {
+        let first_base = self
+            .by_base
+            .range(..=start)
+            .next_back()
+            .filter(|(_, region)| start < region.base.as_u64().saturating_add(region.len))
+            .map_or(start, |(&base, _)| base);
+
+        for (_, region) in self.by_base.range(first_base..) {
+            if region.perms.contains(RegionPerms::SHARED)
+                || region.perms.contains(RegionPerms::LOCKED)
+                || region.perms.prot_only().0 == 0
+            {
+                continue;
+            }
+            let rb = region.base.as_u64();
+            let first_index = if start > rb {
+                ((start - rb) >> 12) as usize
+            } else {
+                0
+            };
+            let Some(tail) = region.phys.get(first_index..) else {
+                continue;
+            };
+            let Some(relative) = tail.iter().position(|phys| phys.raw() != 0) else {
+                continue;
+            };
+            return Some(VirtAddr::new(rb + ((first_index + relative) as u64) * 4096));
+        }
+        None
+    }
+
     fn insert(&mut self, region: Region) -> Option<Region> {
         self.by_base.insert(region.base.as_u64(), region)
     }
@@ -732,23 +771,7 @@ impl AddressSpace {
     pub fn next_numa_hint_candidate(&self, start: VirtAddr) -> Option<VirtAddr> {
         let start = start.as_u64() & !0xFFF;
         let regions = self.regions.lock();
-        regions
-            .iter()
-            .filter(|region| {
-                !region.perms.contains(RegionPerms::SHARED)
-                    && !region.perms.contains(RegionPerms::LOCKED)
-                    && region.perms.prot_only().0 != 0
-            })
-            .flat_map(|region| {
-                region
-                    .phys
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, phys)| phys.raw() != 0)
-                    .map(|(index, _)| VirtAddr::new(region.base.as_u64() + (index as u64) * 4096))
-            })
-            .filter(|page| page.as_u64() >= start)
-            .min_by_key(|page| page.as_u64())
+        regions.next_numa_hint_candidate(start)
     }
 
     /// Mark this AS as shared by a `CLONE_VM` clone (thread creation).
@@ -4598,14 +4621,19 @@ impl AddressSpace {
                 // the thousands across a large demand-paged region's fork, and
                 // the matching dec_ref(0) on teardown risked free_frame(0) /
                 // frame-0 reuse — corruption surfacing far away.
-                for &p in r.phys.iter() {
-                    if p.raw() == 0 {
-                        continue;
-                    }
-                    let _ = crate::frame::cow::inc_ref(p);
-                }
                 r.perms = r.perms | RegionPerms::COW;
             }
+            // Group all resident private backing by refcount shard and take
+            // each touched lock once. Keep this inside the region transaction:
+            // moving it below the lock would let munmap free a source before
+            // its child's ownership was retained.
+            let cow_frames: Vec<PhysAddr> = g
+                .iter()
+                .filter(|region| !region.perms.contains(RegionPerms::SHARED))
+                .flat_map(|region| region.phys.iter().copied())
+                .filter(|phys| phys.raw() != 0)
+                .collect();
+            crate::frame::cow::inc_ref_batch(&cow_frames);
             g.snapshot()
         };
 
@@ -5695,6 +5723,54 @@ fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
         true
     }
 }
+
+fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
+    let mut table = RegionTable::new();
+    let mut add = |base: u64, perms: RegionPerms, phys: Vec<PhysAddr>| {
+        table.insert(Region {
+            base: VirtAddr::new(base),
+            len: phys.len() as u64 * 4096,
+            perms,
+            phys,
+        });
+    };
+    add(
+        0x1000,
+        RegionPerms::READ | RegionPerms::WRITE,
+        alloc::vec![
+            PhysAddr::new(0),
+            PhysAddr::new(0x20_000),
+            PhysAddr::new(0x21_000)
+        ],
+    );
+    add(0x5000, RegionPerms(0), alloc::vec![PhysAddr::new(0x22_000)]);
+    add(
+        0x7000,
+        RegionPerms::READ | RegionPerms::LOCKED,
+        alloc::vec![PhysAddr::new(0x23_000)],
+    );
+    add(0x8000, RegionPerms::READ, alloc::vec![PhysAddr::new(0)]);
+    add(
+        0xA000,
+        RegionPerms::READ,
+        alloc::vec![PhysAddr::new(0), PhysAddr::new(0x24_000)],
+    );
+
+    if table.next_numa_hint_candidate(0) != Some(VirtAddr::new(0x2000)) {
+        return TestResult::Fail("NUMA cursor did not seek to first resident page");
+    }
+    if table.next_numa_hint_candidate(0x3000) != Some(VirtAddr::new(0x3000)) {
+        return TestResult::Fail("NUMA cursor skipped resident page at cursor");
+    }
+    if table.next_numa_hint_candidate(0x4000) != Some(VirtAddr::new(0xB000)) {
+        return TestResult::Fail("NUMA cursor did not skip holes and ineligible VMAs");
+    }
+    if table.next_numa_hint_candidate(0xC000).is_some() {
+        return TestResult::Fail("NUMA cursor wrapped instead of reporting end of tree");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_numa_candidate_seeks_from_cursor);
 
 /// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
 /// outstanding ticket before its slow path can publish into the new mapping.

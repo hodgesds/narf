@@ -61,6 +61,9 @@ pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
+/// Retain every non-zero COW backing while locking each touched refcount
+/// shard once; duplicate entries represent distinct owners.
+pub fn cow::inc_ref_batch(frames: &[PhysAddr]);
 pub fn map(va: VirtAddr, pf: PhysFrame, flags: MapFlags, domain: DomainId);
 pub fn map_folio(va: VirtAddr, folio: Folio, flags: MapFlags, domain: DomainId);
 pub fn map_huge(va: VirtAddr, folio: Folio, size: PageSize, flags: MapFlags, domain: DomainId);
@@ -489,6 +492,11 @@ x86_64 is rejected at runtime.
   COW. Hardware leaves remain read-only while their backing-frame refcount is
   greater than one. A write fault is recoverable only when both WRITE and COW
   are present; `mprotect(PROT_READ)` therefore cannot be mistaken for COW.
+  Fork retains all resident private backing through one batched operation
+  while the parent region transaction is held. The batch groups frames by
+  refcount shard, locks each touched shard once, and increments once per input
+  occurrence; unbacked zero sentinels and externally owned SHARED mappings are
+  excluded.
 - Base-page relocation installs the disjoint destination before removing the
   source, publishes backing ownership exactly once, invalidates source
   translations before freeing a truncated tail, and leaves the source intact
@@ -499,6 +507,9 @@ x86_64 is rejected at runtime.
   lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
   inspect only the predecessor/successor or intersecting tree range; backing
   ownership and TLB ordering are unchanged by this metadata index invariant.
+  The periodic NUMA sampler seeks to the VMA containing or succeeding its
+  page-aligned cursor and stops at the first eligible resident slot, rather
+  than rescanning all preceding VMAs/pages under the IRQ-safe region lock.
 - Anonymous and file-backed demand faults reserve a page-scoped ticket before
   leaving the address-space region lock. Frame allocation, page zeroing, and
   filesystem callbacks run without that IRQ-disabling lock, so faults on

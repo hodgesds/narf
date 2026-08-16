@@ -3232,6 +3232,57 @@ fn smoke_memory_cow_refcount_round_trip() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_cow_refcount_round_trip);
 
+fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
+    use crate::frame::cow;
+
+    cow::__test_clear();
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        match crate::frame::alloc_frame() {
+            Ok(frame) => frames.push(frame),
+            Err(_) => {
+                for frame in frames {
+                    crate::frame::free_frame(frame);
+                }
+                return TestResult::Skip("frame allocator not initialised");
+            }
+        }
+    }
+    let phys: alloc::vec::Vec<_> = frames.iter().map(|frame| frame.start_address()).collect();
+    let batch = [
+        phys[0],
+        phys[1],
+        phys[2],
+        phys[3],
+        phys[0],
+        crate::PhysAddr::new(0),
+    ];
+    cow::inc_ref_batch(&batch);
+
+    let verdict = if cow::count(phys[0]) != 3 {
+        TestResult::Fail("duplicate batch entries did not retain distinct owners")
+    } else if phys[1..].iter().any(|frame| cow::count(*frame) != 2) {
+        TestResult::Fail("batch did not retain every unique frame")
+    } else if cow::count(crate::PhysAddr::new(0)) != 0 {
+        TestResult::Fail("batch registered the unbacked zero sentinel")
+    } else {
+        TestResult::Pass
+    };
+
+    // Drop the synthetic batch owners, then the original PhysFrame owners.
+    for frame in batch {
+        if frame.raw() != 0 {
+            let _ = cow::dec_ref(frame);
+        }
+    }
+    for frame in frames {
+        crate::frame::free_frame(frame);
+    }
+    cow::__test_clear();
+    verdict
+}
+kernel_test_in!("memory", smoke_memory_cow_refcount_batch_retains_each_owner);
+
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same
