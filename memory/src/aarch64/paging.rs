@@ -13,6 +13,8 @@ static PUBLISH_BARRIER_SEQUENCES: core::sync::atomic::AtomicU64 =
 #[cfg(feature = "kernel-test")]
 static TLBI_BARRIER_SEQUENCES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static RANGE_L3_WALKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Test-only counters for proving multi-leaf helpers amortise architecture
 /// barrier sequences. Production builds contain neither counter nor update.
@@ -24,6 +26,14 @@ pub fn __batch_barrier_counts_for_test() -> (u64, u64) {
         PUBLISH_BARRIER_SEQUENCES.load(Ordering::Relaxed),
         TLBI_BARRIER_SEQUENCES.load(Ordering::Relaxed),
     )
+}
+
+/// Number of upper-level walks performed by contiguous range clearing. One
+/// walk covers every page sharing an L3 table (up to 512 leaves).
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __range_l3_walks_for_test() -> u64 {
+    RANGE_L3_WALKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// A single 64-bit descriptor.
@@ -1018,29 +1028,14 @@ pub unsafe fn rewrite_4kb_scatter_range(
     }
 
     let _guard = pt_lock_for(root).lock();
-    let mut removed = 0;
-    for page in 0..pages {
-        let virt = VirtAddr::new(base.as_u64() + page * 4096);
-        // SAFETY: the complete range was validated and the root lock remains
-        // held for both halves of break-before-make.
-        match unsafe { unmap_4kb_locked(root, virt, false) } {
-            Ok(_) => removed += 1,
-            Err(MapError::AlreadyMapped) => {}
-            Err(error) => {
-                if removed != 0 {
-                    // SAFETY: all descriptors cleared so far precede this
-                    // invalidation; covering untouched suffix pages is benign.
-                    unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };
-                }
-                return Err(error);
-            }
-        }
-    }
+    // SAFETY: complete range validation and the held root lock are above.
+    let (removed, clear_result) = unsafe { clear_4kb_range_locked(root, base, pages) };
     if removed != 0 {
         // SAFETY: all old valid leaves are now clear. This is the break half;
         // the helper's trailing DSB/ISB completes it before any make store.
         unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };
     }
+    clear_result?;
 
     let mut attempted = false;
     let mut result = Ok(());
@@ -1137,6 +1132,74 @@ unsafe fn unmap_4kb_locked(
     Ok(prev_phys)
 }
 
+/// Clear a validated contiguous span while caching its current L3 table.
+///
+/// Returns the present-leaf count plus the first structural error. Missing
+/// upper levels and missing leaves are benign. The caller holds the root lock
+/// and is responsible for invalidating the full span whenever `removed != 0`,
+/// including on error.
+unsafe fn clear_4kb_range_locked(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> (u64, Result<(), MapError>) {
+    // SAFETY: root is identity-reachable and protected by its mutation lock.
+    let l0 = unsafe { &mut *(root.kernel_mut_ptr::<PageTable>()) };
+    let mut cached_key = usize::MAX;
+    let mut cached_l3: *mut PageTable = core::ptr::null_mut();
+    let mut removed = 0;
+
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.as_u64() + page * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.l0 << 18) | (idx.l1 << 9) | idx.l2;
+        if key != cached_key {
+            cached_key = key;
+            cached_l3 = core::ptr::null_mut();
+            #[cfg(feature = "kernel-test")]
+            RANGE_L3_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            let l0e = l0.entries[idx.l0];
+            if !l0e.is_valid() {
+                continue;
+            }
+            if l0e.raw() & 0b11 != 0b11 {
+                return (removed, Err(MapError::EncounteredBlock));
+            }
+            // SAFETY: verified L0 table descriptor under the root lock.
+            let l1 = unsafe { &mut *(l0e.addr().kernel_mut_ptr::<PageTable>()) };
+            let l1e = l1.entries[idx.l1];
+            if !l1e.is_valid() {
+                continue;
+            }
+            if l1e.raw() & 0b11 != 0b11 {
+                return (removed, Err(MapError::EncounteredBlock));
+            }
+            // SAFETY: verified L1 table descriptor under the root lock.
+            let l2 = unsafe { &mut *(l1e.addr().kernel_mut_ptr::<PageTable>()) };
+            let l2e = l2.entries[idx.l2];
+            if !l2e.is_valid() {
+                continue;
+            }
+            if l2e.raw() & 0b11 != 0b11 {
+                return (removed, Err(MapError::EncounteredBlock));
+            }
+            cached_l3 = l2e.addr().kernel_mut_ptr::<PageTable>();
+        }
+        if cached_l3.is_null() {
+            continue;
+        }
+        // SAFETY: cached_l3 came from the verified L2 descriptor for this key;
+        // the held root lock prevents replacement during the range walk.
+        let l3 = unsafe { &mut *cached_l3 };
+        if l3.entries[idx.l3].is_valid() {
+            l3.entries[idx.l3] = PageTableEntry::EMPTY;
+            removed += 1;
+        }
+    }
+    (removed, Ok(()))
+}
+
 /// Tear down a contiguous run under one root lock and one TLBI barrier pair.
 /// Missing leaves are benign; the returned count includes only leaves that
 /// were present and cleared.
@@ -1164,21 +1227,8 @@ pub unsafe fn unmap_4kb_range(root: PhysAddr, base: VirtAddr, pages: u64) -> Res
     }
 
     let _guard = pt_lock_for(root).lock();
-    let mut removed = 0;
-    let mut result = Ok(());
-    for page in 0..pages {
-        let virt = VirtAddr::new(base.as_u64() + page * 4096);
-        // SAFETY: the complete range was validated and the root lock remains
-        // held for this walk.
-        match unsafe { unmap_4kb_locked(root, virt, false) } {
-            Ok(_) => removed += 1,
-            Err(MapError::AlreadyMapped) => {}
-            Err(error) => {
-                result = Err(error);
-                break;
-            }
-        }
-    }
+    // SAFETY: complete range validation and the held root lock are above.
+    let (removed, result) = unsafe { clear_4kb_range_locked(root, base, pages) };
     if removed != 0 {
         // SAFETY: every present leaf in the range is already clear.
         unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };

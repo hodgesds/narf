@@ -443,3 +443,11 @@ argument = "The x86_64 scatter permission rewriter retains one existing root-sha
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The x86_64 one-lock permission transaction and remote-only range broadcast remain private implementation paths inside the existing memory TCB and its established interrupt shootdown bridge. They add no capability, domain assignment, trusted subsystem, user-controlled authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 contiguous clear walker caches only the L3 pointer reached through verified valid table descriptors while holding the same live root's mutation shard. The cache key includes the complete L0/L1/L2 index tuple and is discarded at every 2 MiB boundary, so no leaf write can cross into an unrelated table. Missing tables remain benign holes and a block descriptor fails before it can be treated as a child pointer. Every cleared leaf is still followed by the existing all-ASID inner-shareable invalidation before backing reuse or replacement publication, including partial progress before a structural error; reducing upper-level walks changes neither mapping authority nor translation-retirement ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached aarch64 range walk is an internal implementation detail of the existing memory page-table TCB. It introduces no capability, domain assignment, trusted subsystem, external pointer, or cross-domain path and does not change which root or virtual range the caller is authorized to mutate."

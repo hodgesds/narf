@@ -815,8 +815,8 @@ kernel_test_in!(
 #[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
 fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     use crate::aarch64::paging::{
-        __batch_barrier_counts_for_test, free_user_ttbr0_tree, map_4kb_scatter_range, translate,
-        unmap_4kb_range, PageTable, PtFlags,
+        __batch_barrier_counts_for_test, __range_l3_walks_for_test, free_user_ttbr0_tree,
+        map_4kb_scatter_range, translate, unmap_4kb_range, PageTable, PtFlags,
     };
     use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
 
@@ -870,6 +870,7 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         }
     }
     let barriers_before_rewrite = __batch_barrier_counts_for_test();
+    let walks_before_rewrite = __range_l3_walks_for_test();
     // SAFETY: this is a permission-only replacement of the same live backing
     // in the isolated root. The helper must perform one break-before-make
     // transaction for both present leaves while preserving the lazy hole.
@@ -892,6 +893,11 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 rewrite did not batch break-before-make barriers");
     }
+    if __range_l3_walks_for_test() != walks_before_rewrite + 1 {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 rewrite repeated an upper-level walk per page");
+    }
     for page in [0_u64, 2] {
         let va = VirtAddr::new(base.as_u64() + page * 4096);
         // SAFETY: read-only walk of the isolated live root.
@@ -907,6 +913,7 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     // benign miss and the hardware broadcast is safe even though the root was
     // never active.
     let barriers_before_unmap = __batch_barrier_counts_for_test();
+    let walks_before_unmap = __range_l3_walks_for_test();
     if unsafe { unmap_4kb_range(root, base, 3) } != Ok(2) {
         // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
@@ -917,6 +924,10 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 range unmap did not batch TLBI barriers");
+    }
+    if __range_l3_walks_for_test() != walks_before_unmap + 1 {
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap repeated an upper-level walk per page");
     }
     if unsafe { unmap_4kb_range(root, base, 3) } != Ok(0) {
         // SAFETY: no CPU has ever installed this isolated root.
