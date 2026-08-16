@@ -50,7 +50,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     // signal its services, and it sets SIGNAL_PENDING DIRECTLY (bypassing
     // raise_signal_pending, where the twin probe lives), so a user@957 SIGTERM
     // was invisible until this hook. cgevt_trace-gated, termination signals only.
-    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 1 | 2 | 3 | 9 | 15) {
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 6 | 15) {
         let tgt_comm = proc_comm_of_task(target).unwrap_or_default();
         let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
         if tgt_comm == "systemd"

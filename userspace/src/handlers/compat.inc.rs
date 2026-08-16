@@ -4356,7 +4356,7 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // before its manager can exec `systemd --user`. cgevt_trace-gated and
     // limited to termination signals so the common per-signal path (SIGCHLD,
     // SIGCONT, timers) pays nothing.
-    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 1 | 2 | 3 | 9 | 15) {
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 6 | 15) {
         let tgt_comm = proc_comm_of_task(task).unwrap_or_default();
         let tgt_pid = task_to_pid_raw(task).unwrap_or(task);
         let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(tgt_pid);
