@@ -4226,7 +4226,8 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
         use crate::x86_64::paging::{
-            flush_user_tlb_all_cpus, invlpg_global_range, map_4kb, unmap_4kb_local, PtFlags,
+            flush_user_tlb_all_cpus, invlpg_remote_range, rewrite_4kb_scatter_range,
+            unmap_4kb_local_range, PtFlags,
         };
         if self.root.as_u64() == 0 {
             return;
@@ -4253,50 +4254,36 @@ impl AddressSpace {
             // the underlying frames (region.phys still owns them).
             // The next mprotect-back-to-RW just re-installs.
             if r.perms.prot_only().0 == 0 {
-                for i in 0..r.phys.len() {
-                    let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
-                    // SAFETY: same identity-map invariant.
-                    let _ = unsafe { unmap_4kb_local(self.root, v) };
-                }
+                // SAFETY: same identity-map invariant. The range helper holds
+                // the root lock once and completes local invalidation.
+                let _ = unsafe { unmap_4kb_local_range(self.root, r.base, r.phys.len() as u64) };
             } else {
                 let cow_counts = r
                     .perms
                     .contains(RegionPerms::COW)
                     .then(|| crate::frame::cow::count_batch(&r.phys));
-                for (i, p) in r.phys.iter().enumerate() {
-                    // Skip demand-paged pages (phys == 0). They are
-                    // NOT currently mapped (materialize skips them),
-                    // so unmap_4kb would be a no-op and map_4kb would
-                    // incorrectly install a PTE pointing at physical
-                    // address 0 (BIOS/firmware area), corrupting the
-                    // address space. Demand-paged pages get their
-                    // real PTEs installed by `demand_alloc_page` on
-                    // first user-mode access — no action needed here.
-                    if p.raw() == 0 {
-                        continue;
-                    }
-                    let mut flags = PtFlags::USER;
-                    let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
-                    if user_page_writable_at_count(r.perms, *p, cow_count) {
-                        flags |= PtFlags::WRITABLE;
-                    }
-                    if !r.perms.contains(RegionPerms::EXEC) {
-                        flags |= PtFlags::NO_EXEC;
-                    }
-                    let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
-                    // SAFETY: identity-mapped; v lies inside r which
-                    // was bookkept by a prior map_region.
-                    // SAFETY: Valid memory or trusted environment
-                    let _ = unsafe { unmap_4kb_local(self.root, v) };
-                    // SAFETY: same.
-                    let _ = unsafe { map_4kb(self.root, v, *p, flags) };
-                }
+                // SAFETY: region ownership remains stable under the caller's
+                // region lock. The helper skips zero lazy sentinels, holds the
+                // page-table root lock once, and completes local invalidation.
+                let _ = unsafe {
+                    rewrite_4kb_scatter_range(self.root, r.base, &r.phys, |i, p| {
+                        let mut flags = PtFlags::USER;
+                        let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                        if user_page_writable_at_count(r.perms, p, cow_count) {
+                            flags |= PtFlags::WRITABLE;
+                        }
+                        if !r.perms.contains(RegionPerms::EXEC) {
+                            flags |= PtFlags::NO_EXEC;
+                        }
+                        flags
+                    })
+                };
             }
             let region_pages = (r.len + 0xFFF) >> 12;
             if broadcast && !use_full_flush && region_pages > 0 {
-                // SAFETY: the pages in the range were rewritten above;
-                // invlpg is unconditionally safe.
-                unsafe { invlpg_global_range(r.base, region_pages) };
+                // SAFETY: the batched rewrite/unmap above already completed
+                // the current CPU's invalidation for this exact span.
+                unsafe { invlpg_remote_range(r.base, region_pages) };
             }
         }
         if use_full_flush {

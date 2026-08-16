@@ -435,3 +435,11 @@ argument = "The aarch64 scatter permission rewriter holds the live root's existi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Batched aarch64 permission rewriting and parent COW write protection stay within the existing memory domain manager and reuse its root lock, region ownership, and translation-invalidation authority. They add no capability, domain identifier, trusted subsystem, cross-domain data path, or new accessible mapping."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86_64 scatter permission rewriter retains one existing root-sharded mutation lock across every clear-and-reinstall pair, while the authoritative region lock keeps each non-zero backing frame live and prevents concurrent unmap or replacement. Before releasing the root transaction it locally invalidates the complete changed span, using bounded per-page INVLPG or one non-global flush. A peer-active address space then broadcasts only the remote range half, or uses the existing full local/remote flush for a large rewrite; no peer can retain permissions older than the metadata published by mprotect or COW rematerialization. Zero lazy slots remain absent and permission-only rewriting never releases backing, so batching changes neither ownership nor accessible physical addresses."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The x86_64 one-lock permission transaction and remote-only range broadcast remain private implementation paths inside the existing memory TCB and its established interrupt shootdown bridge. They add no capability, domain assignment, trusted subsystem, user-controlled authority, or cross-domain data path."

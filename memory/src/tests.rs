@@ -741,7 +741,8 @@ kernel_test_in!(
 #[cfg(target_arch = "x86_64")]
 fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     use crate::paging::{
-        map_4kb_scatter_range, translate, unmap_4kb_local_range, PageTable, PtFlags,
+        flags_at, map_4kb_scatter_range, rewrite_4kb_scatter_range, translate,
+        unmap_4kb_local_range, PageTable, PtFlags,
     };
     use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
 
@@ -777,6 +778,29 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
         if got != expected {
             return TestResult::Fail("scatter range translation mismatch");
         }
+    }
+    // SAFETY: permission-only rewrite of the same isolated-root backing.
+    if unsafe {
+        rewrite_4kb_scatter_range(pml4, base, &backing, |_, _| {
+            PtFlags::USER | PtFlags::NO_EXEC
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("scatter range permission rewrite failed");
+    }
+    for page in [0_u64, 2] {
+        let va = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: read-only walk of the isolated live root.
+        let read_only =
+            unsafe { flags_at(pml4, va) }.is_some_and(|flags| !flags.contains(PtFlags::WRITABLE));
+        if !read_only {
+            return TestResult::Fail("scatter range rewrite left a writable leaf");
+        }
+    }
+    // SAFETY: the lazy middle slot must remain absent after the rewrite.
+    if unsafe { translate(pml4, VirtAddr::new(base.as_u64() + 4096)) }.is_some() {
+        return TestResult::Fail("scatter range rewrite mapped a lazy slot");
     }
     // SAFETY: cleanup of the isolated test range.
     let _ = unsafe { unmap_4kb_local_range(pml4, base, 3) };

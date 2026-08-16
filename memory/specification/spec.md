@@ -80,6 +80,14 @@ pub unsafe fn x86_64::paging::map_4kb_scatter_range(
     backing: &[PhysAddr],
     flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
+/// Rewrite scatter backing under one root lock and one local invalidation
+/// phase; peer-active address spaces follow with the remote range/full flush.
+pub unsafe fn x86_64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 /// aarch64 twin: one root lock plus one descriptor-publication barrier for
 /// the complete fresh scatter run.
 pub unsafe fn aarch64::paging::map_4kb_scatter_range(
@@ -368,6 +376,15 @@ pub unsafe fn x86_64::paging::map_4kb_scatter_range(
     flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
 
+/// Rewrite resident x86_64 scatter backing under one root-lock hold and one
+/// local invalidation phase; zero entries remain lazy/unmapped.
+pub unsafe fn x86_64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
 /// aarch64 scatter installation takes the same root lock once and publishes
 /// all fresh descriptors with one DSB/ISB sequence.
 pub unsafe fn aarch64::paging::map_4kb_scatter_range(
@@ -638,6 +655,13 @@ x86_64 is rejected at runtime.
   published once. Parent `rematerialize` is a real rewrite on both supported
   architectures; it may not be a no-op after fork while the parent's live leaf
   is still writable.
+- x86_64 permission and COW write-protect rewrites hold one root mutation shard
+  per region rather than reacquiring it for each unmap/map pair. The helper
+  completes one bounded local invalidation phase after the final leaf write;
+  `AddressSpace` then issues only the remote half of a range shootdown for a
+  peer-active small run, or one full non-global local/remote flush for a large
+  multi-region rewrite. No backing becomes reusable in this permission-only
+  path, and zero lazy sentinels are never installed as physical address zero.
 - A swap-out batch reserves one contiguous slot run, performs one backend
   vector write, validates every same-root leaf before publishing any swap PTE,
   and retires stale translations once before returning any victim frame to the

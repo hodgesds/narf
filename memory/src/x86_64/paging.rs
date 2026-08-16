@@ -529,6 +529,21 @@ pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
             invlpg(v);
         }
     }
+    // SAFETY: the local half was completed above for this exact range.
+    unsafe { invlpg_remote_range(va_base, pages) };
+}
+
+/// Broadcast a range invalidation to peer CPUs without repeating the current
+/// CPU's invalidation. This is the second half of a batched page-table helper
+/// that already retired its local translations while holding the root lock.
+///
+/// # Safety
+/// The caller must have completed a local invalidation covering the complete
+/// range after its final page-table write.
+pub(crate) unsafe fn invlpg_remote_range(va_base: VirtAddr, pages: u64) {
+    if pages == 0 {
+        return;
+    }
     // Prefer the range hook for one-IPI broadcast; fall back to per-page.
     let rh = RANGE_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if rh != 0 {
@@ -930,7 +945,7 @@ pub unsafe fn map_4kb(
     let _pt_guard = pt_lock_for(pml4_phys).lock();
 
     // SAFETY: validation and lock acquisition are immediately above.
-    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags) }
+    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, true) }
 }
 
 /// Install one validated leaf with the per-root page-table lock held.
@@ -939,6 +954,7 @@ unsafe fn map_4kb_locked(
     virt: VirtAddr,
     phys: PhysAddr,
     flags: PtFlags,
+    invalidate_local: bool,
 ) -> Result<(), MapError> {
     let idx = WalkIndices::from_virt(virt);
     // Intermediate tables need `USER` whenever the leaf does — the
@@ -997,9 +1013,11 @@ unsafe fn map_4kb_locked(
     // Local INVLPG is sufficient for a fresh mapping — peer CPUs have
     // no entry to invalidate. Remap/unmap call sites broadcast via
     // `invlpg_global`.
-    // SAFETY: INVLPG is always safe.
-    unsafe {
-        invlpg(virt);
+    if invalidate_local {
+        // SAFETY: INVLPG is always safe.
+        unsafe {
+            invlpg(virt);
+        }
     }
 
     Ok(())
@@ -1054,9 +1072,93 @@ pub unsafe fn map_4kb_scatter_range(
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
         // SAFETY: the complete range was validated above and the root lock is
         // held for this whole loop.
-        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(index, phys))? };
+        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(index, phys), true)? };
     }
     Ok(())
+}
+
+/// Rewrite a scatter-backed run under one root-lock transaction and one local
+/// invalidation phase. Zero physical entries stay lazy and unmapped.
+///
+/// Existing leaves are cleared before their replacements are installed. The
+/// helper performs per-page INVLPG for runs up to 512 pages and one local
+/// non-global flush for larger runs. A caller whose address space can be active
+/// on peer CPUs must follow with [`invlpg_remote_range`] or a full remote flush.
+///
+/// On failure, earlier replacements remain installed and every changed page in
+/// the span is locally invalidated before return.
+///
+/// # Safety
+/// Same live-root, identity-map, and backing-lifetime contract as
+/// [`map_4kb_scatter_range`].
+pub unsafe fn rewrite_4kb_scatter_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(base) || base.raw() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let pages = backing.len() as u64;
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+    if backing
+        .iter()
+        .any(|phys| phys.raw() != 0 && phys.raw() & 0xFFF != 0)
+    {
+        return Err(MapError::UnalignedPhys);
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let mut changed = false;
+    let mut result = Ok(());
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        changed = true;
+        let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
+        // SAFETY: validated range and live root are protected by the one guard.
+        match unsafe { unmap_4kb_locked(pml4_phys, virt, false, false) } {
+            Ok(_) | Err(MapError::AlreadyMapped) => {}
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+        let flags = flags_for(index, phys);
+        // SAFETY: the previous leaf is absent and the same guard remains held.
+        if let Err(error) = unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, false) } {
+            result = Err(error);
+            break;
+        }
+    }
+    if changed {
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        if pages <= FULL_FLUSH_PAGE_CEILING {
+            for page in 0..pages {
+                let virt = VirtAddr::new(base.raw() + page * 4096);
+                // SAFETY: the range is canonical and page-aligned.
+                unsafe { invlpg(virt) };
+            }
+        } else {
+            // SAFETY: user leaves are non-global; this retires every changed
+            // local translation in one operation.
+            unsafe { flush_user_tlb_local() };
+        }
+    }
+    result
 }
 
 /// Tear down a 4 KiB mapping. Intermediate tables are left intact —
