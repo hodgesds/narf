@@ -788,6 +788,111 @@ kernel_test_in!(
     smoke_paging_scatter_range_maps_present_and_skips_lazy
 );
 
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
+    use crate::aarch64::paging::{
+        __batch_barrier_counts_for_test, free_user_ttbr0_tree, map_4kb_scatter_range, translate,
+        unmap_4kb_range, PageTable, PtFlags,
+    };
+    use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    let root = match alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    // SAFETY: the fresh frame is exclusively owned and direct-map reachable.
+    unsafe { core::ptr::write_bytes(root.kernel_mut_ptr::<PageTable>(), 0, 1) };
+    let base = VirtAddr::new(0x567b_0000);
+    let backing = [
+        PhysAddr::new(0x1236_0000),
+        PhysAddr::new(0),
+        PhysAddr::new(0x1236_2000),
+    ];
+    let barriers_before_map = __batch_barrier_counts_for_test();
+    // SAFETY: this test exclusively owns the root. Synthetic leaf backing is
+    // aligned and never dereferenced; zero is the documented lazy sentinel.
+    let mapped = unsafe {
+        map_4kb_scatter_range(root, base, &backing, |_, _| {
+            PtFlags::AP_RW_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    };
+    if mapped.is_err() {
+        // SAFETY: no CPU installs this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter range map failed");
+    }
+    let barriers_after_map = __batch_barrier_counts_for_test();
+    if barriers_after_map.0 != barriers_before_map.0 + 1
+        || barriers_after_map.1 != barriers_before_map.1
+    {
+        // SAFETY: cleanup of a root never installed in TTBR0.
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map did not batch publication barriers");
+    }
+    for (page, expected) in backing.into_iter().enumerate() {
+        // SAFETY: read-only walk of the still-live isolated root.
+        let got = unsafe { translate(root, VirtAddr::new(base.as_u64() + page as u64 * 4096)) };
+        if got != (expected.raw() != 0).then_some(expected) {
+            // SAFETY: cleanup of a root never installed in TTBR0.
+            let _ = unsafe { unmap_4kb_range(root, base, 3) };
+            // SAFETY: no CPU has ever installed this isolated root.
+            unsafe { free_user_ttbr0_tree(root) };
+            return TestResult::Fail("aarch64 scatter translation mismatch");
+        }
+    }
+    // SAFETY: all pages belong to the isolated root; the lazy middle leaf is a
+    // benign miss and the hardware broadcast is safe even though the root was
+    // never active.
+    let barriers_before_unmap = __batch_barrier_counts_for_test();
+    if unsafe { unmap_4kb_range(root, base, 3) } != Ok(2) {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap count mismatch");
+    }
+    let barriers_after_unmap = __batch_barrier_counts_for_test();
+    if barriers_after_unmap.1 != barriers_before_unmap.1 + 1 {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap did not batch TLBI barriers");
+    }
+    if unsafe { unmap_4kb_range(root, base, 3) } != Ok(0) {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 repeated range unmap was not idempotent");
+    }
+    // SAFETY: no CPU has ever installed this isolated root.
+    unsafe { free_user_ttbr0_tree(root) };
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+kernel_test_in!("memory", smoke_aarch64_paging_scatter_and_range_unmap);
+
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+fn smoke_aarch64_paging_root_locks_are_sharded() -> TestResult {
+    use crate::aarch64::paging::pt_lock_for;
+
+    let first = pt_lock_for(crate::PhysAddr::new(0x1000));
+    let second = pt_lock_for(crate::PhysAddr::new(0x2000));
+    let first_addr = first as *const _ as usize;
+    let second_addr = second as *const _ as usize;
+    if core::ptr::eq(first, second) || first_addr & 63 != 0 || second_addr.abs_diff(first_addr) < 64
+    {
+        return TestResult::Fail("aarch64 root mutation shards share a cache line");
+    }
+    let _held = first.lock();
+    if second.try_lock().is_none() {
+        return TestResult::Fail("one aarch64 root lock blocks an unrelated root");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+kernel_test_in!("memory", smoke_aarch64_paging_root_locks_are_sharded);
+
 fn smoke_pagetable_registry_collision_and_tombstone_reuse() -> TestResult {
     // These synthetic, page-aligned addresses are outside the test VM's RAM.
     // Their page numbers differ by the hash-table length, so multiplication

@@ -7,6 +7,25 @@ use core::ptr;
 
 use crate::PhysAddr;
 
+#[cfg(feature = "kernel-test")]
+static PUBLISH_BARRIER_SEQUENCES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static TLBI_BARRIER_SEQUENCES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Test-only counters for proving multi-leaf helpers amortise architecture
+/// barrier sequences. Production builds contain neither counter nor update.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __batch_barrier_counts_for_test() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        PUBLISH_BARRIER_SEQUENCES.load(Ordering::Relaxed),
+        TLBI_BARRIER_SEQUENCES.load(Ordering::Relaxed),
+    )
+}
+
 /// A single 64-bit descriptor.
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
@@ -304,6 +323,8 @@ pub(crate) unsafe fn write_ttbr0_el1_asid(root: PhysAddr, asid: u16) {
 unsafe fn publish_table_write() {
     use core::sync::atomic::{compiler_fence, Ordering};
     compiler_fence(Ordering::SeqCst);
+    #[cfg(feature = "kernel-test")]
+    PUBLISH_BARRIER_SEQUENCES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: barriers at EL1 are always legal and have no operands.
     unsafe {
         core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
@@ -368,6 +389,39 @@ pub unsafe fn tlb_invalidate_va_all_asids_inner_shareable(virt: VirtAddr) {
             options(nostack, preserves_flags),
         );
     }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Invalidate a contiguous 4 KiB run for every ASID with one barrier pair.
+///
+/// The architecture still receives one last-level TLBI operand per page, but
+/// the expensive `DSB ISHST` / `DSB ISH` / `ISB` sequence brackets the whole
+/// transaction instead of every leaf. The caller must have cleared all leaves
+/// before invoking this helper.
+unsafe fn tlb_invalidate_4kb_range_all_asids_inner_shareable(base: VirtAddr, pages: u64) {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    if pages == 0 {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(feature = "kernel-test")]
+    TLBI_BARRIER_SEQUENCES.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: EL1 barrier and TLBI operations are unconditional. VAs are
+    // page-aligned by the caller and encoded shifted down by 12.
+    unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+    for page in 0..pages {
+        let va_page = (base.as_u64() >> 12) + page;
+        unsafe {
+            asm!(
+                "tlbi vaale1is, {va}",
+                va = in(reg) va_page,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -438,6 +492,31 @@ impl WalkIndices {
     }
 }
 
+// ── Per-page-table-root mutation lock ──────────────────────────────
+//
+// Threads sharing one TTBR0 may fault, mprotect, and unmap concurrently on
+// different CPUs. In particular, two `ensure_next_table` calls racing on the
+// same empty descriptor can otherwise publish different child tables, leaking
+// one and orphaning any leaves installed through it. Shard by root page so
+// unrelated address spaces still mutate in parallel, matching x86_64.
+const PT_LOCK_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct PtLock(narf_lib::sync::IrqSafeSpinLock<()>);
+
+impl PtLock {
+    const fn new() -> Self {
+        Self(narf_lib::sync::IrqSafeSpinLock::new(()))
+    }
+}
+
+static PT_LOCKS: [PtLock; PT_LOCK_SHARDS] = [const { PtLock::new() }; PT_LOCK_SHARDS];
+
+#[inline]
+pub(crate) fn pt_lock_for(root: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
+    &PT_LOCKS[((root.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)].0
+}
+
 /// Tear down every subtree of a user-mode TTBR0 root and return
 /// the root frame itself to the allocator.
 ///
@@ -464,6 +543,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
     if root.raw() == 0 {
         return;
     }
+    let _guard = pt_lock_for(root).lock();
     /// True if this entry is present AND a TABLE (not a block).
     /// At L0 every present entry is a table per ARM ARM. At L1/L2
     /// a block entry stops the walk and must be skipped.
@@ -551,6 +631,21 @@ pub unsafe fn map_2mb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _guard = pt_lock_for(root).lock();
+    unsafe { map_2mb_locked(root, virt, phys, flags) }
+}
+
+/// [`map_2mb`] with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`map_2mb`]'s contract and hold [`pt_lock_for`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_2mb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 2 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -589,6 +684,21 @@ pub unsafe fn map_1gb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _guard = pt_lock_for(root).lock();
+    unsafe { map_1gb_locked(root, virt, phys, flags) }
+}
+
+/// [`map_1gb`] with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`map_1gb`]'s contract and hold [`pt_lock_for`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_1gb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 1024 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -620,6 +730,19 @@ pub unsafe fn map_1gb(
 /// Same root/identity-map contract as [`unmap_4kb`].
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub unsafe fn unmap_2mb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    let _guard = pt_lock_for(root).lock();
+    unsafe { unmap_2mb_locked(root, virt) }
+}
+
+/// [`unmap_2mb`] with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`unmap_2mb`]'s contract and hold [`pt_lock_for`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn unmap_2mb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+) -> Result<PhysAddr, MapError> {
     const SIZE: u64 = 2 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -654,6 +777,19 @@ pub unsafe fn unmap_2mb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
 /// Same root/identity-map contract as [`unmap_4kb`].
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub unsafe fn unmap_1gb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    let _guard = pt_lock_for(root).lock();
+    unsafe { unmap_1gb_locked(root, virt) }
+}
+
+/// [`unmap_1gb`] with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`unmap_1gb`]'s contract and hold [`pt_lock_for`].
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn unmap_1gb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+) -> Result<PhysAddr, MapError> {
     const SIZE: u64 = 1024 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -683,12 +819,29 @@ pub unsafe fn unmap_1gb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
 /// - `root` must point at a valid aarch64 root translation table
 ///   whose storage is identity-mapped in the currently-active
 ///   mappings.
-/// - Concurrent modification from another CPU is UB.
+/// - The root must remain live; concurrent mutation is serialized by a
+///   root-sharded IRQ-safe lock.
 pub unsafe fn map_4kb(
     root: PhysAddr,
     virt: VirtAddr,
     phys: PhysAddr,
     flags: PtFlags,
+) -> Result<(), MapError> {
+    let _guard = pt_lock_for(root).lock();
+    // SAFETY: the public contract is forwarded while the root lock is held.
+    unsafe { map_4kb_locked(root, virt, phys, flags, true) }
+}
+
+/// Install one leaf with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`map_4kb`]'s contract and hold [`pt_lock_for`].
+unsafe fn map_4kb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+    publish: bool,
 ) -> Result<(), MapError> {
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -740,9 +893,79 @@ pub unsafe fn map_4kb(
         | PtFlags::SH_INNER
         | PtFlags::ATTR_NORMAL;
     l3.entries[idx.l3] = PageTableEntry::new(phys, base | flags);
-    // SAFETY: publish the descriptor before returning — see `publish_table_write`.
-    unsafe { publish_table_write() };
+    if publish {
+        // SAFETY: publish the descriptor before returning — see
+        // `publish_table_write`.
+        unsafe { publish_table_write() };
+    }
     Ok(())
+}
+
+/// Map scatter backing while taking the root mutation lock and descriptor
+/// publication barrier once. Zero physical entries are lazy holes.
+///
+/// On failure, earlier leaves remain installed; transactional callers must
+/// tear them down, matching the x86_64 helper's contract.
+///
+/// # Safety
+/// Same live-root and identity-map contract as [`map_4kb`] for the complete
+/// range and every non-zero physical entry.
+pub unsafe fn map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(base) || base.as_u64() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let span = (backing.len() as u64)
+        .checked_mul(4096)
+        .ok_or(MapError::NonCanonical)?;
+    let end = base
+        .as_u64()
+        .checked_add(span)
+        .ok_or(MapError::NonCanonical)?;
+    if !backing.is_empty() {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.as_u64() ^ last.as_u64()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+    if backing
+        .iter()
+        .any(|phys| phys.raw() != 0 && phys.raw() & 0xFFF != 0)
+    {
+        return Err(MapError::UnalignedPhys);
+    }
+
+    let _guard = pt_lock_for(root).lock();
+    let mut result = Ok(());
+    let mut attempted = false;
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        attempted = true;
+        let virt = VirtAddr::new(base.as_u64() + index as u64 * 4096);
+        // SAFETY: complete input validation and the root lock are above.
+        if let Err(error) =
+            unsafe { map_4kb_locked(root, virt, phys, flags_for(index, phys), false) }
+        {
+            result = Err(error);
+            break;
+        }
+    }
+    if attempted {
+        // SAFETY: every descriptor write (including an intermediate table
+        // created before a later error) precedes this batch publication.
+        unsafe { publish_table_write() };
+    }
+    result
 }
 
 /// Tear down a 4 KiB mapping at `virt` under `root`. Returns the
@@ -755,6 +978,20 @@ pub unsafe fn map_4kb(
 /// # Safety
 /// Same identity-mapping precondition as `map_4kb`.
 pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    let _guard = pt_lock_for(root).lock();
+    // SAFETY: the public contract is forwarded while the root lock is held.
+    unsafe { unmap_4kb_locked(root, virt, true) }
+}
+
+/// Remove one leaf with this root's mutation lock already held.
+///
+/// # Safety
+/// The caller must uphold [`unmap_4kb`]'s contract and hold [`pt_lock_for`].
+unsafe fn unmap_4kb_locked(
+    root: PhysAddr,
+    virt: VirtAddr,
+    invalidate: bool,
+) -> Result<PhysAddr, MapError> {
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
     }
@@ -794,23 +1031,61 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
         return Err(MapError::AlreadyMapped);
     }
     let prev_phys = leaf.addr();
-    l3.entries[idx.l3] = PageTableEntry(0);
-    // TLB invalidation for the page (VAALE1IS — by last-level VA for every
-    // ASID in the inner-shareable domain). The all-ASID form is required when
-    // the mutated root is not the one currently installed in TTBR0_EL1.
-    let va_page = virt.as_u64() >> 12;
-    // SAFETY: TLBI/DSB/ISB at EL1 are unconditional.
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vaale1is, {va}",
-            "dsb ish",
-            "isb",
-            va = in(reg) va_page,
-            options(nostack, preserves_flags),
-        );
+    l3.entries[idx.l3] = PageTableEntry::EMPTY;
+    if invalidate {
+        // SAFETY: the leaf is already clear and `virt` is page aligned.
+        unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(virt, 1) };
     }
     Ok(prev_phys)
+}
+
+/// Tear down a contiguous run under one root lock and one TLBI barrier pair.
+/// Missing leaves are benign; the returned count includes only leaves that
+/// were present and cleared.
+///
+/// # Safety
+/// Same live-root and identity-map contract as [`unmap_4kb`] for every page in
+/// the range. The root must not be destroyed during the transaction.
+pub unsafe fn unmap_4kb_range(root: PhysAddr, base: VirtAddr, pages: u64) -> Result<u64, MapError> {
+    if !is_canonical(base) {
+        return Err(MapError::NonCanonical);
+    }
+    if base.as_u64() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base
+        .as_u64()
+        .checked_add(span)
+        .ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.as_u64() ^ last.as_u64()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _guard = pt_lock_for(root).lock();
+    let mut removed = 0;
+    let mut result = Ok(());
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: the complete range was validated and the root lock remains
+        // held for this walk.
+        match unsafe { unmap_4kb_locked(root, virt, false) } {
+            Ok(_) => removed += 1,
+            Err(MapError::AlreadyMapped) => {}
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
+    if removed != 0 {
+        // SAFETY: every present leaf in the range is already clear.
+        unsafe { tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages) };
+    }
+    result.map(|()| removed)
 }
 
 /// Walk the table at `root` and return the physical address mapped

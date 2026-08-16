@@ -1297,9 +1297,12 @@ impl AddressSpace {
         region: &HugeRegion,
         page_size: u64,
     ) -> Result<(), (usize, AddressSpaceError)> {
+        let _pt_guard = crate::aarch64::paging::pt_lock_for(self.root).lock();
         for (i, frame) in region.frames.iter().enumerate() {
             let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
-            if let Err(error) = self.map_huge_leaf(va, frame.phys(), region.size, region.perms) {
+            if let Err(error) =
+                self.map_huge_leaf_locked(va, frame.phys(), region.size, region.perms)
+            {
                 return Err((i, error));
             }
         }
@@ -1359,6 +1362,37 @@ impl AddressSpace {
             match size {
                 crate::hugepage::HugeSize::M2 => map_2mb(self.root, va, PhysAddr::new(phys), flags),
                 crate::hugepage::HugeSize::G1 => map_1gb(self.root, va, PhysAddr::new(phys), flags),
+            }
+        };
+        result.map_err(|_| AddressSpaceError::Overlap)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn map_huge_leaf_locked(
+        &self,
+        va: VirtAddr,
+        phys: u64,
+        size: crate::hugepage::HugeSize,
+        perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_1gb_locked, map_2mb_locked, PtFlags};
+        let mut flags = if perms.contains(RegionPerms::WRITE) {
+            PtFlags::AP_RW_EL0
+        } else {
+            PtFlags::AP_RO_EL0
+        };
+        if !perms.contains(RegionPerms::EXEC) {
+            flags = flags | PtFlags::UXN | PtFlags::PXN;
+        }
+        // SAFETY: map_new_huge_leaves holds the root mutation lock.
+        let result = unsafe {
+            match size {
+                crate::hugepage::HugeSize::M2 => {
+                    map_2mb_locked(self.root, va, PhysAddr::new(phys), flags)
+                }
+                crate::hugepage::HugeSize::G1 => {
+                    map_1gb_locked(self.root, va, PhysAddr::new(phys), flags)
+                }
             }
         };
         result.map_err(|_| AddressSpaceError::Overlap)
@@ -1885,23 +1919,26 @@ impl AddressSpace {
                         )
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                if self.root.as_u64() != 0 && first < last {
+                    let start = VirtAddr::new(rb + first as u64 * 4096);
+                    // SAFETY: same transaction and range proof as the x86_64
+                    // arm; aarch64 performs the shareable TLBI in hardware.
+                    let _ = unsafe {
+                        crate::aarch64::paging::unmap_4kb_range(
+                            self.root,
+                            start,
+                            (last - first) as u64,
+                        )
+                    };
+                }
                 for pg in first..last {
-                    #[cfg(target_arch = "aarch64")]
-                    let pv = rb + (pg as u64) * 4096;
                     punched_pages += 1;
-                    // Tear the leaf PTE down NOW, under the lock, with
-                    // LOCAL invalidation only (one batched cross-CPU flush
-                    // below). Doing it here — atomically with the table
-                    // update — means no window ever exists where the table
-                    // says "free" while a stale PTE lingers for a racing
-                    // map_region+materialize to swallow via AlreadyMapped.
-                    if self.root.as_u64() != 0 {
-                        #[cfg(target_arch = "aarch64")]
-                        // SAFETY: see the x86_64 arm.
-                        let _ = unsafe {
-                            crate::aarch64::paging::unmap_4kb(self.root, VirtAddr::new(pv))
-                        };
-                    }
+                    // The architecture range helper tore the leaf down NOW,
+                    // under both the region transaction and root lock. Doing
+                    // it atomically with the table update means no window
+                    // exists where metadata says "free" while a stale leaf
+                    // remains for racing materialize to swallow.
                     // Borrowed (SHARED) frames belong to an external
                     // registry — unmap the PTE but never free the phys.
                     if !shared {
@@ -2047,13 +2084,10 @@ impl AddressSpace {
 
     #[cfg(target_arch = "aarch64")]
     unsafe fn unmap_region_leaves_local(&self, region: &Region) {
-        use crate::aarch64::paging::unmap_4kb;
         let pages = (region.len + 0xFFF) >> 12;
-        for i in 0..pages {
-            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
-            // SAFETY: see the x86_64 variant.
-            let _ = unsafe { unmap_4kb(self.root, v) };
-        }
+        // SAFETY: see the x86_64 variant. aarch64's helper broadcasts the
+        // complete range in hardware with one barrier pair.
+        let _ = unsafe { crate::aarch64::paging::unmap_4kb_range(self.root, region.base, pages) };
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -2093,7 +2127,7 @@ impl AddressSpace {
 
     #[cfg(target_arch = "aarch64")]
     unsafe fn install_region_leaves_local(&self, region: &Region) -> Result<(), AddressSpaceError> {
-        use crate::aarch64::paging::{map_4kb, PtFlags};
+        use crate::aarch64::paging::{map_4kb_scatter_range, PtFlags};
         if region.perms.prot_only().0 == 0 {
             return Ok(());
         }
@@ -2101,25 +2135,23 @@ impl AddressSpace {
             .perms
             .contains(RegionPerms::COW)
             .then(|| crate::frame::cow::count_batch(&region.phys));
-        for (index, phys) in region.phys.iter().copied().enumerate() {
-            if phys.raw() == 0 {
-                continue;
-            }
-            let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
-            let mut flags = if user_page_writable_at_count(region.perms, phys, cow_count) {
-                PtFlags::AP_RW_EL0
-            } else {
-                PtFlags::AP_RO_EL0
-            };
-            if !region.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::UXN | PtFlags::PXN;
-            }
-            let va = VirtAddr::new(region.base.as_u64() + index as u64 * 4096);
-            // SAFETY: same contract as the x86_64 implementation.
-            unsafe { map_4kb(self.root, va, phys, flags) }
-                .map_err(|_| AddressSpaceError::OutOfRange)?;
+        // SAFETY: same contract as the x86_64 implementation; the helper
+        // holds the root lock and publishes the complete scatter run once.
+        unsafe {
+            map_4kb_scatter_range(self.root, region.base, &region.phys, |index, phys| {
+                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
+                let mut flags = if user_page_writable_at_count(region.perms, phys, cow_count) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
+                if !region.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
+                flags
+            })
         }
-        Ok(())
+        .map_err(|_| AddressSpaceError::OutOfRange)
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -4127,11 +4159,26 @@ impl AddressSpace {
                 let end_v = hi.min(re);
                 let start_i = ((start_v - rb) >> 12) as usize;
                 let end_i = ((end_v - rb) >> 12) as usize;
+                #[cfg(target_arch = "aarch64")]
+                if self.root.as_u64() != 0 && start_i < end_i {
+                    // SAFETY: this is the page-aligned intersection with one
+                    // live private, unlocked VMA. The region lock keeps its
+                    // ownership stable while the helper clears and
+                    // broadcasts the complete run under one root lock.
+                    let _ = unsafe {
+                        crate::aarch64::paging::unmap_4kb_range(
+                            self.root,
+                            VirtAddr::new(start_v),
+                            (end_i - start_i) as u64,
+                        )
+                    };
+                }
                 for i in start_i..end_i {
                     let p = r.phys[i];
                     if p.raw() == 0 {
                         continue;
                     }
+                    #[cfg(target_arch = "x86_64")]
                     let v = rb + ((i as u64) << 12);
                     if self.root.as_u64() != 0 {
                         #[cfg(target_arch = "x86_64")]
@@ -4140,11 +4187,6 @@ impl AddressSpace {
                         // one batched cross-CPU flush below.
                         let _ = unsafe {
                             crate::x86_64::paging::unmap_4kb_local(self.root, VirtAddr::new(v))
-                        };
-                        #[cfg(target_arch = "aarch64")]
-                        // SAFETY: see the x86_64 arm.
-                        let _ = unsafe {
-                            crate::aarch64::paging::unmap_4kb(self.root, VirtAddr::new(v))
                         };
                     }
                     to_release.push(crate::frame::PhysFrame::new(p));

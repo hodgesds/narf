@@ -80,6 +80,14 @@ pub unsafe fn x86_64::paging::map_4kb_scatter_range(
     backing: &[PhysAddr],
     flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
+/// aarch64 twin: one root lock plus one descriptor-publication barrier for
+/// the complete fresh scatter run.
+pub unsafe fn aarch64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 pub fn map(va: VirtAddr, pf: PhysFrame, flags: MapFlags, domain: DomainId);
 pub fn map_folio(va: VirtAddr, folio: Folio, flags: MapFlags, domain: DomainId);
 pub fn map_huge(va: VirtAddr, folio: Folio, size: PageSize, flags: MapFlags, domain: DomainId);
@@ -349,8 +357,25 @@ pub unsafe fn x86_64::paging::map_4kb_scatter_range(
     root: PhysAddr,
     base: VirtAddr,
     backing: &[PhysAddr],
-    flags_for: impl FnMut(PhysAddr) -> PtFlags,
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
+
+/// aarch64 scatter installation takes the same root lock once and publishes
+/// all fresh descriptors with one DSB/ISB sequence.
+pub unsafe fn aarch64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
+/// Clear a contiguous aarch64 leaf run under one root lock, issuing one
+/// last-level all-ASID TLBI per VA bracketed by one shared barrier sequence.
+pub unsafe fn aarch64::paging::unmap_4kb_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError>;
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
@@ -581,6 +606,14 @@ x86_64 is rejected at runtime.
   fresh huge leaf in the region; a failed leaf releases that lock before
   ordinary rollback unmaps, and no backing is published to region metadata
   until the complete leaf batch succeeds.
+- aarch64 page-table writers are serialized by the same 64-way root-physical
+  lock sharding model as x86_64. Base-page scatter installation holds one shard
+  across the run and publishes all fresh descriptors with one `DSB ISHST` /
+  `ISB`; contiguous teardown clears all leaves before issuing per-VA
+  `VAALE1IS` operations bracketed by one `DSB ISHST` / `DSB ISH` / `ISB`.
+  MAP_FIXED punching, MADV_DONTNEED, region teardown, and fresh huge-region
+  installation use those root transactions, so unrelated address spaces do
+  not serialize and a same-root intermediate-table race cannot orphan leaves.
 - A swap-out batch reserves one contiguous slot run, performs one backend
   vector write, validates every same-root leaf before publishing any swap PTE,
   and retires stale translations once before returning any victim frame to the
@@ -632,6 +665,10 @@ x86_64 is rejected at runtime.
 - Page-table mutation invalidates by VA for every ASID across the
   inner-shareable domain (`VAAE1IS` / `VAALE1IS`). This is required because
   the mutated root need not be the TTBR0 context active on the issuing CPU.
+  Mutators take a 64-way root-physical lock; contiguous base-page teardown
+  batches the required barrier sequence around the complete run rather than
+  paying it once per leaf, while still issuing one last-level TLBI operand per
+  page for CPUs that do not implement range TLBI.
 - MTE: memory tag is 4 bits, stored in the top byte of the address plus
   tag storage. We assign one tag per domain.
 - TBI1/TBI0 enabled; TCR_EL1 configured for MTE.
