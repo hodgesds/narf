@@ -69,6 +69,10 @@ remaining CPUs, send fixed-destination x2APIC IPIs only to those CPUs, and wait
 only for their ACK counters. The unmasked `shoot_range`, `shoot_tag_only`, and
 `shoot_full` helpers remain all-online-peer compatibility wrappers.
 
+On aarch64, tagged memory requests use Inner Shareable TLBI operations and do
+not enter the SGI bridge. The bridge remains responsible for untagged local
+`VMALLE1` requests, which require peer execution to become system-wide.
+
 The PMU route accepts only private INTIDs 16–31, enables the current CPU's
 redistributor immediately, and is inherited by subsequent per-CPU GIC
 initialisation. Its input must come from firmware discovery.

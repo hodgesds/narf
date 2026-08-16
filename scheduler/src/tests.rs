@@ -797,7 +797,13 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     extern crate alloc;
     use crate::{spawn_user, TaskSpec};
     use alloc::sync::Arc;
-    use narf_memory::AddressSpace;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use narf_memory::{tlb_shootdown, AddressSpace};
+
+    static RESIDENCY_SEEN_DURING_POLL: AtomicBool = AtomicBool::new(false);
+    static POLL_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+    RESIDENCY_SEEN_DURING_POLL.store(false, Ordering::Relaxed);
+    POLL_CPU.store(u32::MAX, Ordering::Relaxed);
 
     /// # Safety
     /// Must run at CPL=0 (kernel test context); reading CR3 is otherwise
@@ -837,9 +843,12 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     let _tid = spawn_user(
         crate::alloc_task_id(),
         async {
-            // No-op user-task body. The bug isn't in the body —
-            // it's that the scheduler leaks CR3 to the *next*
-            // task after this one returns.
+            let cpu = narf_lib::percpu::current_cpu() as u32;
+            POLL_CPU.store(cpu, Ordering::Relaxed);
+            RESIDENCY_SEEN_DURING_POLL.store(
+                tlb_shootdown::active_as_bitmap(cpu) & 1 != 0,
+                Ordering::Relaxed,
+            );
         },
         TaskSpec::unthrottled(),
         Arc::clone(&arc_as),
@@ -849,13 +858,23 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
 
     // SAFETY: read_cr3 runs at CPL=0 in the in-kernel test runner.
     let cr3_after = unsafe { read_cr3() };
-    if cr3_after == kernel_cr3 {
-        TestResult::Pass
-    } else if cr3_after == user_cr3 {
-        TestResult::Fail("CR3 left in user AS after run_until_empty")
-    } else {
-        TestResult::Fail("CR3 ended in unexpected value after run_until_empty")
+    if cr3_after == user_cr3 {
+        return TestResult::Fail("CR3 left in user AS after run_until_empty");
     }
+    if cr3_after != kernel_cr3 {
+        return TestResult::Fail("CR3 ended in unexpected value after run_until_empty");
+    }
+    if !RESIDENCY_SEEN_DURING_POLL.load(Ordering::Relaxed) {
+        return TestResult::Fail("PCID-0 residency was absent during user poll");
+    }
+    let poll_cpu = POLL_CPU.load(Ordering::Relaxed);
+    if poll_cpu == u32::MAX {
+        return TestResult::Fail("user poll did not record its CPU");
+    }
+    if tlb_shootdown::active_as_bitmap(poll_cpu) & 1 != 0 {
+        return TestResult::Fail("PCID-0 residency survived kernel CR3 restore");
+    }
+    TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(

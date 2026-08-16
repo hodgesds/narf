@@ -182,6 +182,14 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
   and restores the saved `(root, ASID)` before any later kernel or user task is
   polled. Lifetime-scoped ASIDs make both switches non-flushing; an ASID is not
   reused until the memory subsystem completes a system-wide tag invalidation.
+- On x86_64 the executor publishes process-PCID-0 residency before a user root
+  is loaded using the memory subsystem's sequentially consistent publication
+  primitive, and clears it only after the plain kernel-root CR3 restore has
+  invalidated PCID 0 locally. A CPU entering either scheduler halt path marks
+  itself TLB-idle; after wake it clears that state and completes any deferred
+  full non-global flush before another task root or domain context can load.
+  The idle/debt publication handshake guarantees a racing shootdown is handled
+  either by its ordinary IPI acknowledgement or by this pre-dispatch flush.
 - `donate_to` does not bypass capability checks; caller must hold a
   `Cap<Task, Invoke>` (Stage 3).
 - The executor never holds a lock across a poll boundary.

@@ -2358,6 +2358,11 @@ pub fn run_until_empty() {
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                // The plain kernel-root CR3 restore flushes PCID 0 on this
+                // CPU. Clear residency only after that flush, so a concurrent
+                // shared-AS mutation can never omit a CPU retaining a stale
+                // user translation.
+                narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
             }
             #[cfg(target_arch = "aarch64")]
             if saved_ttbr0 != 0 {
@@ -2771,6 +2776,7 @@ pub fn run_until_empty() {
                     narf_arch::disable_interrupts();
                 }
             }
+            narf_memory::tlb_shootdown::mark_idle(cpu as u32);
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             let woke_late = {
@@ -2781,6 +2787,7 @@ pub fn run_until_empty() {
             };
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 if race_free_halt {
                     // SAFETY: restore the IRQ state we masked above; a wake is
                     // already pending so we loop straight back to polling.
@@ -2816,6 +2823,7 @@ pub fn run_until_empty() {
                     }
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 // SAFETY: restore the IRQ state to the idle path's natural
                 // enabled state (it was enabled before we masked it).
                 unsafe {
@@ -2827,6 +2835,7 @@ pub fn run_until_empty() {
                 // which doesn't HLT-through-an-IPI, so the race doesn't apply.
                 idle_wait(next_deadline);
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             }
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
@@ -3212,6 +3221,7 @@ pub fn run_forever() -> ! {
                 narf_arch::disable_interrupts();
             }
         }
+        narf_memory::tlb_shootdown::mark_idle(cpu as u32);
         CPU_HALTED[cpu].store(true, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);
         let work_arrived = {
@@ -3224,6 +3234,7 @@ pub fn run_forever() -> ! {
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             if race_free_halt {
                 // SAFETY: restore the IRQ state we masked above; work is
                 // already queued so we loop straight back to polling.
@@ -3241,6 +3252,7 @@ pub fn run_forever() -> ! {
                 narf_arch::idle_halt_then_disable();
             }
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             // SAFETY: restore the enabled state this idle path runs with.
             unsafe {
                 narf_arch::enable_interrupts();
@@ -3251,6 +3263,7 @@ pub fn run_forever() -> ! {
             // keeps the pre-existing behaviour.
             narf_arch::halt_until_irq();
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
         }
     }
 }

@@ -416,6 +416,20 @@ pub unsafe fn aarch64::paging::unmap_4kb_range(
     pages: u64,
 ) -> Result<u64, MapError>;
 
+/// Tagged invalidation applies locally and targets only conservatively
+/// resident busy peers. Remote-only variants are used after batched paging
+/// helpers have already completed their local invalidation phase.
+pub fn tlb_shootdown::shootdown(req: ShootdownRequest);
+pub fn tlb_shootdown::shootdown_remote(req: ShootdownRequest);
+pub fn tlb_shootdown::shootdown_remote_full_for_tag(tag: u16);
+/// Residency is published before a context load and cleared only after a
+/// local invalidation. Publication and remote mask sampling use a StoreLoad
+/// barrier pair. Idle debt is discharged before the next task dispatch.
+pub fn tlb_shootdown::set_active_as(cpu: u32, tag: u16);
+pub fn tlb_shootdown::clear_active_as(cpu: u32, tag: u16);
+pub fn tlb_shootdown::mark_idle(cpu: u32);
+pub fn tlb_shootdown::mark_busy(cpu: u32);
+
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
 the global shared-mapping transaction through leaf removal, cross-CPU TLB

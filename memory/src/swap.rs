@@ -1002,11 +1002,13 @@ pub(crate) unsafe fn swap_out_batch_owned(
     // until this callback changes Evicting -> Swapped.
     publish(&resolved);
 
-    // ONE local + peer invalidation for the entire batch, before any old
-    // frame can return to the allocator. This replaces the former one
-    // broadcast-and-ack round trip per page.
-    // SAFETY: every present leaf in the batch was replaced above.
-    unsafe { crate::paging::flush_user_tlb_all_cpus() };
+    // ONE local + residency-filtered peer invalidation for the entire batch,
+    // before any old frame can return to the allocator. All process roots use
+    // flushing PCID 0 and publish exact scheduler residency for that tag.
+    // SAFETY: every present leaf in the batch was replaced above; user PTEs
+    // are non-global, so the local non-global flush retires every victim.
+    unsafe { crate::paging::flush_user_tlb_local() };
+    crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
 
     // ── 6. Only after the batch flush, free all evicted frames. ──
     for (_, phys) in &resolved {

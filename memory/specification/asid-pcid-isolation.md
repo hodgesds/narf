@@ -194,19 +194,43 @@ pub struct ShootdownRequest {
 
 pub fn shootdown(req: ShootdownRequest);
 pub fn shootdown_range(tag: u16, va: u64, pages: u64);
+pub fn shootdown_remote(req: ShootdownRequest);
+pub fn shootdown_remote_full_for_tag(residency_tag: u16);
 pub fn shootdown_target_mask(req: ShootdownRequest) -> u64;
+pub fn set_active_as(cpu: u32, tag: u16);
+pub fn clear_active_as(cpu: u32, tag: u16);
+pub fn mark_idle(cpu: u32);
+pub fn mark_busy(cpu: u32);
 pub fn set_ipi_fanout(
     fanout: fn(req: ShootdownRequest, target_cpus: u64),
 );
 pub fn shootdown_count() -> u64;     // per-CPU counter
 ```
 
-`shootdown` applies the invalidation locally, intersects the online-peer
-mask with conservative per-CPU tag residency and the non-idle mask, then
-passes that exact mask to the interrupt bridge. The bridge must publish,
-IPI, and await exactly those CPUs; it must not broaden the request back to
-an all-peer broadcast. `shootdown_range` represents a contiguous run as one
-request and therefore one remote rendezvous.
+`shootdown` applies the invalidation locally and then dispatches its remote
+half. `shootdown_remote` is for page-table helpers that already completed the
+local half. A tracked tag publishes CPU residency before its context-register
+load and clears residency only after a local invalidation; an untracked bucket
+always retains bootstrap-safe all-peer dispatch. x86 idle CPUs atomically
+acquire full-flush debt instead of receiving an IPI, and `mark_busy` clears the
+idle state and discharges that debt before the scheduler can load another task
+root. The sender publishes debt and rechecks the idle mask, while the waking
+CPU clears idle before claiming debt, so a concurrent wake is covered by either
+the local full flush or the ordinary IPI rendezvous. The interrupt bridge must
+publish, IPI, and await exactly the selected busy CPUs.
+
+The pre-load residency publication is a sequentially consistent read-modify-
+write. Remote dispatch executes a sequentially consistent fence after the
+caller has completed its page-table writes and before it samples residency.
+This forbids the store-buffer outcome where the loading CPU and invalidating
+CPU each miss the other's publication. Batched unmap, permission rewrite, and
+swap-out use the remote-only surface only after completing their local
+invalidation, and never release an unmapped frame before remote completion.
+
+On aarch64, tag/VA and tag-wide requests use Inner Shareable TLBI operations;
+the architecture already propagates them across the shareability domain, so
+the software SGI half is omitted. An untagged local `VMALLE1` request still
+uses the interrupt bridge because that instruction is not shareable-scoped.
 
 ## 5. Test surface
 

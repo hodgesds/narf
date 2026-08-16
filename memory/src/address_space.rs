@@ -2009,13 +2009,14 @@ impl AddressSpace {
                 return;
             }
             if pages > FULL_FLUSH_PAGE_CEILING {
-                // SAFETY: CPL=0; flushes non-global entries — user PTEs are
-                // never GLOBAL so the span's stale entries are covered.
-                unsafe { crate::x86_64::paging::flush_user_tlb_all_cpus() };
+                // SAFETY: CPL=0; the page-table helper already completed the
+                // current CPU's local invalidation phase.
+                unsafe { crate::x86_64::paging::flush_user_tlb_local() };
+                crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
             } else {
-                // SAFETY: every page in the range was already unmapped /
-                // rewritten by the caller; invlpg is unconditionally safe.
-                unsafe { crate::x86_64::paging::invlpg_global_range(base, pages) };
+                crate::tlb_shootdown::shootdown_remote(
+                    crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
+                );
             }
         }
         // aarch64: `unmap_4kb`'s TLBI already covers the shareability
@@ -4226,8 +4227,7 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
         use crate::x86_64::paging::{
-            flush_user_tlb_all_cpus, invlpg_remote_range, rewrite_4kb_scatter_range,
-            unmap_4kb_local_range, PtFlags,
+            flush_user_tlb_local, rewrite_4kb_scatter_range, unmap_4kb_local_range, PtFlags,
         };
         if self.root.as_u64() == 0 {
             return;
@@ -4281,15 +4281,20 @@ impl AddressSpace {
             }
             let region_pages = (r.len + 0xFFF) >> 12;
             if broadcast && !use_full_flush && region_pages > 0 {
-                // SAFETY: the batched rewrite/unmap above already completed
-                // the current CPU's invalidation for this exact span.
-                unsafe { invlpg_remote_range(r.base, region_pages) };
+                crate::tlb_shootdown::shootdown_remote(
+                    crate::tlb_shootdown::ShootdownRequest::for_range(
+                        0,
+                        r.base.as_u64(),
+                        region_pages,
+                    ),
+                );
             }
         }
         if use_full_flush {
-            // SAFETY: CPL=0; user PTEs are never GLOBAL, so a non-global
-            // flush covers every stale entry this walk left on any CPU.
-            unsafe { flush_user_tlb_all_cpus() };
+            // SAFETY: CPL=0; user PTEs are never GLOBAL, so a local
+            // non-global flush covers the current CPU before remote dispatch.
+            unsafe { flush_user_tlb_local() };
+            crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
         }
     }
 
@@ -5549,6 +5554,10 @@ impl AddressSpace {
         }
         #[cfg(target_arch = "x86_64")]
         {
+            // Publish PCID-0 residency before loading the root. A concurrent
+            // shared-AS invalidation therefore either targets this CPU or
+            // completes before MOV CR3 observes the edited page tables.
+            crate::tlb_shootdown::set_active_as(narf_lib::percpu::current_cpu() as u32, 0);
             // SAFETY: `new_for_user` (the only safe path to a
             // non-zero `root`) populated the kernel-half entries
             // from the current PML4, so the next instruction fetch
