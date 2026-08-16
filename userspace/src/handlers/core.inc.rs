@@ -4852,10 +4852,25 @@ fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> 
         Some(f) => f,
         None => return false,
     };
-    match cgroup_rel_path(&full) {
-        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(&rel, child_pid).is_ok(),
+    let rel = cgroup_rel_path(&full);
+    let ok = match &rel {
+        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(rel, child_pid).is_ok(),
         None => false,
+    };
+    // Diagnostic: which cgroup did the CLONE_INTO_CGROUP child actually land
+    // in? If `rel` fails to resolve (or attach fails) the caller falls back to
+    // parent inheritance, so the SERVICE cgroup never goes populated and
+    // systemd's oneshot cgroup-settle wait can hang.
+    #[cfg(feature = "syscall-trace")]
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "CGATTACH pid={} full={} rel={:?} ok={}",
+            child_pid, full, rel, ok
+        );
     }
+    ok
 }
 
 /// Resolve an absolute path that lands inside a mounted cgroup2/cgroupfs to its

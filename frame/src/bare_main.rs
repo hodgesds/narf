@@ -4098,6 +4098,16 @@ fn boot_userspace_init() {
         narf_userspace::syscall::set_trace_errors_only(true);
         let _ = writeln!(console::Writer, "  boot-init: syscall-trace errors-only");
     }
+    // `cgevt_trace` (bare flag): print every cgroup.events `populated`
+    // transition so a service whose start job hangs on the cgroup settling
+    // (e.g. a Type=oneshot in a fresh user slice) can be pinned.
+    if narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .any(|t| t == "cgevt_trace")
+    {
+        narf_filesystem::cgroupfs::set_cgevt_trace(true);
+        let _ = writeln!(console::Writer, "  boot-init: cgroup events trace");
+    }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
     narf_userspace::vdso::register_vdso_image(
