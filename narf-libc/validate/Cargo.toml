@@ -3,6 +3,7 @@ name         = "narf-libc-validate"
 description  = "Smoke binary for narf-libc — links against the relibc-shaped libc shim and prints a startup line."
 version      = "0.0.0"
 edition      = "2021"
+publish      = false
 rust-version = "1.85"
 license      = "GPL-2.0-or-later"
 

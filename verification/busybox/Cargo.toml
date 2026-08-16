@@ -1,9 +1,11 @@
 [package]
 name        = "narf-busybox"
-version     = "0.0.0"
-edition     = "2024"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
 description = "Downloads + builds a static busybox at NARF's PML4[1] user vaddr and exposes the bytes via include_bytes!. Used by the linux-compat demo."
-publish     = false
 build       = "build.rs"
 
 [lib]

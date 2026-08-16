@@ -12,17 +12,17 @@ name = "narf_drivers_sdio"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
-narf-io           = { path = "../../io" }
-narf-bus          = { path = "../../bus" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-memory       = { path = "../../memory" }
-narf-drivers      = { path = "../" }
-narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-console      = { path = "../../console" }
-narf-time         = { path = "../../time" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-io           = { path = "../../io", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-drivers      = { path = "../", version = "0.1.0" }
+narf-driver-runtime = { path = "../runtime", version = "0.1.0", default-features = false, features = ["kernel"] }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-time         = { path = "../../time", version = "0.1.0" }
 
 [features]
 kernel-test = []

@@ -21,6 +21,7 @@ done
 
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
     { echo "invalid semantic version: $version" >&2; exit 1; }
+packaging/publish-crates.sh --version "$version" --plan >/dev/null
 git diff --quiet
 git diff --cached --quiet
 [[ -z $(git status --porcelain --untracked-files=normal) ]] ||
@@ -41,4 +42,3 @@ fi
 
 git tag -s "v${version}" "$commit" -m "$subject"
 echo "Created signed local tag v${version}; review it before pushing."
-

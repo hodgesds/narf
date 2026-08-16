@@ -12,23 +12,23 @@ name = "narf_input_driver"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib            = { path = "../../lib" }
-narf-input          = { path = "../../input" }
-narf-arch           = { path = "../../arch" }
-narf-time           = { path = "../../time" }
-narf-interrupts     = { path = "../../interrupts" }
-narf-acpi           = { path = "../../acpi" }
-narf-drivers        = { path = "../../drivers" }
-narf-init           = { path = "../../init" }
-narf-drivers-i2c    = { path = "../i2c" }
-narf-drivers-gpio   = { path = "../gpio" }
-narf-hid            = { path = "../../hid" }
-narf-scheduler      = { path = "../../scheduler" }
-narf-aml            = { path = "../../aml" }
-narf-fb             = { path = "../../fb" }
-narf-console        = { path = "../../console" }
-narf-drivers-virtio = { path = "../virtio" }
-narf-kernel-test    = { path = "../../verification/kernel-test" }
+narf-lib            = { path = "../../lib", version = "0.1.0" }
+narf-input          = { path = "../../input", version = "0.1.0" }
+narf-arch           = { path = "../../arch", version = "0.1.0" }
+narf-time           = { path = "../../time", version = "0.1.0" }
+narf-interrupts     = { path = "../../interrupts", version = "0.1.0" }
+narf-acpi           = { path = "../../acpi", version = "0.1.0" }
+narf-drivers        = { path = "../../drivers", version = "0.1.0" }
+narf-init           = { path = "../../init", version = "0.1.0" }
+narf-drivers-i2c    = { path = "../i2c", version = "0.1.0" }
+narf-drivers-gpio   = { path = "../gpio", version = "0.1.0" }
+narf-hid            = { path = "../../hid", version = "0.1.0" }
+narf-scheduler      = { path = "../../scheduler", version = "0.1.0" }
+narf-aml            = { path = "../../aml", version = "0.1.0" }
+narf-fb             = { path = "../../fb", version = "0.1.0" }
+narf-console        = { path = "../../console", version = "0.1.0" }
+narf-drivers-virtio = { path = "../virtio", version = "0.1.0" }
+narf-kernel-test    = { path = "../../verification/kernel-test", version = "0.1.0" }
 async-trait         = "0.1"
 
 [lints]

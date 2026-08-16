@@ -12,30 +12,30 @@ name = "narf_fb"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-graphics     = { path = "../graphics" }
-narf-graphics-driver = { path = "../drivers/graphics" }
-narf-drivers-virtio  = { path = "../drivers/virtio" }
-narf-drivers-gpu     = { path = "../drivers/gpu" }
-narf-capabilities = { path = "../capabilities" }
-narf-init         = { path = "../init" }
-narf-ipc          = { path = "../ipc" }
-narf-memory       = { path = "../memory" }
-narf-userspace    = { path = "../userspace" }
-narf-scheduler    = { path = "../scheduler" }
-narf-time         = { path = "../time" }
-narf-shmem        = { path = "../shmem" }
-narf-input        = { path = "../input" }
-narf-interrupts   = { path = "../interrupts" }
-narf-drivers-i2c  = { path = "../drivers/i2c" }
-narf-drivers-gpio = { path = "../drivers/gpio" }
-narf-drivers-usb  = { path = "../drivers/usb" }
-narf-console      = { path = "../console" }
-narf-aml          = { path = "../aml" }
-narf-power        = { path = "../power" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
-narf-filesystem   = { path = "../filesystem" }
-narf-arch         = { path = "../arch" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-graphics     = { path = "../graphics", version = "0.1.0" }
+narf-graphics-driver = { path = "../drivers/graphics", version = "0.1.0" }
+narf-drivers-virtio  = { path = "../drivers/virtio", version = "0.1.0" }
+narf-drivers-gpu     = { path = "../drivers/gpu", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-ipc          = { path = "../ipc", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-userspace    = { path = "../userspace", version = "0.1.0" }
+narf-scheduler    = { path = "../scheduler", version = "0.1.0" }
+narf-time         = { path = "../time", version = "0.1.0" }
+narf-shmem        = { path = "../shmem", version = "0.1.0" }
+narf-input        = { path = "../input", version = "0.1.0" }
+narf-interrupts   = { path = "../interrupts", version = "0.1.0" }
+narf-drivers-i2c  = { path = "../drivers/i2c", version = "0.1.0" }
+narf-drivers-gpio = { path = "../drivers/gpio", version = "0.1.0" }
+narf-drivers-usb  = { path = "../drivers/usb", version = "0.1.0" }
+narf-console      = { path = "../console", version = "0.1.0" }
+narf-aml          = { path = "../aml", version = "0.1.0" }
+narf-power        = { path = "../power", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
+narf-filesystem   = { path = "../filesystem", version = "0.1.0" }
+narf-arch         = { path = "../arch", version = "0.1.0" }
 
 [features]
 # Marker the frame-level `kernel-test` feature switches on so this

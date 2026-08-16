@@ -12,16 +12,16 @@ name = "narf_drivers_serial"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-arch         = { path = "../../arch" }
-narf-bus          = { path = "../../bus" }
-narf-acpi         = { path = "../../acpi" }
-narf-aml          = { path = "../../aml" }
-narf-memory       = { path = "../../memory" }
-narf-init         = { path = "../../init" }
-narf-console      = { path = "../../console" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-arch         = { path = "../../arch", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-acpi         = { path = "../../acpi", version = "0.1.0" }
+narf-aml          = { path = "../../aml", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

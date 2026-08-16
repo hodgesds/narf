@@ -12,8 +12,8 @@ name = "narf_drivers_crypto"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

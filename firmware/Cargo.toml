@@ -19,16 +19,16 @@ default = []
 firmware-allow-unsigned = []
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-capabilities = { path = "../capabilities" }
-narf-io           = { path = "../io" }
-narf-rcu          = { path = "../rcu" }
-narf-crypto       = { path = "../crypto" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
-narf-init         = { path = "../init" }
-narf-filesystem   = { path = "../filesystem" }
-narf-initramfs    = { path = "../initramfs" }
-narf-scheduler    = { path = "../scheduler" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-io           = { path = "../io", version = "0.1.0" }
+narf-rcu          = { path = "../rcu", version = "0.1.0" }
+narf-crypto       = { path = "../crypto", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-filesystem   = { path = "../filesystem", version = "0.1.0" }
+narf-initramfs    = { path = "../initramfs", version = "0.1.0" }
+narf-scheduler    = { path = "../scheduler", version = "0.1.0" }
 
 [lints]
 workspace = true

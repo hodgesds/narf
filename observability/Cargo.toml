@@ -12,12 +12,12 @@ name = "narf_observability"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-arch         = { path = "../arch" }
-narf-capabilities = { path = "../capabilities" }
-narf-tracing      = { path = "../tracing" }
-narf-time         = { path = "../time" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-arch         = { path = "../arch", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-tracing      = { path = "../tracing", version = "0.1.0" }
+narf-time         = { path = "../time", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

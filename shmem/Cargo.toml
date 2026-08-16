@@ -12,13 +12,13 @@ name = "narf_shmem"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-capabilities = { path = "../capabilities" }
-narf-init         = { path = "../init" }
-narf-memory       = { path = "../memory" }
-narf-userspace    = { path = "../userspace" }
-narf-io           = { path = "../io" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-userspace    = { path = "../userspace", version = "0.1.0" }
+narf-io           = { path = "../io", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

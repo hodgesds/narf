@@ -12,93 +12,93 @@ name = "narf-frame"
 path = "src/main.rs"
 
 [dependencies]
-narf-lib           = { path = "../lib" }
-narf-security      = { path = "../security" }
-narf-acpi          = { path = "../acpi" }
-narf-aml           = { path = "../aml" }
-narf-arch          = { path = "../arch" }
-narf-memory        = { path = "../memory" }
-narf-boot          = { path = "../boot" }
-narf-console       = { path = "../console" }
-narf-crypto        = { path = "../crypto" }
-narf-time          = { path = "../time" }
-narf-scheduler     = { path = "../scheduler" }
-narf-interrupts    = { path = "../interrupts" }
-narf-bus           = { path = "../bus" }
-narf-event-bus     = { path = "../event_bus" }
-narf-io            = { path = "../io" }
-narf-block         = { path = "../block" }
-narf-drivers-nvme    = { path = "../drivers/nvme" }
-narf-drivers-virtio  = { path = "../drivers/virtio" }
-narf-drivers-net     = { path = "../drivers/net" }
-narf-net             = { path = "../net" }
-narf-drivers-wireless = { path = "../drivers/wireless" }
-narf-drivers-i3c      = { path = "../drivers/i3c" }
-narf-drivers-i2c      = { path = "../drivers/i2c" }
-narf-drivers-gpio     = { path = "../drivers/gpio" }
-narf-drivers         = { path = "../drivers" }
-narf-drivers-storage = { path = "../drivers/storage" }
-narf-drivers-usb     = { path = "../drivers/usb" }
-narf-drivers-video   = { path = "../drivers/video" }
-narf-drivers-media = { path = "../drivers/media" }
-narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
-narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
-narf-drivers-platform = { path = "../drivers/platform" }
-narf-drivers-fs-ext2  = { path = "../drivers/fs/ext2" }
-narf-drivers-fs-ext4  = { path = "../drivers/fs/ext4" }
-narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
-narf-drivers-fs-exfat = { path = "../drivers/fs/exfat" }
-narf-drivers-fs-minix = { path = "../drivers/fs/minix" }
-narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660" }
-narf-drivers-fs-udf   = { path = "../drivers/fs/udf" }
-narf-drivers-fs-9p    = { path = "../drivers/fs/9p" }
-narf-drivers-fs-squashfs = { path = "../drivers/fs/squashfs" }
-narf-drivers-fs-btrfs = { path = "../drivers/fs/btrfs" }
-narf-input           = { path = "../input" }
-narf-input-driver    = { path = "../drivers/input" }
-narf-graphics        = { path = "../graphics" }
-narf-graphics-driver = { path = "../drivers/graphics" }
-narf-drivers-gpu     = { path = "../drivers/gpu" }
-narf-drivers-nvidia  = { path = "../drivers/nvidia" }
-narf-drivers-psp     = { path = "../drivers/psp" }
-narf-drivers-crypto  = { path = "../drivers/crypto" }
-narf-init            = { path = "../init" }
-narf-fb              = { path = "../fb" }
-narf-audio           = { path = "../audio" }
-narf-bluetooth       = { path = "../bluetooth" }
-narf-edid            = { path = "../edid" }
-narf-efi             = { path = "../efi" }
-narf-hid             = { path = "../hid" }
-narf-pinctrl         = { path = "../pinctrl" }
-narf-usbpd           = { path = "../usbpd" }
-narf-drivers-usbpd   = { path = "../drivers/usbpd" }
-narf-wireless        = { path = "../wireless" }
-narf-accel           = { path = "../accel" }
-narf-tpm             = { path = "../tpm" }
-narf-i3c             = { path = "../i3c" }
-narf-pwm             = { path = "../pwm" }
-narf-drivers-leds      = { path = "../drivers/leds" }
-narf-drivers-backlight = { path = "../drivers/backlight" }
-narf-pmbus             = { path = "../pmbus" }
-narf-spdm            = { path = "../spdm" }
-narf-scmi            = { path = "../scmi" }
-narf-shmem           = { path = "../shmem" }
-narf-firmware        = { path = "../firmware" }
-narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
-narf-firmware-smbios = { path = "../firmware/smbios" }
-narf-firmware-fdt    = { path = "../firmware/fdt" }
-narf-initramfs       = { path = "../initramfs" }
-narf-power           = { path = "../power" }
-narf-observability   = { path = "../observability" }
-narf-rcu             = { path = "../rcu" }
-narf-filesystem      = { path = "../filesystem" }
-narf-userspace       = { path = "../userspace" }
-narf-user-runtime    = { path = "../user-runtime" }
-narf-bpf             = { path = "../bpf" }
-narf-bpf-idle        = { path = "../bpf-idle", optional = true }
-narf-bpf-leds        = { path = "../bpf-leds", optional = true }
-narf-kernel-test     = { path = "../verification/kernel-test" }
-narf-verification    = { path = "../verification", optional = true }
+narf-lib           = { path = "../lib", version = "0.1.0" }
+narf-security      = { path = "../security", version = "0.1.0" }
+narf-acpi          = { path = "../acpi", version = "0.1.0" }
+narf-aml           = { path = "../aml", version = "0.1.0" }
+narf-arch          = { path = "../arch", version = "0.1.0" }
+narf-memory        = { path = "../memory", version = "0.1.0" }
+narf-boot          = { path = "../boot", version = "0.1.0" }
+narf-console       = { path = "../console", version = "0.1.0" }
+narf-crypto        = { path = "../crypto", version = "0.1.0" }
+narf-time          = { path = "../time", version = "0.1.0" }
+narf-scheduler     = { path = "../scheduler", version = "0.1.0" }
+narf-interrupts    = { path = "../interrupts", version = "0.1.0" }
+narf-bus           = { path = "../bus", version = "0.1.0" }
+narf-event-bus     = { path = "../event_bus", version = "0.1.0" }
+narf-io            = { path = "../io", version = "0.1.0" }
+narf-block         = { path = "../block", version = "0.1.0" }
+narf-drivers-nvme    = { path = "../drivers/nvme", version = "0.1.0" }
+narf-drivers-virtio  = { path = "../drivers/virtio", version = "0.1.0" }
+narf-drivers-net     = { path = "../drivers/net", version = "0.1.0" }
+narf-net             = { path = "../net", version = "0.1.0" }
+narf-drivers-wireless = { path = "../drivers/wireless", version = "0.1.0" }
+narf-drivers-i3c      = { path = "../drivers/i3c", version = "0.1.0" }
+narf-drivers-i2c      = { path = "../drivers/i2c", version = "0.1.0" }
+narf-drivers-gpio     = { path = "../drivers/gpio", version = "0.1.0" }
+narf-drivers         = { path = "../drivers", version = "0.1.0" }
+narf-drivers-storage = { path = "../drivers/storage", version = "0.1.0" }
+narf-drivers-usb     = { path = "../drivers/usb", version = "0.1.0" }
+narf-drivers-video   = { path = "../drivers/video", version = "0.1.0" }
+narf-drivers-media = { path = "../drivers/media", version = "0.1.0" }
+narf-drivers-thunderbolt = { path = "../drivers/thunderbolt", version = "0.1.0" }
+narf-drivers-fingerprint = { path = "../drivers/fingerprint", version = "0.1.0" }
+narf-drivers-platform = { path = "../drivers/platform", version = "0.1.0" }
+narf-drivers-fs-ext2  = { path = "../drivers/fs/ext2", version = "0.1.0" }
+narf-drivers-fs-ext4  = { path = "../drivers/fs/ext4", version = "0.1.0" }
+narf-drivers-fs-fat   = { path = "../drivers/fs/fat", version = "0.1.0" }
+narf-drivers-fs-exfat = { path = "../drivers/fs/exfat", version = "0.1.0" }
+narf-drivers-fs-minix = { path = "../drivers/fs/minix", version = "0.1.0" }
+narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660", version = "0.1.0" }
+narf-drivers-fs-udf   = { path = "../drivers/fs/udf", version = "0.1.0" }
+narf-drivers-fs-9p    = { path = "../drivers/fs/9p", version = "0.1.0" }
+narf-drivers-fs-squashfs = { path = "../drivers/fs/squashfs", version = "0.1.0" }
+narf-drivers-fs-btrfs = { path = "../drivers/fs/btrfs", version = "0.1.0" }
+narf-input           = { path = "../input", version = "0.1.0" }
+narf-input-driver    = { path = "../drivers/input", version = "0.1.0" }
+narf-graphics        = { path = "../graphics", version = "0.1.0" }
+narf-graphics-driver = { path = "../drivers/graphics", version = "0.1.0" }
+narf-drivers-gpu     = { path = "../drivers/gpu", version = "0.1.0" }
+narf-drivers-nvidia  = { path = "../drivers/nvidia", version = "0.1.0" }
+narf-drivers-psp     = { path = "../drivers/psp", version = "0.1.0" }
+narf-drivers-crypto  = { path = "../drivers/crypto", version = "0.1.0" }
+narf-init            = { path = "../init", version = "0.1.0" }
+narf-fb              = { path = "../fb", version = "0.1.0" }
+narf-audio           = { path = "../audio", version = "0.1.0" }
+narf-bluetooth       = { path = "../bluetooth", version = "0.1.0" }
+narf-edid            = { path = "../edid", version = "0.1.0" }
+narf-efi             = { path = "../efi", version = "0.1.0" }
+narf-hid             = { path = "../hid", version = "0.1.0" }
+narf-pinctrl         = { path = "../pinctrl", version = "0.1.0" }
+narf-usbpd           = { path = "../usbpd", version = "0.1.0" }
+narf-drivers-usbpd   = { path = "../drivers/usbpd", version = "0.1.0" }
+narf-wireless        = { path = "../wireless", version = "0.1.0" }
+narf-accel           = { path = "../accel", version = "0.1.0" }
+narf-tpm             = { path = "../tpm", version = "0.1.0" }
+narf-i3c             = { path = "../i3c", version = "0.1.0" }
+narf-pwm             = { path = "../pwm", version = "0.1.0" }
+narf-drivers-leds      = { path = "../drivers/leds", version = "0.1.0" }
+narf-drivers-backlight = { path = "../drivers/backlight", version = "0.1.0" }
+narf-pmbus             = { path = "../pmbus", version = "0.1.0" }
+narf-spdm            = { path = "../spdm", version = "0.1.0" }
+narf-scmi            = { path = "../scmi", version = "0.1.0" }
+narf-shmem           = { path = "../shmem", version = "0.1.0" }
+narf-firmware        = { path = "../firmware", version = "0.1.0" }
+narf-firmware-fw-cfg = { path = "../firmware/fw_cfg", version = "0.1.0" }
+narf-firmware-smbios = { path = "../firmware/smbios", version = "0.1.0" }
+narf-firmware-fdt    = { path = "../firmware/fdt", version = "0.1.0" }
+narf-initramfs       = { path = "../initramfs", version = "0.1.0" }
+narf-power           = { path = "../power", version = "0.1.0" }
+narf-observability   = { path = "../observability", version = "0.1.0" }
+narf-rcu             = { path = "../rcu", version = "0.1.0" }
+narf-filesystem      = { path = "../filesystem", version = "0.1.0" }
+narf-userspace       = { path = "../userspace", version = "0.1.0" }
+narf-user-runtime    = { path = "../user-runtime", version = "0.1.0" }
+narf-bpf             = { path = "../bpf", version = "0.1.0" }
+narf-bpf-idle        = { path = "../bpf-idle", version = "0.1.0", optional = true }
+narf-bpf-leds        = { path = "../bpf-leds", version = "0.1.0", optional = true }
+narf-kernel-test     = { path = "../verification/kernel-test", version = "0.1.0" }
+narf-verification    = { path = "../verification", version = "0.1.0", optional = true }
 
 [features]
 # Profiling: emit a `perf stat`-style line (per-CPU narf_lib::perf software

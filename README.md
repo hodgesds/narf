@@ -100,7 +100,7 @@ require a Rust toolchain. Download the package for your distribution from a
 NARF release, then install it with the distribution's package manager:
 
 ```sh
-VERSION=0.5.0
+VERSION=0.1.0
 
 # Debian or Ubuntu
 sudo apt install "./narf-kernel_${VERSION}_amd64.deb"
@@ -119,13 +119,13 @@ distribution kernel installed and configured as the default until you have
 validated NARF on the machine.
 
 To build and install a native package from a NARF checkout, install the optional
-Cargo frontend and let it detect the host package manager:
+Cargo frontend from crates.io and let it detect the host package manager:
 
 ```sh
-cargo install --path build/cargo-narf
+cargo install cargo-narf
 cargo narf detect
-cargo narf install --version 0.5.0 --dry-run
-cargo narf install --version 0.5.0
+cargo narf install --version 0.1.0 --dry-run
+cargo narf install --version 0.1.0
 ```
 
 `cargo narf install` builds a native package and delegates installation to
@@ -137,6 +137,28 @@ Current native packages target x86_64 GRUB systems with Multiboot2. Native
 aarch64 installation, systemd-boot/kernel-install, and Secure Boot are not yet
 supported. See [packaging/README.md](packaging/README.md) for package creation,
 Gentoo setup, removal commands, artifact contents, and current limitations.
+
+### Custom kernels and out-of-tree components
+
+NARF publishes its reusable kernel, subsystem, driver, compatibility, and test
+crates to crates.io under one synchronized version. A custom workspace can use
+only the components it needs while Cargo resolves the rest of the compatible
+NARF graph from the same release:
+
+```toml
+[dependencies]
+narf-lib = "0.1.0"
+narf-capabilities = "0.1.0"
+narf-drivers = "0.1.0"
+narf-filesystem = "0.1.0"
+```
+
+Use one NARF version throughout a custom kernel; mixing release lines is not a
+supported ABI. The `narf-frame` package is the default kernel assembly, while
+the interfaces for custom drivers, filesystems, and other policy components
+are indexed in [docs/extending/README.md](docs/extending/README.md). The pinned
+nightly toolchain and bare-metal target configuration remain necessary when
+linking a bootable kernel.
 
 ---
 

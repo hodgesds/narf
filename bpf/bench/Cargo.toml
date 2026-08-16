@@ -16,11 +16,11 @@ path = "src/lib.rs"
 # dependency went the other way the two would cycle, and the harness would
 # stop being reusable by any other subsystem that wants §8-shaped samples.
 [dependencies]
-narf-lib     = { path = "../../lib" }
-narf-time    = { path = "../../time" }
-narf-console = { path = "../../console" }
-narf-init    = { path = "../../init" }
-narf-boot    = { path = "../../boot" }
+narf-lib     = { path = "../../lib", version = "0.1.0" }
+narf-time    = { path = "../../time", version = "0.1.0" }
+narf-console = { path = "../../console", version = "0.1.0" }
+narf-init    = { path = "../../init", version = "0.1.0" }
+narf-boot    = { path = "../../boot", version = "0.1.0" }
 
 [lints]
 workspace = true

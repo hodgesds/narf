@@ -17,7 +17,7 @@ default = []
 kernel-test = ["dep:narf-kernel-test"]
 
 [dependencies]
-narf-kernel-test = { path = "../../verification/kernel-test", optional = true }
+narf-kernel-test = { path = "../../verification/kernel-test", version = "0.1.0", optional = true }
 
 [lints]
 workspace = true
