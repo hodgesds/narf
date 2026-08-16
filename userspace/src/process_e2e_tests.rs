@@ -3300,7 +3300,7 @@ fn smoke_wave61_pidfd_signals_on_exit() -> TestResult {
 
     const PID: u64 = 0xA110;
     // assume_alive=true → exited=false at mint time.
-    let st = crate::pidfd::mint_for(PID, true);
+    let st = crate::pidfd::mint_for(PID, 0, true);
     let file = crate::pidfd::PidFdFile::new(st.clone());
 
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
@@ -3329,7 +3329,7 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 
     const PID: u64 = 0xDEAD;
     // assume_alive=false → exited bit initialised true.
-    let st = crate::pidfd::mint_for(PID, false);
+    let st = crate::pidfd::mint_for(PID, 0, false);
     let file = crate::pidfd::PidFdFile::new(st);
 
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
@@ -3342,6 +3342,53 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_zombie_immediate);
 
+/// Regression: `PidFdFile::poll_readiness` must be AUTHORITATIVE — consult the
+/// target task's real state — not merely cache-driven off the `exited` flag.
+/// `notify_exit(pid)` is missed when the pid is released back to the pool
+/// before the exiting task's observer fires; the flag then stays false and a
+/// supervisor (systemd, Qt forkfd) blocks forever on a process that already
+/// exited. The fallback keys on the immutable, reuse-safe TaskId, so it must
+/// fire once the task is a zombie or gone from the registry — and must NOT
+/// fire while the task is alive.
+fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+    const TID: u64 = 0x5150_0001;
+    const PID: u64 = 0x5150_0002;
+    // A live, registered task (state = TASK_RUNNING).
+    let _t = crate::task::Task::new_registered(TID, PID);
+
+    // `exited` flag never set + task ALIVE ⇒ not readable (no misfire).
+    let st = crate::pidfd::mint_for(PID, TID, true);
+    let file = crate::pidfd::PidFdFile::new(st);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
+        let _ = crate::task::release_task(TID);
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd for a LIVE task must not be readable via the fallback");
+    }
+
+    // Zombie (exited, not yet reaped): flag still unset, but the authoritative
+    // fallback must report POLLIN — this is the fix.
+    crate::task::mark_zombie(TID);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        let _ = crate::task::release_task(TID);
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd for a ZOMBIE task must be readable via the authoritative fallback");
+    }
+
+    // Reaped (gone from the registry): still POLLIN.
+    let _ = crate::task::release_task(TID);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd for a REAPED (gone) task must be readable via the fallback");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_pidfd_authoritative_exit_fallback);
+
 /// Smoke 33: multiple pidfds for the same pid share state. Once one
 /// observes the exit, every other observer agrees.
 fn smoke_wave61_pidfd_shared_state() -> TestResult {
@@ -3350,8 +3397,8 @@ fn smoke_wave61_pidfd_shared_state() -> TestResult {
     crate::pidfd::__test_reset();
 
     const PID: u64 = 0xB055;
-    let a = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
-    let b = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let a = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
+    let b = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
 
     if narf_filesystem::FileOps::poll_readiness(&a) & POLL_IN != 0
         || narf_filesystem::FileOps::poll_readiness(&b) & POLL_IN != 0
@@ -3402,7 +3449,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     const PID: u64 = 4242;
 
     // First occupant: alive, then exits. Hold its fd across the reuse.
-    let old_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let old_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
     crate::pidfd::notify_exit(PID);
     if narf_filesystem::FileOps::poll_readiness(&old_fd) & POLL_IN == 0 {
         crate::pidfd::__test_reset();
@@ -3412,7 +3459,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     // Reaped: the number goes back to the pool and is handed to a new,
     // LIVE process.
     crate::release_pid(crate::ProcessId(PID));
-    let new_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let new_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
 
     if narf_filesystem::FileOps::poll_readiness(&new_fd) & POLL_IN != 0 {
         crate::pidfd::__test_reset();

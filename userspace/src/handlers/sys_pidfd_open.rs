@@ -26,9 +26,12 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     };
     // Pid is alive if it has a registered PID→TaskId mapping. A
     // missing mapping means the pid was never minted or its task has
-    // already torn down — treat as zombie (immediately readable).
-    let alive = pid_to_task_raw(pid_raw).is_some();
-    let state = crate::pidfd::mint_for(pid_raw, alive);
+    // already torn down — treat as zombie (immediately readable). The
+    // resolved TaskId (if any) is the authoritative, reuse-safe exit signal
+    // for `poll_readiness`.
+    let target_tid = pid_to_task_raw(pid_raw);
+    let alive = target_tid.is_some();
+    let state = crate::pidfd::mint_for(pid_raw, target_tid.unwrap_or(0), alive);
     let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
     let new_fd = match fd::with_table(task, |t| {

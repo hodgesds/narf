@@ -19,7 +19,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat, POLL_IN};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -28,8 +28,16 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// caller — `on_child_exit` may run after the opener is gone.
 #[derive(Debug)]
 pub struct PidFdState {
-    /// Target ProcessId.raw().
+    /// Target ProcessId.raw(). Keys the `PIDFD_TABLE` (reusable name).
     pub pid: u64,
+    /// Target leader TaskId (globally unique, never recycled), or 0 if not yet
+    /// known / unresolvable. Atomic because `clone3` mints the state BEFORE the
+    /// child task exists (a deliberate race guard), then publishes the tid once
+    /// the child is spawned via [`set_tid`]. This is what makes
+    /// `poll_readiness` authoritative and pid-reuse-safe: even if the `exited`
+    /// cache is missed (the pid was released before the exit observer fired),
+    /// the fallback consults this task's real state via `task::task_has_exited`.
+    pub tid: AtomicU64,
     /// Set once `on_child_exit(pid)` fires; never cleared. A pidfd
     /// minted *after* the target has already exited starts with this
     /// already true.
@@ -37,11 +45,18 @@ pub struct PidFdState {
 }
 
 impl PidFdState {
-    fn new(pid: u64, exited: bool) -> Arc<Self> {
+    fn new(pid: u64, tid: u64, exited: bool) -> Arc<Self> {
         Arc::new(PidFdState {
             pid,
+            tid: AtomicU64::new(tid),
             exited: AtomicBool::new(exited),
         })
+    }
+
+    /// Publish the target leader TaskId after a deferred (`clone3`) mint. A
+    /// no-op if already set to the same value; only ever goes 0 → real.
+    pub fn set_tid(&self, tid: u64) {
+        self.tid.store(tid, Ordering::Release);
     }
 }
 
@@ -67,11 +82,15 @@ pub fn __test_reset() {
 /// Look up or create the shared state for `pid`. The caller's
 /// `Arc<PidFdState>` is what becomes the new fd's backing object.
 ///
+/// `tid`: the target's leader TaskId (globally unique) for the authoritative
+/// exit fallback, or 0 if the caller cannot resolve one (then only the cached
+/// `exited` flag drives readiness, the pre-existing behaviour).
+///
 /// `assume_alive`: if the caller has no way to verify the pid maps
 /// to a live task (no PID→TaskId mapping registered), set this false
 /// so a poll on the fd returns POLLIN immediately — Linux's behaviour
 /// when `pidfd_open` is called against an already-zombie pid.
-pub fn mint_for(pid: u64, assume_alive: bool) -> Arc<PidFdState> {
+pub fn mint_for(pid: u64, tid: u64, assume_alive: bool) -> Arc<PidFdState> {
     let mut g = PIDFD_TABLE.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
@@ -80,7 +99,7 @@ pub fn mint_for(pid: u64, assume_alive: bool) -> Arc<PidFdState> {
     if let Some(existing) = map.get(&pid) {
         return existing.clone();
     }
-    let st = PidFdState::new(pid, !assume_alive);
+    let st = PidFdState::new(pid, tid, !assume_alive);
     map.insert(pid, st.clone());
     st
 }
@@ -179,10 +198,20 @@ impl FileOps for PidFdFile {
 
     fn poll_readiness(&self) -> u32 {
         if self.state.exited.load(Ordering::Acquire) {
-            POLL_IN
-        } else {
-            0
+            return POLL_IN;
         }
+        // Authoritative fallback. The `exited` flag is a cache set by
+        // `notify_exit(pid)`, which is missed when the pid is released back to
+        // the allocation pool (forget_pid) before the exiting task's observer
+        // fires — leaving this pidfd un-signalable forever, so a supervisor
+        // (systemd, Qt forkfd) blocks on a process that already exited. Consult
+        // the target's real task state, keyed on the reuse-safe TaskId: a
+        // zombie or already-reaped leader means the process exited.
+        let tid = self.state.tid.load(Ordering::Acquire);
+        if tid != 0 && crate::task::task_has_exited(tid) {
+            return POLL_IN;
+        }
+        0
     }
 
     fn pidfd_target_pid(&self) -> Option<u64> {

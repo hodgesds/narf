@@ -747,6 +747,24 @@ pub fn mark_zombie(tid: u64) -> bool {
     }
 }
 
+/// True if `tid`'s task has EXITED — it is a zombie (exited, not yet reaped)
+/// or already gone from the registry (reaped). A live/running task returns
+/// false. Because the registry holds exactly one entry per task from spawn to
+/// reap, "absent" is unambiguously "reaped".
+///
+/// This is the authoritative, pid-reuse-SAFE signal a pidfd needs: TaskIds are
+/// globally unique and never recycled, unlike the ProcessId that keys the
+/// pidfd `exited` cache. See `pidfd::PidFdFile::poll_readiness` — that cache
+/// can be missed if the pid is released back to the pool before the exiting
+/// task's observer fires, which would otherwise strand the pidfd
+/// un-signalable forever.
+pub fn task_has_exited(tid: u64) -> bool {
+    match task_get(tid) {
+        None => true,
+        Some(t) => t.state.load(Ordering::Acquire) == TASK_ZOMBIE,
+    }
+}
+
 /// `release_task()`: drop the registry's reference at reap time. The
 /// memory is freed when the last outstanding `Arc` drops (typically
 /// the executor slot's future, if it hasn't been dropped already).

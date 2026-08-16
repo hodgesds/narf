@@ -5415,7 +5415,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // that exit (POLLIN never fires; systemd would supervise a ghost).
     // The fd itself is installed after the child's fd-table fork below.
     let pidfd_state = if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
-        Some(crate::pidfd::mint_for(child_visible_pid, true))
+        // tid=0: the child task does not exist yet (this mints BEFORE the
+        // spawn, on purpose). `set_tid` publishes the leader TaskId once the
+        // child is spawned below; until then the `exited` flag alone drives
+        // readiness, which the tiny mint→spawn window can only ever set true.
+        Some(crate::pidfd::mint_for(child_visible_pid, 0, true))
     } else {
         None
     };
@@ -5501,6 +5505,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     };
     let child_tid = pending_child.task_id();
     proc_identity_fork(parent_pid, child_tid.raw());
+    // Publish the pidfd's target leader TaskId now that the child task exists.
+    // Only for a real process clone: for CLONE_THREAD the pidfd tracks the
+    // existing process leader, not this new thread, so leave it unresolved and
+    // let the `exited` cache drive it (unchanged from before pidfds grew a tid).
+    if !share_thread {
+        if let Some(st) = &pidfd_state {
+            st.set_tid(child_tid.raw());
+        }
+    }
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
