@@ -237,6 +237,10 @@ static REBALANCE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 const FRAME_CACHE_CAPACITY: usize = 16;
 const FRAME_CACHE_BATCH: usize = 8;
+/// Maximum final-owner returns published during one cache/zone transaction.
+/// The fixed bound keeps IRQ-masked work finite and permits stack-backed spill
+/// storage: freeing memory must not allocate memory after ownership reaches 0.
+const FRAME_RETURN_CHUNK: usize = 64;
 
 #[derive(Copy, Clone)]
 struct NodeFrameCache {
@@ -282,6 +286,8 @@ static FRAME_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_REFILLS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_SPILLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static FRAME_CACHE_BATCH_FREE_LOCKS: AtomicU64 = AtomicU64::new(0);
 static FRAME_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(align(64))]
@@ -932,6 +938,73 @@ fn free_order0_to_cache(node: usize, frame: u64) -> bool {
     true
 }
 
+/// Publish a bounded set of final-owner order-0 frames for one NUMA node.
+///
+/// No allocation is permitted here: callers have already removed the final
+/// ownership reference, so allocator progress must not depend on obtaining a
+/// fresh frame. Cached spills remain covered by the cache lock until they are
+/// installed in the buddy zone. That cache -> zone lock coupling is required
+/// so a concurrent drain/hot-remove transaction cannot observe the frames in
+/// neither location.
+fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
+    debug_assert!(frames.len() <= FRAME_RETURN_CHUNK);
+    if frames.is_empty() {
+        return;
+    }
+    let node = node.min(MAX_NUMA_NODES - 1);
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
+        let mut zone = ZONES[node].0.lock();
+        for &frame in frames {
+            zone.free(frame, 0);
+        }
+        return;
+    }
+
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let mut cache = FRAME_CACHES[cpu].0.lock();
+    #[cfg(feature = "kernel-test")]
+    FRAME_CACHE_BATCH_FREE_LOCKS.fetch_add(1, Ordering::Relaxed);
+    // A coordinated drain may have published bypass after the optimistic
+    // check. Match the scalar path by publishing directly to the zone.
+    if frame_cache_bypassed(node) {
+        drop(cache);
+        let mut zone = ZONES[node].0.lock();
+        for &frame in frames {
+            zone.free(frame, 0);
+        }
+        return;
+    }
+
+    let local = &mut cache.nodes[node];
+    let mut spills = [0u64; FRAME_RETURN_CHUNK];
+    let mut spill_len = 0usize;
+    for &frame in frames {
+        buddy::audit_cached_free(frame);
+        if local.len == FRAME_CACHE_CAPACITY {
+            debug_assert!(spill_len + FRAME_CACHE_BATCH <= spills.len());
+            for _ in 0..FRAME_CACHE_BATCH {
+                local.len -= 1;
+                spills[spill_len] = local.frames[local.len];
+                spill_len += 1;
+            }
+            FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
+            FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
+        }
+        local.frames[local.len] = frame;
+        local.len += 1;
+        FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
+    }
+
+    if spill_len != 0 {
+        // Keep `cache` held until every removed cached frame is visible in the
+        // zone. See the drain/hot-remove exclusion argument above.
+        let mut zone = ZONES[node].0.lock();
+        for &frame in &spills[..spill_len] {
+            zone.free_cached(frame, 0);
+        }
+    }
+}
+
 /// Drain every CPU's cache for one node and run `f` while new cache entries
 /// are bypassed. Lock order is drain -> per-CPU cache -> zone; ordinary paths
 /// take at most one per-CPU cache before the zone and never take a drain lock.
@@ -1310,6 +1383,17 @@ fn buddy_free_frame(f: PhysFrame) {
 /// Return a frame after the caller has established that no COW owner remains.
 /// This is the common accounting/scrub/NUMA path for scalar and batched free.
 fn buddy_return_unreferenced_frame(f: PhysFrame) {
+    buddy_prepare_unreferenced_frame(f.start_address());
+    let Some((zone_idx, frame_no)) = buddy_unreferenced_route(f) else {
+        return;
+    };
+    if !free_order0_to_cache(zone_idx, frame_no) {
+        ZONES[zone_idx].0.lock().free(frame_no, 0);
+    }
+}
+
+/// Complete work that must precede publication of a final-owner frame.
+fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
     // cgroup memory uncharge: only here, where the frame is genuinely
     // returned to the buddy — i.e. the COW refcount has reached 0 — does
     // it balance the single charge taken at `alloc_frame_on`. The
@@ -1322,20 +1406,20 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
     // buddy. The frame's COW refcount just hit 0 and it is NOT yet on
     // any free list, so we hold exclusive access — no lock needed and
     // no allocator can hand it out mid-scrub.
-    scrub_freed_frame(f.start_address());
-    let node = phys_to_node(f.start_address().raw());
+    scrub_freed_frame(phys);
+}
+
+/// Resolve the allocator destination after final-owner accounting/scrub.
+fn buddy_unreferenced_route(f: PhysFrame) -> Option<(usize, u64)> {
     if !ALLOC.initialised.load(Ordering::Acquire) {
-        return;
+        return None;
     }
     let zone_idx = if ALLOC.numa_aware.load(Ordering::Acquire) {
-        node
+        phys_to_node(f.start_address().raw())
     } else {
         0
     };
-    let frame_no = buddy::frame_no(f);
-    if !free_order0_to_cache(zone_idx, frame_no) {
-        ZONES[zone_idx].0.lock().free(frame_no, 0);
-    }
+    Some((zone_idx, buddy::frame_no(f)))
 }
 
 fn buddy_free_frame_batch(frames: &[PhysFrame]) {
@@ -1344,8 +1428,40 @@ fn buddy_free_frame_batch(frames: &[PhysFrame]) {
         .map(|frame| frame.start_address())
         .filter(|phys| phys.raw() >= LOW_RESERVED_BYTES)
         .collect();
-    for phys in cow::dec_ref_batch(&valid) {
-        buddy_return_unreferenced_frame(PhysFrame::new(phys));
+    let released = cow::dec_ref_batch(&valid);
+
+    // From this point onward no heap allocation is permitted: every entry in
+    // `released` has already lost its final owner. Complete scalar-equivalent
+    // accounting/scrub first, then publish through fixed-size stack chunks.
+    for &phys in &released {
+        buddy_prepare_unreferenced_frame(phys);
+    }
+    if !ALLOC.initialised.load(Ordering::Acquire) {
+        return;
+    }
+
+    let numa_aware = ALLOC.numa_aware.load(Ordering::Acquire);
+    let node_count = if numa_aware { MAX_NUMA_NODES } else { 1 };
+    for node in 0..node_count {
+        let mut chunk = [0u64; FRAME_RETURN_CHUNK];
+        let mut chunk_len = 0usize;
+        for &phys in &released {
+            let zone_idx = if numa_aware {
+                phys_to_node(phys.raw())
+            } else {
+                0
+            };
+            if zone_idx != node {
+                continue;
+            }
+            chunk[chunk_len] = buddy::frame_no(PhysFrame::new(phys));
+            chunk_len += 1;
+            if chunk_len == FRAME_RETURN_CHUNK {
+                free_order0_chunk_to_zone(node, &chunk);
+                chunk_len = 0;
+            }
+        }
+        free_order0_chunk_to_zone(node, &chunk[..chunk_len]);
     }
 }
 
@@ -1657,7 +1773,10 @@ pub mod cow {
             }
         }
 
-        let mut releasable = Vec::new();
+        // Reserve before any refcount reaches zero. Growing this vector while
+        // holding a COW shard after final-owner removal would make teardown's
+        // forward progress depend on a recursive frame allocation.
+        let mut releasable = Vec::with_capacity(frames.len());
         for (shard, indices) in by_shard.into_iter().enumerate() {
             if indices.is_empty() {
                 continue;
@@ -1870,6 +1989,65 @@ fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_round_trip);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_order0_frame_cache_batch_free_is_bounded() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return TestResult::Skip("frame caches not published");
+    }
+    let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+        current_cpu_node().min(MAX_NUMA_NODES - 1)
+    } else {
+        0
+    };
+    if frame_cache_bypassed(node) {
+        return TestResult::Skip("frame cache drain/hotplug bypass is active");
+    }
+
+    const FRAMES: usize = FRAME_RETURN_CHUNK + 1;
+    let free_before = node_free(node);
+    let mut frames = Vec::with_capacity(FRAMES);
+    for _ in 0..FRAMES {
+        let frame = match alloc_pages_on(node, 0) {
+            Ok(frame) => frame,
+            Err(_) => {
+                buddy_free_frame_batch(&frames);
+                return TestResult::Skip("not enough order-0 frames for batch-free smoke");
+            }
+        };
+        let release_node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+            phys_to_node(frame.start_address().raw())
+        } else {
+            0
+        };
+        if release_node != node {
+            frames.push(frame);
+            buddy_free_frame_batch(&frames);
+            return TestResult::Skip("allocation fell back to another NUMA node");
+        }
+        frames.push(frame);
+    }
+
+    let locks_before = FRAME_CACHE_BATCH_FREE_LOCKS.load(Ordering::Relaxed);
+    buddy_free_frame_batch(&frames);
+    let locks = FRAME_CACHE_BATCH_FREE_LOCKS
+        .load(Ordering::Relaxed)
+        .saturating_sub(locks_before);
+    if locks != 2 {
+        return TestResult::Fail("batch free did not use bounded cache transactions");
+    }
+    if node_free(node) != free_before {
+        return TestResult::Fail("batch free changed free-page accounting");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "memory/frame",
+    smoke_order0_frame_cache_batch_free_is_bounded
+);
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {

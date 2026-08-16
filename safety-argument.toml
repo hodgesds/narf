@@ -416,6 +416,9 @@ argument = "Batched COW count snapshots preserve one result per input position a
 ref = "security-model/specification/spec.md#L75"
 argument = "Batched region, MAP_FIXED-punch, and MADV_DONTNEED release begins only after every affected leaf is removed and the existing local/remote TLB retirement completes. The buddy allocator filters forbidden low memory before refcount mutation, drops exactly one owner for every nonzero input under that frame's existing COW shard lock, and forwards only unregistered or final-owner frames to the same scalar cgroup-uncharge, scrub, allocation-audit, NUMA-cache, and buddy-free path. Duplicate inputs retain scalar owner cardinality, zero sentinels are ignored, and pluggable allocators inherit a scalar batch default, so batching cannot create a second free-list owner or make backing reusable while a COW owner or stale translation remains."
 
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Final-owner batch publication reserves its result capacity before any COW decrement can reach zero and thereafter uses only fixed 64-frame stack buffers, so teardown cannot recurse into frame allocation after acquiring exclusive ownership. Every frame completes cgroup uncharge and optional scrub before publication. Cache insertion and audit transitions match scalar return; any displaced cached entries reach the buddy while the same cache lock remains held, preserving the cache-drain and runtime-hot-remove invariant that a free frame is continuously visible in either the cache or its NUMA zone. Direct bypass publication serializes on the existing zone lock, and the bounded chunk limits IRQ-masked work without changing owner cardinality."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"

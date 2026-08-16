@@ -766,16 +766,19 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_idle_mask_round_trip() -> TestResult {
+    // Stay outside the live QEMU topology: a real AP may concurrently publish
+    // its scheduler idle state and race this structural bitmap assertion.
+    const TEST_CPU: u32 = (MAX_CPUS - 1) as u32;
     __reset_for_test();
     if idle_mask() != 0 {
         return TestResult::Fail("idle_mask not zero after reset");
     }
-    mark_idle(2);
-    if idle_mask() & (1u64 << 2) == 0 {
+    mark_idle(TEST_CPU);
+    if idle_mask() & (1u64 << TEST_CPU) == 0 {
         return TestResult::Fail("mark_idle didn't set bit");
     }
-    mark_busy(2);
-    if idle_mask() & (1u64 << 2) != 0 {
+    mark_busy(TEST_CPU);
+    if idle_mask() & (1u64 << TEST_CPU) != 0 {
         return TestResult::Fail("mark_busy didn't clear bit");
     }
     TestResult::Pass
