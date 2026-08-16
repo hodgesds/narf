@@ -4610,6 +4610,27 @@ pub(crate) fn terminate_current_task(
             ctx.rip()
         );
     }
+    // [PROBE] Light (cgevt_trace-gated) twin of the above for the systemd
+    // session-bringup investigation: if `systemd --user` (or an "(sd-*)" helper)
+    // is killed by a signal rather than exit_group()ing, record WHICH signal —
+    // pairs with the USEREXIT line in sys_exit_group so a flapping user@N.service
+    // reports its cause on the console without the syscall-trace firehose.
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        let comm = proc_comm_of(pid).unwrap_or_default();
+        if comm == "systemd" || comm.starts_with("(sd") {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "USEREXIT pid={} tid={} comm={} killed_by_signal={} core_dumped={} ip={:x}",
+                pid,
+                task,
+                comm,
+                signum,
+                core_dumped,
+                ctx.rip()
+            );
+        }
+    }
     stage_pending_termination(pid, encode_signaled_status(signum, core_dumped));
     // Robust-futex owner-died walk — must run HERE, in the dying task's
     // own trap context (its user AS is still active for the user-memory
