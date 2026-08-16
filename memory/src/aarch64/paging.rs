@@ -28,7 +28,7 @@ pub fn __batch_barrier_counts_for_test() -> (u64, u64) {
     )
 }
 
-/// Number of upper-level walks performed by contiguous range clearing. One
+/// Number of upper-level walks performed by contiguous range helpers. One
 /// walk covers every page sharing an L3 table (up to 512 leaves).
 #[cfg(feature = "kernel-test")]
 #[doc(hidden)]
@@ -911,6 +911,73 @@ unsafe fn map_4kb_locked(
     Ok(())
 }
 
+/// Install scatter leaves while caching the current L3 table.
+///
+/// Returns whether any non-lazy backing entry was attempted plus the first
+/// error. The caller holds the root lock and performs the publication barrier.
+unsafe fn map_4kb_scatter_range_locked(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: &mut impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> (bool, Result<(), MapError>) {
+    // SAFETY: root is identity-reachable and protected by its mutation lock.
+    let l0 = unsafe { &mut *(root.kernel_mut_ptr::<PageTable>()) };
+    let mut cached_key = usize::MAX;
+    let mut cached_l3: *mut PageTable = core::ptr::null_mut();
+    let mut attempted = false;
+
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        attempted = true;
+        let flags = flags_for(index, phys);
+        let virt = VirtAddr::new(base.as_u64() + index as u64 * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.l0 << 18) | (idx.l1 << 9) | idx.l2;
+        if key != cached_key {
+            cached_key = key;
+            #[cfg(feature = "kernel-test")]
+            RANGE_L3_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            // SAFETY: each live table is identity-reachable and every missing
+            // level is allocated while the root mutation lock remains held.
+            let l1_phys = match unsafe { ensure_next_table(&mut l0.entries[idx.l0]) } {
+                Ok(phys) => phys,
+                Err(error) => return (attempted, Err(error)),
+            };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let l1 = unsafe { &mut *(l1_phys.kernel_mut_ptr::<PageTable>()) };
+            let l2_phys = match unsafe { ensure_next_table(&mut l1.entries[idx.l1]) } {
+                Ok(phys) => phys,
+                Err(error) => return (attempted, Err(error)),
+            };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let l2 = unsafe { &mut *(l2_phys.kernel_mut_ptr::<PageTable>()) };
+            let l3_phys = match unsafe { ensure_next_table(&mut l2.entries[idx.l2]) } {
+                Ok(phys) => phys,
+                Err(error) => return (attempted, Err(error)),
+            };
+            cached_l3 = l3_phys.kernel_mut_ptr::<PageTable>();
+        }
+
+        // SAFETY: cached_l3 was obtained for this complete upper-index tuple,
+        // and the held root lock prevents descriptor replacement.
+        let l3 = unsafe { &mut *cached_l3 };
+        if l3.entries[idx.l3].is_valid() {
+            return (attempted, Err(MapError::AlreadyMapped));
+        }
+        let base_flags = PtFlags::VALID
+            | PtFlags::TYPE_PAGE
+            | PtFlags::AF
+            | PtFlags::SH_INNER
+            | PtFlags::ATTR_NORMAL;
+        l3.entries[idx.l3] = PageTableEntry::new(phys, base_flags | flags);
+    }
+    (attempted, Ok(()))
+}
+
 /// Map scatter backing while taking the root mutation lock and descriptor
 /// publication barrier once. Zero physical entries are lazy holes.
 ///
@@ -954,22 +1021,9 @@ pub unsafe fn map_4kb_scatter_range(
     }
 
     let _guard = pt_lock_for(root).lock();
-    let mut result = Ok(());
-    let mut attempted = false;
-    for (index, phys) in backing.iter().copied().enumerate() {
-        if phys.raw() == 0 {
-            continue;
-        }
-        attempted = true;
-        let virt = VirtAddr::new(base.as_u64() + index as u64 * 4096);
-        // SAFETY: complete input validation and the root lock are above.
-        if let Err(error) =
-            unsafe { map_4kb_locked(root, virt, phys, flags_for(index, phys), false) }
-        {
-            result = Err(error);
-            break;
-        }
-    }
+    // SAFETY: complete input validation and the root lock are above.
+    let (attempted, result) =
+        unsafe { map_4kb_scatter_range_locked(root, base, backing, &mut flags_for) };
     if attempted {
         // SAFETY: every descriptor write (including an intermediate table
         // created before a later error) precedes this batch publication.
@@ -1037,22 +1091,9 @@ pub unsafe fn rewrite_4kb_scatter_range(
     }
     clear_result?;
 
-    let mut attempted = false;
-    let mut result = Ok(());
-    for (index, phys) in backing.iter().copied().enumerate() {
-        if phys.raw() == 0 {
-            continue;
-        }
-        attempted = true;
-        let virt = VirtAddr::new(base.as_u64() + index as u64 * 4096);
-        // SAFETY: validated backing stays live and the root lock is held.
-        if let Err(error) =
-            unsafe { map_4kb_locked(root, virt, phys, flags_for(index, phys), false) }
-        {
-            result = Err(error);
-            break;
-        }
-    }
+    // SAFETY: validated backing stays live and the root lock is held.
+    let (attempted, result) =
+        unsafe { map_4kb_scatter_range_locked(root, base, backing, &mut flags_for) };
     if attempted {
         // SAFETY: publish every replacement descriptor (and any intermediate
         // table created before an error) as the make half of the transaction.

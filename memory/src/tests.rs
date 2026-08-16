@@ -846,6 +846,7 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         PhysAddr::new(0x1236_2000),
     ];
     let barriers_before_map = __batch_barrier_counts_for_test();
+    let walks_before_map = __range_l3_walks_for_test();
     // SAFETY: this test exclusively owns the root. Synthetic leaf backing is
     // aligned and never dereferenced; zero is the documented lazy sentinel.
     let mapped = unsafe {
@@ -867,6 +868,11 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 scatter map did not batch publication barriers");
+    }
+    if __range_l3_walks_for_test() != walks_before_map + 1 {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map repeated an upper-level walk per page");
     }
     for (page, expected) in backing.into_iter().enumerate() {
         // SAFETY: read-only walk of the still-live isolated root.
@@ -903,10 +909,10 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 rewrite did not batch break-before-make barriers");
     }
-    if __range_l3_walks_for_test() != walks_before_rewrite + 1 {
+    if __range_l3_walks_for_test() != walks_before_rewrite + 2 {
         let _ = unsafe { unmap_4kb_range(root, base, 3) };
         unsafe { free_user_ttbr0_tree(root) };
-        return TestResult::Fail("aarch64 rewrite repeated an upper-level walk per page");
+        return TestResult::Fail("aarch64 rewrite did not batch both upper-level walks");
     }
     for page in [0_u64, 2] {
         let va = VirtAddr::new(base.as_u64() + page * 4096);
@@ -944,6 +950,27 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 repeated range unmap was not idempotent");
     }
+    let boundary_base = VirtAddr::new(0x567f_f000);
+    let boundary_backing = [PhysAddr::new(0x1237_0000), PhysAddr::new(0x1237_1000)];
+    let walks_before_boundary = __range_l3_walks_for_test();
+    // SAFETY: the two-page isolated range straddles an L3-table boundary and
+    // its aligned synthetic backing is never dereferenced.
+    if unsafe {
+        map_4kb_scatter_range(root, boundary_base, &boundary_backing, |_, _| {
+            PtFlags::AP_RW_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    }
+    .is_err()
+    {
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 boundary scatter map failed");
+    }
+    if __range_l3_walks_for_test() != walks_before_boundary + 2 {
+        let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map reused L3 across a boundary");
+    }
+    let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
     // SAFETY: no CPU has ever installed this isolated root.
     unsafe { free_user_ttbr0_tree(root) };
     TestResult::Pass

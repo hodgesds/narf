@@ -654,9 +654,10 @@ x86_64 is rejected at runtime.
   invalidation completes, then all non-zero replacements are installed and
   published once. Parent `rematerialize` is a real rewrite on both supported
   architectures; it may not be a no-op after fork while the parent's live leaf
-  is still writable. Contiguous clearing caches the current L3 table, so up to
-  512 adjacent 4 KiB leaves share one L0/L1/L2 walk without weakening the
-  root-lock or invalidate-before-reuse transaction.
+  is still writable. Contiguous mapping and clearing cache the current L3
+  table, so up to 512 adjacent 4 KiB leaves share one L0/L1/L2 walk in each
+  phase without weakening the root-lock, publication, or
+  invalidate-before-reuse transaction.
 - x86_64 permission and COW write-protect rewrites hold one root mutation shard
   per region rather than reacquiring it for each unmap/map pair. The helper
   caches the current leaf table and directly replaces present descriptors, so

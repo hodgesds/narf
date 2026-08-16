@@ -459,3 +459,11 @@ argument = "The x86_64 permission rewriter caches a leaf-table pointer only afte
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The cached x86_64 permission walk remains an internal optimization of the existing memory page-table TCB. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 scatter installer caches an L3 pointer only after ensuring or verifying every L0/L1/L2 table descriptor under the live root's existing mutation shard. The complete upper-level index tuple keys the cache and every 2 MiB boundary forces a new verified walk, so a leaf cannot be installed through an unrelated table. Fresh intermediate tables and leaves remain unpublished until the existing single DSB/ISB sequence; the permission-rewrite caller still completes the break and all-ASID inner-shareable invalidation before invoking this make phase. Lazy zero entries remain absent, existing leaves still fail as AlreadyMapped, and partial allocation or installation retains the prior partial-progress contract, so fewer walks change neither authority, backing ownership, nor descriptor publication ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached aarch64 scatter installer is internal to the existing memory page-table TCB and reuses its root lock, frame allocator, and publication barrier. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."
