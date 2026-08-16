@@ -12,15 +12,15 @@ name = "narf_aml"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib         = { path = "../lib" }
-narf-console     = { path = "../console" }
-narf-acpi        = { path = "../acpi" }
-narf-memory      = { path = "../memory" }
-narf-time        = { path = "../time" }
-narf-scheduler   = { path = "../scheduler" }
-narf-capabilities = { path = "../capabilities" }
-narf-event-bus   = { path = "../event_bus" }
-narf-kernel-test = { path = "../verification/kernel-test" }
+narf-lib         = { path = "../lib", version = "0.1.0" }
+narf-console     = { path = "../console", version = "0.1.0" }
+narf-acpi        = { path = "../acpi", version = "0.1.0" }
+narf-memory      = { path = "../memory", version = "0.1.0" }
+narf-time        = { path = "../time", version = "0.1.0" }
+narf-scheduler   = { path = "../scheduler", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-event-bus   = { path = "../event_bus", version = "0.1.0" }
+narf-kernel-test = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

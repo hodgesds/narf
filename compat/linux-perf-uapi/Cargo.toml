@@ -1,5 +1,6 @@
 [package]
 name = "narf-linux-perf-uapi"
+description = "Linux perf_event UAPI constants and structures used by NARF compatibility code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

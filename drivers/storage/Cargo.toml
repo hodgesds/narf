@@ -12,22 +12,22 @@ name = "narf_drivers_storage"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-bus          = { path = "../../bus" }
-narf-capabilities = { path = "../../capabilities" }
-narf-console      = { path = "../../console" }
-narf-io           = { path = "../../io" }
-narf-memory       = { path = "../../memory" }
-narf-time         = { path = "../../time" }
-narf-block        = { path = "../../block" }
-narf-filesystem   = { path = "../../filesystem" }
-narf-drivers      = { path = "../" }
-narf-init         = { path = "../../init" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-scheduler    = { path = "../../scheduler" }
-narf-acpi         = { path = "../../acpi" }
-narf-aml          = { path = "../../aml" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-io           = { path = "../../io", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-time         = { path = "../../time", version = "0.1.0" }
+narf-block        = { path = "../../block", version = "0.1.0" }
+narf-filesystem   = { path = "../../filesystem", version = "0.1.0" }
+narf-drivers      = { path = "../", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-scheduler    = { path = "../../scheduler", version = "0.1.0" }
+narf-acpi         = { path = "../../acpi", version = "0.1.0" }
+narf-aml          = { path = "../../aml", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
 
 [features]
 # Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't

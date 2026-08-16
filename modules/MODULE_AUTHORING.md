@@ -24,9 +24,10 @@ crate-type = ["staticlib"]   # produces .a; we extract the .o
 
 [dependencies]
 # Modules link against the kernel's exported symbols via narf-modules.
-# In-tree the path; out-of-tree use the version published on crates.io.
-narf-modules = { path = "../narf-modules" }
-narf-capabilities = { path = "../narf-capabilities" }
+# In-tree manifests add a path; out-of-tree crates use the synchronized
+# version published on crates.io.
+narf-modules = "0.1.0"
+narf-capabilities = "0.1.0"
 ```
 
 Source layout:

@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "6ad0d16abee10036094cd56a5bf070c4f85bfb17f06f0a95cfe7ff29e1f5c2f7"
+prompt_hash = "1f76862e96411de766f4887f1338cead76c0e2a383144beb49c67529b7962813"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -291,3 +291,11 @@ argument = "The retarget hook continues to write only the current CPU's existing
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Private base-page teardown skips the external shared-alias transaction only while holding the address-space region tables continuously from SHARED classification through removal. Shared unmap and range punching retain transaction -> huge-region -> regular-region ordering through leaf removal, cross-CPU TLB invalidation, and the backing owner's release hook. A racing map cannot change the classification without the held region lock. The x86_64 range helper changes only lock granularity: it holds the same per-root page-table mutation lock across the batch, performs the same validated walk and local INVLPG for every present leaf, and callers retain the existing cross-CPU flush-before-frame-release ordering. Private COW ownership is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame, memory, capabilities, and scheduler changes are manifest-only registry metadata. Cargo continues to select the same local path packages, features, targets, profiles, and Rust sources for every in-tree build; the matching 0.1.0 requirement merely supplies an immutable crates.io fallback for external custom workspaces. No trusted subsystem, authority, domain transition, mapping, task state, or TCB boundary changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Every registry fallback is constrained to the synchronized NARF 0.1 release line and package preflight verifies the complete dependency graph before a maintainer-signed tag can publish it. Capability checks, domain tags, PKRS/TCF save-restore, frame ownership, page-table permissions, and scheduler dispatch code are byte-for-byte unchanged; the workspace lockfile resolves the same local sources used by the existing verification gates."

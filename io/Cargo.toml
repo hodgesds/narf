@@ -12,11 +12,11 @@ name = "narf_io"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-memory       = { path = "../memory" }
-narf-capabilities = { path = "../capabilities" }
-narf-acpi         = { path = "../acpi" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-acpi         = { path = "../acpi", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [features]
 # Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't

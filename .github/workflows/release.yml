@@ -31,6 +31,7 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq .verification.verified)" = true
           version="${RELEASE_TAG#v}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+          packaging/publish-crates.sh --version "$version" --plan >/dev/null
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   packages:
@@ -124,8 +125,23 @@ jobs:
             target/narf-aarch64-uefi.img
             target/narf-aarch64-uefi.img.sha256
 
-  publish:
+  crates:
     needs: [validate, packages, iso-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - run: rustup show active-toolchain || rustup toolchain install
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          NARF_RELEASE_TAG_VERIFIED: "1"
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: packaging/publish-crates.sh --version "$VERSION" --execute
+
+  publish:
+    needs: [validate, packages, iso-test, crates]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

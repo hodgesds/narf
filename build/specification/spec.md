@@ -47,10 +47,19 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a
   checksummed release manifest.
-- `cargo install --path build/cargo-narf` installs the optional source-tree
-  frontend. `cargo narf package` drives reproducible native package generation;
+- `cargo install cargo-narf` installs the optional source-tree frontend from
+  crates.io. `cargo narf package` drives reproducible native package generation;
   `cargo narf install` delegates the resulting artifact to apt/dpkg, dnf/rpm,
-  or pacman rather than writing `/boot` directly.
+  or pacman rather than writing `/boot` directly. Both commands operate on a
+  NARF checkout selected by the current directory or `--repo`.
+- Public workspace packages use one synchronized semantic version and carry
+  versioned registry fallbacks beside their in-tree path dependencies. This
+  lets custom kernels and out-of-tree extensions consume the same component
+  graph from crates.io without changing in-tree development or LTO behavior.
+- `packaging/publish-crates.sh --version X.Y.Z --check` validates the complete
+  crates.io archive set and dependency order without uploading. `--execute` is
+  restricted to the matching clean, signed release tag and publishes in
+  dependency order; interrupted runs skip versions already present.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.
@@ -201,6 +210,12 @@ formats are versioned per their respective specs:
   (per `observability/spec` §8.4).
 - `.narfmod`: per `drivers/spec` §5.
 - `narf.toml` (workspace manifest): per `drivers/spec` §6.
+
+The crates.io SDK follows the kernel release version in lockstep. Internal
+dependencies retain local `path` entries for workspace builds and specify the
+same registry version for external consumers. `xtask`, validation binaries,
+and boot-image-only helpers remain repository-private; all reusable
+`narf-*` components and `cargo-narf` are release artifacts.
 
 `build/` itself doesn't have an exported ABI surface — it's a
 build-time tool. Reproducible builds are the "ABI" guarantee:

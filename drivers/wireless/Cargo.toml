@@ -12,26 +12,26 @@ name = "narf_drivers_wireless"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
-narf-io           = { path = "../../io" }
-narf-ipc          = { path = "../../ipc" }
-narf-time         = { path = "../../time" }
-narf-wireless     = { path = "../../wireless" }
-narf-net          = { path = "../../net" }
-narf-bus          = { path = "../../bus" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-memory       = { path = "../../memory" }
-narf-drivers      = { path = "../" }
-narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-scheduler    = { path = "../../scheduler" }
-narf-console      = { path = "../../console" }
-narf-firmware     = { path = "../../firmware" }
-narf-crypto       = { path = "../../crypto" }
-narf-init         = { path = "../../init" }
-narf-drivers-sdio = { path = "../sdio" }
-narf-drivers-usb  = { path = "../usb" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-io           = { path = "../../io", version = "0.1.0" }
+narf-ipc          = { path = "../../ipc", version = "0.1.0" }
+narf-time         = { path = "../../time", version = "0.1.0" }
+narf-wireless     = { path = "../../wireless", version = "0.1.0" }
+narf-net          = { path = "../../net", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-drivers      = { path = "../", version = "0.1.0" }
+narf-driver-runtime = { path = "../runtime", version = "0.1.0", default-features = false, features = ["kernel"] }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
+narf-scheduler    = { path = "../../scheduler", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-firmware     = { path = "../../firmware", version = "0.1.0" }
+narf-crypto       = { path = "../../crypto", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-drivers-sdio = { path = "../sdio", version = "0.1.0" }
+narf-drivers-usb  = { path = "../usb", version = "0.1.0" }
 async-trait = "0.1"
 
 [features]

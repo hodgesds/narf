@@ -12,8 +12,8 @@ name = "narf_compat_relibc"
 path = "src/lib.rs"
 
 [dependencies]
-narf-libc        = { path = "../../narf-libc" }
-narf-kernel-test = { path = "../../verification/kernel-test" }
+narf-libc        = { path = "../../narf-libc", version = "0.1.0" }
+narf-kernel-test = { path = "../../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true
