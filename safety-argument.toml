@@ -247,6 +247,14 @@ argument = "Timer-preemption accounting reads only the current task's scalar tim
 ref = "security-model/specification/spec.md#L42"
 argument = "The removed scan neither enforced capability checks nor assigned domain tags; it leaked an overlapping free after an ownership violation had already occurred. The audited address-space and page-table ownership fixes remain in place, while KASAN-capable kernel tests and stress teardown continue to exercise double-free and use-after-free failures."
 
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The boot huge-page reservation and per-NUMA-node pool remain inside the existing memory/frame TCB. The change adds no trusted subsystem, capability, domain transition, or user-visible authority; it makes the boot-only physical-memory ownership contract explicit with an unsafe interface."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Huge-page reservation now excludes the architecture-reserved low-memory window and every caller-protected physical range before publishing a HugeFrame, with bare_main mandatorily protecting the complete loaded-kernel interval before the buddy sees the same usable map. Each claimed frame is stored in exactly one physical-NUMA-node stack and returned as a buddy exclusion; boot reserves stack capacity for allocated plus free claims, so free_hugepage cannot recursively allocate while holding the IRQ-safe pool lock."
+
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -339,3 +347,27 @@ argument = "Ordered-tree point lookup returns only the greatest VMA base not abo
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The page-table ownership registry remains fixed-size, allocation-free, and lock-free. Open-addressed insertion uses compare-exchange and never replaces a live physical-frame marker; lookup follows a collision chain until a never-used slot; unregister publishes a tombstone rather than an empty slot so later colliding registrations cannot become false negatives. A full registry still fails closed by retaining every existing ownership marker and incrementing the overflow counter. Consequently free_user_pml4_tree continues to reclaim only registered AS-private tables and cannot mistake copied kernel-shared page tables for owned frames."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Live batched swap-out accepts only resident, anonymous-private, base-page backing that is neither shared, COW, file-backed, nor locked. The AddressSpace marks every victim Evicting while holding its authoritative region lock; the swap transaction then revalidates one root, every present leaf, and every physical address before replacing any PTE. Only after the complete PTE batch commits does the ownership callback clear the corresponding Region.phys entries, and only after the targeted TLB retirement completes are the frames returned to the allocator. Swap-in reads into fresh unpublished frames, atomically validates and replaces the complete same-root leaf batch, publishes those frames into Region ownership, and discards the slots only after publication. Failure rolls back transition metadata or retains stable swap entries, so neither path creates an unowned live frame, double owner, or stale translation to a reused frame."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The proportional-set-size range planner is a pure, bounded metadata policy and cannot unmap, free, or grant access. PSS units rank and size fair scan work, while only independently supplied expected_free_pages advances the physical high-watermark goal; a shared alias with proportional charge but zero physical yield therefore cannot satisfy reclaim. The AddressSpace executor revalidates root identity, VMA kind, LOCKED/COW/shared/file exclusions, residency, and leaf ownership before each bounded swap transaction, so stale planner input fails without bypassing mapping permissions, ownership, capability checks, or domain tags."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Targeted x86_64 TLB shootdown derives its CPU mask from the address space's conservative active-CPU bitmap: stale membership can add harmless recipients but cannot omit an active one, and bootstrap or unavailable tracking broadcasts to every online peer. The memory bridge passes that exact mask to interrupts, which publishes requests, sends fixed-destination IPIs, and waits for acknowledgements over the same selected set; full flushes now use the same annotated request path. Concurrent senders service inbound requests while waiting, preserving completion without weakening the rule that invalidation finishes before an unmapped frame may be reused. aarch64 retains its existing shareable hardware invalidation plus SGI behavior."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Batched reclaim, swap ownership transitions, and targeted invalidation remain within the existing memory domain manager and interrupt delivery seams. They add no trusted subsystem, capability authority, DomainId, domain-rights transition, or cross-domain data path; the change restructures existing page ownership and translation retirement inside the documented TCB boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Batched huge-page allocation computes policy/cpuset-constrained node orders before taking the pool lock, transfers ownership only after every requested frame has been popped, and on exhaustion pushes each partial frame back into its exact originating node stack before returning. sys_mmap zeroes the exclusively owned completed vector before publishing any hardware leaf; map_huge_region retains its existing rollback and TLB-before-free ownership ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "x86_64 multi-leaf huge mappings hold the existing root-sharded page-table mutation lock once across the complete fresh-leaf installation. The lock-free helpers remain crate-private and require that guard; public single-leaf callers retain identical validation and locking. A failed batch drops the guard before removing installed leaves, returns every exclusively owned HugeFrame to its exact NUMA pool, and publishes no HugeRegion metadata, preserving one-owner and invalidate-before-reuse ordering without a recursive-lock deadlock."

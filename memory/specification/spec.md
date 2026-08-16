@@ -134,12 +134,83 @@ pub fn node_total(node: usize) -> usize;
 /// Free-block counts for buddy orders 0 through 10.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 
+/// Free-memory pressure band and the physical-page deficit to high.
+pub fn watermark_min() -> u64;
+pub fn watermark_low() -> u64;
+pub fn watermark_high() -> u64;
+pub fn reclaim_goal_pages() -> usize;
+
+/// Fixed-point proportional-set-size units (one private resident page).
+pub const PSS_UNITS_PER_PAGE: u64;
+pub struct ReclaimRangeCandidate {
+    pub address_space_root: PhysAddr,
+    pub base: VirtAddr,
+    pub pages: usize,
+    pub mapcount: u32,
+    /// Conservative rmap-derived physical yield; zero-yield aliases are skipped.
+    pub expected_free_pages: usize,
+    pub age: u8,
+    pub locked: bool,
+}
+pub struct PlannedReclaimRange { /* root, base, pages, PSS, expected yield */ }
+pub struct ReclaimBatchPlan { /* selected ranges + PSS/yield/scan totals */ }
+pub fn plan_reclaim_ranges(
+    candidates: &[ReclaimRangeCandidate],
+    target_free_pages: usize,
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan;
+pub fn plan_watermark_reclaim(
+    candidates: &[ReclaimRangeCandidate],
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan;
+
+/// Swap backends consume vectors as the primary interface. Default methods
+/// preserve compatibility for simple backends; block/zram implementations may
+/// submit or lock once for the whole vector.
+pub trait SwapBackend: Send + Sync {
+    fn write_batch(&self, slots: &[SwapSlot], frames: &[PhysAddr])
+        -> Result<(), SwapError>;
+    fn read_batch_into(&self, slots: &[SwapSlot], frames: &[PhysAddr])
+        -> Result<(), SwapError>;
+    fn discard_batch(&self, slots: &[SwapSlot]);
+}
+#[cfg(target_arch = "x86_64")]
+pub struct SwapVictim { pub pml4_phys: PhysAddr, pub virt: VirtAddr }
+#[cfg(target_arch = "x86_64")]
+pub struct SwapInRequest {
+    pub pml4_phys: PhysAddr,
+    pub virt: VirtAddr,
+    pub flags: PtFlags,
+}
+/// Low-level ownership-sensitive primitive; live VMA reclaim must use the
+/// AddressSpace-integrated transaction.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn swap_out_plan(plan: &ReclaimBatchPlan) -> SwapBatchReport;
+#[cfg(target_arch = "x86_64")]
+pub fn swap_in_batch(requests: &[SwapInRequest]) -> Result<Vec<PhysAddr>, SwapError>;
+
 /// Hugepage allocation is local-first with SLIT-ordered fallback.
+/// Boot-only reservation skips every protected half-open physical range and
+/// returns the additional ranges which the buddy must exclude.
+pub unsafe fn reserve_from_regions(
+    usable: &[UsableRegion],
+    protected: &[(u64, u64)],
+    want_2m: usize,
+    want_1g: usize,
+) -> Vec<(u64, u64)>;
 pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError>;
 pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError>;
 /// Strict node-selection primitives used by NUMA policy consumers.
 pub fn alloc_hugepage_2m_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
 pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+/// All-or-nothing vector allocation with one pool-lock transaction.
+pub fn alloc_hugepages_with(
+    size: HugeSize,
+    policies: &[Mempolicy],
+    local: usize,
+) -> Result<Vec<HugeFrame>, HugeAllocError>;
 // Exported from the `hugepage` module.
 pub fn node_stats(node: usize) -> HugeNodeStats;
 
@@ -164,6 +235,17 @@ impl RegionPerms {
 }
 
 impl AddressSpace {
+    /// One ownership-integrated same-root page-out submission.
+    pub unsafe fn swap_out_private_batch(
+        &self,
+        base: VirtAddr,
+        pages: usize,
+    ) -> Result<usize, SwapError>;
+    /// Execute selected ranges in bounded batches with partial-progress data.
+    pub unsafe fn swap_out_reclaim_plan(
+        &self,
+        plan: &ReclaimBatchPlan,
+    ) -> SwapBatchReport;
     /// Materialize every recorded base-page region; used for exec/fork build.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
     /// Materialize only current regions intersecting a page-aligned user range.
@@ -408,6 +490,41 @@ x86_64 is rejected at runtime.
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
+- PSS is a range-selection weight, never evidence that physical memory was
+  released. Watermark progress advances only by conservative reverse-map
+  `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
+- Boot huge-page reservation never claims the architecture-reserved low-memory
+  window or any caller-protected physical range. The loaded kernel image is a
+  mandatory protected range, and every successful claim is returned as a buddy
+  exclusion before the same usable map is donated. Free 2 MiB and 1 GiB frames
+  are partitioned by physical NUMA node, so strict-node allocate, free, and
+  per-node statistics are O(1); boot pre-reserves each node stack for its total
+  outstanding reservation so a later free cannot grow a vector while holding
+  the huge-pool IRQ-safe lock. Multi-frame allocation precomputes each policy
+  order before taking that lock, pops the complete vector in one critical
+  section, and rolls every pop back to its original node before returning an
+  exhaustion error; callers never observe partial batch ownership. On x86_64,
+  `map_huge_region` holds one per-root page-table mutation lock across every
+  fresh huge leaf in the region; a failed leaf releases that lock before
+  ordinary rollback unmaps, and no backing is published to region metadata
+  until the complete leaf batch succeeds.
+- A swap-out batch reserves one contiguous slot run, performs one backend
+  vector write, validates every same-root leaf before publishing any swap PTE,
+  and retires stale translations once before returning any victim frame to the
+  allocator. Failure before PTE publication leaves every mapping resident and
+  releases the complete slot run.
+- A swap-in batch validates and reads every requested slot into unpublished
+  frames before atomically replacing the same-root swap leaves. Failure leaves
+  all PTEs and slots unchanged. Backend I/O runs without the global swap-device
+  lock or a page-table mutation lock held.
+- Live anonymous-private x86_64 swap uses region-table transitions
+  `Evicting -> Swapped -> Loading -> Resident`. PTE publication transfers the
+  corresponding `Region::phys` ownership before TLB invalidation/free; page-in
+  republishes Region ownership before retiring slots. A fault on `Swapped`
+  collects consecutive leaves ahead of the fault for one vector read/PTE
+  commit. Teardown atomically clears all stable swap leaves and discards their
+  slots as one backend batch. Shared, COW, file-backed, and locked pages are
+  ineligible until reverse-map/slot-sharing semantics are defined.
 
 ## 5. Architecture notes
 
@@ -509,8 +626,8 @@ breakdown. Modules in tree:
   `try_dealloc_atomic` for IRQ-context callers.
 - `heap.rs` — hybrid bootstrap-bump → slab `#[global_allocator]`,
   `BOOTSTRAP_CAPACITY = 8 << 20`.
-- `hugepage.rs` — boot-reserved 2 MiB / 1 GiB pool (cmdline
-  `hugepages_2m=N` / `hugepages_1g=N`), no buddy fallback.
+- `hugepage.rs` — boot-reserved, protected-range-aware, per-NUMA-node 2 MiB /
+  1 GiB pools (cmdline `hugepages_2m=N` / `hugepages_1g=N`), no buddy fallback.
 - `atomic_pool.rs` — driver-side `AtomicPool<T>` fixed-capacity
   pool for IRQ-critical paths that can't tolerate even
   `try_alloc_atomic` failure.

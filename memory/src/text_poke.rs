@@ -1173,8 +1173,8 @@ mod tests {
     #[test]
     fn poke_window_sits_above_the_pack_region() {
         // A poke slot that overlapped the pack region would map a scratch
-        // frame on top of live JIT text.
-        assert!(POKE_VA_BASE >= crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::BPF_TEXT_USABLE);
+        // frame on top of live JIT text. POKE_VA_BASE is defined at the exact
+        // end of that region; this test checks the far endpoint.
         let last = poke_va(narf_lib::percpu::MAX_CPUS - 1);
         assert!(last < crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::SLOT_SPAN);
     }

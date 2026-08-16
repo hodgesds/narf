@@ -317,16 +317,13 @@ pub fn shootdown_target_mask(req: ShootdownRequest) -> u64 {
 // the hook unset and `shootdown` reduces to local invalidation.
 //
 // The fan-out hook is called only when the filtered target mask is
-// non-empty. The interrupts crate is responsible for translating
-// the `ShootdownRequest` into the concrete IPI primitive
-// (`shoot_range` / `shoot_tag_only` / broadcast). Future revision:
-// pass the target mask through so the bridge can use targeted
-// rather than broadcast IPIs (Intel SDM Vol 3 §11.6.1 -- physical
-// destination mode in the ICR). Today's bridge still broadcasts;
-// the filter at least avoids the call entirely when no peer needs
-// it, which is the biggest win.
+// non-empty. The interrupts crate translates the request into the
+// concrete IPI primitive and sends only to `targets` (Intel SDM Vol
+// 3 §11.6.1, physical destination mode in the ICR). Passing the mask
+// is load-bearing: recomputing or broadcasting in the bridge would
+// defeat both the active-AS filter and idle-CPU elision.
 
-type IpiFanoutFn = fn(req: ShootdownRequest);
+type IpiFanoutFn = fn(req: ShootdownRequest, targets: u64);
 
 static IPI_FANOUT: AtomicUsize = AtomicUsize::new(0);
 
@@ -336,14 +333,14 @@ pub fn set_ipi_fanout(f: IpiFanoutFn) {
     IPI_FANOUT.store(f as usize, Ordering::Release);
 }
 
-fn ipi_fanout(req: ShootdownRequest) {
+fn ipi_fanout(req: ShootdownRequest, targets: u64) {
     let f = IPI_FANOUT.load(Ordering::Acquire);
     if f != 0 {
         // SAFETY: stored as `IpiFanoutFn as usize`; round-trip back
         // is sound when non-null.
         // SAFETY: Valid memory or trusted environment
         let func: IpiFanoutFn = unsafe { core::mem::transmute(f) };
-        func(req);
+        func(req, targets);
     }
 }
 
@@ -370,7 +367,7 @@ pub fn shootdown(req: ShootdownRequest) {
     }
     FILTERED_TARGETS.fetch_add(targets.count_ones() as u64, Ordering::Relaxed);
     IPI_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-    ipi_fanout(req);
+    ipi_fanout(req, targets);
 }
 
 /// Batched range shootdown. Issues one IPI for `pages` contiguous

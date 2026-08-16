@@ -707,7 +707,7 @@ static PT_LOCKS: [narf_lib::sync::IrqSafeSpinLock<()>; PT_LOCK_SHARDS] =
     [const { narf_lib::sync::IrqSafeSpinLock::new(()) }; PT_LOCK_SHARDS];
 
 #[inline]
-fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
+pub(crate) fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
     // Roots are page-aligned; index by the page number's low bits.
     &PT_LOCKS[((pml4_phys.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)]
 }
@@ -726,6 +726,27 @@ pub unsafe fn map_2mb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: this function holds the root's mutation lock and forwards the
+    // public mapping contract unchanged.
+    unsafe { map_2mb_locked(pml4_phys, virt, phys, flags) }
+}
+
+/// [`map_2mb`] with the per-root mutation lock already held by the caller.
+///
+/// This is crate-visible so a multi-leaf address-space operation can amortize
+/// one lock acquisition across the whole region.
+///
+/// # Safety
+/// The caller must uphold [`map_2mb`]'s contract and hold
+/// [`pt_lock_for(pml4_phys)`] for the entire call.
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_2mb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 2 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -736,7 +757,6 @@ pub unsafe fn map_2mb(
     if phys.raw() & (SIZE - 1) != 0 {
         return Err(MapError::UnalignedPhys);
     }
-    let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
     let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
     if flags.contains(PtFlags::USER) {
@@ -769,6 +789,24 @@ pub unsafe fn map_1gb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: this function holds the root's mutation lock and forwards the
+    // public mapping contract unchanged.
+    unsafe { map_1gb_locked(pml4_phys, virt, phys, flags) }
+}
+
+/// [`map_1gb`] with the per-root mutation lock already held by the caller.
+///
+/// # Safety
+/// The caller must uphold [`map_1gb`]'s contract and hold
+/// [`pt_lock_for(pml4_phys)`] for the entire call.
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_1gb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 1024 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -779,7 +817,6 @@ pub unsafe fn map_1gb(
     if phys.raw() & (SIZE - 1) != 0 {
         return Err(MapError::UnalignedPhys);
     }
-    let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
     let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
     if flags.contains(PtFlags::USER) {

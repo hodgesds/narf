@@ -499,7 +499,7 @@ fn donate_around_excludes(zone: &mut BuddyZone, start: u64, end: u64, exclude: &
 /// `Vec::pop` returned high frames first; the buddy, splitting
 /// from any order, can return low frames early. Skip the first
 /// MiB unconditionally.
-const LOW_RESERVED_BYTES: u64 = 0x100000;
+pub(crate) const LOW_RESERVED_BYTES: u64 = 0x100000;
 
 /// Donate `[start, end)` (page-aligned) to `zone` as a single contiguous run.
 /// Skips the first MiB of phys (BIOS / SMP trampoline territory).

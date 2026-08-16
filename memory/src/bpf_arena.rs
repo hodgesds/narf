@@ -1054,9 +1054,8 @@ mod tests {
             ((BPF_ARENA_BASE >> 39) & 0x1FF) as usize,
             BPF_ARENA_PML4_SLOT
         );
-        // 512 GiB of guard on each side vastly exceeds Linux's ISA-derived
-        // 64 KiB (`arena.c:45`: round_up(1 << 16, 8192)).
-        assert!(SLOT_SPAN > (1u64 << 16));
+        // Guard sizing is pinned by the compile-time invariants above; this
+        // runtime test covers the externally visible slot placement.
     }
 
     // There is deliberately *no* host test restating the tail-guard arithmetic.

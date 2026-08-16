@@ -201,6 +201,43 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_tlb_shootdown_target_mask_excludes_unselected_peer() -> TestResult {
+    use crate::x86_64::{apic, ipi};
+
+    if narf_lib::smp::cpu_count() < 3 {
+        return TestResult::Skip("need two peer CPUs to observe target exclusion");
+    }
+    if !apic::x2apic_active() {
+        return TestResult::Skip("targeted shootdown IPI requires x2APIC");
+    }
+
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let mut peers = (0..narf_lib::smp::cpu_count()).filter(|cpu| *cpu != self_cpu);
+    let target = peers.next().unwrap_or(0);
+    let excluded = peers.next().unwrap_or(target);
+    let target_before = ipi::ever_received(target);
+    let excluded_before = ipi::ever_received(excluded);
+
+    // SAFETY: x2APIC is active and the shootdown vector is installed.
+    unsafe {
+        ipi::shoot_range_mask(0xFFFF_FFFF_8000_4000, 1, 0, 1u64 << (target & 63));
+    }
+
+    if ipi::ever_received(target) != target_before + 1 {
+        return TestResult::Fail("selected peer did not service targeted shootdown");
+    }
+    if ipi::ever_received(excluded) != excluded_before {
+        return TestResult::Fail("unselected peer serviced targeted shootdown");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/ipi",
+    smoke_tlb_shootdown_target_mask_excludes_unselected_peer
+);
+
 /// Regression guard for the per-CPU-AP-trap-stack invariant (commit
 /// c97bf5b4 / e368ef22). When the APs shared the BSP's single TSS/`rsp0`
 /// and the one global `IST_STACKS` on 4 KiB stacks, a *storm* of broadcast

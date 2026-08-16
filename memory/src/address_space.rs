@@ -267,12 +267,28 @@ pub struct Region {
 #[derive(Clone, Debug, Default)]
 struct RegionTable {
     by_base: BTreeMap<u64, Region>,
+    /// Per-page swap ownership transitions, keyed by page-aligned user VA.
+    /// Kept under the same lock as `Region::phys` so the two authorities can
+    /// never disagree at a visible transaction boundary.
+    swap_pages: BTreeMap<u64, SwapPageState>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+enum SwapPageState {
+    /// Backend write is in progress; the region still owns `phys`.
+    Evicting(PhysAddr),
+    /// PTE owns a swap slot and the corresponding `Region::phys` entry is 0.
+    Swapped,
+    /// Backend read is in progress; another fault should retry.
+    Loading,
 }
 
 impl RegionTable {
     const fn new() -> Self {
         Self {
             by_base: BTreeMap::new(),
+            swap_pages: BTreeMap::new(),
         }
     }
 
@@ -1160,25 +1176,91 @@ impl AddressSpace {
             }
         }
 
-        for (i, frame) in region.frames.iter().enumerate() {
-            let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
-            let result = self.map_huge_leaf(va, frame.phys(), region.size, region.perms);
-            if result.is_err() {
-                for j in 0..i {
-                    let rollback_va = VirtAddr::new(region.base.as_u64() + j as u64 * page_size);
-                    let _ = self.unmap_huge_leaf(rollback_va, region.size);
-                }
-                for frame in region.frames {
-                    crate::hugepage::free_hugepage(frame);
-                }
-                return result;
+        if let Err((installed, error)) = self.map_new_huge_leaves(&region, page_size) {
+            // The x86 batch helper has released the page-table lock before
+            // rollback, so these ordinary unmap helpers cannot self-deadlock.
+            for j in 0..installed {
+                let rollback_va = VirtAddr::new(region.base.as_u64() + j as u64 * page_size);
+                let _ = self.unmap_huge_leaf(rollback_va, region.size);
             }
+            for frame in region.frames {
+                crate::hugepage::free_hugepage(frame);
+            }
+            return Err(error);
         }
         let (base, len) = (region.base.as_u64(), region.len);
         huge.push(region);
         drop(huge);
         self.bump_mmap_cursor_past(base, len);
         Ok(())
+    }
+
+    /// Install every fresh huge leaf in a region, reporting how many leaves
+    /// need rollback if an installation fails.
+    #[cfg(target_arch = "x86_64")]
+    fn map_new_huge_leaves(
+        &self,
+        region: &HugeRegion,
+        page_size: u64,
+    ) -> Result<(), (usize, AddressSpaceError)> {
+        // One per-root page-table lock covers the complete region rather than
+        // disabling IRQs and reacquiring the same shard once per huge leaf.
+        let _pt_guard = crate::x86_64::paging::pt_lock_for(self.root).lock();
+        for (i, frame) in region.frames.iter().enumerate() {
+            let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
+            if let Err(error) =
+                self.map_huge_leaf_locked(va, frame.phys(), region.size, region.perms)
+            {
+                return Err((i, error));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn map_new_huge_leaves(
+        &self,
+        region: &HugeRegion,
+        page_size: u64,
+    ) -> Result<(), (usize, AddressSpaceError)> {
+        for (i, frame) in region.frames.iter().enumerate() {
+            let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
+            if let Err(error) = self.map_huge_leaf(va, frame.phys(), region.size, region.perms) {
+                return Err((i, error));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn map_huge_leaf_locked(
+        &self,
+        va: VirtAddr,
+        phys: u64,
+        size: crate::hugepage::HugeSize,
+        perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_1gb_locked, map_2mb_locked, PtFlags};
+        let mut flags = PtFlags::USER;
+        if perms.contains(RegionPerms::WRITE) {
+            flags |= PtFlags::WRITABLE;
+        }
+        if !perms.contains(RegionPerms::EXEC) {
+            flags |= PtFlags::NO_EXEC;
+        }
+        // SAFETY: map_new_huge_leaves holds this root's page-table mutation
+        // lock; map_huge_region validated the live-root and alignment contract.
+        let result = unsafe {
+            match size {
+                crate::hugepage::HugeSize::M2 => {
+                    map_2mb_locked(self.root, va, PhysAddr::new(phys), flags)
+                }
+                crate::hugepage::HugeSize::G1 => {
+                    map_1gb_locked(self.root, va, PhysAddr::new(phys), flags)
+                }
+            }
+        };
+        result.map_err(|_| AddressSpaceError::Overlap)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1416,6 +1498,9 @@ impl AddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
         let mut regions = self.regions.lock();
+        if regions.swap_pages.range(old_lo..old_hi).next().is_some() {
+            return Err(AddressSpaceError::NotImplemented);
+        }
         let source = regions
             .get(old_lo)
             .filter(|region| region.len == old_len)
@@ -1524,6 +1609,34 @@ impl AddressSpace {
             None
         };
         record_unmap_path(shared);
+        #[cfg(target_arch = "x86_64")]
+        let swapped_entries = {
+            let region = regions
+                .get(base.as_u64())
+                .ok_or(AddressSpaceError::Unmapped)?;
+            let lo = region.base.as_u64();
+            let hi = lo.saturating_add(region.len);
+            if regions.swap_pages.range(lo..hi).any(|(_, state)| {
+                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+            }) {
+                return Err(AddressSpaceError::NotImplemented);
+            }
+            let pages: Vec<VirtAddr> = regions
+                .swap_pages
+                .range(lo..hi)
+                .filter_map(|(&va, state)| {
+                    matches!(state, SwapPageState::Swapped).then_some(VirtAddr::new(va))
+                })
+                .collect();
+            // SAFETY: these VAs are stable Swapped records under the region
+            // lock and name this live address-space root.
+            let entries = unsafe { crate::swap::take_swap_entries(self.root, &pages) }
+                .map_err(|_| AddressSpaceError::NotImplemented)?;
+            for va in pages {
+                regions.swap_pages.remove(&va.as_u64());
+            }
+            entries
+        };
         let region = {
             let region = regions
                 .remove(base.as_u64())
@@ -1553,6 +1666,8 @@ impl AddressSpace {
         // ONE cross-CPU invalidation BEFORE any frame is freed for reuse
         // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
         self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
+        #[cfg(target_arch = "x86_64")]
+        crate::swap::swap_discard_batch(&swapped_entries);
         if self.root.as_u64() != 0 {
             self.free_region_frames(&region);
         }
@@ -1597,6 +1712,13 @@ impl AddressSpace {
             None
         };
         record_unmap_path(shared);
+
+        if regions.swap_pages.range(lo..hi).next().is_some() {
+            // Partial MAP_FIXED teardown of swap backing needs slot-aware
+            // splitting. Refuse until that transaction lands rather than
+            // leaking a slot or converting preserved data to demand-zero.
+            return Err(AddressSpaceError::NotImplemented);
+        }
 
         // A hardware huge leaf cannot be split into a differently-sized
         // mapping without first manufacturing replacement backing. Permit
@@ -2251,6 +2373,174 @@ impl AddressSpace {
         }
     }
 
+    /// Swap one bounded run of private resident pages with a single backend
+    /// vector operation and one TLB retirement.
+    ///
+    /// The region table records `Evicting` before backend I/O begins. On PTE
+    /// commit the swap layer calls back before invalidation/free, allowing this
+    /// method to clear authoritative `Region::phys` ownership and publish
+    /// `Swapped` atomically under the region lock. Shared, COW, file-backed,
+    /// locked, lazy, and already-transitioning pages are rejected.
+    ///
+    /// # Safety
+    ///
+    /// `self.root` must be a live identity-reachable root and every selected
+    /// page must remain owned by this address space for the transaction. The
+    /// internal transition records enforce the latter against VMA operations.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn swap_out_private_batch(
+        &self,
+        base: VirtAddr,
+        pages: usize,
+    ) -> Result<usize, crate::swap::SwapError> {
+        use crate::swap::{SwapError, SwapVictim};
+
+        if pages == 0 || pages > crate::swap::swap_batch_pages() || base.as_u64() & 0xfff != 0 {
+            return Err(SwapError::InvalidBatch);
+        }
+        let mut victims = Vec::with_capacity(pages);
+        {
+            let mut table = self.regions.lock();
+            for page in 0..pages {
+                let offset = (page as u64)
+                    .checked_mul(4096)
+                    .ok_or(SwapError::InvalidBatch)?;
+                let va = base
+                    .as_u64()
+                    .checked_add(offset)
+                    .ok_or(SwapError::InvalidBatch)?;
+                if table.swap_pages.contains_key(&va) {
+                    return Err(SwapError::InvalidBatch);
+                }
+                let region = table.containing(va).ok_or(SwapError::MapFailed)?;
+                if region.perms.contains(RegionPerms::LOCKED)
+                    || region.perms.contains(RegionPerms::SHARED)
+                    || region.perms.contains(RegionPerms::FILE_DEMAND)
+                    || region.perms.contains(RegionPerms::COW)
+                    || region.perms.prot_only().0 == 0
+                {
+                    return Err(SwapError::InvalidBatch);
+                }
+                let index = ((va - region.base.as_u64()) >> 12) as usize;
+                let phys = *region.phys.get(index).ok_or(SwapError::MapFailed)?;
+                if phys.raw() == 0 {
+                    return Err(SwapError::InvalidBatch);
+                }
+                victims.push((
+                    SwapVictim {
+                        pml4_phys: self.root,
+                        virt: VirtAddr::new(va),
+                    },
+                    phys,
+                ));
+            }
+            for (victim, phys) in &victims {
+                table
+                    .swap_pages
+                    .insert(victim.virt.as_u64(), SwapPageState::Evicting(*phys));
+            }
+        }
+
+        let bare_victims: Vec<SwapVictim> = victims.iter().map(|(victim, _)| *victim).collect();
+        // SAFETY: the transition table above pins metadata ownership. The
+        // callback clears it before the swap primitive invalidates/frees.
+        let result = unsafe {
+            crate::swap::swap_out_batch_owned(&bare_victims, |resolved| {
+                let mut table = self.regions.lock();
+                for (victim, phys) in resolved {
+                    let va = victim.virt.as_u64();
+                    assert_eq!(
+                        table.swap_pages.get(&va),
+                        Some(&SwapPageState::Evicting(*phys)),
+                        "swap ownership transition changed before PTE commit"
+                    );
+                    {
+                        let region = table
+                            .containing_mut(va)
+                            .expect("swap victim region disappeared during transaction");
+                        let index = ((va - region.base.as_u64()) >> 12) as usize;
+                        assert_eq!(region.phys[index], *phys);
+                        region.phys[index] = PhysAddr::new(0);
+                    }
+                    table.swap_pages.insert(va, SwapPageState::Swapped);
+                }
+            })
+        };
+
+        // Remove reservations for an aborted transaction or for a backed page
+        // whose leaf was already absent and therefore was skipped.
+        let mut table = self.regions.lock();
+        for (victim, phys) in victims {
+            if table.swap_pages.get(&victim.virt.as_u64()) == Some(&SwapPageState::Evicting(phys)) {
+                table.swap_pages.remove(&victim.virt.as_u64());
+            }
+        }
+        result
+    }
+
+    /// Execute this address space's selected PSS reclaim ranges with live VMA
+    /// ownership integration and explicit partial progress.
+    ///
+    /// Large ranges are split at the runtime swap batch ceiling. A plan that
+    /// names another root, shared/COW/locked backing, or malformed metadata
+    /// stops at the first such submission and reports the pages already
+    /// completed; earlier batches remain valid swap entries.
+    ///
+    /// # Safety
+    ///
+    /// `self.root` must remain a live identity-reachable root for the pass.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn swap_out_reclaim_plan(
+        &self,
+        plan: &crate::reclaim::ReclaimBatchPlan,
+    ) -> crate::swap::SwapBatchReport {
+        let mut report = crate::swap::SwapBatchReport {
+            planned_pages: plan
+                .ranges
+                .iter()
+                .fold(0usize, |sum, range| sum.saturating_add(range.pages)),
+            ..crate::swap::SwapBatchReport::default()
+        };
+        let batch_pages = crate::swap::swap_batch_pages();
+        for range in &plan.ranges {
+            if range.address_space_root != self.root {
+                report.error = Some(crate::swap::SwapError::InvalidBatch);
+                return report;
+            }
+            let mut offset = 0usize;
+            while offset < range.pages {
+                let pages = (range.pages - offset).min(batch_pages);
+                let byte_offset = match (offset as u64).checked_mul(4096) {
+                    Some(offset) => offset,
+                    None => {
+                        report.error = Some(crate::swap::SwapError::InvalidBatch);
+                        return report;
+                    }
+                };
+                let base = match range.base.as_u64().checked_add(byte_offset) {
+                    Some(base) => VirtAddr::new(base),
+                    None => {
+                        report.error = Some(crate::swap::SwapError::InvalidBatch);
+                        return report;
+                    }
+                };
+                report.attempted_pages = report.attempted_pages.saturating_add(pages);
+                report.submissions = report.submissions.saturating_add(1);
+                // SAFETY: forwarded live-root contract; the callee validates
+                // and transactionally pins every Region backing slot.
+                match unsafe { self.swap_out_private_batch(base, pages) } {
+                    Ok(done) => report.swapped_pages = report.swapped_pages.saturating_add(done),
+                    Err(error) => {
+                        report.error = Some(error);
+                        return report;
+                    }
+                }
+                offset += pages;
+            }
+        }
+        report
+    }
+
     /// Demand-paging entry point — called from the user-mode #PF
     /// handler when CR2 (x86_64) / FAR_EL1 (aarch64) lands inside
     /// a known region whose `phys[i]` is the zero sentinel
@@ -2281,6 +2571,87 @@ impl AddressSpace {
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
+        // Swap faults are resolved before anonymous/file demand allocation.
+        // Evicting/Loading means another CPU owns the transition; returning Ok
+        // retries the instruction until that bounded batch publishes a leaf.
+        let swap_requests = {
+            let mut table = self.regions.lock();
+            match table.swap_pages.get(&v).copied() {
+                Some(SwapPageState::Evicting(_)) | Some(SwapPageState::Loading) => return Ok(()),
+                Some(SwapPageState::Swapped) => {
+                    let region = table.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+                    let index = ((v - region.base.as_u64()) >> 12) as usize;
+                    if region.phys.get(index).is_none_or(|phys| phys.raw() != 0) {
+                        return Err(AddressSpaceError::NotImplemented);
+                    }
+                    let mut flags = PtFlags::USER;
+                    if region.perms.contains(RegionPerms::WRITE) {
+                        flags |= PtFlags::WRITABLE;
+                    }
+                    if !region.perms.contains(RegionPerms::EXEC) {
+                        flags |= PtFlags::NO_EXEC;
+                    }
+                    // Read-ahead consecutive swapped leaves in this VMA. The
+                    // faulting page is first, followed by increasing VAs, so
+                    // a sequential workload consumes the complete contiguous
+                    // slot run with one backend/PTE transaction.
+                    let region_end = region.base.as_u64().saturating_add(region.len);
+                    let mut requests = Vec::with_capacity(crate::swap::swap_batch_pages());
+                    let mut cursor = v;
+                    while cursor < region_end && requests.len() < crate::swap::swap_batch_pages() {
+                        if table.swap_pages.get(&cursor) != Some(&SwapPageState::Swapped) {
+                            break;
+                        }
+                        requests.push(crate::swap::SwapInRequest {
+                            pml4_phys: self.root,
+                            virt: VirtAddr::new(cursor),
+                            flags,
+                        });
+                        cursor = cursor.saturating_add(4096);
+                    }
+                    for request in &requests {
+                        table
+                            .swap_pages
+                            .insert(request.virt.as_u64(), SwapPageState::Loading);
+                    }
+                    Some(requests)
+                }
+                None => None,
+            }
+        };
+        if let Some(requests) = swap_requests {
+            let loaded = crate::swap::swap_in_batch_owned(&requests, |frames| {
+                let mut table = self.regions.lock();
+                for (request, phys) in requests.iter().zip(frames) {
+                    let va = request.virt.as_u64();
+                    assert_eq!(
+                        table.swap_pages.get(&va),
+                        Some(&SwapPageState::Loading),
+                        "swap-in ownership transition changed before publish"
+                    );
+                    {
+                        let region = table
+                            .containing_mut(va)
+                            .expect("swap-in region disappeared during transaction");
+                        let index = ((va - region.base.as_u64()) >> 12) as usize;
+                        assert_eq!(region.phys[index], PhysAddr::new(0));
+                        region.phys[index] = *phys;
+                    }
+                    table.swap_pages.remove(&va);
+                }
+            });
+            if loaded.is_ok() {
+                return Ok(());
+            }
+            let mut table = self.regions.lock();
+            for request in requests {
+                let va = request.virt.as_u64();
+                if table.swap_pages.get(&va) == Some(&SwapPageState::Loading) {
+                    table.swap_pages.insert(va, SwapPageState::Swapped);
+                }
+            }
+            return Err(AddressSpaceError::OutOfRange);
+        }
         // Demand-paged file mapping: the frame comes from the backing file,
         // not from the frame allocator. Resolved with no lock held (see
         // `file_demand_miss`), then published into the region's `phys` slot,
@@ -2861,10 +3232,16 @@ impl AddressSpace {
         // wrong region. VAs stay meaningful across any reshuffle.
         let mut anonymous_vas: Vec<u64> = Vec::new();
         let mut file_vas: Vec<u64> = Vec::new();
+        let mut swap_vas: Vec<u64> = Vec::new();
         {
             let g = self.regions.lock();
             if !Self::regions_cover_range(&g, lo, hi) {
                 return Err(AddressSpaceError::Unmapped);
+            }
+            if g.swap_pages.range(lo..hi).any(|(_, state)| {
+                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+            }) {
+                return Err(AddressSpaceError::NotImplemented);
             }
             g.for_each_overlapping(lo, hi, |r| {
                 let rb = r.base.as_u64();
@@ -2877,7 +3254,9 @@ impl AddressSpace {
                 for i in first..last {
                     if r.phys[i].raw() == 0 {
                         let va = rb + ((i as u64) << 12);
-                        if r.perms.contains(RegionPerms::FILE_DEMAND) {
+                        if g.swap_pages.get(&va) == Some(&SwapPageState::Swapped) {
+                            swap_vas.push(va);
+                        } else if r.perms.contains(RegionPerms::FILE_DEMAND) {
                             file_vas.push(va);
                         } else {
                             anonymous_vas.push(va);
@@ -2885,6 +3264,14 @@ impl AddressSpace {
                     }
                 }
             });
+        }
+
+        // Preserved swap contents take precedence over anonymous zero-fill.
+        // The first fault may batch-read consecutive entries; later VAs then
+        // take the already-resident recovery path without changing contents.
+        for va in swap_vas {
+            // SAFETY: mlock operates on this live address-space root.
+            unsafe { self.demand_alloc_page(VirtAddr::new(va))? };
         }
 
         // FILE_DEMAND pages are borrowed from their backing file.  Routing
@@ -3088,6 +3475,15 @@ impl AddressSpace {
         // ack-wait itself services peer shootdowns (see `remap_page`,
         // which has always broadcast under this lock).
         let mut g = self.regions.lock();
+        if g.swap_pages
+            .range(lo..hi)
+            .any(|(_, state)| matches!(state, SwapPageState::Loading))
+        {
+            // A page-in commit has already captured the old PTE flags. Let
+            // that bounded transaction finish rather than publish those old
+            // flags after this permission change.
+            return Err(AddressSpaceError::NotImplemented);
+        }
         let mut hits = Vec::new();
         g.for_each_overlapping_mut(lo, hi, |r| {
             let rb = r.base.as_u64();
@@ -3264,6 +3660,20 @@ impl AddressSpace {
             return Err(AddressSpaceError::Unmapped);
         }
 
+        // Avoid changing huge mappings and only then discovering that a
+        // base-page swap-in covering the same request already captured stale
+        // permissions. This is repeated under the region lock below to close
+        // the race with a page-in that starts while huge leaves are updated.
+        if self
+            .regions
+            .lock()
+            .swap_pages
+            .range(lo..hi)
+            .any(|(_, state)| matches!(state, SwapPageState::Loading))
+        {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+
         let huge_touched = {
             let mut huge = self.huge_regions.lock();
             if huge.iter().any(|region| {
@@ -3362,6 +3772,12 @@ impl AddressSpace {
         // see `change_perms_range` for the full rationale + why the
         // under-lock broadcast is deadlock-safe).
         let mut g = self.regions.lock();
+        if g.swap_pages
+            .range(lo..hi)
+            .any(|(_, state)| matches!(state, SwapPageState::Loading))
+        {
+            return Err(AddressSpaceError::NotImplemented);
+        }
         let touched: Vec<Region> = {
             // Drain only the entries intersecting [lo, hi), split them, and
             // reinsert their disjoint fragments under the same lock.
@@ -3519,8 +3935,33 @@ impl AddressSpace {
         // learned to self-heal it).
         let mut to_release: Vec<PhysAddr> = Vec::new();
         let mut touched = false;
+        #[cfg(target_arch = "x86_64")]
+        let discarded_swap;
         {
             let mut g = self.regions.lock();
+            #[cfg(target_arch = "x86_64")]
+            {
+                if g.swap_pages.range(lo..hi).any(|(_, state)| {
+                    matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+                }) {
+                    return Err(AddressSpaceError::NotImplemented);
+                }
+                let swapped_pages: Vec<VirtAddr> = g
+                    .swap_pages
+                    .range(lo..hi)
+                    .filter_map(|(&va, state)| {
+                        matches!(state, SwapPageState::Swapped).then_some(VirtAddr::new(va))
+                    })
+                    .collect();
+                // SAFETY: stable same-root swap records are pinned by the
+                // region lock; MADV_DONTNEED intentionally discards contents.
+                discarded_swap =
+                    unsafe { crate::swap::take_swap_entries(self.root, &swapped_pages) }
+                        .map_err(|_| AddressSpaceError::NotImplemented)?;
+                for va in swapped_pages {
+                    g.swap_pages.remove(&va.as_u64());
+                }
+            }
             g.for_each_overlapping_mut(lo, hi, |r| {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
@@ -3578,6 +4019,8 @@ impl AddressSpace {
         if !touched {
             return Err(AddressSpaceError::Unmapped);
         }
+        #[cfg(target_arch = "x86_64")]
+        crate::swap::swap_discard_batch(&discarded_swap);
         // ONE cross-CPU invalidation over the advised span BEFORE any
         // frame is freed for reuse (no-op unless CLONE_VM-shared).
         if !to_release.is_empty() {
@@ -4025,6 +4468,11 @@ impl AddressSpace {
         // Snapshot the resulting region list to clone into the child.
         let parent_regions: Vec<Region> = {
             let mut g = self.regions.lock();
+            if !g.swap_pages.is_empty() {
+                // Swap slots are single-owner today. Cloning phys=0 would
+                // silently replace preserved contents with demand-zero.
+                return Err(AddressSpaceError::NotImplemented);
+            }
             for r in g.iter_mut() {
                 // MAP_SHARED regions (POSIX shm AND borrowed device
                 // frames — framebuffers, DRM dumb buffers) are genuinely
@@ -4973,6 +5421,24 @@ impl Drop for AddressSpace {
         // through &mut self below; the list is about to be
         // dropped anyway.
         let regions = core::mem::take(&mut *self.regions.lock());
+        #[cfg(target_arch = "x86_64")]
+        let swapped_pages: Vec<VirtAddr> = regions
+            .swap_pages
+            .iter()
+            .map(|(&va, state)| {
+                assert_eq!(
+                    *state,
+                    SwapPageState::Swapped,
+                    "address space dropped during a swap ownership transition"
+                );
+                VirtAddr::new(va)
+            })
+            .collect();
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: Drop has exclusive ownership of this live root and all
+        // records above are stable Swapped entries.
+        let swapped_entries = unsafe { crate::swap::take_swap_entries(self.root, &swapped_pages) }
+            .expect("stable swapped page lost its swap PTE before drop");
         for r in regions.iter() {
             // SAFETY: see unmap_region_pages — same identity-map
             // contract; no CPU is using self.root at this point
@@ -4980,6 +5446,8 @@ impl Drop for AddressSpace {
             // SAFETY: Valid memory or trusted environment
             unsafe { self.unmap_region_pages(r) };
         }
+        #[cfg(target_arch = "x86_64")]
+        crate::swap::swap_discard_batch(&swapped_entries);
         // Now reclaim the page-table pages themselves. The
         // sentinel root == 0 means an `empty()` AS that never
         // got a real page-table allocation; nothing to free.

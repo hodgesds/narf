@@ -7,11 +7,13 @@
 //!
 //! Reservation policy (see `memory/specification/heap-migration.md`
 //! §3.1.2 / §4.6): at boot, `reserve_from_regions()` walks the
-//! usable memory map and carves leading naturally-aligned 1 GiB
-//! and 2 MiB chunks out of each region, up to the cmdline-bounded
-//! targets. Whatever leading misalignment + tail remains is
-//! handed to the buddy via the normal `init_from_map` path,
-//! reported as a list of byte-range excludes.
+//! usable memory map and carves naturally-aligned 1 GiB and 2 MiB
+//! chunks out of each region, up to the cmdline-bounded targets.
+//! Caller-protected ranges (most importantly the loaded kernel image)
+//! and the architecture-reserved low-memory window are skipped. Whatever
+//! leading misalignment + protected holes + tail remains is handed to the
+//! buddy via the normal `init_from_map` path, reported as a list of
+//! byte-range excludes.
 //!
 //! Hugepage allocations DO NOT fall back to coalescing buddy
 //! blocks. If the boot reservation didn't capture enough,
@@ -94,37 +96,59 @@ pub enum HugeAllocError {
 }
 
 struct HugePool {
-    free_2m: Vec<u64>,
-    free_1g: Vec<u64>,
+    /// Free pages are partitioned by physical NUMA node. Strict-node
+    /// allocation is therefore one stack pop instead of a reverse scan over
+    /// every reserved huge page (and one SRAT lookup per candidate).
+    free_2m: [Vec<u64>; MAX_NUMA_NODES],
+    free_1g: [Vec<u64>; MAX_NUMA_NODES],
+    /// Per-node reservation totals include allocated pages. Besides
+    /// diagnostics, these let a later reservation pre-grow each stack for all
+    /// outstanding frames so `free_hugepage` never reallocates while holding
+    /// `POOL`.
+    reserved_2m_by_node: [usize; MAX_NUMA_NODES],
+    reserved_1g_by_node: [usize; MAX_NUMA_NODES],
     reserved_2m: usize,
     reserved_1g: usize,
 }
 
 impl HugePool {
     const fn new() -> Self {
+        const NEW_VEC: Vec<u64> = Vec::new();
         Self {
-            free_2m: Vec::new(),
-            free_1g: Vec::new(),
+            free_2m: [NEW_VEC; MAX_NUMA_NODES],
+            free_1g: [NEW_VEC; MAX_NUMA_NODES],
+            reserved_2m_by_node: [0; MAX_NUMA_NODES],
+            reserved_1g_by_node: [0; MAX_NUMA_NODES],
             reserved_2m: 0,
             reserved_1g: 0,
+        }
+    }
+
+    #[inline]
+    fn free_mut(&mut self, size: HugeSize, node: usize) -> &mut Vec<u64> {
+        match size {
+            HugeSize::M2 => &mut self.free_2m[node],
+            HugeSize::G1 => &mut self.free_1g[node],
         }
     }
 }
 
 static POOL: IrqSafeSpinLock<HugePool> = IrqSafeSpinLock::new(HugePool::new());
 
-/// Carve naturally-aligned hugepages out of `usable` regions, up
-/// to the requested counts, and stash them in the pool. Returns
-/// the byte-range excludes that the buddy must skip when it
-/// donates the same regions.
+/// Carve naturally-aligned hugepages out of `usable` regions, up to the
+/// requested counts, and stash them in the pool. `protected` contains
+/// half-open byte ranges which may be inside otherwise-usable memory but must
+/// never enter either allocator, such as the loaded kernel image. Returns the
+/// byte-range excludes that the buddy must skip when it donates the same
+/// regions.
 ///
 /// Algorithm (per region, processed in order):
 ///   1. Skip head bytes until 1 GiB-aligned. While we still want
-///      1 GiB pages and the region has ≥ 1 GiB remaining, claim
-///      a 1 GiB chunk and advance.
+///      1 GiB pages and the region has ≥ 1 GiB remaining, skip any
+///      candidate intersecting `protected`, otherwise claim it and advance.
 ///   2. Then, while we still want 2 MiB pages and the region has
-///      ≥ 2 MiB remaining (with 2 MiB-aligned cursor), claim a
-///      2 MiB chunk and advance.
+///      ≥ 2 MiB remaining (with 2 MiB-aligned cursor), apply the same
+///      protected-range check, claim a 2 MiB chunk, and advance.
 ///   3. The leading misalignment + trailing remainder stay with
 ///      the region; the buddy will pick those up.
 ///
@@ -134,34 +158,45 @@ static POOL: IrqSafeSpinLock<HugePool> = IrqSafeSpinLock::new(HugePool::new());
 /// Idempotency: this is a one-shot boot call. Calling twice
 /// would push duplicate phys addresses into the pool and is a
 /// caller bug.
-pub fn reserve_from_regions(
+///
+/// # Safety
+///
+/// Every unprotected byte in `usable` must be real, kernel-reachable RAM which
+/// is not owned by firmware, the loaded kernel, boot metadata, or another
+/// allocator. The caller must include every live subrange in `protected` and
+/// call this exactly once before the buddy allocator accepts the same regions.
+pub unsafe fn reserve_from_regions(
     usable: &[UsableRegion],
+    protected: &[(u64, u64)],
     want_2m: usize,
     want_1g: usize,
 ) -> Vec<(u64, u64)> {
     let mut excludes: Vec<(u64, u64)> = Vec::new();
-    let mut pool = POOL.lock();
-    let cap_2m = pool.free_2m.capacity();
-    let cap_1g = pool.free_1g.capacity();
-    pool.free_2m.reserve_exact(want_2m.saturating_sub(cap_2m));
-    pool.free_1g.reserve_exact(want_1g.saturating_sub(cap_1g));
+    let mut claims: Vec<(u64, HugeSize, usize)> = Vec::new();
+    claims.reserve_exact(want_2m.saturating_add(want_1g));
     let mut left_2m = want_2m;
     let mut left_1g = want_1g;
 
     for r in usable {
         let region_start = r.start.raw();
-        let region_end = region_start + r.len;
-        let mut cursor = region_start;
+        let Some(region_end) = region_start.checked_add(r.len) else {
+            continue;
+        };
+        // Keep the same low-memory reservation policy as the buddy. Without
+        // this, a bootloader map which calls 0..1 MiB usable could let the
+        // huge pool capture the BIOS data area or SMP trampoline.
+        let mut cursor = region_start.max(frame::LOW_RESERVED_BYTES);
 
         // Phase 1: claim 1 GiB chunks while available + wanted.
         while left_1g > 0 {
-            let aligned = (cursor + HUGEPAGE_1G_BYTES - 1) & !(HUGEPAGE_1G_BYTES - 1);
-            let chunk_end = aligned + HUGEPAGE_1G_BYTES;
-            if chunk_end > region_end {
+            let Some(aligned) = next_unprotected(cursor, region_end, HUGEPAGE_1G_BYTES, protected)
+            else {
                 break;
-            }
-            pool.free_1g.push(aligned);
-            pool.reserved_1g += 1;
+            };
+            let chunk_end = aligned + HUGEPAGE_1G_BYTES;
+            // SAFETY: `aligned` lies within a caller-supplied usable region.
+            let node = unsafe { frame::narf_phys_node(aligned) }.min(MAX_NUMA_NODES - 1);
+            claims.push((aligned, HugeSize::G1, node));
             excludes.push((aligned, chunk_end));
             cursor = chunk_end;
             left_1g -= 1;
@@ -169,13 +204,14 @@ pub fn reserve_from_regions(
 
         // Phase 2: claim 2 MiB chunks while available + wanted.
         while left_2m > 0 {
-            let aligned = (cursor + HUGEPAGE_2M_BYTES - 1) & !(HUGEPAGE_2M_BYTES - 1);
-            let chunk_end = aligned + HUGEPAGE_2M_BYTES;
-            if chunk_end > region_end {
+            let Some(aligned) = next_unprotected(cursor, region_end, HUGEPAGE_2M_BYTES, protected)
+            else {
                 break;
-            }
-            pool.free_2m.push(aligned);
-            pool.reserved_2m += 1;
+            };
+            let chunk_end = aligned + HUGEPAGE_2M_BYTES;
+            // SAFETY: `aligned` lies within a caller-supplied usable region.
+            let node = unsafe { frame::narf_phys_node(aligned) }.min(MAX_NUMA_NODES - 1);
+            claims.push((aligned, HugeSize::M2, node));
             excludes.push((aligned, chunk_end));
             cursor = chunk_end;
             left_2m -= 1;
@@ -185,7 +221,63 @@ pub fn reserve_from_regions(
             break;
         }
     }
+
+    let mut added_2m = [0usize; MAX_NUMA_NODES];
+    let mut added_1g = [0usize; MAX_NUMA_NODES];
+    for &(_, size, node) in &claims {
+        match size {
+            HugeSize::M2 => added_2m[node] += 1,
+            HugeSize::G1 => added_1g[node] += 1,
+        }
+    }
+
+    let mut pool = POOL.lock();
+    for node in 0..MAX_NUMA_NODES {
+        let target_2m = pool.reserved_2m_by_node[node].saturating_add(added_2m[node]);
+        let target_1g = pool.reserved_1g_by_node[node].saturating_add(added_1g[node]);
+        let len_2m = pool.free_2m[node].len();
+        let len_1g = pool.free_1g[node].len();
+        pool.free_2m[node].reserve_exact(target_2m.saturating_sub(len_2m));
+        pool.free_1g[node].reserve_exact(target_1g.saturating_sub(len_1g));
+        pool.reserved_2m_by_node[node] = target_2m;
+        pool.reserved_1g_by_node[node] = target_1g;
+    }
+    for (phys, size, node) in claims {
+        pool.free_mut(size, node).push(phys);
+        match size {
+            HugeSize::M2 => pool.reserved_2m += 1,
+            HugeSize::G1 => pool.reserved_1g += 1,
+        }
+    }
     excludes
+}
+
+/// Find the first naturally aligned `size` chunk at or after `cursor` which
+/// fits below `region_end` and does not intersect a protected range.
+fn next_unprotected(
+    mut cursor: u64,
+    region_end: u64,
+    size: u64,
+    protected: &[(u64, u64)],
+) -> Option<u64> {
+    debug_assert!(size.is_power_of_two());
+    loop {
+        let aligned = cursor.checked_add(size - 1)? & !(size - 1);
+        let chunk_end = aligned.checked_add(size)?;
+        if chunk_end > region_end {
+            return None;
+        }
+        let overlap_end = protected
+            .iter()
+            .filter(|&&(lo, hi)| lo < chunk_end && aligned < hi)
+            .map(|&(_, hi)| hi)
+            .max();
+        match overlap_end {
+            Some(end) if end > cursor => cursor = end,
+            Some(_) => cursor = chunk_end,
+            None => return Some(aligned),
+        }
+    }
 }
 
 /// Allocate one 2 MiB hugepage from the boot-reserved pool.
@@ -221,6 +313,66 @@ pub fn alloc_hugepage_with(
     policy: Mempolicy,
     local: usize,
 ) -> Result<HugeFrame, HugeAllocError> {
+    let plan = plan_policy(policy, local)?;
+    let mut pool = POOL.lock();
+    let (frame, node) = alloc_from_pool(&mut pool, size, &plan)?;
+    drop(pool);
+    account_policy_allocation(&plan, node, frame.size_bytes() >> 12);
+    Ok(frame)
+}
+
+/// Allocate a complete hugepage vector under precomputed NUMA policies.
+///
+/// The operation takes the pool lock once and is all-or-nothing: exhaustion
+/// returns every frame popped by this call before exposing an error. Callers
+/// can therefore build a multi-leaf mapping without lock/unlock and policy
+/// ordering work once per leaf or a partial-allocation cleanup path.
+pub fn alloc_hugepages_with(
+    size: HugeSize,
+    policies: &[Mempolicy],
+    local: usize,
+) -> Result<Vec<HugeFrame>, HugeAllocError> {
+    let mut plans = Vec::with_capacity(policies.len());
+    for &policy in policies {
+        plans.push(plan_policy(policy, local)?);
+    }
+    let mut frames: Vec<HugeFrame> = Vec::with_capacity(plans.len());
+
+    let mut pool = POOL.lock();
+    for plan in &mut plans {
+        let Some((frame, node)) = alloc_from_pool(&mut pool, size, plan).ok() else {
+            // Each pop created at least one free slot in its original node
+            // stack, so rollback cannot grow a vector under the pool lock.
+            for (frame, completed) in frames.drain(..).zip(plans.iter()) {
+                pool.free_mut(size, completed.selected_node)
+                    .push(frame.phys);
+            }
+            return Err(HugeAllocError::Empty);
+        };
+        plan.selected_node = node;
+        frames.push(frame);
+    }
+    drop(pool);
+
+    let pages = match size {
+        HugeSize::M2 => HUGEPAGE_2M_BYTES >> 12,
+        HugeSize::G1 => HUGEPAGE_1G_BYTES >> 12,
+    };
+    for plan in &plans {
+        account_policy_allocation(plan, plan.selected_node, pages);
+    }
+    Ok(frames)
+}
+
+struct HugePolicyPlan {
+    order: [usize; MAX_NUMA_NODES],
+    count: usize,
+    preferred: usize,
+    interleave: bool,
+    selected_node: usize,
+}
+
+fn plan_policy(policy: Mempolicy, local: usize) -> Result<HugePolicyPlan, HugeAllocError> {
     let all_nodes = (1u64 << MAX_NUMA_NODES) - 1;
     let allowed = policy.allowed & all_nodes;
     if allowed == 0 {
@@ -274,19 +426,33 @@ pub fn alloc_hugepage_with(
     if let Some(pos) = order[..count].iter().position(|&node| node == preferred) {
         order[..count].swap(0, pos);
     }
-    for &node in &order[..count] {
-        if let Ok(allocated) = alloc_hugepage_on(size, node) {
-            let pages = allocated.size_bytes() >> 12;
-            frame::account_numa_allocation(preferred, node, pages);
-            if matches!(policy.mode, MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE)
-                && node == preferred
-            {
-                frame::account_interleave_hit(node, pages);
-            }
-            return Ok(allocated);
+    Ok(HugePolicyPlan {
+        order,
+        count,
+        preferred,
+        interleave: matches!(policy.mode, MPOL_INTERLEAVE | MPOL_WEIGHTED_INTERLEAVE),
+        selected_node: MAX_NUMA_NODES,
+    })
+}
+
+fn alloc_from_pool(
+    pool: &mut HugePool,
+    size: HugeSize,
+    plan: &HugePolicyPlan,
+) -> Result<(HugeFrame, usize), HugeAllocError> {
+    for &node in &plan.order[..plan.count] {
+        if let Some(phys) = pool.free_mut(size, node).pop() {
+            return Ok((HugeFrame { phys, size }, node));
         }
     }
     Err(HugeAllocError::Empty)
+}
+
+fn account_policy_allocation(plan: &HugePolicyPlan, node: usize, pages: u64) {
+    frame::account_numa_allocation(plan.preferred, node, pages);
+    if plan.interleave && node == plan.preferred {
+        frame::account_interleave_hit(node, pages);
+    }
 }
 
 fn alloc_hugepage_local(size: HugeSize) -> Result<HugeFrame, HugeAllocError> {
@@ -317,28 +483,19 @@ pub(crate) fn alloc_hugepage_on(size: HugeSize, node: usize) -> Result<HugeFrame
         return Err(HugeAllocError::Empty);
     }
     let mut pool = POOL.lock();
-    let free = match size {
-        HugeSize::M2 => &mut pool.free_2m,
-        HugeSize::G1 => &mut pool.free_1g,
-    };
-    let Some(index) = free.iter().rposition(|&phys| {
-        // SAFETY: every pool entry was carved from a usable region.
-        unsafe { frame::narf_phys_node(phys) == node }
-    }) else {
-        return Err(HugeAllocError::Empty);
-    };
-    let phys = free.swap_remove(index);
+    let phys = pool
+        .free_mut(size, node)
+        .pop()
+        .ok_or(HugeAllocError::Empty)?;
     Ok(HugeFrame { phys, size })
 }
 
 /// Return a hugepage to the pool. Caller asserts the frame came
 /// from a prior `alloc_hugepage_*` of the matching size.
 pub fn free_hugepage(frame: HugeFrame) {
+    let node = frame.node().min(MAX_NUMA_NODES - 1);
     let mut pool = POOL.lock();
-    match frame.size {
-        HugeSize::M2 => pool.free_2m.push(frame.phys),
-        HugeSize::G1 => pool.free_1g.push(frame.phys),
-    }
+    pool.free_mut(frame.size, node).push(frame.phys);
 }
 
 /// Snapshot of pool state for diagnostics + tests.
@@ -363,8 +520,8 @@ pub fn stats() -> HugeStats {
     HugeStats {
         reserved_2m: pool.reserved_2m,
         reserved_1g: pool.reserved_1g,
-        free_2m: pool.free_2m.len(),
-        free_1g: pool.free_1g.len(),
+        free_2m: pool.free_2m.iter().map(Vec::len).sum(),
+        free_1g: pool.free_1g.iter().map(Vec::len).sum(),
     }
 }
 
@@ -378,21 +535,7 @@ pub fn node_stats(node: usize) -> HugeNodeStats {
     }
     let pool = POOL.lock();
     HugeNodeStats {
-        free_2m: pool
-            .free_2m
-            .iter()
-            .filter(|&&phys| {
-                // SAFETY: every pool entry was carved from usable memory.
-                unsafe { frame::narf_phys_node(phys) == node }
-            })
-            .count(),
-        free_1g: pool
-            .free_1g
-            .iter()
-            .filter(|&&phys| {
-                // SAFETY: every pool entry was carved from usable memory.
-                unsafe { frame::narf_phys_node(phys) == node }
-            })
-            .count(),
+        free_2m: pool.free_2m[node].len(),
+        free_1g: pool.free_1g[node].len(),
     }
 }

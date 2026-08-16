@@ -1132,14 +1132,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // region) is donated to the buddy via init_from_map.
             let want_2m = parse_cmdline_count(narf_boot::cmdline(), "hugepages_2m");
             let want_1g = parse_cmdline_count(narf_boot::cmdline(), "hugepages_1g");
+            let kernel_exclude = [(kstart, kend)];
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
-                narf_memory::hugepage::reserve_from_regions(&regions, want_2m, want_1g)
+                // SAFETY: `regions` is the bootloader's usable-RAM map, the
+                // loaded kernel is explicitly protected, and this one-shot
+                // call runs before `init_from_map` donates the same RAM to the
+                // buddy. Firmware and boot metadata are non-usable map entries.
+                unsafe {
+                    narf_memory::hugepage::reserve_from_regions(
+                        &regions,
+                        &kernel_exclude,
+                        want_2m,
+                        want_1g,
+                    )
+                }
             } else {
                 alloc::vec::Vec::new()
             };
             let mut excludes: alloc::vec::Vec<(u64, u64)> =
                 alloc::vec::Vec::with_capacity(1 + huge_excludes.len());
-            excludes.push((kstart, kend));
+            excludes.extend_from_slice(&kernel_exclude);
             excludes.extend(huge_excludes.iter().copied());
 
             // KASAN: reserve a flat shadow byte-array (1 byte / 8 memory

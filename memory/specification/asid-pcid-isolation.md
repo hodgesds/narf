@@ -183,12 +183,20 @@ pub struct ShootdownRequest {
 }
 
 pub fn shootdown(req: ShootdownRequest);
+pub fn shootdown_range(tag: u16, va: u64, pages: u64);
+pub fn shootdown_target_mask(req: ShootdownRequest) -> u64;
+pub fn set_ipi_fanout(
+    fanout: fn(req: ShootdownRequest, target_cpus: u64),
+);
 pub fn shootdown_count() -> u64;     // per-CPU counter
 ```
 
-Stage cut: implement the API + the local-CPU path; the IPI fan-out
-becomes real when SMP bring-up wires APs (currently NARF runs
-single-CPU, so `shootdown` reduces to local invalidation).
+`shootdown` applies the invalidation locally, intersects the online-peer
+mask with conservative per-CPU tag residency and the non-idle mask, then
+passes that exact mask to the interrupt bridge. The bridge must publish,
+IPI, and await exactly those CPUs; it must not broaden the request back to
+an all-peer broadcast. `shootdown_range` represents a contiguous run as one
+request and therefore one remote rendezvous.
 
 ## 5. Test surface
 
@@ -200,12 +208,10 @@ single-CPU, so `shootdown` reduces to local invalidation).
 | `invpcid_single_compiles`          | INVPCID type-1 wrapper assembles cleanly |
 | `tlbi_aside1is_compiles`           | aarch64 ASIDE1IS wrapper assembles cleanly |
 | `shootdown_local_only_when_up`     | shootdown() on UP exits without panic |
+| `tlb_shootdown_target_mask_excludes_unselected_peer` | only selected peer ACKs a targeted request |
 
 ## 6. Out of scope (v0.1)
 
-- Eager TLB shootdown across SMP (peer-IPI fan-out is no-op
-  until APs are wired in `frame/`).
-- Per-VA shootdown range coalescing.
 - `INVLPGB` / `INVLPGA` (AMD / nested-virt invalidation
   instructions).
 - Hardware-assisted shootdown (Intel "Linear Address Masking" /

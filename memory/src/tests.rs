@@ -3431,12 +3431,12 @@ kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
 fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     use crate::frame::UsableRegion;
     use crate::hugepage::{
-        alloc_hugepage_2m, alloc_hugepage_2m_on, free_hugepage, node_stats, reserve_from_regions,
-        stats, HugeAllocError, HUGEPAGE_2M_BYTES,
+        alloc_hugepage_2m, alloc_hugepage_2m_on, alloc_hugepages_with, free_hugepage, node_stats,
+        reserve_from_regions, stats, HugeAllocError, HugeSize, HUGEPAGE_2M_BYTES,
     };
-    use crate::PhysAddr;
+    use crate::{Mempolicy, PhysAddr, MPOL_BIND};
 
-    // Synthetic 16 MiB region aligned to 2 MiB. The phys addresses
+    // Synthetic region aligned to 2 MiB. The phys addresses
     // here are bookkeeping-only — we never touch the memory, so it
     // doesn't matter that they don't correspond to real RAM.
     // Picked far above any realistic kernel-image footprint to
@@ -3445,13 +3445,28 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     const PAGES: usize = 4;
     let region = UsableRegion {
         start: PhysAddr::new(SYNTH_BASE),
-        len: (PAGES as u64) * HUGEPAGE_2M_BYTES,
+        len: ((PAGES + 1) as u64) * HUGEPAGE_2M_BYTES,
     };
+    // Model the loaded kernel occupying one otherwise-usable huge frame.
+    // Reservation must step over it and still satisfy the requested count
+    // from the remainder of the region.
+    let protected = [(
+        SYNTH_BASE + HUGEPAGE_2M_BYTES,
+        SYNTH_BASE + 2 * HUGEPAGE_2M_BYTES,
+    )];
 
     let before = stats();
-    let excludes = reserve_from_regions(&[region], PAGES, 0);
+    // SAFETY: synthetic bookkeeping-only addresses are drained before the
+    // test returns and no returned frame is dereferenced or donated.
+    let excludes = unsafe { reserve_from_regions(&[region], &protected, PAGES, 0) };
     if excludes.len() != PAGES {
         return TestResult::Fail("reserve_from_regions returned wrong exclude count");
+    }
+    if excludes
+        .iter()
+        .any(|&(lo, hi)| lo < protected[0].1 && protected[0].0 < hi)
+    {
+        return TestResult::Fail("hugepage reservation overlapped a protected range");
     }
     // SAFETY: the exclude is a synthetic physical address used only for
     // topology lookup; the test never dereferences it.
@@ -3465,20 +3480,36 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
         return TestResult::Fail("per-node free_2m omitted reserved pages");
     }
 
-    // Drain exactly PAGES new allocations through the strict-node API.
-    let mut allocated = alloc::vec::Vec::new();
-    for _ in 0..PAGES {
-        match alloc_hugepage_2m_on(target_node) {
-            Ok(f) => {
-                if f.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
-                    return TestResult::Fail("alloc_hugepage_2m_on returned unaligned phys");
-                }
-                if f.node() != target_node {
-                    return TestResult::Fail("strict hugepage allocation returned wrong node");
-                }
-                allocated.push(f);
-            }
-            Err(_) => return TestResult::Fail("strict hugepage allocation exhausted before PAGES"),
+    let policy = Mempolicy {
+        mode: MPOL_BIND,
+        nodemask: 1u64 << target_node,
+        allowed: 1u64 << target_node,
+        home_node: target_node as u32,
+        interleave_index: 0,
+    };
+    // An oversized batch must roll every pop back before reporting failure.
+    let too_many = alloc::vec![policy; PAGES + 1];
+    let before_failed_batch = node_stats(target_node);
+    if alloc_hugepages_with(HugeSize::M2, &too_many, target_node).is_ok() {
+        return TestResult::Fail("oversized hugepage batch unexpectedly succeeded");
+    }
+    if node_stats(target_node) != before_failed_batch {
+        return TestResult::Fail("failed hugepage batch leaked a partial allocation");
+    }
+
+    // Drain exactly PAGES new allocations through one all-or-nothing pool
+    // transaction, then validate strict physical placement.
+    let policies = alloc::vec![policy; PAGES];
+    let mut allocated = match alloc_hugepages_with(HugeSize::M2, &policies, target_node) {
+        Ok(frames) => frames,
+        Err(_) => return TestResult::Fail("batched strict hugepage allocation failed"),
+    };
+    for frame in &allocated {
+        if frame.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
+            return TestResult::Fail("batched hugepage allocation returned unaligned phys");
+        }
+        if frame.node() != target_node {
+            return TestResult::Fail("batched strict hugepage allocation returned wrong node");
         }
     }
 
@@ -3533,7 +3564,9 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     };
 
     let before = stats();
-    let excludes = reserve_from_regions(&[region], 0, 1);
+    // SAFETY: synthetic bookkeeping-only address; no frame is dereferenced or
+    // donated and the reservation is drained before return.
+    let excludes = unsafe { reserve_from_regions(&[region], &[], 0, 1) };
     if excludes.len() != 1 {
         return TestResult::Fail("expected exactly one 1G exclude");
     }
@@ -3620,36 +3653,119 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
     const USER_VA: u64 = 0x0000_5000_4000_0000;
     let region = UsableRegion {
         start: PhysAddr::new(SYNTH_BASE),
-        len: HUGEPAGE_2M_BYTES,
+        len: 2 * HUGEPAGE_2M_BYTES,
     };
-    let excludes = reserve_from_regions(&[region], 1, 0);
-    if excludes.len() != 1 {
-        return TestResult::Fail("failed to reserve synthetic 2M mapping frame");
+    // SAFETY: synthetic bookkeeping-only address; no frame is dereferenced or
+    // donated and the reservation is drained before return.
+    let excludes = unsafe { reserve_from_regions(&[region], &[], 2, 0) };
+    if excludes.len() != 2 {
+        return TestResult::Fail("failed to reserve synthetic 2M mapping frames");
     }
     // SAFETY: topology lookup only; no synthetic memory is dereferenced.
     let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
     let before_map = node_stats(node);
-    let frame = match alloc_hugepage_2m_on(node) {
-        Ok(frame) => frame,
-        Err(_) => return TestResult::Fail("strict 2M allocation failed"),
-    };
-    let phys = frame.phys();
     // SAFETY: kernel test runs with paging live.
     let aspace = match unsafe { AddressSpace::new_for_user() } {
         Ok(aspace) => aspace,
+        Err(_) => return TestResult::Fail("user address-space creation failed"),
+    };
+
+    // Force a failure on the second leaf. The first leaf and both transferred
+    // frames must roll back after the one-lock x86 batch releases its guard.
+    let first = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("first strict 2M allocation failed"),
+    };
+    let second = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
         Err(_) => {
-            crate::hugepage::free_hugepage(frame);
-            return TestResult::Fail("user address-space creation failed");
+            crate::hugepage::free_hugepage(first);
+            return TestResult::Fail("second strict 2M allocation failed");
         }
     };
-    // SAFETY: the fresh AS owns a live root; frame and VA are 2M-aligned.
+    let conflict_va = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the inactive test root is exclusively owned and the synthetic
+    // zero physical base is never dereferenced.
+    let conflict = unsafe {
+        crate::x86_64::paging::map_2mb(
+            aspace.root,
+            conflict_va,
+            PhysAddr::new(0),
+            crate::x86_64::paging::PtFlags::USER,
+        )
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: same exclusive-root and never-dereferenced contract.
+    let conflict = unsafe {
+        crate::aarch64::paging::map_2mb(
+            aspace.root,
+            conflict_va,
+            PhysAddr::new(0),
+            crate::aarch64::paging::PtFlags::AP_RW_EL0,
+        )
+    };
+    if conflict.is_err() {
+        crate::hugepage::free_hugepage(first);
+        crate::hugepage::free_hugepage(second);
+        return TestResult::Fail("could not install second-leaf conflict");
+    }
+    // SAFETY: the fresh AS owns a live root; frames and VA are 2M-aligned.
     if unsafe {
         aspace.map_huge_region(HugeRegion {
             base: VirtAddr::new(USER_VA),
-            len: HUGEPAGE_2M_BYTES,
+            len: 2 * HUGEPAGE_2M_BYTES,
             perms: RegionPerms::READ | RegionPerms::WRITE,
             size: crate::hugepage::HugeSize::M2,
-            frames: alloc::vec![frame],
+            frames: alloc::vec![first, second],
+        })
+    }
+    .is_ok()
+    {
+        return TestResult::Fail("conflicting multi-leaf huge mapping succeeded");
+    }
+    #[cfg(target_arch = "x86_64")]
+    let rolled_back =
+        // SAFETY: the first leaf must have been removed from this owned root.
+        unsafe { crate::x86_64::paging::translate(aspace.root, VirtAddr::new(USER_VA)) };
+    #[cfg(target_arch = "aarch64")]
+    let rolled_back =
+        // SAFETY: the first leaf must have been removed from this owned root.
+        unsafe { crate::aarch64::paging::translate(aspace.root, VirtAddr::new(USER_VA)) };
+    if rolled_back.is_some() {
+        return TestResult::Fail("failed huge batch left its first leaf mapped");
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: removes the test-owned structural conflict.
+    let conflict_removed = unsafe { crate::x86_64::paging::unmap_2mb(aspace.root, conflict_va) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: removes the test-owned structural conflict.
+    let conflict_removed = unsafe { crate::aarch64::paging::unmap_2mb(aspace.root, conflict_va) };
+    if conflict_removed.is_err() || node_stats(node).free_2m != before_map.free_2m {
+        return TestResult::Fail("failed huge batch did not restore pool ownership");
+    }
+
+    let first = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("first post-rollback allocation failed"),
+    };
+    let second = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => {
+            crate::hugepage::free_hugepage(first);
+            return TestResult::Fail("second post-rollback allocation failed");
+        }
+    };
+    let first_phys = first.phys();
+    let second_phys = second.phys();
+    // SAFETY: the AS owns a live root; frames and VA are 2M-aligned.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: 2 * HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: crate::hugepage::HugeSize::M2,
+            frames: alloc::vec![first, second],
         })
     }
     .is_err()
@@ -3663,8 +3779,18 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
     let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
-    if translated.map(PhysAddr::raw) != Some(phys + 0x1f000) {
+    if translated.map(PhysAddr::raw) != Some(first_phys + 0x1f000) {
         return TestResult::Fail("huge-leaf translation lost its block offset");
+    }
+    let second_probe = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES + 0x17000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let second_translated = unsafe { crate::x86_64::paging::translate(aspace.root, second_probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let second_translated = unsafe { crate::aarch64::paging::translate(aspace.root, second_probe) };
+    if second_translated.map(PhysAddr::raw) != Some(second_phys + 0x17000) {
+        return TestResult::Fail("second huge leaf translated to the wrong frame");
     }
     if aspace.mapped_page_size(probe) != Some(HUGEPAGE_2M_BYTES) {
         return TestResult::Fail("2M mapping reported the wrong leaf size");
@@ -3676,6 +3802,7 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
         return TestResult::Fail("huge frame did not return to its NUMA pool");
     }
     // Drain the synthetic reservation so sibling tests see their entry state.
+    let _ = alloc_hugepage_2m_on(node);
     let _ = alloc_hugepage_2m_on(node);
     TestResult::Pass
 }
@@ -4566,6 +4693,223 @@ fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_demand_alloc_installs_pte);
+
+/// Live AddressSpace swap must move ownership with the PTE transition: two
+/// pages fault back through `demand_alloc_page`, while teardown discards the
+/// remaining swap slot without treating its zero `Region::phys` entry as an
+/// anonymous demand-zero page or double-freeing the old frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
+    use crate::reclaim::{plan_reclaim_ranges, ReclaimRangeCandidate};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr, ZramBackend};
+
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Skip("another swap lifecycle is active");
+    }
+    crate::install_swap_backend(ZramBackend::new());
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 3;
+    let base = VirtAddr::new(0x0000_0080_0008_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for index in 0..N {
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let address = frame.start_address();
+        // SAFETY: the fresh frame is exclusively owned by the new region.
+        unsafe {
+            core::ptr::write_bytes(address.kernel_mut_ptr::<u8>(), 0x91 + index as u8, 4096);
+        }
+        phys.push(address);
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("swap lifecycle setup failed");
+    }
+    // SAFETY: `aspace` owns a live root and the validated private region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("swap lifecycle setup failed");
+    }
+
+    let plan = plan_reclaim_ranges(
+        &[ReclaimRangeCandidate {
+            address_space_root: aspace.root,
+            base,
+            pages: N,
+            mapcount: 1,
+            expected_free_pages: N,
+            age: 0,
+            locked: false,
+        }],
+        N,
+        N,
+    );
+    // SAFETY: test owns this live address space and its private resident run.
+    let report = unsafe { aspace.swap_out_reclaim_plan(&plan) };
+    if report.error.is_some() || report.swapped_pages != N || report.submissions != 1 {
+        return TestResult::Fail("AddressSpace batch page-out failed");
+    }
+    let snapshot = aspace.regions_snapshot();
+    if snapshot.len() != 1 || snapshot[0].phys.iter().any(|entry| entry.raw() != 0) {
+        return TestResult::Fail("page-out did not transfer Region ownership");
+    }
+    if crate::swap_stats().resident != N as u64 {
+        return TestResult::Fail("batch page-out did not charge every slot");
+    }
+
+    // Fault the middle page: the first-class batch-in path restores it and
+    // the consecutive page ahead, leaving page zero swapped for teardown.
+    // SAFETY: same live-root/fault-path contract as a real user #PF.
+    if unsafe { aspace.demand_alloc_page(VirtAddr::new(base.as_u64() + 4096)) }.is_err() {
+        return TestResult::Fail("swap fault-in failed");
+    }
+    let after_fault = aspace.regions_snapshot();
+    if after_fault[0].phys[0].raw() != 0 {
+        return TestResult::Fail("batch-in unexpectedly pulled a page behind the fault");
+    }
+    for index in 1..N {
+        let restored = after_fault[0].phys[index];
+        if restored.raw() == 0 {
+            return TestResult::Fail("fault-in did not republish Region backing");
+        }
+        // SAFETY: restored is resident and region-owned until teardown.
+        if unsafe { core::ptr::read_volatile(restored.kernel_ptr::<u8>()) } != 0x91 + index as u8 {
+            return TestResult::Fail("fault-in content mismatch");
+        }
+    }
+    if crate::swap_stats().resident != 1 {
+        return TestResult::Fail("batched page-in slot accounting is wrong");
+    }
+
+    if aspace.unmap_region(base).is_err() {
+        return TestResult::Fail("mixed resident/swapped teardown failed");
+    }
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Fail("teardown leaked the unfaulted swap slot");
+    }
+
+    // mlock must preserve swapped contents by paging them in before setting
+    // LOCKED; treating Region::phys==0 as anonymous would silently zero data.
+    let lock_base = VirtAddr::new(base.as_u64() + 0x20_0000);
+    let mut lock_phys = alloc::vec::Vec::new();
+    for pattern in [0xa1u8, 0xa2] {
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), pattern, 4096) };
+        lock_phys.push(frame);
+    }
+    if aspace
+        .map_region(Region {
+            base: lock_base,
+            len: 8192,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: lock_phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mlock swap setup map failed");
+    }
+    // SAFETY: live test root.
+    if unsafe { aspace.materialize_range(lock_base, 8192) }.is_err() {
+        return TestResult::Fail("mlock swap setup materialize failed");
+    }
+    // SAFETY: private two-page run owned by the test AS.
+    if unsafe { aspace.swap_out_private_batch(lock_base, 2) } != Ok(2)
+        || aspace.mlock_range(lock_base, 8192).is_err()
+    {
+        return TestResult::Fail("mlock did not restore swapped contents");
+    }
+    let locked = aspace
+        .regions_snapshot()
+        .into_iter()
+        .find(|region| region.base == lock_base)
+        .expect("locked region missing");
+    if !locked.perms.contains(RegionPerms::LOCKED) || locked.phys.iter().any(|phys| phys.raw() == 0)
+    {
+        return TestResult::Fail("mlock left swapped backing or failed to pin");
+    }
+    for (index, pattern) in [0xa1u8, 0xa2].into_iter().enumerate() {
+        // SAFETY: mlock made the complete region resident.
+        if unsafe { core::ptr::read_volatile(locked.phys[index].kernel_ptr::<u8>()) } != pattern {
+            return TestResult::Fail("mlock replaced swap data with zero-fill");
+        }
+    }
+    if crate::swap_stats().resident != 0 || aspace.unmap_region(lock_base).is_err() {
+        return TestResult::Fail("mlock swap cleanup failed");
+    }
+
+    #[cfg(feature = "linux-compat")]
+    {
+        // MADV_DONTNEED has the opposite contract: retire the stable swap
+        // entry so the next touch is anonymous zero-fill.
+        let discard_base = VirtAddr::new(base.as_u64() + 0x40_0000);
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0xd7, 4096) };
+        if aspace
+            .map_region(Region {
+                base: discard_base,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![frame],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("madvise swap setup map failed");
+        }
+        // SAFETY: live test root and private mapping.
+        if unsafe { aspace.materialize_range(discard_base, 4096) }.is_err() {
+            return TestResult::Fail("MADV_DONTNEED swap discard failed");
+        }
+        // SAFETY: the test AS exclusively owns this private resident page.
+        if unsafe { aspace.swap_out_private_batch(discard_base, 1) } != Ok(1)
+            || aspace.madvise_dontneed(discard_base, 4096).is_err()
+        {
+            return TestResult::Fail("MADV_DONTNEED swap discard failed");
+        }
+        if crate::swap_stats().resident != 0 {
+            return TestResult::Fail("MADV_DONTNEED leaked a swap slot");
+        }
+        // SAFETY: normal anonymous demand fault after slot retirement.
+        if unsafe { aspace.demand_alloc_page(discard_base) }.is_err() {
+            return TestResult::Fail("post-madvise zero fault failed");
+        }
+        let zero = aspace
+            .regions_snapshot()
+            .into_iter()
+            .find(|region| region.base == discard_base)
+            .expect("madvise region missing")
+            .phys[0];
+        // SAFETY: demand fault made this region-owned frame resident.
+        if unsafe { core::ptr::read_volatile(zero.kernel_ptr::<u8>()) } != 0 {
+            return TestResult::Fail("MADV_DONTNEED preserved discarded swap data");
+        }
+        if aspace.unmap_region(discard_base).is_err() {
+            return TestResult::Fail("madvise swap cleanup failed");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_address_space_batched_swap_lifecycle);
 
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the

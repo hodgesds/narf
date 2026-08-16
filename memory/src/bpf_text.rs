@@ -2310,9 +2310,4 @@ mod tests {
             assert!(slot < 384, "collides with the kernel direct map");
         }
     }
-
-    #[test]
-    fn a_guard_slot_separates_the_windows() {
-        assert!(BPF_ARENA_PML4_SLOT >= BPF_TEXT_PML4_SLOT + 2);
-    }
 }

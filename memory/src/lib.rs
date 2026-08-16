@@ -188,8 +188,12 @@ pub use pager::{
 };
 pub use swap::{
     backend_name as swap_backend_name, install_backend as install_swap_backend,
-    set_swap_batch_pages, swap_batch_pages, swap_discard, swap_stats, SwapBackend, SwapError,
-    SwapPte, SwapStats, ZramBackend, SWAP_BATCH_PAGES_DEFAULT, SWAP_BATCH_PAGES_MAX,
+    set_swap_batch_pages, swap_batch_pages, swap_discard, swap_discard_batch, swap_stats,
+    SwapBackend, SwapError, SwapPte, SwapStats, ZramBackend, SWAP_BATCH_PAGES_DEFAULT,
+    SWAP_BATCH_PAGES_MAX,
 };
 #[cfg(target_arch = "x86_64")]
-pub use swap::{swap_in_pte, swap_out_batch, SwapVictim};
+pub use swap::{
+    swap_in_batch, swap_in_pte, swap_out_batch, swap_out_plan, SwapBatchReport, SwapInRequest,
+    SwapVictim,
+};

@@ -119,7 +119,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             home_node: stored.home_node,
             interleave_index: 0,
         };
-        let mut frames = alloc::vec::Vec::with_capacity((len / page_size) as usize);
+        let count = (len / page_size) as usize;
+        let mut policies = alloc::vec::Vec::with_capacity(count);
         for _ in 0..(len / page_size) {
             if matches!(
                 policy.mode,
@@ -127,26 +128,25 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             ) {
                 policy.interleave_index = task_interleave_index(task, true);
             }
-            let frame = match narf_memory::hugepage::alloc_hugepage_with(
-                size,
-                policy,
-                narf_memory::frame::local_node(),
-            ) {
-                Ok(frame) => frame,
-                Err(_) => {
-                    for frame in frames {
-                        narf_memory::hugepage::free_hugepage(frame);
-                    }
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-                    return;
-                }
-            };
+            policies.push(policy);
+        }
+        let frames = match narf_memory::hugepage::alloc_hugepages_with(
+            size,
+            &policies,
+            narf_memory::frame::local_node(),
+        ) {
+            Ok(frames) => frames,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                return;
+            }
+        };
+        for frame in &frames {
             // SAFETY: a newly allocated huge frame is exclusively owned and
             // identity-reachable under the kernel's direct mapping.
             unsafe {
                 core::ptr::write_bytes(frame.phys() as *mut u8, 0, frame.size_bytes() as usize);
             }
-            frames.push(frame);
         }
         // SAFETY: `as_ref` is the caller's live root; frames are owned and
         // aligned for the selected hardware leaf size.

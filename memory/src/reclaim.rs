@@ -97,7 +97,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::PhysAddr;
+use crate::{PhysAddr, VirtAddr};
 
 // ── Free-memory watermarks (Linux-shaped) ──────────────────────────
 //
@@ -200,6 +200,197 @@ pub fn reclaim_goal_pages() -> usize {
         return 0;
     }
     high.saturating_sub(crate::frame_stats().free as u64) as usize
+}
+
+// ── PSS-sized range reclaim planning ──────────────────────────────────────
+
+/// Fixed-point units in one resident page of proportional-set-size (PSS).
+///
+/// Integer fixed point keeps reclaim planning deterministic and usable in
+/// `no_std`: a private page contributes `PSS_UNITS_PER_PAGE`, while one alias
+/// of a page with mapcount four contributes one quarter of that value.
+pub const PSS_UNITS_PER_PAGE: u64 = 4096;
+
+/// One cold, virtually-contiguous range offered to the reclaim planner.
+///
+/// `pages` is the number of resident mappings in the run. `mapcount` is the
+/// average number of aliases per backing page and controls PSS sizing.
+/// `expected_free_pages` is deliberately separate: it is the number of
+/// physical pages reverse-map accounting predicts will actually become free
+/// if the complete range is evicted. A shared alias with other live mappings
+/// therefore has `expected_free_pages == 0`; a reverse-map group that removes
+/// every alias may report the number of unique backing pages instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimRangeCandidate {
+    /// Architecture page-table root naming the address space.
+    pub address_space_root: PhysAddr,
+    /// First page-aligned virtual address in the resident run.
+    pub base: VirtAddr,
+    /// Resident virtual pages in the contiguous run.
+    pub pages: usize,
+    /// Average mapping count of each backing page; zero is treated as one.
+    pub mapcount: u32,
+    /// Conservative physical-page yield if the entire run is evicted.
+    pub expected_free_pages: usize,
+    /// LRU age; smaller values are colder and are considered first.
+    pub age: u8,
+    /// Pinned/wired ranges are never selected.
+    pub locked: bool,
+}
+
+/// A prefix of a candidate selected for one swap/reclaim submission.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedReclaimRange {
+    pub address_space_root: PhysAddr,
+    pub base: VirtAddr,
+    pub pages: usize,
+    pub mapcount: u32,
+    pub estimated_pss_units: u64,
+    pub expected_free_pages: usize,
+}
+
+/// Result of one range-planning pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimBatchPlan {
+    /// Cold ranges in execution order, bounded by the caller's page cap.
+    pub ranges: Vec<PlannedReclaimRange>,
+    /// Watermark-derived physical-page goal supplied by the caller.
+    pub target_free_pages: usize,
+    /// PSS target corresponding to `target_free_pages`.
+    pub target_pss_units: u64,
+    /// Sum of proportional resident size selected.
+    pub selected_pss_units: u64,
+    /// Conservative number of physical pages the selection should release.
+    pub expected_free_pages: usize,
+    /// Resident mappings examined, including ineligible ranges.
+    pub scanned_pages: usize,
+}
+
+#[inline]
+fn pss_units(pages: usize, mapcount: u32) -> u64 {
+    let mappings = u64::from(mapcount.max(1));
+    let scaled = (pages as u128).saturating_mul(PSS_UNITS_PER_PAGE as u128);
+    (scaled / u128::from(mappings)).min(u128::from(u64::MAX)) as u64
+}
+
+#[inline]
+fn proportional_yield(take: usize, candidate: &ReclaimRangeCandidate) -> usize {
+    if take == candidate.pages {
+        return candidate.expected_free_pages.min(candidate.pages);
+    }
+    take.saturating_mul(candidate.expected_free_pages) / candidate.pages.max(1)
+}
+
+/// Plan a cold-range reclaim batch using PSS and a physical-yield guard.
+///
+/// Candidates are ordered by age, then by expected physical yield. The
+/// planner accumulates proportional resident size but never treats PSS as
+/// proof that memory will be released: only `expected_free_pages` advances
+/// the watermark goal. Selection stops at the physical goal, the equivalent
+/// PSS target, or `max_selected_pages`, whichever bound is reached first.
+///
+/// This function performs policy only; it does not touch page tables or issue
+/// I/O. Keeping the planner pure makes the expensive rmap/PTE scan separable
+/// from the swap transaction and straightforward to test.
+pub fn plan_reclaim_ranges(
+    candidates: &[ReclaimRangeCandidate],
+    target_free_pages: usize,
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan {
+    let target_pss_units = (target_free_pages as u128)
+        .saturating_mul(PSS_UNITS_PER_PAGE as u128)
+        .min(u128::from(u64::MAX)) as u64;
+    let mut plan = ReclaimBatchPlan {
+        target_free_pages,
+        target_pss_units,
+        ..ReclaimBatchPlan::default()
+    };
+    if target_free_pages == 0 || max_selected_pages == 0 {
+        return plan;
+    }
+
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_unstable_by(|left, right| {
+        let left = &candidates[*left];
+        let right = &candidates[*right];
+        left.age
+            .cmp(&right.age)
+            .then_with(|| {
+                // Compare yield ratios without floating point. Higher yield
+                // sorts first; u128 prevents overflow for hostile metadata.
+                let lhs =
+                    (left.expected_free_pages as u128).saturating_mul(right.pages.max(1) as u128);
+                let rhs =
+                    (right.expected_free_pages as u128).saturating_mul(left.pages.max(1) as u128);
+                rhs.cmp(&lhs)
+            })
+            .then_with(|| left.base.as_u64().cmp(&right.base.as_u64()))
+    });
+
+    let mut selected_pages = 0usize;
+    for index in order {
+        let candidate = &candidates[index];
+        plan.scanned_pages = plan.scanned_pages.saturating_add(candidate.pages);
+        if candidate.locked
+            || candidate.pages == 0
+            || candidate.expected_free_pages == 0
+            || candidate.base.as_u64() & 0xfff != 0
+        {
+            continue;
+        }
+        if plan.expected_free_pages >= target_free_pages
+            || plan.selected_pss_units >= target_pss_units
+            || selected_pages >= max_selected_pages
+        {
+            break;
+        }
+
+        let capacity = max_selected_pages - selected_pages;
+        let remaining_free = target_free_pages - plan.expected_free_pages;
+        // Conservative ceil: select enough of a uniformly-reclaimable range
+        // to cover the remaining physical target, then clamp to the batch.
+        let by_free = remaining_free
+            .saturating_mul(candidate.pages)
+            .saturating_add(candidate.expected_free_pages - 1)
+            / candidate.expected_free_pages;
+        let remaining_pss = target_pss_units - plan.selected_pss_units;
+        let by_pss = ((remaining_pss as u128)
+            .saturating_mul(u128::from(candidate.mapcount.max(1)))
+            .saturating_add(PSS_UNITS_PER_PAGE as u128 - 1)
+            / PSS_UNITS_PER_PAGE as u128)
+            .min(usize::MAX as u128) as usize;
+        let take = candidate
+            .pages
+            .min(capacity)
+            .min(by_free.max(1))
+            .min(by_pss.max(1));
+        if take == 0 {
+            break;
+        }
+
+        let range_pss = pss_units(take, candidate.mapcount);
+        let range_yield = proportional_yield(take, candidate);
+        plan.ranges.push(PlannedReclaimRange {
+            address_space_root: candidate.address_space_root,
+            base: candidate.base,
+            pages: take,
+            mapcount: candidate.mapcount.max(1),
+            estimated_pss_units: range_pss,
+            expected_free_pages: range_yield,
+        });
+        selected_pages = selected_pages.saturating_add(take);
+        plan.selected_pss_units = plan.selected_pss_units.saturating_add(range_pss);
+        plan.expected_free_pages = plan.expected_free_pages.saturating_add(range_yield);
+    }
+    plan
+}
+
+/// Build one bounded reclaim plan from the live high-watermark deficit.
+pub fn plan_watermark_reclaim(
+    candidates: &[ReclaimRangeCandidate],
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan {
+    plan_reclaim_ranges(candidates, reclaim_goal_pages(), max_selected_pages)
 }
 
 // ── Shrinker registry (Linux `struct shrinker`) ────────────────────
@@ -397,6 +588,92 @@ mod watermark_tests {
     kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
 }
 
+/// Pure range-planner tests, registered in the in-kernel test image.
+mod range_planner_tests {
+    use super::{plan_reclaim_ranges, ReclaimRangeCandidate, PSS_UNITS_PER_PAGE};
+    use crate::{PhysAddr, VirtAddr};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn candidate(
+        base: u64,
+        pages: usize,
+        mapcount: u32,
+        expected_free_pages: usize,
+        age: u8,
+        locked: bool,
+    ) -> ReclaimRangeCandidate {
+        ReclaimRangeCandidate {
+            address_space_root: PhysAddr::new(0x1000),
+            base: VirtAddr::new(base),
+            pages,
+            mapcount,
+            expected_free_pages,
+            age,
+            locked,
+        }
+    }
+
+    fn smoke_reclaim_range_plan_private_target() -> TestResult {
+        let candidates = [
+            candidate(0x40_0000, 8, 1, 8, 5, false),
+            candidate(0x50_0000, 8, 1, 8, 0, false),
+        ];
+        let plan = plan_reclaim_ranges(&candidates, 4, 16);
+        if plan.ranges.len() != 1 || plan.ranges[0].base != VirtAddr::new(0x50_0000) {
+            return TestResult::Fail("planner must select the coldest range first");
+        }
+        if plan.ranges[0].pages != 4
+            || plan.expected_free_pages != 4
+            || plan.selected_pss_units != 4 * PSS_UNITS_PER_PAGE
+        {
+            return TestResult::Fail("private range should stop exactly at the target");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_range_plan_private_target);
+
+    fn smoke_reclaim_range_plan_pss_sizes_shared_scan() -> TestResult {
+        // Eight mapped pages with mapcount four account for two pages of PSS.
+        // Reverse-map coverage predicts that evicting the whole range releases
+        // two unique physical pages, so both stop conditions agree at 8 VAs.
+        let candidates = [candidate(0x60_0000, 8, 4, 2, 0, false)];
+        let plan = plan_reclaim_ranges(&candidates, 2, 16);
+        if plan.ranges.len() != 1 || plan.ranges[0].pages != 8 {
+            return TestResult::Fail("PSS sizing should retain the complete shared scan");
+        }
+        if plan.selected_pss_units != 2 * PSS_UNITS_PER_PAGE || plan.expected_free_pages != 2 {
+            return TestResult::Fail("PSS and physical-yield accounting diverged");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_range_plan_pss_sizes_shared_scan
+    );
+
+    fn smoke_reclaim_range_plan_skips_phantom_yield() -> TestResult {
+        let candidates = [
+            // A single shared alias has PSS but cannot release its backing.
+            candidate(0x70_0000, 16, 4, 0, 0, false),
+            candidate(0x80_0000, 4, 1, 4, 1, true),
+            candidate(0x90_0001, 4, 1, 4, 2, false),
+            candidate(0xa0_0000, 4, 1, 4, 3, false),
+        ];
+        let plan = plan_reclaim_ranges(&candidates, 3, 64);
+        if plan.ranges.len() != 1 || plan.ranges[0].base != VirtAddr::new(0xa0_0000) {
+            return TestResult::Fail("planner selected locked, unaligned, or zero-yield range");
+        }
+        if plan.expected_free_pages != 3 || plan.scanned_pages != 28 {
+            return TestResult::Fail("planner target or scan accounting is wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_range_plan_skips_phantom_yield
+    );
+}
+
 /// Shrinker-registry tests. Always compiled so they register + run under
 /// `cargo xtask test`. A mock shrinker backed by an atomic object count
 /// exercises registration, proportional `shrink_all`, and idempotent
@@ -510,15 +787,12 @@ pub enum ReclaimOutcome {
     /// integration (frame-free on success + side-table for
     /// `page_in` discovery) is a Wave C+1 follow-up.
     ///
-    /// The **live**, batched swap path now lives in `crate::swap`:
-    /// `swap::swap_out_batch(&[SwapVictim])` writes a run of victims
-    /// out in one backend call, installs swap-entry PTEs, and frees the
-    /// frames; `swap::swap_in_pte` faults them back on demand. A caller
-    /// that knows a victim's *virtual* address (the mmap / address-space
-    /// layer) drives that path directly. This per-`phys` `ReclaimFn`
-    /// seam can't reach it because it lacks the reverse mapping
-    /// (`phys → (pml4, virt)`); wiring an rmap so the LRU scan itself
-    /// can batch-evict is the follow-up.
+    /// The **live**, batched swap path now lives in `crate::swap` plus
+    /// `AddressSpace::swap_out_reclaim_plan`: it writes a selected run in one
+    /// backend call, transfers Region/PTE ownership, invalidates once, and
+    /// faults consecutive leaves back through `swap_in_batch`. This per-phys
+    /// seam still lacks reverse mappings; callers with rmap/VMA context feed
+    /// `plan_reclaim_ranges` and the AddressSpace executor.
     DeferToPager,
 }
 

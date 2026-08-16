@@ -616,15 +616,19 @@ up beyond what Stage 1 ships.
 
 ### Phase 6 — hugepage pool (separate from buddy)
 
-**Done** (`54a1b73`). `memory/src/hugepage.rs` with 2 MiB and
-1 GiB pools. `reserve_from_regions(usable, want_2m, want_1g)`
-walks the memory map at boot, carves leading naturally-aligned
-chunks out of each region up to the cmdline-bounded targets
-(`hugepages_2m=N` / `hugepages_1g=N`), and returns the
-byte-range excludes that `init_from_map` skips when donating
-to the buddy. `alloc_hugepage_2m` / `alloc_hugepage_1g` return
-`HugeFrame`s; pool exhaustion returns `Err(Empty)` (no
-buddy-coalesce fallback). Tests:
+**Done** (`54a1b73`, subsequently hardened and NUMA-partitioned).
+`memory/src/hugepage.rs` provides 2 MiB and 1 GiB pools.
+`reserve_from_regions(usable, protected, want_2m, want_1g)` walks the
+memory map at boot, skips the architecture-reserved low-memory window and
+every protected range (including the loaded kernel), carves naturally-aligned
+chunks up to the cmdline-bounded targets (`hugepages_2m=N` /
+`hugepages_1g=N`), and returns the byte-range excludes that `init_from_map`
+skips when donating to the buddy. Free frames are partitioned by physical NUMA
+node and their vectors are sized at boot for all outstanding reservations, so
+strict-node allocation, free, and per-node statistics are O(1) without
+allocator recursion under the pool lock. `alloc_hugepage_2m` /
+`alloc_hugepage_1g` return `HugeFrame`s; pool exhaustion returns `Err(Empty)`
+(no buddy-coalesce fallback). Tests:
 `smoke_hugepage_2m_reserve_alloc_free` and
 `smoke_hugepage_1g_reserve_picks_aligned_chunk`.
 
