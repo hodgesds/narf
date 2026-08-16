@@ -81,6 +81,105 @@ fn smoke_poll_one_fd_not_ready_returns_zero() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_poll_one_fd_not_ready_returns_zero);
 
+/// ppoll: an eventfd whose counter is nonzero is POLLIN-ready, so ppoll
+/// returns it (revents POLLIN), never parks. This is the EXACT shape a Qt
+/// event dispatcher relies on: it writes its wakeup eventfd, then the loop's
+/// ppoll must observe it readable and return to run posted events. If ppoll
+/// on a readable eventfd parked instead, any Qt nested `QEventLoop` would
+/// strand — which is the failure mode the CachyOS greeter
+/// (startplasma-login-wayland, blocked in KUpdateLaunchEnvironmentJob) shows.
+/// The prior ppoll tests only cover the empty-set / null-fds error arms;
+/// none exercised a real fd's readiness through the ppoll entry point.
+fn smoke_ppoll_eventfd_ready_returns_pollin() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let _task = setup_poll_test();
+    // Real eventfd2(initval=1, flags=0) → counter starts at 1 → POLL_IN ready.
+    let er = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 1,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if er.status != SyscallReturn::OK || er.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd2(1,0) returned -1");
+    }
+    let fd = er.value as u32;
+
+    // pollfd { fd, events=POLLIN, revents=0 }.
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+    // timespec {0,0} = nonblocking (a NULL timeout would block forever).
+    let ts: [u8; 16] = [0; 16];
+
+    let r = call(
+        Syscall::Ppoll,
+        SyscallArgs {
+            arg0: pfd.as_ptr() as u64,
+            arg1: 1,
+            arg2: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("ppoll should return 1 for a readable eventfd");
+    }
+    let revents = u16::from_ne_bytes([pfd[6], pfd[7]]);
+    if revents & (narf_filesystem::POLL_IN as u16) == 0 {
+        return TestResult::Fail("ppoll did not report POLLIN for the readable eventfd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_ppoll_eventfd_ready_returns_pollin);
+
+/// ppoll: an eventfd with counter 0 is NOT readable → nonblocking ppoll
+/// returns 0. Pairs with the ready case so an eventfd `poll_readiness`
+/// regression (readable-when-empty OR empty-when-readable) is caught from
+/// both directions through the ppoll path specifically.
+fn smoke_ppoll_eventfd_empty_returns_zero() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let _task = setup_poll_test();
+    // Real eventfd2(initval=0, flags=0) → counter 0 → NOT POLL_IN readable.
+    let er = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if er.status != SyscallReturn::OK || er.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd2(0,0) returned -1");
+    }
+    let fd = er.value as u32;
+
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+    let ts: [u8; 16] = [0; 16];
+
+    let r = call(
+        Syscall::Ppoll,
+        SyscallArgs {
+            arg0: pfd.as_ptr() as u64,
+            arg1: 1,
+            arg2: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("ppoll should return 0 for an empty eventfd (nonblocking)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_ppoll_eventfd_empty_returns_zero);
+
 /// poll: invalid fd gives POLLNVAL in revents, returns 1
 fn smoke_poll_invalid_fd_returns_pollnval() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
