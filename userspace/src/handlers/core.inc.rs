@@ -4861,8 +4861,7 @@ fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> 
     // in? If `rel` fails to resolve (or attach fails) the caller falls back to
     // parent inheritance, so the SERVICE cgroup never goes populated and
     // systemd's oneshot cgroup-settle wait can hang.
-    #[cfg(feature = "syscall-trace")]
-    {
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -5441,8 +5440,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // Diagnostic: pid the CLONE_PIDFD pidfd is minted under. Compare with the
     // PIDFD-EXIT line for the same process's exit — a mismatch (or a
     // pidfd_found=false there) is the reap-hang root cause.
-    #[cfg(feature = "syscall-trace")]
-    if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && flags & CLONE_PIDFD != 0 && ca.pidfd != 0
+    {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -7608,7 +7607,6 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
-    let _ = child_tid;
     #[cfg(feature = "linux-compat")]
     crate::ptrace::release_process(child_pid);
 
@@ -7621,8 +7619,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // the one the exit path reports — so its POLLIN-on-exit never fires and
     // systemd supervises a ghost (start job hangs "running"). Pair with the
     // PIDFD-MINT line at the CLONE_PIDFD site.
-    #[cfg(feature = "syscall-trace")]
-    {
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         use core::fmt::Write as _;
         let comm =
             proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));

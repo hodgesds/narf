@@ -131,6 +131,15 @@ pub fn set_cgevt_trace(v: bool) {
     CGEVT_TRACE.store(v, Ordering::Relaxed);
 }
 
+/// Whether the `CGEVT` trace is enabled. Reused as a lightweight runtime gate
+/// for the paired userspace exit-detection diagnostics (`CGATTACH`,
+/// `PIDFD-MINT`, `PIDFD-EXIT`) so they can be watched in a boot WITHOUT the
+/// `syscall-trace` firehose — which is heavy enough to change the failure mode
+/// of the very phase (systemd `--user` session bring-up) they diagnose.
+pub fn cgevt_trace_enabled() -> bool {
+    CGEVT_TRACE.load(Ordering::Relaxed)
+}
+
 fn alloc_cgroup_ino() -> u64 {
     NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed)
 }
