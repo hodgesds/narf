@@ -4350,6 +4350,37 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     if signum == 0 || signum > 64 {
         return;
     }
+    // [PROBE] Name the SENDER of a termination signal aimed at a systemd
+    // manager/helper or any task in the user-957 session cgroup — to find who
+    // (PID1's job logic? logind? a timeout escalation?) tears down user@957
+    // before its manager can exec `systemd --user`. cgevt_trace-gated and
+    // limited to termination signals so the common per-signal path (SIGCHLD,
+    // SIGCONT, timers) pays nothing.
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 1 | 2 | 3 | 9 | 15) {
+        let tgt_comm = proc_comm_of_task(task).unwrap_or_default();
+        let tgt_pid = task_to_pid_raw(task).unwrap_or(task);
+        let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(tgt_pid);
+        if tgt_comm == "systemd"
+            || tgt_comm.starts_with("(sd")
+            || tgt_comm.starts_with("(systemd")
+            || tgt_cg.contains("user-957")
+        {
+            let sender = current_task_id();
+            let sender_pid = task_to_pid_raw(sender).unwrap_or(sender);
+            let sender_comm = proc_comm_of_task(sender).unwrap_or_default();
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "SIGSEND sig={} -> pid={} comm={} cg={} FROM pid={} comm={}",
+                signum,
+                tgt_pid,
+                tgt_comm,
+                tgt_cg,
+                sender_pid,
+                sender_comm
+            );
+        }
+    }
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
     signal_stopcont_interaction(task, signum);

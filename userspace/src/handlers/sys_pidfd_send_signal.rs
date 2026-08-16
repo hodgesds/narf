@@ -45,6 +45,34 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     if let Some(tid) = pid_to_task_raw(target) {
         target = tid;
     }
+    // [PROBE] Name the SENDER of a termination signal to a user-957 /
+    // systemd-manager task. pidfd_send_signal is the path modern systemd uses to
+    // signal its services, and it sets SIGNAL_PENDING DIRECTLY (bypassing
+    // raise_signal_pending, where the twin probe lives), so a user@957 SIGTERM
+    // was invisible until this hook. cgevt_trace-gated, termination signals only.
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 1 | 2 | 3 | 9 | 15) {
+        let tgt_comm = proc_comm_of_task(target).unwrap_or_default();
+        let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
+        if tgt_comm == "systemd"
+            || tgt_comm.starts_with("(sd")
+            || tgt_comm.starts_with("(systemd")
+            || tgt_cg.contains("user-957")
+        {
+            let sender_pid = task_to_pid_raw(task).unwrap_or(task);
+            let sender_comm = proc_comm_of_task(task).unwrap_or_default();
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "SIGSEND(pidfd) sig={} -> pid={} comm={} cg={} FROM pid={} comm={}",
+                signum,
+                pid,
+                tgt_comm,
+                tgt_cg,
+                sender_pid,
+                sender_comm
+            );
+        }
+    }
     signal_stopcont_interaction(target, signum);
     if a.arg2 == 0 {
         // NULL info is a kill(2)-shaped send: Linux's prepare_kill_siginfo
