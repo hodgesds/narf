@@ -4617,17 +4617,19 @@ pub(crate) fn terminate_current_task(
     // reports its cause on the console without the syscall-trace firehose.
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         let comm = proc_comm_of(pid).unwrap_or_default();
-        if comm == "systemd" || comm.starts_with("(sd") {
+        let cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
+        if comm == "systemd" || comm.starts_with("(sd") || cg.contains("user-957") {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "USEREXIT pid={} tid={} comm={} killed_by_signal={} core_dumped={} ip={:x}",
+                "USEREXIT pid={} tid={} comm={} killed_by_signal={} core_dumped={} ip={:x} cg={}",
                 pid,
                 task,
                 comm,
                 signum,
                 core_dumped,
-                ctx.rip()
+                ctx.rip(),
+                cg
             );
         }
     }

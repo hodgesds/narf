@@ -13,15 +13,17 @@ pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
     // clean/requested stop; non-zero maps to a systemd EXIT_* failure class.
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         let comm = proc_comm_of_task(tid).unwrap_or_default();
-        if comm == "systemd" || comm.starts_with("(sd") {
+        let cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
+        if comm == "systemd" || comm.starts_with("(sd") || cg.contains("user-957") {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "USEREXIT pid={} tid={} comm={} exit_group_code={}",
+                "USEREXIT pid={} tid={} comm={} exit_group_code={} cg={}",
                 pid,
                 tid,
                 comm,
-                ctx.args().arg0 as i64
+                ctx.args().arg0 as i64,
+                cg
             );
         }
     }

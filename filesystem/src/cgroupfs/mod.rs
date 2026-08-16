@@ -131,6 +131,14 @@ pub fn set_cgevt_trace(v: bool) {
     CGEVT_TRACE.store(v, Ordering::Relaxed);
 }
 
+/// Absolute cgroup path a pid currently belongs to (root `/` if unplaced).
+/// Diagnostic helper for the USEREXIT probe so an exiting process can be
+/// attributed to its service cgroup (e.g. `.../user@957.service`) regardless
+/// of its comm.
+pub fn cgroup_path_of(pid: u64) -> String {
+    cgroup_of(pid).abs_path()
+}
+
 /// Whether the `CGEVT` trace is enabled. Reused as a lightweight runtime gate
 /// for the paired userspace exit-detection diagnostics (`CGATTACH`,
 /// `PIDFD-MINT`, `PIDFD-EXIT`) so they can be watched in a boot WITHOUT the
