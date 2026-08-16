@@ -97,6 +97,83 @@ fn uevent_wake_hook() {
     narf_net::readiness::notify(0);
 }
 
+/// `syscall-trace` D-Bus peek. When the current task is a trace target, and
+/// `buf` looks like a D-Bus wire message (endianness byte + type + version 1),
+/// print `DBUS t=<tid> comm=<c> <TX|RX> <TYPE> serial=<n> hdr=[...ascii...]`.
+/// The header-field region carries the DESTINATION / INTERFACE / MEMBER /
+/// PATH strings as plain ASCII, so a raw string scan (no fragile field-array
+/// alignment parse) is enough to name a METHOD_CALL's target + method and
+/// spot the last unanswered call before a nested-event-loop park. Used to
+/// pin which synchronous D-Bus reply the CachyOS greeter's main thread is
+/// blocked awaiting.
+#[cfg(feature = "syscall-trace")]
+pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
+    use core::fmt::Write as _;
+    if buf.len() < 16 || !crate::syscall::syscall_trace_target_task() {
+        return;
+    }
+    let le = match buf[0] {
+        b'l' => true,
+        b'B' => false,
+        _ => return,
+    };
+    let ty = buf[1];
+    // version byte (buf[3]) is 1 for every D-Bus message; screens out
+    // non-D-Bus streams that happen to start with 'l'/'B'.
+    if ty == 0 || ty > 4 || buf[3] != 1 {
+        return;
+    }
+    let rd32 = |o: usize| -> u32 {
+        let b = [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]];
+        if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }
+    };
+    let serial = rd32(8);
+    let fields_len = rd32(12) as usize;
+    let tyname = match ty {
+        1 => "CALL",
+        2 => "RETURN",
+        3 => "ERROR",
+        4 => "SIGNAL",
+        _ => "?",
+    };
+    let tid = crate::handlers::current_task_id();
+    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
+    let _ = write!(
+        narf_console::Writer,
+        "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
+    );
+    let end = core::cmp::min(buf.len(), 16 + fields_len);
+    let mut run: usize = 0;
+    let mut start = 16;
+    for i in 16..end {
+        let b = buf[i];
+        if b.is_ascii_graphic() && b != b' ' {
+            if run == 0 {
+                start = i;
+            }
+            run += 1;
+        } else {
+            if run >= 3 {
+                for &c in &buf[start..start + run] {
+                    let _ = write!(narf_console::Writer, "{}", c as char);
+                }
+                let _ = write!(narf_console::Writer, " ");
+            }
+            run = 0;
+        }
+    }
+    if run >= 3 {
+        for &c in &buf[start..start + run] {
+            let _ = write!(narf_console::Writer, "{}", c as char);
+        }
+    }
+    let _ = writeln!(narf_console::Writer, "]");
+}
+
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_RAW: u32 = 3;
