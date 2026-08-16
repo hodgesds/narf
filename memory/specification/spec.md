@@ -65,6 +65,10 @@ pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
 /// per-CPU-cache/NUMA-zone return work, while alternative allocators retain
 /// the scalar default.
 pub fn free_frame_batch(frames: &[PhysFrame]);
+/// Internal final-owner path: caller proves every frame is uniquely owned and
+/// absent from COW/page-table registries, allowing allocator implementations
+/// to bypass shared-owner lookups.
+pub(crate) unsafe fn free_unique_frame_batch(frames: &[PhysFrame]);
 /// Retain every non-zero COW backing while locking each touched refcount
 /// shard once; duplicate entries represent distinct owners.
 pub fn cow::inc_ref_batch(frames: &[PhysAddr]);
@@ -623,6 +627,16 @@ x86_64 is rejected at runtime.
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
+- Final-owner address-space teardown preallocates top-level detachment storage,
+  clears every private root descriptor under one short root-shard transaction,
+  and releases that shard before walking intermediate tables or entering the
+  frame allocator. The global shared-mapping transaction ends after all leaf
+  retirement and external backing release, before private intermediate-table
+  reclaim. The last-`Arc` contract proves that the detached root cannot be
+  active, repopulated, or gain a new shared alias. Intermediate and root frames
+  return in bounded 64-frame batches; x86_64 still requires a live ownership-
+  registry entry at every reclaimed level, so copied kernel tables remain
+  outside the detached set and can never enter a batch.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
@@ -720,6 +734,11 @@ x86_64 is rejected at runtime.
   `AddressSpace` teardown broadcasts `TLBI ASIDE1IS` before making that tag
   reusable. Pool exhaustion falls back safely to ASID 0 with a local full
   invalidation on every distinct-root switch.
+- Final-owner TTBR0 teardown clears all valid L0 table descriptors under the
+  root mutation shard, then drops the shard before walking the now-inactive
+  subtrees and returning translation-table frames in bounded allocator batches.
+  The later ASID retirement still invalidates the lifetime tag before reuse;
+  no CPU can execute the retired root during the unlocked reclaim walk.
 - Page-table mutation invalidates by VA for every ASID across the
   inner-shareable domain (`VAAE1IS` / `VAALE1IS`). This is required because
   the mutated root need not be the TTBR0 context active on the issuing CPU.

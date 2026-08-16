@@ -5632,52 +5632,61 @@ impl Drop for AddressSpace {
     /// entries on x86_64 are not freed — only the user half
     /// (entries 0..=255) and the PML4 frame itself.
     fn drop(&mut self) {
-        let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
-        let huge_regions = core::mem::take(&mut *self.huge_regions.lock());
-        for region in huge_regions {
-            let page_size = match region.size {
-                crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
-                crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+        {
+            // Serialize externally owned aliases only through authoritative
+            // leaf retirement and backing release. After both region tables
+            // have been drained, last-Arc ownership prevents any new alias
+            // from appearing and intermediate page-table reclaim needs no
+            // shared-mapping exclusion.
+            let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
+            let huge_regions = core::mem::take(&mut *self.huge_regions.lock());
+            for region in huge_regions {
+                let page_size = match region.size {
+                    crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES,
+                    crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES,
+                };
+                for i in 0..region.frames.len() {
+                    let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
+                    let _ = self.unmap_huge_leaf(va, region.size);
+                }
+                for frame in region.frames {
+                    crate::hugepage::free_hugepage(frame);
+                }
+            }
+            // Take ownership of the region list to avoid borrowing
+            // through &mut self below; the list is about to be
+            // dropped anyway.
+            let regions = core::mem::take(&mut *self.regions.lock());
+            #[cfg(target_arch = "x86_64")]
+            let swapped_pages: Vec<VirtAddr> = regions
+                .swap_pages
+                .iter()
+                .map(|(&va, state)| {
+                    assert_eq!(
+                        *state,
+                        SwapPageState::Swapped,
+                        "address space dropped during a swap ownership transition"
+                    );
+                    VirtAddr::new(va)
+                })
+                .collect();
+            #[cfg(target_arch = "x86_64")]
+            let swapped_entries = {
+                // SAFETY: Drop has exclusive ownership of this live root and
+                // all records above are stable Swapped entries.
+                unsafe { crate::swap::take_swap_entries(self.root, &swapped_pages) }
+                    .expect("stable swapped page lost its swap PTE before drop")
             };
-            for i in 0..region.frames.len() {
-                let va = VirtAddr::new(region.base.as_u64() + i as u64 * page_size);
-                let _ = self.unmap_huge_leaf(va, region.size);
+            for r in regions.iter() {
+                // SAFETY: see unmap_region_pages — same identity-map
+                // contract; no CPU is using self.root at this point
+                // since we're past the last Arc reference.
+                // SAFETY: Valid memory or trusted environment
+                unsafe { self.unmap_region_pages(r) };
             }
-            for frame in region.frames {
-                crate::hugepage::free_hugepage(frame);
-            }
+            #[cfg(target_arch = "x86_64")]
+            crate::swap::swap_discard_batch(&swapped_entries);
         }
-        // Take ownership of the region list to avoid borrowing
-        // through &mut self below; the list is about to be
-        // dropped anyway.
-        let regions = core::mem::take(&mut *self.regions.lock());
-        #[cfg(target_arch = "x86_64")]
-        let swapped_pages: Vec<VirtAddr> = regions
-            .swap_pages
-            .iter()
-            .map(|(&va, state)| {
-                assert_eq!(
-                    *state,
-                    SwapPageState::Swapped,
-                    "address space dropped during a swap ownership transition"
-                );
-                VirtAddr::new(va)
-            })
-            .collect();
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: Drop has exclusive ownership of this live root and all
-        // records above are stable Swapped entries.
-        let swapped_entries = unsafe { crate::swap::take_swap_entries(self.root, &swapped_pages) }
-            .expect("stable swapped page lost its swap PTE before drop");
-        for r in regions.iter() {
-            // SAFETY: see unmap_region_pages — same identity-map
-            // contract; no CPU is using self.root at this point
-            // since we're past the last Arc reference.
-            // SAFETY: Valid memory or trusted environment
-            unsafe { self.unmap_region_pages(r) };
-        }
-        #[cfg(target_arch = "x86_64")]
-        crate::swap::swap_discard_batch(&swapped_entries);
         // Now reclaim the page-table pages themselves. The
         // sentinel root == 0 means an `empty()` AS that never
         // got a real page-table allocation; nothing to free.

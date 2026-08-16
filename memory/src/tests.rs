@@ -2505,6 +2505,130 @@ fn smoke_memory_many_concurrent_as_then_drop() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_many_concurrent_as_then_drop);
 
+/// Final-owner teardown must detach every sparse top-level subtree in one
+/// short root transaction, then return the intermediate tables through the
+/// batched allocator path. On x86_64 also prove that detachment did not weaken
+/// the private-table ownership registry: every captured hierarchy frame must
+/// be unregistered before it becomes reusable.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let before = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::paging::__teardown_batch_counts_for_test()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::aarch64::paging::__teardown_batch_counts_for_test()
+        }
+    };
+    // These occupy top-level slots 1, 128, and 255 on both 48-bit, four-level
+    // implementations while staying in the canonical user half.
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    // SAFETY: the test runner has paging enabled and exclusively owns the AS.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    for base in bases {
+        let backing = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        if address_space
+            .map_region(Region {
+                base: VirtAddr::new(base),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![backing],
+            })
+            .is_err()
+        {
+            crate::free_frame(crate::PhysFrame::new(backing));
+            return TestResult::Fail("sparse teardown fixture region was rejected");
+        }
+    }
+    // SAFETY: the test owns the root and every registered backing frame.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("sparse teardown fixture materialize failed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let registered_tables = {
+        use crate::x86_64::paging::PageTable;
+        let mut tables = alloc::vec![address_space.root];
+        // SAFETY: the materialized root and each verified present descriptor
+        // are identity-reachable, live, and exclusively owned by this test.
+        let pml4 = unsafe { &*address_space.root.as_ptr::<PageTable>() };
+        for base in bases {
+            let pml4e = pml4.entries[((base >> 39) & 0x1ff) as usize];
+            if !pml4e.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PML4 entry");
+            }
+            tables.push(pml4e.addr());
+            // SAFETY: the present PML4 entry names a live, identity-reachable
+            // PDPT in this test's exclusively owned hierarchy.
+            let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+            let pdpte = pdpt.entries[((base >> 30) & 0x1ff) as usize];
+            if !pdpte.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PDPT entry");
+            }
+            tables.push(pdpte.addr());
+            // SAFETY: the present PDPT entry names a live, identity-reachable
+            // PD in this test's exclusively owned hierarchy.
+            let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+            let pde = pd.entries[((base >> 21) & 0x1ff) as usize];
+            if !pde.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PD entry");
+            }
+            tables.push(pde.addr());
+        }
+        if tables
+            .iter()
+            .any(|table| !crate::frame::__pagetable_is_registered(table.raw()))
+        {
+            return TestResult::Fail("sparse fixture table was not registry-owned");
+        }
+        tables
+    };
+
+    drop(address_space);
+    let after = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::paging::__teardown_batch_counts_for_test()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::aarch64::paging::__teardown_batch_counts_for_test()
+        }
+    };
+    if after.0 != before.0 + bases.len() as u64 {
+        return TestResult::Fail("final teardown did not detach every sparse top-level subtree");
+    }
+    // This fixture owns ten table frames (root plus three 3-level subtrees),
+    // so the 64-frame bound must amortise them into exactly one return.
+    if after.1 != before.1 + 1 {
+        return TestResult::Fail("final teardown did not batch table-frame return");
+    }
+    #[cfg(target_arch = "x86_64")]
+    if registered_tables
+        .iter()
+        .any(|table| crate::frame::__pagetable_is_registered(table.raw()))
+    {
+        return TestResult::Fail("final teardown left a stale page-table registration");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!("memory", smoke_memory_sparse_root_teardown_is_batched);
+
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
 
 /// Materialize twice in a row on the same AS — must be idempotent

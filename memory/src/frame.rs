@@ -1336,6 +1336,24 @@ pub fn free_frame_batch(frames: &[PhysFrame]) {
     }
 }
 
+/// Return a batch whose frames are known to have exactly one owner and are not
+/// present in the COW registry. Page-table teardown uses this after detaching
+/// the final inactive root and removing every table ownership registration.
+///
+/// # Safety
+/// Every input frame must be exclusively owned by the caller. In particular,
+/// it must have no COW reference-count entry and no live page-table registry
+/// entry. Violating this contract can make a still-owned frame reusable.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
+pub(crate) unsafe fn free_unique_frame_batch(frames: &[PhysFrame]) {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_free_caller(core::panic::Location::caller());
+    if let Some(allocator) = current_alloc() {
+        // SAFETY: forwarded from this function's caller contract.
+        unsafe { allocator.free_unique_frame_batch(frames) };
+    }
+}
+
 /// Buddy-backed implementation of `free_frame`.
 ///
 /// COW interaction: if the frame has a refcount > 1 (multiple
@@ -2292,6 +2310,16 @@ pub trait FrameAlloc: Send + Sync {
             self.free_frame(*frame);
         }
     }
+    /// Return frames for which the caller has already proved unique ownership.
+    /// Simple allocators retain their ordinary batch semantics; allocators with
+    /// separate shared-owner metadata may bypass those lookups.
+    ///
+    /// # Safety
+    /// Every frame must be exclusively owned by the caller and absent from any
+    /// allocator-specific shared-owner registry.
+    unsafe fn free_unique_frame_batch(&self, frames: &[PhysFrame]) {
+        self.free_frame_batch(frames);
+    }
     /// Snapshot of allocator usage.
     fn stats(&self) -> FrameStats;
 }
@@ -2325,6 +2353,11 @@ impl FrameAlloc for BuddyFrameAlloc {
     }
     fn free_frame_batch(&self, frames: &[PhysFrame]) {
         buddy_free_frame_batch(frames);
+    }
+    unsafe fn free_unique_frame_batch(&self, frames: &[PhysFrame]) {
+        for frame in frames {
+            buddy_return_unreferenced_frame(*frame);
+        }
     }
     fn stats(&self) -> FrameStats {
         buddy_stats()

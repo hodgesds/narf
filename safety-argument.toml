@@ -483,3 +483,15 @@ argument = "Every successful x86_64 base-page or huge-page installation now ORs 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Intermediate x86_64 permission promotion is an internal correction to the existing page-table construction path. It adds no capability, domain assignment, trusted subsystem, external authority, mapped physical frame, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Final-owner page-table teardown detaches only private top-level descriptors while holding the live root's existing mutation shard, after last-Arc ownership has proved that no CPU can execute or repopulate the root. The shared-alias transaction remains held through every leaf retirement, translation invalidation, and external backing release, and ends only after both authoritative region tables are drained; last-Arc ownership then excludes any new alias during private intermediate-table reclaim. Detached tables are traversed before bounded batch return; x86_64 unregisters and revalidates ownership at every level before making a table reusable, preserving the exclusion of copied kernel-shared tables."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Unlocked final-root traversal and batched table-frame return remain private implementation details of the existing memory domain manager TCB. They add no capability, domain assignment, trusted subsystem, user-visible mapping, external pointer, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The unique-frame batch API is crate-private and unsafe: page-table teardown invokes it only after last-Arc ownership has made the root inactive, every data leaf has been retired, each private table has been detached, and x86_64 has removed the table's ownership-registry entry. Page-table frames never enter the data-page COW registry, so bypassing COW lookup cannot skip another owner; alternative allocators retain the ordinary batch implementation by default."

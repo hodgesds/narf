@@ -3,6 +3,7 @@
 //! Spec: `memory/specification/spec.md`. aarch64 uses 64-bit descriptors
 //! in a 4-level walk (L0-L3) for 4 KiB pages.
 
+use alloc::vec::Vec;
 use core::ptr;
 
 use crate::PhysAddr;
@@ -15,6 +16,10 @@ static TLBI_BARRIER_SEQUENCES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "kernel-test")]
 static RANGE_L3_WALKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static TEARDOWN_DETACHED_L1S: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static TEARDOWN_FREE_BATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Test-only counters for proving multi-leaf helpers amortise architecture
 /// barrier sequences. Production builds contain neither counter nor update.
@@ -34,6 +39,18 @@ pub fn __batch_barrier_counts_for_test() -> (u64, u64) {
 #[doc(hidden)]
 pub fn __range_l3_walks_for_test() -> u64 {
     RANGE_L3_WALKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only cumulative counts for final-root subtree detachment and allocator
+/// batches. Production builds contain neither counter nor update.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __teardown_batch_counts_for_test() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        TEARDOWN_DETACHED_L1S.load(Ordering::Relaxed),
+        TEARDOWN_FREE_BATCHES.load(Ordering::Relaxed),
+    )
 }
 
 /// A single 64-bit descriptor.
@@ -538,6 +555,8 @@ pub(crate) fn pt_lock_for(root: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpi
 /// here; the `AddressSpace::Drop` path arranges for
 /// `unmap_region_pages` to release every region's data frames first
 /// so this routine only reclaims the page-table pages themselves.
+/// Valid L0 table descriptors are detached under the root shard; the inactive
+/// subtrees are walked and batch-returned after that shard is released.
 ///
 /// Reference: ARM ARM (DDI 0487 §D8) translation-table descriptor
 /// formats — bit 0 = VALID, bit 1 = TYPE (1 = table at L0/L1/L2,
@@ -549,25 +568,66 @@ pub(crate) fn pt_lock_for(root: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpi
 /// - All data-page leaves must already have been released.
 /// - No CPU may be using `root` as its active TTBR0.
 pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
-    use crate::frame::{free_frame, PhysFrame};
+    use crate::frame::{free_unique_frame_batch, PhysFrame};
+    const FREE_BATCH_FRAMES: usize = 64;
+
+    #[inline]
+    fn flush_reclaimed(frames: &mut Vec<PhysFrame>) {
+        if frames.is_empty() {
+            return;
+        }
+        // SAFETY: TTBR0 tables are private to this final inactive root and
+        // page-table frames are never COW-shared.
+        unsafe { free_unique_frame_batch(frames) };
+        frames.clear();
+        #[cfg(feature = "kernel-test")]
+        TEARDOWN_FREE_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn queue_reclaimed(frames: &mut Vec<PhysFrame>, phys: PhysAddr) {
+        frames.push(PhysFrame::new(phys));
+        if frames.len() == FREE_BATCH_FRAMES {
+            flush_reclaimed(frames);
+        }
+    }
+
     if root.raw() == 0 {
         return;
     }
-    let _guard = pt_lock_for(root).lock();
     /// True if this entry is present AND a TABLE (not a block).
     /// At L0 every present entry is a table per ARM ARM. At L1/L2
     /// a block entry stops the walk and must be skipped.
     fn is_table_descriptor(e: PageTableEntry) -> bool {
         e.is_valid() && (e.0 & 0b10) != 0
     }
-    // SAFETY: identity-reachable per caller contract.
-    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
-    for l0_idx in 0..512usize {
-        let l0e = l0.entries[l0_idx];
-        if !is_table_descriptor(l0e) {
-            continue;
+    // Reserve before taking the IRQ-safe root shard so detachment cannot grow
+    // the vector while interrupts are disabled.
+    let mut detached_l1s = Vec::with_capacity(512);
+    {
+        let _guard = pt_lock_for(root).lock();
+        // SAFETY: identity-reachable per caller contract.
+        let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+        for l0_idx in 0..512usize {
+            let l0e = l0.entries[l0_idx];
+            if !is_table_descriptor(l0e) {
+                continue;
+            }
+            detached_l1s.push(l0e.addr());
+            l0.entries[l0_idx] = PageTableEntry::EMPTY;
         }
-        let l1_pa = l0e.addr();
+    }
+    #[cfg(feature = "kernel-test")]
+    TEARDOWN_DETACHED_L1S.fetch_add(
+        detached_l1s.len() as u64,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
+    // The final-owner contract guarantees this root is inactive. Reclaiming
+    // detached tables and entering allocator/COW locks therefore needs no root
+    // shard and cannot block unrelated mutations that hash to the same shard.
+    let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
+    for l1_pa in detached_l1s {
         // SAFETY: same.
         let l1 = unsafe { &mut *l1_pa.kernel_mut_ptr::<PageTable>() };
         for l1_idx in 0..512usize {
@@ -586,14 +646,14 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
                 // L3 — leaf-level table; data frames already
                 // released by `unmap_region_pages`. Reclaim the
                 // table page itself.
-                free_frame(PhysFrame::new(l2e.addr()));
+                queue_reclaimed(&mut reclaimed, l2e.addr());
             }
-            free_frame(PhysFrame::new(l2_pa));
+            queue_reclaimed(&mut reclaimed, l2_pa);
         }
-        free_frame(PhysFrame::new(l1_pa));
-        l0.entries[l0_idx] = PageTableEntry::EMPTY;
+        queue_reclaimed(&mut reclaimed, l1_pa);
     }
-    free_frame(PhysFrame::new(root));
+    queue_reclaimed(&mut reclaimed, root);
+    flush_reclaimed(&mut reclaimed);
 }
 
 /// aarch64 "canonical": top 16 bits are either all-0 (low half /
