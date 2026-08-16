@@ -61,9 +61,24 @@ pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
+/// Return independently owned frames; buddy batches COW shard acquisition,
+/// while alternative allocators retain the scalar default.
+pub fn free_frame_batch(frames: &[PhysFrame]);
 /// Retain every non-zero COW backing while locking each touched refcount
 /// shard once; duplicate entries represent distinct owners.
 pub fn cow::inc_ref_batch(frames: &[PhysAddr]);
+/// Return counts in input order while locking each touched shard once.
+pub fn cow::count_batch(frames: &[PhysAddr]) -> Vec<u32>;
+/// Drop one owner per input and return frames whose final owner was removed.
+pub fn cow::dec_ref_batch(frames: &[PhysAddr]) -> Vec<PhysAddr>;
+/// Install scatter backing under one root lock; the callback index preserves
+/// alignment with per-page metadata when zero lazy slots are skipped.
+pub unsafe fn x86_64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 pub fn map(va: VirtAddr, pf: PhysFrame, flags: MapFlags, domain: DomainId);
 pub fn map_folio(va: VirtAddr, folio: Folio, flags: MapFlags, domain: DomainId);
 pub fn map_huge(va: VirtAddr, folio: Folio, size: PageSize, flags: MapFlags, domain: DomainId);
@@ -496,7 +511,18 @@ x86_64 is rejected at runtime.
   while the parent region transaction is held. The batch groups frames by
   refcount shard, locks each touched shard once, and increments once per input
   occurrence; unbacked zero sentinels and externally owned SHARED mappings are
-  excluded.
+  excluded. Multi-page materialization and parent permission rewriting snapshot
+  COW counts by shard while holding the relevant address-space region lock. A
+  concurrent last-owner decrement may conservatively leave a leaf read-only;
+  a sole-owner frame cannot become newly shared without that same region
+  transaction, so the snapshot cannot incorrectly grant WRITE to shared
+  backing. Region teardown, MAP_FIXED punching, and MADV_DONTNEED retire leaves
+  and complete the required TLB flush before dropping backing owners through
+  the allocator's batch interface.
+  The buddy implementation locks each touched COW shard once and sends only
+  final-owner/unregistered frames through the unchanged cgroup-uncharge,
+  optional scrub, allocation-audit, NUMA-cache, and buddy-return path;
+  alternative allocators use the scalar default.
 - Base-page relocation installs the disjoint destination before removing the
   source, publishes backing ownership exactly once, invalidates source
   translations before freeing a truncated tail, and leaves the source intact

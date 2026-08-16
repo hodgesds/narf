@@ -1020,7 +1020,7 @@ pub unsafe fn map_4kb_scatter_range(
     pml4_phys: PhysAddr,
     base: VirtAddr,
     backing: &[PhysAddr],
-    mut flags_for: impl FnMut(PhysAddr) -> PtFlags,
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError> {
     if !is_canonical(base) || base.raw() & 0xFFF != 0 {
         return Err(if is_canonical(base) {
@@ -1054,7 +1054,7 @@ pub unsafe fn map_4kb_scatter_range(
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
         // SAFETY: the complete range was validated above and the root lock is
         // held for this whole loop.
-        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(phys))? };
+        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(index, phys))? };
     }
     Ok(())
 }

@@ -761,8 +761,12 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     ];
     // SAFETY: the test owns this isolated root; non-zero synthetic backing is
     // aligned and never dereferenced, while zero is the documented lazy slot.
-    if unsafe { map_4kb_scatter_range(pml4, base, &backing, |_| PtFlags::USER | PtFlags::WRITABLE) }
-        .is_err()
+    if unsafe {
+        map_4kb_scatter_range(pml4, base, &backing, |_, _| {
+            PtFlags::USER | PtFlags::WRITABLE
+        })
+    }
+    .is_err()
     {
         return TestResult::Fail("scatter range map failed");
     }
@@ -3258,25 +3262,33 @@ fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
         crate::PhysAddr::new(0),
     ];
     cow::inc_ref_batch(&batch);
+    let counts = cow::count_batch(&batch);
 
-    let verdict = if cow::count(phys[0]) != 3 {
+    let mut verdict = if cow::count(phys[0]) != 3 {
         TestResult::Fail("duplicate batch entries did not retain distinct owners")
     } else if phys[1..].iter().any(|frame| cow::count(*frame) != 2) {
         TestResult::Fail("batch did not retain every unique frame")
     } else if cow::count(crate::PhysAddr::new(0)) != 0 {
         TestResult::Fail("batch registered the unbacked zero sentinel")
+    } else if counts != [3, 2, 2, 2, 3, 0] {
+        TestResult::Fail("batch count snapshot lost input order or duplicate identity")
     } else {
         TestResult::Pass
     };
 
-    // Drop the synthetic batch owners, then the original PhysFrame owners.
-    for frame in batch {
-        if frame.raw() != 0 {
-            let _ = cow::dec_ref(frame);
-        }
+    // Drop the synthetic batch owners. Every real frame keeps its implicit
+    // original owner, so none is allocator-releasable yet.
+    let releasable = cow::dec_ref_batch(&batch);
+    let post_drop = cow::count_batch(&batch);
+    if matches!(verdict, TestResult::Pass) && !releasable.is_empty() {
+        verdict = TestResult::Fail("batch COW drop released a frame with a live owner");
+    } else if matches!(verdict, TestResult::Pass) && post_drop != [1, 1, 1, 1, 1, 0] {
+        verdict = TestResult::Fail("batch COW drop lost duplicate-owner cardinality");
     }
-    for frame in frames {
-        crate::frame::free_frame(frame);
+
+    crate::frame::free_frame_batch(&frames);
+    if matches!(verdict, TestResult::Pass) && phys.iter().any(|frame| cow::count(*frame) != 0) {
+        verdict = TestResult::Fail("allocator batch free left final COW owners registered");
     }
     cow::__test_clear();
     verdict

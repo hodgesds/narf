@@ -224,10 +224,20 @@ impl core::ops::BitOr for RegionPerms {
 /// therefore needs no split.
 #[inline]
 fn user_page_writable(perms: RegionPerms, phys: PhysAddr) -> bool {
+    let cow_count = if perms.contains(RegionPerms::COW) && phys.raw() != 0 {
+        crate::frame::cow::count(phys)
+    } else {
+        0
+    };
+    user_page_writable_at_count(perms, phys, cow_count)
+}
+
+/// Batch-aware counterpart used when the caller already holds a stable COW
+/// count snapshot for the region.
+#[inline]
+fn user_page_writable_at_count(perms: RegionPerms, phys: PhysAddr, cow_count: u32) -> bool {
     perms.contains(RegionPerms::WRITE)
-        && (!perms.contains(RegionPerms::COW)
-            || phys.raw() == 0
-            || crate::frame::cow::count(phys) <= 1)
+        && (!perms.contains(RegionPerms::COW) || phys.raw() == 0 || cow_count <= 1)
 }
 
 /// A user-mode mapping. The virtual range is contiguous; the
@@ -1848,7 +1858,7 @@ impl AddressSpace {
         // (an infinite-#PF trap for the old spurious-fault heuristic).
         // stress-ng --vma's concurrent mmap/munmap threads (CLONE_VM AS on
         // SMP) hit this window continuously.
-        let mut to_free: Vec<PhysAddr> = Vec::new();
+        let mut to_free: Vec<crate::frame::PhysFrame> = Vec::new();
         let mut punched_pages: u64 = 0;
         {
             let old_regions = regions.drain_overlapping(lo, hi);
@@ -1897,7 +1907,7 @@ impl AddressSpace {
                     if !shared {
                         if let Some(p) = old.phys.get(pg) {
                             if p.raw() != 0 {
-                                to_free.push(*p);
+                                to_free.push(crate::frame::PhysFrame::new(*p));
                             }
                         }
                     } else if let Some(p) = old.phys.get(pg) {
@@ -1939,15 +1949,10 @@ impl AddressSpace {
             self.flush_region_broadcast(base, (hi - lo) >> 12);
         }
         if self.root.as_u64() != 0 {
-            for p in to_free {
-                // `to_free` comes exclusively from `Region.phys`, whose
-                // backing lists contain data frames only (same invariant as
-                // `free_region_frames` below). A page-table frame cannot
-                // appear here, so consulting the 16K-slot PT registry for
-                // every punched page is both redundant and pathologically
-                // expensive under Plasma's MAP_FIXED churn.
-                crate::frame::free_frame(crate::frame::PhysFrame::new(p));
-            }
+            // `to_free` comes exclusively from `Region.phys`, whose backing
+            // lists contain data frames only. The range flush above completed
+            // before this batched owner drop.
+            crate::frame::free_frame_batch(&to_free);
         }
         Ok(())
     }
@@ -2063,13 +2068,18 @@ impl AddressSpace {
         if region.perms.prot_only().0 == 0 {
             return Ok(());
         }
+        let cow_counts = region
+            .perms
+            .contains(RegionPerms::COW)
+            .then(|| crate::frame::cow::count_batch(&region.phys));
         // SAFETY: caller guarantees a live root and validated disjoint region;
         // the scatter list is authoritative backing and the paging helper
         // serialises the complete run with one per-root lock acquisition.
         unsafe {
-            map_4kb_scatter_range(self.root, region.base, &region.phys, |phys| {
+            map_4kb_scatter_range(self.root, region.base, &region.phys, |index, phys| {
                 let mut flags = PtFlags::USER;
-                if user_page_writable(region.perms, phys) {
+                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
+                if user_page_writable_at_count(region.perms, phys, cow_count) {
                     flags |= PtFlags::WRITABLE;
                 }
                 if !region.perms.contains(RegionPerms::EXEC) {
@@ -2087,11 +2097,16 @@ impl AddressSpace {
         if region.perms.prot_only().0 == 0 {
             return Ok(());
         }
+        let cow_counts = region
+            .perms
+            .contains(RegionPerms::COW)
+            .then(|| crate::frame::cow::count_batch(&region.phys));
         for (index, phys) in region.phys.iter().copied().enumerate() {
             if phys.raw() == 0 {
                 continue;
             }
-            let mut flags = if user_page_writable(region.perms, phys) {
+            let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[index]);
+            let mut flags = if user_page_writable_at_count(region.perms, phys, cow_count) {
                 PtFlags::AP_RW_EL0
             } else {
                 PtFlags::AP_RO_EL0
@@ -2130,7 +2145,7 @@ impl AddressSpace {
     /// Borrowed (SHARED) frames belong to an external registry — never
     /// freed here. Callers must have completed the cross-CPU flush first.
     fn free_region_frames(&self, region: &Region) {
-        use crate::frame::{free_frame, PhysFrame};
+        use crate::frame::{free_frame_batch, PhysFrame};
         if region.perms.contains(RegionPerms::SHARED) {
             for phys in &region.phys {
                 release_shared_phys(*phys);
@@ -2138,20 +2153,19 @@ impl AddressSpace {
             return;
         }
         let pages = (region.len + 0xFFF) >> 12;
-        for i in 0..pages {
-            let phys = match region.phys.get(i as usize) {
-                Some(p) if p.raw() != 0 => *p,
-                // Demand-paged-but-untouched (phys 0) or a length
-                // mismatch: nothing this region owns to free here.
-                _ => continue,
-            };
-            // No `__pagetable_is_registered` guard here: a region's
-            // backing list only ever holds DATA frames (the loader,
-            // demand_alloc, and cow_split all populate it), never a
-            // page-table page — so the check could never fire, and at
-            // O(PT_REGISTRY_LEN) per page it was a real teardown cost.
-            free_frame(PhysFrame::new(phys));
-        }
+        let frames: Vec<PhysFrame> = region
+            .phys
+            .iter()
+            .take(pages as usize)
+            .copied()
+            .filter(|phys| phys.raw() != 0)
+            .map(PhysFrame::new)
+            .collect();
+        // No `__pagetable_is_registered` guard here: a region's backing list
+        // only ever holds DATA frames. Leaf retirement and the cross-CPU TLB
+        // flush completed before this call, so the allocator may now drop all
+        // owners while locking each touched COW shard once.
+        free_frame_batch(&frames);
     }
 
     /// Number of mapped regions.
@@ -4055,7 +4069,7 @@ impl AddressSpace {
         // the same "backed bookkeeping over an absent PTE" terminal
         // state (an infinite-#PF loop before `demand_alloc_page`
         // learned to self-heal it).
-        let mut to_release: Vec<PhysAddr> = Vec::new();
+        let mut to_release: Vec<crate::frame::PhysFrame> = Vec::new();
         let mut touched = false;
         #[cfg(target_arch = "x86_64")]
         let discarded_swap;
@@ -4133,7 +4147,7 @@ impl AddressSpace {
                             crate::aarch64::paging::unmap_4kb(self.root, VirtAddr::new(v))
                         };
                     }
-                    to_release.push(p);
+                    to_release.push(crate::frame::PhysFrame::new(p));
                     r.phys[i] = PhysAddr::new(0);
                 }
             });
@@ -4149,16 +4163,10 @@ impl AddressSpace {
             self.flush_region_broadcast(base, (hi - lo) >> 12);
         }
         if self.root.as_u64() != 0 {
-            for p in to_release {
-                // `to_release` is sourced only from `Region.phys`; page-table
-                // frames are never stored there. Keep madvise(DONTNEED)
-                // proportional to the advised pages instead of scanning the
-                // global 16K-entry PT registry once per page.
-                // `free_frame` consults the COW refcount table, so a frame
-                // still shared with another AS stays live until its last
-                // owner releases it.
-                crate::frame::free_frame(crate::frame::PhysFrame::new(p));
-            }
+            // `to_release` is authoritative data backing only. The batched
+            // allocator path consults COW ownership once per touched shard;
+            // frames shared with another AS remain live.
+            crate::frame::free_frame_batch(&to_release);
         }
         Ok(())
     }
@@ -4209,6 +4217,10 @@ impl AddressSpace {
                     let _ = unsafe { unmap_4kb_local(self.root, v) };
                 }
             } else {
+                let cow_counts = r
+                    .perms
+                    .contains(RegionPerms::COW)
+                    .then(|| crate::frame::cow::count_batch(&r.phys));
                 for (i, p) in r.phys.iter().enumerate() {
                     // Skip demand-paged pages (phys == 0). They are
                     // NOT currently mapped (materialize skips them),
@@ -4222,7 +4234,8 @@ impl AddressSpace {
                         continue;
                     }
                     let mut flags = PtFlags::USER;
-                    if user_page_writable(r.perms, *p) {
+                    let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                    if user_page_writable_at_count(r.perms, *p, cow_count) {
                         flags |= PtFlags::WRITABLE;
                     }
                     if !r.perms.contains(RegionPerms::EXEC) {
@@ -4266,6 +4279,10 @@ impl AddressSpace {
                 }
                 continue;
             }
+            let cow_counts = r
+                .perms
+                .contains(RegionPerms::COW)
+                .then(|| crate::frame::cow::count_batch(&r.phys));
             for (i, p) in r.phys.iter().enumerate() {
                 // Lazy pages have no leaf to rewrite. Mapping the zero
                 // sentinel here would expose physical address zero after an
@@ -4276,7 +4293,8 @@ impl AddressSpace {
                 let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: see x86_64 variant.
                 let _ = unsafe { unmap_4kb(self.root, v) };
-                let mut flags = if user_page_writable(r.perms, *p) {
+                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                let mut flags = if user_page_writable_at_count(r.perms, *p, cow_count) {
                     PtFlags::AP_RW_EL0
                 } else {
                     PtFlags::AP_RO_EL0
@@ -4374,6 +4392,11 @@ impl AddressSpace {
                 None => (0, r.phys.len()),
             };
 
+            let cow_counts = r
+                .perms
+                .contains(RegionPerms::COW)
+                .then(|| crate::frame::cow::count_batch(&r.phys[first..last]));
+
             for i in first..last {
                 let p = r.phys[i];
                 // Lazy / unbacked: phys[i] == 0 means the
@@ -4384,7 +4407,8 @@ impl AddressSpace {
                     continue;
                 }
                 let mut flags = PtFlags::USER;
-                if user_page_writable(r.perms, p) {
+                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i - first]);
+                if user_page_writable_at_count(r.perms, p, cow_count) {
                     flags |= PtFlags::WRITABLE;
                 }
                 if !r.perms.contains(RegionPerms::EXEC) {
@@ -4465,12 +4489,17 @@ impl AddressSpace {
                 }
                 None => (0, r.phys.len()),
             };
+            let cow_counts = r
+                .perms
+                .contains(RegionPerms::COW)
+                .then(|| crate::frame::cow::count_batch(&r.phys[first..last]));
             for i in first..last {
                 let p = r.phys[i];
                 if p.raw() == 0 {
                     continue;
                 }
-                let mut flags = if user_page_writable(r.perms, p) {
+                let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i - first]);
+                let mut flags = if user_page_writable_at_count(r.perms, p, cow_count) {
                     PtFlags::AP_RW_EL0
                 } else {
                     PtFlags::AP_RO_EL0

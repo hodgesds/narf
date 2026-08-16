@@ -1252,6 +1252,19 @@ pub fn free_frame(f: PhysFrame) {
     }
 }
 
+/// Return a vector of independently owned base frames through the installed
+/// allocator. Alternative allocators inherit the scalar default; the buddy
+/// implementation batches COW-refcount shard acquisition before returning
+/// only last-owner frames to its NUMA caches/free lists.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
+pub fn free_frame_batch(frames: &[PhysFrame]) {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_free_caller(core::panic::Location::caller());
+    if let Some(allocator) = current_alloc() {
+        allocator.free_frame_batch(frames);
+    }
+}
+
 /// Buddy-backed implementation of `free_frame`.
 ///
 /// COW interaction: if the frame has a refcount > 1 (multiple
@@ -1273,6 +1286,12 @@ fn buddy_free_frame(f: PhysFrame) {
         // Other ASes still reference this frame; don't return it.
         return;
     }
+    buddy_return_unreferenced_frame(f);
+}
+
+/// Return a frame after the caller has established that no COW owner remains.
+/// This is the common accounting/scrub/NUMA path for scalar and batched free.
+fn buddy_return_unreferenced_frame(f: PhysFrame) {
     // cgroup memory uncharge: only here, where the frame is genuinely
     // returned to the buddy — i.e. the COW refcount has reached 0 — does
     // it balance the single charge taken at `alloc_frame_on`. The
@@ -1298,6 +1317,17 @@ fn buddy_free_frame(f: PhysFrame) {
     let frame_no = buddy::frame_no(f);
     if !free_order0_to_cache(zone_idx, frame_no) {
         ZONES[zone_idx].0.lock().free(frame_no, 0);
+    }
+}
+
+fn buddy_free_frame_batch(frames: &[PhysFrame]) {
+    let valid: Vec<PhysAddr> = frames
+        .iter()
+        .map(|frame| frame.start_address())
+        .filter(|phys| phys.raw() >= LOW_RESERVED_BYTES)
+        .collect();
+    for phys in cow::dec_ref_batch(&valid) {
+        buddy_return_unreferenced_frame(PhysFrame::new(phys));
     }
 }
 
@@ -1593,6 +1623,49 @@ pub mod cow {
         }
     }
 
+    /// Drop one owner for every non-zero input and return exactly the frames
+    /// whose final COW owner was removed (or which were never registered).
+    ///
+    /// Results preserve input order within each shard only; callers must treat
+    /// them as an ownership set, not as a positional mask. Duplicate inputs
+    /// are processed as distinct owner drops. Each touched shard is locked
+    /// once, eliminating per-page IRQ disable/restore cycles during teardown.
+    pub fn dec_ref_batch(frames: &[PhysAddr]) -> Vec<PhysAddr> {
+        let mut by_shard: [Vec<usize>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
+        for (index, phys) in frames.iter().enumerate() {
+            let key = phys.raw();
+            if key != 0 {
+                by_shard[ref_shard(key)].push(index);
+            }
+        }
+
+        let mut releasable = Vec::new();
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let mut guard = REFCOUNTS[shard].map.lock();
+            for index in indices {
+                let phys = frames[index];
+                let Some(map) = guard.as_mut() else {
+                    releasable.push(phys);
+                    continue;
+                };
+                let key = phys.raw();
+                let Some(entry) = map.get(&key) else {
+                    releasable.push(phys);
+                    continue;
+                };
+                let previous = entry.fetch_sub(1, Ordering::AcqRel);
+                if previous <= 1 {
+                    map.remove(&key);
+                    releasable.push(phys);
+                }
+            }
+        }
+        releasable
+    }
+
     /// Read-only peek at a frame's refcount. Returns 0 if the
     /// frame was never registered; otherwise the current count.
     pub fn count(phys: PhysAddr) -> u32 {
@@ -1604,6 +1677,41 @@ pub mod cow {
             .and_then(|m| m.get(&key))
             .map(|c| c.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Snapshot COW counts in the same order as `frames`.
+    ///
+    /// Each touched shard is locked once, so page-table construction can
+    /// derive permissions for a complete region without one IRQ-disabling
+    /// lock acquisition per leaf. Zero/unregistered frames report zero and
+    /// duplicate inputs receive identical snapshots.
+    pub fn count_batch(frames: &[PhysAddr]) -> Vec<u32> {
+        let mut counts = alloc::vec![0; frames.len()];
+        let mut by_shard: [Vec<usize>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
+        for (index, phys) in frames.iter().enumerate() {
+            let key = phys.raw();
+            if key != 0 {
+                by_shard[ref_shard(key)].push(index);
+            }
+        }
+
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let guard = REFCOUNTS[shard].map.lock();
+            let Some(map) = guard.as_ref() else {
+                continue;
+            };
+            for index in indices {
+                let key = frames[index].raw();
+                counts[index] = map
+                    .get(&key)
+                    .map(|count| count.load(Ordering::Acquire))
+                    .unwrap_or(0);
+            }
+        }
+        counts
     }
 
     /// Test hook — drop every recorded refcount. Tests that
@@ -2031,6 +2139,14 @@ pub trait FrameAlloc: Send + Sync {
     /// Return a frame to the pool. Impls that don't support freeing
     /// (e.g. `BumpFrameAlloc`) may treat this as a no-op.
     fn free_frame(&self, frame: PhysFrame);
+    /// Return multiple independently owned base frames. The default preserves
+    /// compatibility for simple allocators; implementations may coalesce
+    /// metadata locking while retaining scalar ownership semantics.
+    fn free_frame_batch(&self, frames: &[PhysFrame]) {
+        for frame in frames {
+            self.free_frame(*frame);
+        }
+    }
     /// Snapshot of allocator usage.
     fn stats(&self) -> FrameStats;
 }
@@ -2061,6 +2177,9 @@ impl FrameAlloc for BuddyFrameAlloc {
     }
     fn free_frame(&self, frame: PhysFrame) {
         buddy_free_frame(frame);
+    }
+    fn free_frame_batch(&self, frames: &[PhysFrame]) {
+        buddy_free_frame_batch(frames);
     }
     fn stats(&self) -> FrameStats {
         buddy_stats()
