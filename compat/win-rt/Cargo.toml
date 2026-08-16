@@ -12,7 +12,7 @@ name = "narf_compat_win_rt"
 path = "src/lib.rs"
 
 [dependencies]
-narf-user-runtime = { path = "../../user-runtime" }
+narf-user-runtime = { path = "../../user-runtime", version = "0.1.0" }
 
 [lints]
 workspace = true

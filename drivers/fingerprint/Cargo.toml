@@ -12,10 +12,10 @@ name = "narf_drivers_fingerprint"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-console      = { path = "../../console" }
-narf-init         = { path = "../../init" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
 
 [features]
 kernel-test = []

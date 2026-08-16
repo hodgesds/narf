@@ -12,70 +12,70 @@ name = "narf_verification"
 path = "src/lib.rs"
 
 [dependencies]
-narf-kernel-test  = { path = "kernel-test" }
-narf-lib         = { path = "../lib" }
-narf-acpi        = { path = "../acpi" }
-narf-aml         = { path = "../aml" }
-narf-arch        = { path = "../arch" }
-narf-memory      = { path = "../memory" }
-narf-scheduler   = { path = "../scheduler" }
-narf-capabilities = { path = "../capabilities" }
-narf-tracing    = { path = "../tracing" }
-narf-bpf        = { path = "../bpf" }
-narf-bpf-structops = { path = "../bpf/structops" }
-narf-bpf-idle   = { path = "../bpf-idle" }
-narf-bpf-leds   = { path = "../bpf-leds" }
-narf-bus        = { path = "../bus" }
-narf-boot       = { path = "../boot" }
-narf-rcu        = { path = "../rcu" }
-narf-ipc        = { path = "../ipc" }
-narf-abi        = { path = "../abi" }
-narf-io         = { path = "../io" }
-narf-drivers    = { path = "../drivers" }
-narf-drivers-virtio = { path = "../drivers/virtio" }
-narf-input        = { path = "../input" }
-narf-input-driver = { path = "../drivers/input" }
-narf-graphics     = { path = "../graphics" }
-narf-graphics-driver = { path = "../drivers/graphics" }
-narf-init         = { path = "../init" }
-narf-fb           = { path = "../fb" }
-narf-audio        = { path = "../audio" }
-narf-wireless     = { path = "../wireless" }
-narf-accel        = { path = "../accel" }
-narf-tpm          = { path = "../tpm" }
-narf-i3c          = { path = "../i3c" }
-narf-shmem        = { path = "../shmem" }
-narf-firmware     = { path = "../firmware" }
-narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
-narf-firmware-smbios = { path = "../firmware/smbios" }
-narf-block      = { path = "../block" }
-narf-console    = { path = "../console" }
-narf-interrupts = { path = "../interrupts" }
-narf-time       = { path = "../time" }
-narf-crypto     = { path = "../crypto" }
-narf-net        = { path = "../net" }
-narf-filesystem = { path = "../filesystem" }
-narf-power      = { path = "../power" }
-narf-observability = { path = "../observability" }
-narf-userspace  = { path = "../userspace" }
+narf-kernel-test  = { path = "kernel-test", version = "0.1.0" }
+narf-lib         = { path = "../lib", version = "0.1.0" }
+narf-acpi        = { path = "../acpi", version = "0.1.0" }
+narf-aml         = { path = "../aml", version = "0.1.0" }
+narf-arch        = { path = "../arch", version = "0.1.0" }
+narf-memory      = { path = "../memory", version = "0.1.0" }
+narf-scheduler   = { path = "../scheduler", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-tracing    = { path = "../tracing", version = "0.1.0" }
+narf-bpf        = { path = "../bpf", version = "0.1.0" }
+narf-bpf-structops = { path = "../bpf/structops", version = "0.1.0" }
+narf-bpf-idle   = { path = "../bpf-idle", version = "0.1.0" }
+narf-bpf-leds   = { path = "../bpf-leds", version = "0.1.0" }
+narf-bus        = { path = "../bus", version = "0.1.0" }
+narf-boot       = { path = "../boot", version = "0.1.0" }
+narf-rcu        = { path = "../rcu", version = "0.1.0" }
+narf-ipc        = { path = "../ipc", version = "0.1.0" }
+narf-abi        = { path = "../abi", version = "0.1.0" }
+narf-io         = { path = "../io", version = "0.1.0" }
+narf-drivers    = { path = "../drivers", version = "0.1.0" }
+narf-drivers-virtio = { path = "../drivers/virtio", version = "0.1.0" }
+narf-input        = { path = "../input", version = "0.1.0" }
+narf-input-driver = { path = "../drivers/input", version = "0.1.0" }
+narf-graphics     = { path = "../graphics", version = "0.1.0" }
+narf-graphics-driver = { path = "../drivers/graphics", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-fb           = { path = "../fb", version = "0.1.0" }
+narf-audio        = { path = "../audio", version = "0.1.0" }
+narf-wireless     = { path = "../wireless", version = "0.1.0" }
+narf-accel        = { path = "../accel", version = "0.1.0" }
+narf-tpm          = { path = "../tpm", version = "0.1.0" }
+narf-i3c          = { path = "../i3c", version = "0.1.0" }
+narf-shmem        = { path = "../shmem", version = "0.1.0" }
+narf-firmware     = { path = "../firmware", version = "0.1.0" }
+narf-firmware-fw-cfg = { path = "../firmware/fw_cfg", version = "0.1.0" }
+narf-firmware-smbios = { path = "../firmware/smbios", version = "0.1.0" }
+narf-block      = { path = "../block", version = "0.1.0" }
+narf-console    = { path = "../console", version = "0.1.0" }
+narf-interrupts = { path = "../interrupts", version = "0.1.0" }
+narf-time       = { path = "../time", version = "0.1.0" }
+narf-crypto     = { path = "../crypto", version = "0.1.0" }
+narf-net        = { path = "../net", version = "0.1.0" }
+narf-filesystem = { path = "../filesystem", version = "0.1.0" }
+narf-power      = { path = "../power", version = "0.1.0" }
+narf-observability = { path = "../observability", version = "0.1.0" }
+narf-userspace  = { path = "../userspace", version = "0.1.0" }
 # Optional: pulled in only under `boot-init` so default builds
 # don't trigger the busybox download + make. Falls back to an
 # empty slice when musl-gcc isn't on the host (see busybox
 # crate's build.rs).
-narf-busybox    = { path = "busybox", optional = true }
-narf-drivers-nvme = { path = "../drivers/nvme" }
-narf-drivers-net  = { path = "../drivers/net" }
-narf-drivers-gpu  = { path = "../drivers/gpu" }
-narf-drivers-storage = { path = "../drivers/storage" }
-narf-drivers-usb     = { path = "../drivers/usb" }
-narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
-narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
-narf-drivers-platform = { path = "../drivers/platform" }
-narf-drivers-sound = { path = "../drivers/sound" }
-narf-drivers-hwmon   = { path = "../drivers/hwmon", features = ["kernel-test"] }
-narf-drivers-extcon  = { path = "../drivers/extcon", features = ["kernel-test"] }
-narf-compat-win   = { path = "../compat/win" }
-narf-modules      = { path = "../modules" }
+narf-busybox    = { path = "busybox", version = "0.1.0", optional = true }
+narf-drivers-nvme = { path = "../drivers/nvme", version = "0.1.0" }
+narf-drivers-net  = { path = "../drivers/net", version = "0.1.0" }
+narf-drivers-gpu  = { path = "../drivers/gpu", version = "0.1.0" }
+narf-drivers-storage = { path = "../drivers/storage", version = "0.1.0" }
+narf-drivers-usb     = { path = "../drivers/usb", version = "0.1.0" }
+narf-drivers-thunderbolt = { path = "../drivers/thunderbolt", version = "0.1.0" }
+narf-drivers-fingerprint = { path = "../drivers/fingerprint", version = "0.1.0" }
+narf-drivers-platform = { path = "../drivers/platform", version = "0.1.0" }
+narf-drivers-sound = { path = "../drivers/sound", version = "0.1.0" }
+narf-drivers-hwmon   = { path = "../drivers/hwmon", version = "0.1.0", features = ["kernel-test"] }
+narf-drivers-extcon  = { path = "../drivers/extcon", version = "0.1.0", features = ["kernel-test"] }
+narf-compat-win   = { path = "../compat/win", version = "0.1.0" }
+narf-modules      = { path = "../modules", version = "0.1.0" }
 
 [features]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the

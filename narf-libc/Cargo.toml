@@ -1,7 +1,7 @@
 [package]
 name         = "narf-libc"
 description  = "relibc-shaped libc shim for NARF user binaries (Path B)"
-version      = "0.0.0"
+version      = "0.1.0"
 edition      = "2021"
 rust-version = "1.85"
 license      = "GPL-2.0-or-later"
@@ -12,7 +12,7 @@ name = "narf_libc"
 path = "src/lib.rs"
 
 [dependencies]
-narf-user-runtime = { path = "../user-runtime" }
+narf-user-runtime = { path = "../user-runtime", version = "0.1.0" }
 
 # Sibling-of-narf-testbin pattern: terminate the workspace walk so
 # the kernel workspace's fat-LTO release settings + code-model=kernel

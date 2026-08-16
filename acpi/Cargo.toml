@@ -12,10 +12,10 @@ name = "narf_acpi"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib         = { path = "../lib" }
-narf-memory      = { path = "../memory" }
-narf-arch        = { path = "../arch" }
-narf-kernel-test = { path = "../verification/kernel-test" }
+narf-lib         = { path = "../lib", version = "0.1.0" }
+narf-memory      = { path = "../memory", version = "0.1.0" }
+narf-arch        = { path = "../arch", version = "0.1.0" }
+narf-kernel-test = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

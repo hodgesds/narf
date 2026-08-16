@@ -12,7 +12,7 @@ name = "narf_pinctrl"
 path = "src/lib.rs"
 
 [dependencies]
-narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [features]
 kernel-test = []

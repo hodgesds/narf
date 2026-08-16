@@ -12,13 +12,13 @@ name = "narf_graphics_driver"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-graphics     = { path = "../../graphics" }
-narf-bus          = { path = "../../bus" }
-narf-capabilities = { path = "../../capabilities" }
-narf-memory       = { path = "../../memory" }
-narf-drivers      = { path = "../../drivers" }
-narf-init         = { path = "../../init" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-graphics     = { path = "../../graphics", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-drivers      = { path = "../../drivers", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
 
 [lints]
 workspace = true

@@ -15,8 +15,8 @@ default = []
 kernel-test = ["dep:narf-kernel-test"]
 
 [dependencies]
-narf-bpf-isa = { path = "../isa" }
-narf-kernel-test = { path = "../../verification/kernel-test", optional = true }
+narf-bpf-isa = { path = "../isa", version = "0.1.0" }
+narf-kernel-test = { path = "../../verification/kernel-test", version = "0.1.0", optional = true }
 
 [lints]
 workspace = true

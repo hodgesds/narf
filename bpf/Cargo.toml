@@ -44,24 +44,24 @@ bench = ["dep:narf-bpf-bench"]
 cgroup = ["narf-memory/cgroup"]
 
 [dependencies]
-narf-bpf-isa      = { path = "isa" }
-narf-bpf-verifier = { path = "verifier" }
-narf-bpf-jit      = { path = "jit" }
-narf-lib          = { path = "../lib" }
-narf-memory       = { path = "../memory" }
-narf-rcu          = { path = "../rcu" }
-narf-arch         = { path = "../arch" }
-narf-capabilities = { path = "../capabilities" }
-narf-crypto       = { path = "../crypto" }
-narf-filesystem   = { path = "../filesystem" }
-narf-net          = { path = "../net" }
-narf-tracing      = { path = "../tracing" }
-narf-init         = { path = "../init" }
-narf-time         = { path = "../time" }
-narf-kernel-test  = { path = "../verification/kernel-test", optional = true }
-narf-boot         = { path = "../boot", optional = true }
-narf-console      = { path = "../console", optional = true }
-narf-bpf-bench    = { path = "bench", optional = true }
+narf-bpf-isa      = { path = "isa", version = "0.1.0" }
+narf-bpf-verifier = { path = "verifier", version = "0.1.0" }
+narf-bpf-jit      = { path = "jit", version = "0.1.0" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-rcu          = { path = "../rcu", version = "0.1.0" }
+narf-arch         = { path = "../arch", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-crypto       = { path = "../crypto", version = "0.1.0" }
+narf-filesystem   = { path = "../filesystem", version = "0.1.0" }
+narf-net          = { path = "../net", version = "0.1.0" }
+narf-tracing      = { path = "../tracing", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-time         = { path = "../time", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0", optional = true }
+narf-boot         = { path = "../boot", version = "0.1.0", optional = true }
+narf-console      = { path = "../console", version = "0.1.0", optional = true }
+narf-bpf-bench    = { path = "bench", version = "0.1.0", optional = true }
 
 [lints]
 workspace = true

@@ -12,10 +12,10 @@ name = "narf_boot"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib    = { path = "../lib" }
-narf-memory = { path = "../memory" }
-narf-firmware-fdt = { path = "../firmware/fdt" }
-narf-kernel-test = { path = "../verification/kernel-test" }
+narf-lib    = { path = "../lib", version = "0.1.0" }
+narf-memory = { path = "../memory", version = "0.1.0" }
+narf-firmware-fdt = { path = "../firmware/fdt", version = "0.1.0" }
+narf-kernel-test = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [features]
 kernel-test = []

@@ -30,22 +30,23 @@ Developers working from a source checkout may install the optional Cargo
 subcommand:
 
 ```sh
-cargo install --path build/cargo-narf
+cargo install cargo-narf
 cargo narf detect
-cargo narf package --version 0.5.0 --formats auto
+cargo narf package --version 0.1.0 --formats auto
 ```
 
 `auto` reads `/etc/os-release`. The wrapper locates the checkout and calls the
 same reproducible `build-release.sh` path used by release CI; it does not carry
-a second package implementation.
+a second package implementation. Run it inside a NARF checkout or pass
+`--repo /path/to/narf` explicitly.
 
 For a local installation, the explicit `install` command builds one native
 artifact and delegates it to the host package manager:
 
 ```sh
-cargo narf install --version 0.5.0
+cargo narf install --version 0.1.0
 # Inspect the final privileged command without executing it:
-cargo narf install --version 0.5.0 --dry-run
+cargo narf install --version 0.1.0 --dry-run
 ```
 
 Debian-family systems use apt/dpkg, RPM-family systems use dnf/rpm, and Arch
@@ -55,10 +56,34 @@ files into `/boot` itself: package ownership, upgrade ordering and removal stay
 with the native distribution database. End users installing release `.deb`,
 `.rpm`, or `.pkg.tar.zst` artifacts do not need Cargo or a Rust toolchain.
 
+## Crates.io SDK release
+
+Reusable workspace components and `cargo-narf` are published at one
+synchronized version so custom kernels can consume a coherent dependency graph.
+In-tree manifests retain `path` dependencies for development and also specify
+the matching registry version used outside the repository. The separately
+rooted `narf-libc` is injected into the release graph after
+`narf-user-runtime`; repository-only `xtask` and validation/boot helpers remain
+private.
+
+Inspect the deterministic dependency order or package-check the complete
+release without uploading:
+
+```sh
+packaging/publish-crates.sh --version 0.1.0 --plan
+packaging/publish-crates.sh --version 0.1.0 --check
+```
+
+The release workflow runs the same preflight and invokes `--execute` only from
+the matching clean, annotated, maintainer-signed tag. It requires the scoped
+`CRATES_IO_TOKEN` repository secret. Uploads are dependency ordered and
+resumable: an exact crate version already visible on crates.io is skipped. A
+human maintainer must create and sign the release tag; AI agents may not do so.
+
 Build every format available on the current host:
 
 ```sh
-packaging/build-release.sh --version 0.5.0 --formats all
+packaging/build-release.sh --version 0.1.0 --formats all
 ```
 
 The script builds `target/x86_64-unknown-none/release/narf-frame` through
@@ -77,14 +102,14 @@ To test packaging without compiling the kernel, provide that canonical kernel
 artifact and use `--skip-build`:
 
 ```sh
-packaging/build-release.sh --version 0.5.0 --skip-build
+packaging/build-release.sh --version 0.1.0 --skip-build
 ```
 
 ## Tagging
 
-`prepare-tag.sh 0.5.0` validates the version, clean tree, current branch, and
+`prepare-tag.sh 0.1.0` validates the version, clean tree, current branch, and
 release commit. It prints the signed-tag command by default. A human maintainer
-may pass `--create` to create the signed `v0.5.0` tag locally, then push it
+may pass `--create` to create the signed `v0.1.0` tag locally, then push it
 after review. The tool never pushes and AI agents must never create or sign a
 release tag.
 

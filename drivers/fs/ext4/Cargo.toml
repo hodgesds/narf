@@ -19,20 +19,20 @@ path = "src/lib.rs"
 # the ext4-specific contract (must have EXTENTS, must validate
 # extent-tree on every inode) on top.
 [dependencies]
-narf-lib              = { path = "../../../lib" }
-narf-arch             = { path = "../../../arch" }
-narf-drivers          = { path = "../../" }
-narf-driver-runtime   = { path = "../../runtime" }
-narf-capabilities     = { path = "../../../capabilities" }
-narf-memory           = { path = "../../../memory" }
-narf-block            = { path = "../../../block" }
-narf-filesystem       = { path = "../../../filesystem" }
-narf-io               = { path = "../../../io" }
-narf-init             = { path = "../../../init" }
-narf-scheduler        = { path = "../../../scheduler" }
-narf-time             = { path = "../../../time" }
-narf-drivers-fs-ext2  = { path = "../ext2" }
-narf-kernel-test      = { path = "../../../verification/kernel-test" }
+narf-lib              = { path = "../../../lib", version = "0.1.0" }
+narf-arch             = { path = "../../../arch", version = "0.1.0" }
+narf-drivers          = { path = "../../", version = "0.1.0" }
+narf-driver-runtime   = { path = "../../runtime", version = "0.1.0" }
+narf-capabilities     = { path = "../../../capabilities", version = "0.1.0" }
+narf-memory           = { path = "../../../memory", version = "0.1.0" }
+narf-block            = { path = "../../../block", version = "0.1.0" }
+narf-filesystem       = { path = "../../../filesystem", version = "0.1.0" }
+narf-io               = { path = "../../../io", version = "0.1.0" }
+narf-init             = { path = "../../../init", version = "0.1.0" }
+narf-scheduler        = { path = "../../../scheduler", version = "0.1.0" }
+narf-time             = { path = "../../../time", version = "0.1.0" }
+narf-drivers-fs-ext2  = { path = "../ext2", version = "0.1.0" }
+narf-kernel-test      = { path = "../../../verification/kernel-test", version = "0.1.0" }
 
 [lints]
 workspace = true

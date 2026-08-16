@@ -12,24 +12,24 @@ name = "narf_audio"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-capabilities = { path = "../capabilities" }
-narf-firmware     = { path = "../firmware" }
-narf-init         = { path = "../init" }
-narf-memory       = { path = "../memory" }
-narf-userspace    = { path = "../userspace" }
-narf-drivers-virtio = { path = "../drivers/virtio" }
-narf-shmem        = { path = "../shmem" }
-narf-arch         = { path = "../arch" }
-narf-bus          = { path = "../bus" }
-narf-io           = { path = "../io" }
-narf-drivers      = { path = "../drivers" }
-narf-interrupts   = { path = "../interrupts" }
-narf-acpi         = { path = "../acpi" }
-narf-aml          = { path = "../aml" }
-narf-scheduler    = { path = "../scheduler" }
-narf-time         = { path = "../time" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-firmware     = { path = "../firmware", version = "0.1.0" }
+narf-init         = { path = "../init", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-userspace    = { path = "../userspace", version = "0.1.0" }
+narf-drivers-virtio = { path = "../drivers/virtio", version = "0.1.0" }
+narf-shmem        = { path = "../shmem", version = "0.1.0" }
+narf-arch         = { path = "../arch", version = "0.1.0" }
+narf-bus          = { path = "../bus", version = "0.1.0" }
+narf-io           = { path = "../io", version = "0.1.0" }
+narf-drivers      = { path = "../drivers", version = "0.1.0" }
+narf-interrupts   = { path = "../interrupts", version = "0.1.0" }
+narf-acpi         = { path = "../acpi", version = "0.1.0" }
+narf-aml          = { path = "../aml", version = "0.1.0" }
+narf-scheduler    = { path = "../scheduler", version = "0.1.0" }
+narf-time         = { path = "../time", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
 
 [features]
 kernel-test = []

@@ -12,20 +12,20 @@ name = "narf_drivers_nvme"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
-narf-io           = { path = "../../io" }
-narf-memory       = { path = "../../memory" }
-narf-block        = { path = "../../block" }
-narf-bus          = { path = "../../bus" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-scheduler    = { path = "../../scheduler" }
-narf-time         = { path = "../../time" }
-narf-drivers      = { path = "../../drivers" }
-narf-init         = { path = "../../init" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-arch         = { path = "../../arch" }
-narf-power        = { path = "../../power" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-io           = { path = "../../io", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-block        = { path = "../../block", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-scheduler    = { path = "../../scheduler", version = "0.1.0" }
+narf-time         = { path = "../../time", version = "0.1.0" }
+narf-drivers      = { path = "../../drivers", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
+narf-arch         = { path = "../../arch", version = "0.1.0" }
+narf-power        = { path = "../../power", version = "0.1.0" }
 
 [lints]
 workspace = true

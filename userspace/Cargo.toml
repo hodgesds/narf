@@ -12,31 +12,31 @@ name = "narf_userspace"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../lib" }
-narf-arch         = { path = "../arch" }
-narf-abi          = { path = "../abi" }
-narf-capabilities = { path = "../capabilities" }
-narf-console      = { path = "../console" }
-narf-filesystem   = { path = "../filesystem" }
-narf-block        = { path = "../block" }
-narf-drivers-fs-fat = { path = "../drivers/fs/fat" }
-narf-net          = { path = "../net" }
-narf-firmware     = { path = "../firmware" }
-narf-memory       = { path = "../memory" }
-narf-scheduler    = { path = "../scheduler" }
-narf-time         = { path = "../time" }
-narf-tracing      = { path = "../tracing" }
-narf-bpf          = { path = "../bpf" }
-narf-bpf-btf      = { path = "../bpf/btf" }
-narf-bpf-isa      = { path = "../bpf/isa" }
-narf-bpf-verifier = { path = "../bpf/verifier" }
-narf-initramfs    = { path = "../initramfs" }
-narf-input        = { path = "../input" }
-narf-interrupts   = { path = "../interrupts" }
-narf-linux-perf-uapi = { path = "../compat/linux-perf-uapi" }
-narf-kernel-test  = { path = "../verification/kernel-test" }
-narf-modules      = { path = "../modules" }
-narf-power        = { path = "../power" }
+narf-lib          = { path = "../lib", version = "0.1.0" }
+narf-arch         = { path = "../arch", version = "0.1.0" }
+narf-abi          = { path = "../abi", version = "0.1.0" }
+narf-capabilities = { path = "../capabilities", version = "0.1.0" }
+narf-console      = { path = "../console", version = "0.1.0" }
+narf-filesystem   = { path = "../filesystem", version = "0.1.0" }
+narf-block        = { path = "../block", version = "0.1.0" }
+narf-drivers-fs-fat = { path = "../drivers/fs/fat", version = "0.1.0" }
+narf-net          = { path = "../net", version = "0.1.0" }
+narf-firmware     = { path = "../firmware", version = "0.1.0" }
+narf-memory       = { path = "../memory", version = "0.1.0" }
+narf-scheduler    = { path = "../scheduler", version = "0.1.0" }
+narf-time         = { path = "../time", version = "0.1.0" }
+narf-tracing      = { path = "../tracing", version = "0.1.0" }
+narf-bpf          = { path = "../bpf", version = "0.1.0" }
+narf-bpf-btf      = { path = "../bpf/btf", version = "0.1.0" }
+narf-bpf-isa      = { path = "../bpf/isa", version = "0.1.0" }
+narf-bpf-verifier = { path = "../bpf/verifier", version = "0.1.0" }
+narf-initramfs    = { path = "../initramfs", version = "0.1.0" }
+narf-input        = { path = "../input", version = "0.1.0" }
+narf-interrupts   = { path = "../interrupts", version = "0.1.0" }
+narf-linux-perf-uapi = { path = "../compat/linux-perf-uapi", version = "0.1.0" }
+narf-kernel-test  = { path = "../verification/kernel-test", version = "0.1.0" }
+narf-modules      = { path = "../modules", version = "0.1.0" }
+narf-power        = { path = "../power", version = "0.1.0" }
 
 [features]
 # Default-on so the workspace's `cargo xtask kernel-test` driver

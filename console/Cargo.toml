@@ -12,9 +12,9 @@ name = "narf_console"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib    = { path = "../lib" }
-narf-arch   = { path = "../arch" }
-narf-memory = { path = "../memory" }
+narf-lib    = { path = "../lib", version = "0.1.0" }
+narf-arch   = { path = "../arch", version = "0.1.0" }
+narf-memory = { path = "../memory", version = "0.1.0" }
 
 [lints]
 workspace = true

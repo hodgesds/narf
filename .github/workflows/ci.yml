@@ -115,6 +115,15 @@ jobs:
       - name: Host unit-test gate
         run: cargo xtask host-test
 
+      - name: Crates.io publication plan
+        run: packaging/test-publish-crates.sh
+
+      - name: Crates.io package preflight
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "cargo-narf") | .version')"
+          packaging/publish-crates.sh --version "$version" --check
+
   clippy-kernel:
     name: clippy-kernel / ${{ matrix.arch }}
     needs: changes

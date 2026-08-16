@@ -12,25 +12,25 @@ name = "narf_drivers_net"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
-narf-io           = { path = "../../io" }
-narf-ipc          = { path = "../../ipc" }
-narf-net          = { path = "../../net" }
-narf-bus          = { path = "../../bus" }
-narf-console      = { path = "../../console" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-memory       = { path = "../../memory" }
-narf-arch         = { path = "../../arch" }
-narf-acpi         = { path = "../../acpi" }
-narf-aml          = { path = "../../aml" }
-narf-drivers      = { path = "../" }
-narf-init         = { path = "../../init" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
-narf-firmware    = { path = "../../firmware" }
-narf-scheduler   = { path = "../../scheduler" }
-narf-time        = { path = "../../time" }
+narf-lib          = { path = "../../lib", version = "0.1.0" }
+narf-capabilities = { path = "../../capabilities", version = "0.1.0" }
+narf-io           = { path = "../../io", version = "0.1.0" }
+narf-ipc          = { path = "../../ipc", version = "0.1.0" }
+narf-net          = { path = "../../net", version = "0.1.0" }
+narf-bus          = { path = "../../bus", version = "0.1.0" }
+narf-console      = { path = "../../console", version = "0.1.0" }
+narf-interrupts   = { path = "../../interrupts", version = "0.1.0" }
+narf-memory       = { path = "../../memory", version = "0.1.0" }
+narf-arch         = { path = "../../arch", version = "0.1.0" }
+narf-acpi         = { path = "../../acpi", version = "0.1.0" }
+narf-aml          = { path = "../../aml", version = "0.1.0" }
+narf-drivers      = { path = "../", version = "0.1.0" }
+narf-init         = { path = "../../init", version = "0.1.0" }
+narf-kernel-test  = { path = "../../verification/kernel-test", version = "0.1.0" }
+narf-driver-runtime = { path = "../runtime", version = "0.1.0", default-features = false, features = ["kernel"] }
+narf-firmware    = { path = "../../firmware", version = "0.1.0" }
+narf-scheduler   = { path = "../../scheduler", version = "0.1.0" }
+narf-time        = { path = "../../time", version = "0.1.0" }
 
 [lints]
 workspace = true
