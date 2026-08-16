@@ -798,6 +798,8 @@ pub(crate) unsafe fn map_2mb_locked(
     if pd.entries[idx.pd].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], table_flags);
+    promote_intermediate_flags(&mut pdpt.entries[idx.pdpt], table_flags);
     pd.entries[idx.pd] = PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
     unsafe { invlpg(virt) };
     Ok(())
@@ -853,6 +855,7 @@ pub(crate) unsafe fn map_1gb_locked(
     if pdpt.entries[idx.pdpt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], table_flags);
     pdpt.entries[idx.pdpt] =
         PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
     unsafe { invlpg(virt) };
@@ -1005,6 +1008,9 @@ unsafe fn map_4kb_locked(
     if pt.entries[idx.pt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], base_flags);
+    promote_intermediate_flags(&mut pdpt.entries[idx.pdpt], base_flags);
+    promote_intermediate_flags(&mut pd.entries[idx.pd], base_flags);
     pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
 
     // Diagnostic readback: if the leaf entry we just wrote doesn't
@@ -1080,6 +1086,9 @@ pub unsafe fn map_4kb_scatter_range(
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
     let mut cached_key = usize::MAX;
     let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pdpte: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pde: *mut PageTableEntry = core::ptr::null_mut();
     let mut changed = false;
     let mut has_global = false;
     let mut result = Ok(());
@@ -1090,6 +1099,10 @@ pub unsafe fn map_4kb_scatter_range(
         changed = true;
         let flags = flags_for(index, phys);
         has_global |= flags.contains(PtFlags::GLOBAL);
+        let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+        if flags.contains(PtFlags::USER) {
+            table_flags |= PtFlags::USER;
+        }
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
         let idx = WalkIndices::from_virt(virt);
         let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
@@ -1098,40 +1111,43 @@ pub unsafe fn map_4kb_scatter_range(
             #[cfg(feature = "kernel-test")]
             RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-            let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
-            if flags.contains(PtFlags::USER) {
-                table_flags |= PtFlags::USER;
-            }
             // SAFETY: every level is identity-reachable and the root lock is held.
-            let pdpt_phys =
-                match unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags) } {
-                    Ok(phys) => phys,
-                    Err(error) => {
-                        result = Err(error);
-                        break;
-                    }
-                };
-            // SAFETY: ensure_next_table returned a verified table descriptor.
-            let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
-            // SAFETY: the PDPT slot is live and root-locked for this mutation.
-            let pd_phys =
-                match unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], table_flags) } {
-                    Ok(phys) => phys,
-                    Err(error) => {
-                        result = Err(error);
-                        break;
-                    }
-                };
-            // SAFETY: ensure_next_table returned a verified table descriptor.
-            let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
-            // SAFETY: the PD slot is live and root-locked for this mutation.
-            let pt_phys = match unsafe { ensure_next_table(&mut pd.entries[idx.pd], table_flags) } {
+            let pml4e = &mut pml4.entries[idx.pml4];
+            // SAFETY: pml4e is a live root slot protected by the root lock.
+            let pdpt_phys = match unsafe { ensure_next_table(pml4e, table_flags) } {
                 Ok(phys) => phys,
                 Err(error) => {
                     result = Err(error);
                     break;
                 }
             };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PDPT slot is live and root-locked for this mutation.
+            let pdpte = &mut pdpt.entries[idx.pdpt];
+            // SAFETY: pdpte is a live slot protected by the root lock.
+            let pd_phys = match unsafe { ensure_next_table(pdpte, table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PD slot is live and root-locked for this mutation.
+            let pde = &mut pd.entries[idx.pd];
+            // SAFETY: pde is a live slot protected by the root lock.
+            let pt_phys = match unsafe { ensure_next_table(pde, table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            cached_pml4e = pml4e;
+            cached_pdpte = pdpte;
+            cached_pde = pde;
             cached_pt = pt_phys.as_mut_ptr::<PageTable>();
         }
 
@@ -1141,6 +1157,15 @@ pub unsafe fn map_4kb_scatter_range(
         if pt.entries[idx.pt].is_present() {
             result = Err(MapError::AlreadyMapped);
             break;
+        }
+        // Re-evaluate every leaf's permissions independently. Only the table
+        // identity is cached; no permission decision is memoized.
+        // SAFETY: all three pointers were captured from the verified walk for
+        // cached_key and remain stable under the root mutation guard.
+        unsafe {
+            promote_intermediate_flags(&mut *cached_pml4e, table_flags);
+            promote_intermediate_flags(&mut *cached_pdpte, table_flags);
+            promote_intermediate_flags(&mut *cached_pde, table_flags);
         }
         pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
         debug_assert_eq!(pt.entries[idx.pt].addr(), phys);
@@ -1214,6 +1239,9 @@ pub unsafe fn rewrite_4kb_scatter_range(
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
     let mut cached_key = usize::MAX;
     let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pdpte: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pde: *mut PageTableEntry = core::ptr::null_mut();
     for (index, phys) in backing.iter().copied().enumerate() {
         if phys.raw() == 0 {
             continue;
@@ -1228,11 +1256,11 @@ pub unsafe fn rewrite_4kb_scatter_range(
             #[cfg(feature = "kernel-test")]
             RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-            let pml4e = pml4.entries[idx.pml4];
+            let pml4e = &mut pml4.entries[idx.pml4];
             if pml4e.is_present() {
                 // SAFETY: verified present table descriptor under root lock.
                 let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
-                let pdpte = pdpt.entries[idx.pdpt];
+                let pdpte = &mut pdpt.entries[idx.pdpt];
                 if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
                     result = Err(MapError::EncounteredHugePage);
                     break;
@@ -1240,12 +1268,15 @@ pub unsafe fn rewrite_4kb_scatter_range(
                 if pdpte.is_present() {
                     // SAFETY: verified PDPT table descriptor under root lock.
                     let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
-                    let pde = pd.entries[idx.pd];
+                    let pde = &mut pd.entries[idx.pd];
                     if pde.flags().contains(PtFlags::HUGE_PAGE) {
                         result = Err(MapError::EncounteredHugePage);
                         break;
                     }
                     if pde.is_present() {
+                        cached_pml4e = pml4e;
+                        cached_pdpte = pdpte;
+                        cached_pde = pde;
                         cached_pt = pde.addr().as_mut_ptr::<PageTable>();
                     }
                 }
@@ -1261,6 +1292,19 @@ pub unsafe fn rewrite_4kb_scatter_range(
             // The next page must rediscover the table just created.
             cached_key = usize::MAX;
         } else {
+            let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+            if flags.contains(PtFlags::USER) {
+                table_flags |= PtFlags::USER;
+            }
+            // Permission requirements are derived per leaf; only verified
+            // descriptor addresses are cached under the root lock.
+            // SAFETY: pointers came from this cached key's verified walk and
+            // remain live while the root mutation guard is held.
+            unsafe {
+                promote_intermediate_flags(&mut *cached_pml4e, table_flags);
+                promote_intermediate_flags(&mut *cached_pdpte, table_flags);
+                promote_intermediate_flags(&mut *cached_pde, table_flags);
+            }
             // SAFETY: cached_pt came from the verified PDE for this key and
             // remains stable under the root mutation guard.
             let pt = unsafe { &mut *cached_pt };
@@ -1800,4 +1844,14 @@ unsafe fn ensure_next_table(
     PageTable::zero_at(phys.as_mut_ptr::<PageTable>());
     *slot = PageTableEntry::new(phys, flags);
     Ok(phys)
+}
+
+/// Add permissions required by a new descendant leaf to an existing table
+/// descriptor. Leaf permissions remain authoritative: setting USER/WRITABLE
+/// here cannot grant either permission through a supervisor/read-only leaf.
+#[inline]
+fn promote_intermediate_flags(slot: &mut PageTableEntry, required: PtFlags) {
+    debug_assert!(slot.is_present());
+    debug_assert!(!slot.flags().contains(PtFlags::HUGE_PAGE));
+    *slot = PageTableEntry::from_raw(slot.raw() | required.bits());
 }

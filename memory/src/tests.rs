@@ -743,10 +743,37 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     #[cfg(feature = "kernel-test")]
     use crate::paging::__range_pt_walks_for_test;
     use crate::paging::{
-        flags_at, map_4kb_scatter_range, rewrite_4kb_scatter_range, translate,
-        unmap_4kb_local_range, PageTable, PtFlags,
+        flags_at, map_4kb, map_4kb_scatter_range, rewrite_4kb_scatter_range, translate,
+        unmap_4kb_local_range, PageTable, PtFlags, WalkIndices,
     };
     use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    unsafe fn upper_user_bits(root: PhysAddr, virt: VirtAddr) -> Option<[bool; 3]> {
+        let idx = WalkIndices::from_virt(virt);
+        // SAFETY: the caller supplies a live, identity-reachable isolated root.
+        let pml4 = unsafe { &*root.as_ptr::<PageTable>() };
+        let pml4e = pml4.entries[idx.pml4];
+        if !pml4e.is_present() {
+            return None;
+        }
+        // SAFETY: the present non-leaf entry was created by map_4kb below.
+        let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+        let pdpte = pdpt.entries[idx.pdpt];
+        if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+            return None;
+        }
+        // SAFETY: the verified non-huge entry names a live PD.
+        let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+        let pde = pd.entries[idx.pd];
+        if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+            return None;
+        }
+        Some([
+            pml4e.flags().contains(PtFlags::USER),
+            pdpte.flags().contains(PtFlags::USER),
+            pde.flags().contains(PtFlags::USER),
+        ])
+    }
 
     let pml4 = match alloc_frame() {
         Ok(frame) => frame.start_address(),
@@ -845,6 +872,69 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     }
     // SAFETY: cleanup of the isolated boundary-spanning range.
     let _ = unsafe { unmap_4kb_local_range(pml4, boundary_base, 2) };
+
+    // A fresh PML4 slot keeps this mapping-order fixture independent from the
+    // earlier USER scatter mappings in slot zero.
+    let order_base = VirtAddr::new(0x0000_0100_0000_0000);
+    // SAFETY: fresh aligned leaf in the isolated root.
+    if unsafe {
+        map_4kb(
+            pml4,
+            order_base,
+            PhysAddr::new(0x1238_0000),
+            PtFlags::WRITABLE,
+        )
+    }
+    .is_err()
+    {
+        return TestResult::Fail("supervisor-first fixture map failed");
+    }
+    // SAFETY: read-only inspection of the live isolated hierarchy.
+    if unsafe { upper_user_bits(pml4, order_base) } != Some([false; 3]) {
+        return TestResult::Fail("supervisor mapping unexpectedly promoted upper USER bits");
+    }
+    // SAFETY: deliberate collision in the isolated root must fail without
+    // mutating intermediate permissions.
+    if unsafe {
+        map_4kb(
+            pml4,
+            order_base,
+            PhysAddr::new(0x1238_1000),
+            PtFlags::USER | PtFlags::WRITABLE,
+        )
+    } != Err(crate::paging::MapError::AlreadyMapped)
+    {
+        return TestResult::Fail("colliding USER map did not fail precisely");
+    }
+    // SAFETY: read-only inspection after the rejected mapping.
+    if unsafe { upper_user_bits(pml4, order_base) } != Some([false; 3]) {
+        return TestResult::Fail("failed USER map promoted intermediate permissions");
+    }
+    let user_virt = VirtAddr::new(order_base.raw() + 4096);
+    // SAFETY: adjacent leaf is absent and shares the isolated hierarchy.
+    if unsafe {
+        map_4kb(
+            pml4,
+            user_virt,
+            PhysAddr::new(0x1238_1000),
+            PtFlags::USER | PtFlags::WRITABLE,
+        )
+    }
+    .is_err()
+    {
+        return TestResult::Fail("user-second fixture map failed");
+    }
+    // SAFETY: read-only inspection after the successful USER mapping.
+    if unsafe { upper_user_bits(pml4, user_virt) } != Some([true; 3]) {
+        return TestResult::Fail("user mapping did not promote every upper USER bit");
+    }
+    // The upper promotion must not change the supervisor leaf's authority.
+    // SAFETY: read-only leaf walk of the live isolated root.
+    if unsafe { flags_at(pml4, order_base) }.is_some_and(|flags| flags.contains(PtFlags::USER)) {
+        return TestResult::Fail("upper promotion changed supervisor leaf authority");
+    }
+    // SAFETY: cleanup of both order-sensitive fixture leaves.
+    let _ = unsafe { unmap_4kb_local_range(pml4, order_base, 2) };
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

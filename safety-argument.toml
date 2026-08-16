@@ -475,3 +475,11 @@ argument = "The x86_64 scatter installer caches a PT pointer only after ensuring
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The cached x86_64 scatter installer remains internal to the existing memory page-table TCB and reuses its root lock, allocator, and local invalidation primitives. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Every successful x86_64 base-page or huge-page installation now ORs that leaf's independently derived USER/WRITABLE requirements into each verified non-huge intermediate descriptor after the destination leaf is proven absent; the permission-rewrite path performs the same promotion only after its complete structural walk succeeds. A supervisor leaf remains inaccessible because x86 permission checks AND the upper and leaf bits, so permissive table descriptors cannot override a leaf with USER or WRITABLE clear. Promotion preserves the descriptor's physical address and all existing flags, occurs under the live root's mutation shard, and is followed by the path's existing local invalidation. Failed AlreadyMapped or structural-error paths do not promote existing descriptors, preserving their no-permission-mutation behavior."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Intermediate x86_64 permission promotion is an internal correction to the existing page-table construction path. It adds no capability, domain assignment, trusted subsystem, external authority, mapped physical frame, or cross-domain path."

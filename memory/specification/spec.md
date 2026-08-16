@@ -668,6 +668,10 @@ x86_64 is rejected at runtime.
   peer-active small run, or one full non-global local/remote flush for a large
   multi-region rewrite. No backing becomes reusable in this permission-only
   path, and zero lazy sentinels are never installed as physical address zero.
+  A successful x86_64 map promotes USER/WRITABLE requirements into every
+  intermediate descriptor only after proving the destination leaf absent;
+  requirements are derived independently per leaf, failed maps leave existing
+  permissions unchanged, and leaf flags remain the final authority.
 - A swap-out batch reserves one contiguous slot run, performs one backend
   vector write, validates every same-root leaf before publishing any swap PTE,
   and retires stale translations once before returning any victim frame to the
