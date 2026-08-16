@@ -61,8 +61,9 @@ pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
-/// Return independently owned frames; buddy batches COW shard acquisition,
-/// while alternative allocators retain the scalar default.
+/// Return independently owned frames; buddy batches COW shards and bounded
+/// per-CPU-cache/NUMA-zone return work, while alternative allocators retain
+/// the scalar default.
 pub fn free_frame_batch(frames: &[PhysFrame]);
 /// Retain every non-zero COW backing while locking each touched refcount
 /// shard once; duplicate entries represent distinct owners.
@@ -466,12 +467,15 @@ x86_64 is rejected at runtime.
   cache-line isolated. Order-0 allocation/free is fronted by a bounded,
   cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
   under one zone-lock acquisition, while cached pages remain included in
-  free-page and order-0 statistics. A base-page refill or folio allocation
-  holds only one zone lock at a time; nearest-node fallback releases the failed
-  zone before trying the next, so unrelated NUMA nodes do not serialize on a
-  global frame lock. Coordinated draining bypasses new cache insertion before
-  high-order retry; runtime-hotplug nodes bypass the cache so exact-range
-  offline admission continues to observe every free frame in the buddy.
+  free-page and order-0 statistics. Batched final-owner return groups pages by
+  physical NUMA node, takes the current CPU cache lock for at most 64 pages at
+  a time, and publishes all direct/spilled pages through one buddy-zone lock
+  per touched node. A base-page refill or folio allocation holds only one zone
+  lock at a time; nearest-node fallback releases the failed zone before trying
+  the next, so unrelated NUMA nodes do not serialize on a global frame lock.
+  Coordinated draining bypasses new cache insertion before high-order retry;
+  runtime-hotplug nodes bypass the cache so exact-range offline admission
+  continues to observe every free frame in the buddy.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range
@@ -519,10 +523,11 @@ x86_64 is rejected at runtime.
   backing. Region teardown, MAP_FIXED punching, and MADV_DONTNEED retire leaves
   and complete the required TLB flush before dropping backing owners through
   the allocator's batch interface.
-  The buddy implementation locks each touched COW shard once and sends only
-  final-owner/unregistered frames through the unchanged cgroup-uncharge,
-  optional scrub, allocation-audit, NUMA-cache, and buddy-return path;
-  alternative allocators use the scalar default.
+  The buddy implementation locks each touched COW shard once, performs the
+  scalar-equivalent cgroup uncharge and optional scrub for only final-owner or
+  unregistered frames, then groups those frames for bounded per-CPU cache and
+  per-NUMA-zone return. Allocation-audit transitions and cache-drain bypass
+  revalidation are preserved; alternative allocators use the scalar default.
 - Base-page relocation installs the disjoint destination before removing the
   source, publishes backing ownership exactly once, invalidates source
   translations before freeing a truncated tail, and leaves the source intact
