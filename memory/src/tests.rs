@@ -762,6 +762,8 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
         PhysAddr::new(0),
         PhysAddr::new(0x1236_2000),
     ];
+    #[cfg(feature = "kernel-test")]
+    let walks_before_map = __range_pt_walks_for_test();
     // SAFETY: the test owns this isolated root; non-zero synthetic backing is
     // aligned and never dereferenced, while zero is the documented lazy slot.
     if unsafe {
@@ -772,6 +774,12 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     .is_err()
     {
         return TestResult::Fail("scatter range map failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before_map + 1 {
+            return TestResult::Fail("scatter map repeated an upper-level walk per page");
+        }
     }
     for (page, expected) in backing.into_iter().enumerate() {
         // SAFETY: read-only walk of the still-live isolated root.
@@ -814,6 +822,29 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     }
     // SAFETY: cleanup of the isolated test range.
     let _ = unsafe { unmap_4kb_local_range(pml4, base, 3) };
+    let boundary_base = VirtAddr::new(0x567f_f000);
+    let boundary_backing = [PhysAddr::new(0x1237_0000), PhysAddr::new(0x1237_1000)];
+    #[cfg(feature = "kernel-test")]
+    let walks_before_boundary = __range_pt_walks_for_test();
+    // SAFETY: the isolated two-page range crosses a PT boundary; synthetic
+    // aligned backing is never dereferenced.
+    if unsafe {
+        map_4kb_scatter_range(pml4, boundary_base, &boundary_backing, |_, _| {
+            PtFlags::USER | PtFlags::WRITABLE
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("scatter boundary map failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before_boundary + 2 {
+            return TestResult::Fail("scatter map reused a PT across its boundary");
+        }
+    }
+    // SAFETY: cleanup of the isolated boundary-spanning range.
+    let _ = unsafe { unmap_4kb_local_range(pml4, boundary_base, 2) };
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

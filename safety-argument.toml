@@ -467,3 +467,11 @@ argument = "The aarch64 scatter installer caches an L3 pointer only after ensuri
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The cached aarch64 scatter installer is internal to the existing memory page-table TCB and reuses its root lock, frame allocator, and publication barrier. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86_64 scatter installer caches a PT pointer only after ensuring or verifying every PML4/PDPT/PD table descriptor under the live root's existing mutation shard. Its cache key contains the complete upper-index tuple and every 2 MiB boundary performs a new verified walk, so leaf stores cannot cross into an unrelated table. Each non-zero backing entry retains its caller-derived USER/WRITE/NX flags, lazy zero entries remain absent, existing leaves still fail as AlreadyMapped, and errors preserve the established partial-progress contract. The complete attempted span is locally invalidated before the root guard is released, including partial progress; large non-global runs use one local user flush while any run containing GLOBAL falls back to per-VA INVLPG. Batching therefore changes neither mapping authority, backing ownership, nor stale negative-translation retirement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached x86_64 scatter installer remains internal to the existing memory page-table TCB and reuses its root lock, allocator, and local invalidation primitives. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."

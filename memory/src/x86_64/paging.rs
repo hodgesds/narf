@@ -723,7 +723,7 @@ static PT_LOCKS: [narf_lib::sync::IrqSafeSpinLock<()>; PT_LOCK_SHARDS] =
 #[cfg(feature = "kernel-test")]
 static RANGE_PT_WALKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Upper-level walks performed by the contiguous permission rewriter. One
+/// Upper-level walks performed by contiguous scatter helpers. One
 /// walk covers every page sharing a leaf table (up to 512 entries).
 #[cfg(feature = "kernel-test")]
 #[doc(hidden)]
@@ -1034,8 +1034,9 @@ unsafe fn map_4kb_locked(
 }
 
 /// Map a contiguous virtual run from scatter-list backing while acquiring the
-/// per-root mutation lock once. Zero physical entries are lazy holes and are
-/// skipped. `flags_for` derives each leaf's permissions from its backing.
+/// per-root mutation lock once. Adjacent leaves share one upper-level walk and
+/// one bounded local invalidation phase. Zero physical entries are lazy holes
+/// and are skipped. `flags_for` derives each leaf's permissions from backing.
 ///
 /// On failure, leaves installed earlier in the run remain present; callers
 /// that need transactionality must tear the destination range down before
@@ -1075,16 +1076,89 @@ pub unsafe fn map_4kb_scatter_range(
     }
 
     let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: root is identity-reachable and protected by the mutation guard.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut changed = false;
+    let mut has_global = false;
+    let mut result = Ok(());
     for (index, phys) in backing.iter().copied().enumerate() {
         if phys.raw() == 0 {
             continue;
         }
+        changed = true;
+        let flags = flags_for(index, phys);
+        has_global |= flags.contains(PtFlags::GLOBAL);
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
-        // SAFETY: the complete range was validated above and the root lock is
-        // held for this whole loop.
-        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(index, phys), true)? };
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            #[cfg(feature = "kernel-test")]
+            RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+            if flags.contains(PtFlags::USER) {
+                table_flags |= PtFlags::USER;
+            }
+            // SAFETY: every level is identity-reachable and the root lock is held.
+            let pdpt_phys =
+                match unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags) } {
+                    Ok(phys) => phys,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PDPT slot is live and root-locked for this mutation.
+            let pd_phys =
+                match unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], table_flags) } {
+                    Ok(phys) => phys,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PD slot is live and root-locked for this mutation.
+            let pt_phys = match unsafe { ensure_next_table(&mut pd.entries[idx.pd], table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            cached_pt = pt_phys.as_mut_ptr::<PageTable>();
+        }
+
+        // SAFETY: cached_pt belongs to this complete upper-index tuple and is
+        // stable while the root mutation guard is held.
+        let pt = unsafe { &mut *cached_pt };
+        if pt.entries[idx.pt].is_present() {
+            result = Err(MapError::AlreadyMapped);
+            break;
+        }
+        pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
+        debug_assert_eq!(pt.entries[idx.pt].addr(), phys);
     }
-    Ok(())
+    if changed {
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        let pages = backing.len() as u64;
+        if pages <= FULL_FLUSH_PAGE_CEILING || has_global {
+            for page in 0..pages {
+                // SAFETY: the complete span was validated above.
+                unsafe { invlpg(VirtAddr::new(base.raw() + page * 4096)) };
+            }
+        } else {
+            // SAFETY: no installed leaf in this transaction is global.
+            unsafe { flush_user_tlb_local() };
+        }
+    }
+    result
 }
 
 /// Rewrite a scatter-backed run under one root-lock transaction and one local
