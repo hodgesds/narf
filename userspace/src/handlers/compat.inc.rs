@@ -6213,6 +6213,44 @@ pub fn default_sync_signal_delivery(
                         }
                     }
                 }
+                // The region CONTAINING the faulting address, with its perms
+                // — the decisive datum for a #PF. A write (error-code W=1) to a
+                // PRESENT page (P=1) whose region shows w=true means WRITE was
+                // granted but the leaf PTE was mapped read-only: a page-table
+                // permission-derivation bug (the mmap-scalability materializer
+                // regressed). A w=false region is a genuine PROT_READ mapping
+                // the task wrongly wrote to. This single line disambiguates.
+                #[cfg(feature = "linux-compat")]
+                {
+                    if let Some(pinfo) = proc_task_info(pid) {
+                        match pinfo
+                            .vmas
+                            .iter()
+                            .find(|v| info.addr >= v.start && info.addr < v.end)
+                        {
+                            Some(vma) => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  fault-vma={:016x}-{:016x} r={} w={} x={} shared={} {}",
+                                    vma.start,
+                                    vma.end,
+                                    vma.readable,
+                                    vma.writable,
+                                    vma.executable,
+                                    vma.shared,
+                                    vma.label
+                                );
+                            }
+                            None => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  fault-vma=<no region contains {:x}>",
+                                    info.addr
+                                );
+                            }
+                        }
+                    }
+                }
                 for i in 0..96u64 {
                     let mut w = [0u8; 8];
                     // SAFETY: copy_from_user range-validates the source VA and
