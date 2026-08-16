@@ -738,6 +738,86 @@ kernel_test_in!(
     smoke_paging_local_range_unmap_batches_present_leaves
 );
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
+    use crate::paging::{
+        map_4kb_scatter_range, translate, unmap_4kb_local_range, PageTable, PtFlags,
+    };
+    use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    let pml4 = match alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    let base = VirtAddr::new(0x567b_0000);
+    let backing = [
+        PhysAddr::new(0x1236_0000),
+        PhysAddr::new(0),
+        PhysAddr::new(0x1236_2000),
+    ];
+    // SAFETY: the test owns this isolated root; non-zero synthetic backing is
+    // aligned and never dereferenced, while zero is the documented lazy slot.
+    if unsafe { map_4kb_scatter_range(pml4, base, &backing, |_| PtFlags::USER | PtFlags::WRITABLE) }
+        .is_err()
+    {
+        return TestResult::Fail("scatter range map failed");
+    }
+    for (page, expected) in backing.into_iter().enumerate() {
+        // SAFETY: read-only walk of the still-live isolated root.
+        let got = unsafe { translate(pml4, VirtAddr::new(base.as_u64() + page as u64 * 4096)) };
+        let expected = (expected.raw() != 0).then_some(expected);
+        if got != expected {
+            return TestResult::Fail("scatter range translation mismatch");
+        }
+    }
+    // SAFETY: cleanup of the isolated test range.
+    let _ = unsafe { unmap_4kb_local_range(pml4, base, 3) };
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_paging_scatter_range_maps_present_and_skips_lazy
+);
+
+fn smoke_pagetable_registry_collision_and_tombstone_reuse() -> TestResult {
+    // These synthetic, page-aligned addresses are outside the test VM's RAM.
+    // Their page numbers differ by the hash-table length, so multiplication
+    // by an odd hash constant leaves the same low index bits and forces a
+    // probe-chain collision.
+    const FIRST: u64 = 0x0000_0e00_0000_0000;
+    const COLLIDING: u64 = FIRST + (131072 * 4096);
+    const REPLACEMENT: u64 = COLLIDING + (131072 * 4096);
+    crate::frame::__pagetable_register(FIRST);
+    crate::frame::__pagetable_register(COLLIDING);
+    if !crate::frame::__pagetable_is_registered(FIRST)
+        || !crate::frame::__pagetable_is_registered(COLLIDING)
+    {
+        return TestResult::Fail("colliding page-table registrations were lost");
+    }
+    crate::frame::__pagetable_unregister(FIRST);
+    if crate::frame::__pagetable_is_registered(FIRST)
+        || !crate::frame::__pagetable_is_registered(COLLIDING)
+    {
+        return TestResult::Fail("tombstone broke the remaining probe chain");
+    }
+    crate::frame::__pagetable_register(REPLACEMENT);
+    if !crate::frame::__pagetable_is_registered(REPLACEMENT) {
+        return TestResult::Fail("tombstone slot was not reusable");
+    }
+    crate::frame::__pagetable_unregister(COLLIDING);
+    crate::frame::__pagetable_unregister(REPLACEMENT);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_pagetable_registry_collision_and_tombstone_reuse
+);
+
 fn smoke_frame_alloc_roundtrip() -> TestResult {
     let f = match crate::alloc_frame() {
         Ok(f) => f,
@@ -2846,6 +2926,84 @@ fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_grow_region_bumps_mmap_cursor);
 
+/// A relocating mremap must move live translations and ownership together:
+/// the old leaves disappear, resident frames reappear at the destination
+/// without copying, and a grown tail stays absent for demand paging.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_relocate_region_moves_live_leaves() -> TestResult {
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
+    #[cfg(target_arch = "x86_64")]
+    use crate::x86_64::paging::translate;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    const OLD: u64 = 0x0000_4080_0100_0000;
+    const NEW: u64 = 0x0000_4080_0200_0000;
+    // SAFETY: test boot initialized paging and the frame allocator.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("new_for_user unavailable"),
+    };
+    let first = match crate::frame::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let second = match crate::frame::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            crate::frame::free_frame(crate::frame::PhysFrame::new(first));
+            return TestResult::Skip("frame allocator drained");
+        }
+    };
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(OLD),
+            len: 8192,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![first, second],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("source registration failed");
+    }
+    // SAFETY: aspace owns a live root and both mapped frames.
+    if unsafe { aspace.materialize_range(VirtAddr::new(OLD), 8192) }.is_err() {
+        return TestResult::Fail("source materialization failed");
+    }
+    // SAFETY: both ranges are disjoint, page-aligned user ranges owned by
+    // this live address space.
+    if unsafe { aspace.relocate_region(VirtAddr::new(OLD), 8192, VirtAddr::new(NEW), 12288) }
+        .is_err()
+    {
+        return TestResult::Fail("relocate_region failed");
+    }
+
+    // SAFETY: translate only reads the test-owned live page-table root.
+    let old_first = unsafe { translate(aspace.root, VirtAddr::new(OLD)) };
+    // SAFETY: same root and destination range.
+    let new_first = unsafe { translate(aspace.root, VirtAddr::new(NEW)) };
+    // SAFETY: same root and destination range.
+    let new_second = unsafe { translate(aspace.root, VirtAddr::new(NEW + 4096)) };
+    // SAFETY: the grown tail is expected to have no leaf.
+    let new_tail = unsafe { translate(aspace.root, VirtAddr::new(NEW + 8192)) };
+    let region = aspace.lookup(VirtAddr::new(NEW));
+    if old_first.is_some()
+        || new_first != Some(first)
+        || new_second != Some(second)
+        || new_tail.is_some()
+        || !region.is_some_and(|region| {
+            region.base == VirtAddr::new(NEW)
+                && region.len == 12288
+                && region.phys == alloc::vec![first, second, crate::PhysAddr::new(0)]
+        })
+    {
+        return TestResult::Fail("relocation did not move leaves/backing atomically");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_relocate_region_moves_live_leaves);
+
 /// Buddy allocator invariant: a sequence of N back-to-back
 /// `alloc_frame` calls without any intervening `free_frame` MUST
 /// return N distinct physical frames. A failure here is the root
@@ -3041,7 +3199,8 @@ kernel_test_in!("memory", smoke_memory_cow_refcount_round_trip);
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same
-    // PhysAddr and the COW refcount is 2; both lose WRITE.
+    // PhysAddr and the COW refcount is 2; both retain logical WRITE and gain
+    // the internal COW marker so their hardware leaves remain read-only.
     // After cow_split_on_write on the child, the child's
     // Region.phys[0] is a fresh frame, the parent's is unchanged,
     // and the parent's bytes are visible in the child (memcpy
@@ -3091,8 +3250,26 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     if cow::count(frame) != 2 {
         return TestResult::Fail("COW: refcount should be 2 after fork");
     }
-    if p_region.perms.contains(RegionPerms::WRITE) || c_region.perms.contains(RegionPerms::WRITE) {
-        return TestResult::Fail("COW: both regions must lose WRITE post-fork");
+    if !p_region.perms.contains(RegionPerms::WRITE)
+        || !c_region.perms.contains(RegionPerms::WRITE)
+        || !p_region.perms.contains(RegionPerms::COW)
+        || !c_region.perms.contains(RegionPerms::COW)
+    {
+        return TestResult::Fail("COW: fork lost logical WRITE or the COW marker");
+    }
+
+    // mprotect is the authority boundary: once the parent becomes logically
+    // read-only, a present write fault must not be accepted as COW recovery.
+    if parent
+        .change_perms_range(VirtAddr::new(VADDR), 4096, RegionPerms::READ)
+        .is_err()
+    {
+        return TestResult::Fail("mprotect-style permission change failed");
+    }
+    // SAFETY: VADDR names the test-owned present COW mapping; this deliberately
+    // exercises rejection after its logical WRITE permission is removed.
+    if unsafe { parent.cow_split_on_write(VirtAddr::new(VADDR)) }.is_ok() {
+        return TestResult::Fail("COW recovery bypassed logical read-only permission");
     }
 
     // Split the child's page.
@@ -3129,7 +3306,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
         return TestResult::Fail("post-split: parent should be sole owner of original");
     }
     if !c_split.perms.contains(RegionPerms::WRITE) {
-        return TestResult::Fail("split should restore WRITE on the child");
+        return TestResult::Fail("split should preserve logical WRITE on the child");
     }
 
     // Cleanup: both `parent` and `child` own their region frames;
@@ -5780,7 +5957,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     // Both sides materialise the post-fork RO PTEs. We then replay
     // exactly what the #PF handler does on the child's first write:
     //   1. cow_split_on_write — allocates a private frame, memcpys,
-    //      dec_refs the shared frame, regains WRITE on the region.
+    //      dec_refs the shared frame; logical WRITE was retained throughout.
     //   2. remap_page — rewrites the live PTE so the next user
     //      instruction succeeds.
     // After the round trip, mutating through the child's PTE must
@@ -5833,8 +6010,8 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     if unsafe { child.materialize() }.is_err() {
         return TestResult::Fail("child materialize");
     }
-    // Parent's PTEs need re-walking: clone_for_fork stripped WRITE
-    // from the regions but the live PTEs are still RW.
+    // Parent's PTEs need re-walking: clone_for_fork marked the resident frames
+    // COW-shared but the live PTEs are still RW.
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.rematerialize() }.is_err() {
         return TestResult::Fail("parent rematerialize");
@@ -6255,15 +6432,150 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         }
         _ => false,
     };
+    // Bookkeeping alone is insufficient: stress-ng caught a real regression
+    // where mprotect returned success but the live leaf remained writable.
+    // SAFETY: `a.root` is the live test-owned PML4 and `mid` is mapped above.
+    let leaf_read_only = unsafe { crate::x86_64::paging::flags_at(a.root, mid) }
+        .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE));
     core::mem::forget(a);
-    if ok {
+    if ok && leaf_read_only {
         TestResult::Pass
+    } else if !leaf_read_only {
+        TestResult::Fail("mprotect bookkeeping changed but the leaf stayed writable")
     } else {
         TestResult::Fail("split layout / perms / phys did not match expectation")
     }
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
+
+/// Rewriting permissions on a lazy mapping must leave its zero backing
+/// sentinel unmapped.  In particular, the aarch64 rewrite path once omitted
+/// the `phys == 0` guard and installed a user leaf for physical address zero.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_mprotect_keeps_lazy_page_unmapped() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let va = VirtAddr::new(0x0000_0080_0800_0000);
+    if a.map_region(Region {
+        base: va,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+        || a.mprotect_range(va, 0x1000, RegionPerms::READ).is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("lazy mprotect setup failed");
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reads the test-owned page table.
+    let translated = unsafe { crate::x86_64::paging::translate(a.root, va) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads the test-owned page table.
+    let translated = unsafe { crate::aarch64::paging::translate(a.root, va) };
+    let still_lazy = a
+        .regions_snapshot()
+        .iter()
+        .find(|region| region.base == va)
+        .is_some_and(|region| region.phys == alloc::vec![PhysAddr::new(0)]);
+    core::mem::forget(a);
+    if translated.is_none() && still_lazy {
+        TestResult::Pass
+    } else if translated.is_some() {
+        TestResult::Fail("mprotect mapped the lazy-page zero sentinel")
+    } else {
+        TestResult::Fail("mprotect changed lazy backing metadata")
+    }
+}
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!("memory", smoke_memory_mprotect_keeps_lazy_page_unmapped);
+
+/// Linux rounds a non-zero length upward but refuses to partially protect a
+/// range containing a hole. Validate the whole interval before splitting any
+/// VMA; zero length remains a no-op even for a W|X-shaped request.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_mprotect_hole_is_atomic_and_len_rounds() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_0c00_0000u64;
+    for offset in [0, 0x2000] {
+        if a.map_region(Region {
+            base: VirtAddr::new(base + offset),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        {
+            core::mem::forget(a);
+            return TestResult::Fail("map_region failed");
+        }
+    }
+    if a.mprotect_range(VirtAddr::new(base), 0x3000, RegionPerms::READ)
+        != Err(crate::AddressSpaceError::Unmapped)
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("mprotect across a hole did not fail atomically");
+    }
+    if a.regions_snapshot()
+        .iter()
+        .filter(|region| region.base.as_u64() == base || region.base.as_u64() == base + 0x2000)
+        .any(|region| !region.perms.contains(RegionPerms::WRITE))
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("failed mprotect changed one side of the hole");
+    }
+    if a.mprotect_range(VirtAddr::new(base), 1, RegionPerms::READ)
+        .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("mprotect did not round a one-byte length");
+    }
+    let rounded = a
+        .lookup(VirtAddr::new(base))
+        .is_some_and(|region| !region.perms.contains(RegionPerms::WRITE));
+    let wx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
+    let zero_ok = a
+        .mprotect_range(VirtAddr::new(base + 0x1000), 0, wx)
+        .is_ok();
+    core::mem::forget(a);
+    if rounded && zero_ok {
+        TestResult::Pass
+    } else if !rounded {
+        TestResult::Fail("one-byte mprotect did not cover its page")
+    } else {
+        TestResult::Fail("zero-length mprotect was not a no-op")
+    }
+}
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_mprotect_hole_is_atomic_and_len_rounds
+);
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
@@ -6360,6 +6672,99 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
+
+/// MADV_DONTNEED reports an unmapped hole without releasing either mapped
+/// island, and rounds a one-byte request over its containing page.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let base = 0x0000_0080_0804_0000u64;
+    for (offset, phys) in [(0, 0x2000_0000), (0x2000, 0x2000_1000)] {
+        if a.map_region(Region {
+            base: VirtAddr::new(base + offset),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(phys)],
+        })
+        .is_err()
+        {
+            return TestResult::Fail("map_region failed");
+        }
+    }
+    if a.madvise_dontneed(VirtAddr::new(base), 0x3000) != Err(crate::AddressSpaceError::Unmapped) {
+        return TestResult::Fail("madvise across a hole did not fail");
+    }
+    if a.regions_snapshot()
+        .iter()
+        .filter(|region| region.base.as_u64() == base || region.base.as_u64() == base + 0x2000)
+        .any(|region| region.phys[0].raw() == 0)
+    {
+        return TestResult::Fail("failed madvise partially released backing");
+    }
+    if a.madvise_dontneed(VirtAddr::new(base), 1).is_err() {
+        return TestResult::Fail("madvise did not round a one-byte length");
+    }
+    if a.lookup(VirtAddr::new(base))
+        .is_some_and(|region| region.phys[0].raw() == 0)
+        && a.madvise_dontneed(VirtAddr::new(base), 0).is_ok()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("rounded/zero-length madvise semantics were wrong")
+    }
+}
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!("memory", smoke_memory_madvise_hole_is_atomic_and_len_rounds);
+
+/// Residency sampling walks a VMA once, preserves lazy-page state, rounds the
+/// byte length, and rejects a trailing hole without returning a partial view.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_residency_range_is_coherent() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let base = VirtAddr::new(0x0000_0080_0808_0000);
+    if a.map_region(Region {
+        base,
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![
+            PhysAddr::new(0x2100_0000),
+            PhysAddr::new(0),
+            PhysAddr::new(0x2100_1000),
+        ],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    if a.residency_range(base, 0x3000) != Ok(alloc::vec![1, 0, 1]) {
+        return TestResult::Fail("resident/lazy vector was wrong");
+    }
+    if a.residency_range(base, 1) != Ok(alloc::vec![1]) {
+        return TestResult::Fail("one-byte mincore range did not round up");
+    }
+    if a.residency_range(base, 0x4000) != Err(crate::AddressSpaceError::Unmapped) {
+        return TestResult::Fail("residency range accepted a trailing hole");
+    }
+    if a.residency_range(VirtAddr::new(base.as_u64() + 1), 1)
+        != Err(crate::AddressSpaceError::AlignmentMismatch)
+        || a.residency_range(base, 0) != Ok(alloc::vec![])
+    {
+        return TestResult::Fail("residency range validation was wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_residency_range_is_coherent);
 
 // ── Wave-A pluggable FrameAlloc smoke ───────────────────────────────
 //
@@ -6676,8 +7081,9 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
             }
             recs.push((va, frame, magic));
         }
-        // SAFETY: fresh user root; installs only this DSO's PTEs.
-        if unsafe { a.materialize() }.is_err() {
+        // SAFETY: fresh user root; installs only this DSO's PTEs. This is the
+        // same incremental path sys_mmap uses, so prior DSOs are not revisited.
+        if unsafe { a.materialize_range(VirtAddr::new(b), SPAN) }.is_err() {
             return TestResult::Fail("materialize failed under scale");
         }
         // RELRO-style: drop the first segment to RO.
@@ -6701,6 +7107,252 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_mmap_scale_overlay_pattern_stays_consistent);
+
+/// The ordered VMA index is the metadata foundation for logarithmic lookup,
+/// insertion, and empty MAP_FIXED-punch checks. Exercise enough randomized
+/// insertions to cross several B-tree levels, then verify predecessor and
+/// successor overlap admission, a no-overlap punch, and keyed removal.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_regions_stay_sorted_for_fixed_churn() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test-owned inactive user root.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let base = 0x0000_4070_0000_0000u64;
+    const PAGES: u64 = 1024;
+    // Multiplication by an odd number permutes every element modulo 2^10.
+    for i in 0..PAGES {
+        let page = (i * 405) & (PAGES - 1);
+        if a.map_region(Region {
+            base: VirtAddr::new(base + page * 4096),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        {
+            return TestResult::Fail("out-of-order VMA insertion failed");
+        }
+    }
+    let before = a.regions_snapshot();
+    if !before
+        .windows(2)
+        .all(|pair| pair[0].base.as_u64() < pair[1].base.as_u64())
+    {
+        return TestResult::Fail("VMA insertion lost sorted order");
+    }
+    if before.len() != PAGES as usize {
+        return TestResult::Fail("random VMA insertion lost an entry");
+    }
+    if a.map_region(Region {
+        base: VirtAddr::new(base + 512 * 4096),
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![PhysAddr::new(0)],
+    }) != Err(crate::AddressSpaceError::Overlap)
+    {
+        return TestResult::Fail("tree admitted an equal-base overlap");
+    }
+    if a.punch_fixed(VirtAddr::new(base + 2 * PAGES * 4096), 4096)
+        .is_err()
+        || a.regions_snapshot().len() != before.len()
+    {
+        return TestResult::Fail("empty fixed punch changed the VMA table");
+    }
+    if a.unmap_region(VirtAddr::new(base + 512 * 4096)).is_err() {
+        return TestResult::Fail("ordered VMA removal failed");
+    }
+    let after = a.regions_snapshot();
+    if !after
+        .windows(2)
+        .all(|pair| pair[0].base.as_u64() < pair[1].base.as_u64())
+    {
+        return TestResult::Fail("VMA removal lost sorted order");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_regions_stay_sorted_for_fixed_churn);
+
+/// Incremental materialisation must install exactly the requested page range,
+/// with the same physical backing as a later full materialisation.
+///
+/// This is both a correctness test and the structural scalability guard: a
+/// one-page mmap must not walk or install unrelated page slots merely because
+/// they already exist in the same address space.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_materialize_range_installs_only_intersection() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test-owned user root; it is never activated.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    // Validation is part of the new public surface: malformed intervals must
+    // fail before any page-table walk can observe them.
+    // SAFETY: `a` owns a live user root; this malformed range is rejected
+    // before the implementation walks it.
+    let misaligned = unsafe { a.materialize_range(VirtAddr::new(0x4081_0000_0001), 4096) };
+    // SAFETY: same live-root argument; zero length is rejected.
+    let empty = unsafe { a.materialize_range(VirtAddr::new(0x4081_0000_0000), 0) };
+    // SAFETY: same live-root argument; crossing the user ceiling is rejected.
+    let beyond_user =
+        unsafe { a.materialize_range(VirtAddr::new(AddressSpace::USER_HALF_END - 4096), 8192) };
+    if misaligned != Err(crate::AddressSpaceError::AlignmentMismatch)
+        || empty != Err(crate::AddressSpaceError::AlignmentMismatch)
+        || beyond_user != Err(crate::AddressSpaceError::OutOfRange)
+    {
+        return TestResult::Fail("materialize_range accepted a malformed interval");
+    }
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..3 {
+        match crate::alloc_frame() {
+            Ok(frame) => frames.push(frame.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    let base = VirtAddr::new(0x0000_4081_0000_0000);
+    if a.map_region(Region {
+        base,
+        len: 3 * 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: frames.clone(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+
+    // SAFETY: the root is live and the interval is one aligned page inside
+    // the recorded region.
+    if unsafe { a.materialize_range(VirtAddr::new(base.as_u64() + 4096), 4096) }.is_err() {
+        return TestResult::Fail("one-page materialize_range failed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::x86_64::paging::translate(a.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::aarch64::paging::translate(a.root, va) }
+    }
+
+    // SAFETY: `a` owns a live user page-table root.
+    let first = unsafe { translated(&a, base) };
+    // SAFETY: same live-root argument.
+    let last = unsafe { translated(&a, VirtAddr::new(base.as_u64() + 8192)) };
+    if first.is_some() || last.is_some() {
+        return TestResult::Fail("materialize_range installed a page outside its interval");
+    }
+    // SAFETY: same live-root argument.
+    if unsafe { translated(&a, VirtAddr::new(base.as_u64() + 4096)) } != Some(frames[1]) {
+        return TestResult::Fail("materialize_range installed the wrong middle-page backing");
+    }
+
+    // Full construction remains idempotent over the middle page and installs
+    // both untouched neighbors with their original backing.
+    // SAFETY: test-owned live root.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("full materialize after range failed");
+    }
+    for (index, frame) in frames.iter().enumerate() {
+        let va = VirtAddr::new(base.as_u64() + index as u64 * 4096);
+        // SAFETY: test-owned live root.
+        if unsafe { translated(&a, va) } != Some(*frame) {
+            return TestResult::Fail("full materialize disagreed with range backing");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_materialize_range_installs_only_intersection);
+
+/// A bad, unrelated VMA must not poison incremental materialisation of a
+/// valid mmap range. A test-owned huge leaf gives a deterministic structural
+/// conflict that the full construction walk rejects.
+#[cfg(target_arch = "x86_64")]
+fn smoke_materialize_range_skips_unrelated_invalid_region() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test-owned user root; it is never activated.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let conflict = VirtAddr::new(0x0000_3000_0000_0000);
+    // SAFETY: the test owns this inactive user root. Physical zero is never
+    // accessed; the huge leaf exists only to create a page-table shape that a
+    // 4 KiB materialization must reject.
+    if unsafe {
+        paging::map_2mb(
+            a.root,
+            conflict,
+            crate::PhysAddr::new(0),
+            paging::PtFlags::USER | paging::PtFlags::NO_EXEC,
+        )
+    }
+    .is_err()
+    {
+        return TestResult::Fail("could not install structural conflict leaf");
+    }
+    let low_frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let good_frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    if a.map_region(Region {
+        base: conflict,
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![low_frame],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("low structural region registration failed");
+    }
+    let good = VirtAddr::new(0x0000_4082_0000_0000);
+    if a.map_region(Region {
+        base: good,
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![good_frame],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("good region registration failed");
+    }
+
+    // SAFETY: live root and valid high user interval.
+    if unsafe { a.materialize_range(good, 4096) }.is_err() {
+        return TestResult::Fail("unrelated invalid VMA poisoned range materialization");
+    }
+    // SAFETY: `a.root` is the live test user PML4.
+    if unsafe { paging::translate(a.root, good) } != Some(good_frame) {
+        return TestResult::Fail("valid range translated to the wrong frame");
+    }
+    // SAFETY: same root; the full walk should still detect the huge-leaf
+    // conflict, proving the range call did not silently walk that VMA.
+    if unsafe { a.materialize() } != Err(crate::AddressSpaceError::Overlap) {
+        return TestResult::Fail("full materialize did not detect low identity-map conflict");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_materialize_range_skips_unrelated_invalid_region
+);
 
 // ── demand-fault self-heal: "backed bookkeeping over an absent leaf PTE"
 //    must install the PTE, not retry forever ──────────────────────────────
@@ -7133,6 +7785,148 @@ fn smoke_memory_mlock_force_backs_lazy_pages() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mlock_force_backs_lazy_pages);
 
+/// Locking a subrange must neither populate nor pin the rest of a large VMA.
+/// The old implementation scanned every phys slot and set LOCKED on the
+/// whole intersecting region, making small locks of large mappings both
+/// semantically wrong and proportional to the mapping size.  Also exercise
+/// Linux's byte-length rounding by unlocking one byte of the first locked
+/// page.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_splits_exact_subrange() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_1800_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x4000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 4],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    if a.mlock_range(VirtAddr::new(base + 0x1000), 0x2000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("partial mlock failed");
+    }
+
+    let mut regions: alloc::vec::Vec<_> = a
+        .regions_snapshot()
+        .into_iter()
+        .filter(|r| r.base.as_u64() >= base && r.base.as_u64() < base + 0x4000)
+        .collect();
+    regions.sort_by_key(|r| r.base.as_u64());
+    let exact_lock = regions.len() == 3
+        && regions[0].base.as_u64() == base
+        && regions[0].len == 0x1000
+        && !regions[0].perms.contains(RegionPerms::LOCKED)
+        && regions[0].phys == alloc::vec![PhysAddr::new(0)]
+        && regions[1].base.as_u64() == base + 0x1000
+        && regions[1].len == 0x2000
+        && regions[1].perms.contains(RegionPerms::LOCKED)
+        && regions[1].phys.iter().all(|phys| phys.raw() != 0)
+        && regions[2].base.as_u64() == base + 0x3000
+        && regions[2].len == 0x1000
+        && !regions[2].perms.contains(RegionPerms::LOCKED)
+        && regions[2].phys == alloc::vec![PhysAddr::new(0)];
+    if !exact_lock {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock populated or locked outside its subrange");
+    }
+
+    if a.munlock_range(VirtAddr::new(base + 0x1000), 1).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("one-byte munlock failed");
+    }
+    let regions = a.regions_snapshot();
+    let page_locked = |va: u64| {
+        regions
+            .iter()
+            .find(|r| r.base.as_u64() <= va && va < r.base.as_u64() + r.len)
+            .is_some_and(|r| r.perms.contains(RegionPerms::LOCKED))
+    };
+    let exact_unlock = !page_locked(base)
+        && !page_locked(base + 0x1000)
+        && page_locked(base + 0x2000)
+        && !page_locked(base + 0x3000);
+    core::mem::forget(a);
+    if exact_unlock {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("munlock changed LOCKED outside its rounded page")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_mlock_splits_exact_subrange);
+
+/// MLOCK_ONFAULT pins the VMA state without eagerly populating it; the first
+/// access backs only the faulted page and the LOCKED marker survives.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_onfault_stays_lazy_until_fault() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = VirtAddr::new(0x0000_0080_1c00_0000);
+    if a.map_region(Region {
+        base,
+        len: 0x2000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 2],
+    })
+    .is_err()
+        || a.mlock_range_onfault(base, 0x2000).is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("MLOCK_ONFAULT setup failed");
+    }
+    let before = a
+        .regions_snapshot()
+        .iter()
+        .find(|region| region.base == base)
+        .is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED)
+                && region.phys.iter().all(|phys| phys.raw() == 0)
+        });
+    if !before {
+        core::mem::forget(a);
+        return TestResult::Fail("MLOCK_ONFAULT eagerly populated the range");
+    }
+
+    // SAFETY: test-owned live root and initialized frame allocator.
+    if unsafe { a.demand_alloc_page(base) }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("demand fault after MLOCK_ONFAULT failed");
+    }
+    let after = a
+        .regions_snapshot()
+        .iter()
+        .find(|region| region.base == base)
+        .is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED)
+                && region.phys[0].raw() != 0
+                && region.phys[1].raw() == 0
+        });
+    core::mem::forget(a);
+    if after {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fault populated the wrong pages or dropped LOCKED")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_mlock_onfault_stays_lazy_until_fault);
+
 /// A range spanning two adjacent regions must flag **both**. The
 /// intersect test is `rb < hi && lo < re`; an off-by-one there (or a
 /// `find`-style "first match wins") would silently leave the second
@@ -7188,6 +7982,52 @@ fn smoke_memory_mlock_spans_multiple_regions() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mlock_spans_multiple_regions);
 
+/// A mapped-unmapped-mapped range is not partially lockable.  Validate the
+/// complete range before allocating or setting flags so failure leaves both
+/// mapped islands untouched.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_hole_is_atomic() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_2800_0000u64;
+    for offset in [0, 0x2000] {
+        if a.map_region(Region {
+            base: VirtAddr::new(base + offset),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        {
+            core::mem::forget(a);
+            return TestResult::Fail("map_region failed");
+        }
+    }
+
+    if a.mlock_range(VirtAddr::new(base), 0x3000).is_ok() {
+        core::mem::forget(a);
+        return TestResult::Fail("mlock across a hole succeeded");
+    }
+    let untouched = a
+        .regions_snapshot()
+        .iter()
+        .filter(|r| r.base.as_u64() == base || r.base.as_u64() == base + 0x2000)
+        .all(|r| !r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
+    core::mem::forget(a);
+    if untouched {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("failed mlock partially changed mapped pages")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_mlock_hole_is_atomic);
+
 /// Negative pair: a range intersecting nothing is `Unmapped`, for both
 /// verbs. `munlock` had no negative test at all, so a change making it
 /// silently succeed on an unmapped range would not have been noticed.
@@ -7203,11 +8043,15 @@ fn smoke_memory_mlock_unmapped_is_rejected() -> TestResult {
     let nowhere = VirtAddr::new(0x0000_0080_3000_0000);
     let mlock_err = a.mlock_range(nowhere, 0x1000).is_err();
     let munlock_err = a.munlock_range(nowhere, 0x1000).is_err();
+    let zero_len_ok = a.mlock_range(nowhere, 0).is_ok()
+        && a.mlock_range_onfault(nowhere, 0).is_ok()
+        && a.munlock_range(nowhere, 0).is_ok();
     core::mem::forget(a);
-    match (mlock_err, munlock_err) {
-        (true, true) => TestResult::Pass,
-        (false, _) => TestResult::Fail("mlock on an unmapped range succeeded"),
-        (_, false) => TestResult::Fail("munlock on an unmapped range succeeded"),
+    match (mlock_err, munlock_err, zero_len_ok) {
+        (true, true, true) => TestResult::Pass,
+        (false, _, _) => TestResult::Fail("mlock on an unmapped range succeeded"),
+        (_, false, _) => TestResult::Fail("munlock on an unmapped range succeeded"),
+        (_, _, false) => TestResult::Fail("zero-length lock operation was not a no-op"),
     }
 }
 #[cfg(target_arch = "x86_64")]

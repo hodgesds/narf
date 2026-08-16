@@ -978,20 +978,22 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     };
     // Post-COW: parent and child SHARE the physical frame
     // immediately after fork. The page-fault handler will split
-    // on first write via cow_split_on_write. Both regions also
-    // lose their WRITE bit (the trap path needs the fault).
+    // on first write via cow_split_on_write. Both regions retain logical
+    // WRITE while the internal COW marker forces read-only hardware leaves.
     if parent_region.phys[0] != child_region.phys[0] {
         return TestResult::Fail("COW fork must share frames, not eagerly memcpy");
     }
     if narf_memory::frame::cow::count(parent_region.phys[0]) < 2 {
         return TestResult::Fail("COW refcount should be >= 2 after fork");
     }
-    if parent_region
+    if !parent_region
         .perms
         .contains(narf_memory::RegionPerms::WRITE)
-        || child_region.perms.contains(narf_memory::RegionPerms::WRITE)
+        || !child_region.perms.contains(narf_memory::RegionPerms::WRITE)
+        || !parent_region.perms.contains(narf_memory::RegionPerms::COW)
+        || !child_region.perms.contains(narf_memory::RegionPerms::COW)
     {
-        return TestResult::Fail("post-fork regions must lose WRITE pending split");
+        return TestResult::Fail("post-fork regions lost WRITE or lack the COW marker");
     }
 
     // Verify the shared frame still holds the sentinel byte

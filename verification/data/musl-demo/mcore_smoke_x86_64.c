@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 
 static void w(const char *m) { write(1, m, strlen(m)); }
 
@@ -34,7 +35,35 @@ int main(void) {
         w("mcore-fail: resident\n");
         return 1;
     }
+    if (vec[1] & 1) {
+        w("mcore-fail: lazy reported resident\n");
+        return 1;
+    }
+    unsigned char one = 0;
+    if (mincore(p, 1, &one) != 0 || !(one & 1)) {
+        w("mcore-fail: mincore length rounding\n");
+        return 1;
+    }
+    errno = 0;
+    if (msync(p, len, MS_ASYNC | MS_SYNC) != -1 || errno != EINVAL) {
+        w("mcore-fail: msync conflicting flags\n");
+        return 1;
+    }
+    if (munmap(p + 4096, 4096) != 0) {
+        w("mcore-fail: hole setup\n");
+        return 1;
+    }
+    errno = 0;
+    if (mincore(p, len, vec) != -1 || errno != ENOMEM) {
+        w("mcore-fail: mincore hole\n");
+        return 1;
+    }
+    errno = 0;
+    if (msync(p, len, MS_SYNC) != -1 || errno != ENOMEM) {
+        w("mcore-fail: msync hole\n");
+        return 1;
+    }
     w("mcore-ok\n");
-    munmap(p, len);
+    munmap(p, 4096);
     return 0;
 }

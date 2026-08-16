@@ -1072,69 +1072,86 @@ fn scrub_freed_frame(phys: PhysAddr) {
     let _ = phys;
 }
 
-/// Page-table-frame registry. Every PT / PD / PDPT / PML4 page
-/// allocated for a user `AddressSpace` is recorded here at alloc
-/// time and unregistered when the matching `free_user_pml4_tree`
-/// walk reclaims it. `AddressSpace::unmap_region_pages` consults
-/// this before handing the leaf phys from `unmap_4kb` to
-/// `free_frame`: if the leaf happens to alias a known page-table
-/// frame (a corner case in the AS drop teardown where the same
-/// phys would otherwise be freed twice — once via the region's
-/// data path, once via the page-table walk), the region-side free
-/// is skipped and `free_user_pml4_tree` reclaims it.
+/// Page-table-frame registry. Every PT / PD / PDPT / PML4 page allocated for a
+/// user `AddressSpace` is recorded here and unregistered when reclaimed.
+/// `free_user_pml4_tree` uses membership to distinguish AS-private tables from
+/// kernel-shared entries copied into a fresh root; it must never free the
+/// latter.
 ///
 /// Sized for the LIVE page-table-frame working set across all
 /// concurrently-mapped user address spaces — NOT the cumulative count.
 /// Entries are cleared on each AS's teardown (`__pagetable_unregister`
 /// via `free_user_pml4_tree`), so a correctly-drained registry only ever
 /// holds the page-table pages of currently-live ASes (a handful of
-/// processes × ~10 tables each). 16 K slots is generous headroom. The
-/// registry is a flat fixed-size atomic array so it can be consulted
-/// without taking the buddy lock (which `unmap_region_pages` would
-/// otherwise re-enter).
-const PT_REGISTRY_LEN: usize = 16384;
+/// processes × their sparse user mappings). The registry is a fixed
+/// open-addressed atomic hash table so it can be consulted without allocation
+/// or the buddy lock. A flat linear scan made sparse MAP_FIXED/mremap table
+/// construction quadratic and overflowed after 16 K live tables.
+const PT_REGISTRY_LEN: usize = 131072;
+const PT_REGISTRY_TOMBSTONE: u64 = 1;
 static PT_REGISTRY: [core::sync::atomic::AtomicU64; PT_REGISTRY_LEN] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; PT_REGISTRY_LEN]
 };
 
+#[inline]
+fn pagetable_registry_start(phys: u64) -> usize {
+    debug_assert!(PT_REGISTRY_LEN.is_power_of_two());
+    (((phys >> PAGE_SHIFT).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize) & (PT_REGISTRY_LEN - 1)
+}
+
 #[doc(hidden)]
 pub fn __pagetable_register(phys: u64) {
     use core::sync::atomic::Ordering;
-    // Dedup: a frame reused as a page-table page WITHOUT a prior
-    // unregister must not occupy two slots — `__pagetable_unregister`
-    // clears only the first match, which would leave a stale `true`.
-    if PT_REGISTRY
-        .iter()
-        .any(|s| s.load(Ordering::Relaxed) == phys)
-    {
+    debug_assert!(phys > PT_REGISTRY_TOMBSTONE && phys & (PAGE_SIZE - 1) == 0);
+    let start = pagetable_registry_start(phys);
+    'retry: loop {
+        let mut first_tombstone = None;
+        for distance in 0..PT_REGISTRY_LEN {
+            let index = (start + distance) & (PT_REGISTRY_LEN - 1);
+            let value = PT_REGISTRY[index].load(Ordering::Acquire);
+            if value == phys {
+                return;
+            }
+            if value == PT_REGISTRY_TOMBSTONE {
+                first_tombstone.get_or_insert(index);
+                continue;
+            }
+            if value != 0 {
+                continue;
+            }
+            let target = first_tombstone.unwrap_or(index);
+            let expected = if target == index {
+                0
+            } else {
+                PT_REGISTRY_TOMBSTONE
+            };
+            if PT_REGISTRY[target]
+                .compare_exchange(expected, phys, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+            continue 'retry;
+        }
+        if let Some(target) = first_tombstone {
+            if PT_REGISTRY[target]
+                .compare_exchange(
+                    PT_REGISTRY_TOMBSTONE,
+                    phys,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+            continue;
+        }
+        // Full of live entries. Never evict another root's ownership marker.
+        PT_REGISTRY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    // Claim an EMPTY slot via CAS; NEVER clobber a live registration.
-    // The previous `head = fetch_add(1) % LEN; store(phys)` blindly
-    // overwrote slot `head` on every register, so after LEN cumulative
-    // registrations the ring wrapped and evicted the still-live
-    // registration of a different, running AS. `is_registered()` then
-    // returned a false-negative for that live page-table page, so
-    // `unmap_region_pages` freed it as region data while
-    // `free_user_pml4_tree` also freed it as a table page — the
-    // "marginal-buddy" double-free (rare because it needs LEN+ cumulative
-    // registrations to wrap).
-    for slot in PT_REGISTRY.iter() {
-        if slot
-            .compare_exchange(0, phys, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-    }
-    // Registry full — the live page-table working set exceeds LEN (only
-    // possible if address spaces are leaking their page tables). Leaving
-    // `phys` unregistered is the SAFE failure: `unmap_region_pages` may
-    // free it on the region path, a single (not double) free. Clobbering
-    // a live entry — the old behaviour — is the unsafe one. Count it so
-    // the overflow is observable rather than silent.
-    PT_REGISTRY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count of `__pagetable_register` calls that found no free slot. Stays
@@ -1146,9 +1163,20 @@ pub static PT_REGISTRY_OVERFLOWS: core::sync::atomic::AtomicUsize =
 #[doc(hidden)]
 pub fn __pagetable_unregister(phys: u64) {
     use core::sync::atomic::Ordering;
-    for slot in PT_REGISTRY.iter() {
-        if slot.load(Ordering::Relaxed) == phys {
-            slot.store(0, Ordering::Relaxed);
+    let start = pagetable_registry_start(phys);
+    for distance in 0..PT_REGISTRY_LEN {
+        let slot = &PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)];
+        let value = slot.load(Ordering::Acquire);
+        if value == 0 {
+            return;
+        }
+        if value == phys {
+            let _ = slot.compare_exchange(
+                phys,
+                PT_REGISTRY_TOMBSTONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             return;
         }
     }
@@ -1157,9 +1185,17 @@ pub fn __pagetable_unregister(phys: u64) {
 #[doc(hidden)]
 pub fn __pagetable_is_registered(phys: u64) -> bool {
     use core::sync::atomic::Ordering;
-    PT_REGISTRY
-        .iter()
-        .any(|s| s.load(Ordering::Relaxed) == phys)
+    let start = pagetable_registry_start(phys);
+    for distance in 0..PT_REGISTRY_LEN {
+        let value = PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)].load(Ordering::Acquire);
+        if value == phys {
+            return true;
+        }
+        if value == 0 {
+            return false;
+        }
+    }
+    false
 }
 
 /// Per-frame reference counting for the COW-fork path.

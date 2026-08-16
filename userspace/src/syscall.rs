@@ -580,8 +580,8 @@ pub enum Syscall {
     /// Change protection on a memory range. arg0 = base addr,
     /// arg1 = length in bytes, arg2 = POSIX-shape prot bitmask
     /// (1 = READ, 2 = WRITE, 4 = EXEC). Walks the calling AS's
-    /// region table and rewrites every page's PTE in place via
-    /// `AddressSpace::change_perms_range`. Returns Ok(0) on
+    /// region table, splits partial VMAs, and rewrites affected PTEs via
+    /// `AddressSpace::mprotect_range`. Returns Ok(0) on
     /// success, InvalidOp if no region intersects the requested
     /// range or the AS lookup failed.
     MProtect,
@@ -1734,9 +1734,9 @@ pub enum Syscall {
     /// Linux `sendfile` (x86_64=40, aarch64=71).
     Sendfile,
 
-    /// `mremap(old, old_len, new_len, flags, new_addr)` — resize an
-    /// existing anonymous mapping (in-place grow). arg0 = old addr,
-    /// arg1 = old len, arg2 = new len, arg3 = flags.
+    /// `mremap(old, old_len, new_len, flags, new_addr)` — shrink, grow,
+    /// or move one complete private mapping while preserving backing.
+    /// Supports MAYMOVE and FIXED; DONTUNMAP is rejected explicitly.
     /// Linux `mremap` (x86_64=25, aarch64=216).
     Mremap,
 
@@ -1832,7 +1832,8 @@ pub enum Syscall {
     /// (accepted, no-op). Linux (x86_64=221, aarch64=223).
     Fadvise64,
 
-    /// `mlock2(addr, len, flags)` — like mlock with MLOCK_ONFAULT.
+    /// `mlock2(addr, len, flags)` — eager with flags=0; MLOCK_ONFAULT
+    /// pins future faulted pages without eagerly populating the range.
     /// Linux (x86_64=325, aarch64=284).
     Mlock2,
 

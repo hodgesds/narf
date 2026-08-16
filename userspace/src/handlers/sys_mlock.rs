@@ -16,7 +16,7 @@ use super::*;
 /// intersecting regions.
 /// `mlock(addr, len)` — force-back lazy pages + set LOCKED flag.
 /// arg0 = base, arg1 = len. Ok(0) on success, InvalidOp on
-/// failure (no region intersects, OOM, AS lookup failed).
+/// failure (range contains a hole, OOM, AS lookup failed).
 pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let as_ref = match current_address_space() {

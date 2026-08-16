@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "6ad0d16abee10036094cd56a5bf070c4f85bfb17f06f0a95cfe7ff29e1f5c2f7"
+prompt_hash = "376409e8b766be629e598557ea11b309d2ba7ddd3f02f2dad99e620f0f5d5ec2"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -290,4 +290,52 @@ argument = "The retarget hook continues to write only the current CPU's existing
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Private base-page teardown skips the external shared-alias transaction only while holding the address-space region tables continuously from SHARED classification through removal. Shared unmap and range punching retain transaction -> huge-region -> regular-region ordering through leaf removal, cross-CPU TLB invalidation, and the backing owner's release hook. A racing map cannot change the classification without the held region lock. The x86_64 range helper changes only lock granularity: it holds the same per-root page-table mutation lock across the batch, performs the same validated walk and local INVLPG for every present leaf, and callers retain the existing cross-CPU flush-before-frame-release ordering. Private COW ownership is unchanged."
+argument = "Private base-page teardown skips the external shared-alias transaction only while holding the address-space region tables continuously from SHARED classification through removal. Shared unmap and range punching retain transaction -> huge-region -> regular-region ordering through leaf removal, cross-CPU TLB invalidation, and the backing owner's release hook. A racing map cannot change the classification without the held region lock. The x86_64 range helper holds the same per-root page-table mutation lock across the batch and caches only non-owning leaf-table pointers while that lock excludes replacement. Small batches retain per-leaf INVLPG; large batches clear every leaf before one compiler-fenced local non-global flush. Callers retain the existing cross-CPU flush-before-frame-release ordering. Private COW ownership is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Range-scoped mmap materialization holds the authoritative address-space region lock continuously while selecting current backing metadata and installing leaf PTEs, so a CLONE_VM peer cannot unmap and free a cloned snapshot beneath the walk. It validates a non-empty aligned user-half interval and reuses the existing per-architecture permission derivation, W^X policy, map-error handling, and frame ownership; it changes only which current region page slots are visited and grants no new capability or domain access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Fork COW state is represented independently from logical POSIX WRITE authority. Page-table derivation permits a writable user leaf only when WRITE remains granted and either no COW sharing exists or the authoritative frame refcount is one. The write-fault path requires both WRITE and COW before copying, so mprotect(PROT_READ) cannot restore access. aarch64 user mappings use EL0 AP encodings, and lazy zero sentinels never become leaves."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Private-region relocation holds huge and regular region locks from validation through publication, preinstalls a disjoint destination before removing source leaves, and retains source bookkeeping for rollback on page-table failure. A destination accepted by both region tables is PTE-free under the mapping invariant because every metadata removal first tears down its leaves; an unexpected leaf is rejected by installation and rollback rather than overwritten. Scatter installation holds the existing per-root page-table mutation lock across the batch, derives each page's unchanged COW/user permissions, and skips lazy zero sentinels. Source translations are invalidated on every CPU before a truncated tail is returned to the allocator; shared and huge ownership shapes are rejected rather than approximated."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "mlock validates complete mapped coverage before mutation, resolves file-demand pages through their external owner, allocates anonymous backing with no region lock held, revalidates before publishing, and frees every unconsumed or failed allocation. Exact VMA splitting moves rather than clones physical lists, preserving private, COW, and borrowed-frame ownership; LOCKED changes reclaim eligibility only and grants no mapping permission."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "mprotect and madvise preflight complete range coverage before changing permissions or releasing backing, so a hole cannot cause a partial security-state change. Permission rewrites preserve internal LOCKED/COW flags, derive hardware access from the resulting logical authority, skip lazy zero sentinels on both architectures, and keep W^X rejection in the existing capability-gated transition model."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Residency queries hold the huge-region and regular-region locks in the established order for one coherent snapshot, validate complete coverage before returning any result, and expose only one resident/nonresident bit per requested user page. They neither materialize lazy backing nor reveal physical addresses, frame ownership, COW reference counts, capability state, or domain tags; the userspace mincore adapter copies only this bounded bit vector through the guarded user-copy path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The base-page region table remains ordered by virtual base after every operation that can move or append an entry. Since overlap admission still rejects intersecting intervals, predecessor/successor checks are equivalent to the former full scan. Empty MAP_FIXED punches return before touching page tables or backing; overlapping punches retain the existing under-lock leaf removal, cross-CPU invalidation-before-release, and authoritative Region.phys ownership path. Keyed removal does not change which region or frames are retired."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Exact-range LOCKED flag updates use the ordered, non-overlapping VMA invariant to drain only intersecting tree entries. Each affected Region.phys vector is still consumed exactly once into disjoint head/middle/tail fragments, unchanged regions remain in place, and reinsertion derives each key from its fragment base. This changes metadata movement only: eager population, leaf permissions, COW/shared ownership, and failure-before-mutation coverage validation are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Overlapping MAP_FIXED and munmap punches use the ordered, non-overlapping VMA invariant to classify shared mappings and drain only intersecting tree entries. Each removed Region.phys entry still follows the existing under-lock leaf teardown and shared-release or private-free path; prefix and suffix fragments remain disjoint and are reinserted by base. Unchanged regions retain ownership in place, and cross-CPU invalidation still precedes private frame reuse."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The base-page VMA representation changes from a sorted vector to a BTreeMap keyed by Region.base. Structural mutation is private to RegionTable: insert derives the key from the value, relocation and stack growth remove the old key before changing base, and range splits drain owned Region values before inserting disjoint fragments. Tree removal therefore transfers each Region.phys vector exactly once into the same leaf-teardown, COW/shared release, or surviving-fragment paths; it changes lookup and metadata movement complexity without changing frame ownership, page-table mutation, or invalidate-before-reuse ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Ordered-tree point lookup returns only the greatest VMA base not above the requested user address and then checks the region end before exposing or mutating backing. Permission derivation, user-half validation, W^X checks, COW authorization, and domain/page-table flags are unchanged; the index neither grants a mapping nor bypasses any capability or domain check."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The page-table ownership registry remains fixed-size, allocation-free, and lock-free. Open-addressed insertion uses compare-exchange and never replaces a live physical-frame marker; lookup follows a collision chain until a never-used slot; unregister publishes a tombstone rather than an empty slot so later colliding registrations cannot become false negatives. A full registry still fails closed by retaining every existing ownership marker and incrementing the overflow counter. Consequently free_user_pml4_tree continues to reclaim only registered AS-private tables and cannot mistake copied kernel-shared page tables for owned frames."
