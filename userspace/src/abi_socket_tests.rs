@@ -3613,6 +3613,214 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_scm_rights_fd_passing);
 
+/// Send 8 KiB chunks into `fd`'s stream ring until it reports EAGAIN, asserting
+/// the non-blocking full-ring contract along the way: every return is either a
+/// positive accepted-byte count or EAGAIN — NEVER a bogus 0 for a non-empty
+/// buffer. The pre-fix full-ring path returned ok(0), which correct clients
+/// (sd-bus/dbus-broker) mis-handle as no-progress or a broken stream. Returns
+/// the total bytes the ring accepted before it filled.
+fn fill_stream_ring_until_eagain(fd: u64) -> Result<i64, &'static str> {
+    let chunk = [0x5au8; 8192];
+    let mut total: i64 = 0;
+    for _ in 0..256 {
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd, chunk.as_ptr() as u64, chunk.len() as u64, 0),
+        )
+        .ok_or("fill send status")?;
+        if r == EAGAIN {
+            return Ok(total);
+        }
+        if r <= 0 {
+            return Err("full-ring send returned a non-positive value other than EAGAIN");
+        }
+        total += r;
+    }
+    Err("stream ring never reported EAGAIN under continuous sending")
+}
+
+/// A non-blocking `send()` on a FULL AF_UNIX stream ring reports EAGAIN and
+/// recovers once the peer drains — it must never return a bogus 0-byte
+/// "success". Returning 0 for a non-empty buffer is not a value Linux send(2)
+/// ever produces; it made correct clients busy-loop or treat the stream as
+/// broken (a candidate for logind's "Connection reset by peer" when it asks
+/// systemd to StartTransientUnit the session scope over the system bus).
+fn smoke_abi_socket_send_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let accepted = fill_stream_ring_until_eagain(fd0)?;
+        if accepted <= 0 {
+            return Err("ring accepted no bytes before EAGAIN");
+        }
+        // Drain one chunk on the peer; the sender must then make progress.
+        let mut sink = [0u8; 8192];
+        let got = call(
+            Syscall::SocketRecv.raw(),
+            a3(fd1, sink.as_mut_ptr() as u64, sink.len() as u64, 0),
+        )
+        .ok_or("drain recv status")?;
+        if got <= 0 {
+            return Err("draining the peer returned no bytes");
+        }
+        let resumed = call(Syscall::SocketSend.raw(), a3(fd0, sink.as_ptr() as u64, 1, 0))
+            .ok_or("post-drain send status")?;
+        if resumed <= 0 {
+            return Err("send did not resume after the peer freed ring space");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd0));
+        let _ = call(Syscall::Close.raw(), a0(fd1));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_full_ring_reports_eagain
+);
+
+/// The non-fd `sendmsg()` path shares the full-ring contract: EAGAIN, not 0.
+fn smoke_abi_socket_sendmsg_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, _fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        let r = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("full-ring sendmsg status")?;
+        if r != EAGAIN {
+            return Err("sendmsg on a full ring did not report EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmsg_full_ring_reports_eagain
+);
+
+/// An fd-passing `sendmsg()` (SCM_RIGHTS) on a FULL ring must report EAGAIN and
+/// must NOT swallow the descriptor: after the peer drains, the retried send
+/// delivers the fd intact. The pre-fix path returned Ok(0) here AND dropped the
+/// fd batch on the floor — precisely the shape that breaks the logind→systemd
+/// scope-creation handshake and any AF_UNIX fd-passing under back-pressure.
+fn smoke_abi_socket_sendmsg_fd_full_ring_eagain_preserves_fd() -> TestResult {
+    with_setup(|| {
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+
+        // Build an fd-passing sendmsg: one payload byte + one SCM_RIGHTS fd.
+        let passed_fd = call(
+            Syscall::SocketOpen.raw(),
+            a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0),
+        )
+        .ok_or("passed fd status")? as i32;
+        if passed_fd < 0 {
+            return Err("passed-fd socket setup failed");
+        }
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&((16 + 4) as u64).to_le_bytes());
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_le_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&24u64.to_le_bytes());
+
+        // Full ring: the fd-passing sendmsg must report EAGAIN, not 0.
+        let blocked = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("full-ring fd sendmsg status")?;
+        if blocked != EAGAIN {
+            return Err("fd-passing sendmsg on a full ring did not report EAGAIN");
+        }
+
+        // Drain the peer completely so the ring has room again.
+        let mut sink = [0u8; 8192];
+        for _ in 0..256 {
+            let got = call(
+                Syscall::SocketRecv.raw(),
+                a3(fd1, sink.as_mut_ptr() as u64, sink.len() as u64, 0),
+            )
+            .ok_or("drain recv status")?;
+            if got == EAGAIN || got == 0 {
+                break;
+            }
+            if got < 0 {
+                return Err("drain recv error");
+            }
+        }
+
+        // Retry the SAME message — now it succeeds and still carries the fd.
+        let sent = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("retry fd sendmsg status")?;
+        if sent != payload.len() as i64 {
+            return Err("fd sendmsg did not succeed after the ring drained");
+        }
+
+        // recvmsg on the peer must install a fresh, distinct fd — proving the
+        // descriptor was NOT dropped by the EAGAIN'd first attempt.
+        let mut dst = [0u8; 16];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd1, rmsg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 {
+            return Err("recvmsg did not return the retried payload byte count");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            rmsg[40], rmsg[41], rmsg[42], rmsg[43], rmsg[44], rmsg[45], rmsg[46], rmsg[47],
+        ]) as usize;
+        if ctrllen < 16 + 4 {
+            return Err("SCM_RIGHTS fd was lost across the EAGAIN/retry");
+        }
+        let ctype = i32::from_le_bytes([rctrl[12], rctrl[13], rctrl[14], rctrl[15]]);
+        if ctype != SCM_RIGHTS {
+            return Err("received cmsg was not SCM_RIGHTS after retry");
+        }
+        let new_fd = i32::from_le_bytes([rctrl[16], rctrl[17], rctrl[18], rctrl[19]]);
+        if new_fd < 0 || new_fd as u64 == fd1 {
+            return Err("SCM_RIGHTS did not install a valid distinct fd after retry");
+        }
+        let _ = call(Syscall::Close.raw(), a0(new_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(passed_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd0));
+        let _ = call(Syscall::Close.raw(), a0(fd1));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmsg_fd_full_ring_eagain_preserves_fd
+);
+
 /// AF_UNIX datagrams carry SCM_RIGHTS too. This exercises the complete syscall
 /// path used by sd_notify FDSTORE: sendmsg parses the control record, the
 /// datagram queue preserves it with the payload, recvmsg installs a fresh

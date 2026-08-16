@@ -45,12 +45,12 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
         addr: dest,
     }) {
         crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            // Yield + retry from libc.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        // Surface the real errno (ECONNREFUSED for a datagram to a missing
-        // name, ENOTCONN, EINVAL, …) rather than a bare -1/EPERM.
+        // Surface the real errno (EAGAIN for a full ring — matching sendmsg and
+        // recv's non-blocking branch; ECONNREFUSED for a datagram to a missing
+        // name; ENOTCONN; EINVAL; …) rather than a bare -1/EPERM. A full ring
+        // MUST report EAGAIN, never a bogus 0-byte "success": returning 0 for a
+        // non-empty buffer makes correct clients busy-loop or treat the stream
+        // as broken, and matches nothing Linux ever returns from send(2).
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }

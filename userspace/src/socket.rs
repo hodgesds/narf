@@ -4795,6 +4795,17 @@ impl SocketFile {
             tx.write_stream_with_fds(buf, fds)
         };
         drop(state);
+        // Ring full (nothing fit) but there WAS data to send: the fd batch was
+        // not enqueued (write_*_with_fds bails before queuing when no bytes
+        // fit). Report EAGAIN so the caller waits for POLLOUT and RETRIES the
+        // whole sendmsg — re-attaching its SCM_RIGHTS fds — instead of seeing a
+        // bogus 0-byte "success". A 0 return from sendmsg is not a valid stream
+        // result: sd-bus/dbus-broker treat it as no-progress and either
+        // busy-loop or tear the connection down ("Connection reset by peer"),
+        // and the fds passed in this call would be silently dropped.
+        if n == 0 && !buf.is_empty() {
+            return Err(SockError::WouldBlock);
+        }
         // Wake a peer parked in poll/epoll/recv on the other end — same as
         // `do_send`. An fd-passing `sendmsg` (SCM_RIGHTS) is how libseat hands a
         // compositor its DRM/input fds; without this, a client blocked in
