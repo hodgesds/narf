@@ -93,6 +93,53 @@ end-to-end compatibility track.
 
 ---
 
+## Install on a Linux distribution
+
+Prebuilt native packages are the recommended installation path and do not
+require a Rust toolchain. Download the package for your distribution from a
+NARF release, then install it with the distribution's package manager:
+
+```sh
+VERSION=0.5.0
+
+# Debian or Ubuntu
+sudo apt install "./narf-kernel_${VERSION}_amd64.deb"
+
+# Fedora or another RPM-based distribution
+sudo dnf install ./narf-kernel-${VERSION}-*.x86_64.rpm
+
+# Arch Linux
+sudo pacman -U "./narf-kernel-${VERSION}-1-x86_64.pkg.tar.zst"
+```
+
+The package installs a versioned kernel in `/boot`, adds a GRUB menu generator,
+and refreshes the GRUB configuration when the host provides the usual update
+tool. Reboot and select **NARF &lt;version&gt;** from the GRUB menu. Keep your
+distribution kernel installed and configured as the default until you have
+validated NARF on the machine.
+
+To build and install a native package from a NARF checkout, install the optional
+Cargo frontend and let it detect the host package manager:
+
+```sh
+cargo install --path build/cargo-narf
+cargo narf detect
+cargo narf install --version 0.5.0 --dry-run
+cargo narf install --version 0.5.0
+```
+
+`cargo narf install` builds a native package and delegates installation to
+`apt`/`dpkg`, `dnf`/`rpm`, or `pacman`; it never copies files directly into
+`/boot`. Gentoo output is generated as an overlay-ready ebuild rather than
+installed automatically because overlay registration is host policy.
+
+Current native packages target x86_64 GRUB systems with Multiboot2. Native
+aarch64 installation, systemd-boot/kernel-install, and Secure Boot are not yet
+supported. See [packaging/README.md](packaging/README.md) for package creation,
+Gentoo setup, removal commands, artifact contents, and current limitations.
+
+---
+
 ## Quick start
 
 **Prerequisites:** Rust nightly (pinned in `rust-toolchain.toml`),
