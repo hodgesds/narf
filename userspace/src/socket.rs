@@ -4678,7 +4678,7 @@ impl SocketFile {
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. }
             | SocketState::InetConnected { tx, .. }
-            | SocketState::Inet6Connected { tx, .. } => tx,
+            | SocketState::Inet6Connected { tx, .. } => tx.clone(),
             _ => return Err(SockError::NotConnected),
         };
         if tx.is_closed() {
@@ -4704,9 +4704,14 @@ impl SocketFile {
         // the task, which re-parks without re-running collect_ready, so the data
         // is never collected and the peer is never served (a finite-timeout
         // dispatcher like wl_2proc's `dispatch(50)` masked this via its deadline
-        // re-execute). notify(0) calls the same wake hook AND bumps the gen.
+        // re-execute). `wake_reader` bumps the gen too — but wakes ONLY the
+        // peer that reads this ring (its recorded owner), instead of `notify(0)`
+        // waking every parked poller. AF_UNIX is point-to-point, so the blanket
+        // wake was a thundering herd (SMP cross-core IPI storm) on ALL Unix /
+        // D-Bus traffic. Unknown owner (loopback INET, or a UNIX ring not yet
+        // read) falls back to wake-all, so correctness is preserved.
         if n > 0 {
-            narf_net::readiness::notify(0);
+            tx.wake_reader();
         }
         if n == 0 && !buf.is_empty() {
             Err(SockError::WouldBlock)
@@ -4732,6 +4737,10 @@ impl SocketFile {
             | SocketState::Inet6Connected { rx, .. } => rx,
             _ => return Err(SockError::NotConnected),
         };
+        // Claim this ring for the current reader (even on a WouldBlock read, so
+        // a reader that parks BEFORE data arrives is still recorded), so the
+        // peer's next send targets ONLY this task instead of waking the herd.
+        rx.set_owner(crate::handlers::current_task_id());
         let n = if flags & MSG_PEEK != 0 {
             rx.peek(buf)
         } else {
@@ -4886,6 +4895,14 @@ pub struct RingBuf {
     closed: AtomicBool,
     readable_token: AtomicU64,
     writable_token: AtomicU64,
+    /// Task that READS this ring (the endpoint holding it as `rx`), for a
+    /// TARGETED readiness wake. AF_UNIX is point-to-point, so a send that fills
+    /// this ring should wake ONLY this reader — not every parked poller. The
+    /// old blanket `notify(0)` was a thundering herd (and, under SMP, a
+    /// cross-core IPI storm) on ALL Unix-socket / D-Bus traffic. 0 = unknown →
+    /// fall back to wake-all. Best-effort like TCP's TCB owner; the readiness
+    /// generation guard covers a stale/absent owner so it can never strand.
+    owner_task: AtomicU64,
 }
 
 struct RingInner {
@@ -4946,6 +4963,37 @@ impl RingBuf {
             closed: AtomicBool::new(false),
             readable_token: AtomicU64::new(0),
             writable_token: AtomicU64::new(0),
+            owner_task: AtomicU64::new(0),
+        }
+    }
+
+    /// Record the task that reads this ring (its `rx` endpoint owner), so a
+    /// send that fills it can wake ONLY that reader. See [`RingBuf::owner_task`].
+    #[inline]
+    fn set_owner(&self, task_id: u64) {
+        self.owner_task.store(task_id, Ordering::Relaxed);
+    }
+
+    /// The reader task recorded by [`RingBuf::set_owner`], or 0 if unknown.
+    #[inline]
+    fn owner(&self) -> u64 {
+        self.owner_task.load(Ordering::Relaxed)
+    }
+
+    /// Wake ONLY this ring's reader (the peer parked on it) and bump the
+    /// readiness generation — the point-to-point targeted wake that replaces
+    /// the blanket `notify(0)` herd on AF_UNIX data sends. When the reader is
+    /// unknown (owner 0: pre-registration, or an fd shared across tasks), fall
+    /// back to the conservative wake-all so correctness never depends on the
+    /// owner being right.
+    #[inline]
+    fn wake_reader(&self) {
+        let owner = self.owner();
+        if owner != 0 {
+            narf_net::readiness::bump_generation();
+            crate::handlers::wake_io_owner(owner);
+        } else {
+            narf_net::readiness::notify(0);
         }
     }
 

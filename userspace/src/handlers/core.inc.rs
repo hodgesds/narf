@@ -189,20 +189,29 @@ pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
 pub fn wake_io_waiters(key: u64) {
     if key != 0 {
         if let Some(owner) = tcb_owner(key as u32) {
-            // Owner known: targeted wake iff it's parked. Its waker lives in
-            // the owner's shard (keyed by task id).
-            let waker = {
-                let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
-                g.as_mut().and_then(|m| m.remove(&owner))
-            };
-            if let Some(w) = waker {
-                wake_one(owner, w);
-            }
+            // Owner known: targeted wake iff it's parked.
+            wake_io_owner(owner);
             return;
         }
         // Untracked key → fall through to wake-all (safety net).
     }
     wake_all_io_waiters();
+}
+
+/// Wake ONLY `owner`'s parked I/O waker, if it is parked. The targeted-wake
+/// primitive: used by the TCB-keyed net path AND directly by AF_UNIX sends,
+/// which are point-to-point and know their peer's reader (the `RingBuf` owner),
+/// so they must wake that one task — never the whole parked-poller herd. The
+/// waker lives in the owner's shard (keyed by task id). A wrong/absent owner is
+/// safe: the readiness generation guard makes the real reader re-poll.
+pub(crate) fn wake_io_owner(owner: u64) {
+    let waker = {
+        let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
+        g.as_mut().and_then(|m| m.remove(&owner))
+    };
+    if let Some(w) = waker {
+        wake_one(owner, w);
+    }
 }
 
 /// Evdev dispatch wake bridge: bump the readiness generation + wake all
