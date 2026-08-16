@@ -4094,15 +4094,27 @@ impl SocketFile {
                     fds: Vec::new(),
                 };
                 let mut ds = dest_sock.state.lock();
-                if let SocketState::InetDgram { inbox, .. } = &mut *ds {
+                let delivered = if let SocketState::InetDgram { inbox, .. } = &mut *ds {
                     inbox.push_back(pkt);
+                    true
+                } else {
+                    false // no bound InetDgram at the destination — dropped
+                };
+                drop(ds);
+                if delivered {
                     dest_sock
                         .dgram_readable_token
                         .fetch_add(1, Ordering::Release);
-                    SocketOpResult::Ok(buf.len() as u64)
-                } else {
-                    SocketOpResult::Ok(buf.len() as u64) // dropped
+                    // Wake a reader parked in poll/epoll on the destination.
+                    // Without this a peer blocked in epoll_wait(-1)/poll(-1) on
+                    // a bound UDP socket never wakes for a loopback datagram —
+                    // an infinite-timeout park breaks only on the readiness
+                    // generation bump, and the ~10 ms backstop re-checks the
+                    // park condition without re-running the readiness scan.
+                    // Mirrors the AF_UNIX dgram send path (dispatch_unix_dgram).
+                    narf_net::readiness::notify(0);
                 }
+                SocketOpResult::Ok(buf.len() as u64)
             }
             SocketOp::Recv { buf, flags: _ } => {
                 let mut state = self.state.lock();

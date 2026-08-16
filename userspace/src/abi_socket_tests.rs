@@ -3288,6 +3288,191 @@ kernel_test_in!(
     smoke_abi_socket_notify_path_dgram_epollin_deliver
 );
 
+/// The WAKE channel for a delivered AF_UNIX datagram — the half every
+/// timeout-0 epoll scan in this file cannot see. A service's
+/// `sd_notify(READY=1)` sendto must (1) bump the readiness GENERATION, the
+/// only thing that breaks PID 1 out of an infinite-timeout `epoll_wait`
+/// re-park (a fresh scan finds the datagram whether or not anyone was
+/// notified, so scan-only tests stay green across a lost wake), and
+/// (2) make the re-executed scan report the fd readable. Mirrors
+/// `smoke_abi_socket_connected_pair_send_wakes_parked_epoll`, which pins the
+/// same two halves for connected STREAM pairs; named SOCK_DGRAM endpoints
+/// take a different send path (`dispatch_unix_dgram_with_fds`) with its own
+/// notify call, so a regression there is invisible to the stream test.
+/// Covers both address families sd_notify uses: a PATHNAME bind
+/// (/run/systemd/notify) and an ABSTRACT bind (@/org/freedesktop/systemd1/
+/// notify).
+fn smoke_abi_dgram_send_wakes_parked_reader() -> TestResult {
+    with_setup(|| {
+        for abstract_ns in [false, true] {
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = if abstract_ns {
+                abstract_sockaddr(b"narf-dgram-wake")
+            } else {
+                unix_sockaddr(b"/abi-dgram-wake.sock")
+            };
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err(if abstract_ns {
+                    "bind() of the abstract dgram receiver failed"
+                } else {
+                    "bind() of the pathname dgram receiver failed"
+                });
+            }
+            let epfd = add_level_epollin(rx)?;
+
+            // Negative half: an idle bound dgram socket must not report
+            // ready, or a parked PID 1 degenerates into a recv/EAGAIN spin.
+            if epoll_ready_now(epfd)? != 0 {
+                return Err("idle dgram socket reported epoll-ready before any send");
+            }
+
+            let before = narf_net::readiness::generation();
+            let tx = open_unix(SOCK_DGRAM)?;
+            let payload = b"READY=1\n";
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            )
+            .ok_or("sendto status")?;
+            if sent != payload.len() as i64 {
+                return Err("sendto() of the notify datagram failed");
+            }
+
+            // Half 1: the wake channel. Without this bump a reader parked in
+            // `epoll_wait(-1)`/`poll(-1)` never re-runs its readiness scan and
+            // the READY=1 sits queued forever (Type=notify start job hangs).
+            if narf_net::readiness::generation() <= before {
+                return Err(if abstract_ns {
+                    "abstract dgram sendto published no readiness wake for a parked reader"
+                } else {
+                    "pathname dgram sendto published no readiness wake for a parked reader"
+                });
+            }
+            // Half 2: the scan a woken waiter re-executes must see the datagram.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err("delivered dgram did not make the receiver epoll-readable");
+            }
+            // And the recv the woken reader issues must return the bytes.
+            let mut rbuf = [0u8; 16];
+            let got = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if got != payload.len() as i64 || &rbuf[..payload.len()] != payload {
+                return Err("woken reader did not receive the READY=1 bytes");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_dgram_send_wakes_parked_reader
+);
+
+/// Same two halves for the AF_INET SOCK_DGRAM (UDP loopback) sibling path.
+/// `dispatch_inet_dgram`'s Send enqueues into the destination inbox and
+/// advances `dgram_readable_token`, but — unlike the AF_UNIX dgram path —
+/// never calls `narf_net::readiness::notify`, so a reader parked in an
+/// infinite-timeout `epoll_wait`/`poll` on a bound UDP socket is never woken
+/// by a loopback datagram (the epoll park backstop re-checks the park
+/// condition without re-running the readiness scan). Delivery itself works —
+/// only the wake channel is missing.
+fn smoke_abi_inet_dgram_send_wakes_parked_reader() -> TestResult {
+    with_setup(|| {
+        // sockaddr_in: family(u16 LE) + port(u16 BE) + addr(u32 BE) + pad.
+        fn inet_sockaddr(ip: [u8; 4], port: u16) -> ([u8; 16], u64) {
+            let mut buf = [0u8; 16];
+            buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            buf[2..4].copy_from_slice(&port.to_be_bytes());
+            buf[4..8].copy_from_slice(&ip);
+            (buf, 16)
+        }
+        let rx = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) failed"),
+        };
+        let (raddr, ralen) = inet_sockaddr([127, 0, 0, 1], 47311);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, raddr.as_ptr() as u64, ralen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the UDP receiver failed");
+        }
+        let epfd = add_level_epollin(rx)?;
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("idle UDP socket reported epoll-ready before any send");
+        }
+
+        // Sender must be bound first: NARF's InetDgram Send has no
+        // Linux-style sendto auto-bind (Fresh state → ENOTCONN).
+        let tx = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) for sender failed"),
+        };
+        let (taddr, talen) = inet_sockaddr([127, 0, 0, 1], 47312);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(tx, taddr.as_ptr() as u64, talen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the UDP sender failed");
+        }
+
+        let before = narf_net::readiness::generation();
+        let payload = b"udp-wake";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: raddr.as_ptr() as u64,
+                arg5: ralen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("sendto status")?;
+        if sent != payload.len() as i64 {
+            return Err("UDP loopback sendto failed");
+        }
+
+        // Delivery half (works today): the scan sees the datagram.
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("delivered UDP datagram did not make the receiver epoll-readable");
+        }
+        // Wake half: the generation bump that un-parks an infinite-timeout
+        // waiter. This is the missing notify in `dispatch_inet_dgram`.
+        if narf_net::readiness::generation() <= before {
+            return Err("UDP loopback sendto published no readiness wake for a parked reader");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_inet_dgram_send_wakes_parked_reader
+);
+
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
 /// half, and confirm a NEW fd (different number, usable) was installed.
 fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
