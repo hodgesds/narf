@@ -800,6 +800,19 @@ fn do_execve_resolved(
     }
     let path: &str = &path_owned;
 
+    // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
+    // fast boot even while the console is otherwise quiet): mark when the
+    // session reaches its compositor / shell. Its presence = the greeter got
+    // past the session-bus step and the desktop path is unblocked; its absence
+    // across a boot = still stuck. One substring check per execve (cold path).
+    if path.contains("kwin_wayland")
+        || path.contains("plasmashell")
+        || path.contains("kwin_wrapper")
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "SESSION-EXEC path={}", path);
+    }
+
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write as _;

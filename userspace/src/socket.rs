@@ -3654,6 +3654,25 @@ impl SocketFile {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 }
+                // [VERIFY-PROBE] Unconditional: a SUCCESSFUL connect to a
+                // per-user session bus (/run/user/<uid>/bus) means user@<uid>'s
+                // systemd --user is up serving its bus — i.e. the D-Bus reset
+                // that was stopping user@957 is gone. Before the AF_UNIX
+                // targeted-wake fix the greeter only ever reached the SYSTEM bus.
+                // This prints in a CLEAN fast boot even while the console is
+                // otherwise quiet, giving a yes/no on the desktop path.
+                if let UnixAddr::Path(p) = &uaddr {
+                    if p.contains("/run/user/") && p.ends_with("/bus") {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "SESSIONBUS-CONNECT path={} by={}",
+                            p,
+                            crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
+                                .unwrap_or_default()
+                        );
+                    }
+                }
                 // Wayland/dbus connect-latency diagnostic: stamp WHO connected
                 // to WHICH listener path and WHEN, so a slow accept()or is
                 // measurable from the serial log (pairs with UNIXACC below).
