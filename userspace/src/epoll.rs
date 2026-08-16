@@ -251,30 +251,6 @@ impl EpollInstance {
         }
     }
 
-    /// Return a vector of (events, data) pairs for ready fds.
-    /// Consults the current fd-table for each interest item.
-    /// `(fd, poll_readiness_bits)` for every fd in the interest set, for the
-    /// unbounded-park diagnostic. Same snapshot-then-poll shape as
-    /// [`Self::collect_ready`] so it reports what that function would see.
-    #[cfg(feature = "unix-latency-trace")]
-    fn dbg_interest_readiness(&self, task_id: u64) -> Vec<(i32, u32)> {
-        let snapshot: Vec<(i32, EpollItem)> = {
-            let g = self.inner.lock();
-            g.interest.iter().map(|(k, v)| (*k, v.clone())).collect()
-        };
-        snapshot
-            .into_iter()
-            .map(|(fd, _)| {
-                let bits = crate::fd::with_table(task_id, |t| {
-                    t.get(fd as u32).map(|e| e.ops.poll_readiness())
-                })
-                .flatten()
-                .unwrap_or(u32::MAX);
-                (fd, bits)
-            })
-            .collect()
-    }
-
     /// Per-interest-fd EPOLLET edge state for the unbounded-park diagnostic.
     /// Mirrors [`Self::collect_ready`]'s exact delivery decision so a fd that
     /// is level-readable (`ready != 0`) but `would_deliver == false` while the
@@ -1131,19 +1107,26 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             crate::handlers::set_signal_mask_for_task(task, old);
                         }
                         // Debug-feature only: what the interest set looked
-                        // like at the instant we committed to an UNBOUNDED
-                        // park. With `timeout_ms < 0` the only wake sources
-                        // are `readiness::notify` and the timerfd clamp, so a
-                        // task that parks here with a readable fd in its set
-                        // never wakes. Printing the set is the difference
+                        // like at the instant we committed to a park. Covers
+                        // BOTH finite and infinite timeouts — systemd/PID 1's
+                        // event loop uses a FINITE-timeout epoll_wait, and a
+                        // finite park that re-arms every backstop tick with a
+                        // readable-but-undelivered fd in its set is just as
+                        // stranded as an unbounded one (the accept edge is lost
+                        // on every re-scan). Printing the set is the difference
                         // between "epoll never saw the fd" and "the fd really
                         // was not ready", which no amount of outside
-                        // observation distinguishes.
+                        // observation distinguishes. Throttled to ~4 lines/s so
+                        // a persistent strand can't re-flood the serial line
+                        // (that flood is itself an observer effect that
+                        // manufactures the accept pile-up under investigation).
                         #[cfg(feature = "unix-latency-trace")]
-                        if deadline_ns.is_none() {
+                        {
                             use core::fmt::Write as _;
                             static SHOWN: core::sync::atomic::AtomicU32 =
                                 core::sync::atomic::AtomicU32::new(0);
+                            static LAST_NS: core::sync::atomic::AtomicU64 =
+                                core::sync::atomic::AtomicU64::new(0);
                             // Budget generously: an earlier 48-line cap was
                             // spent entirely by PID 1 and systemd-tmpfiles
                             // before the task under investigation had even
@@ -1173,7 +1156,14 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                                 // accept/read strand worth printing.
                                 (cur & ((want & EPOLLIN) | EPOLLERR | EPOLLHUP)) != 0
                             });
-                            if suspicious && SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                            let now_ns = narf_scheduler::narf_time::monotonic_ns();
+                            let throttled = now_ns.saturating_sub(LAST_NS.load(Ordering::Relaxed))
+                                < 250_000_000;
+                            if suspicious
+                                && !throttled
+                                && SHOWN.fetch_add(1, Ordering::Relaxed) < 2000
+                            {
+                                LAST_NS.store(now_ns, Ordering::Relaxed);
                                 let comm = crate::handlers::proc_comm_of_task(task)
                                     .unwrap_or_else(|| alloc::string::String::from("?"));
                                 let _ = write!(
