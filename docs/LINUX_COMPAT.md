@@ -464,7 +464,10 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
 - systemd as PID 1 is **in progress** (reaches early init, not a full boot).
 - Namespace breadth is partial and mostly gated behind `container`; abstract
   AF_UNIX / rtnetlink / udev-event firing are noted as systemd gates.
-- No distro packaging; build from source.
+- Native x86_64 packages are produced for Debian/Ubuntu, RPM distributions,
+  Arch, and Gentoo, with a source-installable `cargo narf` frontend. The
+  remaining packaging gap is non-GRUB/kernel-install integration and a
+  versioned UEFI application suitable for systemd-boot.
 
 **The cfg-gating trap (repeat).** Building without `linux-compat` (or without
 `container`) silently removes ~50 syscalls; a program that needs them gets an

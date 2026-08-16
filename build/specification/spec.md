@@ -47,6 +47,10 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a
   checksummed release manifest.
+- `cargo install --path build/cargo-narf` installs the optional source-tree
+  frontend. `cargo narf package` drives reproducible native package generation;
+  `cargo narf install` delegates the resulting artifact to apt/dpkg, dnf/rpm,
+  or pacman rather than writing `/boot` directly.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.

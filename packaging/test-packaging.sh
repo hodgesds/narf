@@ -23,6 +23,16 @@ test -f "$tmp/out/release-manifest.json"
 tar -tzf "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz" |
     grep -F './boot/narf-kernel-0.0.0-test.1' >/dev/null
 
+# Exercise the source-installable Cargo frontend as well as the underlying
+# release builder. It must produce the same package layout without installing
+# anything on the host.
+cargo run -q -p cargo-narf -- narf package --version 0.0.0-test.1 \
+    --formats tar --skip-build --output "$tmp/cargo-out" \
+    --source-date-epoch 1700000000
+test -f "$tmp/cargo-out/narf-0.0.0-test.1-x86_64.tar.gz"
+tar -tzf "$tmp/cargo-out/narf-0.0.0-test.1-x86_64.tar.gz" |
+    grep -F './boot/narf-kernel-0.0.0-test.1' >/dev/null
+
 if [[ -f $tmp/created ]]; then
     while IFS= read -r path; do rm -f "$path"; done <"$tmp/created"
 fi

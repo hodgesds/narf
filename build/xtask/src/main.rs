@@ -8105,6 +8105,10 @@ fn host_test_cmd() -> Result<()> {
                 // invalidates every perf conclusion drawn through it.
                 "-p",
                 "xtask",
+                // Developer-facing native package frontend. Its os-release
+                // detection and command construction must remain host-safe.
+                "-p",
+                "cargo-narf",
             ],
         ),
         (
