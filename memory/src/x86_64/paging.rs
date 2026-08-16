@@ -720,6 +720,16 @@ use crate::VirtAddr;
 const PT_LOCK_SHARDS: usize = 64;
 static PT_LOCKS: [narf_lib::sync::IrqSafeSpinLock<()>; PT_LOCK_SHARDS] =
     [const { narf_lib::sync::IrqSafeSpinLock::new(()) }; PT_LOCK_SHARDS];
+#[cfg(feature = "kernel-test")]
+static RANGE_PT_WALKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Upper-level walks performed by the contiguous permission rewriter. One
+/// walk covers every page sharing a leaf table (up to 512 entries).
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __range_pt_walks_for_test() -> u64 {
+    RANGE_PT_WALKS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[inline]
 pub(crate) fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
@@ -1080,8 +1090,8 @@ pub unsafe fn map_4kb_scatter_range(
 /// Rewrite a scatter-backed run under one root-lock transaction and one local
 /// invalidation phase. Zero physical entries stay lazy and unmapped.
 ///
-/// Existing leaves are cleared before their replacements are installed. The
-/// helper performs per-page INVLPG for runs up to 512 pages and one local
+/// Existing leaves are replaced in place while the root mutation lock is held.
+/// The helper performs per-page INVLPG for runs up to 512 pages and one local
 /// non-global flush for larger runs. A caller whose address space can be active
 /// on peer CPUs must follow with [`invlpg_remote_range`] or a full remote flush.
 ///
@@ -1123,25 +1133,65 @@ pub unsafe fn rewrite_4kb_scatter_range(
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     let mut changed = false;
     let mut result = Ok(());
+    // Cache the leaf table for each contiguous 2 MiB run. Permission rewrites
+    // normally touch already-materialized leaves, so this makes the common
+    // path one upper walk plus one descriptor store per 512 pages.
+    // SAFETY: root is identity-reachable and protected by the mutation guard.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
     for (index, phys) in backing.iter().copied().enumerate() {
         if phys.raw() == 0 {
             continue;
         }
         changed = true;
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
-        // SAFETY: validated range and live root are protected by the one guard.
-        match unsafe { unmap_4kb_locked(pml4_phys, virt, false, false) } {
-            Ok(_) | Err(MapError::AlreadyMapped) => {}
-            Err(error) => {
-                result = Err(error);
-                break;
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            #[cfg(feature = "kernel-test")]
+            RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            let pml4e = pml4.entries[idx.pml4];
+            if pml4e.is_present() {
+                // SAFETY: verified present table descriptor under root lock.
+                let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+                let pdpte = pdpt.entries[idx.pdpt];
+                if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                    result = Err(MapError::EncounteredHugePage);
+                    break;
+                }
+                if pdpte.is_present() {
+                    // SAFETY: verified PDPT table descriptor under root lock.
+                    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+                    let pde = pd.entries[idx.pd];
+                    if pde.flags().contains(PtFlags::HUGE_PAGE) {
+                        result = Err(MapError::EncounteredHugePage);
+                        break;
+                    }
+                    if pde.is_present() {
+                        cached_pt = pde.addr().as_mut_ptr::<PageTable>();
+                    }
+                }
             }
         }
         let flags = flags_for(index, phys);
-        // SAFETY: the previous leaf is absent and the same guard remains held.
-        if let Err(error) = unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, false) } {
-            result = Err(error);
-            break;
+        if cached_pt.is_null() {
+            // SAFETY: missing upper levels are created under the same guard.
+            if let Err(error) = unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, false) } {
+                result = Err(error);
+                break;
+            }
+            // The next page must rediscover the table just created.
+            cached_key = usize::MAX;
+        } else {
+            // SAFETY: cached_pt came from the verified PDE for this key and
+            // remains stable under the root mutation guard.
+            let pt = unsafe { &mut *cached_pt };
+            pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
+            debug_assert_eq!(pt.entries[idx.pt].addr(), phys);
         }
     }
     if changed {

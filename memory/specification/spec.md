@@ -659,6 +659,8 @@ x86_64 is rejected at runtime.
   root-lock or invalidate-before-reuse transaction.
 - x86_64 permission and COW write-protect rewrites hold one root mutation shard
   per region rather than reacquiring it for each unmap/map pair. The helper
+  caches the current leaf table and directly replaces present descriptors, so
+  up to 512 adjacent 4 KiB pages share one PML4/PDPT/PD walk. It then
   completes one bounded local invalidation phase after the final leaf write;
   `AddressSpace` then issues only the remote half of a range shootdown for a
   peer-active small run, or one full non-global local/remote flush for a large

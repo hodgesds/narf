@@ -740,6 +740,8 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
+    #[cfg(feature = "kernel-test")]
+    use crate::paging::__range_pt_walks_for_test;
     use crate::paging::{
         flags_at, map_4kb_scatter_range, rewrite_4kb_scatter_range, translate,
         unmap_4kb_local_range, PageTable, PtFlags,
@@ -779,6 +781,8 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
             return TestResult::Fail("scatter range translation mismatch");
         }
     }
+    #[cfg(feature = "kernel-test")]
+    let walks_before = __range_pt_walks_for_test();
     // SAFETY: permission-only rewrite of the same isolated-root backing.
     if unsafe {
         rewrite_4kb_scatter_range(pml4, base, &backing, |_, _| {
@@ -788,6 +792,12 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     .is_err()
     {
         return TestResult::Fail("scatter range permission rewrite failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before + 1 {
+            return TestResult::Fail("scatter rewrite repeated an upper-level walk per page");
+        }
     }
     for page in [0_u64, 2] {
         let va = VirtAddr::new(base.as_u64() + page * 4096);
