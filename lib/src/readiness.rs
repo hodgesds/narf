@@ -30,17 +30,21 @@
 //!
 //! # Durability of the wake itself
 //!
-//! `set` fires each waiter's [`Waker::wake`] *outside* the lock. In NARF the
-//! park waker is a no-op-vtable waker whose real effect is an atomic store
-//! (`sleep_deadline_ns = 0`) — IRQ-safe and un-droppable, so the wake is
-//! durable even when `set` runs from a device IRQ. `Readiness` itself is
-//! waker-agnostic: it stores whatever `Waker` [`arm`] was handed and calls
-//! `wake()`.
+//! `set` fires each satisfied waiter with [`Waker::wake_by_ref`], *under* the
+//! lock, and never removes a waiter. In NARF the park waker's `wake_by_ref` is
+//! the Linux `try_to_wake_up` op: an atomic runnable-bit store plus a
+//! lock-free reschedule IPI, touching no allocation. So the wake is durable
+//! and IRQ-safe even when `set` runs from a device-IRQ readiness source — it
+//! drops no `Arc` (a `WakeCell` dealloc, illegal in IRQ) and deadlocks against
+//! no lock; Linux likewise wakes under the wait-queue lock. A woken waiter
+//! stays registered until the task's re-arm (which replaces it, or returns
+//! `Ready` and removes it) or its [`disarm`] on exit; a redundant re-fire is
+//! an idempotent runnable-bit store. `Readiness` stays waker-agnostic and only
+//! ever calls `wake_by_ref` — never a dropping `wake`.
 
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use core::task::{Poll, Waker};
 
 use crate::sync::IrqSafeSpinLock;
@@ -115,34 +119,34 @@ impl Readiness {
     /// `clear`-only transitions (readiness going away) touch neither `seq` nor
     /// waiters — a poller waits for readiness to *appear*, never to leave.
     pub fn set(&self, add: u32, clear: u32) {
-        // Collect the wakers to fire, then wake OUTSIDE the lock: `wake()` may
-        // re-enter scheduling and must not run under the readiness lock.
-        let to_wake: Vec<Waker> = {
-            let mut g = self.inner.lock();
-            let old = g.mask;
-            let new = (old & !clear) | add;
-            g.mask = new;
-            let rising = new & !old;
-            if rising == 0 {
-                return;
+        let mut g = self.inner.lock();
+        let old = g.mask;
+        let new = (old & !clear) | add;
+        g.mask = new;
+        let rising = new & !old;
+        if rising == 0 {
+            return;
+        }
+        g.seq = g.seq.wrapping_add(1);
+        // Wake every satisfied waiter BY REFERENCE, UNDER the lock. This is the
+        // end-to-end durable, IRQ-safe wake:
+        //
+        // * `wake_by_ref` is the Linux-TTWU op — an atomic runnable-bit store
+        //   plus a lock-free reschedule IPI (`resched_remote`). It touches no
+        //   allocation and takes no lock, so calling it under this spinlock
+        //   neither deadlocks nor drops an `Arc` — the latter being illegal
+        //   from an IRQ-context readiness source (a `Sleepable`/`WakeCell`
+        //   dealloc). Linux likewise wakes under the wait-queue lock.
+        // * Waiters are NOT removed here. Removing would drop the waker's
+        //   `Arc<WakeCell>`, the very IRQ-illegal dealloc we must avoid. A woken
+        //   waiter is instead cleared by the task's re-arm ([`arm`] replaces by
+        //   id, and a now-satisfied re-arm returns `Ready` which removes it) or
+        //   by its [`disarm`] on exit. A still-registered, already-woken waiter
+        //   is harmless: a later rising edge simply re-stores its runnable bit.
+        for w in g.waiters.values() {
+            if w.interest & new != 0 {
+                w.waker.wake_by_ref();
             }
-            g.seq = g.seq.wrapping_add(1);
-            // Wake — and remove — every waiter now satisfied. Removed waiters
-            // re-arm on their next poll pass; a still-registered waiter is one
-            // whose interest is not yet met.
-            let mut fire = Vec::new();
-            g.waiters.retain(|_id, w| {
-                if w.interest & new != 0 {
-                    fire.push(w.waker.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            fire
-        };
-        for w in to_wake {
-            w.wake();
         }
     }
 
@@ -245,9 +249,10 @@ mod tests {
         // The edge arrives AFTER we registered: the durable case.
         r.set(IN, 0);
         assert_eq!(n.load(Ordering::SeqCst), 1, "set must wake the armed waiter");
-        assert_eq!(r.waiter_count(), 0, "a woken waiter is removed");
-        // And the level is now visible.
+        assert_eq!(r.waiter_count(), 1, "set is drop-free: the woken waiter is kept");
+        // The level is now visible; re-arm returns Ready and clears the entry.
         assert_eq!(r.arm(1, IN, &w), Poll::Ready(IN));
+        assert_eq!(r.waiter_count(), 0, "re-arm on Ready clears the registration");
     }
 
     #[test]
@@ -272,7 +277,31 @@ mod tests {
         assert_eq!(r.waiter_count(), 1);
         r.set(OUT, 0); // the OUT edge does
         assert_eq!(n.load(Ordering::SeqCst), 1);
+        assert_eq!(r.waiter_count(), 1, "drop-free: the woken waiter is kept");
+    }
+
+    #[test]
+    fn set_is_drop_free_and_keeps_waiter() {
+        // `set` must NEVER remove/drop a waiter — dropping the waker's Arc is an
+        // IRQ-illegal dealloc. The woken waiter stays registered (and re-fires
+        // on a later edge) until `disarm` clears it in task context.
+        let r = Readiness::new(0);
+        let n = Arc::new(AtomicU32::new(0));
+        let w = counting_waker(&n);
+        assert_eq!(r.arm(1, IN, &w), Poll::Pending);
+        r.set(IN, 0);
+        assert_eq!(r.waiter_count(), 1, "set keeps the waiter");
+        // A later rising edge (after a clear) re-fires the SAME kept waiter —
+        // an idempotent runnable-bit store, harmless.
+        r.set(0, IN); // clear (no wake, no bump)
+        r.set(IN, 0); // rise again
+        assert_eq!(n.load(Ordering::SeqCst), 2, "kept waiter re-fires on next edge");
+        // Only disarm (task context) removes it.
+        r.disarm(1);
         assert_eq!(r.waiter_count(), 0);
+        r.set(0, IN);
+        r.set(IN, 0);
+        assert_eq!(n.load(Ordering::SeqCst), 2, "disarmed waiter never fires again");
     }
 
     #[test]
