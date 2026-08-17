@@ -318,13 +318,11 @@ impl EpollInstance {
                 continue;
             }
             if let Some(ops) = item.file.upgrade() {
-                if let Some(r) = ops.readiness() {
-                    let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
-                    let interest = want | EPOLLERR | EPOLLHUP;
-                    // Register the wake; the Ready result is deliberately
-                    // ignored — collect_ready owns delivery (see doc above).
-                    let _ = r.arm(task_id, interest, waker);
-                }
+                let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                let interest = want | EPOLLERR | EPOLLHUP;
+                // Register the wake; the Ready result is deliberately ignored —
+                // collect_ready owns delivery (see doc above).
+                let _ = ops.arm_readiness(task_id, interest, waker);
             }
         }
     }
@@ -337,9 +335,7 @@ impl EpollInstance {
             self.inner.lock().interest.values().cloned().collect();
         for item in &snapshot {
             if let Some(ops) = item.file.upgrade() {
-                if let Some(r) = ops.readiness() {
-                    r.disarm(task_id);
-                }
+                ops.disarm_readiness(task_id);
             }
         }
     }

@@ -745,6 +745,37 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Arm a `poll`/`epoll` waiter (identified by `task_id`) on this file's
+    /// durable readiness for `interest`, returning the
+    /// [`Poll`](core::task::Poll) result of the register-then-check, or `None`
+    /// if the file is still on the legacy path.
+    ///
+    /// The default delegates to [`Self::readiness`] — correct for a file whose
+    /// readiness is one directly-owned cell (eventfd, pipe). A file whose
+    /// readiness is COMPOSITE or lives behind a lock overrides this: an AF_UNIX
+    /// socket's rx/tx `RingBuf` cells sit inside its state lock, so it locks,
+    /// reaches each cell, and `arm`s them under the interest bits each covers.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.readiness().map(|r| r.arm(task_id, interest, waker))
+    }
+
+    /// Remove `task_id`'s registration from this file's durable readiness.
+    /// Returns whether the file is on the durable path at all. Default via
+    /// [`Self::readiness`]; composite / behind-a-lock files override.
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        if let Some(r) = self.readiness() {
+            r.disarm(task_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Monotonic source-local tokens for edge-triggered readiness.
     ///
     /// A readiness provider that can transition away from and back to the

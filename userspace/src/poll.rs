@@ -499,9 +499,9 @@ fn arm_readiness_cells(task_id: u64, fds: &[PollFd], waker: &core::task::Waker) 
                 continue;
             }
             if let Some(e) = t.get(pfd.fd as u32) {
-                if let Some(r) = e.ops.readiness() {
-                    let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
-                    if r.arm(task_id, interest, waker).is_ready() {
+                let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
+                if let Some(poll) = e.ops.arm_readiness(task_id, interest, waker) {
+                    if poll.is_ready() {
                         any_ready = true;
                     }
                 }
@@ -522,9 +522,7 @@ fn disarm_readiness_cells(task_id: u64, fds: &[PollFd]) {
                 continue;
             }
             if let Some(e) = t.get(pfd.fd as u32) {
-                if let Some(r) = e.ops.readiness() {
-                    r.disarm(task_id);
-                }
+                e.ops.disarm_readiness(task_id);
             }
         }
     });
