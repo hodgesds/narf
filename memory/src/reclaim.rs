@@ -117,6 +117,9 @@ use crate::{PhysAddr, VirtAddr};
 static WMARK_MIN: AtomicU64 = AtomicU64::new(0);
 static WMARK_LOW: AtomicU64 = AtomicU64::new(0);
 static WMARK_HIGH: AtomicU64 = AtomicU64::new(0);
+/// Total usable page count, recorded at `init_watermarks` so the low/high band
+/// can be re-derived whenever `min` or the scale factor changes at runtime.
+static WMARK_TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Lower clamp on `min` (pages): keep at least ~2 MiB free even on
 /// tiny memories so an allocation storm always has a little headroom.
@@ -125,44 +128,96 @@ const WMARK_MIN_FLOOR_PAGES: u64 = 512;
 /// machine doesn't hold back an absurd amount of otherwise-usable RAM.
 const WMARK_MIN_CEIL_PAGES: u64 = 65_536;
 
+/// `vm.watermark_scale_factor` analogue, in units of 1/10000 of total RAM.
+/// It sets the gap between adjacent watermarks — `gap = max(min/4,
+/// total·scale/10000)` — so a larger factor WIDENS the reclaim band and kswapd
+/// sheds a bigger batch per wake (fewer, larger passes). Linux defaults to 10
+/// (0.1%) and clamps to [1, 3000].
+const WMARK_SCALE_DEFAULT: u64 = 10;
+const WMARK_SCALE_MIN: u64 = 1;
+const WMARK_SCALE_MAX: u64 = 3000;
+static WMARK_SCALE_FACTOR: AtomicU64 = AtomicU64::new(WMARK_SCALE_DEFAULT);
+
 /// Compute + install the free-memory watermarks from the total usable
 /// page count. Call once, at boot, after the frame allocator reports
-/// its total. `min = clamp(4·√total, floor, ceil)`, `low = 5/4·min`,
-/// `high = 3/2·min`.
+/// its total. `min = clamp(4·√total, floor, ceil)`, then low/high per
+/// [`derive_band`] at the current scale factor.
 pub fn init_watermarks(total_pages: usize) {
-    let (min, low, high) = compute_watermarks(total_pages);
+    WMARK_TOTAL_PAGES.store(total_pages as u64, Ordering::Relaxed);
+    let min = (total_pages as u64)
+        .isqrt()
+        .saturating_mul(4)
+        .clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
     WMARK_MIN.store(min, Ordering::Relaxed);
-    WMARK_LOW.store(low, Ordering::Relaxed);
-    WMARK_HIGH.store(high, Ordering::Relaxed);
+    recompute_low_high();
 }
 
 /// Runtime override of the `min` free-page reserve — the analogue of
 /// Linux's `vm.min_free_kbytes` sysctl. `low`/`high` are re-derived
-/// from it (`low = 5/4·min`, `high = 3/2·min`), so tuning this one
-/// knob shifts the whole reclaim band, exactly as writing
-/// `min_free_kbytes` does. The value is clamped to the same
-/// [floor, ceil] band as the boot auto-sizing. Intended to back a
-/// future `/proc/sys/vm/min_free_kbytes` write.
+/// from it (see [`derive_band`]), so tuning this one knob shifts the
+/// whole reclaim band. Clamped to the same [floor, ceil] band as the
+/// boot auto-sizing. Intended to back a future
+/// `/proc/sys/vm/min_free_kbytes` write.
 pub fn set_min_free_pages(min_pages: u64) {
-    let (min, low, high) = derive_watermarks(min_pages);
-    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_MIN.store(
+        min_pages.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES),
+        Ordering::Relaxed,
+    );
+    recompute_low_high();
+}
+
+/// Runtime override of the watermark scale factor — the analogue of Linux's
+/// `vm.watermark_scale_factor`. Clamped to [1, 3000]; re-derives low/high from
+/// the live `min` + total RAM. Intended to back a future
+/// `/proc/sys/vm/watermark_scale_factor` write.
+pub fn set_watermark_scale_factor(factor: u64) {
+    WMARK_SCALE_FACTOR.store(
+        factor.clamp(WMARK_SCALE_MIN, WMARK_SCALE_MAX),
+        Ordering::Relaxed,
+    );
+    recompute_low_high();
+}
+
+/// The current watermark scale factor.
+pub fn watermark_scale_factor() -> u64 {
+    WMARK_SCALE_FACTOR.load(Ordering::Relaxed)
+}
+
+/// Re-derive and install `low`/`high` from the live `min`, total pages, and
+/// scale factor. Called whenever any input changes.
+fn recompute_low_high() {
+    let (_, low, high) = derive_band(
+        WMARK_MIN.load(Ordering::Relaxed),
+        WMARK_TOTAL_PAGES.load(Ordering::Relaxed),
+        WMARK_SCALE_FACTOR.load(Ordering::Relaxed),
+    );
     WMARK_LOW.store(low, Ordering::Relaxed);
     WMARK_HIGH.store(high, Ordering::Relaxed);
 }
 
-/// Pure watermark math (no global state) — `(min, low, high)` in pages
-/// sized from total RAM. Split out so it can be unit-tested without
-/// perturbing the live boot-installed watermarks.
-fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
-    derive_watermarks((total_pages as u64).isqrt().saturating_mul(4))
+/// Pure watermark-band math (no global state), mirroring Linux's
+/// `__setup_per_zone_wmarks`: `gap = max(min/4, total·scale/10000)`,
+/// `low = min + gap`, `high = min + 2·gap`. The `min/4` floor keeps a usable
+/// band on small RAM; the `total·scale` term dominates on large RAM. Split out
+/// so it can be unit-tested without perturbing the live watermarks.
+fn derive_band(min: u64, total_pages: u64, scale: u64) -> (u64, u64, u64) {
+    let gap = (min / 4).max(total_pages.saturating_mul(scale) / 10_000);
+    (
+        min,
+        min.saturating_add(gap),
+        min.saturating_add(gap.saturating_mul(2)),
+    )
 }
 
-/// Clamp a requested `min` to the sane band and derive `(min, low,
-/// high)`. Shared by the RAM auto-sizing and the runtime override so
-/// both produce an identically-shaped, ordered band.
-fn derive_watermarks(requested_min: u64) -> (u64, u64, u64) {
-    let min = requested_min.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
-    (min, min.saturating_mul(5) / 4, min.saturating_mul(3) / 2)
+/// Full band from total RAM at the default scale factor. Pure; used by the
+/// watermark unit tests and mirrors what [`init_watermarks`] installs.
+fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
+    let total = total_pages as u64;
+    let min = total
+        .isqrt()
+        .saturating_mul(4)
+        .clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
+    derive_band(min, total, WMARK_SCALE_DEFAULT)
 }
 
 /// The `min` (emergency) free-page watermark, or 0 if unconfigured.
@@ -640,19 +695,19 @@ pub fn try_to_free(target: usize) -> usize {
 /// below. They exercise the pure `compute_watermarks`, so they never
 /// touch the live boot-installed watermark globals.
 mod watermark_tests {
-    use super::{
-        compute_watermarks, derive_watermarks, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES,
-    };
+    use super::{compute_watermarks, derive_band, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_reclaim_watermarks_ordered_and_scaled() -> TestResult {
-        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048.
+        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048. At
+        // the default scale the min/4 floor dominates (total·10/10000 = 262 <
+        // 512), so low = 5/4·min, high = 3/2·min.
         let (min, low, high) = compute_watermarks(262_144);
         if min != 2048 {
             return TestResult::Fail("min for 1 GiB should be 2048 pages");
         }
         if low != min * 5 / 4 || high != min * 3 / 2 {
-            return TestResult::Fail("low/high must be 5/4·min and 3/2·min");
+            return TestResult::Fail("low/high must be 5/4·min and 3/2·min at 1 GiB");
         }
         if !(min < low && low < high) {
             return TestResult::Fail("watermarks must be strictly min<low<high");
@@ -670,8 +725,9 @@ mod watermark_tests {
         if min_small != WMARK_MIN_FLOOR_PAGES {
             return TestResult::Fail("tiny RAM must clamp min to the floor");
         }
-        // Huge memory clamps min down to the ceiling.
-        let (min_huge, low_huge, high_huge) = compute_watermarks(usize::MAX);
+        // Huge (but non-overflowing) memory clamps min down to the ceiling and
+        // stays ordered. 1<<40 pages: min = 4·2^20 → clamped to the ceiling.
+        let (min_huge, low_huge, high_huge) = compute_watermarks(1usize << 40);
         if min_huge != WMARK_MIN_CEIL_PAGES {
             return TestResult::Fail("huge RAM must clamp min to the ceiling");
         }
@@ -682,23 +738,39 @@ mod watermark_tests {
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_clamped);
 
-    fn smoke_reclaim_watermarks_tunable_override() -> TestResult {
-        // The runtime override (vm.min_free_kbytes analogue) re-derives the
-        // whole band from the requested min, clamped to the same range.
-        let (min, low, high) = derive_watermarks(4096);
+    fn smoke_reclaim_watermarks_band_math() -> TestResult {
+        // The pure band math the min/scale overrides re-derive from. Where the
+        // min/4 floor dominates (small total term), low=5/4·min, high=3/2·min.
+        let (min, low, high) = derive_band(4096, 262_144, 10);
         if min != 4096 || low != 5120 || high != 6144 {
-            return TestResult::Fail("override should derive low=5/4·min, high=3/2·min");
-        }
-        // Below the floor and above the ceiling clamp identically to boot.
-        if derive_watermarks(1).0 != WMARK_MIN_FLOOR_PAGES {
-            return TestResult::Fail("override below floor must clamp up");
-        }
-        if derive_watermarks(u64::MAX).0 != WMARK_MIN_CEIL_PAGES {
-            return TestResult::Fail("override above ceiling must clamp down");
+            return TestResult::Fail("min/4-dominated band should be 4096/5120/6144");
         }
         TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_band_math);
+
+    fn smoke_reclaim_watermark_scale_factor() -> TestResult {
+        // On large RAM the total·scale/10000 term dominates the min/4 floor, so
+        // a bigger scale factor widens the reclaim band (Linux's
+        // vm.watermark_scale_factor). 16 GiB = 4194304 pages, min = ceiling
+        // (65536): scale 10 → gap = max(16384, 4194) = 16384 (floor); scale
+        // 100 → gap = max(16384, 41943) = 41943 (scale wins).
+        let (min, total) = (WMARK_MIN_CEIL_PAGES, 4_194_304u64);
+        let (_, low10, high10) = derive_band(min, total, 10);
+        let (_, low100, high100) = derive_band(min, total, 100);
+        if !(low100 > low10 && high100 > high10) {
+            return TestResult::Fail("a larger scale factor must raise low/high");
+        }
+        // high−low == gap, so a larger scale must widen the band.
+        if high100 - low100 <= high10 - low10 {
+            return TestResult::Fail("a larger scale factor must widen the low..high band");
+        }
+        if !(min < low100 && low100 < high100) {
+            return TestResult::Fail("scaled watermarks must stay ordered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermark_scale_factor);
 }
 
 /// Pure range-planner tests, registered in the in-kernel test image.

@@ -51,6 +51,14 @@ static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 /// Pages kswapd reclaims per online CPU per wake, as a floor. More CPUs
 /// means more concurrent allocators building pressure, so kswapd must
 /// shed a bigger batch to keep ahead of them.
+// Used only by `kswapd_kthread`, which is spawned only from `run_async_demo`
+// (the real boot path); the `kernel-test`/`boot-smoke`/`idt-selftest` configs
+// don't compile that path, so gate this to match and stay warning-clean.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
 /// Set by `kswapd_wake` when the allocator wants the reclaimer to run. A flag
@@ -92,6 +100,13 @@ fn kswapd_wake() {
 /// lock, the victim region locks, and issuing TLB shootdowns are all sound.
 /// Lives here (not in `memory`) because the wake, clock, and CPU count come
 /// from `narf_scheduler`, which the low-level `memory` crate cannot depend on.
+// Spawned only from `run_async_demo`; gated to match so the non-boot configs
+// (`kernel-test`/`boot-smoke`/`idt-selftest`) that omit that path don't warn.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
 async fn kswapd_kthread() {
     use core::sync::atomic::Ordering;
     // Bound the passes per wake so a persistently-unbalanced zone can't spin
