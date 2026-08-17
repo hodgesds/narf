@@ -2214,6 +2214,83 @@ impl FileOps for SocketFile {
             _ => (0, 0),
         }
     }
+
+    /// Durable arm for a connected AF_UNIX/AF_INET stream socket. Both rings of
+    /// a connected pair carry a [`RingBuf::readiness`] cell, so we arm the SAME
+    /// task on whichever cell(s) the caller's interest touches: the rx ring for
+    /// POLL_IN (data arrival / EOF) and the tx ring for POLL_OUT (space frees).
+    /// POLL_HUP is folded into both interests so a peer close — which closes the
+    /// peer's rings, i.e. OUR rx (via its tx) and OUR tx (via its rx) — wakes a
+    /// reader AND a writer, even one blocked on a full ring. `arm` is fused with
+    /// the ring's `set` under one lock, so the classic "check-then-park" lost
+    /// wakeup is unrepresentable: any state the ring reaches before we insert
+    /// the waiter is already visible to this `arm`.
+    ///
+    /// Returns `None` for states not yet migrated (dgram/listener/netlink/…) or
+    /// an interest that touches neither direction, so the caller keeps the
+    /// legacy edge-token + 10 ms backstop path for those.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        use core::task::Poll;
+        let want_in = interest & narf_filesystem::POLL_IN != 0;
+        let want_out = interest & narf_filesystem::POLL_OUT != 0;
+        if !want_in && !want_out {
+            return None;
+        }
+        let (rx, tx) = match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => (rx.clone(), tx.clone()),
+            _ => return None,
+        };
+        // Arm off the state lock: the cloned Arcs keep the rings alive, and a
+        // concurrent close latches POLL_IN|POLL_HUP into the cell, so `arm`
+        // still observes readiness rather than parking on a dead ring.
+        let mut ready = 0u32;
+        if want_in {
+            if let Poll::Ready(bits) = rx.readiness().arm(
+                task_id,
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                waker,
+            ) {
+                ready |= bits;
+            }
+        }
+        if want_out {
+            if let Poll::Ready(bits) = tx.readiness().arm(
+                task_id,
+                narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+                waker,
+            ) {
+                ready |= bits;
+            }
+        }
+        if ready != 0 {
+            Some(Poll::Ready(ready))
+        } else {
+            Some(Poll::Pending)
+        }
+    }
+
+    /// Remove this task's waiter from both rings of a connected pair. Safe to
+    /// call even when only one side was armed (a `disarm` on an absent id is a
+    /// no-op). Returns `false` for unmigrated states so the caller runs its
+    /// legacy disarm path.
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        let (rx, tx) = match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => (rx.clone(), tx.clone()),
+            _ => return false,
+        };
+        rx.readiness().disarm(task_id);
+        tx.readiness().disarm(task_id);
+        true
+    }
 }
 
 impl SocketFile {
@@ -4944,6 +5021,16 @@ pub struct RingBuf {
     /// fall back to wake-all. Best-effort like TCP's TCB owner; the readiness
     /// generation guard covers a stale/absent owner so it can never strand.
     owner_task: AtomicU64,
+    /// Durable per-ring readiness cell — the migration target that replaces the
+    /// two edge tokens + `wake_reader`'s `notify` herd. A RingBuf is SHARED: it
+    /// is one endpoint's `rx` and the peer's `tx`, so its cell carries the full
+    /// triple — POLL_IN (buffered data, or closed → EOF), POLL_OUT (has space),
+    /// POLL_HUP (closed). The reader arms POLL_IN|POLL_HUP; the writer arms
+    /// POLL_OUT — both on the SAME cell, so a write that fills the ring wakes
+    /// the reader and a read that drains it wakes the writer, with no
+    /// cross-endpoint plumbing. Fused arm/set under one lock makes the lost
+    /// wakeup unrepresentable (see `narf_lib::readiness`).
+    readiness: narf_lib::readiness::Readiness,
 }
 
 struct RingInner {
@@ -5005,6 +5092,9 @@ impl RingBuf {
             readable_token: AtomicU64::new(0),
             writable_token: AtomicU64::new(0),
             owner_task: AtomicU64::new(0),
+            // A fresh ring is empty: writable (has space), not readable, not
+            // closed.
+            readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
         }
     }
 
@@ -5036,6 +5126,42 @@ impl RingBuf {
         } else {
             narf_net::readiness::notify(0);
         }
+    }
+
+    /// Recompute the durable readiness cell from the current ring state and
+    /// publish the transition. POLL_IN = buffered data OR closed (a closed ring
+    /// is permanently readable so a parked reader wakes to a 0-byte EOF read),
+    /// POLL_OUT = has space (a closed ring still reports writable so a parked
+    /// writer wakes to discover EPIPE), POLL_HUP = closed. `set` bumps the edge
+    /// sequence and wakes armed waiters only on a rising edge, all under one
+    /// lock (drop-free), so a concurrent `arm` can never miss this transition.
+    /// Called after every write/read/close that changes occupancy; kept
+    /// alongside the legacy edge tokens + `wake_reader` during the migration.
+    fn sync_readiness(&self) {
+        let closed = self.closed.load(Ordering::Acquire);
+        let (data, space) = {
+            let g = self.inner.lock();
+            (
+                g.len > 0 || !g.packets.is_empty(),
+                g.len < RING_CAP && g.packet_bytes < RING_CAP,
+            )
+        };
+        let readable = data || closed;
+        let add = (if readable { narf_filesystem::POLL_IN } else { 0 })
+            | (if space { narf_filesystem::POLL_OUT } else { 0 })
+            | (if closed { narf_filesystem::POLL_HUP } else { 0 });
+        let clear = (if readable { 0 } else { narf_filesystem::POLL_IN })
+            | (if space { 0 } else { narf_filesystem::POLL_OUT })
+            | (if closed { 0 } else { narf_filesystem::POLL_HUP });
+        self.readiness.set(add, clear);
+    }
+
+    /// The durable readiness cell shared by both endpoints of this ring. The
+    /// reader arms POLL_IN|POLL_HUP, the writer arms POLL_OUT — see
+    /// [`RingBuf::readiness`] (the field).
+    #[inline]
+    fn readiness(&self) -> &narf_lib::readiness::Readiness {
+        &self.readiness
     }
 
     /// Take ancillary rights associated with the most recent receive.
@@ -5070,6 +5196,7 @@ impl RingBuf {
         // desktop gate). Matches write_packet, which already bumps every write.
         if n != 0 {
             self.readable_token.fetch_add(1, Ordering::Release);
+            self.sync_readiness();
         }
         n
     }
@@ -5099,6 +5226,7 @@ impl RingBuf {
         // write so an EPOLLET reader re-fires on bytes appended before it
         // drained. n > 0 here (the n == 0 case returned early above).
         self.readable_token.fetch_add(1, Ordering::Release);
+        self.sync_readiness();
         n
     }
 
@@ -5119,6 +5247,7 @@ impl RingBuf {
         g.packet_bytes += src.len();
         drop(g);
         self.readable_token.fetch_add(1, Ordering::Release);
+        self.sync_readiness();
         src.len()
     }
 
@@ -5152,6 +5281,11 @@ impl RingBuf {
         drop(g);
         if became_writable {
             self.writable_token.fetch_add(1, Ordering::Release);
+        }
+        if n != 0 {
+            // Draining bytes can clear POLL_IN (ring now empty) and set POLL_OUT
+            // (space freed); republish so a writer parked on this ring wakes.
+            self.sync_readiness();
         }
         n
     }
@@ -5196,6 +5330,9 @@ impl RingBuf {
             if became_writable {
                 self.writable_token.fetch_add(1, Ordering::Release);
             }
+            // A record was consumed: POLL_IN may fall (queue now empty) and
+            // POLL_OUT may rise; republish for a writer parked on this ring.
+            self.sync_readiness();
         }
         Some((copied, full))
     }
@@ -5207,6 +5344,11 @@ impl RingBuf {
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.readable_token.fetch_add(1, Ordering::Release);
+            // Closing latches POLL_IN (EOF) + POLL_HUP so a reader parked on
+            // this ring wakes to a 0-byte read; POLL_OUT stays set so a parked
+            // writer wakes to discover EPIPE. Ordering matters: set closed
+            // (swap above), THEN sync so sync_readiness observes closed=true.
+            self.sync_readiness();
         }
     }
 

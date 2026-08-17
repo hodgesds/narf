@@ -1256,6 +1256,69 @@ kernel_test_in!(
     smoke_abi_socket_connected_pair_send_wakes_parked_epoll
 );
 
+/// A connected AF_UNIX stream whose PEER closes must become POLLIN|POLLHUP:
+/// Linux reports POLLIN (so the reader runs read()→0=EOF and tears the
+/// connection down) AND POLLHUP. The close travels `SocketFile::drop` →
+/// `tx.close()`, which latches POLL_IN|POLL_HUP into the peer's rx ring — both
+/// its durable readiness cell (waking a reader armed on it) and, via
+/// `readiness::notify`, the legacy generation channel.
+///
+/// Same two-halves shape as the send-wake twin above:
+///   1. the close must publish a readiness wake (generation bump) — without it
+///      a reader parked in `poll(-1)`/`epoll_wait(-1)` never re-scans and the
+///      fd hangs forever instead of surfacing EOF. Invisible to any timeout-0
+///      scan, so it is asserted directly.
+///   2. the re-scan a woken poller runs must then report POLLIN|POLLHUP.
+fn smoke_abi_socket_connected_pair_peer_close_reports_hup() -> TestResult {
+    with_setup(|| {
+        const POLLIN: u16 = 0x1;
+        const POLLHUP: u16 = 0x10;
+        let (peer, rx) = make_pair(SOCK_STREAM)?;
+
+        // pollfd { fd: rx, events: POLLIN, revents: 0 } — 8 bytes.
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&(rx as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+        // Negative half: an open, idle pair must NOT report ready on POLLIN.
+        if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("open idle connected pair reported POLLIN before peer close");
+        }
+
+        let before = narf_net::readiness::generation();
+        // Drop the peer endpoint (its only fd). SocketFile::drop closes its tx
+        // ring, i.e. OUR rx ring → EOF.
+        if call(Syscall::Close.raw(), a0(peer)) != Some(0) {
+            return Err("closing the peer half failed");
+        }
+        // Half 1: peer close must publish a readiness wake.
+        if narf_net::readiness::generation() <= before {
+            return Err("peer close published no readiness wake for a parked poller");
+        }
+        // Half 2: the re-scan reports POLLIN (EOF) and POLLHUP. POLLHUP is
+        // reported even though only POLLIN was requested (poll_scan folds in
+        // POLL_ERR|POLL_HUP|POLL_NVAL unconditionally, matching Linux).
+        pfd[6..8].copy_from_slice(&0u16.to_ne_bytes());
+        match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+            Some(1) => {
+                let revents = u16::from_le_bytes(pfd[6..8].try_into().unwrap());
+                if revents & POLLIN == 0 {
+                    return Err("peer-closed stream did not report POLLIN (EOF)");
+                }
+                if revents & POLLHUP == 0 {
+                    return Err("peer-closed stream did not report POLLHUP");
+                }
+            }
+            _ => return Err("peer-closed stream was not reported ready by poll"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(rx));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connected_pair_peer_close_reports_hup
+);
+
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
 fn smoke_abi_socket_shutdown_pos() -> TestResult {
