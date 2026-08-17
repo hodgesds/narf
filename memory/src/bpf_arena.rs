@@ -690,11 +690,16 @@ impl Drop for Arena {
 unsafe fn map_arena_page(va: u64, phys: PhysAddr) -> Result<(), ArenaError> {
     use crate::x86_64::paging::{map_4kb, PtFlags};
     let root = crate::bpf_text::kernel_root_for_mapping().ok_or(ArenaError::SlotsUnreserved)?;
-    // RW, never executable, GLOBAL — arena contents are identical under every
-    // CR3 because the top-level entry is snapshot-copied into every AS.
-    // Never `USER`: userspace reaches arena pages through its own SHARED
-    // mapping of the same frames, not through this window.
-    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::GLOBAL;
+    // RW, never executable, and NON-global. Arena pages are UNMAPPED at runtime
+    // (`unmap_arena_page`), so they must not be GLOBAL: the idle-CPU deferred
+    // flush and the no-PCID MOV-CR3 self-flush both retain global entries, which
+    // would strand a stale translation on a peer after unmap (see the invariant
+    // enforced by `unmap_4kb`'s debug_assert, and the note on
+    // `vmalloc::kernel_leaf_flags`). Cross-AS visibility comes from the
+    // snapshot-copied top-level kernel entry / the shared page tables, not the
+    // global bit. Never `USER`: userspace reaches arena pages through its own
+    // SHARED mapping of the same frames, not through this window.
+    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC;
     // SAFETY: `root` is the recorded kernel root whose arena top-level entry
     // exists; `va` is fresh, page-aligned VA inside that window.
     unsafe { map_4kb(root, VirtAddr::new(va), phys, flags).map_err(|_| ArenaError::MapFailed) }

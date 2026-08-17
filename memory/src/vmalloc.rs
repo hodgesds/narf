@@ -197,13 +197,24 @@ impl VaMap {
 static VALLOC_MAP: IrqSafeSpinLock<VaMap> = IrqSafeSpinLock::new(VaMap::new());
 
 /// Kernel leaf-mapping flags for a frame-backed vmalloc page: writable,
-/// non-executable, global (kernel-shared).
+/// non-executable, and **NON-global**.
+///
+/// vmalloc pages are mapped and UNMAPPED at runtime, so they must never be
+/// GLOBAL: several TLB-flush paths (the idle-CPU deferred `flush_user_tlb_local`
+/// via `apply_lazy_local_full`, `invpcid_all_without_globals`, and the
+/// no-PCID MOV-CR3 self-flush) deliberately RETAIN global entries. A global
+/// vmalloc mapping would therefore leave a stale translation on an idle peer
+/// after `vfree`, and it would access the reused frame — an intermittent SMP
+/// #PF / corruption. Global is reserved for PERMANENT kernel mappings (kernel
+/// text, the direct map, the per-CPU BPF stack) that are never shot down;
+/// `unmap_4kb` `debug_assert`s this invariant. Cross-AS visibility comes from
+/// the shared kernel page tables, not the global bit, so dropping it is free.
 #[inline]
 fn kernel_leaf_flags() -> crate::paging::PtFlags {
     use crate::paging::PtFlags;
     #[cfg(target_arch = "x86_64")]
     {
-        PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::GLOBAL
+        PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_EXEC
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -309,19 +320,12 @@ pub fn valloc(size: usize) -> Option<NonNull<u8>> {
     NonNull::new(base as *mut u8)
 }
 
-/// Free a `valloc` allocation: unmap + free every backing DATA frame, then
-/// reclaim the VA range.
-///
-/// The intermediate page tables covering the vmalloc window are intentionally
-/// RETAINED (not freed here), exactly as `ioremap` and Linux's vmalloc keep
-/// theirs: their count is bounded by the window size (~one PT per 2 MiB) and
-/// they are reused by every later allocation into the same 2 MiB chunk. Keeping
-/// them also means a `valloc` into an already-touched chunk performs NO
-/// page-table allocation — valuable because `valloc` runs on the heap's
-/// allocation-failure path, where allocating a fresh table frame could itself
-/// fail. (The first allocation into a fresh chunk still allocates its tables;
-/// if the pool is simultaneously empty that `valloc` fails gracefully with
-/// `None` rather than panicking.)
+/// Free a `valloc` allocation: unmap + free every backing DATA frame, free any
+/// page tables the range leaves empty (`unmap_and_free` → `free_empty_pt`
+/// cascade, keeping only the shared reserved top-level slot), then reclaim the
+/// VA. Fully reclaiming — no residual page-table retention. Each leaf is
+/// unmapped with a global (broadcast) invalidation, so peers cannot hold a
+/// stale entry for a freed table.
 ///
 /// # Safety
 /// `ptr` must have come from `valloc` and `size` be the same size passed there.

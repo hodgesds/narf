@@ -1593,6 +1593,19 @@ unsafe fn unmap_4kb_locked(
     if !removed.is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    // Invariant guard (see `vmalloc::kernel_leaf_flags`): a GLOBAL leaf must
+    // never be unmapped at runtime. Several TLB-flush paths deliberately retain
+    // global entries (the idle-CPU deferred `flush_user_tlb_local`,
+    // `invpcid_all_without_globals`, the no-PCID MOV-CR3 self-flush), so a
+    // GLOBAL mapping torn down here would strand a stale translation on a peer
+    // CPU and let it access the reused frame — an intermittent SMP #PF. GLOBAL
+    // is reserved for PERMANENT kernel mappings that are never shot down. If
+    // this fires, the offending mapper must drop `PtFlags::GLOBAL`.
+    debug_assert!(
+        !removed.flags().contains(PtFlags::GLOBAL),
+        "unmap_4kb of a GLOBAL leaf at {:#x} — runtime-unmapped kernel mappings must be non-global",
+        virt.raw(),
+    );
     pt.entries[idx.pt] = PageTableEntry::EMPTY;
 
     // Unmap is the canonical "stale-TLB" case: peer CPUs may have
