@@ -535,3 +535,173 @@ fn smoke_devfs_block_poll_readiness() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs_block", smoke_devfs_block_poll_readiness);
+
+// ── Test 11: chown/chmod on a block node PERSISTS across re-lookup ─────
+//
+// Regression for the CachyOS boot: udev's coldplug does
+//   `chown(/dev/sata0, 0, 993); chmod(/dev/sata0, 0o660)`
+// and the node kept returning EOPNOTSUPP because `BlockFile` — synthesised
+// fresh on every `/dev/<name>` lookup — implemented neither `set_owners` nor
+// `set_perms`, and had nowhere to store them. A persistent name-keyed overlay
+// now backs both, so the new owner/mode survive the next lookup's brand-new
+// `BlockFile`.
+
+fn smoke_devfs_block_chown_chmod_persists() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, DevFs};
+
+    crate::devfs_block::__reset_block_attrs_for_test();
+    let snap = narf_block::registry::__snapshot_for_test();
+
+    let dev = FakeBlockDevice::filled(8, 512, 0x00);
+    narf_block::registry::register_block_device("nvme0-attr", dev);
+
+    let auth = bootstrap_mount_authority();
+    let mnt = registry().mount(&auth, "/dev-attr-test", DevFs::new());
+    let _mnt = match mnt {
+        Ok(h) => h,
+        Err(_) => {
+            narf_block::registry::__restore_for_test(snap);
+            crate::devfs_block::__reset_block_attrs_for_test();
+            return TestResult::Fail("DevFs mount for chown/chmod test failed");
+        }
+    };
+
+    let resolve = || {
+        registry()
+            .resolve_absolute("/dev-attr-test/nvme0-attr", |fs, rel| {
+                crate::resolve(fs.root(), rel).ok()
+            })
+            .flatten()
+    };
+
+    // Baseline: default root:disk 0o660.
+    let node = match resolve() {
+        Some(f) => f,
+        None => {
+            narf_block::registry::__restore_for_test(snap);
+            crate::devfs_block::__reset_block_attrs_for_test();
+            return TestResult::Fail("initial block-node lookup returned None");
+        }
+    };
+    if node.owners() != (0, 6) || node.stat().mode.perms != 0o660 {
+        narf_block::registry::__restore_for_test(snap);
+        crate::devfs_block::__reset_block_attrs_for_test();
+        return TestResult::Fail("unexpected default block-node owner/mode");
+    }
+
+    // udev-style chown to root:993 and chmod to 0o640.
+    let set_ok = matches!(poll_once(node.set_owners(0, 993)), Some(Ok(())))
+        && matches!(poll_once(node.set_perms(0o640)), Some(Ok(())));
+    drop(node);
+    if !set_ok {
+        narf_block::registry::__restore_for_test(snap);
+        crate::devfs_block::__reset_block_attrs_for_test();
+        return TestResult::Fail("set_owners/set_perms returned an error (EOPNOTSUPP regression)");
+    }
+
+    // Re-resolve builds a BRAND-NEW BlockFile; the change must survive.
+    let reop = resolve();
+    narf_block::registry::__restore_for_test(snap);
+
+    let verdict = match reop {
+        Some(f) => {
+            if f.owners() == (0, 993) && f.stat().mode.perms == 0o640 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("chown/chmod did not persist across block-node re-lookup")
+            }
+        }
+        None => TestResult::Fail("re-lookup of block node returned None"),
+    };
+    crate::devfs_block::__reset_block_attrs_for_test();
+    verdict
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_block_chown_chmod_persists
+);
+
+// ── Test 12: symlinkat under /dev/disk/by-uuid ────────────────────────
+//
+// Regression for the CachyOS boot: udev computes each filesystem's UUID and
+// creates `/dev/disk/by-uuid/<uuid> -> ../../<dev>`, but `DevDiskByUuid` had
+// no `symlink` op so the `symlinkat` failed and `udevadm settle` never
+// completed. The directory now carries a writable overlay: the alias is
+// created, resolves on lookup, `readlink`s to its target, appears in readdir,
+// and can be unlinked.
+
+fn smoke_devfs_disk_by_uuid_symlink_roundtrip() -> TestResult {
+    use crate::devfs_block::DevDiskByUuid;
+    use crate::{DirOps, FileType, FsError};
+
+    crate::devfs_block::__reset_disk_links_for_test();
+    let dir = DevDiskByUuid;
+
+    let uuid = "066fb7bb-1111-2222-3333-444455556666";
+    let target = "../../vblk0p2";
+
+    let finish = |verdict: TestResult| {
+        crate::devfs_block::__reset_disk_links_for_test();
+        verdict
+    };
+
+    // Create the alias.
+    if !matches!(poll_once(dir.symlink(uuid, target)), Some(Ok(_))) {
+        return finish(TestResult::Fail(
+            "by-uuid symlink create failed (EINVAL regression)",
+        ));
+    }
+    // A duplicate create is EEXIST (Busy), matching Linux symlink(2).
+    if !matches!(
+        poll_once(dir.symlink(uuid, target)),
+        Some(Err(FsError::Busy))
+    ) {
+        return finish(TestResult::Fail(
+            "duplicate by-uuid symlink did not report Busy",
+        ));
+    }
+    // It resolves on lookup and stats as a symlink.
+    let node = match dir.lookup(uuid) {
+        Some(f) => f,
+        None => {
+            return finish(TestResult::Fail(
+                "created by-uuid symlink not found on lookup",
+            ))
+        }
+    };
+    if node.stat().mode.file_type != FileType::Symlink {
+        return finish(TestResult::Fail("looked-up by-uuid node is not a symlink"));
+    }
+    // readlink returns the verbatim target.
+    let mut buf = [0u8; 64];
+    match poll_once(node.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == target.as_bytes() => {}
+        _ => {
+            return finish(TestResult::Fail(
+                "by-uuid readlink returned the wrong target",
+            ))
+        }
+    }
+    // readdir lists it.
+    let listed = dir.enumerate(0, 64);
+    if !listed
+        .iter()
+        .any(|(nm, ft)| nm == uuid && *ft == FileType::Symlink)
+    {
+        return finish(TestResult::Fail("by-uuid symlink absent from enumerate"));
+    }
+    // Unlink removes it.
+    if !matches!(poll_once(dir.unlink(uuid)), Some(Ok(()))) {
+        return finish(TestResult::Fail("by-uuid symlink unlink failed"));
+    }
+    if dir.lookup(uuid).is_some() {
+        return finish(TestResult::Fail(
+            "by-uuid symlink still present after unlink",
+        ));
+    }
+    finish(TestResult::Pass)
+}
+kernel_test_in!(
+    "filesystem/devfs_block",
+    smoke_devfs_disk_by_uuid_symlink_roundtrip
+);

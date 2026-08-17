@@ -33,12 +33,83 @@
 //! re-check — it trusts the kernel open path.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_block::{registry::BlockDeviceSync, BlockError};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
+
+// ── persistent owner/mode overlay ─────────────────────────────────────
+//
+// A `BlockFile` is synthesised FRESH on every `/dev/<name>` lookup
+// (`lookup_block_file`), so per-node attribute state can't live in the
+// `BlockFile` struct — it would evaporate at the next lookup. udev's coldplug
+// chowns/chmods each disk node (`root:disk 0660`, and distro-specific gids such
+// as CachyOS's `gid=993`), and the new owner/mode MUST survive to the next
+// `stat`, or the node keeps its default ownership and the chown/chmod "does
+// nothing". Linux devtmpfs persists these on the real inode; NARF has no
+// persistent inode here, so mirror the memfs per-node owner/mode model in a
+// name-keyed overlay that outlives the transient node. Keyed by the block
+// registry name, which is unique and stable across lookups.
+
+/// Default block-node ownership: root:disk (uid 0, gid 6), matching the Linux
+/// `50-udev-default.rules` convention before udev applies distro overrides.
+const DEFAULT_UID: u32 = 0;
+const DEFAULT_GID: u32 = 6;
+
+#[derive(Copy, Clone)]
+struct BlockNodeAttr {
+    uid: u32,
+    gid: u32,
+    perms: u16,
+}
+
+static BLOCK_NODE_ATTRS: IrqSafeSpinLock<BTreeMap<String, BlockNodeAttr>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Persisted owners for `name`, if a chown/chmod has ever touched it.
+fn block_attr_owners(name: &str) -> Option<(u32, u32)> {
+    BLOCK_NODE_ATTRS.lock().get(name).map(|a| (a.uid, a.gid))
+}
+
+/// Persisted permission bits for `name`, if a chown/chmod has ever touched it.
+fn block_attr_perms(name: &str) -> Option<u16> {
+    BLOCK_NODE_ATTRS.lock().get(name).map(|a| a.perms)
+}
+
+/// Persist new owners for `name`, preserving any previously-set mode bits.
+/// `default_perms` seeds the entry the first time it is created.
+fn block_attr_set_owners(name: &str, uid: u32, gid: u32, default_perms: u16) {
+    let mut map = BLOCK_NODE_ATTRS.lock();
+    let entry = map.entry(String::from(name)).or_insert(BlockNodeAttr {
+        uid: DEFAULT_UID,
+        gid: DEFAULT_GID,
+        perms: default_perms & 0o7777,
+    });
+    entry.uid = uid;
+    entry.gid = gid;
+}
+
+/// Persist new permission bits for `name`, preserving any previously-set owner.
+fn block_attr_set_perms(name: &str, perms: u16) {
+    let mut map = BLOCK_NODE_ATTRS.lock();
+    let entry = map.entry(String::from(name)).or_insert(BlockNodeAttr {
+        uid: DEFAULT_UID,
+        gid: DEFAULT_GID,
+        perms: 0,
+    });
+    entry.perms = perms & 0o7777;
+}
+
+/// Drop all persisted block-node attributes (test isolation).
+#[doc(hidden)]
+pub fn __reset_block_attrs_for_test() {
+    BLOCK_NODE_ATTRS.lock().clear();
+}
 
 // ── BlockFile ─────────────────────────────────────────────────────────
 
@@ -62,6 +133,10 @@ pub struct BlockFile {
     /// Linux device number (`st_rdev`). Registry-backed disks use block
     /// extended major 259 and a stable enumeration minor.
     pub rdev: u64,
+    /// Block-registry name (e.g. `"sata0"`, `"vblk0p2"`), the key under which
+    /// chown/chmod persist in `BLOCK_NODE_ATTRS`. `None` for directly-
+    /// constructed nodes (unit tests) that have no persistent `/dev` identity.
+    pub name: Option<String>,
 }
 
 impl core::fmt::Debug for BlockFile {
@@ -88,6 +163,7 @@ impl BlockFile {
             block_size,
             perms: 0o660,
             rdev: 0,
+            name: None,
         }
     }
 
@@ -227,6 +303,12 @@ impl FileOps for BlockFile {
         let size = self.byte_capacity();
         let bs = self.block_size as u64;
         let blocks = size.div_ceil(bs);
+        // A persisted chmod (udev coldplug) overrides the default 0o660.
+        let perms = self
+            .name
+            .as_deref()
+            .and_then(block_attr_perms)
+            .unwrap_or(self.perms);
         Stat {
             size,
             blocks,
@@ -234,17 +316,45 @@ impl FileOps for BlockFile {
             // Combined with perms (0o660 default) → 0o060660.
             mode: Mode {
                 file_type: FileType::Block,
-                perms: self.perms,
+                perms,
             },
             mtime_cycles: 0,
         }
     }
 
     fn owners(&self) -> (u32, u32) {
-        // root:disk (UID 0, GID 6) — matches Linux block-device
-        // udev default (see udev rules in
-        // /usr/lib/udev/rules.d/50-udev-default.rules).
-        (0, 6)
+        // Default root:disk (UID 0, GID 6) — matches Linux block-device udev
+        // default (see /usr/lib/udev/rules.d/50-udev-default.rules) — unless a
+        // chown has persisted a different owner for this node.
+        self.name
+            .as_deref()
+            .and_then(block_attr_owners)
+            .unwrap_or((DEFAULT_UID, DEFAULT_GID))
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        // Persist under the registry name so the new owner survives the next
+        // `/dev/<name>` lookup (which builds a brand-new `BlockFile`). A node
+        // with no persistent identity (direct construction) can't store this.
+        let result = match self.name.as_deref() {
+            Some(name) => {
+                block_attr_set_owners(name, uid, gid, self.perms);
+                Ok(())
+            }
+            None => Err(FsError::Unsupported),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        let result = match self.name.as_deref() {
+            Some(name) => {
+                block_attr_set_perms(name, perms);
+                Ok(())
+            }
+            None => Err(FsError::Unsupported),
+        };
+        Box::pin(async move { result })
     }
 
     fn rdev(&self) -> u64 {
@@ -273,6 +383,8 @@ pub fn lookup_block_file(name: &str) -> Option<Arc<dyn FileOps>> {
     narf_block::find_block_device_indexed(name).map(|(minor, dev)| {
         let mut file = BlockFile::from_dev(dev);
         file.rdev = crate::devfs::linux_makedev(259, minor as u32);
+        // Carry the registry name so chown/chmod persist across lookups.
+        file.name = Some(String::from(name));
         Arc::new(file) as Arc<dyn FileOps>
     })
 }
@@ -290,6 +402,63 @@ pub fn enumerate_block_devices() -> Vec<(alloc::string::String, FileType)> {
 // ── /dev/disk/by-{label,partuuid} directories ────────────────────────
 
 use crate::{DirEntry, DirOps};
+
+// ── writable symlink overlays for /dev/disk/by-* ──────────────────────
+//
+// The `by-uuid` / `by-partuuid` / `by-label` directories synthesise their
+// entries from block-registry partition metadata, so they are re-created fresh
+// on every `lookup_dir` and hold no writable state of their own. But udev's
+// coldplug computes the FILESYSTEM uuid/label (by probing partition contents,
+// which the partition scanner never does) and creates the canonical
+// `/dev/disk/by-uuid/<fs-uuid> -> ../../<dev>` symlink itself. Without a
+// writable backing, that `symlinkat` fails and `udevadm settle` never
+// completes. Give each directory a global symlink overlay (reusing the
+// devtmpfs dynamic-node machinery) that outlives the transient dir object, so
+// udev-created aliases persist, resolve on lookup, and appear in readdir
+// alongside the synthesised entries.
+static BY_UUID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+static BY_PARTUUID_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+static BY_LABEL_LINKS: IrqSafeSpinLock<crate::devfs::DynamicMap> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Drop all udev-created by-* symlinks (test isolation).
+#[doc(hidden)]
+pub fn __reset_disk_links_for_test() {
+    BY_UUID_LINKS.lock().clear();
+    BY_PARTUUID_LINKS.lock().clear();
+    BY_LABEL_LINKS.lock().clear();
+}
+
+/// Create a udev symlink in a by-* overlay. `generated_exists` guards against
+/// shadowing/duplicating a synthesised (partition-derived) entry, which
+/// `symlink(2)` reports as `EEXIST` just like a re-create of an overlay entry.
+fn disk_symlink<'a>(
+    overlay: &'static IrqSafeSpinLock<crate::devfs::DynamicMap>,
+    generated_exists: bool,
+    name: &'a str,
+    target: &'a str,
+) -> FsFuture<'a, Arc<dyn FileOps>> {
+    let result = if generated_exists {
+        Err(FsError::Busy)
+    } else {
+        crate::devfs::dynamic_symlink(overlay, name, target)
+    };
+    Box::pin(async move { result })
+}
+
+/// `enumerate` for a by-* dir: the synthesised entries followed by any
+/// udev-created overlay symlinks, then paginated by `cursor`/`max`.
+fn disk_enumerate(
+    mut generated: Vec<(String, FileType)>,
+    overlay: &IrqSafeSpinLock<crate::devfs::DynamicMap>,
+    cursor: usize,
+    max: usize,
+) -> Vec<(String, FileType)> {
+    generated.extend(crate::devfs::dynamic_enumerate(overlay));
+    generated.into_iter().skip(cursor).take(max).collect()
+}
 
 /// `/dev/disk/` — a virtual directory with three subdirectories:
 /// `by-label`, `by-uuid` (filesystem UUID), and `by-partuuid`.
@@ -369,6 +538,18 @@ impl DirOps for DevDiskByLabel {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
+            // Then any udev-created label alias.
+            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_LABEL_LINKS, name))
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let generated_exists = self.lookup_generated(name);
+        disk_symlink(&BY_LABEL_LINKS, generated_exists, name, target)
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(&BY_LABEL_LINKS, name);
+        Box::pin(async move { result })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -378,21 +559,19 @@ impl DirOps for DevDiskByLabel {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
-        narf_block::block_devices()
+        let generated = narf_block::block_devices()
             .into_iter()
             .filter_map(|r| {
                 r.partition.and_then(|p| {
                     if p.partlabel.is_empty() {
                         None
                     } else {
-                        Some(p.partlabel)
+                        Some((p.partlabel, FileType::Symlink))
                     }
                 })
             })
-            .skip(cursor)
-            .take(max)
-            .map(|label| (label, FileType::Symlink))
-            .collect()
+            .collect();
+        disk_enumerate(generated, &BY_LABEL_LINKS, cursor, max)
     }
 
     fn enumerate_async<'a>(
@@ -405,10 +584,25 @@ impl DirOps for DevDiskByLabel {
     }
 }
 
+impl DevDiskByLabel {
+    /// Whether a synthesised (partition-derived) label entry named `name`
+    /// exists — the shadow guard for `symlink`.
+    fn lookup_generated(&self, name: &str) -> bool {
+        narf_block::block_devices().into_iter().any(|r| {
+            r.partition
+                .as_ref()
+                .map(|p| p.partlabel == name)
+                .unwrap_or(false)
+        })
+    }
+}
+
 // ── by-uuid ───────────────────────────────────────────────────────────
 
 /// `/dev/disk/by-uuid/` — filesystem UUID.
 ///
+/// Synthesised from each partition's filesystem UUID, plus any
+/// udev-created aliases in the writable overlay.
 pub struct DevDiskByUuid;
 
 impl core::fmt::Debug for DevDiskByUuid {
@@ -431,6 +625,18 @@ impl DirOps for DevDiskByUuid {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
+            // Then any udev-created uuid alias.
+            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_UUID_LINKS, name))
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let generated_exists = self.lookup_generated(name);
+        disk_symlink(&BY_UUID_LINKS, generated_exists, name, target)
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(&BY_UUID_LINKS, name);
+        Box::pin(async move { result })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -438,14 +644,19 @@ impl DirOps for DevDiskByUuid {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
-        narf_block::block_devices()
+        let generated = narf_block::block_devices()
             .into_iter()
-            .filter_map(|r| r.partition.map(|p| p.fs_uuid))
-            .filter(|uuid| !uuid.is_empty())
-            .skip(cursor)
-            .take(max)
-            .map(|uuid| (uuid, FileType::Symlink))
-            .collect()
+            .filter_map(|r| {
+                r.partition.and_then(|p| {
+                    if p.fs_uuid.is_empty() {
+                        None
+                    } else {
+                        Some((p.fs_uuid, FileType::Symlink))
+                    }
+                })
+            })
+            .collect();
+        disk_enumerate(generated, &BY_UUID_LINKS, cursor, max)
     }
 
     fn enumerate_async<'a>(
@@ -455,6 +666,19 @@ impl DirOps for DevDiskByUuid {
     ) -> crate::FsFuture<'a, Vec<(alloc::string::String, FileType)>> {
         let v = self.enumerate(cursor, max);
         Box::pin(async move { Ok(v) })
+    }
+}
+
+impl DevDiskByUuid {
+    /// Whether a synthesised (partition-derived) uuid entry named `name`
+    /// exists — the shadow guard for `symlink`.
+    fn lookup_generated(&self, name: &str) -> bool {
+        narf_block::block_devices().into_iter().any(|r| {
+            r.partition
+                .as_ref()
+                .map(|p| !p.fs_uuid.is_empty() && p.fs_uuid.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -484,6 +708,18 @@ impl DirOps for DevDiskByPartUuid {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
+            // Then any udev-created partuuid alias.
+            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_PARTUUID_LINKS, name))
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let generated_exists = self.lookup_generated(name);
+        disk_symlink(&BY_PARTUUID_LINKS, generated_exists, name, target)
+    }
+
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_unlink(&BY_PARTUUID_LINKS, name);
+        Box::pin(async move { result })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -491,21 +727,19 @@ impl DirOps for DevDiskByPartUuid {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(alloc::string::String, FileType)> {
-        narf_block::block_devices()
+        let generated = narf_block::block_devices()
             .into_iter()
             .filter_map(|r| {
                 r.partition.and_then(|p| {
                     if p.partuuid.is_empty() {
                         None
                     } else {
-                        Some(p.partuuid)
+                        Some((p.partuuid, FileType::Symlink))
                     }
                 })
             })
-            .skip(cursor)
-            .take(max)
-            .map(|uuid| (uuid, FileType::Symlink))
-            .collect()
+            .collect();
+        disk_enumerate(generated, &BY_PARTUUID_LINKS, cursor, max)
     }
 
     fn enumerate_async<'a>(
@@ -515,5 +749,18 @@ impl DirOps for DevDiskByPartUuid {
     ) -> crate::FsFuture<'a, Vec<(alloc::string::String, FileType)>> {
         let v = self.enumerate(cursor, max);
         Box::pin(async move { Ok(v) })
+    }
+}
+
+impl DevDiskByPartUuid {
+    /// Whether a synthesised (partition-derived) partuuid entry named `name`
+    /// exists — the shadow guard for `symlink`.
+    fn lookup_generated(&self, name: &str) -> bool {
+        narf_block::block_devices().into_iter().any(|r| {
+            r.partition
+                .as_ref()
+                .map(|p| p.partuuid == name)
+                .unwrap_or(false)
+        })
     }
 }
