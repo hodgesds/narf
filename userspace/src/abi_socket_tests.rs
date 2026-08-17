@@ -915,6 +915,83 @@ kernel_test_in!(
     smoke_abi_socket_unix_listener_connect_wakes_parked_poller
 );
 
+/// A second connect(2) on an already-connected AF_UNIX stream fd returns
+/// EISCONN and must NOT leave a GHOST pending connection. The old connect path
+/// pushed the server endpoint onto the listener's pending queue BEFORE
+/// validating the client's own state, so a retry (or any connect on a
+/// non-Fresh socket) enqueued a dead server half whose rx ring had no writer —
+/// accept() then returned a permanently POLLIN-silent fd. That is the
+/// dbus-broker system-bus strand fingerprint: an accepted connection that never
+/// becomes readable. After the fix the listener yields exactly ONE live,
+/// readable connection and no ghost.
+fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
+    with_setup(|| {
+        const EISCONN: i64 = -56;
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-connect-twice");
+        if call(Syscall::SocketBind.raw(), a2(srv, addr.as_ptr() as u64, alen)).ok_or("bind status")?
+            != 0
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("listen failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen))
+            .ok_or("connect status")?
+            != 0
+        {
+            return Err("first connect failed");
+        }
+        // Second connect on the SAME connected fd: EISCONN, and it must NOT
+        // enqueue a ghost server endpoint.
+        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen))
+            .ok_or("connect2 status")?
+            != EISCONN
+        {
+            return Err("second connect on a connected fd did not return -EISCONN");
+        }
+        // Exactly ONE pending connection, and it is LIVE (a readable ring).
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept did not return the one real connection");
+        }
+        let msg = b"ping";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(cli, msg.as_ptr() as u64, msg.len() as u64, 0),
+        ) != Some(msg.len() as i64)
+        {
+            return Err("client send on the accepted connection failed");
+        }
+        let mut buf = [0u8; 8];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(conn as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        )
+        .ok_or("recv status")?;
+        if n != msg.len() as i64 || &buf[..msg.len()] != msg {
+            return Err("accepted connection was not a live readable ring (ghost)");
+        }
+        // No ghost queued: a non-blocking accept4 on the now-empty listener must
+        // return EAGAIN, not a second (dead) connection.
+        if call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, SOCK_NONBLOCK)).ok_or("accept4 status")?
+            != EAGAIN
+        {
+            return Err("a ghost pending connection was left queued after EISCONN");
+        }
+        let _ = call(Syscall::Close.raw(), a0(cli));
+        let _ = call(Syscall::Close.raw(), a0(conn as u64));
+        let _ = call(Syscall::Close.raw(), a0(srv));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_twice_no_ghost_pending
+);
+
 /// A listening AF_UNIX socket watched through an epoll fd that is ITSELF
 /// polled — libwayland's shape. `wl_event_loop` owns an epoll containing
 /// the display socket and hands its fd to the toolkit's main loop, which

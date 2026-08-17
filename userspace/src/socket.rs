@@ -3610,6 +3610,25 @@ impl SocketFile {
                     Some(l) => l,
                     None => return SocketOpResult::Err(SockError::ConnectionRefused),
                 };
+                // Reject an already-connected (or otherwise non-connectable) fd
+                // BEFORE minting/queuing any server endpoint. The old order
+                // pushed server_end onto the listener's pending queue and only
+                // THEN validated the client's state, so a second connect(2) on
+                // the same fd (Linux returns EISCONN) — or any connect on a
+                // non-Fresh socket — left a GHOST pending connection whose
+                // client half was never wired: its rx ring had no writer, so
+                // accept() returned a permanently POLLIN-silent fd. That is the
+                // dbus-broker system-bus strand — an accepted connection that
+                // never becomes readable, so the daemon never reads the client's
+                // AUTH and the client blocks forever. Peek the client state now;
+                // the commit happens after the server end is safely queued (so a
+                // listener torn down mid-connect leaves the client fd usable,
+                // not half-connected).
+                let local_addr = match &*self.state.lock() {
+                    SocketState::Fresh => None,
+                    SocketState::UnixBound { addr } => Some(addr.clone()),
+                    _ => return SocketOpResult::Err(SockError::AlreadyConnected),
+                };
                 // Mint two ring buffers; one direction each.
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
@@ -3709,26 +3728,18 @@ impl SocketFile {
                 // forever (the connection sits unaccepted; observed as weston
                 // never serving an external client). See the send path above.
                 narf_net::readiness::notify(0);
-                // Configure our (client) end.
-                let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh | SocketState::UnixBound { .. } => {
-                        let local_addr = match &*state {
-                            SocketState::UnixBound { addr } => Some(addr.clone()),
-                            _ => None,
-                        };
-                        *state = SocketState::UnixConnected {
-                            tx: a_to_b,
-                            rx: b_to_a,
-                            local_addr,
-                        };
-                        drop(state);
-                        self.set_peer_cred(listener_cred);
-                        self.set_peer_groups(listener_groups);
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::AlreadyConnected),
-                }
+                // Commit the client end. Its state was validated (Fresh|Bound)
+                // BEFORE server_end was queued, so an already-connected fd was
+                // rejected up front and no ghost was ever created; `local_addr`
+                // was captured at that check.
+                *self.state.lock() = SocketState::UnixConnected {
+                    tx: a_to_b,
+                    rx: b_to_a,
+                    local_addr,
+                };
+                self.set_peer_cred(listener_cred);
+                self.set_peer_groups(listener_groups);
+                SocketOpResult::Ok(0)
             }
             SocketOp::Send {
                 buf,
