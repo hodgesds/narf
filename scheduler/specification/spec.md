@@ -71,6 +71,14 @@ before switching and calls `resume` only when `pause` reported an open syscall
 span, preventing off-CPU residency from being charged as kernel CPU time. The
 callbacks run with interrupts disabled and may not sleep or take a non-IRQ-safe
 lock.
+Own-stack user tasks are timer-preemptible at the CPL3 scheduler tick. The
+preemption path retains the task's live trap frame, FPU state, address space,
+TLS base, and dedicated kernel-stack continuation across requeue, so a
+syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
+Their CPL0 syscall continuations remain run-to-completion except at explicit
+park/yield points. NARF does not yet have a Linux-style per-task preempt-disable
+counter, so enabling arbitrary CPL0 timer preemption for user tasks would make
+lock-bearing kernel continuations migratable and could strand shared state.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Ordinary background task polls deliberately do not advance it: scheduler churn

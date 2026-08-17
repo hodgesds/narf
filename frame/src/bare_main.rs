@@ -48,84 +48,107 @@ static mut BOOT_INFO: Option<BootInfo> = None;
 #[global_allocator]
 static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 
-/// Monotonic timestamp (ns) at/after which kswapd may run its next pass.
-/// The cadence is ADAPTIVE (set at the end of each pass), not a fixed
-/// timer: relaxed when memory is healthy, tight under pressure. This
-/// bounds how often the (buddy-locking) watermark probe runs when idle
-/// while letting reclaim run nearly continuously under pressure.
-static KSWAPD_NEXT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// Pages kswapd reclaims per online CPU per wake, as a floor. More CPUs
 /// means more concurrent allocators building pressure, so kswapd must
 /// shed a bigger batch to keep ahead of them.
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
-/// kswapd-analogue: proactive background page reclaim. Registered as a
-/// `sleep_pumps` callback so it runs in cooperative executor (task, NOT
-/// IRQ) context — safe to take the buddy lock while freeing reclaimed
-/// frames.
-///
-/// Linux's kswapd is event-driven (the allocator wakes it when a zone
-/// drops below its low watermark, and it reclaims until the zone is
-/// balanced at the high watermark). NARF's cooperative model has no
-/// wakeable kthread, so this polls from the executor's `sleep_pumps` —
-/// but the WATERMARK, not a fixed timer, is the gate, and the poll
-/// cadence adapts to pressure so behaviour approximates "reclaim until
-/// balanced":
-///
-/// * healthy (free >= low): relaxed ~100 ms poll, LRU aging only;
-/// * pressured (free < low): reclaim toward `high`, re-check in ~2 ms;
-/// * emergency (free < min): reclaim now and re-run next pass.
-///
-/// The reclaim target scales with BOTH the free-memory deficit
-/// (`reclaim_goal_pages` = high − free) and the online CPU count
-/// (`KSWAPD_PAGES_PER_CPU` floor). Lives here (not in `memory`) because
-/// the clock + CPU count come from `narf_scheduler`, which the low-level
-/// `memory` crate does not depend on.
-fn kswapd_pump() {
+/// Set by `kswapd_wake` when the allocator wants the reclaimer to run. A flag
+/// (not just a waker) so a wake that races the kthread's park is never lost.
+static KSWAPD_WORK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The parked reclaimer kthread's waker, installed on each park.
+static KSWAPD_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Wake the reclaimer kthread. Installed into `narf_memory::reclaim` as the
+/// wake hook (`set_kswapd_wake_hook`) and called from the frame allocator when
+/// a userspace allocation pushes against the `min` reserve. Cheap and safe
+/// from any context: it only sets a flag and wakes a stored waker.
+fn kswapd_wake() {
     use core::sync::atomic::Ordering;
-    const IDLE_INTERVAL_NS: u64 = 100_000_000; // healthy: relax the poll
-    const PRESSURE_INTERVAL_NS: u64 = 2_000_000; // under pressure: re-check ~2 ms
-
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let next = KSWAPD_NEXT_NS.load(Ordering::Relaxed);
-    if now < next {
-        return;
+    KSWAPD_WORK.store(true, Ordering::Release);
+    let waker = KSWAPD_WAKER.lock().clone();
+    if let Some(w) = waker {
+        w.wake();
     }
-    // Claim this tick (optimistically set the pressured cadence) so
-    // concurrent executors don't all reclaim at once; the winner adjusts
-    // the next-run time below based on what it observes.
-    if KSWAPD_NEXT_NS
-        .compare_exchange(
-            next,
-            now.saturating_add(PRESSURE_INTERVAL_NS),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        return;
-    }
+}
 
-    // Batch floor scales with the number of online CPUs (concurrent
-    // allocators); the actual target also tracks the free-memory deficit.
-    let cpu_floor =
-        (narf_scheduler::online_cpu_set().len() as usize).saturating_mul(KSWAPD_PAGES_PER_CPU);
+/// The kswapd / OOM-reaper kthread — the wakeable reclaimer NARF's watermarks
+/// launch. Linux's kswapd is event-driven: the allocator wakes it when a zone
+/// falls below its low watermark, and it reclaims until the zone is balanced at
+/// the high watermark, then sleeps. This is the faithful shape (superseding the
+/// old `sleep_pumps` poll): the kthread PARKS until `kswapd_wake` signals it,
+/// then:
+///
+/// * reclaims toward the `high` watermark (in-kernel shrinkers);
+/// * if it cannot lift free off the emergency `min` floor, the remaining
+///   pressure is anonymous userspace memory, so it OOM-kills the
+///   highest-badness process and drains the async reap backlog — freeing a
+///   victim's pages without waiting for it to schedule and exit;
+/// * parks again once balanced.
+///
+/// Runs in cooperative executor (task, NOT IRQ) context, so taking the buddy
+/// lock, the victim region locks, and issuing TLB shootdowns are all sound.
+/// Lives here (not in `memory`) because the wake, clock, and CPU count come
+/// from `narf_scheduler`, which the low-level `memory` crate cannot depend on.
+async fn kswapd_kthread() {
+    use core::sync::atomic::Ordering;
+    // Bound the passes per wake so a persistently-unbalanced zone can't spin
+    // the kthread; a still-pressured zone re-wakes it on the next allocation.
+    const MAX_PASSES: usize = 64;
+    loop {
+        // Park until the allocator signals work. Register-then-recheck closes
+        // the wake/park race (a wake between the swap and the store still runs).
+        core::future::poll_fn(|cx| {
+            if KSWAPD_WORK.swap(false, Ordering::AcqRel) {
+                return core::task::Poll::Ready(());
+            }
+            *KSWAPD_WAKER.lock() = Some(cx.waker().clone());
+            if KSWAPD_WORK.swap(false, Ordering::AcqRel) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+        .await;
 
-    if narf_memory::reclaim::under_min_watermark() {
-        // Emergency: reclaim hard and re-run on the very next pass.
-        let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
-        narf_memory::reclaim::try_to_free(target);
-        KSWAPD_NEXT_NS.store(now, Ordering::Relaxed);
-    } else if narf_memory::reclaim::under_low_watermark() {
-        // Pressured: reclaim toward the high watermark; the CAS above
-        // already scheduled a prompt (~2 ms) re-check.
-        let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
-        narf_memory::reclaim::try_to_free(target);
-    } else {
-        // Healthy: just age the LRU and relax the poll cadence.
-        narf_memory::reclaim::reclaim_sweep_pump();
-        KSWAPD_NEXT_NS.store(now.saturating_add(IDLE_INTERVAL_NS), Ordering::Relaxed);
+        // Batch floor scales with the online CPU count (concurrent allocators);
+        // the actual target also tracks the free-memory deficit.
+        let cpu_floor =
+            (narf_scheduler::online_cpu_set().len() as usize).saturating_mul(KSWAPD_PAGES_PER_CPU);
+
+        // Reclaim toward the `high` watermark while pressured. This runs on
+        // EVERY wake and only sheds reclaimable (clean cache) pages — it never
+        // kills, so it is safe to run freely under the routine transient dips a
+        // fork/vmalloc storm produces.
+        let mut pass = 0;
+        while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark() {
+            let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
+            let freed = narf_memory::reclaim::try_to_free(target);
+            if freed == 0 {
+                // No forward progress — nothing more to shed this wake.
+                break;
+            }
+            pass += 1;
+            narf_scheduler::yield_now().await;
+        }
+
+        // OOM-kill ONLY on a genuine exhaustion signal: a KERNEL allocation
+        // actually failed (reserve empty), or user pressure under an overcommit
+        // policy that permits killing. NOT on a mere dip below `min` — those
+        // are routine under fork/vmalloc churn and the reserve + vmalloc carry
+        // them without a kill (killing a stress-ng worker there would fail the
+        // run under `--abort`). The victim's pages come back via `reap_all`.
+        if narf_memory::reclaim::take_oom_needed() {
+            if let Some(pid) = narf_memory::oom::request_oom_relief() {
+                let _ = writeln!(
+                    console::Writer,
+                    "  oom: Killed process pid={pid} to relieve memory pressure"
+                );
+            }
+        }
+        narf_memory::oom::reap_all();
     }
 }
 
@@ -1256,7 +1279,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // cooperative executor (sleep_pumps), rate-limited to ~100 ms, so
             // memory pressure is relieved BEFORE an allocation fails rather
             // than only reactively in the alloc-failure path.
-            narf_scheduler::sleep_pumps::register(kswapd_pump);
+            // Wire the wakeable kswapd/OOM-reaper kthread's wake hook now (a
+            // plain fn-pointer store). The allocator calls it when a userspace
+            // allocation pushes against the `min` reserve. The kthread itself
+            // is SPAWNED later (in `run_async_demo`), once the scheduler's ready
+            // queues exist — `spawn` here, before `scheduler::init`, would panic.
+            narf_memory::reclaim::set_kswapd_wake_hook(kswapd_wake);
 
             // MMU handoff per console/ §3.1. The three-step sequence
             // (print, swap, remap) is orchestrated here because
@@ -1381,6 +1409,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
+                    }
+                }
+
+                // Pre-populate the vmalloc window's kernel PML4 slot in the
+                // live kernel root, BEFORE the per-domain PML4 clones and any
+                // user address space copy the kernel half by value. Without
+                // this, a frame-backed vmalloc mapping created later would live
+                // only in the AS that faulted it in, and a kernel access from
+                // another AS's CPU would hit an empty slot (cross-AS #PF).
+                match narf_memory::vmalloc::reserve_kernel_slot() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  vmalloc: kernel VA slot {} reserved",
+                            narf_memory::vmalloc::KERNEL_PML4_SLOT
+                        );
+                    }
+                    Err(e) => {
+                        let _ =
+                            writeln!(console::Writer, "  vmalloc: slot reservation failed: {e:?}");
                     }
                 }
 
@@ -3705,6 +3753,13 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
+    // Spawn the wakeable kswapd/OOM-reaper kthread now that the scheduler's
+    // ready queues are live and BEFORE `run_until_empty` (with boot-init the
+    // user futures loop forever, so the executor never returns). It parks
+    // immediately and runs only when the allocator wakes it under memory
+    // pressure. Not boot-init-gated: any workload can hit the reserve.
+    narf_scheduler::spawn_stackful(kswapd_kthread());
+
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
 
@@ -3832,6 +3887,10 @@ fn boot_userspace_init() {
     sigaction_init();
     signal_init();
     narf_userspace::handlers::init_per_task_state();
+    // Install the process OOM policy so the kswapd pump can kill the
+    // highest-badness process (and the reaper reclaim it) once in-kernel
+    // reclaim can no longer hold the free pool above the emergency watermark.
+    narf_userspace::oom::install();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.

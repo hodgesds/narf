@@ -406,8 +406,9 @@ fn smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie() -> TestResult {
         }
         // Between peek and reap the zombie stays /proc-visible with
         // state Z and its real parent (what systemd's PPid check reads).
-        let info = crate::handlers::proc_task_info(CHILD)
-            .ok_or("zombie /proc entry vanished after the WNOWAIT peek")?;
+        let info =
+            crate::handlers::proc_task_info(CHILD, narf_filesystem::procfs::TaskInfoQuery::Basic)
+                .ok_or("zombie /proc entry vanished after the WNOWAIT peek")?;
         if info.state != 'Z' {
             return Err("unreaped zombie must report /proc state Z");
         }
@@ -477,8 +478,11 @@ fn smoke_abi_proc2_proc_visible_running_and_zombie_child() -> TestResult {
         crate::handlers::__test_inject_parent_of(CHILD_PID, FAKE_TASK);
         // (1) Running child (off-queue, off-CPU-locally): /proc resolves
         // with state R and the real parent in PPid.
-        let info = crate::handlers::proc_task_info(CHILD_PID)
-            .ok_or("/proc entry missing for a registered RUNNING child (off-queue)")?;
+        let info = crate::handlers::proc_task_info(
+            CHILD_PID,
+            narf_filesystem::procfs::TaskInfoQuery::Basic,
+        )
+        .ok_or("/proc entry missing for a registered RUNNING child (off-queue)")?;
         if info.state != 'R' {
             return Err("running child must report /proc state R");
         }
@@ -489,8 +493,11 @@ fn smoke_abi_proc2_proc_visible_running_and_zombie_child() -> TestResult {
         // /proc-visible with state Z + PPid until the parent reaps.
         crate::task::mark_zombie(CHILD_TID);
         crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD_PID, 0);
-        let info = crate::handlers::proc_task_info(CHILD_PID)
-            .ok_or("/proc entry vanished for an unreaped zombie child")?;
+        let info = crate::handlers::proc_task_info(
+            CHILD_PID,
+            narf_filesystem::procfs::TaskInfoQuery::Basic,
+        )
+        .ok_or("/proc entry vanished for an unreaped zombie child")?;
         if info.state != 'Z' {
             return Err("unreaped zombie must report /proc state Z");
         }
@@ -508,7 +515,9 @@ fn smoke_abi_proc2_proc_visible_running_and_zombie_child() -> TestResult {
         if i32::from_ne_bytes(si[16..20].try_into().unwrap()) != CHILD_PID as i32 {
             return Err("waitid did not reap the zombie child");
         }
-        if crate::handlers::proc_task_info(CHILD_PID).is_some() {
+        if crate::handlers::proc_task_info(CHILD_PID, narf_filesystem::procfs::TaskInfoQuery::Basic)
+            .is_some()
+        {
             return Err("reaped pid must not stay /proc-visible");
         }
         Ok(())

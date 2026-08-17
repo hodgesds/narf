@@ -268,6 +268,11 @@ contract.
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.
+Basic procfs task snapshots obtain virtual size, resident pages, writable data,
+and stack size from allocation-free address-space aggregates. Per-region VMA
+materialisation is query-gated to `/proc/<pid>/maps` and `numa_maps`, so a
+metadata or liveness read cannot require contiguous kernel memory proportional
+to the target's VMA count.
 Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata

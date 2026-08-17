@@ -1223,6 +1223,11 @@ pub struct StackfulOptions {
     /// task. Use for drivers that hold hardware locks across an
     /// `.await`-free region.
     pub no_preempt: bool,
+    /// Allow timer slicing when this task is interrupted in CPL3. This is
+    /// independent of `no_preempt`: user tasks keep arbitrary CPL0 kernel
+    /// continuations non-preemptible until the scheduler has a preempt-disable
+    /// counter, while still time-slicing syscall-free userspace.
+    pub user_preempt: bool,
     /// Per-task kernel stack size. Must be ≥ 4 KiB and 16-byte
     /// aligned. Default `stackful::DEFAULT_KERNEL_STACK_BYTES`
     /// (16 KiB).
@@ -1234,6 +1239,7 @@ impl Default for StackfulOptions {
         Self {
             slice_cycles: stackful::DEFAULT_SLICE_CYCLES,
             no_preempt: false,
+            user_preempt: false,
             stack_bytes: stackful::DEFAULT_KERNEL_STACK_BYTES,
         }
     }
@@ -1328,21 +1334,26 @@ where
 {
     let mut spec = spec;
     spec.affinity = normalize_spawn_affinity(spec.affinity);
-    // Run user tasks on their OWN kernel stack via the no-preempt stackful
+    // Run user tasks on their OWN kernel stack via the stackful
     // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
     // *plain* UserTaskFuture would therefore run `enter_user_mode_resume` —
     // whose synthetic iretq frame pushes the user CS/SS selectors — onto the
     // shared executor stack, where a stale pushed selector can survive at a
     // slot a later executor `ret` pops (→ #UD jumping to a selector value).
-    // Giving the user task its own stack confines those pushes. The adapter is
-    // no_preempt: user tasks yield cooperatively via the longjmp machinery, not
-    // timer-driven try_preempt (which is CPL=0-only anyway). x86_64 only —
-    // aarch64's stackful adapter is a stub that completes immediately.
+    // Giving the user task its own stack confines those pushes. User tasks
+    // remain timer-preemptible ONLY at CPL3: the own-stack path
+    // (`try_preempt_user`) preserves the complete trap continuation and FPU
+    // state, so a syscall-free loop yields its CPU. Arbitrary CPL0 preemption
+    // stays disabled until NARF has Linux-style preempt-disable accounting;
+    // otherwise a suspended syscall can strand a lock needed by every sibling
+    // in its CLONE_VM address space. x86_64 only — aarch64's stackful adapter
+    // is a stub that completes immediately.
     #[cfg(target_arch = "x86_64")]
     let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_options(
         f,
         crate::StackfulOptions {
             no_preempt: true,
+            user_preempt: true,
             ..Default::default()
         },
     ));

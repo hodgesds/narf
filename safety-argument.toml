@@ -422,6 +422,10 @@ argument = "Final-owner batch publication reserves its result capacity before an
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
+argument = "Address-space byte accounting now walks immutable region lengths under the existing region lock and uses saturating addition, rather than cloning ownership-bearing per-page backing vectors. It neither changes mappings nor exposes physical addresses, cannot wrap into a smaller accounting value, and performs no allocation while an exiting task snapshots rusage, so memory pressure cannot convert diagnostic accounting into a kernel allocator panic."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
 argument = "aarch64 map, unmap, huge-leaf, and final user-root teardown paths now serialize structural page-table writes through a cache-line-independent 64-way lock selected solely from the live root physical page. Scatter installation retains that lock across every intermediate-table and leaf write and executes one architecture-required descriptor-publication barrier before returning, including after partial failure. Contiguous teardown clears every present leaf under the same lock, then executes all-ASID inner-shareable last-level TLBI operands inside one complete DSB/ISB sequence before authoritative backing can be released. MAP_FIXED, MADV_DONTNEED, and region teardown retain their region-metadata transaction through this operation, so no racing writer can orphan a child table, preserve a stale translation to reusable backing, or publish metadata inconsistent with the leaf tree."
 
 [[invariants_preserved]]
@@ -495,3 +499,15 @@ argument = "Unlocked final-root traversal and batched table-frame return remain 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The unique-frame batch API is crate-private and unsafe: page-table teardown invokes it only after last-Arc ownership has made the root inactive, every data leaf has been retired, each private table has been detached, and x86_64 has removed the table's ownership-registry entry. Page-table frames never enter the data-page COW registry, so bypassing COW lookup cannot skip another owner; alternative allocators retain the ordinary batch implementation by default."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "x86_64 user tasks now use the already-established own-stack CPL3 timer-preemption path while retaining run-to-completion CPL0 syscall continuations. Separate policy bits prevent enabling userspace fairness from also making arbitrary kernel continuations preemptible before NARF has a preempt-disable counter. The CPL3 path switches only after validating that the live trap frame lies within the current task's dedicated kernel stack, marks the return as a suspended continuation for QSBR, saves the task FPU before clearing current-task publication, re-arms exactly that slot's waker, and restores the same continuation, address space, TLS base, and FPU state before iretq. It neither aliases task stacks nor permits one task to resume through another task's address space or register state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "User timer preemption remains inside the existing frame and scheduler executor TCB and uses its existing per-task stack, trap-frame, address-space, and run-queue ownership. It adds no trusted subsystem, capability, domain assignment, ambient authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Procfs basic task snapshots now obtain only saturating allocation-free aggregate counters while holding the existing address-space region locks. The scan never transfers physical ownership or exposes frame addresses, counts a base page resident only when its authoritative physical slot is nonzero, and converts huge leaves to base-page equivalents without changing mappings. Detailed per-VMA NUMA data remains opt-in for maps/numa_maps; ordinary liveness and metadata reads cannot allocate kernel memory proportional to an untrusted task's region count."

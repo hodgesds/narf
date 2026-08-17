@@ -319,6 +319,12 @@ impl AddressSpace {
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
     /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).
     pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64>;
+    /// Sum base-page and hardware-huge VMA spans without allocation.
+    pub fn mapped_bytes(&self) -> u64;
+    /// Allocation-free mapped/resident/writable-nonexec aggregate counters.
+    pub fn memory_stats(&self) -> AddressSpaceMemoryStats;
+    /// Length of the base-page or hardware-huge region starting at `base`.
+    pub fn region_len_at_base(&self, base: VirtAddr) -> Option<u64>;
     /// Copy resident bytes through owned physical backing without user faults.
     pub fn copy_user_bytes_nofault(&self, vaddr: VirtAddr, dst: &mut [u8])
         -> usize;

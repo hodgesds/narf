@@ -192,6 +192,119 @@ pub fn under_min_watermark() -> bool {
     min != 0 && (crate::frame_stats().free as u64) < min
 }
 
+/// `true` when a userspace-backing allocation must be refused to keep the
+/// `min` watermark reserve intact for the kernel. Refuse once granting one
+/// more page would drop free below `min` (i.e. `free <= min`), reserving the
+/// `min` band for kernel/atomic allocations so they never fail under userspace
+/// memory pressure. Returns `false` (never blocks) when watermarks are unset.
+pub fn user_alloc_would_breach_reserve() -> bool {
+    let min = WMARK_MIN.load(Ordering::Relaxed);
+    min != 0 && (crate::frame_stats().free as u64) <= min
+}
+
+// ── kswapd/reaper kthread wake hook ────────────────────────────────
+//
+// `memory` cannot depend on the scheduler, so the kernel binary installs a
+// `fn()` that wakes the parked reclaimer kthread. The allocator calls
+// `wake_kswapd()` when it pushes a userspace allocation against the reserve, so
+// reclaim/OOM runs under load rather than only when a CPU happens to idle.
+
+static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Set when the allocator could not satisfy a KERNEL allocation even after the
+/// reserve and the vmalloc fallback — i.e. genuine, unrecoverable exhaustion,
+/// not a transient dip below `min`. Only THIS arms the reclaimer's OOM killer;
+/// ordinary reserve-breach wakes just reclaim + reap. Keeping the OOM decision
+/// gated on real exhaustion is what stops the reclaimer from killing (and, with
+/// stress-ng `--abort`, failing) a workload that the reserve + vmalloc already
+/// carry without any kill.
+static OOM_NEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Signal that a kernel allocation genuinely failed, and wake the reclaimer to
+/// OOM-kill. Called from the frame allocator's exhaustion path.
+pub fn signal_oom_needed() {
+    OOM_NEEDED.store(true, Ordering::Release);
+    wake_kswapd();
+}
+
+/// Consume the pending-OOM signal (the reclaimer checks this before killing).
+pub fn take_oom_needed() -> bool {
+    OOM_NEEDED.swap(false, Ordering::AcqRel)
+}
+
+// ── Overcommit policy (vm.overcommit_memory analogue) ──────────────────
+//
+// The `min` reserve ALWAYS protects the kernel — a userspace allocation is
+// refused once it would breach it (graceful ENOMEM), regardless of this knob.
+// That anti-panic invariant is not configurable. What IS configurable is
+// whether that user memory pressure also arms the OOM killer to reclaim a hog:
+//
+//   * Never (2)     — graceful ENOMEM only; the kernel never OOM-kills for user
+//                     pressure. Matches the reserve's no-overcommit behaviour
+//                     and lets stress-ng-style workloads that expect ENOMEM
+//                     (and abort on a killed worker) run clean. NARF default.
+//   * Heuristic (0) — Linux's default: user pressure the reclaimer can't clear
+//                     kills the highest-badness process.
+//   * Always (1)    — same OOM behaviour as Heuristic here (both allow the
+//                     killer); kept distinct for the sysctl ABI value.
+
+/// `vm.overcommit_memory` values.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum OvercommitMode {
+    Heuristic = 0,
+    Always = 1,
+    Never = 2,
+}
+
+/// Default: `Never` — user pressure surfaces as ENOMEM, not an OOM-kill. This
+/// is stricter than Linux's default (`Heuristic`) on purpose: NARF's reserve
+/// already prevents the kernel from failing, so killing a process is a genuine
+/// last resort reserved for real kernel exhaustion.
+static OVERCOMMIT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(OvercommitMode::Never as u8);
+
+/// Set the overcommit mode from a raw sysctl value (0/1/2). Out-of-range
+/// values are ignored. Backs a future `/proc/sys/vm/overcommit_memory`.
+pub fn set_overcommit_mode(raw: u8) {
+    if raw <= 2 {
+        OVERCOMMIT.store(raw, Ordering::Relaxed);
+    }
+}
+
+/// The current overcommit mode.
+pub fn overcommit_mode() -> OvercommitMode {
+    match OVERCOMMIT.load(Ordering::Relaxed) {
+        0 => OvercommitMode::Heuristic,
+        1 => OvercommitMode::Always,
+        _ => OvercommitMode::Never,
+    }
+}
+
+/// Whether a reserve-refused USER allocation should arm the OOM killer (kill a
+/// hog) rather than only returning ENOMEM. True for Heuristic/Always.
+pub fn user_pressure_arms_oom() -> bool {
+    !matches!(overcommit_mode(), OvercommitMode::Never)
+}
+
+/// Install the reclaimer wake hook (the kernel binary passes a `fn()` that
+/// wakes its parked kswapd/reaper kthread). Call once at boot.
+pub fn set_kswapd_wake_hook(hook: fn()) {
+    KSWAPD_WAKE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Wake the parked reclaimer kthread, if one is installed. Cheap and safe to
+/// call from the allocation path: the hook only flags + wakes a waker. No-op
+/// before the kthread is spawned.
+pub fn wake_kswapd() {
+    let p = KSWAPD_WAKE_HOOK.load(Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: `p` was stored by `set_kswapd_wake_hook` from a live `fn()`,
+        // and `fn()` and `usize` are the same width on every target here.
+        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
+        hook();
+    }
+}
+
 /// Pages a reclaim pass should aim to free to reach the `high`
 /// watermark, or 0 if already at/above it (or unconfigured).
 pub fn reclaim_goal_pages() -> usize {

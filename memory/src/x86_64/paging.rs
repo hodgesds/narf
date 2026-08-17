@@ -1358,6 +1358,66 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     unsafe { unmap_4kb_impl(pml4_phys, virt, true) }
 }
 
+/// If the level-1 page table (PT) covering `virt` in `root` holds no present
+/// leaves, free it and clear its PD entry. The frame-backed vmalloc free path
+/// calls this to FULLY reclaim page tables rather than retaining them; PD/PDPT
+/// levels are intentionally kept (the PDPT is the shared, boot-reserved kernel
+/// vmalloc slot every address space copies by value). Returns true if a PT was
+/// freed. A no-op (returns false) on huge leaves or an already-empty subtree.
+///
+/// # Safety
+/// `root` must be the live kernel root. The caller MUST have already unmapped
+/// every present leaf in this PT with a GLOBAL INVLPG (as `unmap_4kb` does):
+/// INVLPG invalidates the paging-structure caches for the address on all CPUs,
+/// so once every leaf is flushed, no CPU can walk the freed PT frame after it
+/// is reused.
+pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    let _guard = pt_lock_for(root).lock();
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: root is identity-reachable and the mutation lock is held.
+    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return false;
+    }
+    // SAFETY: a present PML4 entry names an identity-reachable PDPT. The PDPT
+    // itself is the shared, boot-reserved kernel vmalloc slot and is never
+    // freed here, so this borrow is const.
+    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpte = pdpt.entries[idx.pdpt];
+    if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    // SAFETY: a present, non-huge PDPT entry names an identity-reachable PD.
+    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pde = pd.entries[idx.pd];
+    if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    let pt_phys = pde.addr();
+    // SAFETY: a present, non-huge PD entry names an identity-reachable PT.
+    let pt = unsafe { &*pt_phys.as_ptr::<PageTable>() };
+    if pt.entries.iter().any(|e| e.is_present()) {
+        return false;
+    }
+    // Detach and free the now-empty PT. The caller's per-leaf global INVLPGs
+    // already flushed the paging-structure caches covering this range, so the
+    // freed frame cannot be walked into after reuse.
+    pd.entries[idx.pd] = PageTableEntry::EMPTY;
+    crate::frame::__pagetable_unregister(pt_phys.raw());
+    crate::frame::free_frame(crate::frame::PhysFrame::new(pt_phys));
+    // Cascade: if that emptied the PD too, free it and clear its PDPT entry.
+    // Stop at the PDPT — it is the reserved slot's shared child every address
+    // space copies, so it must persist.
+    if !pd.entries.iter().any(|e| e.is_present()) {
+        let pd_phys = pdpte.addr();
+        pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
+        crate::frame::__pagetable_unregister(pd_phys.raw());
+        crate::frame::free_frame(crate::frame::PhysFrame::new(pd_phys));
+    }
+    true
+}
+
 /// [`unmap_4kb`] WITHOUT the cross-CPU shootdown broadcast — the leaf PTE is
 /// cleared and INVLPG'd **locally only**. For batched whole-AS operations
 /// (fork's parent `rematerialize`, exit-path region teardown) that issue ONE

@@ -819,6 +819,70 @@ pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
     alloc_frame_on_inner(preferred)
 }
 
+/// Whether an allocation is servicing the kernel or a userspace mapping.
+///
+/// The `min` watermark is a reserve the kernel must always be able to draw on:
+/// a `Kernel` allocation may take the pool down into it so kernel/atomic work
+/// (page tables, slab, fork/teardown metadata) never fails under memory
+/// pressure. A `User` allocation (demand fault, COW, stack growth, brk,
+/// mmap-populate, page migration) is refused — surfacing as `-ENOMEM` to
+/// userspace — once granting it would breach the reserve, so userspace cannot
+/// starve the kernel. This is NARF's analogue of Linux's `ALLOC_WMARK_MIN`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum AllocContext {
+    /// Kernel/atomic allocation — may consume the `min` reserve.
+    Kernel,
+    /// Userspace-backing allocation — must leave the `min` reserve intact.
+    User,
+}
+
+/// Central reserve gate. Returns `Exhausted` (and wakes the reclaimer) when a
+/// `User` allocation would breach the `min` watermark reserve; `Kernel`
+/// allocations always pass. Enforced once, here, so every allocation entry
+/// inherits the same policy — a user path cannot silently drain the reserve.
+#[inline]
+fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
+    if ctx == AllocContext::User && crate::reclaim::user_alloc_would_breach_reserve() {
+        // Wake the reclaimer so it can shed clean cache and let the retry
+        // succeed. Under an overcommit policy that permits it (Heuristic /
+        // Always), also arm the OOM killer so sustained user pressure reclaims
+        // a hog rather than only failing the faulting task. Under `Never` (the
+        // default) this stays a graceful ENOMEM — no process is killed.
+        crate::reclaim::wake_kswapd();
+        if crate::reclaim::user_pressure_arms_oom() {
+            crate::reclaim::signal_oom_needed();
+        }
+        return Err(FrameAllocError::Exhausted);
+    }
+    Ok(())
+}
+
+/// Allocate one CPU-local frame for a userspace mapping, honouring the `min`
+/// watermark reserve. Mirrors [`alloc_frame`] but with `User` context.
+pub fn alloc_user_frame() -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
+    alloc_frame_on_inner_ctx(current_cpu_node(), AllocContext::User)
+}
+
+/// Reserve-respecting `User`-context variant of [`alloc_frame_on`].
+pub fn alloc_frame_on_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
+    alloc_frame_on_inner_ctx(node, ctx)
+}
+
+/// Reserve-respecting variant of [`alloc_frame_anywhere`].
+pub fn alloc_frame_anywhere_ctx(ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
+    reserve_permits(ctx)?;
+    alloc_frame_anywhere()
+}
+
+/// `User`-context strict per-node allocation for a bound mempolicy.
+pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    alloc_frame_on_strict_for_ctx(node, node, AllocContext::User)
+}
+
 /// Phys-address ceiling for early boot. While set, alloc_frame*
 /// returns only frames whose physical address is strictly below
 /// this value. Reason: pre-MMU-init code (per-domain PML4 setup,
@@ -1065,6 +1129,17 @@ pub(crate) fn alloc_frame_on_strict_for(
     node: usize,
     preferred: usize,
 ) -> Result<PhysFrame, FrameAllocError> {
+    alloc_frame_on_strict_for_ctx(node, preferred, AllocContext::Kernel)
+}
+
+/// Reserve-aware core of the strict per-node path. `User` allocations are
+/// refused once they would breach the `min` watermark reserve.
+pub(crate) fn alloc_frame_on_strict_for_ctx(
+    node: usize,
+    preferred: usize,
+    ctx: AllocContext,
+) -> Result<PhysFrame, FrameAllocError> {
+    reserve_permits(ctx)?;
     #[cfg(feature = "cgroup")]
     if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
         return Err(FrameAllocError::Exhausted);
@@ -1103,6 +1178,14 @@ fn buddy_alloc_frame_on_strict(
 /// for the `frame-alloc-audit` alloc-site map, instead of one shadowing
 /// the other.
 fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    alloc_frame_on_inner_ctx(node, AllocContext::Kernel)
+}
+
+/// Reserve-aware core of `alloc_frame` / `alloc_frame_on`. `User` allocations
+/// are refused (and the reclaimer woken) once they would breach the `min`
+/// watermark reserve; `Kernel` allocations may consume it.
+fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
+    reserve_permits(ctx)?;
     // cgroup memory accounting: charge one page to the current task's
     // cgroup chain *before* the allocation commits. A `false` return
     // means a `memory.max` would be exceeded, so the allocation is
@@ -1119,6 +1202,16 @@ fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
         // Allocation failed after charging — refund so accounting stays
         // balanced with the actual page population.
         crate::cgroup_charge::uncharge(PAGE_SIZE);
+    }
+    if r.is_err() && ctx == AllocContext::Kernel {
+        // A KERNEL allocation could not be satisfied even into the `min`
+        // reserve — genuine, unrecoverable exhaustion (a `User` alloc would
+        // have been refused earlier by `reserve_permits`, keeping this reserve
+        // intact). Arm the reclaimer's OOM killer. This does NOT fire on the
+        // transient below-`min` dips a fork/vmalloc storm produces, only when
+        // a kernel request actually fails — so a workload the reserve +
+        // vmalloc already carry is never needlessly OOM-killed.
+        crate::reclaim::signal_oom_needed();
     }
     r
 }

@@ -2067,6 +2067,87 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe fn unmap_region_pages(&self, _region: &Region) {}
 
+    /// Reclaim the resident private, unlocked, anonymous frames of this address
+    /// space out from under a victim the OOM killer has already SIGKILLed,
+    /// without waiting for it to schedule and run its own exit teardown.
+    /// Returns the number of base pages freed. See `crate::oom` for the whole
+    /// soundness argument; in brief:
+    ///
+    ///   * The reaper holds an `Arc` to this AS, so the last-`Arc` `Drop`
+    ///     teardown (which frees the same frames) cannot run concurrently —
+    ///     no double free.
+    ///   * Only single-threaded (`!vm_shared`) victims are reaped, and the
+    ///     region table is taken with `try_lock`. So no sibling thread is
+    ///     mid-fault on this table and no CPU is spinning on this lock while
+    ///     the forced shootdown below waits for acks — that would deadlock.
+    ///   * A forced full user-TLB shootdown lands before any frame is freed, so
+    ///     a CPU still momentarily running the doomed task cannot alias a reused
+    ///     frame through a stale entry; its next access re-faults, and the
+    ///     zeroed backing turns that into a fresh demand fault.
+    ///
+    /// SHARED (borrowed) and LOCKED regions, huge regions, and swap slots are
+    /// left for the victim's own exit, matching every other teardown path.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn reap_anonymous(&self) -> usize {
+        if self.root.as_u64() == 0 || self.is_vm_shared() {
+            return 0;
+        }
+        let Some(mut regions) = self.regions.try_lock() else {
+            return 0;
+        };
+
+        // Pass 1: tear down every reapable leaf PTE with local invalidation.
+        let mut reaped_any = false;
+        for r in regions.iter() {
+            if r.perms.contains(RegionPerms::SHARED) || r.perms.contains(RegionPerms::LOCKED) {
+                continue;
+            }
+            // SAFETY: identity-mapped root; the region was materialized through
+            // it and the table lock pins its backing during the walk.
+            unsafe { self.unmap_region_leaves_local(r) };
+            reaped_any = true;
+        }
+        if !reaped_any {
+            return 0;
+        }
+
+        // ONE forced full user-TLB shootdown across ALL CPUs. Unlike the
+        // vm_shared-gated `flush_region_broadcast`, the reaper runs cross-task
+        // and cannot assume the doomed AS is resident only on the local CPU.
+        // No CPU can be spinning on this region lock (`!vm_shared` + we hold it
+        // via try_lock), so the ack-wait cannot deadlock.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: CPL=0; the local invalidation phase completed above.
+            unsafe { crate::x86_64::paging::flush_user_tlb_local() };
+            crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+        }
+
+        // Pass 2: free the backing frames (allocation-free) and zero the
+        // entries so the victim's own `Drop` teardown skips them — idempotent.
+        let mut freed = 0usize;
+        for r in regions.iter_mut() {
+            if r.perms.contains(RegionPerms::SHARED) || r.perms.contains(RegionPerms::LOCKED) {
+                continue;
+            }
+            let pages = ((r.len + 0xFFF) >> 12) as usize;
+            let n = pages.min(r.phys.len());
+            crate::frame::free_phys_batch(&r.phys[..n]);
+            for p in r.phys[..n].iter_mut() {
+                if p.raw() != 0 {
+                    freed += 1;
+                    *p = PhysAddr::new(0);
+                }
+            }
+        }
+        freed
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn reap_anonymous(&self) -> usize {
+        0
+    }
+
     /// Tear down every leaf PTE of `region` with LOCAL invalidation only
     /// (x86_64; aarch64's TLBI broadcasts in hardware). The cross-CPU
     /// shootdown is batched into ONE broadcast by the caller
@@ -3110,7 +3191,7 @@ impl AddressSpace {
             alloc::vec::Vec::with_capacity(npages as usize);
         let mut p = v_page;
         while p <= guard_base {
-            let phys = crate::frame::alloc_frame()
+            let phys = crate::frame::alloc_user_frame()
                 .map_err(|_| AddressSpaceError::OutOfRange)?
                 .start_address();
             // SAFETY: identity-mapped; freshly-allocated frame is ours.
@@ -3202,7 +3283,7 @@ impl AddressSpace {
             alloc::vec::Vec::with_capacity(npages as usize);
         let mut p = v_page;
         while p <= guard_base {
-            let phys = crate::frame::alloc_frame()
+            let phys = crate::frame::alloc_user_frame()
                 .map_err(|_| AddressSpaceError::OutOfRange)?
                 .start_address();
             // SAFETY: phys-as-virt via kernel_mut_ptr stays valid even
@@ -4907,7 +4988,7 @@ impl AddressSpace {
             (ticket, old_phys)
         };
 
-        let new_frame = match crate::frame::alloc_frame() {
+        let new_frame = match crate::frame::alloc_user_frame() {
             Ok(frame) => frame,
             Err(_) => {
                 let mut regions = self.regions.lock();
@@ -5023,7 +5104,7 @@ impl AddressSpace {
             return Ok(old_node);
         }
 
-        let new_frame = crate::frame::alloc_frame_on_strict(target_node)
+        let new_frame = crate::frame::alloc_user_frame_on_strict(target_node)
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
         // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.

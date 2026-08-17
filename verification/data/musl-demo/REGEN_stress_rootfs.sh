@@ -50,10 +50,18 @@ echo "installing stress-ng + perf + base userland into rootfs"
     --allow-untrusted --no-cache \
     add alpine-baselayout busybox musl stress-ng perf
 
-# The workload chroot_run runs. Various stressors exercising fork/thread/alloc/
-# mmap/pipe/sock/context-switch churn; each capped so the whole pass fits the CI
-# window even under KASAN's outline-check slowdown. `--expect STRESS-DONE` (in
-# the CI job) keys on the final marker so run-interactive exits promptly.
+# Alpine stress-ng 0.18 is built without its mremap stressor even though NARF
+# implements the syscall. Install the focused in-tree probe so mremap coverage
+# is required instead of being silently reported as skipped.
+musl-gcc -O2 -Wall -fPIE -pie -mcmodel=large \
+    "$ROOT/verification/data/musl-demo/mremap_smoke_x86_64.c" \
+    -o "$RD/usr/bin/mremap_smoke"
+
+# The workload chroot_run runs. Required MM stressors fail the probe immediately;
+# a worker error must never be hidden behind the final completion marker. Each
+# stressor is capped so the whole pass fits the CI window even under KASAN's
+# outline-check slowdown. `--expect STRESS-DONE` (in the CI job) keys on the
+# final marker so run-interactive exits promptly.
 cat > "$RD/probe.sh" <<'PROBE'
 echo "STRESS-START pid=$$"
 DUR="${STRESS_DUR:-6s}"
@@ -64,12 +72,31 @@ if ! /usr/bin/stress-ng --mmapfork 1 --mmapfork-bytes 4M \
   exit 1
 fi
 echo "MMAPFORK-DONE"
-for s in "--fork 4" "--malloc 4" "--vm 2 --vm-bytes 32M" "--mmap 2" \
-         "--pthread 4" "--pipe 2" "--sock 2" "--switch 4" "--clone 2" \
-         "--sigrt 4" "--cpu 2"; do
-  echo "=== stressor: $s ==="
-  /usr/bin/stress-ng $s --timeout "$DUR" --metrics-brief 2>&1 || echo "STRESSOR-RC=$? for [$s]"
-done
+
+echo "=== required regression: mremap semantics ==="
+if ! /usr/bin/mremap_smoke 2>&1; then
+  echo "MREMAP-FAIL"
+  exit 1
+fi
+echo "MREMAP-DONE"
+
+# Memory-management correctness matrix. Keep each explicit: this is also the
+# checklist consumed when evaluating a memory-sensitive commit. The byte caps
+# avoid turning KASAN shadow overhead into an accidental OOM test. One
+# stress-ng exec drives the complete sequence: NARF's current exec loader must
+# buffer the 4.7 MiB stress-ng ELF contiguously, so re-execing it after every
+# stressor would conflate buddy high-order fragmentation with the stressor under
+# test. `--sequential` still forks fresh workers for every selected stressor.
+echo "=== required sequential MM/process matrix ==="
+if ! /usr/bin/stress-ng --sequential 2 \
+        --with fork,malloc,vm,mmap,brk,stack,vma,mlock,madvise,fault,shm,pthread,pipe,sock,switch,clone,sigrt,cpu \
+        --malloc-bytes 32M --vm-bytes 32M --mmap-bytes 32M \
+        --shm-bytes 16M \
+        --timeout "$DUR" --abort --verify --stressor-time --metrics-brief 2>&1; then
+  echo "STRESS-MATRIX-FAIL"
+  exit 1
+fi
+echo "STRESS-MATRIX-DONE"
 echo "=== perf stat: stress-ng cpu ==="
 PERF_OUT="$(/usr/bin/perf stat -x, -e 'task-clock,task-clock:u,task-clock:k' -- \
   /usr/bin/stress-ng --cpu 4 --timeout 1s --metrics-brief 2>&1)"

@@ -1177,6 +1177,64 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     unsafe { unmap_4kb_locked(root, virt, true) }
 }
 
+/// If the last-level (L3) table covering `virt` in `root` holds no valid
+/// entries, free it and clear its L2 descriptor. The frame-backed vmalloc free
+/// path calls this to FULLY reclaim page tables rather than retaining them; the
+/// L0/L1/L2 levels are kept (the L1 under the reserved kernel L0 slot is shared
+/// by every address space). Returns true if a table was freed. A no-op on block
+/// descriptors or an already-empty subtree.
+///
+/// # Safety
+/// `root` must be the live kernel root. The caller MUST have already unmapped
+/// every valid leaf in this L3 with a broadcast TLBI (as `unmap_4kb` does), so
+/// no CPU can walk the freed table frame after it is reused.
+pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    let _guard = pt_lock_for(root).lock();
+    let idx = WalkIndices::from_virt(virt);
+    // A descriptor is a table iff its low two bits are 0b11 (valid + table);
+    // a block/invalid descriptor stops the walk with nothing to reclaim.
+    // SAFETY: root is kernel-reachable and the mutation lock is held.
+    let l0 = unsafe { &*root.kernel_mut_ptr::<PageTable>() };
+    let l0e = l0.entries[idx.l0];
+    if (l0e.0 & 0b11) != 0b11 {
+        return false;
+    }
+    // The L1 under the reserved L0 slot is shared by every address space and is
+    // never freed here, so this borrow is const.
+    // SAFETY: a table descriptor names a kernel-reachable L1.
+    let l1 = unsafe { &mut *l0e.addr().kernel_mut_ptr::<PageTable>() };
+    let l1e = l1.entries[idx.l1];
+    if (l1e.0 & 0b11) != 0b11 {
+        return false;
+    }
+    // SAFETY: a table descriptor names a kernel-reachable L2.
+    let l2 = unsafe { &mut *l1e.addr().kernel_mut_ptr::<PageTable>() };
+    let l2e = l2.entries[idx.l2];
+    if (l2e.0 & 0b11) != 0b11 {
+        return false;
+    }
+    let l3_phys = l2e.addr();
+    // SAFETY: a table descriptor names a kernel-reachable L3.
+    let l3 = unsafe { &*l3_phys.kernel_mut_ptr::<PageTable>() };
+    if l3.entries.iter().any(|e| e.is_valid()) {
+        return false;
+    }
+    // Detach and free the now-empty L3. The caller's per-leaf broadcast TLBIs
+    // already invalidated the walk caches covering this range.
+    l2.entries[idx.l2] = PageTableEntry::EMPTY;
+    crate::frame::__pagetable_unregister(l3_phys.raw());
+    crate::frame::free_frame(crate::frame::PhysFrame::new(l3_phys));
+    // Cascade: if that emptied the L2 too, free it and clear its L1 entry. Stop
+    // at the L1 — it is the reserved L0 slot's shared child and must persist.
+    if !l2.entries.iter().any(|e| e.is_valid()) {
+        let l2_phys = l2e.addr();
+        l1.entries[idx.l1] = PageTableEntry::EMPTY;
+        crate::frame::__pagetable_unregister(l2_phys.raw());
+        crate::frame::free_frame(crate::frame::PhysFrame::new(l2_phys));
+    }
+    true
+}
+
 /// Remove one leaf with this root's mutation lock already held.
 ///
 /// # Safety

@@ -32,7 +32,25 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-use crate::frame::{self, FrameAllocError, PhysFrame, MAX_NUMA_NODES};
+use crate::frame::{self, AllocContext, FrameAllocError, PhysFrame, MAX_NUMA_NODES};
+
+// Every allocation in this module backs a userspace page — mempolicy is a
+// userspace NUMA policy applied on the demand-fault / mlock path — so all of
+// them honour the `min` watermark reserve (`AllocContext::User`). Routing
+// through these thin wrappers keeps that guarantee in one place instead of
+// tagging each of the many per-node attempts below.
+#[inline]
+fn u_alloc_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    frame::alloc_frame_on_ctx(node, AllocContext::User)
+}
+#[inline]
+fn u_alloc_strict(node: usize, preferred: usize) -> Result<PhysFrame, FrameAllocError> {
+    frame::alloc_frame_on_strict_for_ctx(node, preferred, AllocContext::User)
+}
+#[inline]
+fn u_alloc_anywhere() -> Result<PhysFrame, FrameAllocError> {
+    frame::alloc_frame_anywhere_ctx(AllocContext::User)
+}
 
 /// Linux `MPOL_*` mode values (the low bits of the mode word).
 pub const MPOL_DEFAULT: u32 = 0;
@@ -386,7 +404,7 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
                 interleave_pick(mask, policy.interleave_index)
             };
             let result = if unconstrained {
-                frame::alloc_frame_on(node)
+                u_alloc_on(node)
             } else {
                 alloc_preferred_within(node, mask)
             };
@@ -403,7 +421,7 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
             let preferred = policy.nodemask & allowed;
             let node = first_node(preferred).unwrap_or(local);
             if unconstrained {
-                frame::alloc_frame_on(node)
+                u_alloc_on(node)
             } else {
                 alloc_preferred_within(node, allowed)
             }
@@ -418,7 +436,7 @@ pub fn alloc_frame_with(policy: Mempolicy, local: usize) -> Result<PhysFrame, Fr
             alloc_preferred_many(preferred, allowed, anchor)
         }
         // DEFAULT and LOCAL mean local-first, but never outside cpuset.mems.
-        _ if unconstrained => frame::alloc_frame_on(local),
+        _ if unconstrained => u_alloc_on(local),
         _ => alloc_preferred_within(local, allowed),
     }
 }
@@ -438,13 +456,13 @@ fn alloc_preferred_many(
     }
     candidates[..count].sort_unstable_by_key(|&node| (frame::node_distance(anchor, node), node));
     for &node in &candidates[..count] {
-        if let Ok(frame) = frame::alloc_frame_on_strict_for(node, node) {
+        if let Ok(frame) = u_alloc_strict(node, node) {
             return Ok(frame);
         }
     }
     for node in 0..MAX_NUMA_NODES {
         if (allowed >> node) & 1 != 0 && (preferred >> node) & 1 == 0 {
-            if let Ok(frame) = frame::alloc_frame_on_strict_for(node, anchor) {
+            if let Ok(frame) = u_alloc_strict(node, anchor) {
                 return Ok(frame);
             }
         }
@@ -456,13 +474,13 @@ fn alloc_preferred_many(
 /// nodes. Every attempt is strict so a cgroup hard boundary cannot spill.
 fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, FrameAllocError> {
     if preferred < MAX_NUMA_NODES && (allowed >> preferred) & 1 != 0 {
-        if let Ok(frame) = frame::alloc_frame_on_strict_for(preferred, preferred) {
+        if let Ok(frame) = u_alloc_strict(preferred, preferred) {
             return Ok(frame);
         }
     }
     for node in 0..MAX_NUMA_NODES {
         if node != preferred && (allowed >> node) & 1 != 0 {
-            if let Ok(frame) = frame::alloc_frame_on_strict_for(node, preferred) {
+            if let Ok(frame) = u_alloc_strict(node, preferred) {
                 return Ok(frame);
             }
         }
@@ -474,7 +492,7 @@ fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, F
 /// from the lowest masked node. Never spills outside the mask.
 fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
     let Some(first) = first_node(mask) else {
-        return frame::alloc_frame_anywhere();
+        return u_alloc_anywhere();
     };
     let anchor = if home_node == u32::MAX {
         first
@@ -506,7 +524,7 @@ fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
     }
     let preferred = candidates[0];
     for &node in &candidates[..count] {
-        if let Ok(f) = frame::alloc_frame_on_strict_for(node, preferred) {
+        if let Ok(f) = u_alloc_strict(node, preferred) {
             return Ok(f);
         }
     }

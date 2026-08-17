@@ -26,16 +26,42 @@
 //! pointer. A real free list can land later when long-running
 //! drivers actually exercise iounmap.
 
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::{PhysAddr, PhysFrame, VirtAddr};
 
 #[cfg(target_arch = "x86_64")]
 const VMALLOC_BASE: u64 = 0xFFFF_8800_0000_0000;
 #[cfg(target_arch = "aarch64")]
 const VMALLOC_BASE: u64 = 0xFFFF_C000_0000_0000;
 
-/// 4 GiB of vmalloc space — enough for any plausible BAR
-/// allocation; trivial to bump if a driver wants more.
-const VMALLOC_LIMIT: u64 = VMALLOC_BASE + (4u64 << 30);
+/// 4 GiB of vmalloc space, split in two halves that share one kernel PML4
+/// slot (so one boot-time `reserve_kernel_slot` covers both):
+///   * lower 2 GiB — `ioremap`'s unbacked bump allocator (device BARs;
+///     long-lived, so its no-op free is acceptable).
+///   * upper 2 GiB — the frame-backed [`valloc`] heap fallback, with a
+///     bitmap allocator that actually reclaims VA on `vfree`.
+const IOREMAP_LIMIT: u64 = VMALLOC_BASE + (2u64 << 30);
+const VALLOC_BASE: u64 = IOREMAP_LIMIT;
+const VALLOC_LIMIT: u64 = VMALLOC_BASE + (4u64 << 30);
+/// Pages in the `valloc` half; one bit each in `VALLOC_MAP`.
+const VALLOC_PAGES: usize = (2usize << 30) / 4096;
+const VALLOC_WORDS: usize = VALLOC_PAGES / 64;
+
+/// Kernel PML4 (x86) / L0 (aarch64) slot the whole vmalloc window lives in.
+/// The entire 4 GiB fits in one 512 GiB slot. Boot pre-populates this slot's
+/// top-level entry BEFORE any user address space is created, so the by-value
+/// kernel-half copy in `new_user_pml4` shares the same lower page tables and
+/// vmalloc/ioremap mappings are visible in every address space (otherwise a
+/// kernel access from another AS's CPU would hit an empty slot — a cross-AS
+/// page fault). Decodes from `VMALLOC_BASE`; asserted in `reserve_kernel_slot`.
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_PML4_SLOT: usize = 272;
+#[cfg(target_arch = "aarch64")]
+pub const KERNEL_PML4_SLOT: usize = 384;
 
 static CURSOR: AtomicU64 = AtomicU64::new(VMALLOC_BASE);
 
@@ -69,7 +95,7 @@ pub fn alloc(len: u64) -> Result<VmRange, VmallocError> {
     loop {
         let cur = CURSOR.load(Ordering::Relaxed);
         let end = cur.checked_add(len_pg).ok_or(VmallocError::Exhausted)?;
-        if end > VMALLOC_LIMIT {
+        if end > IOREMAP_LIMIT {
             return Err(VmallocError::Exhausted);
         }
         match CURSOR.compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed) {
@@ -101,4 +127,266 @@ pub fn claimed_bytes() -> u64 {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     CURSOR.store(VMALLOC_BASE, Ordering::Relaxed);
+}
+
+// ── Frame-backed vmalloc (kernel-heap large-allocation fallback) ───────
+//
+// The kernel heap's large-object path (`slab::alloc_large`) uses a
+// physically-CONTIGUOUS buddy block, which fails under fragmentation even when
+// plenty of scattered pages are free (a 64 KiB `Vec` needs 16 adjacent frames).
+// `valloc` backs a virtually-contiguous range with SCATTERED order-0 frames, so
+// a large kernel allocation — e.g. `clone_for_fork`'s region-sized `Vec` — only
+// needs enough free pages, not a contiguous run. NARF's analogue of Linux
+// `vmalloc` behind `kvmalloc`.
+
+/// Bitmap allocator over the `valloc` half of the window: one bit per page,
+/// set = in use. Fixed-size (allocation-free), so `valloc` never re-enters the
+/// heap allocator it backs. `free_run` reclaims VA — unlike the ioremap bump.
+struct VaMap {
+    words: [u64; VALLOC_WORDS],
+}
+
+impl VaMap {
+    const fn new() -> Self {
+        Self {
+            words: [0; VALLOC_WORDS],
+        }
+    }
+    #[inline]
+    fn used(&self, page: usize) -> bool {
+        self.words[page / 64] & (1u64 << (page % 64)) != 0
+    }
+    /// First-fit run of `n` contiguous free pages; marks them used. Skips
+    /// fully-allocated words to keep the scan short under churn.
+    fn alloc_run(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > VALLOC_PAGES {
+            return None;
+        }
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        let mut page = 0usize;
+        while page < VALLOC_PAGES {
+            if run_len == 0 && page % 64 == 0 && self.words[page / 64] == u64::MAX {
+                page += 64;
+                run_start = page;
+                continue;
+            }
+            if self.used(page) {
+                run_len = 0;
+                run_start = page + 1;
+            } else {
+                run_len += 1;
+                if run_len == n {
+                    for p in run_start..run_start + n {
+                        self.words[p / 64] |= 1u64 << (p % 64);
+                    }
+                    return Some(run_start);
+                }
+            }
+            page += 1;
+        }
+        None
+    }
+    fn free_run(&mut self, base: usize, n: usize) {
+        for p in base..base + n {
+            self.words[p / 64] &= !(1u64 << (p % 64));
+        }
+    }
+}
+
+static VALLOC_MAP: IrqSafeSpinLock<VaMap> = IrqSafeSpinLock::new(VaMap::new());
+
+/// Kernel leaf-mapping flags for a frame-backed vmalloc page: writable,
+/// non-executable, global (kernel-shared).
+#[inline]
+fn kernel_leaf_flags() -> crate::paging::PtFlags {
+    use crate::paging::PtFlags;
+    #[cfg(target_arch = "x86_64")]
+    {
+        PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::GLOBAL
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        PtFlags::AP_RW_EL1 | PtFlags::ATTR_NORMAL | PtFlags::UXN | PtFlags::PXN
+    }
+}
+
+/// Map one kernel page at `va` to `phys` in the shared kernel tables.
+///
+/// # Safety
+/// `va` must lie in the pre-reserved vmalloc slot and `phys` be an owned frame.
+unsafe fn map_kernel_page(va: VirtAddr, phys: PhysAddr) -> Result<(), ()> {
+    let root = crate::bpf_text::kernel_root_for_mapping().ok_or(())?;
+    // SAFETY: `root` is the live kernel PML4/L0; `va` is in the pre-reserved
+    // kernel-shared vmalloc slot; `phys` is a fresh, exclusively-owned frame.
+    unsafe { crate::paging::map_4kb(root, va, phys, kernel_leaf_flags()) }.map_err(|_| ())
+}
+
+/// Unmap one kernel page at `va`, returning the physical frame it backed. The
+/// underlying `unmap_4kb` performs the global TLB invalidation.
+///
+/// # Safety
+/// `va` must be a page currently mapped by `map_kernel_page`.
+unsafe fn unmap_kernel_page(va: VirtAddr) -> Result<PhysAddr, ()> {
+    let root = crate::bpf_text::kernel_root_for_mapping().ok_or(())?;
+    // SAFETY: `root` is the live kernel root; `va` was mapped here by us.
+    unsafe { crate::paging::unmap_4kb(root, va) }.map_err(|_| ())
+}
+
+/// Unmap + free the first `count` pages of the range at VA `base`.
+///
+/// # Safety
+/// `[base, base + count*4096)` must be pages this module mapped.
+unsafe fn unmap_and_free(base: u64, count: usize) {
+    for i in 0..count {
+        let va = VirtAddr::new(base + (i as u64) * 4096);
+        // SAFETY: mapped by `map_kernel_page` for this allocation.
+        if let Ok(phys) = unsafe { unmap_kernel_page(va) } {
+            if phys.raw() != 0 {
+                crate::frame::free_frame(PhysFrame::new(phys));
+            }
+        }
+    }
+    // Fully reclaim page tables: free any last-level table the freed range
+    // leaves empty (checked once per 2 MiB granule; a table still holding a
+    // live allocation's leaves is kept). Every leaf above was unmapped with a
+    // global TLB/PWC invalidation, so freeing the now-empty table is safe.
+    if count != 0 {
+        if let Some(root) = crate::bpf_text::kernel_root_for_mapping() {
+            let end = base + (count as u64) * 4096;
+            let mut granule = base & !0x1F_FFFFu64;
+            while granule < end {
+                // SAFETY: the range's leaves were just unmapped+flushed above.
+                let _ = unsafe { crate::paging::free_empty_pt(root, VirtAddr::new(granule)) };
+                granule += 0x20_0000;
+            }
+        }
+    }
+}
+
+/// `true` when `ptr` lies in the frame-backed `valloc` half of the window.
+/// The kernel-heap large-free path uses this to route a pointer back to
+/// `vfree` vs the contiguous buddy free.
+#[inline]
+pub fn is_valloc_ptr(ptr: *const u8) -> bool {
+    (VALLOC_BASE..VALLOC_LIMIT).contains(&(ptr as u64))
+}
+
+/// Allocate `size` bytes of virtually-contiguous, physically-SCATTERED kernel
+/// memory. Returns `None` if VA or frames are exhausted. Bookkeeping is
+/// allocation-free, so it is safe to call from the heap allocator's large-object
+/// path. Every backing frame uses `Kernel` context (may draw the `min` reserve).
+pub fn valloc(size: usize) -> Option<NonNull<u8>> {
+    let n = size.div_ceil(4096);
+    if n == 0 {
+        return None;
+    }
+    let base_page = VALLOC_MAP.lock().alloc_run(n)?;
+    let base = VALLOC_BASE + (base_page as u64) * 4096;
+
+    let mut done = 0usize;
+    while done < n {
+        let va = VirtAddr::new(base + (done as u64) * 4096);
+        let frame = match crate::frame::alloc_frame() {
+            Ok(f) => f,
+            Err(_) => {
+                // SAFETY: `done` pages were mapped above.
+                unsafe { unmap_and_free(base, done) };
+                VALLOC_MAP.lock().free_run(base_page, n);
+                return None;
+            }
+        };
+        // SAFETY: kernel VA in the reserved vmalloc slot; frame is ours.
+        if unsafe { map_kernel_page(va, frame.start_address()) }.is_err() {
+            crate::frame::free_frame(frame);
+            // SAFETY: `done` pages were mapped above (this one is not).
+            unsafe { unmap_and_free(base, done) };
+            VALLOC_MAP.lock().free_run(base_page, n);
+            return None;
+        }
+        done += 1;
+    }
+    NonNull::new(base as *mut u8)
+}
+
+/// Free a `valloc` allocation: unmap + free every backing DATA frame, then
+/// reclaim the VA range.
+///
+/// The intermediate page tables covering the vmalloc window are intentionally
+/// RETAINED (not freed here), exactly as `ioremap` and Linux's vmalloc keep
+/// theirs: their count is bounded by the window size (~one PT per 2 MiB) and
+/// they are reused by every later allocation into the same 2 MiB chunk. Keeping
+/// them also means a `valloc` into an already-touched chunk performs NO
+/// page-table allocation — valuable because `valloc` runs on the heap's
+/// allocation-failure path, where allocating a fresh table frame could itself
+/// fail. (The first allocation into a fresh chunk still allocates its tables;
+/// if the pool is simultaneously empty that `valloc` fails gracefully with
+/// `None` rather than panicking.)
+///
+/// # Safety
+/// `ptr` must have come from `valloc` and `size` be the same size passed there.
+pub unsafe fn vfree(ptr: NonNull<u8>, size: usize) {
+    let n = size.div_ceil(4096);
+    let base = ptr.as_ptr() as u64;
+    // SAFETY: forwarded from the caller's contract; these are our pages.
+    unsafe { unmap_and_free(base, n) };
+    let base_page = ((base - VALLOC_BASE) / 4096) as usize;
+    VALLOC_MAP.lock().free_run(base_page, n);
+}
+
+/// Pre-populate the vmalloc window's kernel PML4/L0 slot in the live kernel
+/// root, so the by-value kernel-half copy in `new_user_pml4` shares the same
+/// lower tables and vmalloc/ioremap mappings are visible in EVERY address
+/// space. MUST run at boot, after `init_mmu` installs the final kernel root and
+/// BEFORE the first user address space is created. Idempotent.
+pub fn reserve_kernel_slot() -> Result<(), VmallocError> {
+    debug_assert_eq!(
+        ((VMALLOC_BASE >> 39) & 0x1FF) as usize,
+        KERNEL_PML4_SLOT,
+        "VMALLOC_BASE does not decode to KERNEL_PML4_SLOT"
+    );
+    let root = crate::bpf_text::kernel_root_for_mapping().ok_or(VmallocError::Exhausted)?;
+    // SAFETY: `root` is the live kernel root; single-threaded boot context.
+    unsafe { reserve_slot(root, KERNEL_PML4_SLOT) }
+}
+
+/// Install an empty next-level table under `root[slot]` if absent, so the slot
+/// is shared by every address space that later copies the kernel half.
+///
+/// # Safety
+/// `root` must be the live, identity-reachable kernel root and the caller
+/// single-threaded (boot).
+#[cfg(target_arch = "x86_64")]
+unsafe fn reserve_slot(root: PhysAddr, slot: usize) -> Result<(), VmallocError> {
+    use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
+    // SAFETY: caller's contract — live kernel PML4.
+    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    if pml4.entries[slot].is_present() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| VmallocError::Exhausted)?;
+    let phys = frame.start_address();
+    crate::frame::__pagetable_register(phys.raw());
+    // SAFETY: fresh frame, exclusively ours until published below.
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096) };
+    pml4.entries[slot] = PageTableEntry::new(phys, PtFlags::PRESENT | PtFlags::WRITABLE);
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn reserve_slot(root: PhysAddr, slot: usize) -> Result<(), VmallocError> {
+    use crate::aarch64::paging::{PageTable, PageTableEntry};
+    // SAFETY: caller's contract — live TTBR1 L0.
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    if l0.entries[slot].is_valid() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| VmallocError::Exhausted)?;
+    let phys = frame.start_address();
+    // SAFETY: fresh frame, exclusively ours until published below.
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096) };
+    // Table descriptor: bits[1:0] = 0b11 (valid + table); leaf entries carry
+    // the real permissions.
+    l0.entries[slot] = PageTableEntry::from_raw(phys.raw() | 0b11);
+    Ok(())
 }

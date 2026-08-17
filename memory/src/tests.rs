@@ -2631,6 +2631,52 @@ kernel_test_in!("memory", smoke_memory_sparse_root_teardown_is_batched);
 
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
 
+/// Accounting callers must be able to total a large lazy mapping without
+/// cloning its per-page backing vector. The public result counts VMA spans,
+/// including unbacked pages, and saturates rather than wrapping.
+fn smoke_memory_mapped_bytes_counts_lazy_regions() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the test owns the new user root for its complete lifetime.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_0000_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3],
+    })
+    .expect("map first lazy region");
+    a.map_region(Region {
+        base: VirtAddr::new(base + 0x10_0000),
+        len: 0x5000,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![PhysAddr::new(0); 5],
+    })
+    .expect("map second lazy region");
+
+    if a.mapped_bytes() != 0x8000 {
+        return TestResult::Fail("mapped_bytes did not sum lazy VMA spans");
+    }
+    let stats = a.memory_stats();
+    if stats.mapped_bytes != 0x8000
+        || stats.resident_pages != 0
+        || stats.writable_nonexec_bytes != 0x3000
+    {
+        return TestResult::Fail("allocation-free memory totals are incorrect");
+    }
+    if a.region_len_at_base(VirtAddr::new(base)) != Some(0x3000)
+        || a.region_len_at_base(VirtAddr::new(base + 0x1000)) != None
+    {
+        return TestResult::Fail("exact-base region length lookup is incorrect");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mapped_bytes_counts_lazy_regions);
+
 /// Materialize twice in a row on the same AS — must be idempotent
 /// and not leak intermediate frames.
 ///
@@ -6244,6 +6290,134 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_unmap_region_cycle_no_leak);
+
+/// The OOM reaper reclaims a private anonymous region's resident frames out
+/// from under a would-be victim, returns them to the pool, unmaps them, and is
+/// idempotent — a second reap frees nothing (so it never double-frees against
+/// the victim's own exit teardown).
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let pages = 4usize;
+    let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+    for _ in 0..pages {
+        match crate::alloc_frame() {
+            Ok(f) => phys_list.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    let vbase = 0x0000_0080_0B00_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: (pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: phys_list,
+    })
+    .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+
+    // Reap must free exactly the region's resident pages and return them to
+    // the pool. Measure the delta across the reap to isolate the data frames
+    // from the (leaked-on-forget) page-table overhead.
+    let before_reap = crate::frame::stats().free;
+    let freed = a.reap_anonymous();
+    let after_reap = crate::frame::stats().free;
+    if freed != pages {
+        core::mem::forget(a);
+        return TestResult::Fail("reap did not free every resident anonymous page");
+    }
+    if after_reap < before_reap + pages {
+        core::mem::forget(a);
+        return TestResult::Fail("reaped frames did not return to the pool");
+    }
+    // Idempotent: a second reap frees nothing (backing already zeroed), so it
+    // cannot double-free against the victim's own teardown.
+    if a.reap_anonymous() != 0 {
+        core::mem::forget(a);
+        return TestResult::Fail("second reap double-counted freed frames");
+    }
+    // The reaped page must no longer translate.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some() {
+        core::mem::forget(a);
+        return TestResult::Fail("reaped page still translates");
+    }
+    // Forget (leak the page tables) rather than Drop so this test's free-page
+    // accounting stays isolated to the reap; idempotency above already proved
+    // Drop would be a safe no-op over the zeroed backing.
+    core::mem::forget(a);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_reap_anonymous_reclaims_and_is_idempotent
+);
+
+/// Frame-backed vmalloc: a 64 KiB `valloc` (the order-4 size that defeats a
+/// contiguous buddy block under fragmentation) must map a usable,
+/// virtually-contiguous region backed by scattered frames; `vfree` must FULLY
+/// reclaim it — every data frame, the now-empty page table(s), and the VA — so
+/// the pool returns exactly to its starting count with no residual retention.
+#[cfg(target_arch = "x86_64")]
+fn smoke_vmalloc_valloc_maps_scattered_and_reclaims() -> TestResult {
+    const SIZE: usize = 64 * 1024;
+
+    let free_before = crate::frame::stats().free;
+    let p = match crate::vmalloc::valloc(SIZE) {
+        Some(p) => p,
+        None => return TestResult::Skip("valloc unavailable (kernel slot not reserved)"),
+    };
+    // The mapping must be coherent across every backing page.
+    let bytes = p.as_ptr();
+    // SAFETY: `valloc` returned SIZE bytes of mapped, writable kernel memory.
+    unsafe {
+        let mut i = 0;
+        while i < SIZE {
+            core::ptr::write_volatile(bytes.add(i), (i as u8) ^ 0xA5);
+            i += 4096;
+        }
+        let mut i = 0;
+        while i < SIZE {
+            if core::ptr::read_volatile(bytes.add(i)) != ((i as u8) ^ 0xA5) {
+                crate::vmalloc::vfree(p, SIZE);
+                return TestResult::Fail("valloc mapping not coherent");
+            }
+            i += 4096;
+        }
+    }
+    // SAFETY: pointer + size came from the matching `valloc`.
+    unsafe { crate::vmalloc::vfree(p, SIZE) };
+    // Full reclamation: data frames AND the emptied page table are returned, so
+    // the free count is EXACTLY restored (no bounded page-table retention).
+    if crate::frame::stats().free != free_before {
+        return TestResult::Fail("valloc/vfree leaked frames or page tables");
+    }
+    // VA reclaimed: a second same-size allocation still succeeds.
+    match crate::vmalloc::valloc(SIZE) {
+        Some(p2) => {
+            // SAFETY: matching valloc/vfree.
+            unsafe { crate::vmalloc::vfree(p2, SIZE) };
+            TestResult::Pass
+        }
+        None => TestResult::Fail("valloc VA not reclaimed after vfree"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_vmalloc_valloc_maps_scattered_and_reclaims);
 
 /// `unmap_region` clears the bookkeeping AND tears down the PTEs
 /// — a `translate` on the just-unmapped vaddr must return None.
