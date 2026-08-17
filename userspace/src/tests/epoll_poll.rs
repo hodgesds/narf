@@ -1258,6 +1258,181 @@ kernel_test_in!(
     smoke_epoll_epollet_unix_listener_drain_refill_before_wait
 );
 
+/// The EXACT socket-activation-accept-strand shape (the CachyOS mode-1 desktop
+/// gate: dbus-broker stops accepting on /run/dbus/system_bus_socket, so late
+/// clients like systemd-user-runtime-dir hang and user@957 never gets a session
+/// bus). An EPOLLET listener whose queue was drained to EMPTY by a prior accept
+/// must, on the NEXT connect, deliver BOTH halves at once:
+///   (a) a readiness-GENERATION bump — the wake channel that breaks a server
+///       parked in epoll_wait(-1) out of its re-park (else it sleeps past the
+///       connection until an unrelated wake), and
+///   (b) the re-reported ACCEPT EDGE on the re-scan — the listener's POLLIN
+///       mask never dropped across accept→reconnect, so only the
+///       `listener_readable_token` advance distinguishes the new edge.
+/// The two existing tests cover these halves separately (edge via timeout=0,
+/// wake via a level poll on the first connect); neither covers them TOGETHER
+/// under EPOLLET after a drain-to-empty, which is precisely the strand.
+fn smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+
+    let open_stream = || {
+        call(
+            Syscall::SocketOpen,
+            SyscallArgs {
+                arg0: crate::socket::AF_UNIX as u64,
+                arg1: crate::socket::SOCK_STREAM as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let server = open_stream();
+    if server == u64::MAX {
+        return TestResult::Fail("listener socket failed");
+    }
+
+    let mut addr = [0u8; 128];
+    addr[..2].copy_from_slice(&crate::socket::AF_UNIX.to_le_bytes());
+    let path = b"/epoll-listener-drain-empty";
+    addr[2..2 + path.len()].copy_from_slice(path);
+    let addr_len = (2 + path.len()) as u64;
+    if call(
+        Syscall::SocketBind,
+        SyscallArgs {
+            arg0: server,
+            arg1: addr.as_ptr() as u64,
+            arg2: addr_len,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+        || call(
+            Syscall::SocketListen,
+            SyscallArgs {
+                arg0: server,
+                arg1: 16,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+            != 0
+    {
+        return TestResult::Fail("listener bind/listen failed");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value;
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    event[4..12].copy_from_slice(&0xDECAFu64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: server,
+            arg3: event.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("listener epoll add failed");
+    }
+
+    let mut out = [0u8; 12];
+    let connect = |client: u64| {
+        call(
+            Syscall::SocketConnect,
+            SyscallArgs {
+                arg0: client,
+                arg1: addr.as_ptr() as u64,
+                arg2: addr_len,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let wait0 = |buf: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+
+    // First connection: take its initial edge, then accept to drain EMPTY.
+    let c1 = open_stream();
+    if c1 == u64::MAX || connect(c1) != 0 {
+        return TestResult::Fail("first connect failed");
+    }
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("initial EPOLLET listener edge missing");
+    }
+    if call(
+        Syscall::SocketAccept,
+        SyscallArgs {
+            arg0: server,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        == u64::MAX
+    {
+        return TestResult::Fail("first accept failed");
+    }
+    // Queue empty + edge already consumed: an EPOLLET re-scan sees no new edge.
+    if wait0(&mut out) != 0 {
+        return TestResult::Fail("drained EPOLLET listener still reported an edge");
+    }
+
+    // Second connection AFTER the drain-to-empty — the strand-critical enqueue.
+    let gen_before = narf_net::readiness::generation();
+    let c2 = open_stream();
+    if c2 == u64::MAX || connect(c2) != 0 {
+        return TestResult::Fail("post-drain connect failed");
+    }
+    // (a) wake channel: the generation MUST advance, or a server parked in
+    // epoll_wait(-1) never re-scans and the connection is never accepted.
+    if narf_net::readiness::generation() <= gen_before {
+        return TestResult::Fail(
+            "post-drain connect did not bump the readiness generation (parked epoll would sleep)",
+        );
+    }
+    // (b) edge: the re-scan MUST re-report POLLIN even though the mask never
+    // dropped — only listener_readable_token distinguishes this accept edge.
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("post-drain connect did not re-report the EPOLLET accept edge");
+    }
+    if call(
+        Syscall::SocketAccept,
+        SyscallArgs {
+            arg0: server,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        == u64::MAX
+    {
+        return TestResult::Fail("second accept (post-drain) failed");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty
+);
+
 /// EPOLLET must retain an enqueue edge that occurs after a drain but before
 /// the next epoll_wait samples the socket.
 fn smoke_epoll_epollet_dgram_drain_refill_before_wait() -> TestResult {
