@@ -1433,6 +1433,123 @@ kernel_test_in!(
     smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty
 );
 
+/// EPOLLET must re-fire POLLIN when more data is appended to a still-unread
+/// stream ring. NARF keys the EPOLLET readable edge on `readable_token`; the
+/// old RingBuf::write bumped it only on the empty->non-empty transition, so a
+/// second write to a non-empty ring produced NO new edge and an edge-triggered
+/// reader that had not yet drained never re-polled POLLIN. That stranded
+/// dbus-broker on an accepted system-bus connection: the client's AUTH then its
+/// Hello arrive back-to-back and the second lands on the unread ring, so the
+/// broker never reads either and never replies (the mode-1 desktop gate). Linux
+/// re-fires an edge-triggered fd on every data arrival.
+fn smoke_epoll_epollet_refires_on_appended_stream_data() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("socketpair failed");
+    }
+    let (wfd, rfd) = (sv[0] as u64, sv[1] as u64);
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value;
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    event[4..12].copy_from_slice(&0xDA7Au64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: rfd,
+            arg3: event.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("epoll add failed");
+    }
+
+    let mut out = [0u8; 12];
+    let wait0 = |o: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: o.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let send = |b: &[u8]| {
+        call(
+            Syscall::SocketSend,
+            SyscallArgs {
+                arg0: wfd,
+                arg1: b.as_ptr() as u64,
+                arg2: b.len() as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+
+    // First write: empty -> non-empty. The EPOLLET edge fires.
+    if send(b"A") != 1 {
+        return TestResult::Fail("first send failed");
+    }
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("initial EPOLLET POLLIN edge missing");
+    }
+    // Do NOT read: the reader's ring stays non-empty. Append a second byte.
+    if send(b"B") != 1 {
+        return TestResult::Fail("second send failed");
+    }
+    // The appended byte MUST produce a fresh EPOLLET edge (Linux re-fires on
+    // every data arrival). The old empty->non-empty-only bump swallowed it.
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("EPOLLET did not re-fire on data appended to an unread ring");
+    }
+    // Both bytes are present when the reader finally drains.
+    let mut buf = [0u8; 4];
+    let n = call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: rfd,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value;
+    if n != 2 || &buf[..2] != b"AB" {
+        return TestResult::Fail("reader did not receive both appended bytes");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_refires_on_appended_stream_data
+);
+
 /// EPOLLET must retain an enqueue edge that occurs after a drain but before
 /// the next epoll_wait samples the socket.
 fn smoke_epoll_epollet_dgram_drain_refill_before_wait() -> TestResult {
@@ -2000,10 +2117,17 @@ kernel_test_in!(
     smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out
 );
 
-/// Adding more bytes to an already-readable stream must not manufacture a
-/// second EPOLLIN edge. The consumer has already been told to drain to
-/// EAGAIN.
-fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
+/// Adding more bytes to an already-readable stream MUST re-fire the EPOLLIN
+/// edge. Linux calls `sk_data_ready()` on every sendmsg chunk UNCONDITIONALLY
+/// (net/unix/af_unix.c `unix_stream_sendmsg`: `__skb_queue_tail` then
+/// `sk_data_ready` inside the per-chunk send loop), so an edge-triggered reader
+/// is re-notified of newly-appended bytes even before it drains. NARF's old
+/// empty->non-empty-only readable edge dropped this, stranding dbus-broker on
+/// an accepted system-bus connection whose client sent AUTH then Hello (the
+/// mode-1 desktop gate). "Drain to EAGAIN" avoids MISSING already-arrived
+/// bytes; it does NOT suppress notification of NEW ones. (Renamed + inverted
+/// from the old `..._write_does_not_retrigger_readable`, which pinned the bug.)
+fn smoke_epoll_epollet_write_retriggers_readable() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
     // buffers. `validate_user_range` confines a real syscall to the user half,
@@ -2076,8 +2200,11 @@ fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
             return TestResult::Fail("EPOLLET stream send failed");
         }
         let ready = wait(&mut out_ev).value;
-        if (index == 0 && ready != 1) || (index == 1 && ready != 0) {
-            return TestResult::Fail("EPOLLET retriggered unchanged readability");
+        // Both writes re-fire the edge: index 0 is empty->non-empty; index 1
+        // appends to a still-unread ring (Linux re-fires per data arrival).
+        let _ = index;
+        if ready != 1 {
+            return TestResult::Fail("EPOLLET did not re-fire on appended stream data");
         }
     }
 
@@ -2086,7 +2213,7 @@ fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
 }
 kernel_test_in!(
     "userspace",
-    smoke_epoll_epollet_write_does_not_retrigger_readable
+    smoke_epoll_epollet_write_retriggers_readable
 );
 
 /// A full stream is not writable; consuming one byte must publish exactly one

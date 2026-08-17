@@ -5049,7 +5049,6 @@ impl RingBuf {
 
     fn write(&self, src: &[u8]) -> usize {
         let mut g = self.inner.lock();
-        let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
         for (i, &byte) in src.iter().enumerate().take(n) {
@@ -5058,9 +5057,18 @@ impl RingBuf {
         }
         g.len += n;
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
-        let became_readable = !was_readable && n != 0;
         drop(g);
-        if became_readable {
+        // Advance the readable edge on EVERY write that adds bytes, not only on
+        // the empty->non-empty transition. NARF's EPOLLET edge detection
+        // (poll_edge_token) keys on readable_token, and Linux re-fires an
+        // edge-triggered fd on every data arrival — so a follow-up write that
+        // lands on a still-unread ring must also produce a fresh edge. Bumping
+        // only on became-readable dropped the edge for bytes appended before the
+        // peer drained: an EPOLLET reader (dbus-broker on an accepted system-bus
+        // connection) never re-polled POLLIN and never read the client's
+        // follow-up bytes, stranding the D-Bus AUTH handshake (the mode-1
+        // desktop gate). Matches write_packet, which already bumps every write.
+        if n != 0 {
             self.readable_token.fetch_add(1, Ordering::Release);
         }
         n
@@ -5068,7 +5076,6 @@ impl RingBuf {
 
     fn write_stream_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>) -> usize {
         let mut g = self.inner.lock();
-        let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
         if n == 0 {
@@ -5087,11 +5094,11 @@ impl RingBuf {
                 fds,
             });
         }
-        let became_readable = !was_readable;
         drop(g);
-        if became_readable {
-            self.readable_token.fetch_add(1, Ordering::Release);
-        }
+        // See RingBuf::write: advance the readable edge on every data-bearing
+        // write so an EPOLLET reader re-fires on bytes appended before it
+        // drained. n > 0 here (the n == 0 case returned early above).
+        self.readable_token.fetch_add(1, Ordering::Release);
         n
     }
 
