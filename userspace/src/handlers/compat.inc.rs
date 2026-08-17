@@ -6266,7 +6266,9 @@ pub fn default_sync_signal_delivery(
                 // the task wrongly wrote to. This single line disambiguates.
                 #[cfg(feature = "linux-compat")]
                 {
-                    if let Some(pinfo) = proc_task_info(pid) {
+                    if let Some(pinfo) =
+                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
+                    {
                         match pinfo
                             .vmas
                             .iter()
