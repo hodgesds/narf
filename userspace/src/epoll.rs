@@ -297,6 +297,53 @@ impl EpollInstance {
             .collect()
     }
 
+    /// Arm every interest fd that owns a durable
+    /// [`Readiness`](narf_lib::readiness::Readiness) cell so a `set` edge on it
+    /// wakes THIS `epoll_wait` directly via the cell, keyed by `task_id`.
+    /// Registration ONLY — the edge/level DELIVERY decision stays with
+    /// [`Self::collect_ready`], so an EPOLLET fd that is level-ready with no new
+    /// edge is never spuriously delivered (which is why this does not use the
+    /// `arm` Ready result to abort the park). A no-op for interest fds still on
+    /// the legacy path (`readiness() == None`); those keep waking through the
+    /// legacy `readiness::notify` + `epoll_park_gen` guard. Idempotent: `arm`
+    /// replaces this task's registration by id on every re-execution.
+    fn arm_readiness_cells(&self, task_id: u64, waker: &core::task::Waker) {
+        let snapshot: alloc::vec::Vec<EpollItem> =
+            self.inner.lock().interest.values().cloned().collect();
+        for item in &snapshot {
+            // Disarmed EPOLLONESHOT (no interest bits) has nothing to wait for.
+            if (item.events & EPOLLONESHOT) != 0
+                && (item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
+            {
+                continue;
+            }
+            if let Some(ops) = item.file.upgrade() {
+                if let Some(r) = ops.readiness() {
+                    let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+                    let interest = want | EPOLLERR | EPOLLHUP;
+                    // Register the wake; the Ready result is deliberately
+                    // ignored — collect_ready owns delivery (see doc above).
+                    let _ = r.arm(task_id, interest, waker);
+                }
+            }
+        }
+    }
+
+    /// Remove this task's registration from every interest fd's Readiness cell.
+    /// Called on every non-park return so a woken-but-returned wait leaves no
+    /// stale waiter behind. No-op for legacy-path fds.
+    fn disarm_readiness_cells(&self, task_id: u64) {
+        let snapshot: alloc::vec::Vec<EpollItem> =
+            self.inner.lock().interest.values().cloned().collect();
+        for item in &snapshot {
+            if let Some(ops) = item.file.upgrade() {
+                if let Some(r) = ops.readiness() {
+                    r.disarm(task_id);
+                }
+            }
+        }
+    }
+
     fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
         let owner_id = task_id; // simplified owner model
 
@@ -1036,6 +1083,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
             if let Some(old) = old_mask {
                 crate::handlers::set_signal_mask_for_task(task, old);
             }
+            instance.disarm_readiness_cells(task);
             ctx.set_return(SyscallReturn::ok(n as u64));
             return;
         }
@@ -1049,6 +1097,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 return;
             }
             Some(d) if d != u64::MAX && narf_scheduler::narf_time::monotonic_ns() >= d => {
+                instance.disarm_readiness_cells(task);
                 if let Some(uctx_ptr) = uctx_opt {
                     // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
                     // `CURRENT`, live for this trap; `sleep_deadline_ns` is an
@@ -1078,6 +1127,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         if let Some(h) = crate::signal_delivery_hook() {
                             if h(ctx, crate::Syscall::EpollWait.raw()) {
                                 // Signal delivered. Interrupt syscall with EINTR.
+                                instance.disarm_readiness_cells(task);
                                 if let Some(old) = old_mask {
                                     crate::handlers::set_signal_mask_for_task(task, old);
                                 }
@@ -1198,6 +1248,14 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // from `CURRENT`, live for this trap; `state`/`exit_reason`
                         // are its own `UnsafeCell` fields and the `hook` consumes
                         // the same pointer to park exactly this task.
+                        // Durable per-fd wake: arm each interest fd's Readiness
+                        // cell so a `set` edge wakes this epoll_wait directly
+                        // (alongside the legacy net_io_wait path during
+                        // migration). Registration only — collect_ready above
+                        // owns delivery; a strict no-op until an fd migrates.
+                        if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
+                            instance.arm_readiness_cells(task, &w);
+                        }
                         // SAFETY: Valid memory or trusted environment
                         unsafe {
                             let uc = &*uctx_ptr;
