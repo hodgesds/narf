@@ -11,8 +11,15 @@
 //! wired (affects real behaviour), a stub, or read-only computed.
 //!
 //! Keys that ARE wired:
-//!   - `min_free_kbytes`  — value is read by the frame allocator's
-//!     low-watermark check (once that lands).
+//!   - `min_free_kbytes`  — drives the live `min` free-page reserve via
+//!     `narf_memory::reclaim::set_min_free_pages` (kB/4); the allocator's
+//!     watermark check and kswapd wake-up read the derived band. Read
+//!     reflects `reclaim::watermark_min() * 4`.
+//!   - `watermark_scale_factor` — drives the reclaim band gap via
+//!     `narf_memory::reclaim::set_watermark_scale_factor`.
+//!   - `overcommit_memory` — selects the live overcommit policy
+//!     (0=heuristic, 1=always, 2=never) via
+//!     `narf_memory::reclaim::set_overcommit_mode`.
 //!   - `drop_caches`      — write triggers `narf_memory::reclaim::drop_caches`.
 //!   - `max_map_count`    — enforced by the address-space region-count check.
 //!   - `panic_on_oom`     — checked by the OOM handler stub.
@@ -57,16 +64,11 @@ static DIRTY_RATIO: AtomicU64 = AtomicU64::new(20);
 static DIRTY_BYTES: AtomicU64 = AtomicU64::new(0);
 static DIRTY_EXPIRE_CENTISECS: AtomicU64 = AtomicU64::new(3000);
 static DIRTY_WRITEBACK_CENTISECS: AtomicU64 = AtomicU64::new(500);
-static OVERCOMMIT_MEMORY: AtomicU64 = AtomicU64::new(0);
 static OVERCOMMIT_RATIO: AtomicU64 = AtomicU64::new(50);
 static OVERCOMMIT_KBYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_MAP_COUNT: AtomicU64 = AtomicU64::new(65530);
 static NR_OVERCOMMIT_HUGEPAGES: AtomicU64 = AtomicU64::new(0);
 static PANIC_ON_OOM: AtomicU64 = AtomicU64::new(0);
-
-// min_free_kbytes is computed from heap size at registration time and
-// then stored so subsequent reads are consistent.
-static MIN_FREE_KBYTES: AtomicU64 = AtomicU64::new(0);
 
 // ── Parse helpers ────────────────────────────────────────────────
 
@@ -87,6 +89,11 @@ fn parse_u64_max(s: &str, max: u64) -> Result<u64, FsError> {
 
 fn read_u64(cell: &AtomicU64) -> String {
     let v = cell.load(Ordering::Relaxed);
+    alloc::format!("{}\n", v)
+}
+
+/// Render a computed (non-atomic) `u64` for a wired key's `read`.
+fn read_val(v: u64) -> String {
     alloc::format!("{}\n", v)
 }
 
@@ -121,37 +128,9 @@ fn drop_caches_write(s: &str) -> Result<(), FsError> {
 
 // ── Registration ─────────────────────────────────────────────────
 
-/// Compute a sensible `min_free_kbytes` from the total physical frames.
-/// Linux uses `int_sqrt(totalram_pages * (PAGE_SIZE / 1024))` clamped
-/// to [128, 65536] kB; we use the same formula.
-fn compute_min_free_kbytes() -> u64 {
-    let stats = narf_memory::frame::stats();
-    let total_kb = (stats.total as u64) * 4; // 4 KiB pages
-                                             // Integer square root approximation.
-    let x = total_kb;
-    if x == 0 {
-        return 128;
-    }
-    // Newton's method, converges quickly.
-    let mut y = x;
-    loop {
-        let ny = (y + x / y) / 2;
-        if ny >= y {
-            break;
-        }
-        y = ny;
-    }
-    let result = y;
-    result.clamp(128, 65536)
-}
-
 /// Register every `/proc/sys/vm/*` sysctl. Called once at boot.
 /// Idempotent — repeated calls replace the existing entries.
 pub fn register_all() {
-    // Seed min_free_kbytes from actual RAM size.
-    let min_free = compute_min_free_kbytes();
-    MIN_FREE_KBYTES.store(min_free, Ordering::Relaxed);
-
     // swappiness: 0-200; default 60. Stub: stored, not consulted.
     register_sysctl(SysctlEntry {
         path: "vm/swappiness",
@@ -248,14 +227,16 @@ pub fn register_all() {
         perms: 0o644,
     });
 
-    // overcommit_memory: 0=heuristic 1=always 2=never; default 0.
-    // Wired: OOM handler will consult this when it lands.
+    // overcommit_memory: 0=heuristic 1=always 2=never. WIRED to the reclaimer's
+    // OOM policy: `Never` (2, NARF default) surfaces user pressure as ENOMEM;
+    // `Heuristic`/`Always` (0/1) let the OOM killer reclaim a hog. Linux ref:
+    // `mm/util.c` `overcommit_memory` handler.
     register_sysctl(SysctlEntry {
         path: "vm/overcommit_memory",
-        read: || read_u64(&OVERCOMMIT_MEMORY),
+        read: || read_val(narf_memory::reclaim::overcommit_mode() as u64),
         write: Some(|s| {
             let v = parse_u64_max(s, 2)?;
-            OVERCOMMIT_MEMORY.store(v, Ordering::Relaxed);
+            narf_memory::reclaim::set_overcommit_mode(v as u8);
             Ok(())
         }),
         perms: 0o644,
@@ -285,13 +266,31 @@ pub fn register_all() {
         perms: 0o644,
     });
 
-    // min_free_kbytes: computed from RAM. Wired (frame allocator low-watermark).
+    // min_free_kbytes: WIRED to the frame allocator's `min` watermark reserve.
+    // The reserve is in pages (4 KiB); reads reflect the LIVE reserve (which the
+    // setter clamps to a sane band), so a write-then-read round-trips through
+    // the same clamping Linux applies. Linux ref: `mm/page_alloc.c`
+    // `min_free_kbytes_sysctl_handler` → `setup_per_zone_wmarks`.
     register_sysctl(SysctlEntry {
         path: "vm/min_free_kbytes",
-        read: || read_u64(&MIN_FREE_KBYTES),
+        read: || read_val(narf_memory::reclaim::watermark_min() * 4),
+        write: Some(|s| {
+            let kb = parse_u64(s)?;
+            narf_memory::reclaim::set_min_free_pages(kb / 4);
+            Ok(())
+        }),
+        perms: 0o644,
+    });
+
+    // watermark_scale_factor: WIRED. Sets the gap between watermarks in units of
+    // 1/10000 of RAM; a larger value widens the reclaim band. Linux ref:
+    // `mm/page_alloc.c` `watermark_scale_factor_sysctl_handler`.
+    register_sysctl(SysctlEntry {
+        path: "vm/watermark_scale_factor",
+        read: || read_val(narf_memory::reclaim::watermark_scale_factor()),
         write: Some(|s| {
             let v = parse_u64(s)?;
-            MIN_FREE_KBYTES.store(v, Ordering::Relaxed);
+            narf_memory::reclaim::set_watermark_scale_factor(v);
             Ok(())
         }),
         perms: 0o644,
@@ -354,22 +353,10 @@ pub fn max_map_count() -> u64 {
     MAX_MAP_COUNT.load(Ordering::Relaxed)
 }
 
-/// Current `overcommit_memory` mode (0=heuristic, 1=always, 2=never).
-#[inline]
-pub fn overcommit_memory() -> u64 {
-    OVERCOMMIT_MEMORY.load(Ordering::Relaxed)
-}
-
 /// Current `panic_on_oom` flag.
 #[inline]
 pub fn panic_on_oom() -> bool {
     PANIC_ON_OOM.load(Ordering::Relaxed) != 0
-}
-
-/// Current `min_free_kbytes` threshold.
-#[inline]
-pub fn min_free_kbytes() -> u64 {
-    MIN_FREE_KBYTES.load(Ordering::Relaxed)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -479,6 +466,87 @@ kernel_test_in!(
     smoke_vm_overcommit_memory_rejects_3
 );
 
+fn smoke_vm_overcommit_memory_updates_live_mode() -> TestResult {
+    ensure_registered();
+    let saved = narf_memory::reclaim::overcommit_mode() as u8;
+    // Write drives the live reclaim policy, not a local shadow copy.
+    let w = sysctl_write(&["sys", "vm", "overcommit_memory"], b"1\n");
+    let live = narf_memory::reclaim::overcommit_mode() as u64;
+    let readback = sysctl_read(&["sys", "vm", "overcommit_memory"]);
+    // Restore the boot default so later tests / the live kernel are unperturbed.
+    narf_memory::reclaim::set_overcommit_mode(saved);
+    if !matches!(w, Some(Ok(_))) {
+        return TestResult::Fail("vm/overcommit_memory write '1' failed");
+    }
+    if live != 1 {
+        return TestResult::Fail("vm/overcommit_memory write '1' did not set live mode to Always");
+    }
+    match readback {
+        Some(s) if s == "1\n" => TestResult::Pass,
+        _ => TestResult::Fail("vm/overcommit_memory read after write '1' did not return '1\\n'"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_overcommit_memory_updates_live_mode
+);
+
+fn smoke_vm_min_free_kbytes_roundtrip() -> TestResult {
+    ensure_registered();
+    let saved = narf_memory::reclaim::watermark_min();
+    // 8192 kB = 2048 pages, comfortably inside the [512, 65536]-page clamp,
+    // so the kB->pages->kB round-trip is exact.
+    let w = sysctl_write(&["sys", "vm", "min_free_kbytes"], b"8192\n");
+    let live_pages = narf_memory::reclaim::watermark_min();
+    let readback = sysctl_read(&["sys", "vm", "min_free_kbytes"]);
+    narf_memory::reclaim::set_min_free_pages(saved);
+    if !matches!(w, Some(Ok(_))) {
+        return TestResult::Fail("vm/min_free_kbytes write '8192' failed");
+    }
+    if live_pages != 2048 {
+        return TestResult::Fail(
+            "vm/min_free_kbytes write '8192' did not set watermark_min to 2048 pages",
+        );
+    }
+    match readback {
+        Some(s) if s == "8192\n" => TestResult::Pass,
+        _ => {
+            TestResult::Fail("vm/min_free_kbytes read after write '8192' did not return '8192\\n'")
+        }
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_min_free_kbytes_roundtrip
+);
+
+fn smoke_vm_watermark_scale_factor_roundtrip() -> TestResult {
+    ensure_registered();
+    let saved = narf_memory::reclaim::watermark_scale_factor();
+    let w = sysctl_write(&["sys", "vm", "watermark_scale_factor"], b"20\n");
+    let live = narf_memory::reclaim::watermark_scale_factor();
+    let readback = sysctl_read(&["sys", "vm", "watermark_scale_factor"]);
+    narf_memory::reclaim::set_watermark_scale_factor(saved);
+    if !matches!(w, Some(Ok(_))) {
+        return TestResult::Fail("vm/watermark_scale_factor write '20' failed");
+    }
+    if live != 20 {
+        return TestResult::Fail(
+            "vm/watermark_scale_factor write '20' did not update the live factor",
+        );
+    }
+    match readback {
+        Some(s) if s == "20\n" => TestResult::Pass,
+        _ => TestResult::Fail(
+            "vm/watermark_scale_factor read after write '20' did not return '20\\n'",
+        ),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_vm",
+    smoke_vm_watermark_scale_factor_roundtrip
+);
+
 fn smoke_vm_dirty_background_bytes_default() -> TestResult {
     ensure_registered();
     DIRTY_BACKGROUND_BYTES.store(0, Ordering::Relaxed);
@@ -491,14 +559,3 @@ kernel_test_in!(
     "filesystem/procfs/sys_vm",
     smoke_vm_dirty_background_bytes_default
 );
-
-fn smoke_vm_min_free_kbytes_nonzero() -> TestResult {
-    ensure_registered();
-    let v = min_free_kbytes();
-    if v >= 128 {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("vm/min_free_kbytes should be >= 128")
-    }
-}
-kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_min_free_kbytes_nonzero);
