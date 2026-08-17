@@ -2669,7 +2669,7 @@ fn smoke_memory_mapped_bytes_counts_lazy_regions() -> TestResult {
         return TestResult::Fail("allocation-free memory totals are incorrect");
     }
     if a.region_len_at_base(VirtAddr::new(base)) != Some(0x3000)
-        || a.region_len_at_base(VirtAddr::new(base + 0x1000)) != None
+        || a.region_len_at_base(VirtAddr::new(base + 0x1000)).is_some()
     {
         return TestResult::Fail("exact-base region length lookup is incorrect");
     }

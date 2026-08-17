@@ -1473,6 +1473,7 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     fold_current_slice(task_ptr);
     // This Pending return suspended an arbitrary continuation. The executor
     // must not report a QSBR quiescent state for the slot.
+    // SAFETY: `task_ptr` names the live current task (same pointer used above).
     unsafe {
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
