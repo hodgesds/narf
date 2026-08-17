@@ -6523,11 +6523,19 @@ pub fn __test_sigaction_reset() {
 /// through the same shared-sighand path a real `rt_sigaction` uses.
 #[doc(hidden)]
 pub fn __test_set_sigaction(task: u64, signum: usize, handler: u64) {
+    __test_set_sigaction_flags(task, signum, handler, 0);
+}
+
+/// Test hook: like `__test_set_sigaction` but with an explicit
+/// `sa_flags` (e.g. `SA_RESTART`), so a test can exercise the
+/// restart / altstack / siginfo delivery decisions.
+#[doc(hidden)]
+pub fn __test_set_sigaction_flags(task: u64, signum: usize, handler: u64, flags: u32) {
     if let Some(h) = sighand_of(task) {
         h.lock()[signum] = Some(SigAction {
             handler,
             restorer: 0,
-            flags: 0,
+            flags,
         });
     }
 }

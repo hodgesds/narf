@@ -1045,13 +1045,26 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // `returning_to_user` so a redirect-to-kernel handler
         // (exit, longjmp) bypasses delivery cleanly.
         //
-        // `num` is forwarded so the hook can ask the restartable-
-        // syscall table whether the syscall the trap is returning
-        // from should be re-executed when SA_RESTART is set on
-        // the handler (in which case the arch's `deliver_signal`
-        // rewinds RIP - 2 to land on the `int 0x80` opcode).
+        // SYSCALL_NUM_NONE, NOT `num`: `kernel_syscall_entry` has
+        // already run this syscall to COMPLETION (a real value is
+        // in rax). A syscall that genuinely blocked and was
+        // interrupted delivers its signal — and takes any
+        // SA_RESTART RIP-rewind — at its own park/yield point,
+        // with the real syscall number, INSIDE the handler (see
+        // `maybe_deliver_signal_before_yield` / poll.rs); it never
+        // reaches this completion hook with the signal still
+        // pending. Forwarding the real `num` here would let an
+        // SA_RESTART signal delivered on the way out rewind RIP-2
+        // and RE-EXECUTE a syscall that already returned (with rax
+        // clobbered by its return value) — a completed
+        // connect/accept/read replayed. Passing the sentinel makes
+        // `is_restartable_syscall` short-circuit to false, so a
+        // completed syscall is never restarted. This is exactly
+        // what the `syscall`-instruction completion path does
+        // (`userspace/src/syscall.rs`, `SYSCALL_NUM_NONE`); the two
+        // gates must stay in parity.
         if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-            hook(&mut ctx, num);
+            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
         }
         return;
     }
