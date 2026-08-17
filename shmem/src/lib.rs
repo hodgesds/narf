@@ -80,6 +80,9 @@ impl core::fmt::Debug for Entry {
 // and a Vec<Entry> growth otherwise requires one high-order contiguous kernel
 // heap allocation (160 KiB at 2,048 entries). The pointer vector's growth is
 // ten times smaller while each entry remains a small independent allocation.
+// `clippy::vec_box` flags the Box as redundant, but the indirection is the
+// whole point here — it is what keeps the vector's backing small.
+#[allow(clippy::vec_box)]
 static REGISTRY: IrqSafeSpinLock<Vec<Box<Entry>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -239,6 +242,8 @@ fn free_phys_frames(frames: Vec<u64>) {
 
 /// Reclaim unreferenced pages of a removed entry. Returns frames that must be
 /// freed after the registry lock is released.
+// The `Box` indirection is deliberate (see `REGISTRY`) — keeps the vector small.
+#[allow(clippy::vec_box)]
 fn reap_removed_entry(registry: &mut Vec<Box<Entry>>, idx: usize) -> Vec<u64> {
     let mut reclaim = Vec::new();
     if !registry[idx].removed {
@@ -311,7 +316,7 @@ pub fn __reset_for_test() {
         let mut registry = REGISTRY.lock();
         core::mem::take(&mut *registry)
             .into_iter()
-            .flat_map(|entry| (*entry).frames)
+            .flat_map(|entry| entry.frames)
             .filter(|phys| *phys != 0)
             .collect()
     };

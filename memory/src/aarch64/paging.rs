@@ -440,6 +440,7 @@ unsafe fn tlb_invalidate_4kb_range_all_asids_inner_shareable(base: VirtAddr, pag
     unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
     for page in 0..pages {
         let va_page = (base.as_u64() >> 12) + page;
+        // SAFETY: as above — unconditional EL1 TLBI over a page-aligned VA.
         unsafe {
             asm!(
                 "tlbi vaale1is, {va}",
@@ -448,6 +449,7 @@ unsafe fn tlb_invalidate_4kb_range_all_asids_inner_shareable(base: VirtAddr, pag
             );
         }
     }
+    // SAFETY: as above — unconditional EL1 barrier pair.
     unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
     compiler_fence(Ordering::SeqCst);
 }
@@ -1009,12 +1011,14 @@ unsafe fn map_4kb_scatter_range_locked(
             };
             // SAFETY: ensure_next_table returned a verified table descriptor.
             let l1 = unsafe { &mut *(l1_phys.kernel_mut_ptr::<PageTable>()) };
+            // SAFETY: as above — `l1` is root-locked and identity-reachable.
             let l2_phys = match unsafe { ensure_next_table(&mut l1.entries[idx.l1]) } {
                 Ok(phys) => phys,
                 Err(error) => return (attempted, Err(error)),
             };
             // SAFETY: ensure_next_table returned a verified table descriptor.
             let l2 = unsafe { &mut *(l2_phys.kernel_mut_ptr::<PageTable>()) };
+            // SAFETY: as above — `l2` is root-locked and identity-reachable.
             let l3_phys = match unsafe { ensure_next_table(&mut l2.entries[idx.l2]) } {
                 Ok(phys) => phys,
                 Err(error) => return (attempted, Err(error)),

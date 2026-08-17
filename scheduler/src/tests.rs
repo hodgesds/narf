@@ -902,8 +902,8 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
-        // SAFETY: Valid memory or trusted environment
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: reads a system register into the sole `out(reg)` operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -1086,8 +1086,8 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
-        // SAFETY: Valid memory or trusted environment
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: reads a system register into the sole `out(reg)` operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",

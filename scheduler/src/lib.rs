@@ -2296,8 +2296,8 @@ pub fn run_until_empty() {
                 // is unconditionally permitted. It has no memory operand,
                 // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
                 // receives the register value.
-                // SAFETY: Valid memory or trusted environment
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: EL1 system-register asm; operands as documented above.
                 unsafe {
                     core::arch::asm!(
                         "mrs {0}, ttbr0_el1",
@@ -2383,8 +2383,8 @@ pub fn run_until_empty() {
                 // reuse, so restoring the saved `(root, ASID)` context needs
                 // only the architected DSB + MSR + ISB sequence. Flushing here
                 // would discard the translations that ASIDs exist to retain.
-                // SAFETY: Valid memory or trusted environment
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: EL1 TLBI/ASID asm; operands as documented above.
                 unsafe {
                     core::arch::asm!(
                         "dsb ish",

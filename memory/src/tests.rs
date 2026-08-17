@@ -7639,6 +7639,7 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
     #[cfg(target_arch = "x86_64")]
     let leaf_read_only = unsafe { crate::x86_64::paging::flags_at(a.root, mid) }
         .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE));
+    // SAFETY: `a.root` is the live test-owned L0 and `mid` is mapped above.
     #[cfg(target_arch = "aarch64")]
     let leaf_read_only =
         unsafe { crate::aarch64::paging::flags_at(a.root, mid) }.is_some_and(|flags| {
