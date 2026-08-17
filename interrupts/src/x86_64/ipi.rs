@@ -298,14 +298,6 @@ pub unsafe fn poll_pending_shootdown() {
     }
 }
 
-/// x2APIC ICR with delivery mode = Fixed, destination shorthand =
-/// "all excluding self" (bits 19..=18 = 0b11), trigger = edge,
-/// vector = `VECTOR_TLB_SHOOTDOWN`. Bit 14 (level=assert) is set
-/// for compatibility with older docs even though x2APIC ignores it.
-const ICR_BROADCAST_SHOOTDOWN: u64 = 0xC0 << 12               // dest shorthand = 0b11 (all-excluding-self) at bits[19:18]
-    | (1 << 14)              // level = assert
-    | (crate::VECTOR_TLB_SHOOTDOWN as u64); // vector
-
 /// Broadcast a TLB-shootdown IPI to every CPU except the sender,
 /// requesting an `INVLPG` for `va`. Spins until every online AP has
 /// ack'd. Idempotent across multiple senders — each CPU's PENDING_VA
@@ -341,9 +333,23 @@ pub const SHOOTDOWN_FULL_SENTINEL: u64 = u64::MAX;
 /// # Safety
 /// Same preconditions as `shoot_va`.
 pub unsafe fn shoot_full() {
-    // SAFETY: caller contract; the sentinel is routed by the handler.
+    // SAFETY: caller contract; the sentinel is routed by the handler and
+    // the mask is narrowed to online peers by `shoot_range_mask`.
     unsafe {
-        shoot_range(SHOOTDOWN_FULL_SENTINEL, 1, 0);
+        shoot_full_mask(u64::MAX);
+    }
+}
+
+/// Targeted form of [`shoot_full`]. Only online peer CPUs selected by
+/// `target_mask` receive the request and participate in the ACK wait.
+///
+/// # Safety
+/// Same preconditions as [`shoot_full`].
+pub unsafe fn shoot_full_mask(target_mask: u64) {
+    // SAFETY: caller contract; the non-canonical sentinel cannot collide
+    // with an ordinary VA request.
+    unsafe {
+        shoot_range_mask(SHOOTDOWN_FULL_SENTINEL, 1, 0, target_mask);
     }
 }
 
@@ -354,25 +360,40 @@ pub unsafe fn shoot_full() {
 /// # Safety
 /// Same preconditions as `shoot_va`.
 pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
+    // SAFETY: caller contract; `shoot_range_mask` removes self/offline bits.
+    unsafe {
+        shoot_range_mask(va, pages, tag, u64::MAX);
+    }
+}
+
+/// Targeted range shootdown. Publishes the request and sends an x2APIC
+/// fixed IPI only to online peer CPUs selected by `target_mask`; the ACK
+/// wait covers exactly the same set. This is the sink for
+/// `memory::tlb_shootdown`'s active-address-space filter.
+///
+/// # Safety
+/// Same preconditions as [`shoot_range`]. Bits that do not identify an
+/// online peer CPU are ignored.
+pub unsafe fn shoot_range_mask(va: u64, pages: u64, tag: u16, target_mask: u64) {
     if va == 0 || pages == 0 {
         return;
     }
-    let total = narf_lib::smp::cpu_count();
-    if total <= 1 {
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let self_bit = 1u64 << (self_cpu & 63);
+    let targets = target_mask & narf_lib::smp::online_bitmap() & !self_bit;
+    if targets == 0 {
         return;
     }
 
-    let self_cpu = narf_lib::percpu::current_cpu() as u32;
-
-    // Snapshot every other CPU's ack counter and publish the target
+    // Snapshot every target CPU's ack counter and publish the target
     // VA + range + tag. Publish order: TAG → PAGES → VA. The handler
     // reads in the same order under acquire, so when it sees a
     // non-zero VA the matching tag is already visible.
     let mut snap = [0u64; MAX_CPUS];
-    for cpu in 0..total {
-        if cpu == self_cpu {
-            continue;
-        }
+    let mut pending = targets;
+    while pending != 0 {
+        let cpu = pending.trailing_zeros();
+        pending &= pending - 1;
         let i = (cpu as usize).min(MAX_CPUS - 1);
         snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
         PENDING_TAG[i].store(tag, Ordering::Release);
@@ -380,18 +401,15 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
         PENDING_VA[i].store(va, Ordering::Release);
     }
 
-    // Send the IPI. WRMSR is a serialising instruction so prior
-    // PENDING_VA stores are visible to the receivers.
-    // SAFETY: caller-asserted x2APIC online.
-    unsafe {
-        apic::wrmsr_icr(ICR_BROADCAST_SHOOTDOWN);
-    }
+    // Each fixed-destination WRMSR is serialising, so the matching
+    // PENDING_* stores are visible before that receiver runs.
+    apic::send_fixed_ipi(targets, crate::VECTOR_TLB_SHOOTDOWN);
 
-    // Wait for every other online CPU to advance its ack counter.
-    for cpu in 0..total {
-        if cpu == self_cpu {
-            continue;
-        }
+    // Wait for exactly the CPUs that were sent the request.
+    let mut waiting = targets;
+    while waiting != 0 {
+        let cpu = waiting.trailing_zeros();
+        waiting &= waiting - 1;
         let i = (cpu as usize).min(MAX_CPUS - 1);
         let mut spins: u32 = 0;
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
@@ -431,36 +449,52 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
 /// installed). `tag` must be a non-zero PCID (0 is the no-PCID
 /// sentinel and would just be a no-op in the handler).
 pub unsafe fn shoot_tag_only(tag: u16) {
+    // SAFETY: caller contract; the targeted helper narrows the mask.
+    unsafe {
+        shoot_tag_only_mask(tag, u64::MAX);
+    }
+}
+
+/// Targeted form of [`shoot_tag_only`]. Only selected online peers are
+/// published to, interrupted, and awaited.
+///
+/// # Safety
+/// Same preconditions as [`shoot_tag_only`].
+pub unsafe fn shoot_tag_only_mask(tag: u16, target_mask: u64) {
     if tag == 0 {
         return;
     }
-    let total = narf_lib::smp::cpu_count();
-    if total <= 1 {
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let self_bit = 1u64 << (self_cpu & 63);
+    let targets = target_mask & narf_lib::smp::online_bitmap() & !self_bit;
+    if targets == 0 {
         return;
     }
-    let self_cpu = narf_lib::percpu::current_cpu() as u32;
     let mut snap = [0u64; MAX_CPUS];
-    for cpu in 0..total {
-        if cpu == self_cpu {
-            continue;
-        }
+    let mut pending = targets;
+    while pending != 0 {
+        let cpu = pending.trailing_zeros();
+        pending &= pending - 1;
         let i = (cpu as usize).min(MAX_CPUS - 1);
         snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
         PENDING_VA[i].store(0, Ordering::Release);
         PENDING_PAGES[i].store(0, Ordering::Release);
         PENDING_TAG[i].store(tag, Ordering::Release);
     }
-    // SAFETY: caller-asserted x2APIC online.
-    unsafe {
-        apic::wrmsr_icr(ICR_BROADCAST_SHOOTDOWN);
-    }
-    for cpu in 0..total {
-        if cpu == self_cpu {
-            continue;
-        }
+    apic::send_fixed_ipi(targets, crate::VECTOR_TLB_SHOOTDOWN);
+    let mut waiting = targets;
+    while waiting != 0 {
+        let cpu = waiting.trailing_zeros();
+        waiting &= waiting - 1;
         let i = (cpu as usize).min(MAX_CPUS - 1);
         let mut spins: u32 = 0;
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
+            // Break a concurrent-shootdown cycle exactly as the range
+            // path does when callers enter with IRQs masked.
+            // SAFETY: consumes only this CPU's pending cells at CPL=0.
+            unsafe {
+                poll_pending_shootdown();
+            }
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);
             if spins > 10_000_000 {

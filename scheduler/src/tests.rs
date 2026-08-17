@@ -797,7 +797,13 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     extern crate alloc;
     use crate::{spawn_user, TaskSpec};
     use alloc::sync::Arc;
-    use narf_memory::AddressSpace;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use narf_memory::{tlb_shootdown, AddressSpace};
+
+    static RESIDENCY_SEEN_DURING_POLL: AtomicBool = AtomicBool::new(false);
+    static POLL_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+    RESIDENCY_SEEN_DURING_POLL.store(false, Ordering::Relaxed);
+    POLL_CPU.store(u32::MAX, Ordering::Relaxed);
 
     /// # Safety
     /// Must run at CPL=0 (kernel test context); reading CR3 is otherwise
@@ -837,9 +843,12 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     let _tid = spawn_user(
         crate::alloc_task_id(),
         async {
-            // No-op user-task body. The bug isn't in the body —
-            // it's that the scheduler leaks CR3 to the *next*
-            // task after this one returns.
+            let cpu = narf_lib::percpu::current_cpu() as u32;
+            POLL_CPU.store(cpu, Ordering::Relaxed);
+            RESIDENCY_SEEN_DURING_POLL.store(
+                tlb_shootdown::active_as_bitmap(cpu) & 1 != 0,
+                Ordering::Relaxed,
+            );
         },
         TaskSpec::unthrottled(),
         Arc::clone(&arc_as),
@@ -849,13 +858,23 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
 
     // SAFETY: read_cr3 runs at CPL=0 in the in-kernel test runner.
     let cr3_after = unsafe { read_cr3() };
-    if cr3_after == kernel_cr3 {
-        TestResult::Pass
-    } else if cr3_after == user_cr3 {
-        TestResult::Fail("CR3 left in user AS after run_until_empty")
-    } else {
-        TestResult::Fail("CR3 ended in unexpected value after run_until_empty")
+    if cr3_after == user_cr3 {
+        return TestResult::Fail("CR3 left in user AS after run_until_empty");
     }
+    if cr3_after != kernel_cr3 {
+        return TestResult::Fail("CR3 ended in unexpected value after run_until_empty");
+    }
+    if !RESIDENCY_SEEN_DURING_POLL.load(Ordering::Relaxed) {
+        return TestResult::Fail("PCID-0 residency was absent during user poll");
+    }
+    let poll_cpu = POLL_CPU.load(Ordering::Relaxed);
+    if poll_cpu == u32::MAX {
+        return TestResult::Fail("user poll did not record its CPU");
+    }
+    if tlb_shootdown::active_as_bitmap(poll_cpu) & 1 != 0 {
+        return TestResult::Fail("PCID-0 residency survived kernel CR3 restore");
+    }
+    TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
@@ -865,14 +884,10 @@ kernel_test_in!(
 
 /// aarch64 mirror of the x86_64 `…restores_kernel_cr3` test:
 /// asserts that polling a user task leaves TTBR0_EL1 at the
-/// kernel root after `run_until_empty` returns. Today
-/// `AddressSpace::activate()` on aarch64 is a diagnostic no-op
-/// (writes TTBR0 back to itself), so the test passes trivially —
-/// but the assertion stays in place so that if/when activate()
-/// is wired to swap TTBR0 to `self.root`, the scheduler MUST
-/// continue to save and restore it. Without the save/restore,
-/// two user tasks back-to-back would inherit each other's TTBR0
-/// until their own activate() ran.
+/// kernel root after `run_until_empty` returns. `activate()` installs
+/// the user root for the poll, so without the save/restore two user
+/// tasks back-to-back would inherit each other's TTBR0 until their
+/// own activation ran.
 #[cfg(target_arch = "aarch64")]
 fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     extern crate alloc;
@@ -887,7 +902,8 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
-        // SAFETY: Valid memory or trusted environment
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: reads a system register into the sole `out(reg)` operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -895,6 +911,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
                 options(nomem, nostack, preserves_flags),
             );
         }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         v
     }
 
@@ -1040,10 +1057,9 @@ kernel_test_in!(
 /// aarch64 mirror of `…sees_kernel_cr3`. Spawns a user task
 /// followed by a kernel task on the same CPU queue; the kernel
 /// task reads its own TTBR0_EL1 and asserts the scheduler
-/// restored it to the kernel value (NOT the leaked user AS).
-/// Trivially passes today because aarch64 activate() is a no-op,
-/// but pins the contract so a future activate() rewrite stays
-/// honest.
+/// restored it to the kernel value (NOT the leaked user AS). The
+/// user task also samples TTBR0 so a no-op `activate()` cannot make
+/// the restore-only half of the test pass accidentally.
 #[cfg(target_arch = "aarch64")]
 fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     extern crate alloc;
@@ -1054,9 +1070,11 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
 
     static USER_RAN: AtomicBool = AtomicBool::new(false);
     static KERNEL_RAN: AtomicBool = AtomicBool::new(false);
+    static USER_TTBR0_OBSERVED: AtomicU64 = AtomicU64::new(0);
     static KERNEL_TTBR0_OBSERVED: AtomicU64 = AtomicU64::new(0);
     USER_RAN.store(false, Ordering::Relaxed);
     KERNEL_RAN.store(false, Ordering::Relaxed);
+    USER_TTBR0_OBSERVED.store(0, Ordering::Relaxed);
     KERNEL_TTBR0_OBSERVED.store(0, Ordering::Relaxed);
 
     crate::__reset_queues_for_test();
@@ -1068,7 +1086,8 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
-        // SAFETY: Valid memory or trusted environment
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: reads a system register into the sole `out(reg)` operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -1076,6 +1095,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
                 options(nomem, nostack, preserves_flags),
             );
         }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         v
     }
     // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
@@ -1093,6 +1113,10 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     let _utid = spawn_user(
         crate::alloc_task_id(),
         async {
+            // SAFETY: the task is polled at EL1 by the executor; MRS has no
+            // side effects and lets the test observe the active low-half root.
+            let observed = unsafe { read_ttbr0() };
+            USER_TTBR0_OBSERVED.store(observed, Ordering::Relaxed);
             USER_RAN.store(true, Ordering::Relaxed);
         },
         TaskSpec::unthrottled(),
@@ -1118,9 +1142,16 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     }
     let observed = KERNEL_TTBR0_OBSERVED.load(Ordering::Relaxed);
     // The user-root bit comparison: TTBR0 holds the root phys in
-    // its top bits plus ASID in low bits. We mask to the table-
-    // address bits before comparison.
+    // its table address in bits [47:12] and ASID in bits [63:48]. We mask to
+    // the table-address bits before comparing roots.
     const ROOT_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    let user_observed = USER_TTBR0_OBSERVED.load(Ordering::Relaxed);
+    if (user_observed & ROOT_MASK) != (user_root & ROOT_MASK) {
+        return TestResult::Fail("user task did not observe its own TTBR0 root");
+    }
+    if (user_observed >> 48) == 0 {
+        return TestResult::Fail("user task did not receive a process ASID");
+    }
     if (observed & ROOT_MASK) == (user_root & ROOT_MASK) {
         return TestResult::Fail("kernel task observed stale user TTBR0 — leak");
     }

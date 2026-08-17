@@ -1223,6 +1223,11 @@ pub struct StackfulOptions {
     /// task. Use for drivers that hold hardware locks across an
     /// `.await`-free region.
     pub no_preempt: bool,
+    /// Allow timer slicing when this task is interrupted in CPL3. This is
+    /// independent of `no_preempt`: user tasks keep arbitrary CPL0 kernel
+    /// continuations non-preemptible until the scheduler has a preempt-disable
+    /// counter, while still time-slicing syscall-free userspace.
+    pub user_preempt: bool,
     /// Per-task kernel stack size. Must be ≥ 4 KiB and 16-byte
     /// aligned. Default `stackful::DEFAULT_KERNEL_STACK_BYTES`
     /// (16 KiB).
@@ -1234,6 +1239,7 @@ impl Default for StackfulOptions {
         Self {
             slice_cycles: stackful::DEFAULT_SLICE_CYCLES,
             no_preempt: false,
+            user_preempt: false,
             stack_bytes: stackful::DEFAULT_KERNEL_STACK_BYTES,
         }
     }
@@ -1328,21 +1334,26 @@ where
 {
     let mut spec = spec;
     spec.affinity = normalize_spawn_affinity(spec.affinity);
-    // Run user tasks on their OWN kernel stack via the no-preempt stackful
+    // Run user tasks on their OWN kernel stack via the stackful
     // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
     // *plain* UserTaskFuture would therefore run `enter_user_mode_resume` —
     // whose synthetic iretq frame pushes the user CS/SS selectors — onto the
     // shared executor stack, where a stale pushed selector can survive at a
     // slot a later executor `ret` pops (→ #UD jumping to a selector value).
-    // Giving the user task its own stack confines those pushes. The adapter is
-    // no_preempt: user tasks yield cooperatively via the longjmp machinery, not
-    // timer-driven try_preempt (which is CPL=0-only anyway). x86_64 only —
-    // aarch64's stackful adapter is a stub that completes immediately.
+    // Giving the user task its own stack confines those pushes. User tasks
+    // remain timer-preemptible ONLY at CPL3: the own-stack path
+    // (`try_preempt_user`) preserves the complete trap continuation and FPU
+    // state, so a syscall-free loop yields its CPU. Arbitrary CPL0 preemption
+    // stays disabled until NARF has Linux-style preempt-disable accounting;
+    // otherwise a suspended syscall can strand a lock needed by every sibling
+    // in its CLONE_VM address space. x86_64 only — aarch64's stackful adapter
+    // is a stub that completes immediately.
     #[cfg(target_arch = "x86_64")]
     let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_options(
         f,
         crate::StackfulOptions {
             no_preempt: true,
+            user_preempt: true,
             ..Default::default()
         },
     ));
@@ -2285,7 +2296,8 @@ pub fn run_until_empty() {
                 // is unconditionally permitted. It has no memory operand,
                 // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
                 // receives the register value.
-                // SAFETY: Valid memory or trusted environment
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: EL1 system-register asm; operands as documented above.
                 unsafe {
                     core::arch::asm!(
                         "mrs {0}, ttbr0_el1",
@@ -2293,6 +2305,7 @@ pub fn run_until_empty() {
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 raw
             } else {
                 0
@@ -2356,31 +2369,32 @@ pub fn run_until_empty() {
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                // The plain kernel-root CR3 restore flushes PCID 0 on this
+                // CPU. Clear residency only after that flush, so a concurrent
+                // shared-AS mutation can never omit a CPU retaining a stale
+                // user translation.
+                narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
             }
             #[cfg(target_arch = "aarch64")]
             if saved_ttbr0 != 0 {
                 // SAFETY: `saved_ttbr0` was just read from
-                // TTBR0_EL1 in kernel context above. The
-                // architected sequence for a TTBR swap is MSR +
-                // ISB; we also broadcast a TLBI VMALLE1IS to
-                // clear stale Stage-1 TLB entries from the
-                // intervening user-AS activation. This is the
-                // same dance `aarch64::paging::write_ttbr0_el1`
-                // performs internally, replicated here so we
-                // don't pull a circular dep on `narf-memory`
-                // from inside `narf-scheduler`'s hot path.
-                // SAFETY: Valid memory or trusted environment
+                // TTBR0_EL1 in kernel context above. Process ASIDs are unique
+                // for the AddressSpace lifetime and are invalidated before
+                // reuse, so restoring the saved `(root, ASID)` context needs
+                // only the architected DSB + MSR + ISB sequence. Flushing here
+                // would discard the translations that ASIDs exist to retain.
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: EL1 TLBI/ASID asm; operands as documented above.
                 unsafe {
                     core::arch::asm!(
-                        "msr ttbr0_el1, {0}",
-                        "isb",
-                        "tlbi vmalle1is",
                         "dsb ish",
+                        "msr ttbr0_el1, {0}",
                         "isb",
                         in(reg) saved_ttbr0,
                         options(nomem, nostack, preserves_flags),
                     );
                 }
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
             let elapsed = Instant::now().cycles_since(start);
             let outcome = slot.account.charge(elapsed, &slot.spec.budget);
@@ -2773,6 +2787,7 @@ pub fn run_until_empty() {
                     narf_arch::disable_interrupts();
                 }
             }
+            narf_memory::tlb_shootdown::mark_idle(cpu as u32);
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             let woke_late = {
@@ -2783,6 +2798,7 @@ pub fn run_until_empty() {
             };
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 if race_free_halt {
                     // SAFETY: restore the IRQ state we masked above; a wake is
                     // already pending so we loop straight back to polling.
@@ -2818,6 +2834,7 @@ pub fn run_until_empty() {
                     }
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
                 // SAFETY: restore the IRQ state to the idle path's natural
                 // enabled state (it was enabled before we masked it).
                 unsafe {
@@ -2829,6 +2846,7 @@ pub fn run_until_empty() {
                 // which doesn't HLT-through-an-IPI, so the race doesn't apply.
                 idle_wait(next_deadline);
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             }
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
@@ -3214,6 +3232,7 @@ pub fn run_forever() -> ! {
                 narf_arch::disable_interrupts();
             }
         }
+        narf_memory::tlb_shootdown::mark_idle(cpu as u32);
         CPU_HALTED[cpu].store(true, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);
         let work_arrived = {
@@ -3226,6 +3245,7 @@ pub fn run_forever() -> ! {
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             if race_free_halt {
                 // SAFETY: restore the IRQ state we masked above; work is
                 // already queued so we loop straight back to polling.
@@ -3243,6 +3263,7 @@ pub fn run_forever() -> ! {
                 narf_arch::idle_halt_then_disable();
             }
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             // SAFETY: restore the enabled state this idle path runs with.
             unsafe {
                 narf_arch::enable_interrupts();
@@ -3253,6 +3274,7 @@ pub fn run_forever() -> ! {
             // keeps the pre-existing behaviour.
             narf_arch::halt_until_irq();
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            narf_memory::tlb_shootdown::mark_busy(cpu as u32);
         }
     }
 }

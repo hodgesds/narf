@@ -546,6 +546,9 @@ pub struct KernelTask {
     /// this task. Use for drivers that hold hardware locks across
     /// an `.await`-free critical section.
     no_preempt: AtomicBool,
+    /// Separate CPL3 policy. User tasks can be time-sliced while their CPL0
+    /// syscall continuations remain run-to-completion (`no_preempt = true`).
+    user_preempt: AtomicBool,
     /// Saved trap frame when the task was preempted. The
     /// preempt_resume_stub uses this to IRET back to the exact
     /// instruction the LAPIC timer interrupted. UnsafeCell because
@@ -676,6 +679,7 @@ impl KernelTask {
             tsc_started: AtomicU64::new(0),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
             no_preempt: AtomicBool::new(false),
+            user_preempt: AtomicBool::new(false),
             saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
@@ -948,6 +952,12 @@ impl KernelTask {
     /// that hold hardware locks across an `.await`-free region.
     pub fn set_no_preempt(&self, v: bool) {
         self.no_preempt.store(v, Ordering::Release);
+    }
+
+    /// Enable or disable own-stack CPL3 timer preemption independently of
+    /// arbitrary CPL0 kernel preemption.
+    pub fn set_user_preempt(&self, v: bool) {
+        self.user_preempt.store(v, Ordering::Release);
     }
 
     /// Set the per-task TSC time slice. Default is
@@ -1413,8 +1423,8 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     }
     // SAFETY: `task_ptr` is the in-flight task on this CPU; the Box is kept
     // alive by the executor's `poll_to_yield` across the user-mode round-trip.
-    let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
-    if no_preempt {
+    let user_preempt = unsafe { (*task_ptr).user_preempt.load(Ordering::Acquire) };
+    if !user_preempt {
         return false;
     }
     // SAFETY: live `task_ptr` as established above.
@@ -1461,6 +1471,12 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // path restamps tsc_started; otherwise every timer-preempted interval
     // disappears from task-clock accounting.
     fold_current_slice(task_ptr);
+    // This Pending return suspended an arbitrary continuation. The executor
+    // must not report a QSBR quiescent state for the slot.
+    // SAFETY: `task_ptr` names the live current task (same pointer used above).
+    unsafe {
+        (*task_ptr).preempted.store(true, Ordering::Release);
+    }
     // Save the user FPU before another task clobbers XMM/x87, and clear CURRENT
     // so a tick during the switch-out window can't re-preempt us.
     user_fpu_save();
@@ -1699,9 +1715,8 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
-        // NOTE: deliberately NOT gated on `no_preempt`. User tasks set
-        // `no_preempt = true` to opt out of ASYNC timer-IRQ preemption (they
-        // "yield cooperatively"), but this is precisely a cooperative yield —
+        // NOTE: deliberately NOT gated on `no_preempt`. User tasks keep CPL0
+        // timer preemption disabled, but this is precisely a cooperative yield —
         // a SYNCHRONOUS slice check at syscall exit, about to return to CPL=3,
         // outside any kernel critical section. Honouring `no_preempt` here is
         // what left a syscall-dense task (stress-ng --sigrt's sigqueue loop)
@@ -1877,10 +1892,10 @@ impl StackfulAdapter {
         }
     }
 
-    /// Construct with explicit options (slice + no_preempt +
+    /// Construct with explicit options (slice + CPL0/CPL3 preemption policy +
     /// stack size). Used by `spawn_stackful_with_options`.
     /// Caller must invoke `apply_options` after construction to
-    /// commit slice/no_preempt to the inner task — kept as a
+    /// commit the options to the inner task — kept as a
     /// separate step so the StackfulOptions struct can stay
     /// `Copy`.
     pub fn with_options<F>(future: F, opts: crate::StackfulOptions) -> Self
@@ -1894,6 +1909,7 @@ impl StackfulAdapter {
         // a simple atomic-set pattern; opts are tiny.
         me.inner.set_slice_cycles(opts.slice_cycles);
         me.inner.set_no_preempt(opts.no_preempt);
+        me.inner.set_user_preempt(opts.user_preempt);
         me
     }
 
@@ -2650,6 +2666,9 @@ pub mod tests {
         if task.no_preempt.load(Ordering::Acquire) {
             return TestResult::Fail("no_preempt should default false");
         }
+        if task.user_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("user_preempt should default false");
+        }
         task.set_no_preempt(true);
         if !task.no_preempt.load(Ordering::Acquire) {
             return TestResult::Fail("set_no_preempt(true) didn't stick");
@@ -2657,6 +2676,14 @@ pub mod tests {
         task.set_no_preempt(false);
         if task.no_preempt.load(Ordering::Acquire) {
             return TestResult::Fail("set_no_preempt(false) didn't stick");
+        }
+        task.set_user_preempt(true);
+        if !task.user_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("set_user_preempt(true) didn't stick");
+        }
+        task.set_user_preempt(false);
+        if task.user_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("set_user_preempt(false) didn't stick");
         }
         TestResult::Pass
     }
@@ -2736,8 +2763,8 @@ pub mod tests {
         TestResult::Pass
     }
 
-    /// StackfulAdapter::with_options applies slice + no_preempt
-    /// + stack size to the inner KernelTask.
+    /// StackfulAdapter::with_options applies both preemption policies, the
+    /// slice, and stack size to the inner KernelTask.
     #[cfg(target_arch = "x86_64")]
     fn smoke_stackful_adapter_applies_options() -> TestResult {
         struct NoopPending;
@@ -2750,6 +2777,7 @@ pub mod tests {
         let opts = crate::StackfulOptions {
             slice_cycles: 42_000_000,
             no_preempt: true,
+            user_preempt: true,
             stack_bytes: 32 * 1024,
         };
         let adapter = StackfulAdapter::with_options(NoopPending, opts);
@@ -2758,6 +2786,9 @@ pub mod tests {
         }
         if !adapter.inner.no_preempt.load(Ordering::Acquire) {
             return TestResult::Fail("no_preempt not applied");
+        }
+        if !adapter.inner.user_preempt.load(Ordering::Acquire) {
+            return TestResult::Fail("user_preempt not applied");
         }
         if adapter.inner.stack.len() != 32 * 1024 {
             return TestResult::Fail("stack_bytes not applied");
@@ -2775,6 +2806,9 @@ pub mod tests {
         }
         if opts.no_preempt {
             return TestResult::Fail("default no_preempt should be false");
+        }
+        if opts.user_preempt {
+            return TestResult::Fail("default user_preempt should be false");
         }
         if opts.stack_bytes != DEFAULT_KERNEL_STACK_BYTES {
             return TestResult::Fail("default stack_bytes drifted");

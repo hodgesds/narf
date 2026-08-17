@@ -749,6 +749,18 @@ pub fn task_count() -> usize {
     TASKS.lock().len()
 }
 
+/// Snapshot every registered task's `(tid, pid)`. The OOM killer scans this
+/// to score candidates without holding the registry lock across address-space
+/// resolution (which locks the scheduler ready queues) — that nesting is the
+/// kind of lock-order inversion the rest of the tree is careful to avoid.
+pub fn snapshot_identities() -> alloc::vec::Vec<(u64, u64)> {
+    TASKS
+        .lock()
+        .values()
+        .map(|t| (t.tid, t.pid.load(Ordering::Relaxed)))
+        .collect()
+}
+
 /// Scheduler slot-reap hook (installed at boot via
 /// `narf_scheduler::set_slot_reap_hook`). Fires when the executor
 /// drops a task slot through an ABNORMAL path — budget-cap revocation

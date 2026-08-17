@@ -19,10 +19,10 @@
 //! point (`swap_out_batch`) selects up to `swap_batch_pages()` cold
 //! victims, allocates a **contiguous run of swap slots** for them, and
 //! writes the whole run to the backing store in one `write_batch` call
-//! (one submission for the batch, not N). Fault-in reads a single page
-//! back on demand, with an optional `read_batch` readahead of the run's
-//! neighbours (they were written adjacently, so they're the natural
-//! readahead set).
+//! (one submission for the batch, not N). Fault-in is symmetric:
+//! `swap_in_batch` restores a same-address-space run with one backend read
+//! and one page-table transaction; `swap_in_pte` is only its compatibility
+//! wrapper for a single fault.
 //!
 //! Designing around the batch from the start is the point: the slot
 //! allocator hands out contiguous runs, the backend's primary write
@@ -56,9 +56,10 @@
 //! faults on touch) but carries a `SWAP_MARKER` bit plus a packed
 //! `(swap_type, offset)` in the software-available bits. The
 //! page-fault handler distinguishes "swapped out" (marker set) from
-//! "never mapped" (all-zero PTE) and routes the former to
-//! `swap_in_pte`. See `SwapPte` for the exact bit layout and its
-//! round-trip unit test.
+//! "never mapped" (all-zero PTE). The AddressSpace fault path gathers the
+//! fault plus consecutive swapped leaves and routes the vector through
+//! `swap_in_batch`; `swap_in_pte` remains the one-page compatibility wrapper.
+//! See `SwapPte` for the exact bit layout and its round-trip unit test.
 //!
 //! # cgroup swap accounting
 //!
@@ -81,7 +82,7 @@
 
 extern crate alloc as alloc_crate;
 
-use alloc_crate::boxed::Box;
+use alloc_crate::sync::Arc;
 use alloc_crate::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -127,6 +128,9 @@ pub enum SwapError {
     /// page-out. The batch is rolled back and the caller keeps the
     /// frames resident.
     SwapLimit,
+    /// A batch mixed address-space roots, repeated a virtual address, exceeded
+    /// the configured maximum, or otherwise could not be committed atomically.
+    InvalidBatch,
 }
 
 // ── Batch-size knob (the headline tunable) ─────────────────────────
@@ -262,8 +266,9 @@ impl SwapPte {
 /// The backend owns *bytes*: it stashes the contents of one or more
 /// 4 KiB pages and answers reads by slot. The primary write path is
 /// **batched** (`write_batch`) — the whole design pushes N pages
-/// through one call. `read` faults a single page back; `read_batch`
-/// is an optional readahead that pulls a contiguous run.
+/// through one call. Scalar `read`/`discard` are compatibility primitives;
+/// `read_batch_into`/`discard_batch` let zram or block backends lock/submit
+/// once for the vector.
 ///
 /// The kernel (this module) owns *frames* and *page tables*; the
 /// backend never touches a PTE or a `PhysFrame`.
@@ -299,9 +304,36 @@ pub trait SwapBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Read a slot run directly into a scatter list of physical frames. This
+    /// is the primary page-in interface: a block backend can issue one vectored
+    /// request and zram can take its index lock once for the complete batch.
+    /// The default preserves compatibility for simple backends while keeping
+    /// publication transactional: callers do not install any PTE until this
+    /// method has returned `Ok(())` for the complete run.
+    fn read_batch_into(&self, slots: &[SwapSlot], pages: &[PhysAddr]) -> Result<(), SwapError> {
+        if slots.len() != pages.len() {
+            return Err(SwapError::InvalidBatch);
+        }
+        for (slot, phys) in slots.iter().zip(pages.iter()) {
+            // SAFETY: the batch caller supplies fresh, exclusively-owned
+            // frames and does not publish them until the complete read wins.
+            let out = unsafe { &mut *phys.kernel_mut_ptr::<[u8; ZPAGE_SIZE]>() };
+            self.read(*slot, out)?;
+        }
+        Ok(())
+    }
+
     /// Release a slot's backing (the page was faulted in or the mapping
     /// was torn down). Idempotent on already-freed slots.
     fn discard(&self, slot: SwapSlot);
+
+    /// Release a complete slot run. Backends should override this when a
+    /// single lock acquisition or one storage discard command can cover it.
+    fn discard_batch(&self, slots: &[SwapSlot]) {
+        for slot in slots {
+            self.discard(*slot);
+        }
+    }
 }
 
 /// Compressed-RAM swap backend (zram-like): LZ4 into a global
@@ -413,12 +445,46 @@ impl SwapBackend for ZramBackend {
             .map_err(|_| SwapError::SlotNotFound)
     }
 
+    fn read_batch_into(&self, slots: &[SwapSlot], pages: &[PhysAddr]) -> Result<(), SwapError> {
+        if slots.len() != pages.len() {
+            return Err(SwapError::InvalidBatch);
+        }
+        let inner = self.inner.lock();
+        for (slot, phys) in slots.iter().zip(pages.iter()) {
+            let handle = inner
+                .handles
+                .get(slot.raw() as usize)
+                .copied()
+                .flatten()
+                .ok_or(SwapError::SlotNotFound)?;
+            // SAFETY: the swap-in batch owns each fresh destination frame
+            // exclusively until every backend read succeeds.
+            let out = unsafe { &mut *phys.kernel_mut_ptr::<[u8; ZPAGE_SIZE]>() };
+            inner
+                .pool
+                .load(handle, out)
+                .map_err(|_| SwapError::SlotNotFound)?;
+        }
+        Ok(())
+    }
+
     fn discard(&self, slot: SwapSlot) {
         let mut inner = self.inner.lock();
         let idx = slot.raw() as usize;
         if let Some(slot_mut) = inner.handles.get_mut(idx) {
             if let Some(h) = slot_mut.take() {
                 inner.pool.free(h);
+            }
+        }
+    }
+
+    fn discard_batch(&self, slots: &[SwapSlot]) {
+        let mut inner = self.inner.lock();
+        for slot in slots {
+            if let Some(slot_mut) = inner.handles.get_mut(slot.raw() as usize) {
+                if let Some(handle) = slot_mut.take() {
+                    inner.pool.free(handle);
+                }
             }
         }
     }
@@ -510,7 +576,7 @@ impl SlotAllocator {
 
 /// The kernel-wide swap device: one backend + one slot allocator.
 struct SwapDevice {
-    backend: Option<Box<dyn SwapBackend>>,
+    backend: Option<Arc<dyn SwapBackend>>,
     slots: SlotAllocator,
     /// Swap area id this device answers for. v1 = 0 (single area).
     /// Consumed by the x86_64 pageout path when stamping swap PTEs;
@@ -562,7 +628,7 @@ pub struct SwapStats {
 /// so only swap at well-defined boundaries — boot / test setup).
 pub fn install_backend<B: SwapBackend>(backend: B) {
     let mut dev = SWAP.lock();
-    dev.backend = Some(Box::new(backend));
+    dev.backend = Some(Arc::new(backend));
 }
 
 /// Install the default compressed-RAM backend if none is set yet.
@@ -571,7 +637,7 @@ pub fn install_backend<B: SwapBackend>(backend: B) {
 pub fn install_default_if_unset() {
     let mut dev = SWAP.lock();
     if dev.backend.is_none() {
-        dev.backend = Some(Box::new(ZramBackend::new()));
+        dev.backend = Some(Arc::new(ZramBackend::new()));
     }
 }
 
@@ -602,8 +668,8 @@ pub fn swap_stats() -> SwapStats {
 // the whole batch (the caller keeps the frames resident).
 
 // These are consumed by the x86_64 batched-pageout path (`swap_out_batch`
-// / `swap_in_pte` / `swap_discard`). aarch64 paging is a stub, so on that
-// arch only `swap_discard` reaches `swap_uncharge` — silence the rest.
+// / `swap_in_batch` / `swap_discard_batch`). aarch64 swap-PTE integration is
+// not implemented, so only discard accounting is architecture-independent.
 #[cfg(feature = "cgroup")]
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[must_use]
@@ -641,6 +707,133 @@ pub struct SwapVictim {
     pub virt: crate::VirtAddr,
 }
 
+/// One requested page in a first-class batched page-in operation.
+///
+/// Every entry in a call to [`swap_in_batch`] must name the same page-table
+/// root. Virtual addresses may be non-contiguous, but must be unique. The
+/// returned physical-frame vector preserves request order.
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SwapInRequest {
+    /// Physical base of the owning address space's PML4.
+    pub pml4_phys: PhysAddr,
+    /// Virtual address whose non-present leaf contains a [`SwapPte`].
+    pub virt: crate::VirtAddr,
+    /// Permissions to install on the restored present leaf.
+    pub flags: crate::paging::PtFlags,
+}
+
+/// Progress from executing a PSS-sized reclaim plan.
+///
+/// A plan may span address spaces, so it is split into same-root submissions
+/// while retaining range-level batching inside each submission. If a later
+/// submission fails, earlier ones remain validly swapped out and `error`
+/// reports why execution stopped; callers never lose partial-progress data.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwapBatchReport {
+    /// Pages present in the policy plan.
+    pub planned_pages: usize,
+    /// Pages handed to the low-level swap transaction before it stopped.
+    pub attempted_pages: usize,
+    /// Pages whose PTE/backing transition completed.
+    pub swapped_pages: usize,
+    /// Backend/PTE batch submissions issued.
+    pub submissions: usize,
+    /// First terminal error, if execution stopped early.
+    pub error: Option<SwapError>,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone)]
+struct SwapOutCommit {
+    virt: crate::VirtAddr,
+    expected_phys: PhysAddr,
+    raw: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone)]
+struct SwapInCommit {
+    virt: crate::VirtAddr,
+    expected_raw: u64,
+    phys: PhysAddr,
+    flags: crate::paging::PtFlags,
+}
+
+/// Atomically replace a same-root set of present 4 KiB leaves with
+/// non-present swap entries under one page-table lock acquisition.
+///
+/// The first pass validates every expected physical frame; only then does the
+/// second pass publish any swap entry. TLB invalidation is deliberately left
+/// to the caller, which performs one full/range batch before freeing backing.
+#[cfg(target_arch = "x86_64")]
+unsafe fn commit_swap_out_batch(
+    pml4_phys: PhysAddr,
+    entries: &[SwapOutCommit],
+) -> Result<(), SwapError> {
+    use crate::paging::PageTableEntry;
+
+    let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
+    for entry in entries {
+        let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
+        // SAFETY: the root lock is held and walk_to_leaf returned a live slot.
+        let current = PageTableEntry::from_raw(unsafe { core::ptr::read_volatile(leaf) });
+        if !current.is_present() || current.addr() != entry.expected_phys {
+            return Err(SwapError::MapFailed);
+        }
+    }
+    for entry in entries {
+        let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
+        // SAFETY: the validation pass proved the leaf exists and the root lock
+        // prevents replacement between validation and this commit pass.
+        unsafe { core::ptr::write_volatile(leaf, entry.raw) };
+    }
+    Ok(())
+}
+
+/// Atomically replace a same-root set of expected swap leaves with restored
+/// present mappings under one page-table lock acquisition.
+#[cfg(target_arch = "x86_64")]
+unsafe fn commit_swap_in_batch(
+    pml4_phys: PhysAddr,
+    entries: &[SwapInCommit],
+) -> Result<(), SwapError> {
+    use crate::paging::{PageTableEntry, PtFlags};
+
+    let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
+    for entry in entries {
+        let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
+        // SAFETY: the root lock is held and walk_to_leaf returned a live slot.
+        let current = unsafe { core::ptr::read_volatile(leaf) };
+        if current != entry.expected_raw || SwapPte::decode(current).is_none() {
+            return Err(SwapError::MapFailed);
+        }
+    }
+    for entry in entries {
+        let leaf = walk_to_leaf(pml4_phys, entry.virt).ok_or(SwapError::MapFailed)?;
+        let present = PageTableEntry::new(entry.phys, entry.flags | PtFlags::PRESENT).raw();
+        // SAFETY: validation proved the expected swap entry is still present
+        // and the root lock prevents a concurrent fault from winning midway.
+        unsafe { core::ptr::write_volatile(leaf, present) };
+    }
+    // A not-present -> present transition needs no remote shootdown, but this
+    // CPU may retain negative paging-structure-cache state. Retire the batch
+    // locally with one full non-global flush for a large run, or INVLPG each
+    // requested VA for a small one.
+    const LOCAL_FULL_FLUSH_THRESHOLD: usize = 32;
+    if entries.len() >= LOCAL_FULL_FLUSH_THRESHOLD {
+        // SAFETY: CPL=0 and every leaf above is already committed.
+        unsafe { crate::paging::flush_user_tlb_local() };
+    } else {
+        for entry in entries {
+            // SAFETY: every request VA was validated by walk_to_leaf.
+            unsafe { crate::paging::invlpg(entry.virt) };
+        }
+    }
+    Ok(())
+}
+
 /// Swap out a **batch** of victim pages in a single backend operation.
 ///
 /// This is the headline entry point. Given up to `swap_batch_pages()`
@@ -652,10 +845,10 @@ pub struct SwapVictim {
 ///   3. Charges the cgroup swap counter for the whole run (roll back
 ///      + bail if over `memory.swap.max`).
 ///   4. Writes every frame to its slot in **one** `write_batch` call.
-///   5. Replaces each victim PTE with a non-present swap entry
-///      (`SwapPte::encode`) via `unmap_4kb` + a direct swap-PTE write,
-///      issuing a single batched TLB range shootdown intent per AS.
-///   6. Frees the now-evicted physical frames back to the buddy.
+///   5. Replaces every victim PTE with a non-present swap entry in one
+///      same-root page-table transaction.
+///   6. Issues one TLB invalidation for the complete batch.
+///   7. Frees the now-evicted physical frames back to the buddy.
 ///
 /// Returns the number of pages actually paged out (0 if the batch was
 /// empty or every victim was already unmapped). On a mid-batch backend
@@ -665,9 +858,33 @@ pub struct SwapVictim {
 /// The caller keeps the returned `SwapSlot` run out of band only if it
 /// wants explicit readahead; the swap entries themselves live in the
 /// PTEs, so a plain fault-in needs no side-table.
+///
+/// # Safety
+///
+/// The caller must atomically remove each resolved frame from its owning
+/// metadata before it can be reclaimed again. In particular, calling this
+/// directly on an [`crate::AddressSpace`] region without clearing its
+/// `Region::phys` slots would make address-space teardown free the frames a
+/// second time. Live reclaim must use the ownership-integrated AddressSpace
+/// path; this primitive exists for that transaction and isolated page-table
+/// tests.
 #[cfg(target_arch = "x86_64")]
-pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
-    use crate::paging::{translate, unmap_4kb};
+pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
+    // SAFETY: forwarded from the public primitive's ownership contract. The
+    // no-op publisher is correct only because that contract requires the
+    // caller to have detached ownership metadata itself.
+    unsafe { swap_out_batch_owned(victims, |_| {}) }
+}
+
+/// Ownership-integrated implementation used by `AddressSpace` reclaim.
+/// `publish` runs after every swap PTE is committed but before the one TLB
+/// retirement and before any victim frame is freed.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn swap_out_batch_owned(
+    victims: &[SwapVictim],
+    publish: impl FnOnce(&[(SwapVictim, PhysAddr)]),
+) -> Result<usize, SwapError> {
+    use crate::paging::translate;
 
     if victims.is_empty() {
         return Ok(0);
@@ -679,6 +896,12 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
     // caller loops if it has more.)
     let batch = victims.len().min(swap_batch_pages());
     let victims = &victims[..batch];
+    let root = victims[0].pml4_phys;
+    if victims.iter().any(|victim| {
+        victim.pml4_phys != root || victim.virt.as_u64() & (ZPAGE_SIZE as u64 - 1) != 0
+    }) {
+        return Err(SwapError::InvalidBatch);
+    }
 
     // ── 1. Resolve live frames. Skip victims that aren't currently
     //       mapped to a 4 KiB page (already unmapped / huge). ──
@@ -692,6 +915,13 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
     }
     if resolved.is_empty() {
         return Ok(0);
+    }
+    resolved.sort_unstable_by_key(|(victim, _)| victim.virt.as_u64());
+    if resolved
+        .windows(2)
+        .any(|pair| pair[0].0.virt == pair[1].0.virt)
+    {
+        return Err(SwapError::InvalidBatch);
     }
     let n = resolved.len();
 
@@ -717,10 +947,13 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
     // ── 4. One batched backend write. ──
     let frames: Vec<PhysAddr> = resolved.iter().map(|(_, p)| *p).collect();
     {
-        let dev = SWAP.lock();
-        let backend = dev.backend.as_ref().expect("backend installed above");
+        let backend = SWAP
+            .lock()
+            .backend
+            .as_ref()
+            .expect("backend installed above")
+            .clone();
         if let Err(e) = backend.write_batch(&slot_run, &frames) {
-            drop(dev);
             // Roll back: uncharge + return the slots. No PTE touched yet.
             swap_uncharge(n as u64);
             let mut dev = SWAP.lock();
@@ -731,59 +964,57 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
         }
     }
 
-    // ── 5 + 6. Install swap PTEs + free the frames. ──
-    //
-    // For each victim: unmap the present PTE (this issues the TLB
-    // invalidation / cross-CPU shootdown via `unmap_4kb`'s
-    // `invlpg_global`), then write the non-present swap entry directly
-    // into the leaf PTE slot, then return the frame to the buddy.
-    let mut done = 0usize;
-    for (k, (v, phys)) in resolved.iter().enumerate() {
-        let slot = SwapSlot(base + k as u64);
-        // SAFETY: caller-owned AS root; the page was resolved present
-        // just above and no other CPU mutates this leaf under us (the
-        // paging lock inside `unmap_4kb` serialises same-root walks).
-        let removed = unsafe { unmap_4kb(v.pml4_phys, v.virt) };
-        if removed.is_err() {
-            // Raced away between translate and unmap — skip; its slot
-            // is dead weight but the backend copy is harmless. Free the
-            // slot back so it can be reused.
-            let mut dev = SWAP.lock();
-            dev.slots.free_slot(base + k as u64);
-            // Discard the now-orphaned backend copy.
-            if let Some(backend) = dev.backend.as_ref() {
-                backend.discard(slot);
+    // ── 5. Atomically stamp the complete same-root PTE batch. ──
+    let commits: Vec<SwapOutCommit> = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, (victim, phys))| SwapOutCommit {
+            virt: victim.virt,
+            expected_phys: *phys,
+            raw: SwapPte {
+                swap_type,
+                offset: base + index as u64,
             }
-            swap_uncharge(1);
-            continue;
+            .encode(),
+        })
+        .collect();
+    // SAFETY: every commit names the one validated root, unique aligned VAs,
+    // and the expected frames resolved immediately above.
+    if unsafe { commit_swap_out_batch(root, &commits) }.is_err() {
+        let backend = SWAP
+            .lock()
+            .backend
+            .as_ref()
+            .expect("backend remains installed")
+            .clone();
+        backend.discard_batch(&slot_run);
+        let mut dev = SWAP.lock();
+        for slot in &slot_run {
+            dev.slots.free_slot(slot.raw());
         }
-        // Install the swap entry directly into the leaf PTE slot.
-        let pte = SwapPte {
-            swap_type,
-            offset: slot.raw(),
-        }
-        .encode();
-        // SAFETY: same AS-root ownership; `write_swap_pte` walks to the
-        // existing leaf (present until the unmap above cleared it, so
-        // every intermediate table exists) and writes the non-present
-        // entry. Non-present ⇒ no INVLPG needed (unmap already flushed).
-        if unsafe { write_swap_pte(v.pml4_phys, v.virt, pte) }.is_err() {
-            // Extremely unlikely (tables were just walked). Restore
-            // sanity: discard the backend copy + free the slot. The
-            // page's contents are lost, but that page was already
-            // unmapped; leaving the PTE empty makes it demand-zero.
-            let mut dev = SWAP.lock();
-            dev.slots.free_slot(base + k as u64);
-            if let Some(backend) = dev.backend.as_ref() {
-                backend.discard(slot);
-            }
-            swap_uncharge(1);
-            continue;
-        }
-        // Return the evicted frame to the buddy.
-        crate::frame::free_frame(crate::frame::PhysFrame::new(*phys));
-        done += 1;
+        drop(dev);
+        swap_uncharge(n as u64);
+        return Err(SwapError::MapFailed);
     }
+
+    // Publish VMA/backing ownership while every old frame is still allocated.
+    // The AddressSpace transition table blocks concurrent teardown and faults
+    // until this callback changes Evicting -> Swapped.
+    publish(&resolved);
+
+    // ONE local + residency-filtered peer invalidation for the entire batch,
+    // before any old frame can return to the allocator. All process roots use
+    // flushing PCID 0 and publish exact scheduler residency for that tag.
+    // SAFETY: every present leaf in the batch was replaced above; user PTEs
+    // are non-global, so the local non-global flush retires every victim.
+    unsafe { crate::paging::flush_user_tlb_local() };
+    crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+
+    // ── 6. Only after the batch flush, free all evicted frames. ──
+    for (_, phys) in &resolved {
+        crate::frame::free_frame(crate::frame::PhysFrame::new(*phys));
+    }
+    let done = resolved.len();
 
     {
         let mut dev = SWAP.lock();
@@ -791,6 +1022,203 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
         dev.pages_out += done as u64;
     }
     Ok(done)
+}
+
+/// Execute the selected virtual runs of a reclaim plan as bounded swap
+/// submissions, preserving explicit partial progress.
+///
+/// Each contiguous plan range is chunked by [`swap_batch_pages`], so slot
+/// allocation, backend I/O, page-table replacement, and TLB retirement stay
+/// first-class batch operations even when the watermark target is large.
+///
+/// # Safety
+///
+/// This has the same backing-ownership precondition as [`swap_out_batch`] for
+/// every selected page. It is a low-level bridge for the AddressSpace reclaim
+/// transaction, not a safe way to evict arbitrary live VMAs.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn swap_out_plan(plan: &crate::reclaim::ReclaimBatchPlan) -> SwapBatchReport {
+    let mut report = SwapBatchReport {
+        planned_pages: plan
+            .ranges
+            .iter()
+            .fold(0usize, |sum, range| sum.saturating_add(range.pages)),
+        ..SwapBatchReport::default()
+    };
+    let batch_pages = swap_batch_pages();
+    for range in &plan.ranges {
+        let mut offset = 0usize;
+        while offset < range.pages {
+            let pages = (range.pages - offset).min(batch_pages);
+            let mut victims = Vec::with_capacity(pages);
+            for page in 0..pages {
+                let page_index = match offset.checked_add(page) {
+                    Some(index) => index,
+                    None => {
+                        report.error = Some(SwapError::InvalidBatch);
+                        return report;
+                    }
+                };
+                let byte_offset = match (page_index as u64).checked_mul(ZPAGE_SIZE as u64) {
+                    Some(offset) => offset,
+                    None => {
+                        report.error = Some(SwapError::InvalidBatch);
+                        return report;
+                    }
+                };
+                let virt = match range.base.as_u64().checked_add(byte_offset) {
+                    Some(virt) => crate::VirtAddr::new(virt),
+                    None => {
+                        report.error = Some(SwapError::InvalidBatch);
+                        return report;
+                    }
+                };
+                victims.push(SwapVictim {
+                    pml4_phys: range.address_space_root,
+                    virt,
+                });
+            }
+            report.attempted_pages = report.attempted_pages.saturating_add(pages);
+            report.submissions = report.submissions.saturating_add(1);
+            // SAFETY: inherited from this function's caller for the plan's
+            // complete selected backing set.
+            match unsafe { swap_out_batch(&victims) } {
+                Ok(done) => report.swapped_pages = report.swapped_pages.saturating_add(done),
+                Err(error) => {
+                    report.error = Some(error);
+                    return report;
+                }
+            }
+            offset += pages;
+        }
+    }
+    report
+}
+
+/// Fault a batch of swapped-out pages back in with one backend operation and
+/// one page-table critical section.
+///
+/// Requests must name one address-space root and unique, page-aligned virtual
+/// addresses. The function validates every swap PTE, allocates all destination
+/// frames, performs one [`SwapBackend::read_batch_into`], and only then
+/// publishes every present PTE atomically with respect to same-root mutation.
+/// If validation, allocation, or I/O fails, no PTE or swap slot is changed.
+/// Returned physical addresses preserve request order.
+#[cfg(target_arch = "x86_64")]
+pub fn swap_in_batch(requests: &[SwapInRequest]) -> Result<Vec<PhysAddr>, SwapError> {
+    swap_in_batch_owned(requests, |_| {})
+}
+
+/// Ownership-integrated implementation used by the AddressSpace fault path.
+/// `publish` runs after present PTEs are committed but before swap slots are
+/// discarded, so region backing becomes authoritative before the transaction
+/// can complete.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn swap_in_batch_owned(
+    requests: &[SwapInRequest],
+    publish: impl FnOnce(&[PhysAddr]),
+) -> Result<Vec<PhysAddr>, SwapError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    if requests.len() > swap_batch_pages() {
+        return Err(SwapError::InvalidBatch);
+    }
+    let root = requests[0].pml4_phys;
+    for (index, request) in requests.iter().enumerate() {
+        if request.pml4_phys != root || request.virt.as_u64() & (ZPAGE_SIZE as u64 - 1) != 0 {
+            return Err(SwapError::InvalidBatch);
+        }
+        if requests[..index]
+            .iter()
+            .any(|prior| prior.virt == request.virt)
+        {
+            return Err(SwapError::InvalidBatch);
+        }
+    }
+
+    // Snapshot all expected swap entries under the same root mutation lock.
+    // A later commit pass revalidates the raw values, so a competing fault can
+    // win safely while backend I/O runs without any page-table lock held.
+    let expected: Vec<(u64, SwapSlot)> = {
+        let _guard = crate::paging::pt_lock_for(root).lock();
+        let mut entries = Vec::with_capacity(requests.len());
+        for request in requests {
+            let raw = read_leaf_pte(root, request.virt).ok_or(SwapError::SlotNotFound)?;
+            let entry = SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?;
+            entries.push((raw, SwapSlot(entry.offset)));
+        }
+        entries
+    };
+    let slots: Vec<SwapSlot> = expected.iter().map(|(_, slot)| *slot).collect();
+
+    // Duplicate slot aliases would let a malformed batch discard the same
+    // backing twice. Legitimate swap PTEs are one-slot-per-leaf.
+    for (index, slot) in slots.iter().enumerate() {
+        if slots[..index].contains(slot) {
+            return Err(SwapError::InvalidBatch);
+        }
+    }
+
+    let mut frames = Vec::with_capacity(requests.len());
+    for _ in requests {
+        match crate::frame::alloc_frame() {
+            Ok(frame) => frames.push(frame),
+            Err(_) => {
+                for frame in frames {
+                    crate::frame::free_frame(frame);
+                }
+                return Err(SwapError::MapFailed);
+            }
+        }
+    }
+    let phys: Vec<PhysAddr> = frames.iter().map(|frame| frame.start_address()).collect();
+    let backend = SWAP
+        .lock()
+        .backend
+        .as_ref()
+        .ok_or(SwapError::SlotNotFound)?
+        .clone();
+    if let Err(error) = backend.read_batch_into(&slots, &phys) {
+        for frame in frames {
+            crate::frame::free_frame(frame);
+        }
+        return Err(error);
+    }
+
+    let commits: Vec<SwapInCommit> = requests
+        .iter()
+        .zip(expected.iter())
+        .zip(phys.iter())
+        .map(|((request, (raw, _)), phys)| SwapInCommit {
+            virt: request.virt,
+            expected_raw: *raw,
+            phys: *phys,
+            flags: request.flags,
+        })
+        .collect();
+    // SAFETY: all requests name the validated root and unique aligned leaves;
+    // fresh frames remain exclusively owned until this all-or-nothing commit.
+    if unsafe { commit_swap_in_batch(root, &commits) }.is_err() {
+        for frame in frames {
+            crate::frame::free_frame(frame);
+        }
+        return Err(SwapError::MapFailed);
+    }
+
+    publish(&phys);
+
+    backend.discard_batch(&slots);
+    {
+        let mut dev = SWAP.lock();
+        for slot in &slots {
+            dev.slots.free_slot(slot.raw());
+        }
+        dev.resident = dev.resident.saturating_sub(requests.len() as u64);
+        dev.pages_in += requests.len() as u64;
+    }
+    swap_uncharge(requests.len() as u64);
+    Ok(phys)
 }
 
 /// Fault a single swapped-out page back in.
@@ -805,73 +1233,21 @@ pub fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError> {
 /// On success the faulting instruction can be resumed — the byte
 /// contents match what was paged out.
 ///
-/// If `readahead` is true, the neighbouring slots of the batch are
-/// *not* automatically mapped (that needs the neighbours' VAs, which
-/// live in other PTEs) but the backend's `read_batch` warm-up is a
-/// future hook; v1 faults exactly the touched page.
+/// AddressSpace faults normally use [`swap_in_batch`] directly to restore the
+/// touched leaf plus consecutive swapped leaves. This wrapper intentionally
+/// restores exactly one page for compatibility and isolated callers.
 #[cfg(target_arch = "x86_64")]
 pub fn swap_in_pte(
     pml4_phys: PhysAddr,
     virt: crate::VirtAddr,
     flags: crate::paging::PtFlags,
 ) -> Result<PhysAddr, SwapError> {
-    use crate::paging::{map_4kb, PtFlags};
-
-    // Read the current leaf PTE to recover the swap slot.
-    let raw = read_leaf_pte(pml4_phys, virt).ok_or(SwapError::SlotNotFound)?;
-    let entry = SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?;
-    let slot = SwapSlot(entry.offset);
-
-    // Allocate a fresh frame for the restored page.
-    let frame = crate::frame::alloc_frame().map_err(|_| SwapError::MapFailed)?;
-    let phys = frame.start_address();
-
-    // Read the page back from the backend into the fresh frame.
-    {
-        let dev = SWAP.lock();
-        let backend = dev.backend.as_ref().ok_or(SwapError::SlotNotFound)?;
-        // SAFETY: `phys` is a freshly-allocated, exclusively-owned 4 KiB
-        // frame; `kernel_mut_ptr` yields a mapping valid for a 4 KiB
-        // write. We cast to a fixed-size array for the backend buffer.
-        let dst = phys.kernel_mut_ptr::<[u8; ZPAGE_SIZE]>();
-        // SAFETY: `dst` is derived from a freshly-allocated, exclusively-
-        // owned 4 KiB frame via `kernel_mut_ptr`; it is non-null, aligned
-        // for `[u8; ZPAGE_SIZE]`, and valid for the write the backend does.
-        let out: &mut [u8; ZPAGE_SIZE] = unsafe { &mut *dst };
-        if let Err(e) = backend.read(slot, out) {
-            drop(dev);
-            crate::frame::free_frame(frame);
-            return Err(e);
-        }
-    }
-
-    // The swap PTE is non-present, so the leaf slot currently holds the
-    // encoded entry — `map_4kb` refuses to overwrite a *present* PTE
-    // but our entry is non-present, so we must clear it first. Write an
-    // empty PTE, then map the fresh frame.
-    // SAFETY: caller-owned AS root; clears the non-present swap entry.
-    unsafe {
-        write_swap_pte(pml4_phys, virt, 0).map_err(|_| SwapError::MapFailed)?;
-    }
-    // SAFETY: caller-owned AS root; the leaf is now empty so map_4kb
-    // installs a fresh present mapping.
-    if unsafe { map_4kb(pml4_phys, virt, phys, flags | PtFlags::PRESENT) }.is_err() {
-        crate::frame::free_frame(frame);
-        return Err(SwapError::MapFailed);
-    }
-
-    // Release the swap slot + backend copy, uncharge, bump counters.
-    {
-        let mut dev = SWAP.lock();
-        if let Some(backend) = dev.backend.as_ref() {
-            backend.discard(slot);
-        }
-        dev.slots.free_slot(slot.raw());
-        dev.resident = dev.resident.saturating_sub(1);
-        dev.pages_in += 1;
-    }
-    swap_uncharge(1);
-    Ok(phys)
+    let restored = swap_in_batch(&[SwapInRequest {
+        pml4_phys,
+        virt,
+        flags,
+    }])?;
+    restored.first().copied().ok_or(SwapError::MapFailed)
 }
 
 /// Drop a swapped-out page's backing without faulting it in. Called
@@ -879,15 +1255,32 @@ pub fn swap_in_pte(
 /// exit): the owner has already cleared/abandoned the PTE, so we only
 /// release the slot + backend copy + cgroup charge.
 pub fn swap_discard(entry: SwapPte) {
-    let slot = SwapSlot(entry.offset);
-    let mut dev = SWAP.lock();
-    if let Some(backend) = dev.backend.as_ref() {
-        backend.discard(slot);
+    swap_discard_batch(&[entry]);
+}
+
+/// Release a vector of swapped-out pages without faulting them in.
+///
+/// Teardown paths use this after clearing a VMA's swap PTEs. The backend is
+/// called once and without the global swap-device lock held; slot/accounting
+/// retirement is then committed under one lock acquisition.
+pub fn swap_discard_batch(entries: &[SwapPte]) {
+    if entries.is_empty() {
+        return;
     }
-    dev.slots.free_slot(slot.raw());
-    dev.resident = dev.resident.saturating_sub(1);
+    let mut slots: Vec<SwapSlot> = entries.iter().map(|entry| SwapSlot(entry.offset)).collect();
+    slots.sort_unstable_by_key(|slot| slot.raw());
+    slots.dedup_by_key(|slot| slot.raw());
+    let backend = SWAP.lock().backend.as_ref().cloned();
+    if let Some(backend) = backend {
+        backend.discard_batch(&slots);
+    }
+    let mut dev = SWAP.lock();
+    for slot in &slots {
+        dev.slots.free_slot(slot.raw());
+    }
+    dev.resident = dev.resident.saturating_sub(slots.len() as u64);
     drop(dev);
-    swap_uncharge(1);
+    swap_uncharge(slots.len() as u64);
 }
 
 // ── Leaf-PTE helpers (x86_64) ──────────────────────────────────────
@@ -941,28 +1334,38 @@ fn read_leaf_pte(pml4_phys: PhysAddr, virt: crate::VirtAddr) -> Option<u64> {
     Some(unsafe { core::ptr::read_volatile(leaf) })
 }
 
-/// Write `raw` into the leaf PTE slot at `virt`. `raw` must be a
-/// non-present value (a swap entry or 0) — writing a present PTE this
-/// way would bypass `map_4kb`'s INVLPG. Fails if the leaf chain is
-/// absent.
-///
-/// # Safety
-/// `pml4_phys` must be a caller-owned, identity-reachable AS root, and
-/// no other CPU may be mutating this leaf concurrently.
+/// Atomically validate and clear a same-root vector of swap leaves for VMA
+/// teardown, returning the entries whose backend slots must be discarded.
 #[cfg(target_arch = "x86_64")]
-unsafe fn write_swap_pte(
+pub(crate) unsafe fn take_swap_entries(
     pml4_phys: PhysAddr,
-    virt: crate::VirtAddr,
-    raw: u64,
-) -> Result<(), SwapError> {
-    debug_assert_eq!(raw & PTE_PRESENT, 0, "swap PTE must be non-present");
-    let leaf = walk_to_leaf(pml4_phys, virt).ok_or(SwapError::MapFailed)?;
-    // SAFETY: per the function contract — live, identity-mapped, u64-
-    // aligned leaf slot with no concurrent mutation.
-    unsafe {
-        core::ptr::write_volatile(leaf, raw);
+    pages: &[crate::VirtAddr],
+) -> Result<Vec<SwapPte>, SwapError> {
+    let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
+    let mut entries = Vec::with_capacity(pages.len());
+    for (index, virt) in pages.iter().enumerate() {
+        if virt.as_u64() & (ZPAGE_SIZE as u64 - 1) != 0 || pages[..index].contains(virt) {
+            return Err(SwapError::InvalidBatch);
+        }
+        let raw = read_leaf_pte(pml4_phys, *virt).ok_or(SwapError::SlotNotFound)?;
+        entries.push(SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?);
     }
-    Ok(())
+    for virt in pages {
+        let leaf = walk_to_leaf(pml4_phys, *virt).ok_or(SwapError::SlotNotFound)?;
+        // SAFETY: every leaf was validated under this still-held root lock.
+        unsafe { core::ptr::write_volatile(leaf, 0) };
+    }
+    const LOCAL_FULL_FLUSH_THRESHOLD: usize = 32;
+    if pages.len() >= LOCAL_FULL_FLUSH_THRESHOLD {
+        // SAFETY: all swap leaves are clear and user PTEs are non-global.
+        unsafe { crate::paging::flush_user_tlb_local() };
+    } else {
+        for virt in pages {
+            // SAFETY: aligned validated user leaf.
+            unsafe { crate::paging::invlpg(*virt) };
+        }
+    }
+    Ok(entries)
 }
 
 // Test-only: reset all global swap state so each test starts clean.
@@ -1174,6 +1577,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn smoke_swap_end_to_end_batch() -> TestResult {
         use crate::paging::{map_4kb, translate, PageTable, PtFlags};
+        use crate::reclaim::{PlannedReclaimRange, ReclaimBatchPlan, PSS_UNITS_PER_PAGE};
         use crate::{alloc_frame, free_frame, VirtAddr};
 
         __reset_for_test();
@@ -1223,13 +1627,31 @@ mod tests {
             });
         }
 
-        // ── Batched swap-out of the whole run. ──
-        let out = match swap_out_batch(&victims) {
-            Ok(n) => n,
-            Err(_) => return TestResult::Fail("swap_out_batch returned Err"),
+        // ── Execute the planner's whole contiguous run. ──
+        let plan = ReclaimBatchPlan {
+            ranges: alloc_crate::vec![PlannedReclaimRange {
+                address_space_root: pml4,
+                base: VirtAddr::new(base_va),
+                pages: N,
+                mapcount: 1,
+                estimated_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+                expected_free_pages: N,
+            }],
+            target_free_pages: N,
+            target_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+            selected_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+            expected_free_pages: N,
+            scanned_pages: N,
         };
-        if out != N {
-            return TestResult::Fail("swap_out_batch didn't page out every victim");
+        // SAFETY: this isolated test page table is the sole owner of every
+        // frame and has no Region metadata that could free them again.
+        let report = unsafe { swap_out_plan(&plan) };
+        if report.error.is_some()
+            || report.swapped_pages != N
+            || report.attempted_pages != N
+            || report.submissions != 1
+        {
+            return TestResult::Fail("swap_out_plan did not complete in one batch");
         }
 
         // Assert every PTE is now a non-present swap entry and the
@@ -1253,12 +1675,21 @@ mod tests {
             return TestResult::Fail("swap_stats.resident wrong after swap-out");
         }
 
-        // ── Fault each page back in and verify the bytes survived. ──
-        for (i, v) in victims.iter().enumerate() {
-            let phys = match swap_in_pte(pml4, v.virt, flags) {
-                Ok(p) => p,
-                Err(_) => return TestResult::Fail("swap_in_pte returned Err"),
-            };
+        // ── Fault the whole run back in with one backend/page-table batch. ──
+        let requests: Vec<SwapInRequest> = victims
+            .iter()
+            .map(|victim| SwapInRequest {
+                pml4_phys: pml4,
+                virt: victim.virt,
+                flags,
+            })
+            .collect();
+        let restored = match swap_in_batch(&requests) {
+            Ok(pages) if pages.len() == N => pages,
+            Ok(_) => return TestResult::Fail("swap_in_batch restored the wrong page count"),
+            Err(_) => return TestResult::Fail("swap_in_batch returned Err"),
+        };
+        for (i, (v, phys)) in victims.iter().zip(restored.iter().copied()).enumerate() {
             // PTE must be present again and translate to the new frame.
             // SAFETY: test-owned root.
             match unsafe { translate(pml4, v.virt) } {

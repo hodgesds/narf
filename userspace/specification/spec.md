@@ -255,7 +255,10 @@ Anonymous private `mmap(MAP_HUGETLB)` supports Linux's default/explicit
 2 MiB and explicit 1 GiB encodings when boot-reserved backing is available.
 Mappings use hardware PD/PDPT leaves on x86_64 and L2/L1 block descriptors
 on aarch64; allocation honors the effective task/range mempolicy and
-`cpuset.mems`; `move_pages`, `migrate_pages`, and `mbind(MPOL_MF_MOVE)`
+`cpuset.mems`. A multi-leaf mapping precomputes the per-leaf policy sequence
+and acquires the huge pool once; exhaustion rolls back the complete vector
+before `mmap` returns `ENOMEM`. `move_pages`, `migrate_pages`, and
+`mbind(MPOL_MF_MOVE)`
 migrate complete hardware leaves between per-node pools while preserving
 contents; `mprotect` operates at the selected hugepage granularity, `munmap`
 returns backing to its per-node pool, and `fork` eagerly copies private huge
@@ -265,6 +268,11 @@ contract.
 The procfs task snapshot includes both base-page and hardware huge-page
 regions with effective policy and per-node residency for
 `/proc/<pid>/numa_maps`.
+Basic procfs task snapshots obtain virtual size, resident pages, writable data,
+and stack size from allocation-free address-space aggregates. Per-region VMA
+materialisation is query-gated to `/proc/<pid>/maps` and `numa_maps`, so a
+metadata or liveness read cannot require contiguous kernel memory proportional
+to the target's VMA count.
 Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata
@@ -612,6 +620,11 @@ number is not.
 - Stack red-zone honoured.
 ### aarch64
 - EL0 entry; `eret`; TPIDR_EL0 for TLS.
+- The scheduler owns TTBR0 context save/activation/restoration around each user
+  future poll. Trap-back longjmp returns with the task's tagged TTBR0 still
+  installed; `UserTaskFuture` does not rewrite or flush it before returning to
+  the executor. This preserves lifetime-scoped process-ASID translations and
+  leaves exactly one component responsible for restoring the incoming root.
 
 ## 6. Dependencies
 

@@ -45,9 +45,9 @@ pub use aarch64 as current;
 
 /// Typical IRQ-vector assignments.
 pub const VECTOR_TIMER: u8 = 32;
-/// Cross-CPU TLB-shootdown IPI. Sender writes a target VA to a
-/// per-CPU shootdown slot then signals via x2APIC ICR all-but-self;
-/// the handler runs INVLPG and bumps an ack counter.
+/// Cross-CPU TLB-shootdown IPI. Sender writes a target VA to each
+/// selected CPU's pending slot, sends fixed-destination x2APIC IPIs,
+/// and waits for the selected handlers to invalidate and ACK.
 pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
 /// LAPIC error vector — programmed into LVT_ERROR. Reading
 /// IA32_X2APIC_ESR after writing 0 to it (Intel SDM Vol 3
@@ -106,7 +106,7 @@ pub fn install_resched_ipi() {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
+fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest, targets: u64) {
     if narf_lib::smp::cpu_count() <= 1 {
         return;
     }
@@ -117,14 +117,14 @@ fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
             let pages = size.div_ceil(0x1000);
             // SAFETY: x2APIC online post-boot; vector installed.
             unsafe {
-                x86_64::ipi::shoot_range(va, pages.max(1), tag);
+                x86_64::ipi::shoot_range_mask(va, pages.max(1), tag, targets);
             }
         }
         // Tag + VA single-page.
         (Some(tag), Some(va), None) => {
             // SAFETY: same.
             unsafe {
-                x86_64::ipi::shoot_va(va, tag);
+                x86_64::ipi::shoot_range_mask(va, 1, tag, targets);
             }
         }
         // Tag-only (full per-tag flush) — real per-tag broadcast.
@@ -135,30 +135,22 @@ fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
         (Some(tag), None, _) => {
             // SAFETY: x2APIC online; vector installed.
             unsafe {
-                x86_64::ipi::shoot_tag_only(tag);
+                x86_64::ipi::shoot_tag_only_mask(tag, targets);
             }
         }
-        // No tag — full TLB flush. The handler skips invalidation
-        // when both tag and VA are zero; we still broadcast the
-        // IPI so every peer's ack counter advances and the
-        // shootdown_count atomic in narf-memory observes delivery.
-        // Peers will pick up the generation bump on their next
-        // page-table switch.
+        // No tag — full non-global TLB flush. Publish the full-flush
+        // sentinel to the selected peers and wait for their ACKs.
         (None, _, _) => {
-            // SAFETY: x2APIC online; broadcast to all-but-self.
+            // SAFETY: x2APIC online; vector installed.
             unsafe {
-                x86_64::apic::wrmsr_icr(
-                    0xC0u64 << 12     // dest shorthand all-excluding-self
-                  | (1 << 14)         // level=assert
-                  | (VECTOR_TLB_SHOOTDOWN as u64),
-                );
+                x86_64::ipi::shoot_full_mask(targets);
             }
         }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {
+fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest, _targets: u64) {
     if narf_lib::smp::cpu_count() <= 1 {
         return;
     }
@@ -171,7 +163,7 @@ fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {}
+fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest, _targets: u64) {}
 
 /// Per-arch CPU "target id" used in MSI / MSI-X routing fields.
 ///

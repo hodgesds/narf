@@ -8,7 +8,7 @@
 //! frames via the identity map.
 //!
 //! Surface mirrors `narf-fb`'s registry pattern: a static
-//! `Vec<Entry>`, a monotonic id allocator, and an exit-observer
+//! registry, a monotonic id allocator, and an exit-observer
 //! reaper hooked into `narf-userspace`.
 //!
 //! Today's per-handle limit is 256 frames (1 MiB). Audio playback
@@ -23,7 +23,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
@@ -76,7 +76,14 @@ impl core::fmt::Debug for Entry {
     }
 }
 
-static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+// Keep entries indirect: stressors can have thousands of live SysV segments,
+// and a Vec<Entry> growth otherwise requires one high-order contiguous kernel
+// heap allocation (160 KiB at 2,048 entries). The pointer vector's growth is
+// ten times smaller while each entry remains a small independent allocation.
+// `clippy::vec_box` flags the Box as redundant, but the indirection is the
+// whole point here — it is what keeps the vector's backing small.
+#[allow(clippy::vec_box)]
+static REGISTRY: IrqSafeSpinLock<Vec<Box<Entry>>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a fresh shared-memory region of `len` bytes (rounded
@@ -111,14 +118,14 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         frames.push(phys);
     }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    REGISTRY.lock().push(Entry {
+    REGISTRY.lock().push(Box::new(Entry {
         handle,
         pid,
         frames,
         refs: alloc::vec![0; pages],
         len: len_pg,
         removed: false,
-    });
+    }));
     Ok(handle)
 }
 
@@ -235,7 +242,9 @@ fn free_phys_frames(frames: Vec<u64>) {
 
 /// Reclaim unreferenced pages of a removed entry. Returns frames that must be
 /// freed after the registry lock is released.
-fn reap_removed_entry(registry: &mut Vec<Entry>, idx: usize) -> Vec<u64> {
+// The `Box` indirection is deliberate (see `REGISTRY`) — keeps the vector small.
+#[allow(clippy::vec_box)]
+fn reap_removed_entry(registry: &mut Vec<Box<Entry>>, idx: usize) -> Vec<u64> {
     let mut reclaim = Vec::new();
     if !registry[idx].removed {
         return reclaim;

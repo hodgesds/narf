@@ -740,10 +740,40 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
+    #[cfg(feature = "kernel-test")]
+    use crate::paging::__range_pt_walks_for_test;
     use crate::paging::{
-        map_4kb_scatter_range, translate, unmap_4kb_local_range, PageTable, PtFlags,
+        flags_at, map_4kb, map_4kb_scatter_range, rewrite_4kb_scatter_range, translate,
+        unmap_4kb_local_range, PageTable, PtFlags, WalkIndices,
     };
     use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    unsafe fn upper_user_bits(root: PhysAddr, virt: VirtAddr) -> Option<[bool; 3]> {
+        let idx = WalkIndices::from_virt(virt);
+        // SAFETY: the caller supplies a live, identity-reachable isolated root.
+        let pml4 = unsafe { &*root.as_ptr::<PageTable>() };
+        let pml4e = pml4.entries[idx.pml4];
+        if !pml4e.is_present() {
+            return None;
+        }
+        // SAFETY: the present non-leaf entry was created by map_4kb below.
+        let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+        let pdpte = pdpt.entries[idx.pdpt];
+        if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+            return None;
+        }
+        // SAFETY: the verified non-huge entry names a live PD.
+        let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+        let pde = pd.entries[idx.pd];
+        if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+            return None;
+        }
+        Some([
+            pml4e.flags().contains(PtFlags::USER),
+            pdpte.flags().contains(PtFlags::USER),
+            pde.flags().contains(PtFlags::USER),
+        ])
+    }
 
     let pml4 = match alloc_frame() {
         Ok(frame) => frame.start_address(),
@@ -759,12 +789,24 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
         PhysAddr::new(0),
         PhysAddr::new(0x1236_2000),
     ];
+    #[cfg(feature = "kernel-test")]
+    let walks_before_map = __range_pt_walks_for_test();
     // SAFETY: the test owns this isolated root; non-zero synthetic backing is
     // aligned and never dereferenced, while zero is the documented lazy slot.
-    if unsafe { map_4kb_scatter_range(pml4, base, &backing, |_| PtFlags::USER | PtFlags::WRITABLE) }
-        .is_err()
+    if unsafe {
+        map_4kb_scatter_range(pml4, base, &backing, |_, _| {
+            PtFlags::USER | PtFlags::WRITABLE
+        })
+    }
+    .is_err()
     {
         return TestResult::Fail("scatter range map failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before_map + 1 {
+            return TestResult::Fail("scatter map repeated an upper-level walk per page");
+        }
     }
     for (page, expected) in backing.into_iter().enumerate() {
         // SAFETY: read-only walk of the still-live isolated root.
@@ -774,8 +816,125 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
             return TestResult::Fail("scatter range translation mismatch");
         }
     }
+    #[cfg(feature = "kernel-test")]
+    let walks_before = __range_pt_walks_for_test();
+    // SAFETY: permission-only rewrite of the same isolated-root backing.
+    if unsafe {
+        rewrite_4kb_scatter_range(pml4, base, &backing, |_, _| {
+            PtFlags::USER | PtFlags::NO_EXEC
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("scatter range permission rewrite failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before + 1 {
+            return TestResult::Fail("scatter rewrite repeated an upper-level walk per page");
+        }
+    }
+    for page in [0_u64, 2] {
+        let va = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: read-only walk of the isolated live root.
+        let read_only =
+            unsafe { flags_at(pml4, va) }.is_some_and(|flags| !flags.contains(PtFlags::WRITABLE));
+        if !read_only {
+            return TestResult::Fail("scatter range rewrite left a writable leaf");
+        }
+    }
+    // SAFETY: the lazy middle slot must remain absent after the rewrite.
+    if unsafe { translate(pml4, VirtAddr::new(base.as_u64() + 4096)) }.is_some() {
+        return TestResult::Fail("scatter range rewrite mapped a lazy slot");
+    }
     // SAFETY: cleanup of the isolated test range.
     let _ = unsafe { unmap_4kb_local_range(pml4, base, 3) };
+    let boundary_base = VirtAddr::new(0x567f_f000);
+    let boundary_backing = [PhysAddr::new(0x1237_0000), PhysAddr::new(0x1237_1000)];
+    #[cfg(feature = "kernel-test")]
+    let walks_before_boundary = __range_pt_walks_for_test();
+    // SAFETY: the isolated two-page range crosses a PT boundary; synthetic
+    // aligned backing is never dereferenced.
+    if unsafe {
+        map_4kb_scatter_range(pml4, boundary_base, &boundary_backing, |_, _| {
+            PtFlags::USER | PtFlags::WRITABLE
+        })
+    }
+    .is_err()
+    {
+        return TestResult::Fail("scatter boundary map failed");
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        if __range_pt_walks_for_test() != walks_before_boundary + 2 {
+            return TestResult::Fail("scatter map reused a PT across its boundary");
+        }
+    }
+    // SAFETY: cleanup of the isolated boundary-spanning range.
+    let _ = unsafe { unmap_4kb_local_range(pml4, boundary_base, 2) };
+
+    // A fresh PML4 slot keeps this mapping-order fixture independent from the
+    // earlier USER scatter mappings in slot zero.
+    let order_base = VirtAddr::new(0x0000_0100_0000_0000);
+    // SAFETY: fresh aligned leaf in the isolated root.
+    if unsafe {
+        map_4kb(
+            pml4,
+            order_base,
+            PhysAddr::new(0x1238_0000),
+            PtFlags::WRITABLE,
+        )
+    }
+    .is_err()
+    {
+        return TestResult::Fail("supervisor-first fixture map failed");
+    }
+    // SAFETY: read-only inspection of the live isolated hierarchy.
+    if unsafe { upper_user_bits(pml4, order_base) } != Some([false; 3]) {
+        return TestResult::Fail("supervisor mapping unexpectedly promoted upper USER bits");
+    }
+    // SAFETY: deliberate collision in the isolated root must fail without
+    // mutating intermediate permissions.
+    if unsafe {
+        map_4kb(
+            pml4,
+            order_base,
+            PhysAddr::new(0x1238_1000),
+            PtFlags::USER | PtFlags::WRITABLE,
+        )
+    } != Err(crate::paging::MapError::AlreadyMapped)
+    {
+        return TestResult::Fail("colliding USER map did not fail precisely");
+    }
+    // SAFETY: read-only inspection after the rejected mapping.
+    if unsafe { upper_user_bits(pml4, order_base) } != Some([false; 3]) {
+        return TestResult::Fail("failed USER map promoted intermediate permissions");
+    }
+    let user_virt = VirtAddr::new(order_base.raw() + 4096);
+    // SAFETY: adjacent leaf is absent and shares the isolated hierarchy.
+    if unsafe {
+        map_4kb(
+            pml4,
+            user_virt,
+            PhysAddr::new(0x1238_1000),
+            PtFlags::USER | PtFlags::WRITABLE,
+        )
+    }
+    .is_err()
+    {
+        return TestResult::Fail("user-second fixture map failed");
+    }
+    // SAFETY: read-only inspection after the successful USER mapping.
+    if unsafe { upper_user_bits(pml4, user_virt) } != Some([true; 3]) {
+        return TestResult::Fail("user mapping did not promote every upper USER bit");
+    }
+    // The upper promotion must not change the supervisor leaf's authority.
+    // SAFETY: read-only leaf walk of the live isolated root.
+    if unsafe { flags_at(pml4, order_base) }.is_some_and(|flags| flags.contains(PtFlags::USER)) {
+        return TestResult::Fail("upper promotion changed supervisor leaf authority");
+    }
+    // SAFETY: cleanup of both order-sensitive fixture leaves.
+    let _ = unsafe { unmap_4kb_local_range(pml4, order_base, 2) };
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -783,6 +942,183 @@ kernel_test_in!(
     "memory",
     smoke_paging_scatter_range_maps_present_and_skips_lazy
 );
+
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
+    use crate::aarch64::paging::{
+        __batch_barrier_counts_for_test, __range_l3_walks_for_test, free_user_ttbr0_tree,
+        map_4kb_scatter_range, translate, unmap_4kb_range, PageTable, PtFlags,
+    };
+    use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    let root = match alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    // SAFETY: the fresh frame is exclusively owned and direct-map reachable.
+    unsafe { core::ptr::write_bytes(root.kernel_mut_ptr::<PageTable>(), 0, 1) };
+    let base = VirtAddr::new(0x567b_0000);
+    let backing = [
+        PhysAddr::new(0x1236_0000),
+        PhysAddr::new(0),
+        PhysAddr::new(0x1236_2000),
+    ];
+    let barriers_before_map = __batch_barrier_counts_for_test();
+    let walks_before_map = __range_l3_walks_for_test();
+    // SAFETY: this test exclusively owns the root. Synthetic leaf backing is
+    // aligned and never dereferenced; zero is the documented lazy sentinel.
+    let mapped = unsafe {
+        map_4kb_scatter_range(root, base, &backing, |_, _| {
+            PtFlags::AP_RW_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    };
+    if mapped.is_err() {
+        // SAFETY: no CPU installs this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter range map failed");
+    }
+    let barriers_after_map = __batch_barrier_counts_for_test();
+    if barriers_after_map.0 != barriers_before_map.0 + 1
+        || barriers_after_map.1 != barriers_before_map.1
+    {
+        // SAFETY: cleanup of a root never installed in TTBR0.
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map did not batch publication barriers");
+    }
+    if __range_l3_walks_for_test() != walks_before_map + 1 {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map repeated an upper-level walk per page");
+    }
+    for (page, expected) in backing.into_iter().enumerate() {
+        // SAFETY: read-only walk of the still-live isolated root.
+        let got = unsafe { translate(root, VirtAddr::new(base.as_u64() + page as u64 * 4096)) };
+        if got != (expected.raw() != 0).then_some(expected) {
+            // SAFETY: cleanup of a root never installed in TTBR0.
+            let _ = unsafe { unmap_4kb_range(root, base, 3) };
+            // SAFETY: no CPU has ever installed this isolated root.
+            unsafe { free_user_ttbr0_tree(root) };
+            return TestResult::Fail("aarch64 scatter translation mismatch");
+        }
+    }
+    let barriers_before_rewrite = __batch_barrier_counts_for_test();
+    let walks_before_rewrite = __range_l3_walks_for_test();
+    // SAFETY: this is a permission-only replacement of the same live backing
+    // in the isolated root. The helper must perform one break-before-make
+    // transaction for both present leaves while preserving the lazy hole.
+    if unsafe {
+        crate::aarch64::paging::rewrite_4kb_scatter_range(root, base, &backing, |_, _| {
+            PtFlags::AP_RO_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    }
+    .is_err()
+    {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter permission rewrite failed");
+    }
+    let barriers_after_rewrite = __batch_barrier_counts_for_test();
+    if barriers_after_rewrite.0 != barriers_before_rewrite.0 + 1
+        || barriers_after_rewrite.1 != barriers_before_rewrite.1 + 1
+    {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 rewrite did not batch break-before-make barriers");
+    }
+    if __range_l3_walks_for_test() != walks_before_rewrite + 2 {
+        let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 rewrite did not batch both upper-level walks");
+    }
+    for page in [0_u64, 2] {
+        let va = VirtAddr::new(base.as_u64() + page * 4096);
+        // SAFETY: read-only walk of the isolated live root.
+        let read_only = unsafe { crate::aarch64::paging::flags_at(root, va) }
+            .is_some_and(|flags| flags.bits() & (0b11 << 6) == PtFlags::AP_RO_EL0.bits());
+        if !read_only {
+            let _ = unsafe { unmap_4kb_range(root, base, 3) };
+            unsafe { free_user_ttbr0_tree(root) };
+            return TestResult::Fail("aarch64 rewrite left a writable leaf");
+        }
+    }
+    // SAFETY: all pages belong to the isolated root; the lazy middle leaf is a
+    // benign miss and the hardware broadcast is safe even though the root was
+    // never active.
+    let barriers_before_unmap = __batch_barrier_counts_for_test();
+    let walks_before_unmap = __range_l3_walks_for_test();
+    if unsafe { unmap_4kb_range(root, base, 3) } != Ok(2) {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap count mismatch");
+    }
+    let barriers_after_unmap = __batch_barrier_counts_for_test();
+    if barriers_after_unmap.1 != barriers_before_unmap.1 + 1 {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap did not batch TLBI barriers");
+    }
+    if __range_l3_walks_for_test() != walks_before_unmap + 1 {
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 range unmap repeated an upper-level walk per page");
+    }
+    if unsafe { unmap_4kb_range(root, base, 3) } != Ok(0) {
+        // SAFETY: no CPU has ever installed this isolated root.
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 repeated range unmap was not idempotent");
+    }
+    let boundary_base = VirtAddr::new(0x567f_f000);
+    let boundary_backing = [PhysAddr::new(0x1237_0000), PhysAddr::new(0x1237_1000)];
+    let walks_before_boundary = __range_l3_walks_for_test();
+    // SAFETY: the two-page isolated range straddles an L3-table boundary and
+    // its aligned synthetic backing is never dereferenced.
+    if unsafe {
+        map_4kb_scatter_range(root, boundary_base, &boundary_backing, |_, _| {
+            PtFlags::AP_RW_EL0 | PtFlags::UXN | PtFlags::PXN
+        })
+    }
+    .is_err()
+    {
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 boundary scatter map failed");
+    }
+    if __range_l3_walks_for_test() != walks_before_boundary + 2 {
+        let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
+        unsafe { free_user_ttbr0_tree(root) };
+        return TestResult::Fail("aarch64 scatter map reused L3 across a boundary");
+    }
+    let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
+    // SAFETY: no CPU has ever installed this isolated root.
+    unsafe { free_user_ttbr0_tree(root) };
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+kernel_test_in!("memory", smoke_aarch64_paging_scatter_and_range_unmap);
+
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+fn smoke_aarch64_paging_root_locks_are_sharded() -> TestResult {
+    use crate::aarch64::paging::pt_lock_for;
+
+    let first = pt_lock_for(crate::PhysAddr::new(0x1000));
+    let second = pt_lock_for(crate::PhysAddr::new(0x2000));
+    let first_addr = first as *const _ as usize;
+    let second_addr = second as *const _ as usize;
+    if core::ptr::eq(first, second) || first_addr & 63 != 0 || second_addr.abs_diff(first_addr) < 64
+    {
+        return TestResult::Fail("aarch64 root mutation shards share a cache line");
+    }
+    let _held = first.lock();
+    if second.try_lock().is_none() {
+        return TestResult::Fail("one aarch64 root lock blocks an unrelated root");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "aarch64", feature = "kernel-test"))]
+kernel_test_in!("memory", smoke_aarch64_paging_root_locks_are_sharded);
 
 fn smoke_pagetable_registry_collision_and_tombstone_reuse() -> TestResult {
     // These synthetic, page-aligned addresses are outside the test VM's RAM.
@@ -1321,6 +1657,42 @@ fn smoke_asid_rollover_bumps_generation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/asid_alloc", smoke_asid_rollover_bumps_generation);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_process_asids_are_unique_and_retired_before_reuse() -> TestResult {
+    use crate::asid_alloc::{
+        allocate_process_asid, process_asid_live_for_test, release_process_asid, N_DOMAINS,
+        TAG_RESERVED,
+    };
+
+    let first = allocate_process_asid();
+    let second = allocate_process_asid();
+    if first.tag == TAG_RESERVED || second.tag == TAG_RESERVED {
+        return TestResult::Fail("process allocator unexpectedly exhausted ASIDs");
+    }
+    if first.tag <= N_DOMAINS as u16 || second.tag <= N_DOMAINS as u16 {
+        return TestResult::Fail("process ASID overlaps the domain-tag partition");
+    }
+    if first.tag == second.tag {
+        return TestResult::Fail("live process address spaces received the same ASID");
+    }
+    if !process_asid_live_for_test(first.tag) || !process_asid_live_for_test(second.tag) {
+        return TestResult::Fail("allocated process ASID was not marked live");
+    }
+
+    release_process_asid(first);
+    if process_asid_live_for_test(first.tag) {
+        release_process_asid(second);
+        return TestResult::Fail("retired process ASID remained live");
+    }
+    release_process_asid(second);
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "memory/asid_alloc",
+    smoke_process_asids_are_unique_and_retired_before_reuse
+);
 
 fn smoke_per_domain_root_register_lookup() -> TestResult {
     use crate::per_domain_root;
@@ -2133,7 +2505,177 @@ fn smoke_memory_many_concurrent_as_then_drop() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_many_concurrent_as_then_drop);
 
+/// Final-owner teardown must detach every sparse top-level subtree in one
+/// short root transaction, then return the intermediate tables through the
+/// batched allocator path. On x86_64 also prove that detachment did not weaken
+/// the private-table ownership registry: every captured hierarchy frame must
+/// be unregistered before it becomes reusable.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let before = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::paging::__teardown_batch_counts_for_test()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::aarch64::paging::__teardown_batch_counts_for_test()
+        }
+    };
+    // These occupy top-level slots 1, 128, and 255 on both 48-bit, four-level
+    // implementations while staying in the canonical user half.
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    // SAFETY: the test runner has paging enabled and exclusively owns the AS.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    for base in bases {
+        let backing = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        if address_space
+            .map_region(Region {
+                base: VirtAddr::new(base),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![backing],
+            })
+            .is_err()
+        {
+            crate::free_frame(crate::PhysFrame::new(backing));
+            return TestResult::Fail("sparse teardown fixture region was rejected");
+        }
+    }
+    // SAFETY: the test owns the root and every registered backing frame.
+    if unsafe { address_space.materialize() }.is_err() {
+        return TestResult::Fail("sparse teardown fixture materialize failed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let registered_tables = {
+        use crate::x86_64::paging::PageTable;
+        let mut tables = alloc::vec![address_space.root];
+        // SAFETY: the materialized root and each verified present descriptor
+        // are identity-reachable, live, and exclusively owned by this test.
+        let pml4 = unsafe { &*address_space.root.as_ptr::<PageTable>() };
+        for base in bases {
+            let pml4e = pml4.entries[((base >> 39) & 0x1ff) as usize];
+            if !pml4e.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PML4 entry");
+            }
+            tables.push(pml4e.addr());
+            // SAFETY: the present PML4 entry names a live, identity-reachable
+            // PDPT in this test's exclusively owned hierarchy.
+            let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+            let pdpte = pdpt.entries[((base >> 30) & 0x1ff) as usize];
+            if !pdpte.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PDPT entry");
+            }
+            tables.push(pdpte.addr());
+            // SAFETY: the present PDPT entry names a live, identity-reachable
+            // PD in this test's exclusively owned hierarchy.
+            let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+            let pde = pd.entries[((base >> 21) & 0x1ff) as usize];
+            if !pde.is_present() {
+                return TestResult::Fail("sparse fixture is missing a PD entry");
+            }
+            tables.push(pde.addr());
+        }
+        if tables
+            .iter()
+            .any(|table| !crate::frame::__pagetable_is_registered(table.raw()))
+        {
+            return TestResult::Fail("sparse fixture table was not registry-owned");
+        }
+        tables
+    };
+
+    drop(address_space);
+    let after = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::paging::__teardown_batch_counts_for_test()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::aarch64::paging::__teardown_batch_counts_for_test()
+        }
+    };
+    if after.0 != before.0 + bases.len() as u64 {
+        return TestResult::Fail("final teardown did not detach every sparse top-level subtree");
+    }
+    // This fixture owns ten table frames (root plus three 3-level subtrees),
+    // so the 64-frame bound must amortise them into exactly one return.
+    if after.1 != before.1 + 1 {
+        return TestResult::Fail("final teardown did not batch table-frame return");
+    }
+    #[cfg(target_arch = "x86_64")]
+    if registered_tables
+        .iter()
+        .any(|table| crate::frame::__pagetable_is_registered(table.raw()))
+    {
+        return TestResult::Fail("final teardown left a stale page-table registration");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!("memory", smoke_memory_sparse_root_teardown_is_batched);
+
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
+
+/// Accounting callers must be able to total a large lazy mapping without
+/// cloning its per-page backing vector. The public result counts VMA spans,
+/// including unbacked pages, and saturates rather than wrapping.
+fn smoke_memory_mapped_bytes_counts_lazy_regions() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the test owns the new user root for its complete lifetime.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_0000_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3],
+    })
+    .expect("map first lazy region");
+    a.map_region(Region {
+        base: VirtAddr::new(base + 0x10_0000),
+        len: 0x5000,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![PhysAddr::new(0); 5],
+    })
+    .expect("map second lazy region");
+
+    if a.mapped_bytes() != 0x8000 {
+        return TestResult::Fail("mapped_bytes did not sum lazy VMA spans");
+    }
+    let stats = a.memory_stats();
+    if stats.mapped_bytes != 0x8000
+        || stats.resident_pages != 0
+        || stats.writable_nonexec_bytes != 0x3000
+    {
+        return TestResult::Fail("allocation-free memory totals are incorrect");
+    }
+    if a.region_len_at_base(VirtAddr::new(base)) != Some(0x3000)
+        || a.region_len_at_base(VirtAddr::new(base + 0x1000)).is_some()
+    {
+        return TestResult::Fail("exact-base region length lookup is incorrect");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mapped_bytes_counts_lazy_regions);
 
 /// Materialize twice in a row on the same AS — must be idempotent
 /// and not leak intermediate frames.
@@ -3196,6 +3738,65 @@ fn smoke_memory_cow_refcount_round_trip() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_cow_refcount_round_trip);
 
+fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
+    use crate::frame::cow;
+
+    cow::__test_clear();
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..4 {
+        match crate::frame::alloc_frame() {
+            Ok(frame) => frames.push(frame),
+            Err(_) => {
+                for frame in frames {
+                    crate::frame::free_frame(frame);
+                }
+                return TestResult::Skip("frame allocator not initialised");
+            }
+        }
+    }
+    let phys: alloc::vec::Vec<_> = frames.iter().map(|frame| frame.start_address()).collect();
+    let batch = [
+        phys[0],
+        phys[1],
+        phys[2],
+        phys[3],
+        phys[0],
+        crate::PhysAddr::new(0),
+    ];
+    cow::inc_ref_batch(&batch);
+    let counts = cow::count_batch(&batch);
+
+    let mut verdict = if cow::count(phys[0]) != 3 {
+        TestResult::Fail("duplicate batch entries did not retain distinct owners")
+    } else if phys[1..].iter().any(|frame| cow::count(*frame) != 2) {
+        TestResult::Fail("batch did not retain every unique frame")
+    } else if cow::count(crate::PhysAddr::new(0)) != 0 {
+        TestResult::Fail("batch registered the unbacked zero sentinel")
+    } else if counts != [3, 2, 2, 2, 3, 0] {
+        TestResult::Fail("batch count snapshot lost input order or duplicate identity")
+    } else {
+        TestResult::Pass
+    };
+
+    // Drop the synthetic batch owners. Every real frame keeps its implicit
+    // original owner, so none is allocator-releasable yet.
+    let releasable = cow::dec_ref_batch(&batch);
+    let post_drop = cow::count_batch(&batch);
+    if matches!(verdict, TestResult::Pass) && !releasable.is_empty() {
+        verdict = TestResult::Fail("batch COW drop released a frame with a live owner");
+    } else if matches!(verdict, TestResult::Pass) && post_drop != [1, 1, 1, 1, 1, 0] {
+        verdict = TestResult::Fail("batch COW drop lost duplicate-owner cardinality");
+    }
+
+    crate::frame::free_frame_batch(&frames);
+    if matches!(verdict, TestResult::Pass) && phys.iter().any(|frame| cow::count(*frame) != 0) {
+        verdict = TestResult::Fail("allocator batch free left final COW owners registered");
+    }
+    cow::__test_clear();
+    verdict
+}
+kernel_test_in!("memory", smoke_memory_cow_refcount_batch_retains_each_owner);
+
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same
@@ -3323,6 +3924,114 @@ kernel_test_in!(
     smoke_memory_clone_for_fork_shares_frames_then_splits
 );
 
+fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResult {
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::{self, cow};
+    use crate::VirtAddr;
+
+    const PAGES: usize = 128;
+    const BASE: u64 = 0x0000_0080_0000_0000;
+
+    // Match stress-ng --mmapfork's troublesome ownership shape: a resident
+    // private mapping is shared through two fork generations, every address
+    // space exits, and the allocator must immediately make forward progress
+    // for the next fork. The 128 pages fill/spill the order-0 cache repeatedly;
+    // the userspace stress gate separately retains the exact 4 MiB workload.
+    // SAFETY: paging and the frame allocator are live in kernel tests.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let mut owned = alloc::vec::Vec::with_capacity(PAGES);
+    for _ in 0..PAGES {
+        match frame::alloc_frame() {
+            Ok(frame) => owned.push(frame),
+            Err(_) => {
+                frame::free_frame_batch(&owned);
+                return TestResult::Skip("not enough frames for nested-fork teardown");
+            }
+        }
+    }
+    let phys: alloc::vec::Vec<_> = owned.iter().map(|frame| frame.start_address()).collect();
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(BASE),
+            len: (PAGES as u64) << 12,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys.clone(),
+        })
+        .is_err()
+    {
+        frame::free_frame_batch(&owned);
+        return TestResult::Fail("map_region nested-fork parent");
+    }
+    // Region metadata now owns every physical frame. PhysFrame is a copyable
+    // handle, so dropping this temporary vector does not return its entries.
+    drop(owned);
+
+    // SAFETY: all roots are fresh, inactive user roots and BASE names the
+    // test-owned resident mapping.
+    if unsafe { parent.materialize() }.is_err() {
+        return TestResult::Fail("materialize nested-fork parent");
+    }
+    // SAFETY: same live-paging contract as materialize above.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("first nested clone_for_fork"),
+    };
+    // SAFETY: child is a fresh inactive user root; parent rewrite applies COW
+    // permissions to its existing leaves.
+    if unsafe { child.materialize() }.is_err() || unsafe { parent.rematerialize() }.is_err() {
+        return TestResult::Fail("materialize first fork generation");
+    }
+    // SAFETY: same fork construction contract, now with an already-COW child.
+    let grandchild = match unsafe { child.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("second nested clone_for_fork"),
+    };
+    // SAFETY: grandchild is fresh and child owns the leaves being rewritten.
+    if unsafe { grandchild.materialize() }.is_err() || unsafe { child.rematerialize() }.is_err() {
+        return TestResult::Fail("materialize second fork generation");
+    }
+    if cow::count(phys[0]) != 3 || cow::count(phys[PAGES - 1]) != 3 {
+        return TestResult::Fail("nested fork lost COW owner cardinality");
+    }
+
+    drop(parent);
+    if cow::count(phys[0]) != 2 || cow::count(phys[PAGES - 1]) != 2 {
+        return TestResult::Fail("parent teardown lost a nested COW owner");
+    }
+    drop(child);
+    if cow::count(phys[0]) != 1 || cow::count(phys[PAGES - 1]) != 1 {
+        return TestResult::Fail("child teardown lost the final nested COW owner");
+    }
+    drop(grandchild);
+    if cow::count(phys[0]) != 0 || cow::count(phys[PAGES - 1]) != 0 {
+        return TestResult::Fail("final nested teardown retained stale COW owners");
+    }
+
+    // The regression in 0239c302 made a later fork stop inside allocator-backed
+    // address-space construction. A fresh root and clone are the progress
+    // assertion; the harness timeout turns any allocator wedge into a failure.
+    // SAFETY: allocator and paging remain live after the complete teardown.
+    let probe = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("allocator made no post-teardown progress"),
+    };
+    // SAFETY: probe is a fresh, inactive user root with no mappings.
+    let probe_child = match unsafe { probe.clone_for_fork() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("post-teardown clone_for_fork failed"),
+    };
+    drop(probe_child);
+    drop(probe);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_nested_fork_teardown_preserves_allocator_progress
+);
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     // After cow_split_on_write rewrites a region's per-page phys
@@ -3431,12 +4140,12 @@ kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
 fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     use crate::frame::UsableRegion;
     use crate::hugepage::{
-        alloc_hugepage_2m, alloc_hugepage_2m_on, free_hugepage, node_stats, reserve_from_regions,
-        stats, HugeAllocError, HUGEPAGE_2M_BYTES,
+        alloc_hugepage_2m, alloc_hugepage_2m_on, alloc_hugepages_with, free_hugepage, node_stats,
+        reserve_from_regions, stats, HugeAllocError, HugeSize, HUGEPAGE_2M_BYTES,
     };
-    use crate::PhysAddr;
+    use crate::{Mempolicy, PhysAddr, MPOL_BIND};
 
-    // Synthetic 16 MiB region aligned to 2 MiB. The phys addresses
+    // Synthetic region aligned to 2 MiB. The phys addresses
     // here are bookkeeping-only — we never touch the memory, so it
     // doesn't matter that they don't correspond to real RAM.
     // Picked far above any realistic kernel-image footprint to
@@ -3445,13 +4154,28 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
     const PAGES: usize = 4;
     let region = UsableRegion {
         start: PhysAddr::new(SYNTH_BASE),
-        len: (PAGES as u64) * HUGEPAGE_2M_BYTES,
+        len: ((PAGES + 1) as u64) * HUGEPAGE_2M_BYTES,
     };
+    // Model the loaded kernel occupying one otherwise-usable huge frame.
+    // Reservation must step over it and still satisfy the requested count
+    // from the remainder of the region.
+    let protected = [(
+        SYNTH_BASE + HUGEPAGE_2M_BYTES,
+        SYNTH_BASE + 2 * HUGEPAGE_2M_BYTES,
+    )];
 
     let before = stats();
-    let excludes = reserve_from_regions(&[region], PAGES, 0);
+    // SAFETY: synthetic bookkeeping-only addresses are drained before the
+    // test returns and no returned frame is dereferenced or donated.
+    let excludes = unsafe { reserve_from_regions(&[region], &protected, PAGES, 0) };
     if excludes.len() != PAGES {
         return TestResult::Fail("reserve_from_regions returned wrong exclude count");
+    }
+    if excludes
+        .iter()
+        .any(|&(lo, hi)| lo < protected[0].1 && protected[0].0 < hi)
+    {
+        return TestResult::Fail("hugepage reservation overlapped a protected range");
     }
     // SAFETY: the exclude is a synthetic physical address used only for
     // topology lookup; the test never dereferences it.
@@ -3465,20 +4189,36 @@ fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
         return TestResult::Fail("per-node free_2m omitted reserved pages");
     }
 
-    // Drain exactly PAGES new allocations through the strict-node API.
-    let mut allocated = alloc::vec::Vec::new();
-    for _ in 0..PAGES {
-        match alloc_hugepage_2m_on(target_node) {
-            Ok(f) => {
-                if f.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
-                    return TestResult::Fail("alloc_hugepage_2m_on returned unaligned phys");
-                }
-                if f.node() != target_node {
-                    return TestResult::Fail("strict hugepage allocation returned wrong node");
-                }
-                allocated.push(f);
-            }
-            Err(_) => return TestResult::Fail("strict hugepage allocation exhausted before PAGES"),
+    let policy = Mempolicy {
+        mode: MPOL_BIND,
+        nodemask: 1u64 << target_node,
+        allowed: 1u64 << target_node,
+        home_node: target_node as u32,
+        interleave_index: 0,
+    };
+    // An oversized batch must roll every pop back before reporting failure.
+    let too_many = alloc::vec![policy; PAGES + 1];
+    let before_failed_batch = node_stats(target_node);
+    if alloc_hugepages_with(HugeSize::M2, &too_many, target_node).is_ok() {
+        return TestResult::Fail("oversized hugepage batch unexpectedly succeeded");
+    }
+    if node_stats(target_node) != before_failed_batch {
+        return TestResult::Fail("failed hugepage batch leaked a partial allocation");
+    }
+
+    // Drain exactly PAGES new allocations through one all-or-nothing pool
+    // transaction, then validate strict physical placement.
+    let policies = alloc::vec![policy; PAGES];
+    let mut allocated = match alloc_hugepages_with(HugeSize::M2, &policies, target_node) {
+        Ok(frames) => frames,
+        Err(_) => return TestResult::Fail("batched strict hugepage allocation failed"),
+    };
+    for frame in &allocated {
+        if frame.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
+            return TestResult::Fail("batched hugepage allocation returned unaligned phys");
+        }
+        if frame.node() != target_node {
+            return TestResult::Fail("batched strict hugepage allocation returned wrong node");
         }
     }
 
@@ -3533,7 +4273,9 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     };
 
     let before = stats();
-    let excludes = reserve_from_regions(&[region], 0, 1);
+    // SAFETY: synthetic bookkeeping-only address; no frame is dereferenced or
+    // donated and the reservation is drained before return.
+    let excludes = unsafe { reserve_from_regions(&[region], &[], 0, 1) };
     if excludes.len() != 1 {
         return TestResult::Fail("expected exactly one 1G exclude");
     }
@@ -3620,36 +4362,119 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
     const USER_VA: u64 = 0x0000_5000_4000_0000;
     let region = UsableRegion {
         start: PhysAddr::new(SYNTH_BASE),
-        len: HUGEPAGE_2M_BYTES,
+        len: 2 * HUGEPAGE_2M_BYTES,
     };
-    let excludes = reserve_from_regions(&[region], 1, 0);
-    if excludes.len() != 1 {
-        return TestResult::Fail("failed to reserve synthetic 2M mapping frame");
+    // SAFETY: synthetic bookkeeping-only address; no frame is dereferenced or
+    // donated and the reservation is drained before return.
+    let excludes = unsafe { reserve_from_regions(&[region], &[], 2, 0) };
+    if excludes.len() != 2 {
+        return TestResult::Fail("failed to reserve synthetic 2M mapping frames");
     }
     // SAFETY: topology lookup only; no synthetic memory is dereferenced.
     let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
     let before_map = node_stats(node);
-    let frame = match alloc_hugepage_2m_on(node) {
-        Ok(frame) => frame,
-        Err(_) => return TestResult::Fail("strict 2M allocation failed"),
-    };
-    let phys = frame.phys();
     // SAFETY: kernel test runs with paging live.
     let aspace = match unsafe { AddressSpace::new_for_user() } {
         Ok(aspace) => aspace,
+        Err(_) => return TestResult::Fail("user address-space creation failed"),
+    };
+
+    // Force a failure on the second leaf. The first leaf and both transferred
+    // frames must roll back after the one-lock x86 batch releases its guard.
+    let first = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("first strict 2M allocation failed"),
+    };
+    let second = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
         Err(_) => {
-            crate::hugepage::free_hugepage(frame);
-            return TestResult::Fail("user address-space creation failed");
+            crate::hugepage::free_hugepage(first);
+            return TestResult::Fail("second strict 2M allocation failed");
         }
     };
-    // SAFETY: the fresh AS owns a live root; frame and VA are 2M-aligned.
+    let conflict_va = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the inactive test root is exclusively owned and the synthetic
+    // zero physical base is never dereferenced.
+    let conflict = unsafe {
+        crate::x86_64::paging::map_2mb(
+            aspace.root,
+            conflict_va,
+            PhysAddr::new(0),
+            crate::x86_64::paging::PtFlags::USER,
+        )
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: same exclusive-root and never-dereferenced contract.
+    let conflict = unsafe {
+        crate::aarch64::paging::map_2mb(
+            aspace.root,
+            conflict_va,
+            PhysAddr::new(0),
+            crate::aarch64::paging::PtFlags::AP_RW_EL0,
+        )
+    };
+    if conflict.is_err() {
+        crate::hugepage::free_hugepage(first);
+        crate::hugepage::free_hugepage(second);
+        return TestResult::Fail("could not install second-leaf conflict");
+    }
+    // SAFETY: the fresh AS owns a live root; frames and VA are 2M-aligned.
     if unsafe {
         aspace.map_huge_region(HugeRegion {
             base: VirtAddr::new(USER_VA),
-            len: HUGEPAGE_2M_BYTES,
+            len: 2 * HUGEPAGE_2M_BYTES,
             perms: RegionPerms::READ | RegionPerms::WRITE,
             size: crate::hugepage::HugeSize::M2,
-            frames: alloc::vec![frame],
+            frames: alloc::vec![first, second],
+        })
+    }
+    .is_ok()
+    {
+        return TestResult::Fail("conflicting multi-leaf huge mapping succeeded");
+    }
+    #[cfg(target_arch = "x86_64")]
+    let rolled_back =
+        // SAFETY: the first leaf must have been removed from this owned root.
+        unsafe { crate::x86_64::paging::translate(aspace.root, VirtAddr::new(USER_VA)) };
+    #[cfg(target_arch = "aarch64")]
+    let rolled_back =
+        // SAFETY: the first leaf must have been removed from this owned root.
+        unsafe { crate::aarch64::paging::translate(aspace.root, VirtAddr::new(USER_VA)) };
+    if rolled_back.is_some() {
+        return TestResult::Fail("failed huge batch left its first leaf mapped");
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: removes the test-owned structural conflict.
+    let conflict_removed = unsafe { crate::x86_64::paging::unmap_2mb(aspace.root, conflict_va) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: removes the test-owned structural conflict.
+    let conflict_removed = unsafe { crate::aarch64::paging::unmap_2mb(aspace.root, conflict_va) };
+    if conflict_removed.is_err() || node_stats(node).free_2m != before_map.free_2m {
+        return TestResult::Fail("failed huge batch did not restore pool ownership");
+    }
+
+    let first = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("first post-rollback allocation failed"),
+    };
+    let second = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => {
+            crate::hugepage::free_hugepage(first);
+            return TestResult::Fail("second post-rollback allocation failed");
+        }
+    };
+    let first_phys = first.phys();
+    let second_phys = second.phys();
+    // SAFETY: the AS owns a live root; frames and VA are 2M-aligned.
+    if unsafe {
+        aspace.map_huge_region(HugeRegion {
+            base: VirtAddr::new(USER_VA),
+            len: 2 * HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: crate::hugepage::HugeSize::M2,
+            frames: alloc::vec![first, second],
         })
     }
     .is_err()
@@ -3663,8 +4488,18 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
     let translated = unsafe { crate::aarch64::paging::translate(aspace.root, probe) };
-    if translated.map(PhysAddr::raw) != Some(phys + 0x1f000) {
+    if translated.map(PhysAddr::raw) != Some(first_phys + 0x1f000) {
         return TestResult::Fail("huge-leaf translation lost its block offset");
+    }
+    let second_probe = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES + 0x17000);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let second_translated = unsafe { crate::x86_64::paging::translate(aspace.root, second_probe) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `aspace` owns the live root and no concurrent mutation occurs.
+    let second_translated = unsafe { crate::aarch64::paging::translate(aspace.root, second_probe) };
+    if second_translated.map(PhysAddr::raw) != Some(second_phys + 0x17000) {
+        return TestResult::Fail("second huge leaf translated to the wrong frame");
     }
     if aspace.mapped_page_size(probe) != Some(HUGEPAGE_2M_BYTES) {
         return TestResult::Fail("2M mapping reported the wrong leaf size");
@@ -3676,6 +4511,7 @@ fn smoke_hugepage_2m_hardware_mapping_roundtrip() -> TestResult {
         return TestResult::Fail("huge frame did not return to its NUMA pool");
     }
     // Drain the synthetic reservation so sibling tests see their entry state.
+    let _ = alloc_hugepage_2m_on(node);
     let _ = alloc_hugepage_2m_on(node);
     TestResult::Pass
 }
@@ -4567,6 +5403,223 @@ fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_demand_alloc_installs_pte);
 
+/// Live AddressSpace swap must move ownership with the PTE transition: two
+/// pages fault back through `demand_alloc_page`, while teardown discards the
+/// remaining swap slot without treating its zero `Region::phys` entry as an
+/// anonymous demand-zero page or double-freeing the old frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
+    use crate::reclaim::{plan_reclaim_ranges, ReclaimRangeCandidate};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr, ZramBackend};
+
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Skip("another swap lifecycle is active");
+    }
+    crate::install_swap_backend(ZramBackend::new());
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 3;
+    let base = VirtAddr::new(0x0000_0080_0008_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for index in 0..N {
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame,
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let address = frame.start_address();
+        // SAFETY: the fresh frame is exclusively owned by the new region.
+        unsafe {
+            core::ptr::write_bytes(address.kernel_mut_ptr::<u8>(), 0x91 + index as u8, 4096);
+        }
+        phys.push(address);
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("swap lifecycle setup failed");
+    }
+    // SAFETY: `aspace` owns a live root and the validated private region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("swap lifecycle setup failed");
+    }
+
+    let plan = plan_reclaim_ranges(
+        &[ReclaimRangeCandidate {
+            address_space_root: aspace.root,
+            base,
+            pages: N,
+            mapcount: 1,
+            expected_free_pages: N,
+            age: 0,
+            locked: false,
+        }],
+        N,
+        N,
+    );
+    // SAFETY: test owns this live address space and its private resident run.
+    let report = unsafe { aspace.swap_out_reclaim_plan(&plan) };
+    if report.error.is_some() || report.swapped_pages != N || report.submissions != 1 {
+        return TestResult::Fail("AddressSpace batch page-out failed");
+    }
+    let snapshot = aspace.regions_snapshot();
+    if snapshot.len() != 1 || snapshot[0].phys.iter().any(|entry| entry.raw() != 0) {
+        return TestResult::Fail("page-out did not transfer Region ownership");
+    }
+    if crate::swap_stats().resident != N as u64 {
+        return TestResult::Fail("batch page-out did not charge every slot");
+    }
+
+    // Fault the middle page: the first-class batch-in path restores it and
+    // the consecutive page ahead, leaving page zero swapped for teardown.
+    // SAFETY: same live-root/fault-path contract as a real user #PF.
+    if unsafe { aspace.demand_alloc_page(VirtAddr::new(base.as_u64() + 4096)) }.is_err() {
+        return TestResult::Fail("swap fault-in failed");
+    }
+    let after_fault = aspace.regions_snapshot();
+    if after_fault[0].phys[0].raw() != 0 {
+        return TestResult::Fail("batch-in unexpectedly pulled a page behind the fault");
+    }
+    for index in 1..N {
+        let restored = after_fault[0].phys[index];
+        if restored.raw() == 0 {
+            return TestResult::Fail("fault-in did not republish Region backing");
+        }
+        // SAFETY: restored is resident and region-owned until teardown.
+        if unsafe { core::ptr::read_volatile(restored.kernel_ptr::<u8>()) } != 0x91 + index as u8 {
+            return TestResult::Fail("fault-in content mismatch");
+        }
+    }
+    if crate::swap_stats().resident != 1 {
+        return TestResult::Fail("batched page-in slot accounting is wrong");
+    }
+
+    if aspace.unmap_region(base).is_err() {
+        return TestResult::Fail("mixed resident/swapped teardown failed");
+    }
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Fail("teardown leaked the unfaulted swap slot");
+    }
+
+    // mlock must preserve swapped contents by paging them in before setting
+    // LOCKED; treating Region::phys==0 as anonymous would silently zero data.
+    let lock_base = VirtAddr::new(base.as_u64() + 0x20_0000);
+    let mut lock_phys = alloc::vec::Vec::new();
+    for pattern in [0xa1u8, 0xa2] {
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), pattern, 4096) };
+        lock_phys.push(frame);
+    }
+    if aspace
+        .map_region(Region {
+            base: lock_base,
+            len: 8192,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: lock_phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mlock swap setup map failed");
+    }
+    // SAFETY: live test root.
+    if unsafe { aspace.materialize_range(lock_base, 8192) }.is_err() {
+        return TestResult::Fail("mlock swap setup materialize failed");
+    }
+    // SAFETY: private two-page run owned by the test AS.
+    if unsafe { aspace.swap_out_private_batch(lock_base, 2) } != Ok(2)
+        || aspace.mlock_range(lock_base, 8192).is_err()
+    {
+        return TestResult::Fail("mlock did not restore swapped contents");
+    }
+    let locked = aspace
+        .regions_snapshot()
+        .into_iter()
+        .find(|region| region.base == lock_base)
+        .expect("locked region missing");
+    if !locked.perms.contains(RegionPerms::LOCKED) || locked.phys.iter().any(|phys| phys.raw() == 0)
+    {
+        return TestResult::Fail("mlock left swapped backing or failed to pin");
+    }
+    for (index, pattern) in [0xa1u8, 0xa2].into_iter().enumerate() {
+        // SAFETY: mlock made the complete region resident.
+        if unsafe { core::ptr::read_volatile(locked.phys[index].kernel_ptr::<u8>()) } != pattern {
+            return TestResult::Fail("mlock replaced swap data with zero-fill");
+        }
+    }
+    if crate::swap_stats().resident != 0 || aspace.unmap_region(lock_base).is_err() {
+        return TestResult::Fail("mlock swap cleanup failed");
+    }
+
+    #[cfg(feature = "linux-compat")]
+    {
+        // MADV_DONTNEED has the opposite contract: retire the stable swap
+        // entry so the next touch is anonymous zero-fill.
+        let discard_base = VirtAddr::new(base.as_u64() + 0x40_0000);
+        let frame = match crate::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0xd7, 4096) };
+        if aspace
+            .map_region(Region {
+                base: discard_base,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![frame],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("madvise swap setup map failed");
+        }
+        // SAFETY: live test root and private mapping.
+        if unsafe { aspace.materialize_range(discard_base, 4096) }.is_err() {
+            return TestResult::Fail("MADV_DONTNEED swap discard failed");
+        }
+        // SAFETY: the test AS exclusively owns this private resident page.
+        if unsafe { aspace.swap_out_private_batch(discard_base, 1) } != Ok(1)
+            || aspace.madvise_dontneed(discard_base, 4096).is_err()
+        {
+            return TestResult::Fail("MADV_DONTNEED swap discard failed");
+        }
+        if crate::swap_stats().resident != 0 {
+            return TestResult::Fail("MADV_DONTNEED leaked a swap slot");
+        }
+        // SAFETY: normal anonymous demand fault after slot retirement.
+        if unsafe { aspace.demand_alloc_page(discard_base) }.is_err() {
+            return TestResult::Fail("post-madvise zero fault failed");
+        }
+        let zero = aspace
+            .regions_snapshot()
+            .into_iter()
+            .find(|region| region.base == discard_base)
+            .expect("madvise region missing")
+            .phys[0];
+        // SAFETY: demand fault made this region-owned frame resident.
+        if unsafe { core::ptr::read_volatile(zero.kernel_ptr::<u8>()) } != 0 {
+            return TestResult::Fail("MADV_DONTNEED preserved discarded swap data");
+        }
+        if aspace.unmap_region(discard_base).is_err() {
+            return TestResult::Fail("madvise swap cleanup failed");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_address_space_batched_swap_lifecycle);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.
@@ -5237,6 +6290,134 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_unmap_region_cycle_no_leak);
+
+/// The OOM reaper reclaims a private anonymous region's resident frames out
+/// from under a would-be victim, returns them to the pool, unmaps them, and is
+/// idempotent — a second reap frees nothing (so it never double-frees against
+/// the victim's own exit teardown).
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let pages = 4usize;
+    let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+    for _ in 0..pages {
+        match crate::alloc_frame() {
+            Ok(f) => phys_list.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    let vbase = 0x0000_0080_0B00_0000u64;
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: (pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: phys_list,
+    })
+    .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+
+    // Reap must free exactly the region's resident pages and return them to
+    // the pool. Measure the delta across the reap to isolate the data frames
+    // from the (leaked-on-forget) page-table overhead.
+    let before_reap = crate::frame::stats().free;
+    let freed = a.reap_anonymous();
+    let after_reap = crate::frame::stats().free;
+    if freed != pages {
+        core::mem::forget(a);
+        return TestResult::Fail("reap did not free every resident anonymous page");
+    }
+    if after_reap < before_reap + pages {
+        core::mem::forget(a);
+        return TestResult::Fail("reaped frames did not return to the pool");
+    }
+    // Idempotent: a second reap frees nothing (backing already zeroed), so it
+    // cannot double-free against the victim's own teardown.
+    if a.reap_anonymous() != 0 {
+        core::mem::forget(a);
+        return TestResult::Fail("second reap double-counted freed frames");
+    }
+    // The reaped page must no longer translate.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some() {
+        core::mem::forget(a);
+        return TestResult::Fail("reaped page still translates");
+    }
+    // Forget (leak the page tables) rather than Drop so this test's free-page
+    // accounting stays isolated to the reap; idempotency above already proved
+    // Drop would be a safe no-op over the zeroed backing.
+    core::mem::forget(a);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_reap_anonymous_reclaims_and_is_idempotent
+);
+
+/// Frame-backed vmalloc: a 64 KiB `valloc` (the order-4 size that defeats a
+/// contiguous buddy block under fragmentation) must map a usable,
+/// virtually-contiguous region backed by scattered frames; `vfree` must FULLY
+/// reclaim it — every data frame, the now-empty page table(s), and the VA — so
+/// the pool returns exactly to its starting count with no residual retention.
+#[cfg(target_arch = "x86_64")]
+fn smoke_vmalloc_valloc_maps_scattered_and_reclaims() -> TestResult {
+    const SIZE: usize = 64 * 1024;
+
+    let free_before = crate::frame::stats().free;
+    let p = match crate::vmalloc::valloc(SIZE) {
+        Some(p) => p,
+        None => return TestResult::Skip("valloc unavailable (kernel slot not reserved)"),
+    };
+    // The mapping must be coherent across every backing page.
+    let bytes = p.as_ptr();
+    // SAFETY: `valloc` returned SIZE bytes of mapped, writable kernel memory.
+    unsafe {
+        let mut i = 0;
+        while i < SIZE {
+            core::ptr::write_volatile(bytes.add(i), (i as u8) ^ 0xA5);
+            i += 4096;
+        }
+        let mut i = 0;
+        while i < SIZE {
+            if core::ptr::read_volatile(bytes.add(i)) != ((i as u8) ^ 0xA5) {
+                crate::vmalloc::vfree(p, SIZE);
+                return TestResult::Fail("valloc mapping not coherent");
+            }
+            i += 4096;
+        }
+    }
+    // SAFETY: pointer + size came from the matching `valloc`.
+    unsafe { crate::vmalloc::vfree(p, SIZE) };
+    // Full reclamation: data frames AND the emptied page table are returned, so
+    // the free count is EXACTLY restored (no bounded page-table retention).
+    if crate::frame::stats().free != free_before {
+        return TestResult::Fail("valloc/vfree leaked frames or page tables");
+    }
+    // VA reclaimed: a second same-size allocation still succeeds.
+    match crate::vmalloc::valloc(SIZE) {
+        Some(p2) => {
+            // SAFETY: matching valloc/vfree.
+            unsafe { crate::vmalloc::vfree(p2, SIZE) };
+            TestResult::Pass
+        }
+        None => TestResult::Fail("valloc VA not reclaimed after vfree"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_vmalloc_valloc_maps_scattered_and_reclaims);
 
 /// `unmap_region` clears the bookkeeping AND tears down the PTEs
 /// — a `translate` on the just-unmapped vaddr must return None.
@@ -6016,6 +7197,23 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     if unsafe { parent.rematerialize() }.is_err() {
         return TestResult::Fail("parent rematerialize");
     }
+    #[cfg(target_arch = "x86_64")]
+    let parent_read_only = {
+        // SAFETY: the parent owns this live root and the region lock is not
+        // concurrently mutated by the isolated test.
+        unsafe { crate::x86_64::paging::flags_at(parent.root, VirtAddr::new(VADDR)) }
+            .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE))
+    };
+    #[cfg(target_arch = "aarch64")]
+    let parent_read_only = {
+        // SAFETY: same isolated live-root contract as the x86_64 check.
+        unsafe { crate::aarch64::paging::flags_at(parent.root, VirtAddr::new(VADDR)) }.is_some_and(
+            |flags| flags.bits() & (0b11 << 6) == crate::aarch64::paging::PtFlags::AP_RO_EL0.bits(),
+        )
+    };
+    if !parent_read_only {
+        return TestResult::Fail("parent rematerialize left the COW leaf writable");
+    }
 
     // ── Replay the #PF handler's COW recovery on the child ──
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -6368,7 +7566,10 @@ kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
 // 3. `madvise_dontneed` releases backed frames + zeros the per-page
 //    phys list so the next access takes the demand-paging path.
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn smoke_memory_mprotect_splits_region() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -6435,8 +7636,15 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
     // Bookkeeping alone is insufficient: stress-ng caught a real regression
     // where mprotect returned success but the live leaf remained writable.
     // SAFETY: `a.root` is the live test-owned PML4 and `mid` is mapped above.
+    #[cfg(target_arch = "x86_64")]
     let leaf_read_only = unsafe { crate::x86_64::paging::flags_at(a.root, mid) }
         .is_some_and(|flags| !flags.contains(crate::x86_64::paging::PtFlags::WRITABLE));
+    // SAFETY: `a.root` is the live test-owned L0 and `mid` is mapped above.
+    #[cfg(target_arch = "aarch64")]
+    let leaf_read_only =
+        unsafe { crate::aarch64::paging::flags_at(a.root, mid) }.is_some_and(|flags| {
+            flags.bits() & (0b11 << 6) == crate::aarch64::paging::PtFlags::AP_RO_EL0.bits()
+        });
     core::mem::forget(a);
     if ok && leaf_read_only {
         TestResult::Pass
@@ -6446,7 +7654,10 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         TestResult::Fail("split layout / perms / phys did not match expectation")
     }
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
 
 /// Rewriting permissions on a lazy mapping must leave its zero backing

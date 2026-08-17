@@ -12,6 +12,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use alloc::vec::Vec;
 use core::fmt;
 use core::ptr;
 
@@ -386,9 +387,27 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
 /// permanent diagnostic and leak-test oracle.
 static USER_PML4_LIVE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
+#[cfg(feature = "kernel-test")]
+static TEARDOWN_DETACHED_PDPTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+static TEARDOWN_FREE_BATCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Number of live user PML4 trees (created minus freed).
 pub fn user_pml4_live() -> i64 {
     USER_PML4_LIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only cumulative counts for final-root subtree detachment and allocator
+/// batches. Production builds contain neither counter nor update.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __teardown_batch_counts_for_test() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        TEARDOWN_DETACHED_PDPTS.load(Ordering::Relaxed),
+        TEARDOWN_FREE_BATCHES.load(Ordering::Relaxed),
+    )
 }
 
 /// Write a value to physical memory while we're still in an
@@ -528,6 +547,21 @@ pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
         unsafe {
             invlpg(v);
         }
+    }
+    // SAFETY: the local half was completed above for this exact range.
+    unsafe { invlpg_remote_range(va_base, pages) };
+}
+
+/// Broadcast a range invalidation to peer CPUs without repeating the current
+/// CPU's invalidation. This is the second half of a batched page-table helper
+/// that already retired its local translations while holding the root lock.
+///
+/// # Safety
+/// The caller must have completed a local invalidation covering the complete
+/// range after its final page-table write.
+pub(crate) unsafe fn invlpg_remote_range(va_base: VirtAddr, pages: u64) {
+    if pages == 0 {
+        return;
     }
     // Prefer the range hook for one-IPI broadcast; fall back to per-page.
     let rh = RANGE_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
@@ -705,9 +739,19 @@ use crate::VirtAddr;
 const PT_LOCK_SHARDS: usize = 64;
 static PT_LOCKS: [narf_lib::sync::IrqSafeSpinLock<()>; PT_LOCK_SHARDS] =
     [const { narf_lib::sync::IrqSafeSpinLock::new(()) }; PT_LOCK_SHARDS];
+#[cfg(feature = "kernel-test")]
+static RANGE_PT_WALKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Upper-level walks performed by contiguous scatter helpers. One
+/// walk covers every page sharing a leaf table (up to 512 entries).
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __range_pt_walks_for_test() -> u64 {
+    RANGE_PT_WALKS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[inline]
-fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
+pub(crate) fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
     // Roots are page-aligned; index by the page number's low bits.
     &PT_LOCKS[((pml4_phys.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)]
 }
@@ -726,6 +770,27 @@ pub unsafe fn map_2mb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: this function holds the root's mutation lock and forwards the
+    // public mapping contract unchanged.
+    unsafe { map_2mb_locked(pml4_phys, virt, phys, flags) }
+}
+
+/// [`map_2mb`] with the per-root mutation lock already held by the caller.
+///
+/// This is crate-visible so a multi-leaf address-space operation can amortize
+/// one lock acquisition across the whole region.
+///
+/// # Safety
+/// The caller must uphold [`map_2mb`]'s contract and hold
+/// [`pt_lock_for(pml4_phys)`] for the entire call.
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_2mb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 2 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -736,7 +801,6 @@ pub unsafe fn map_2mb(
     if phys.raw() & (SIZE - 1) != 0 {
         return Err(MapError::UnalignedPhys);
     }
-    let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
     let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
     if flags.contains(PtFlags::USER) {
@@ -753,6 +817,8 @@ pub unsafe fn map_2mb(
     if pd.entries[idx.pd].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], table_flags);
+    promote_intermediate_flags(&mut pdpt.entries[idx.pdpt], table_flags);
     pd.entries[idx.pd] = PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
     unsafe { invlpg(virt) };
     Ok(())
@@ -769,6 +835,24 @@ pub unsafe fn map_1gb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: this function holds the root's mutation lock and forwards the
+    // public mapping contract unchanged.
+    unsafe { map_1gb_locked(pml4_phys, virt, phys, flags) }
+}
+
+/// [`map_1gb`] with the per-root mutation lock already held by the caller.
+///
+/// # Safety
+/// The caller must uphold [`map_1gb`]'s contract and hold
+/// [`pt_lock_for(pml4_phys)`] for the entire call.
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) unsafe fn map_1gb_locked(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
     const SIZE: u64 = 1024 * 1024 * 1024;
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
@@ -779,7 +863,6 @@ pub unsafe fn map_1gb(
     if phys.raw() & (SIZE - 1) != 0 {
         return Err(MapError::UnalignedPhys);
     }
-    let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
     let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
     if flags.contains(PtFlags::USER) {
@@ -791,6 +874,7 @@ pub unsafe fn map_1gb(
     if pdpt.entries[idx.pdpt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], table_flags);
     pdpt.entries[idx.pdpt] =
         PageTableEntry::new(phys, flags | PtFlags::PRESENT | PtFlags::HUGE_PAGE);
     unsafe { invlpg(virt) };
@@ -893,7 +977,7 @@ pub unsafe fn map_4kb(
     let _pt_guard = pt_lock_for(pml4_phys).lock();
 
     // SAFETY: validation and lock acquisition are immediately above.
-    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags) }
+    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, true) }
 }
 
 /// Install one validated leaf with the per-root page-table lock held.
@@ -902,6 +986,7 @@ unsafe fn map_4kb_locked(
     virt: VirtAddr,
     phys: PhysAddr,
     flags: PtFlags,
+    invalidate_local: bool,
 ) -> Result<(), MapError> {
     let idx = WalkIndices::from_virt(virt);
     // Intermediate tables need `USER` whenever the leaf does — the
@@ -942,6 +1027,9 @@ unsafe fn map_4kb_locked(
     if pt.entries[idx.pt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    promote_intermediate_flags(&mut pml4.entries[idx.pml4], base_flags);
+    promote_intermediate_flags(&mut pdpt.entries[idx.pdpt], base_flags);
+    promote_intermediate_flags(&mut pd.entries[idx.pd], base_flags);
     pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
 
     // Diagnostic readback: if the leaf entry we just wrote doesn't
@@ -960,17 +1048,20 @@ unsafe fn map_4kb_locked(
     // Local INVLPG is sufficient for a fresh mapping — peer CPUs have
     // no entry to invalidate. Remap/unmap call sites broadcast via
     // `invlpg_global`.
-    // SAFETY: INVLPG is always safe.
-    unsafe {
-        invlpg(virt);
+    if invalidate_local {
+        // SAFETY: INVLPG is always safe.
+        unsafe {
+            invlpg(virt);
+        }
     }
 
     Ok(())
 }
 
 /// Map a contiguous virtual run from scatter-list backing while acquiring the
-/// per-root mutation lock once. Zero physical entries are lazy holes and are
-/// skipped. `flags_for` derives each leaf's permissions from its backing.
+/// per-root mutation lock once. Adjacent leaves share one upper-level walk and
+/// one bounded local invalidation phase. Zero physical entries are lazy holes
+/// and are skipped. `flags_for` derives each leaf's permissions from backing.
 ///
 /// On failure, leaves installed earlier in the run remain present; callers
 /// that need transactionality must tear the destination range down before
@@ -983,7 +1074,7 @@ pub unsafe fn map_4kb_scatter_range(
     pml4_phys: PhysAddr,
     base: VirtAddr,
     backing: &[PhysAddr],
-    mut flags_for: impl FnMut(PhysAddr) -> PtFlags,
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError> {
     if !is_canonical(base) || base.raw() & 0xFFF != 0 {
         return Err(if is_canonical(base) {
@@ -1010,16 +1101,251 @@ pub unsafe fn map_4kb_scatter_range(
     }
 
     let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: root is identity-reachable and protected by the mutation guard.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pdpte: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pde: *mut PageTableEntry = core::ptr::null_mut();
+    let mut changed = false;
+    let mut has_global = false;
+    let mut result = Ok(());
     for (index, phys) in backing.iter().copied().enumerate() {
         if phys.raw() == 0 {
             continue;
         }
+        changed = true;
+        let flags = flags_for(index, phys);
+        has_global |= flags.contains(PtFlags::GLOBAL);
+        let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+        if flags.contains(PtFlags::USER) {
+            table_flags |= PtFlags::USER;
+        }
         let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
-        // SAFETY: the complete range was validated above and the root lock is
-        // held for this whole loop.
-        unsafe { map_4kb_locked(pml4_phys, virt, phys, flags_for(phys))? };
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            #[cfg(feature = "kernel-test")]
+            RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            // SAFETY: every level is identity-reachable and the root lock is held.
+            let pml4e = &mut pml4.entries[idx.pml4];
+            // SAFETY: pml4e is a live root slot protected by the root lock.
+            let pdpt_phys = match unsafe { ensure_next_table(pml4e, table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PDPT slot is live and root-locked for this mutation.
+            let pdpte = &mut pdpt.entries[idx.pdpt];
+            // SAFETY: pdpte is a live slot protected by the root lock.
+            let pd_phys = match unsafe { ensure_next_table(pdpte, table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            // SAFETY: ensure_next_table returned a verified table descriptor.
+            let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+            // SAFETY: the PD slot is live and root-locked for this mutation.
+            let pde = &mut pd.entries[idx.pd];
+            // SAFETY: pde is a live slot protected by the root lock.
+            let pt_phys = match unsafe { ensure_next_table(pde, table_flags) } {
+                Ok(phys) => phys,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            cached_pml4e = pml4e;
+            cached_pdpte = pdpte;
+            cached_pde = pde;
+            cached_pt = pt_phys.as_mut_ptr::<PageTable>();
+        }
+
+        // SAFETY: cached_pt belongs to this complete upper-index tuple and is
+        // stable while the root mutation guard is held.
+        let pt = unsafe { &mut *cached_pt };
+        if pt.entries[idx.pt].is_present() {
+            result = Err(MapError::AlreadyMapped);
+            break;
+        }
+        // Re-evaluate every leaf's permissions independently. Only the table
+        // identity is cached; no permission decision is memoized.
+        // SAFETY: all three pointers were captured from the verified walk for
+        // cached_key and remain stable under the root mutation guard.
+        unsafe {
+            promote_intermediate_flags(&mut *cached_pml4e, table_flags);
+            promote_intermediate_flags(&mut *cached_pdpte, table_flags);
+            promote_intermediate_flags(&mut *cached_pde, table_flags);
+        }
+        pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
+        debug_assert_eq!(pt.entries[idx.pt].addr(), phys);
     }
-    Ok(())
+    if changed {
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        let pages = backing.len() as u64;
+        if pages <= FULL_FLUSH_PAGE_CEILING || has_global {
+            for page in 0..pages {
+                // SAFETY: the complete span was validated above.
+                unsafe { invlpg(VirtAddr::new(base.raw() + page * 4096)) };
+            }
+        } else {
+            // SAFETY: no installed leaf in this transaction is global.
+            unsafe { flush_user_tlb_local() };
+        }
+    }
+    result
+}
+
+/// Rewrite a scatter-backed run under one root-lock transaction and one local
+/// invalidation phase. Zero physical entries stay lazy and unmapped.
+///
+/// Existing leaves are replaced in place while the root mutation lock is held.
+/// The helper performs per-page INVLPG for runs up to 512 pages and one local
+/// non-global flush for larger runs. A caller whose address space can be active
+/// on peer CPUs must follow with [`invlpg_remote_range`] or a full remote flush.
+///
+/// On failure, earlier replacements remain installed and every changed page in
+/// the span is locally invalidated before return.
+///
+/// # Safety
+/// Same live-root, identity-map, and backing-lifetime contract as
+/// [`map_4kb_scatter_range`].
+pub unsafe fn rewrite_4kb_scatter_range(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    mut flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(base) || base.raw() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let pages = backing.len() as u64;
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+    if backing
+        .iter()
+        .any(|phys| phys.raw() != 0 && phys.raw() & 0xFFF != 0)
+    {
+        return Err(MapError::UnalignedPhys);
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let mut changed = false;
+    let mut result = Ok(());
+    // Cache the leaf table for each contiguous 2 MiB run. Permission rewrites
+    // normally touch already-materialized leaves, so this makes the common
+    // path one upper walk plus one descriptor store per 512 pages.
+    // SAFETY: root is identity-reachable and protected by the mutation guard.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pdpte: *mut PageTableEntry = core::ptr::null_mut();
+    let mut cached_pde: *mut PageTableEntry = core::ptr::null_mut();
+    for (index, phys) in backing.iter().copied().enumerate() {
+        if phys.raw() == 0 {
+            continue;
+        }
+        changed = true;
+        let virt = VirtAddr::new(base.raw() + index as u64 * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            #[cfg(feature = "kernel-test")]
+            RANGE_PT_WALKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+            let pml4e = &mut pml4.entries[idx.pml4];
+            if pml4e.is_present() {
+                // SAFETY: verified present table descriptor under root lock.
+                let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+                let pdpte = &mut pdpt.entries[idx.pdpt];
+                if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                    result = Err(MapError::EncounteredHugePage);
+                    break;
+                }
+                if pdpte.is_present() {
+                    // SAFETY: verified PDPT table descriptor under root lock.
+                    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+                    let pde = &mut pd.entries[idx.pd];
+                    if pde.flags().contains(PtFlags::HUGE_PAGE) {
+                        result = Err(MapError::EncounteredHugePage);
+                        break;
+                    }
+                    if pde.is_present() {
+                        cached_pml4e = pml4e;
+                        cached_pdpte = pdpte;
+                        cached_pde = pde;
+                        cached_pt = pde.addr().as_mut_ptr::<PageTable>();
+                    }
+                }
+            }
+        }
+        let flags = flags_for(index, phys);
+        if cached_pt.is_null() {
+            // SAFETY: missing upper levels are created under the same guard.
+            if let Err(error) = unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, false) } {
+                result = Err(error);
+                break;
+            }
+            // The next page must rediscover the table just created.
+            cached_key = usize::MAX;
+        } else {
+            let mut table_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+            if flags.contains(PtFlags::USER) {
+                table_flags |= PtFlags::USER;
+            }
+            // Permission requirements are derived per leaf; only verified
+            // descriptor addresses are cached under the root lock.
+            // SAFETY: pointers came from this cached key's verified walk and
+            // remain live while the root mutation guard is held.
+            unsafe {
+                promote_intermediate_flags(&mut *cached_pml4e, table_flags);
+                promote_intermediate_flags(&mut *cached_pdpte, table_flags);
+                promote_intermediate_flags(&mut *cached_pde, table_flags);
+            }
+            // SAFETY: cached_pt came from the verified PDE for this key and
+            // remains stable under the root mutation guard.
+            let pt = unsafe { &mut *cached_pt };
+            pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
+            debug_assert_eq!(pt.entries[idx.pt].addr(), phys);
+        }
+    }
+    if changed {
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        if pages <= FULL_FLUSH_PAGE_CEILING {
+            for page in 0..pages {
+                let virt = VirtAddr::new(base.raw() + page * 4096);
+                // SAFETY: the range is canonical and page-aligned.
+                unsafe { invlpg(virt) };
+            }
+        } else {
+            // SAFETY: user leaves are non-global; this retires every changed
+            // local translation in one operation.
+            unsafe { flush_user_tlb_local() };
+        }
+    }
+    result
 }
 
 /// Tear down a 4 KiB mapping. Intermediate tables are left intact —
@@ -1030,6 +1356,66 @@ pub unsafe fn map_4kb_scatter_range(
 pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
     // SAFETY: forwarded caller contract.
     unsafe { unmap_4kb_impl(pml4_phys, virt, true) }
+}
+
+/// If the level-1 page table (PT) covering `virt` in `root` holds no present
+/// leaves, free it and clear its PD entry. The frame-backed vmalloc free path
+/// calls this to FULLY reclaim page tables rather than retaining them; PD/PDPT
+/// levels are intentionally kept (the PDPT is the shared, boot-reserved kernel
+/// vmalloc slot every address space copies by value). Returns true if a PT was
+/// freed. A no-op (returns false) on huge leaves or an already-empty subtree.
+///
+/// # Safety
+/// `root` must be the live kernel root. The caller MUST have already unmapped
+/// every present leaf in this PT with a GLOBAL INVLPG (as `unmap_4kb` does):
+/// INVLPG invalidates the paging-structure caches for the address on all CPUs,
+/// so once every leaf is flushed, no CPU can walk the freed PT frame after it
+/// is reused.
+pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
+    let _guard = pt_lock_for(root).lock();
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: root is identity-reachable and the mutation lock is held.
+    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return false;
+    }
+    // SAFETY: a present PML4 entry names an identity-reachable PDPT. The PDPT
+    // itself is the shared, boot-reserved kernel vmalloc slot and is never
+    // freed here, so this borrow is const.
+    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpte = pdpt.entries[idx.pdpt];
+    if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    // SAFETY: a present, non-huge PDPT entry names an identity-reachable PD.
+    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pde = pd.entries[idx.pd];
+    if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+        return false;
+    }
+    let pt_phys = pde.addr();
+    // SAFETY: a present, non-huge PD entry names an identity-reachable PT.
+    let pt = unsafe { &*pt_phys.as_ptr::<PageTable>() };
+    if pt.entries.iter().any(|e| e.is_present()) {
+        return false;
+    }
+    // Detach and free the now-empty PT. The caller's per-leaf global INVLPGs
+    // already flushed the paging-structure caches covering this range, so the
+    // freed frame cannot be walked into after reuse.
+    pd.entries[idx.pd] = PageTableEntry::EMPTY;
+    crate::frame::__pagetable_unregister(pt_phys.raw());
+    crate::frame::free_frame(crate::frame::PhysFrame::new(pt_phys));
+    // Cascade: if that emptied the PD too, free it and clear its PDPT entry.
+    // Stop at the PDPT — it is the reserved slot's shared child every address
+    // space copies, so it must persist.
+    if !pd.entries.iter().any(|e| e.is_present()) {
+        let pd_phys = pdpte.addr();
+        pdpt.entries[idx.pdpt] = PageTableEntry::EMPTY;
+        crate::frame::__pagetable_unregister(pd_phys.raw());
+        crate::frame::free_frame(crate::frame::PhysFrame::new(pd_phys));
+    }
+    true
 }
 
 /// [`unmap_4kb`] WITHOUT the cross-CPU shootdown broadcast — the leaf PTE is
@@ -1207,6 +1593,19 @@ unsafe fn unmap_4kb_locked(
     if !removed.is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    // Invariant guard (see `vmalloc::kernel_leaf_flags`): a GLOBAL leaf must
+    // never be unmapped at runtime. Several TLB-flush paths deliberately retain
+    // global entries (the idle-CPU deferred `flush_user_tlb_local`,
+    // `invpcid_all_without_globals`, the no-PCID MOV-CR3 self-flush), so a
+    // GLOBAL mapping torn down here would strand a stale translation on a peer
+    // CPU and let it access the reused frame — an intermittent SMP #PF. GLOBAL
+    // is reserved for PERMANENT kernel mappings that are never shot down. If
+    // this fires, the offending mapper must drop `PtFlags::GLOBAL`.
+    debug_assert!(
+        !removed.flags().contains(PtFlags::GLOBAL),
+        "unmap_4kb of a GLOBAL leaf at {:#x} — runtime-unmapped kernel mappings must be non-global",
+        virt.raw(),
+    );
     pt.entries[idx.pt] = PageTableEntry::EMPTY;
 
     // Unmap is the canonical "stale-TLB" case: peer CPUs may have
@@ -1257,68 +1656,117 @@ unsafe fn unmap_4kb_locked(
 /// - All data-page leaves must already have been released. The
 ///   `AddressSpace::Drop` path arranges this by calling
 ///   `unmap_region_pages` for every region before invoking us.
+/// - Private top-level entries are detached under the root shard; the inactive
+///   subtrees are walked and batch-returned after that shard is released.
 /// - No CPU may be using `pml4_phys` as its active CR3 at the
 ///   time of the call.
 pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
-    use crate::frame::{free_frame, PhysFrame};
+    use crate::frame::{free_unique_frame_batch, PhysFrame};
+    const FREE_BATCH_FRAMES: usize = 64;
+
+    #[inline]
+    fn flush_reclaimed(frames: &mut Vec<PhysFrame>) {
+        if frames.is_empty() {
+            return;
+        }
+        // SAFETY: every queued table was detached from the final inactive
+        // root and unregistered before it entered this batch. Page tables are
+        // never COW-shared.
+        unsafe { free_unique_frame_batch(frames) };
+        frames.clear();
+        #[cfg(feature = "kernel-test")]
+        TEARDOWN_FREE_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn queue_reclaimed(frames: &mut Vec<PhysFrame>, phys: PhysAddr) {
+        frames.push(PhysFrame::new(phys));
+        if frames.len() == FREE_BATCH_FRAMES {
+            flush_reclaimed(frames);
+        }
+    }
+
     if pml4_phys.raw() == 0 {
         return;
     }
     USER_PML4_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    // Serialise teardown against any (stale) concurrent map/unmap on this root.
-    let _pt_guard = pt_lock_for(pml4_phys).lock();
-    // SAFETY: identity-reachable per caller contract.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
-    // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
-    // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
-    // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
-    // PDPT for that slot). Every other PML4[0..256] entry is a
-    // bulk-copied pointer to a SHARED kernel page-table page —
-    //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
-    //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
-    //     access from kernel mode.
-    //   - PML4[2..=255]: currently reserved-zero, but if the kernel
-    //     ever lights one up it'll be shared too.
-    // Walking those and freeing the PDPT they point at returns
-    // kernel page tables to the buddy allocator; the next
-    // `alloc_coherent` hands the freed PDPT to a driver, `memset`
-    // zeros it, and the huge-page entries vanish mid-write — the
-    // exact #PF that surfaced the audio probe regression.
-    // Walk EVERY user-half PML4 slot (1..=255), not a hardcoded pair.
-    // A real process lights up far more than slots 1 + 129:
-    //   slot 1   — user binary  (0x0000_0080_0000_0000)
-    //   slot 128 — ELF interpreter / ld-musl bias (0x0000_4000_0000_0000)
-    //   slot 129 — mmap arena    (0x0000_4080_0000_0000)
-    //   slot 160 — vDSO + brk heap (0x0000_5000_0000_0000)
-    //   slot 255 — user stack    (0x0000_7FFF_FFFC_0000)
-    // The old `[1, 129]` list LEAKED the slot-128/160/255 page tables —
-    // and, worse, never `__pagetable_unregister`'d them, so their stale
-    // registrations accumulated in PT_REGISTRY and accelerated the
-    // ring-wrap clobber behind the "marginal-buddy" double-free.
-    //
-    // Slot 0 (kernel low-4-GiB identity) and slots 256..512 (kernel
-    // high-half) are SHARED — `new_user_pml4_on` bulk-copies the kernel
-    // PDPT pointers into them, so freeing them would return kernel page
-    // tables to the buddy. The loop bound (1..256) excludes both. As an
-    // extra guard against a future kernel mapping inside the user half,
-    // only AS-private PDPTs are walked: those are the ones recorded in
-    // PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
-    // every table they allocate); a kernel-shared PDPT is never
-    // registered, so the `__pagetable_is_registered` check below skips
-    // it.
-    for slot in 1usize..256 {
-        let pml4e = pml4.entries[slot];
-        if !pml4e.is_present() {
-            continue;
+    // Reserve before taking the IRQ-safe page-table lock. There are exactly
+    // 255 candidate private slots, so pushes in the critical section cannot
+    // grow the allocation.
+    let mut detached_pdpts = Vec::with_capacity(255);
+    {
+        // Serialise the short root-detach transaction against any stale
+        // concurrent map/unmap. The caller contract excludes live users, so
+        // detached children need no TLB retirement before traversal.
+        let _pt_guard = pt_lock_for(pml4_phys).lock();
+        // SAFETY: identity-reachable per caller contract.
+        let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+        // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
+        // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
+        // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
+        // PDPT for that slot). Every other PML4[0..256] entry is a
+        // bulk-copied pointer to a SHARED kernel page-table page —
+        //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
+        //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
+        //     access from kernel mode.
+        //   - PML4[2..=255]: currently reserved-zero, but if the kernel
+        //     ever lights one up it'll be shared too.
+        // Walking those and freeing the PDPT they point at returns
+        // kernel page tables to the buddy allocator; the next
+        // `alloc_coherent` hands the freed PDPT to a driver, `memset`
+        // zeros it, and the huge-page entries vanish mid-write — the
+        // exact #PF that surfaced the audio probe regression.
+        // Walk EVERY user-half PML4 slot (1..=255), not a hardcoded pair.
+        // A real process lights up far more than slots 1 + 129:
+        //   slot 1   — user binary  (0x0000_0080_0000_0000)
+        //   slot 128 — ELF interpreter / ld-musl bias (0x0000_4000_0000_0000)
+        //   slot 129 — mmap arena    (0x0000_4080_0000_0000)
+        //   slot 160 — vDSO + brk heap (0x0000_5000_0000_0000)
+        //   slot 255 — user stack    (0x0000_7FFF_FFFC_0000)
+        // The old `[1, 129]` list LEAKED the slot-128/160/255 page tables —
+        // and, worse, never `__pagetable_unregister`'d them, so their stale
+        // registrations accumulated in PT_REGISTRY and accelerated the
+        // ring-wrap clobber behind the "marginal-buddy" double-free.
+        //
+        // Slot 0 (kernel low-4-GiB identity) and slots 256..512 (kernel
+        // high-half) are SHARED — `new_user_pml4_on` bulk-copies the kernel
+        // PDPT pointers into them, so freeing them would return kernel page
+        // tables to the buddy. The loop bound (1..256) excludes both. As an
+        // extra guard against a future kernel mapping inside the user half,
+        // only AS-private PDPTs are walked: those are the ones recorded in
+        // PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
+        // every table they allocate); a kernel-shared PDPT is never
+        // registered, so the `__pagetable_is_registered` check below skips
+        // it.
+        for slot in 1usize..256 {
+            let pml4e = pml4.entries[slot];
+            if !pml4e.is_present() {
+                continue;
+            }
+            let pdpt_pa = pml4e.addr();
+            if pdpt_pa.raw() < 0x100000 {
+                continue;
+            }
+            // Only detach AS-private page tables; never a kernel-shared one.
+            if !crate::frame::__pagetable_is_registered(pdpt_pa.raw()) {
+                continue;
+            }
+            detached_pdpts.push(pdpt_pa);
+            pml4.entries[slot] = PageTableEntry::EMPTY;
         }
-        let pdpt_pa = pml4e.addr();
-        if pdpt_pa.raw() < 0x100000 {
-            continue;
-        }
-        // Only reclaim AS-private page tables; never a kernel-shared one.
-        if !crate::frame::__pagetable_is_registered(pdpt_pa.raw()) {
-            continue;
-        }
+    }
+    #[cfg(feature = "kernel-test")]
+    TEARDOWN_DETACHED_PDPTS.fetch_add(
+        detached_pdpts.len() as u64,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
+    // All allocator work is deliberately outside the page-table shard. Walk
+    // only detached, registry-owned subtrees and return table frames in
+    // bounded batches so a large sparse process neither monopolises the shard
+    // nor builds an unbounded temporary vector during exit.
+    let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
+    for pdpt_pa in detached_pdpts {
         // SAFETY: identity-reachable; PDPT is a page-table frame.
         let pdpt = unsafe { &mut *pdpt_pa.as_mut_ptr::<PageTable>() };
         for pdpt_idx in 0..512usize {
@@ -1351,19 +1799,18 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                     continue;
                 }
                 crate::frame::__pagetable_unregister(pde.addr().raw());
-                free_frame(PhysFrame::new(pde.addr()));
+                queue_reclaimed(&mut reclaimed, pde.addr());
             }
             crate::frame::__pagetable_unregister(pd_pa.raw());
-            free_frame(PhysFrame::new(pd_pa));
+            queue_reclaimed(&mut reclaimed, pd_pa);
         }
         crate::frame::__pagetable_unregister(pdpt_pa.raw());
-        free_frame(PhysFrame::new(pdpt_pa));
-        // Clear the PML4 slot so a stray reuse panics noisily.
-        pml4.entries[slot] = PageTableEntry::EMPTY;
+        queue_reclaimed(&mut reclaimed, pdpt_pa);
     }
     // Finally release the PML4 itself.
     crate::frame::__pagetable_unregister(pml4_phys.raw());
-    free_frame(PhysFrame::new(pml4_phys));
+    queue_reclaimed(&mut reclaimed, pml4_phys);
+    flush_reclaimed(&mut reclaimed);
 }
 
 /// Return the PT-level flags currently set for `virt`, or `None` if
@@ -1537,4 +1984,14 @@ unsafe fn ensure_next_table(
     PageTable::zero_at(phys.as_mut_ptr::<PageTable>());
     *slot = PageTableEntry::new(phys, flags);
     Ok(phys)
+}
+
+/// Add permissions required by a new descendant leaf to an existing table
+/// descriptor. Leaf permissions remain authoritative: setting USER/WRITABLE
+/// here cannot grant either permission through a supervisor/read-only leaf.
+#[inline]
+fn promote_intermediate_flags(slot: &mut PageTableEntry, required: PtFlags) {
+    debug_assert!(slot.is_present());
+    debug_assert!(!slot.flags().contains(PtFlags::HUGE_PAGE));
+    *slot = PageTableEntry::from_raw(slot.raw() | required.bits());
 }

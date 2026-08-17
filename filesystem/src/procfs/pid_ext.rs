@@ -397,7 +397,7 @@ fn render_io(_pid: u64) -> String {
 /// TODO: Pull real counters from the scheduler once per-task runtime
 /// accounting lands in narf_scheduler.
 fn render_sched(pid: u64) -> String {
-    let comm = task_info(pid)
+    let comm = task_info(pid, super::TaskInfoQuery::Basic)
         .map(|i| i.comm)
         .unwrap_or_else(|| format!("task-{}", pid));
     let nice = hook_nice(pid);
@@ -470,7 +470,9 @@ fn render_stack(_pid: u64) -> String {
 /// TODO: surface the actual sleep-site once the scheduler exposes a
 /// per-task "parked in" symbol handle.
 fn render_wchan(pid: u64) -> String {
-    let state = task_info(pid).map(|i| i.state).unwrap_or('R');
+    let state = task_info(pid, super::TaskInfoQuery::Basic)
+        .map(|i| i.state)
+        .unwrap_or('R');
     if state == 'S' {
         // TODO: return the real wait-channel symbol name once
         // narf_scheduler exposes per-task sleep-site info.
@@ -487,7 +489,9 @@ fn render_wchan(pid: u64) -> String {
 /// or `"running\n"` when the task is not blocked in a syscall.
 /// TODO: expose the saved syscall-entry frame from the trap path.
 fn render_syscall(pid: u64) -> String {
-    let state = task_info(pid).map(|i| i.state).unwrap_or('R');
+    let state = task_info(pid, super::TaskInfoQuery::Basic)
+        .map(|i| i.state)
+        .unwrap_or('R');
     if state == 'R' {
         "running\n".to_string()
     } else {
@@ -693,21 +697,9 @@ fn loginuid_set(pid: u64, uid: u32) {
 /// Linux ref: `fs/proc/array.c:proc_pid_statm`.
 fn render_statm(pid: u64) -> String {
     const PAGE_SIZE: u64 = 4096;
-    let info = task_info(pid);
-    // size: sum of all mapped VMA spans, in pages.
-    let size_pages = info
-        .as_ref()
-        .map(|i| {
-            i.vmas
-                .iter()
-                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
-    // resident: approximated as equal to size (no page-table walk yet).
-    // TODO: wire a per-task RSS counter from the page-fault path once
-    // narf_memory exposes per-task resident-set accounting.
-    let resident_pages = size_pages;
+    let info = task_info(pid, super::TaskInfoQuery::Basic);
+    let size_pages = info.as_ref().map_or(0, |i| i.vm_size_bytes / PAGE_SIZE);
+    let resident_pages = info.as_ref().map_or(0, |i| i.resident_pages);
     // shared: MAP_SHARED VMA pages — the `shared` flag every VMA
     // already carries (same residency approximation as `resident`).
     let shared_pages = info
@@ -941,7 +933,7 @@ impl FileOps for ProcTaskTidComm {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
         Box::pin(async move {
-            let comm = task_info(pid)
+            let comm = task_info(pid, super::TaskInfoQuery::Basic)
                 .map(|i| i.comm)
                 .unwrap_or_else(|| format!("task-{}", pid));
             let s = format!("{}\n", comm);

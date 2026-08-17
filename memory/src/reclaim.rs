@@ -97,7 +97,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::PhysAddr;
+use crate::{PhysAddr, VirtAddr};
 
 // ── Free-memory watermarks (Linux-shaped) ──────────────────────────
 //
@@ -117,6 +117,9 @@ use crate::PhysAddr;
 static WMARK_MIN: AtomicU64 = AtomicU64::new(0);
 static WMARK_LOW: AtomicU64 = AtomicU64::new(0);
 static WMARK_HIGH: AtomicU64 = AtomicU64::new(0);
+/// Total usable page count, recorded at `init_watermarks` so the low/high band
+/// can be re-derived whenever `min` or the scale factor changes at runtime.
+static WMARK_TOTAL_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Lower clamp on `min` (pages): keep at least ~2 MiB free even on
 /// tiny memories so an allocation storm always has a little headroom.
@@ -125,44 +128,96 @@ const WMARK_MIN_FLOOR_PAGES: u64 = 512;
 /// machine doesn't hold back an absurd amount of otherwise-usable RAM.
 const WMARK_MIN_CEIL_PAGES: u64 = 65_536;
 
+/// `vm.watermark_scale_factor` analogue, in units of 1/10000 of total RAM.
+/// It sets the gap between adjacent watermarks — `gap = max(min/4,
+/// total·scale/10000)` — so a larger factor WIDENS the reclaim band and kswapd
+/// sheds a bigger batch per wake (fewer, larger passes). Linux defaults to 10
+/// (0.1%) and clamps to [1, 3000].
+const WMARK_SCALE_DEFAULT: u64 = 10;
+const WMARK_SCALE_MIN: u64 = 1;
+const WMARK_SCALE_MAX: u64 = 3000;
+static WMARK_SCALE_FACTOR: AtomicU64 = AtomicU64::new(WMARK_SCALE_DEFAULT);
+
 /// Compute + install the free-memory watermarks from the total usable
 /// page count. Call once, at boot, after the frame allocator reports
-/// its total. `min = clamp(4·√total, floor, ceil)`, `low = 5/4·min`,
-/// `high = 3/2·min`.
+/// its total. `min = clamp(4·√total, floor, ceil)`, then low/high per
+/// [`derive_band`] at the current scale factor.
 pub fn init_watermarks(total_pages: usize) {
-    let (min, low, high) = compute_watermarks(total_pages);
+    WMARK_TOTAL_PAGES.store(total_pages as u64, Ordering::Relaxed);
+    let min = (total_pages as u64)
+        .isqrt()
+        .saturating_mul(4)
+        .clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
     WMARK_MIN.store(min, Ordering::Relaxed);
-    WMARK_LOW.store(low, Ordering::Relaxed);
-    WMARK_HIGH.store(high, Ordering::Relaxed);
+    recompute_low_high();
 }
 
 /// Runtime override of the `min` free-page reserve — the analogue of
 /// Linux's `vm.min_free_kbytes` sysctl. `low`/`high` are re-derived
-/// from it (`low = 5/4·min`, `high = 3/2·min`), so tuning this one
-/// knob shifts the whole reclaim band, exactly as writing
-/// `min_free_kbytes` does. The value is clamped to the same
-/// [floor, ceil] band as the boot auto-sizing. Intended to back a
-/// future `/proc/sys/vm/min_free_kbytes` write.
+/// from it (see [`derive_band`]), so tuning this one knob shifts the
+/// whole reclaim band. Clamped to the same [floor, ceil] band as the
+/// boot auto-sizing. Intended to back a future
+/// `/proc/sys/vm/min_free_kbytes` write.
 pub fn set_min_free_pages(min_pages: u64) {
-    let (min, low, high) = derive_watermarks(min_pages);
-    WMARK_MIN.store(min, Ordering::Relaxed);
+    WMARK_MIN.store(
+        min_pages.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES),
+        Ordering::Relaxed,
+    );
+    recompute_low_high();
+}
+
+/// Runtime override of the watermark scale factor — the analogue of Linux's
+/// `vm.watermark_scale_factor`. Clamped to [1, 3000]; re-derives low/high from
+/// the live `min` + total RAM. Intended to back a future
+/// `/proc/sys/vm/watermark_scale_factor` write.
+pub fn set_watermark_scale_factor(factor: u64) {
+    WMARK_SCALE_FACTOR.store(
+        factor.clamp(WMARK_SCALE_MIN, WMARK_SCALE_MAX),
+        Ordering::Relaxed,
+    );
+    recompute_low_high();
+}
+
+/// The current watermark scale factor.
+pub fn watermark_scale_factor() -> u64 {
+    WMARK_SCALE_FACTOR.load(Ordering::Relaxed)
+}
+
+/// Re-derive and install `low`/`high` from the live `min`, total pages, and
+/// scale factor. Called whenever any input changes.
+fn recompute_low_high() {
+    let (_, low, high) = derive_band(
+        WMARK_MIN.load(Ordering::Relaxed),
+        WMARK_TOTAL_PAGES.load(Ordering::Relaxed),
+        WMARK_SCALE_FACTOR.load(Ordering::Relaxed),
+    );
     WMARK_LOW.store(low, Ordering::Relaxed);
     WMARK_HIGH.store(high, Ordering::Relaxed);
 }
 
-/// Pure watermark math (no global state) — `(min, low, high)` in pages
-/// sized from total RAM. Split out so it can be unit-tested without
-/// perturbing the live boot-installed watermarks.
-fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
-    derive_watermarks((total_pages as u64).isqrt().saturating_mul(4))
+/// Pure watermark-band math (no global state), mirroring Linux's
+/// `__setup_per_zone_wmarks`: `gap = max(min/4, total·scale/10000)`,
+/// `low = min + gap`, `high = min + 2·gap`. The `min/4` floor keeps a usable
+/// band on small RAM; the `total·scale` term dominates on large RAM. Split out
+/// so it can be unit-tested without perturbing the live watermarks.
+fn derive_band(min: u64, total_pages: u64, scale: u64) -> (u64, u64, u64) {
+    let gap = (min / 4).max(total_pages.saturating_mul(scale) / 10_000);
+    (
+        min,
+        min.saturating_add(gap),
+        min.saturating_add(gap.saturating_mul(2)),
+    )
 }
 
-/// Clamp a requested `min` to the sane band and derive `(min, low,
-/// high)`. Shared by the RAM auto-sizing and the runtime override so
-/// both produce an identically-shaped, ordered band.
-fn derive_watermarks(requested_min: u64) -> (u64, u64, u64) {
-    let min = requested_min.clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
-    (min, min.saturating_mul(5) / 4, min.saturating_mul(3) / 2)
+/// Full band from total RAM at the default scale factor. Pure; used by the
+/// watermark unit tests and mirrors what [`init_watermarks`] installs.
+fn compute_watermarks(total_pages: usize) -> (u64, u64, u64) {
+    let total = total_pages as u64;
+    let min = total
+        .isqrt()
+        .saturating_mul(4)
+        .clamp(WMARK_MIN_FLOOR_PAGES, WMARK_MIN_CEIL_PAGES);
+    derive_band(min, total, WMARK_SCALE_DEFAULT)
 }
 
 /// The `min` (emergency) free-page watermark, or 0 if unconfigured.
@@ -192,6 +247,119 @@ pub fn under_min_watermark() -> bool {
     min != 0 && (crate::frame_stats().free as u64) < min
 }
 
+/// `true` when a userspace-backing allocation must be refused to keep the
+/// `min` watermark reserve intact for the kernel. Refuse once granting one
+/// more page would drop free below `min` (i.e. `free <= min`), reserving the
+/// `min` band for kernel/atomic allocations so they never fail under userspace
+/// memory pressure. Returns `false` (never blocks) when watermarks are unset.
+pub fn user_alloc_would_breach_reserve() -> bool {
+    let min = WMARK_MIN.load(Ordering::Relaxed);
+    min != 0 && (crate::frame_stats().free as u64) <= min
+}
+
+// ── kswapd/reaper kthread wake hook ────────────────────────────────
+//
+// `memory` cannot depend on the scheduler, so the kernel binary installs a
+// `fn()` that wakes the parked reclaimer kthread. The allocator calls
+// `wake_kswapd()` when it pushes a userspace allocation against the reserve, so
+// reclaim/OOM runs under load rather than only when a CPU happens to idle.
+
+static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Set when the allocator could not satisfy a KERNEL allocation even after the
+/// reserve and the vmalloc fallback — i.e. genuine, unrecoverable exhaustion,
+/// not a transient dip below `min`. Only THIS arms the reclaimer's OOM killer;
+/// ordinary reserve-breach wakes just reclaim + reap. Keeping the OOM decision
+/// gated on real exhaustion is what stops the reclaimer from killing (and, with
+/// stress-ng `--abort`, failing) a workload that the reserve + vmalloc already
+/// carry without any kill.
+static OOM_NEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Signal that a kernel allocation genuinely failed, and wake the reclaimer to
+/// OOM-kill. Called from the frame allocator's exhaustion path.
+pub fn signal_oom_needed() {
+    OOM_NEEDED.store(true, Ordering::Release);
+    wake_kswapd();
+}
+
+/// Consume the pending-OOM signal (the reclaimer checks this before killing).
+pub fn take_oom_needed() -> bool {
+    OOM_NEEDED.swap(false, Ordering::AcqRel)
+}
+
+// ── Overcommit policy (vm.overcommit_memory analogue) ──────────────────
+//
+// The `min` reserve ALWAYS protects the kernel — a userspace allocation is
+// refused once it would breach it (graceful ENOMEM), regardless of this knob.
+// That anti-panic invariant is not configurable. What IS configurable is
+// whether that user memory pressure also arms the OOM killer to reclaim a hog:
+//
+//   * Never (2)     — graceful ENOMEM only; the kernel never OOM-kills for user
+//                     pressure. Matches the reserve's no-overcommit behaviour
+//                     and lets stress-ng-style workloads that expect ENOMEM
+//                     (and abort on a killed worker) run clean. NARF default.
+//   * Heuristic (0) — Linux's default: user pressure the reclaimer can't clear
+//                     kills the highest-badness process.
+//   * Always (1)    — same OOM behaviour as Heuristic here (both allow the
+//                     killer); kept distinct for the sysctl ABI value.
+
+/// `vm.overcommit_memory` values.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum OvercommitMode {
+    Heuristic = 0,
+    Always = 1,
+    Never = 2,
+}
+
+/// Default: `Never` — user pressure surfaces as ENOMEM, not an OOM-kill. This
+/// is stricter than Linux's default (`Heuristic`) on purpose: NARF's reserve
+/// already prevents the kernel from failing, so killing a process is a genuine
+/// last resort reserved for real kernel exhaustion.
+static OVERCOMMIT: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(OvercommitMode::Never as u8);
+
+/// Set the overcommit mode from a raw sysctl value (0/1/2). Out-of-range
+/// values are ignored. Backs a future `/proc/sys/vm/overcommit_memory`.
+pub fn set_overcommit_mode(raw: u8) {
+    if raw <= 2 {
+        OVERCOMMIT.store(raw, Ordering::Relaxed);
+    }
+}
+
+/// The current overcommit mode.
+pub fn overcommit_mode() -> OvercommitMode {
+    match OVERCOMMIT.load(Ordering::Relaxed) {
+        0 => OvercommitMode::Heuristic,
+        1 => OvercommitMode::Always,
+        _ => OvercommitMode::Never,
+    }
+}
+
+/// Whether a reserve-refused USER allocation should arm the OOM killer (kill a
+/// hog) rather than only returning ENOMEM. True for Heuristic/Always.
+pub fn user_pressure_arms_oom() -> bool {
+    !matches!(overcommit_mode(), OvercommitMode::Never)
+}
+
+/// Install the reclaimer wake hook (the kernel binary passes a `fn()` that
+/// wakes its parked kswapd/reaper kthread). Call once at boot.
+pub fn set_kswapd_wake_hook(hook: fn()) {
+    KSWAPD_WAKE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Wake the parked reclaimer kthread, if one is installed. Cheap and safe to
+/// call from the allocation path: the hook only flags + wakes a waker. No-op
+/// before the kthread is spawned.
+pub fn wake_kswapd() {
+    let p = KSWAPD_WAKE_HOOK.load(Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: `p` was stored by `set_kswapd_wake_hook` from a live `fn()`,
+        // and `fn()` and `usize` are the same width on every target here.
+        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
+        hook();
+    }
+}
+
 /// Pages a reclaim pass should aim to free to reach the `high`
 /// watermark, or 0 if already at/above it (or unconfigured).
 pub fn reclaim_goal_pages() -> usize {
@@ -200,6 +368,197 @@ pub fn reclaim_goal_pages() -> usize {
         return 0;
     }
     high.saturating_sub(crate::frame_stats().free as u64) as usize
+}
+
+// ── PSS-sized range reclaim planning ──────────────────────────────────────
+
+/// Fixed-point units in one resident page of proportional-set-size (PSS).
+///
+/// Integer fixed point keeps reclaim planning deterministic and usable in
+/// `no_std`: a private page contributes `PSS_UNITS_PER_PAGE`, while one alias
+/// of a page with mapcount four contributes one quarter of that value.
+pub const PSS_UNITS_PER_PAGE: u64 = 4096;
+
+/// One cold, virtually-contiguous range offered to the reclaim planner.
+///
+/// `pages` is the number of resident mappings in the run. `mapcount` is the
+/// average number of aliases per backing page and controls PSS sizing.
+/// `expected_free_pages` is deliberately separate: it is the number of
+/// physical pages reverse-map accounting predicts will actually become free
+/// if the complete range is evicted. A shared alias with other live mappings
+/// therefore has `expected_free_pages == 0`; a reverse-map group that removes
+/// every alias may report the number of unique backing pages instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimRangeCandidate {
+    /// Architecture page-table root naming the address space.
+    pub address_space_root: PhysAddr,
+    /// First page-aligned virtual address in the resident run.
+    pub base: VirtAddr,
+    /// Resident virtual pages in the contiguous run.
+    pub pages: usize,
+    /// Average mapping count of each backing page; zero is treated as one.
+    pub mapcount: u32,
+    /// Conservative physical-page yield if the entire run is evicted.
+    pub expected_free_pages: usize,
+    /// LRU age; smaller values are colder and are considered first.
+    pub age: u8,
+    /// Pinned/wired ranges are never selected.
+    pub locked: bool,
+}
+
+/// A prefix of a candidate selected for one swap/reclaim submission.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlannedReclaimRange {
+    pub address_space_root: PhysAddr,
+    pub base: VirtAddr,
+    pub pages: usize,
+    pub mapcount: u32,
+    pub estimated_pss_units: u64,
+    pub expected_free_pages: usize,
+}
+
+/// Result of one range-planning pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimBatchPlan {
+    /// Cold ranges in execution order, bounded by the caller's page cap.
+    pub ranges: Vec<PlannedReclaimRange>,
+    /// Watermark-derived physical-page goal supplied by the caller.
+    pub target_free_pages: usize,
+    /// PSS target corresponding to `target_free_pages`.
+    pub target_pss_units: u64,
+    /// Sum of proportional resident size selected.
+    pub selected_pss_units: u64,
+    /// Conservative number of physical pages the selection should release.
+    pub expected_free_pages: usize,
+    /// Resident mappings examined, including ineligible ranges.
+    pub scanned_pages: usize,
+}
+
+#[inline]
+fn pss_units(pages: usize, mapcount: u32) -> u64 {
+    let mappings = u64::from(mapcount.max(1));
+    let scaled = (pages as u128).saturating_mul(PSS_UNITS_PER_PAGE as u128);
+    (scaled / u128::from(mappings)).min(u128::from(u64::MAX)) as u64
+}
+
+#[inline]
+fn proportional_yield(take: usize, candidate: &ReclaimRangeCandidate) -> usize {
+    if take == candidate.pages {
+        return candidate.expected_free_pages.min(candidate.pages);
+    }
+    take.saturating_mul(candidate.expected_free_pages) / candidate.pages.max(1)
+}
+
+/// Plan a cold-range reclaim batch using PSS and a physical-yield guard.
+///
+/// Candidates are ordered by age, then by expected physical yield. The
+/// planner accumulates proportional resident size but never treats PSS as
+/// proof that memory will be released: only `expected_free_pages` advances
+/// the watermark goal. Selection stops at the physical goal, the equivalent
+/// PSS target, or `max_selected_pages`, whichever bound is reached first.
+///
+/// This function performs policy only; it does not touch page tables or issue
+/// I/O. Keeping the planner pure makes the expensive rmap/PTE scan separable
+/// from the swap transaction and straightforward to test.
+pub fn plan_reclaim_ranges(
+    candidates: &[ReclaimRangeCandidate],
+    target_free_pages: usize,
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan {
+    let target_pss_units = (target_free_pages as u128)
+        .saturating_mul(PSS_UNITS_PER_PAGE as u128)
+        .min(u128::from(u64::MAX)) as u64;
+    let mut plan = ReclaimBatchPlan {
+        target_free_pages,
+        target_pss_units,
+        ..ReclaimBatchPlan::default()
+    };
+    if target_free_pages == 0 || max_selected_pages == 0 {
+        return plan;
+    }
+
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_unstable_by(|left, right| {
+        let left = &candidates[*left];
+        let right = &candidates[*right];
+        left.age
+            .cmp(&right.age)
+            .then_with(|| {
+                // Compare yield ratios without floating point. Higher yield
+                // sorts first; u128 prevents overflow for hostile metadata.
+                let lhs =
+                    (left.expected_free_pages as u128).saturating_mul(right.pages.max(1) as u128);
+                let rhs =
+                    (right.expected_free_pages as u128).saturating_mul(left.pages.max(1) as u128);
+                rhs.cmp(&lhs)
+            })
+            .then_with(|| left.base.as_u64().cmp(&right.base.as_u64()))
+    });
+
+    let mut selected_pages = 0usize;
+    for index in order {
+        let candidate = &candidates[index];
+        plan.scanned_pages = plan.scanned_pages.saturating_add(candidate.pages);
+        if candidate.locked
+            || candidate.pages == 0
+            || candidate.expected_free_pages == 0
+            || candidate.base.as_u64() & 0xfff != 0
+        {
+            continue;
+        }
+        if plan.expected_free_pages >= target_free_pages
+            || plan.selected_pss_units >= target_pss_units
+            || selected_pages >= max_selected_pages
+        {
+            break;
+        }
+
+        let capacity = max_selected_pages - selected_pages;
+        let remaining_free = target_free_pages - plan.expected_free_pages;
+        // Conservative ceil: select enough of a uniformly-reclaimable range
+        // to cover the remaining physical target, then clamp to the batch.
+        let by_free = remaining_free
+            .saturating_mul(candidate.pages)
+            .saturating_add(candidate.expected_free_pages - 1)
+            / candidate.expected_free_pages;
+        let remaining_pss = target_pss_units - plan.selected_pss_units;
+        let by_pss = ((remaining_pss as u128)
+            .saturating_mul(u128::from(candidate.mapcount.max(1)))
+            .saturating_add(PSS_UNITS_PER_PAGE as u128 - 1)
+            / PSS_UNITS_PER_PAGE as u128)
+            .min(usize::MAX as u128) as usize;
+        let take = candidate
+            .pages
+            .min(capacity)
+            .min(by_free.max(1))
+            .min(by_pss.max(1));
+        if take == 0 {
+            break;
+        }
+
+        let range_pss = pss_units(take, candidate.mapcount);
+        let range_yield = proportional_yield(take, candidate);
+        plan.ranges.push(PlannedReclaimRange {
+            address_space_root: candidate.address_space_root,
+            base: candidate.base,
+            pages: take,
+            mapcount: candidate.mapcount.max(1),
+            estimated_pss_units: range_pss,
+            expected_free_pages: range_yield,
+        });
+        selected_pages = selected_pages.saturating_add(take);
+        plan.selected_pss_units = plan.selected_pss_units.saturating_add(range_pss);
+        plan.expected_free_pages = plan.expected_free_pages.saturating_add(range_yield);
+    }
+    plan
+}
+
+/// Build one bounded reclaim plan from the live high-watermark deficit.
+pub fn plan_watermark_reclaim(
+    candidates: &[ReclaimRangeCandidate],
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan {
+    plan_reclaim_ranges(candidates, reclaim_goal_pages(), max_selected_pages)
 }
 
 // ── Shrinker registry (Linux `struct shrinker`) ────────────────────
@@ -336,19 +695,19 @@ pub fn try_to_free(target: usize) -> usize {
 /// below. They exercise the pure `compute_watermarks`, so they never
 /// touch the live boot-installed watermark globals.
 mod watermark_tests {
-    use super::{
-        compute_watermarks, derive_watermarks, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES,
-    };
+    use super::{compute_watermarks, derive_band, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_reclaim_watermarks_ordered_and_scaled() -> TestResult {
-        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048.
+        // 1 GiB = 262144 pages: min = clamp(4·√262144, ..) = 4·512 = 2048. At
+        // the default scale the min/4 floor dominates (total·10/10000 = 262 <
+        // 512), so low = 5/4·min, high = 3/2·min.
         let (min, low, high) = compute_watermarks(262_144);
         if min != 2048 {
             return TestResult::Fail("min for 1 GiB should be 2048 pages");
         }
         if low != min * 5 / 4 || high != min * 3 / 2 {
-            return TestResult::Fail("low/high must be 5/4·min and 3/2·min");
+            return TestResult::Fail("low/high must be 5/4·min and 3/2·min at 1 GiB");
         }
         if !(min < low && low < high) {
             return TestResult::Fail("watermarks must be strictly min<low<high");
@@ -366,8 +725,9 @@ mod watermark_tests {
         if min_small != WMARK_MIN_FLOOR_PAGES {
             return TestResult::Fail("tiny RAM must clamp min to the floor");
         }
-        // Huge memory clamps min down to the ceiling.
-        let (min_huge, low_huge, high_huge) = compute_watermarks(usize::MAX);
+        // Huge (but non-overflowing) memory clamps min down to the ceiling and
+        // stays ordered. 1<<40 pages: min = 4·2^20 → clamped to the ceiling.
+        let (min_huge, low_huge, high_huge) = compute_watermarks(1usize << 40);
         if min_huge != WMARK_MIN_CEIL_PAGES {
             return TestResult::Fail("huge RAM must clamp min to the ceiling");
         }
@@ -378,23 +738,125 @@ mod watermark_tests {
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_clamped);
 
-    fn smoke_reclaim_watermarks_tunable_override() -> TestResult {
-        // The runtime override (vm.min_free_kbytes analogue) re-derives the
-        // whole band from the requested min, clamped to the same range.
-        let (min, low, high) = derive_watermarks(4096);
+    fn smoke_reclaim_watermarks_band_math() -> TestResult {
+        // The pure band math the min/scale overrides re-derive from. Where the
+        // min/4 floor dominates (small total term), low=5/4·min, high=3/2·min.
+        let (min, low, high) = derive_band(4096, 262_144, 10);
         if min != 4096 || low != 5120 || high != 6144 {
-            return TestResult::Fail("override should derive low=5/4·min, high=3/2·min");
-        }
-        // Below the floor and above the ceiling clamp identically to boot.
-        if derive_watermarks(1).0 != WMARK_MIN_FLOOR_PAGES {
-            return TestResult::Fail("override below floor must clamp up");
-        }
-        if derive_watermarks(u64::MAX).0 != WMARK_MIN_CEIL_PAGES {
-            return TestResult::Fail("override above ceiling must clamp down");
+            return TestResult::Fail("min/4-dominated band should be 4096/5120/6144");
         }
         TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_tunable_override);
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermarks_band_math);
+
+    fn smoke_reclaim_watermark_scale_factor() -> TestResult {
+        // On large RAM the total·scale/10000 term dominates the min/4 floor, so
+        // a bigger scale factor widens the reclaim band (Linux's
+        // vm.watermark_scale_factor). 16 GiB = 4194304 pages, min = ceiling
+        // (65536): scale 10 → gap = max(16384, 4194) = 16384 (floor); scale
+        // 100 → gap = max(16384, 41943) = 41943 (scale wins).
+        let (min, total) = (WMARK_MIN_CEIL_PAGES, 4_194_304u64);
+        let (_, low10, high10) = derive_band(min, total, 10);
+        let (_, low100, high100) = derive_band(min, total, 100);
+        if !(low100 > low10 && high100 > high10) {
+            return TestResult::Fail("a larger scale factor must raise low/high");
+        }
+        // high−low == gap, so a larger scale must widen the band.
+        if high100 - low100 <= high10 - low10 {
+            return TestResult::Fail("a larger scale factor must widen the low..high band");
+        }
+        if !(min < low100 && low100 < high100) {
+            return TestResult::Fail("scaled watermarks must stay ordered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_watermark_scale_factor);
+}
+
+/// Pure range-planner tests, registered in the in-kernel test image.
+mod range_planner_tests {
+    use super::{plan_reclaim_ranges, ReclaimRangeCandidate, PSS_UNITS_PER_PAGE};
+    use crate::{PhysAddr, VirtAddr};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn candidate(
+        base: u64,
+        pages: usize,
+        mapcount: u32,
+        expected_free_pages: usize,
+        age: u8,
+        locked: bool,
+    ) -> ReclaimRangeCandidate {
+        ReclaimRangeCandidate {
+            address_space_root: PhysAddr::new(0x1000),
+            base: VirtAddr::new(base),
+            pages,
+            mapcount,
+            expected_free_pages,
+            age,
+            locked,
+        }
+    }
+
+    fn smoke_reclaim_range_plan_private_target() -> TestResult {
+        let candidates = [
+            candidate(0x40_0000, 8, 1, 8, 5, false),
+            candidate(0x50_0000, 8, 1, 8, 0, false),
+        ];
+        let plan = plan_reclaim_ranges(&candidates, 4, 16);
+        if plan.ranges.len() != 1 || plan.ranges[0].base != VirtAddr::new(0x50_0000) {
+            return TestResult::Fail("planner must select the coldest range first");
+        }
+        if plan.ranges[0].pages != 4
+            || plan.expected_free_pages != 4
+            || plan.selected_pss_units != 4 * PSS_UNITS_PER_PAGE
+        {
+            return TestResult::Fail("private range should stop exactly at the target");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_range_plan_private_target);
+
+    fn smoke_reclaim_range_plan_pss_sizes_shared_scan() -> TestResult {
+        // Eight mapped pages with mapcount four account for two pages of PSS.
+        // Reverse-map coverage predicts that evicting the whole range releases
+        // two unique physical pages, so both stop conditions agree at 8 VAs.
+        let candidates = [candidate(0x60_0000, 8, 4, 2, 0, false)];
+        let plan = plan_reclaim_ranges(&candidates, 2, 16);
+        if plan.ranges.len() != 1 || plan.ranges[0].pages != 8 {
+            return TestResult::Fail("PSS sizing should retain the complete shared scan");
+        }
+        if plan.selected_pss_units != 2 * PSS_UNITS_PER_PAGE || plan.expected_free_pages != 2 {
+            return TestResult::Fail("PSS and physical-yield accounting diverged");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_range_plan_pss_sizes_shared_scan
+    );
+
+    fn smoke_reclaim_range_plan_skips_phantom_yield() -> TestResult {
+        let candidates = [
+            // A single shared alias has PSS but cannot release its backing.
+            candidate(0x70_0000, 16, 4, 0, 0, false),
+            candidate(0x80_0000, 4, 1, 4, 1, true),
+            candidate(0x90_0001, 4, 1, 4, 2, false),
+            candidate(0xa0_0000, 4, 1, 4, 3, false),
+        ];
+        let plan = plan_reclaim_ranges(&candidates, 3, 64);
+        if plan.ranges.len() != 1 || plan.ranges[0].base != VirtAddr::new(0xa0_0000) {
+            return TestResult::Fail("planner selected locked, unaligned, or zero-yield range");
+        }
+        if plan.expected_free_pages != 3 || plan.scanned_pages != 28 {
+            return TestResult::Fail("planner target or scan accounting is wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_range_plan_skips_phantom_yield
+    );
 }
 
 /// Shrinker-registry tests. Always compiled so they register + run under
@@ -510,15 +972,12 @@ pub enum ReclaimOutcome {
     /// integration (frame-free on success + side-table for
     /// `page_in` discovery) is a Wave C+1 follow-up.
     ///
-    /// The **live**, batched swap path now lives in `crate::swap`:
-    /// `swap::swap_out_batch(&[SwapVictim])` writes a run of victims
-    /// out in one backend call, installs swap-entry PTEs, and frees the
-    /// frames; `swap::swap_in_pte` faults them back on demand. A caller
-    /// that knows a victim's *virtual* address (the mmap / address-space
-    /// layer) drives that path directly. This per-`phys` `ReclaimFn`
-    /// seam can't reach it because it lacks the reverse mapping
-    /// (`phys → (pml4, virt)`); wiring an rmap so the LRU scan itself
-    /// can batch-evict is the follow-up.
+    /// The **live**, batched swap path now lives in `crate::swap` plus
+    /// `AddressSpace::swap_out_reclaim_plan`: it writes a selected run in one
+    /// backend call, transfers Region/PTE ownership, invalidates once, and
+    /// faults consecutive leaves back through `swap_in_batch`. This per-phys
+    /// seam still lacks reverse mappings; callers with rmap/VMA context feed
+    /// `plan_reclaim_ranges` and the AddressSpace executor.
     DeferToPager,
 }
 

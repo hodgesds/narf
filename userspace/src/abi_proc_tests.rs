@@ -1061,8 +1061,13 @@ fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
         if visible_pid != FAKE_TASK {
             return Err("proc current pid did not match the ABI harness task");
         }
-        if crate::handlers::proc_task_info(visible_pid).is_none() {
-            return Err("proc task provider could not see the ABI harness task");
+        let basic_info = crate::handlers::proc_task_info(
+            visible_pid,
+            narf_filesystem::procfs::TaskInfoQuery::Basic,
+        )
+        .ok_or("proc task provider could not see the ABI harness task")?;
+        if !basic_info.vmas.is_empty() {
+            return Err("basic proc task snapshot eagerly materialised VMAs");
         }
         let link_path = alloc::format!("/proc/{visible_pid}/ns/uts\0");
         let mounted_proc =

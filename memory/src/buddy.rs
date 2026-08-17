@@ -255,6 +255,26 @@ fn audit_free(frame: u64, order: u8) {
     audit::mark_free(frame, order);
 }
 
+/// Transition one live-allocator frame from owned to per-CPU-cache free.
+/// The cache is outside `BuddyZone`, so it must feed the same audit bitmap
+/// explicitly. No-op when frame auditing is disabled.
+#[inline]
+pub(crate) fn audit_cached_free(frame: u64) {
+    #[cfg(feature = "frame-alloc-audit")]
+    audit_free(frame, 0);
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    let _ = frame;
+}
+
+/// Transition one frame from a per-CPU free cache back to caller ownership.
+#[inline]
+pub(crate) fn audit_cached_alloc(frame: u64) {
+    #[cfg(feature = "frame-alloc-audit")]
+    audit_alloc(frame, 0);
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    let _ = frame;
+}
+
 /// Stash the `free_frame` caller's source location for the audit's
 /// double-free panic message. No-op unless `frame-alloc-audit` is set.
 #[inline]
@@ -628,6 +648,19 @@ impl BuddyZone {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
         self.note_free(frame, order);
+        self.free_inner(frame, order);
+    }
+
+    /// Return a block that was already recorded free while resident in a
+    /// per-CPU cache. This updates/coalesces buddy metadata without emitting a
+    /// second audit transition.
+    pub(crate) fn free_cached(&mut self, frame: u64, order: u8) {
+        debug_assert!(order <= MAX_ORDER);
+        debug_assert_eq!(frame & (order_frames(order) - 1), 0);
+        self.free_inner(frame, order);
+    }
+
+    fn free_inner(&mut self, frame: u64, order: u8) {
         self.free_frames += order_frames(order) as usize;
         let mut cur_order = order;
         let mut cur_frame = frame;

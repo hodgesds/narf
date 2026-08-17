@@ -64,6 +64,12 @@ pub struct ProcTaskInfo {
     /// the kernel hook from the AS's regions table; rendered into
     /// /proc/[pid]/maps text by `render_maps`.
     pub vmas: Vec<ProcVma>,
+    /// Allocation-free aggregate accounting used by stat/status/statm. These
+    /// remain populated even when `vmas` was not requested.
+    pub vm_size_bytes: u64,
+    pub resident_pages: u64,
+    pub data_bytes: u64,
+    pub stack_bytes: u64,
     /// Parent visible pid (0 = unknown/orphan).
     pub ppid: u64,
     /// Process group + session ids (stat fields 5-6).
@@ -143,7 +149,15 @@ pub struct ProcVma {
 
 type CurrentPidFn = fn() -> u64;
 type ListPidsFn = fn() -> Vec<u64>;
-type TaskInfoFn = fn(u64) -> Option<ProcTaskInfo>;
+/// Selects whether a procfs task snapshot needs the potentially large VMA
+/// detail vector. Most `/proc/<pid>` fields need only basic metadata.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaskInfoQuery {
+    Basic,
+    Vmas,
+}
+
+type TaskInfoFn = fn(u64, TaskInfoQuery) -> Option<ProcTaskInfo>;
 /// Returns the caller's OUTER ProcessId — the space `ProcPidDir` keys on — for
 /// resolving the `/proc/self` + `/proc/thread-self` magic directories.
 type CurrentOuterPidFn = fn() -> u64;
@@ -243,14 +257,14 @@ fn list_pids() -> Vec<u64> {
     f()
 }
 
-pub(crate) fn task_info(pid: u64) -> Option<ProcTaskInfo> {
+pub(crate) fn task_info(pid: u64, query: TaskInfoQuery) -> Option<ProcTaskInfo> {
     let v = TASK_INFO_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return None;
     }
     // SAFETY: v was stored by install_proc_hooks as a TaskInfoFn fn-pointer; non-zero confirms it.
     let f: TaskInfoFn = unsafe { core::mem::transmute(v) };
-    f(pid)
+    f(pid, query)
 }
 
 // ── Extended + writable per-pid hook types ──────────────────────
@@ -1081,7 +1095,12 @@ impl FileOps for ProcPidFile {
         let pid = self.pid;
         let field = self.field;
         Box::pin(async move {
-            let info = match task_info(pid) {
+            let query = if matches!(field, PidField::Maps | PidField::NumaMaps) {
+                TaskInfoQuery::Vmas
+            } else {
+                TaskInfoQuery::Basic
+            };
+            let info = match task_info(pid, query) {
                 Some(i) => i,
                 None => {
                     // Task gone (zombie reaped). Linux returns ESRCH;
@@ -1656,7 +1675,7 @@ impl DirOps for ProcRoot {
                 // not visible in the reader's namespace → no such entry).
                 if let Ok(n) = name.parse::<u64>() {
                     if let Some(pid) = pid_resolve(n) {
-                        if task_info(pid).is_some() {
+                        if task_info(pid, TaskInfoQuery::Basic).is_some() {
                             return Some(Arc::new(ProcDirMarker));
                         }
                     }
@@ -1698,7 +1717,7 @@ impl DirOps for ProcRoot {
         // validate liveness before materialising the dir keyed on the outer id.
         if let Ok(n) = name.parse::<u64>() {
             if let Some(pid) = pid_resolve(n) {
-                if task_info(pid).is_some() {
+                if task_info(pid, TaskInfoQuery::Basic).is_some() {
                     return Some(Arc::new(ProcPidDir { pid }));
                 }
             }
@@ -2312,12 +2331,8 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     //   minflt cminflt majflt cmajflt utime stime cutime cstime
     //   priority nice num_threads itrealvalue starttime vsize rss
     //   ...  — we fill the first 23 with sensible values and pad.
-    let vsize: u64 = info
-        .vmas
-        .iter()
-        .map(|v| v.end.saturating_sub(v.start))
-        .sum();
-    let rss_pages = vsize / 4096; // no per-page residency — VmRSS mirrors VmSize
+    let vsize = info.vm_size_bytes;
+    let rss_pages = info.resident_pages;
     let num_threads = info.num_threads.max(1); // field 20; 0 → 1
     format!(
         "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
@@ -2376,31 +2391,13 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpgid:\t{}\n", info.pgrp));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSsid:\t{}\n", info.session));
-    // Total mapped and resident sizes from the VMA snapshot. VmPeak/VmHWM
-    // still mirror the current values until NARF retains high-water marks,
-    // but VmRSS uses live resident page counts rather than virtual size.
-    let vm_kb: u64 = info
-        .vmas
-        .iter()
-        .map(|v| v.end.saturating_sub(v.start) / 1024)
-        .sum();
-    let rss_kb: u64 = info
-        .vmas
-        .iter()
-        .map(|v| v.resident_pages.saturating_mul(4))
-        .sum();
-    let data_kb: u64 = info
-        .vmas
-        .iter()
-        .filter(|v| v.writable && !v.executable && v.label != "[stack]")
-        .map(|v| v.end.saturating_sub(v.start) / 1024)
-        .sum();
-    let stack_kb: u64 = info
-        .vmas
-        .iter()
-        .filter(|v| v.label == "[stack]")
-        .map(|v| v.end.saturating_sub(v.start) / 1024)
-        .sum();
+    // Total mapped and resident sizes come from allocation-free address-space
+    // counters. VmPeak/VmHWM still mirror current values until NARF retains
+    // high-water marks.
+    let vm_kb = info.vm_size_bytes / 1024;
+    let rss_kb = info.resident_pages.saturating_mul(4);
+    let data_kb = info.data_bytes / 1024;
+    let stack_kb = info.stack_bytes / 1024;
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmPeak:\t{} kB\n", vm_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmSize:\t{} kB\n", vm_kb));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmHWM:\t{} kB\n", rss_kb));
@@ -2833,6 +2830,10 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             resident_pages: 2,
             kernel_page_kb: 4,
         }],
+        vm_size_bytes: 8192,
+        resident_pages: 2,
+        data_bytes: 0,
+        stack_bytes: 0,
         ppid: 2,
         pgrp: 3,
         session: 4,
@@ -2921,6 +2922,10 @@ fn sample_info() -> ProcTaskInfo {
         stack_top: 0x8000,
         cmdline: alloc::vec![b'a', 0, b'b', 0],
         vmas: Vec::new(),
+        vm_size_bytes: 0,
+        resident_pages: 0,
+        data_bytes: 0,
+        stack_bytes: 0,
         ppid: 7,
         pgrp: 3,
         session: 3,
@@ -3020,6 +3025,10 @@ fn smoke_pid_status_memory_fields_use_vma_sizes() -> TestResult {
             ..ProcVma::default()
         },
     ];
+    info.vm_size_bytes = 32 * 1024;
+    info.resident_pages = 3;
+    info.data_bytes = 16 * 1024;
+    info.stack_bytes = 16 * 1024;
     let status = render_status(&info);
     for expected in [
         "VmSize:\t32 kB",

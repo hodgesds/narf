@@ -2503,10 +2503,6 @@ pub struct UserTaskFuture {
     task: alloc::sync::Arc<crate::task::Task>,
     jmp: UnsafeCell<JmpBuf>,
     state: TaskState,
-    /// Snapshot of the kernel's TTBR0_EL1 captured on the first
-    /// poll so we can restore it on the trap-back path. `None`
-    /// until the first poll runs.
-    saved_ttbr0: core::cell::Cell<Option<u64>>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2537,7 +2533,6 @@ impl UserTaskFuture {
             task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Initial,
-            saved_ttbr0: core::cell::Cell::new(None),
         }
     }
 
@@ -2562,7 +2557,6 @@ impl UserTaskFuture {
             task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Running,
-            saved_ttbr0: core::cell::Cell::new(None),
         }
     }
 
@@ -2742,21 +2736,10 @@ impl core::future::Future for UserTaskFuture {
         // (Task registration happens at spawn time — see the x86_64
         // sibling poll for the rationale.)
 
-        // Snapshot kernel TTBR0_EL1 once. Subsequent polls land
-        // back here via the trap path; we restore on the way out.
-        if this.saved_ttbr0.get().is_none() {
-            let ttbr0: u64;
-            // SAFETY: reading TTBR0_EL1 has no side effects.
-            unsafe {
-                core::arch::asm!("mrs {v}, TTBR0_EL1", v = out(reg) ttbr0,
-                    options(nostack, preserves_flags));
-            }
-            this.saved_ttbr0.set(Some(ttbr0));
-        }
-
-        // Activate the user AS. Until the kernel heap migrates
-        // off TTBR0, this returns NotImplemented; degrade by
-        // resolving Ready immediately (no EL0 entry possible).
+        // Confirm and activate the user AS. The scheduler already installed
+        // this root for the poll; AddressSpace::activate detects the identical
+        // `(root, ASID)` and takes its no-op fast path. Preserve the error path
+        // for an unset root or unsupported architecture fallback.
         if this.process.address_space.activate().is_err() {
             // No state change — the task essentially never ran
             // user code. Fan out the exit observers and resolve.
@@ -2823,28 +2806,13 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
-        // Longjmp path: a hook fired, control is back on the
-        // kernel-side stack. Restore the kernel's saved TTBR0
-        // and keep DAIF masked.
-        let ttbr0 = this.saved_ttbr0.get().expect("saved_ttbr0 set on entry");
-        // SAFETY: ttbr0 came from a prior MSR snapshot of the
-        // active kernel root; restoring is symmetric.
+        // Longjmp path: a hook fired, control is back on the kernel-side
+        // stack. TTBR0 still names this task's tagged user root; the scheduler
+        // owns restoration of the saved incoming `(root, ASID)` immediately
+        // after this poll returns. Restoring here would be redundant and a
+        // full TLBI would defeat lifetime-scoped ASID retention.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            core::arch::asm!(
-                "msr TTBR0_EL1, {v}",
-                "isb",
-                v = in(reg) ttbr0,
-                options(nostack, preserves_flags),
-            );
-            // Local TLB invalidate (broadcast not needed here —
-            // the ready queue serialises this task).
-            core::arch::asm!(
-                "tlbi vmalle1",
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags),
-            );
             core::arch::asm!(
                 "msr DAIFSet, #0xF",
                 options(nomem, nostack, preserves_flags)

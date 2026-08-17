@@ -1095,16 +1095,37 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // Find the smallest buddy order that fits n_pages.
     // order N covers 1 << N pages.
     let order = pages_to_order(n_pages)?;
-    let frame = alloc_pages_on(0, order)?;
+    // Fast path: a physically-contiguous buddy block.
+    if let Ok(frame) = alloc_pages_on(0, order) {
+        LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
+        let p = frame.start_address().kernel_mut_ptr::<u8>();
+        // SAFETY: `p` is reachable through the per-arch kernel
+        // mapping + page-aligned to its order.
+        // SAFETY: Valid memory or trusted environment
+        return Ok(unsafe { NonNull::new_unchecked(p) });
+    }
+    // Fallback (kvmalloc-style): a contiguous order-N block was unavailable —
+    // typically fragmentation, not true exhaustion. Back the allocation with
+    // SCATTERED order-0 frames behind a virtually-contiguous vmalloc mapping,
+    // which only needs enough free pages, not a contiguous run. This keeps a
+    // large kernel allocation (e.g. a big `Vec`) from panicking the whole
+    // kernel when the pool is fragmented but not empty.
+    let p = crate::vmalloc::valloc(layout.size()).ok_or(SlabError::NoMemory)?;
     LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
-    let p = frame.start_address().kernel_mut_ptr::<u8>();
-    // SAFETY: `p` is reachable through the per-arch kernel
-    // mapping + page-aligned to its order.
-    // SAFETY: Valid memory or trusted environment
-    Ok(unsafe { NonNull::new_unchecked(p) })
+    Ok(p)
 }
 
 unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
+    // Scattered (vmalloc) fallback allocations live in the vmalloc window, not
+    // the direct map — route them back to `vfree`, which unmaps + frees the
+    // backing frames and reclaims the VA.
+    if crate::vmalloc::is_valloc_ptr(ptr.as_ptr()) {
+        // SAFETY: the pointer came from `valloc` with this layout's size (the
+        // slab always frees a large block with its original layout).
+        unsafe { crate::vmalloc::vfree(ptr, layout.size()) };
+        LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
     // `alloc_large` handed out `frame.start_address().kernel_mut_ptr()`,
     // so invert that mapping to recover the frame — a plain
     // `PhysAddr::new(ptr)` would treat the direct-map VA as a physical

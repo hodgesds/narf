@@ -3071,7 +3071,7 @@ fn task_vm_bytes(pid: u64) -> u64 {
         }
     });
     match as_arc {
-        Some(a) => a.regions_snapshot().iter().map(|r| r.len).sum(),
+        Some(a) => a.mapped_bytes(),
         None => 0,
     }
 }
@@ -3741,10 +3741,7 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
     let rss_pages = {
         // Address spaces are keyed by TaskId; resolve the outer ProcessId first.
         let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
-        task.map(|as_arc| {
-            let regions = as_arc.regions_snapshot();
-            regions.iter().map(|r| (r.len / 4096).max(1)).sum::<u64>()
-        })
+        task.map(|as_arc| as_arc.mapped_bytes().saturating_add(4095) / 4096)
         .unwrap_or(0)
     };
     let total = stats.total.max(1);
@@ -3851,8 +3848,11 @@ pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
 
 /// /proc/[pid]/* metadata accessor.
 #[cfg(feature = "linux-compat")]
-pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo> {
-    use narf_filesystem::procfs::ProcTaskInfo;
+pub fn proc_task_info(
+    pid: u64,
+    query: narf_filesystem::procfs::TaskInfoQuery,
+) -> Option<narf_filesystem::procfs::ProcTaskInfo> {
+    use narf_filesystem::procfs::{ProcTaskInfo, TaskInfoQuery};
     // Don't gate on "is on a ready queue" — the currently-running
     // task has been popped from its queue for polling and would
     // fail that check while it's the very task asking. Treat any
@@ -3926,57 +3926,70 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // cmdline — argv preserved at exec time. Empty for bare-spawn
     // tasks (initramfs init / shell) until their argv is recorded.
     let cmdline = proc_argv_of(pid);
+    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).or_else(|| {
+        // Currently-polling task isn't in the queue scan; fall back to the
+        // active-AS slot.
+        if tid == current_task_id() {
+            narf_scheduler::current_address_space()
+        } else {
+            None
+        }
+    });
+    let memory_stats = as_arc
+        .as_ref()
+        .map(|as_arc| as_arc.memory_stats())
+        .unwrap_or_default();
+    let stack_bytes = as_arc
+        .as_ref()
+        .and_then(|as_arc| {
+            as_arc.region_len_at_base(narf_memory::VirtAddr::new(
+                crate::process::DEFAULT_USER_STACK_BASE,
+            ))
+        })
+        .unwrap_or(0);
     // VMAs — walk the task's AS regions table. Linux's
     // /proc/[pid]/maps tags certain ranges with brackets ([heap],
     // [stack]); we apply the same labels by matching base address.
     use narf_filesystem::procfs::ProcVma;
     use narf_memory::RegionPerms;
     let mut vmas = alloc::vec::Vec::new();
-    if let Some(as_arc) =
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).or_else(|| {
-            // Currently-polling task isn't in the queue scan;
-            // fall back to the active-AS slot.
-            if tid == current_task_id() {
-                narf_scheduler::current_address_space()
-            } else {
-                None
+    if query == TaskInfoQuery::Vmas {
+        if let Some(as_arc) = as_arc {
+            for r in as_arc.numa_regions_snapshot() {
+                let base = r.base.as_u64();
+                let end = base + r.len;
+                let prot = r.perms.prot_only();
+                let policy = resolve_policy(tid, base);
+                let effective_nodemask =
+                    mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid));
+                let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
+                    "[stack]"
+                } else if base == 0x8000_0000_0000_u64
+                    || (base & 0xffff_ff00_0000_0000) == 0x8000_0000_0000
+                {
+                    "[text]"
+                } else if brk_top != 0 && base <= brk_top && brk_top <= end {
+                    "[heap]"
+                } else {
+                    ""
+                };
+                vmas.push(ProcVma {
+                    start: base,
+                    end,
+                    readable: prot.contains(RegionPerms::READ),
+                    writable: prot.contains(RegionPerms::WRITE),
+                    executable: prot.contains(RegionPerms::EXEC),
+                    // From the UN-stripped perms — prot_only() drops the
+                    // SHARED bit. Feeds maps' s/p column + statm's shared.
+                    shared: r.perms.contains(RegionPerms::SHARED),
+                    label,
+                    numa_policy: policy.mode,
+                    numa_nodemask: effective_nodemask,
+                    numa_node_pages: r.node_pages,
+                    resident_pages: r.resident_pages,
+                    kernel_page_kb: r.kernel_page_kb,
+                });
             }
-        })
-    {
-        for r in as_arc.numa_regions_snapshot() {
-            let base = r.base.as_u64();
-            let end = base + r.len;
-            let prot = r.perms.prot_only();
-            let policy = resolve_policy(tid, base);
-            let effective_nodemask =
-                mpol_effective_nodemask(policy, narf_scheduler::task_mems_allowed(tid));
-            let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
-                "[stack]"
-            } else if base == 0x8000_0000_0000_u64
-                || (base & 0xffff_ff00_0000_0000) == 0x8000_0000_0000
-            {
-                "[text]"
-            } else if brk_top != 0 && base <= brk_top && brk_top <= end {
-                "[heap]"
-            } else {
-                ""
-            };
-            vmas.push(ProcVma {
-                start: base,
-                end,
-                readable: prot.contains(RegionPerms::READ),
-                writable: prot.contains(RegionPerms::WRITE),
-                executable: prot.contains(RegionPerms::EXEC),
-                // From the UN-stripped perms — prot_only() drops the
-                // SHARED bit. Feeds maps' s/p column + statm's shared.
-                shared: r.perms.contains(RegionPerms::SHARED),
-                label,
-                numa_policy: policy.mode,
-                numa_nodemask: effective_nodemask,
-                numa_node_pages: r.node_pages,
-                resident_pages: r.resident_pages,
-                kernel_page_kb: r.kernel_page_kb,
-            });
         }
     }
     // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
@@ -3993,6 +4006,12 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         stack_top,
         cmdline,
         vmas,
+        vm_size_bytes: memory_stats.mapped_bytes,
+        resident_pages: memory_stats.resident_pages,
+        data_bytes: memory_stats
+            .writable_nonexec_bytes
+            .saturating_sub(stack_bytes),
+        stack_bytes,
         // PARENT_OF values are parent TaskIds — translate to the parent's
         // outer ProcessId, then into the READER's namespace view. This is the
         // field systemd's `pidref_is_my_child` compares against its own
@@ -6072,7 +6091,9 @@ pub fn default_sync_signal_delivery(
                 let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
                 #[cfg(feature = "linux-compat")]
                 {
-                    if let Some(info) = proc_task_info(pid) {
+                    if let Some(info) =
+                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
+                    {
                         for vma in info.vmas.iter().filter(|vma| vma.executable) {
                             let _ = writeln!(
                                 narf_console::Writer,

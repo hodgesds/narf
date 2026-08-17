@@ -68,6 +68,7 @@ pub mod mount_api;
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;
+pub mod oom;
 #[cfg(feature = "linux-compat")]
 pub mod perf_event;
 #[cfg(feature = "container")]

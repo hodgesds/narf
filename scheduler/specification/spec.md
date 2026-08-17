@@ -71,6 +71,14 @@ before switching and calls `resume` only when `pause` reported an open syscall
 span, preventing off-CPU residency from being charged as kernel CPU time. The
 callbacks run with interrupts disabled and may not sleep or take a non-IRQ-safe
 lock.
+Own-stack user tasks are timer-preemptible at the CPL3 scheduler tick. The
+preemption path retains the task's live trap frame, FPU state, address space,
+TLS base, and dedicated kernel-stack continuation across requeue, so a
+syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
+Their CPL0 syscall continuations remain run-to-completion except at explicit
+park/yield points. NARF does not yet have a Linux-style per-task preempt-disable
+counter, so enabling arbitrary CPL0 timer preemption for user tasks would make
+lock-bearing kernel continuations migratable and could strand shared state.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Ordinary background task polls deliberately do not advance it: scheduler churn
@@ -177,6 +185,19 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
 ## 4. Invariants & safety properties
 
 - A task always polls inside the domain it was spawned with.
+- A user task polls with its own address-space root active. On aarch64 the
+  executor saves the incoming TTBR0, installs the task's TTBR0 before polling,
+  and restores the saved `(root, ASID)` before any later kernel or user task is
+  polled. Lifetime-scoped ASIDs make both switches non-flushing; an ASID is not
+  reused until the memory subsystem completes a system-wide tag invalidation.
+- On x86_64 the executor publishes process-PCID-0 residency before a user root
+  is loaded using the memory subsystem's sequentially consistent publication
+  primitive, and clears it only after the plain kernel-root CR3 restore has
+  invalidated PCID 0 locally. A CPU entering either scheduler halt path marks
+  itself TLB-idle; after wake it clears that state and completes any deferred
+  full non-global flush before another task root or domain context can load.
+  The idle/debt publication handshake guarantees a racing shootdown is handled
+  either by its ordinary IPI acknowledgement or by this pre-dispatch flush.
 - `donate_to` does not bypass capability checks; caller must hold a
   `Cap<Task, Invoke>` (Stage 3).
 - The executor never holds a lock across a poll boundary.

@@ -247,6 +247,14 @@ argument = "Timer-preemption accounting reads only the current task's scalar tim
 ref = "security-model/specification/spec.md#L42"
 argument = "The removed scan neither enforced capability checks nor assigned domain tags; it leaked an overlapping free after an ownership violation had already occurred. The audited address-space and page-table ownership fixes remain in place, while KASAN-capable kernel tests and stress teardown continue to exercise double-free and use-after-free failures."
 
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The boot huge-page reservation and per-NUMA-node pool remain inside the existing memory/frame TCB. The change adds no trusted subsystem, capability, domain transition, or user-visible authority; it makes the boot-only physical-memory ownership contract explicit with an unsafe interface."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Huge-page reservation now excludes the architecture-reserved low-memory window and every caller-protected physical range before publishing a HugeFrame, with bare_main mandatorily protecting the complete loaded-kernel interval before the buddy sees the same usable map. Each claimed frame is stored in exactly one physical-NUMA-node stack and returned as a buddy exclusion; boot reserves stack capacity for allocated plus free claims, so free_hugepage cannot recursively allocate while holding the IRQ-safe pool lock."
+
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -339,3 +347,167 @@ argument = "Ordered-tree point lookup returns only the greatest VMA base not abo
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The page-table ownership registry remains fixed-size, allocation-free, and lock-free. Open-addressed insertion uses compare-exchange and never replaces a live physical-frame marker; lookup follows a collision chain until a never-used slot; unregister publishes a tombstone rather than an empty slot so later colliding registrations cannot become false negatives. A full registry still fails closed by retaining every existing ownership marker and incrementing the overflow counter. Consequently free_user_pml4_tree continues to reclaim only registered AS-private tables and cannot mistake copied kernel-shared page tables for owned frames."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Live batched swap-out accepts only resident, anonymous-private, base-page backing that is neither shared, COW, file-backed, nor locked. The AddressSpace marks every victim Evicting while holding its authoritative region lock; the swap transaction then revalidates one root, every present leaf, and every physical address before replacing any PTE. Only after the complete PTE batch commits does the ownership callback clear the corresponding Region.phys entries, and only after the targeted TLB retirement completes are the frames returned to the allocator. Swap-in reads into fresh unpublished frames, atomically validates and replaces the complete same-root leaf batch, publishes those frames into Region ownership, and discards the slots only after publication. Failure rolls back transition metadata or retains stable swap entries, so neither path creates an unowned live frame, double owner, or stale translation to a reused frame."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The proportional-set-size range planner is a pure, bounded metadata policy and cannot unmap, free, or grant access. PSS units rank and size fair scan work, while only independently supplied expected_free_pages advances the physical high-watermark goal; a shared alias with proportional charge but zero physical yield therefore cannot satisfy reclaim. The AddressSpace executor revalidates root identity, VMA kind, LOCKED/COW/shared/file exclusions, residency, and leaf ownership before each bounded swap transaction, so stale planner input fails without bypassing mapping permissions, ownership, capability checks, or domain tags."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Targeted x86_64 process shootdown publishes PCID-0 residency before MOV CR3 and clears it only after the plain kernel-root CR3 restore has locally invalidated that context. Filtering becomes authoritative independently per tag bucket, so activity in another bucket cannot turn an untracked tag into a false-negative empty mask. A CPU publishes idle before either scheduler halt; a sender records full-flush debt and then rechecks idle, while wake clears idle before claiming debt, proving that a race is covered by either the acknowledged IPI or a complete local non-global flush before the next task context load. Address-space range/full paths use the remote-only filtered surface only after their local page-table invalidation, and frame ownership is still released afterward. Kernel-global paging hooks remain unfiltered. Tagged aarch64 invalidation uses architected Inner Shareable TLBI propagation and therefore omits only a redundant SGI; untagged VMALLE1 requests retain software fan-out."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Batched reclaim, swap ownership transitions, and targeted invalidation remain within the existing memory domain manager and interrupt delivery seams. They add no trusted subsystem, capability authority, DomainId, domain-rights transition, or cross-domain data path; the change restructures existing page ownership and translation retirement inside the documented TCB boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Batched huge-page allocation computes policy/cpuset-constrained node orders before taking the pool lock, transfers ownership only after every requested frame has been popped, and on exhaustion pushes each partial frame back into its exact originating node stack before returning. sys_mmap zeroes the exclusively owned completed vector before publishing any hardware leaf; map_huge_region retains its existing rollback and TLB-before-free ownership ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "x86_64 multi-leaf huge mappings hold the existing root-sharded page-table mutation lock once across the complete fresh-leaf installation. The lock-free helpers remain crate-private and require that guard; public single-leaf callers retain identical validation and locking. A failed batch drops the guard before removing installed leaves, returns every exclusively owned HugeFrame to its exact NUMA pool, and publishes no HugeRegion metadata, preserving one-owner and invalidate-before-reuse ordering without a recursive-lock deadlock."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "aarch64 AddressSpace activation installs the live L0 root owned by that address space together with a lifetime-exclusive process ASID; the executing kernel, stack, and physical-memory accessors remain on the shared TTBR1 high half. The scheduler saves the complete incoming TTBR0, installs the task context before polling, and restores the saved context before any subsequent task without discarding unrelated tagged translations. Domain tags 1..=16 and process tags 17..=the architectural maximum are disjoint. Last-owner teardown broadcasts ASIDE1IS and waits for its barriers before clearing allocator ownership, while exhaustion uses ASID 0 plus a local full invalidation on each distinct-root switch. Page-table mutation uses all-ASID inner-shareable VA invalidation, so editing an inactive process root or shared TTBR1 leaf cannot leave a stale nonzero-tag translation on any CPU."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 trap-back longjmp stays on the shared TTBR1 kernel stack and returns from UserTaskFuture::poll with that task's still-live tagged TTBR0 installed. The scheduler slot retains its AddressSpace Arc while the already-tested poll boundary restores the complete incoming TTBR0, so the ASID/root cannot retire during the handoff. Removing the redundant same-context TTBR0 write and VMALLE1 therefore changes no accessible mapping window while preserving tagged translations across traps."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Buddy free-list mutation remains protected by an IRQ-safe lock, but ownership is now partitioned one lock per physical NUMA node. Allocation holds only the selected node lock and releases a failed node before nearest-node fallback; free derives the same authoritative physical node before taking its lock. Boot rebalance takes zone locks in ascending node order and publishes NUMA-aware routing only after every block and stable node total is installed. Runtime online/offline keeps range admission and the selected zone mutation in one transaction, updating atomic totals only after successful donation or complete-range removal. Thus no frame can enter two free lists, become visible before accounting, or be reused while still allocated; cache-line isolation changes contention, not frame authority or domain access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The bounded order-0 frame cache is partitioned by CPU and physical NUMA node and protected by a cache-local IRQ-safe lock. A buddy refill records each retained cache frame free in the existing allocation-audit bitmap; cache pop records ownership before publication; cache free records relinquishment before insertion; spill/coordinated drain coalesces an already-free frame without a duplicate audit transition. Cache counters remain part of allocator free-page and order-0 reporting, while cgroup charge/uncharge and COW last-owner checks stay outside and precede the cache transition exactly as they precede direct buddy operations. A per-node bypass is published and rechecked under the cache lock before coordinated draining, preventing a racing insertion from escaping a high-order retry. Runtime-hotplug nodes bypass caching before donation and until their last range is offline, so exact free-range removal retains its all-or-nothing visibility and no removed frame remains cached."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Page-scoped demand-fault tickets remain private address-space metadata inside the existing memory TCB. They add no trusted subsystem, capability, domain assignment, user-visible identifier, or cross-domain data path; the change narrows the duration of an existing VMA critical section."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "A demand ticket grants one fault path temporary ownership of an otherwise-unbacked virtual page, not of a published frame. Anonymous allocation and zeroing run outside the region lock, but publication of Region.phys and leaf installation are one region-lock transaction. Removing or splitting a VMA cancels every covered ticket before replacement metadata can appear; a losing anonymous path frees its unpublished frame and a losing file-backed path releases its external alias. Thus no cancelled fault can publish into an ABA replacement, no peer observes half-published backing, and frame reuse still follows leaf retirement and authoritative region ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "A COW ticket pins the exact source frame before releasing the authoritative region lock, so concurrent VMA teardown can drop its ownership but cannot recycle the source during the copy. Publication revalidates the ticket, WRITE+COW authority, virtual-page identity, and unchanged source backing under the region lock. Success transfers Region.phys to the unpublished destination before dropping both the old ownership and temporary pin; cancellation frees the destination and drops only the pin. The existing post-split remap path still derives user permissions from current metadata and performs translation invalidation before either frame can be reused."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Fork's batched COW retain runs inside the same authoritative parent-region transaction as COW marking and before the child backing snapshot is published. It excludes SHARED mappings and zero sentinels, partitions only by the existing physical-frame shard function, and performs exactly one increment for every resident private input occurrence while holding that frame's existing shard lock. Grouping changes lock acquisition count but not owner cardinality, frame identity, or the requirement that every child reference exists before parent teardown can recycle backing."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The ordered NUMA candidate seek is read-only metadata selection under the existing address-space region lock. It starts at the containing or successor VMA, rejects SHARED, LOCKED, inaccessible, and unbacked pages exactly as before, and returns no permission or ownership token. protect_numa_hint_page still revalidates the selected address under the region lock before removing a leaf, while the fault path retains its existing policy, cpuset, migration, and remap checks; shortening the search cannot grant access or recycle backing."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Batched COW count snapshots preserve one result per input position and read every frame under the same physical-frame shard lock as scalar count and retain operations. Materialization and permission rewriting hold the authoritative address-space region lock across snapshot and PTE installation. The x86 scatter installer passes the original backing index to permission derivation even when a zero lazy slot is skipped, so a count cannot be applied to the wrong physical leaf. A count may fall after observation, which only leaves a sole-owner leaf conservatively read-only; the transition from sole owner to shared requires clone_for_fork to acquire that same address-space lock before incrementing, so no snapshot can observe one and then install WRITE over newly shared backing. Permission and TLB derivation otherwise remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Batched region, MAP_FIXED-punch, and MADV_DONTNEED release begins only after every affected leaf is removed and the existing local/remote TLB retirement completes. The buddy allocator filters forbidden low memory before refcount mutation, drops exactly one owner for every nonzero input under that frame's existing COW shard lock, and forwards only unregistered or final-owner frames to the same scalar cgroup-uncharge, scrub, allocation-audit, NUMA-cache, and buddy-free path. Duplicate inputs retain scalar owner cardinality, zero sentinels are ignored, and pluggable allocators inherit a scalar batch default, so batching cannot create a second free-list owner or make backing reusable while a COW owner or stale translation remains."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Final-owner batch publication reserves its result capacity before any COW decrement can reach zero and thereafter uses only fixed 64-frame stack buffers, so teardown cannot recurse into frame allocation after acquiring exclusive ownership. Every frame completes cgroup uncharge and optional scrub before publication. Cache insertion and audit transitions match scalar return; any displaced cached entries reach the buddy while the same cache lock remains held, preserving the cache-drain and runtime-hot-remove invariant that a free frame is continuously visible in either the cache or its NUMA zone. Direct bypass publication serializes on the existing zone lock, and the bounded chunk limits IRQ-masked work without changing owner cardinality."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Address-space byte accounting now walks immutable region lengths under the existing region lock and uses saturating addition, rather than cloning ownership-bearing per-page backing vectors. It neither changes mappings nor exposes physical addresses, cannot wrap into a smaller accounting value, and performs no allocation while an exiting task snapshots rusage, so memory pressure cannot convert diagnostic accounting into a kernel allocator panic."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "aarch64 map, unmap, huge-leaf, and final user-root teardown paths now serialize structural page-table writes through a cache-line-independent 64-way lock selected solely from the live root physical page. Scatter installation retains that lock across every intermediate-table and leaf write and executes one architecture-required descriptor-publication barrier before returning, including after partial failure. Contiguous teardown clears every present leaf under the same lock, then executes all-ASID inner-shareable last-level TLBI operands inside one complete DSB/ISB sequence before authoritative backing can be released. MAP_FIXED, MADV_DONTNEED, and region teardown retain their region-metadata transaction through this operation, so no racing writer can orphan a child table, preserve a stale translation to reusable backing, or publish metadata inconsistent with the leaf tree."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The aarch64 root-sharded locks and batched descriptor/TLBI helpers remain entirely inside the existing memory domain manager TCB. They add no capability, domain identifier, cross-domain path, or accessible mapping; they serialize and batch the architecture operations already required for the same page-table authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 scatter permission rewriter holds the live root's existing mutation shard across the complete architecture break-before-make transaction. It clears every old leaf before issuing one all-ASID inner-shareable invalidation whose trailing DSB/ISB completes before any replacement descriptor is stored, then publishes all non-zero replacement leaves with one DSB/ISB sequence. Address-space permission changes retain the authoritative region lock and backing ownership through that transaction; zero lazy sentinels remain unmapped. Parent rematerialization now applies the same rewrite after fork, so both parent and child lose write permission before shared COW backing can be modified without a fault."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Batched aarch64 permission rewriting and parent COW write protection stay within the existing memory domain manager and reuse its root lock, region ownership, and translation-invalidation authority. They add no capability, domain identifier, trusted subsystem, cross-domain data path, or new accessible mapping."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86_64 scatter permission rewriter retains one existing root-sharded mutation lock across every clear-and-reinstall pair, while the authoritative region lock keeps each non-zero backing frame live and prevents concurrent unmap or replacement. Before releasing the root transaction it locally invalidates the complete changed span, using bounded per-page INVLPG or one non-global flush. A peer-active address space then broadcasts only the remote range half, or uses the existing full local/remote flush for a large rewrite; no peer can retain permissions older than the metadata published by mprotect or COW rematerialization. Zero lazy slots remain absent and permission-only rewriting never releases backing, so batching changes neither ownership nor accessible physical addresses."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The x86_64 one-lock permission transaction and remote-only range broadcast remain private implementation paths inside the existing memory TCB and its established interrupt shootdown bridge. They add no capability, domain assignment, trusted subsystem, user-controlled authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 contiguous clear walker caches only the L3 pointer reached through verified valid table descriptors while holding the same live root's mutation shard. The cache key includes the complete L0/L1/L2 index tuple and is discarded at every 2 MiB boundary, so no leaf write can cross into an unrelated table. Missing tables remain benign holes and a block descriptor fails before it can be treated as a child pointer. Every cleared leaf is still followed by the existing all-ASID inner-shareable invalidation before backing reuse or replacement publication, including partial progress before a structural error; reducing upper-level walks changes neither mapping authority nor translation-retirement ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached aarch64 range walk is an internal implementation detail of the existing memory page-table TCB. It introduces no capability, domain assignment, trusted subsystem, external pointer, or cross-domain path and does not change which root or virtual range the caller is authorized to mutate."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86_64 permission rewriter caches a leaf-table pointer only after verifying each present non-huge PML4/PDPT/PD descriptor under the live root's existing mutation shard. Its cache key contains the complete upper-level index tuple and is invalidated at every 2 MiB boundary or after creating a missing table, preventing a descriptor write through a stale or unrelated leaf table. Each replacement retains the authoritative region's exact physical address and derived USER/WRITE/NX flags, and the complete changed span is locally invalidated before the guard is released and remotely invalidated before a peer-active rewrite returns. Direct descriptor replacement changes traversal cost, not frame ownership, mapping authority, or stale-translation retirement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached x86_64 permission walk remains an internal optimization of the existing memory page-table TCB. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The aarch64 scatter installer caches an L3 pointer only after ensuring or verifying every L0/L1/L2 table descriptor under the live root's existing mutation shard. The complete upper-level index tuple keys the cache and every 2 MiB boundary forces a new verified walk, so a leaf cannot be installed through an unrelated table. Fresh intermediate tables and leaves remain unpublished until the existing single DSB/ISB sequence; the permission-rewrite caller still completes the break and all-ASID inner-shareable invalidation before invoking this make phase. Lazy zero entries remain absent, existing leaves still fail as AlreadyMapped, and partial allocation or installation retains the prior partial-progress contract, so fewer walks change neither authority, backing ownership, nor descriptor publication ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached aarch64 scatter installer is internal to the existing memory page-table TCB and reuses its root lock, frame allocator, and publication barrier. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86_64 scatter installer caches a PT pointer only after ensuring or verifying every PML4/PDPT/PD table descriptor under the live root's existing mutation shard. Its cache key contains the complete upper-index tuple and every 2 MiB boundary performs a new verified walk, so leaf stores cannot cross into an unrelated table. Each non-zero backing entry retains its caller-derived USER/WRITE/NX flags, lazy zero entries remain absent, existing leaves still fail as AlreadyMapped, and errors preserve the established partial-progress contract. The complete attempted span is locally invalidated before the root guard is released, including partial progress; large non-global runs use one local user flush while any run containing GLOBAL falls back to per-VA INVLPG. Batching therefore changes neither mapping authority, backing ownership, nor stale negative-translation retirement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The cached x86_64 scatter installer remains internal to the existing memory page-table TCB and reuses its root lock, allocator, and local invalidation primitives. It adds no capability, domain assignment, trusted subsystem, external authority, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Every successful x86_64 base-page or huge-page installation now ORs that leaf's independently derived USER/WRITABLE requirements into each verified non-huge intermediate descriptor after the destination leaf is proven absent; the permission-rewrite path performs the same promotion only after its complete structural walk succeeds. A supervisor leaf remains inaccessible because x86 permission checks AND the upper and leaf bits, so permissive table descriptors cannot override a leaf with USER or WRITABLE clear. Promotion preserves the descriptor's physical address and all existing flags, occurs under the live root's mutation shard, and is followed by the path's existing local invalidation. Failed AlreadyMapped or structural-error paths do not promote existing descriptors, preserving their no-permission-mutation behavior."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Intermediate x86_64 permission promotion is an internal correction to the existing page-table construction path. It adds no capability, domain assignment, trusted subsystem, external authority, mapped physical frame, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Final-owner page-table teardown detaches only private top-level descriptors while holding the live root's existing mutation shard, after last-Arc ownership has proved that no CPU can execute or repopulate the root. The shared-alias transaction remains held through every leaf retirement, translation invalidation, and external backing release, and ends only after both authoritative region tables are drained; last-Arc ownership then excludes any new alias during private intermediate-table reclaim. Detached tables are traversed before bounded batch return; x86_64 unregisters and revalidates ownership at every level before making a table reusable, preserving the exclusion of copied kernel-shared tables."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Unlocked final-root traversal and batched table-frame return remain private implementation details of the existing memory domain manager TCB. They add no capability, domain assignment, trusted subsystem, user-visible mapping, external pointer, or cross-domain path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The unique-frame batch API is crate-private and unsafe: page-table teardown invokes it only after last-Arc ownership has made the root inactive, every data leaf has been retired, each private table has been detached, and x86_64 has removed the table's ownership-registry entry. Page-table frames never enter the data-page COW registry, so bypassing COW lookup cannot skip another owner; alternative allocators retain the ordinary batch implementation by default."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "x86_64 user tasks now use the already-established own-stack CPL3 timer-preemption path while retaining run-to-completion CPL0 syscall continuations. Separate policy bits prevent enabling userspace fairness from also making arbitrary kernel continuations preemptible before NARF has a preempt-disable counter. The CPL3 path switches only after validating that the live trap frame lies within the current task's dedicated kernel stack, marks the return as a suspended continuation for QSBR, saves the task FPU before clearing current-task publication, re-arms exactly that slot's waker, and restores the same continuation, address space, TLS base, and FPU state before iretq. It neither aliases task stacks nor permits one task to resume through another task's address space or register state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "User timer preemption remains inside the existing frame and scheduler executor TCB and uses its existing per-task stack, trap-frame, address-space, and run-queue ownership. It adds no trusted subsystem, capability, domain assignment, ambient authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Procfs basic task snapshots now obtain only saturating allocation-free aggregate counters while holding the existing address-space region locks. The scan never transfers physical ownership or exposes frame addresses, counts a base page resident only when its authoritative physical slot is nonzero, and converts huge leaves to base-page equivalents without changing mappings. Detailed per-VMA NUMA data remains opt-in for maps/numa_maps; ordinary liveness and metadata reads cannot allocate kernel memory proportional to an untrusted task's region count."

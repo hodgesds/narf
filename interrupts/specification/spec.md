@@ -45,9 +45,33 @@ pub fn on_irq_with_user_state(
 );
 pub fn interrupted_user_state() -> Option<InterruptedUserState>;
 
+pub fn install_tlb_shootdown_bridge();
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ipi::shoot_range_mask(
+    va: u64,
+    pages: u64,
+    tag: u16,
+    target_cpus: u64,
+);
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ipi::shoot_tag_only_mask(tag: u16, target_cpus: u64);
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn ipi::shoot_full_mask(target_cpus: u64);
+
 #[cfg(target_arch = "aarch64")]
 pub fn gic::configure_pmu_ppi(intid: u32) -> Result<(), ()>;
 ```
+
+The x86 shootdown mask is a logical-CPU bitmap. Implementations intersect it
+with the online set and remove the sender, publish pending state only for the
+remaining CPUs, send fixed-destination x2APIC IPIs only to those CPUs, and wait
+only for their ACK counters. The unmasked `shoot_range`, `shoot_tag_only`, and
+`shoot_full` helpers remain all-online-peer compatibility wrappers.
+
+On aarch64, tagged memory requests use Inner Shareable TLBI operations and do
+not enter the SGI bridge. The bridge remains responsible for untagged local
+`VMALLE1` requests, which require peer execution to become system-wide.
 
 The PMU route accepts only private INTIDs 16–31, enables the current CPU's
 redistributor immediately, and is inherited by subsequent per-CPU GIC

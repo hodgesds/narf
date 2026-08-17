@@ -61,6 +61,53 @@ pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
+/// Return independently owned frames; buddy batches COW shard acquisition and
+/// bounded no-allocation cache/zone publication, while alternative allocators
+/// retain the scalar default.
+pub fn free_frame_batch(frames: &[PhysFrame]);
+/// Internal final-owner path: caller proves every frame is uniquely owned and
+/// absent from COW/page-table registries, allowing allocator implementations
+/// to bypass shared-owner lookups.
+pub(crate) unsafe fn free_unique_frame_batch(frames: &[PhysFrame]);
+/// Retain every non-zero COW backing while locking each touched refcount
+/// shard once; duplicate entries represent distinct owners.
+pub fn cow::inc_ref_batch(frames: &[PhysAddr]);
+/// Return counts in input order while locking each touched shard once.
+pub fn cow::count_batch(frames: &[PhysAddr]) -> Vec<u32>;
+/// Drop one owner per input and return frames whose final owner was removed.
+pub fn cow::dec_ref_batch(frames: &[PhysAddr]) -> Vec<PhysAddr>;
+/// Install scatter backing under one root lock; the callback index preserves
+/// alignment with per-page metadata when zero lazy slots are skipped.
+pub unsafe fn x86_64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+/// Rewrite scatter backing under one root lock and one local invalidation
+/// phase; peer-active address spaces follow with the remote range/full flush.
+pub unsafe fn x86_64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+/// aarch64 twin: one root lock plus one descriptor-publication barrier for
+/// the complete fresh scatter run.
+pub unsafe fn aarch64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+/// Permission/backing rewrite twin: clear the complete span, finish one
+/// all-ASID break-before-make invalidation, then publish non-zero replacements.
+pub unsafe fn aarch64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
 pub fn map(va: VirtAddr, pf: PhysFrame, flags: MapFlags, domain: DomainId);
 pub fn map_folio(va: VirtAddr, folio: Folio, flags: MapFlags, domain: DomainId);
 pub fn map_huge(va: VirtAddr, folio: Folio, size: PageSize, flags: MapFlags, domain: DomainId);
@@ -134,12 +181,83 @@ pub fn node_total(node: usize) -> usize;
 /// Free-block counts for buddy orders 0 through 10.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
 
+/// Free-memory pressure band and the physical-page deficit to high.
+pub fn watermark_min() -> u64;
+pub fn watermark_low() -> u64;
+pub fn watermark_high() -> u64;
+pub fn reclaim_goal_pages() -> usize;
+
+/// Fixed-point proportional-set-size units (one private resident page).
+pub const PSS_UNITS_PER_PAGE: u64;
+pub struct ReclaimRangeCandidate {
+    pub address_space_root: PhysAddr,
+    pub base: VirtAddr,
+    pub pages: usize,
+    pub mapcount: u32,
+    /// Conservative rmap-derived physical yield; zero-yield aliases are skipped.
+    pub expected_free_pages: usize,
+    pub age: u8,
+    pub locked: bool,
+}
+pub struct PlannedReclaimRange { /* root, base, pages, PSS, expected yield */ }
+pub struct ReclaimBatchPlan { /* selected ranges + PSS/yield/scan totals */ }
+pub fn plan_reclaim_ranges(
+    candidates: &[ReclaimRangeCandidate],
+    target_free_pages: usize,
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan;
+pub fn plan_watermark_reclaim(
+    candidates: &[ReclaimRangeCandidate],
+    max_selected_pages: usize,
+) -> ReclaimBatchPlan;
+
+/// Swap backends consume vectors as the primary interface. Default methods
+/// preserve compatibility for simple backends; block/zram implementations may
+/// submit or lock once for the whole vector.
+pub trait SwapBackend: Send + Sync {
+    fn write_batch(&self, slots: &[SwapSlot], frames: &[PhysAddr])
+        -> Result<(), SwapError>;
+    fn read_batch_into(&self, slots: &[SwapSlot], frames: &[PhysAddr])
+        -> Result<(), SwapError>;
+    fn discard_batch(&self, slots: &[SwapSlot]);
+}
+#[cfg(target_arch = "x86_64")]
+pub struct SwapVictim { pub pml4_phys: PhysAddr, pub virt: VirtAddr }
+#[cfg(target_arch = "x86_64")]
+pub struct SwapInRequest {
+    pub pml4_phys: PhysAddr,
+    pub virt: VirtAddr,
+    pub flags: PtFlags,
+}
+/// Low-level ownership-sensitive primitive; live VMA reclaim must use the
+/// AddressSpace-integrated transaction.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn swap_out_plan(plan: &ReclaimBatchPlan) -> SwapBatchReport;
+#[cfg(target_arch = "x86_64")]
+pub fn swap_in_batch(requests: &[SwapInRequest]) -> Result<Vec<PhysAddr>, SwapError>;
+
 /// Hugepage allocation is local-first with SLIT-ordered fallback.
+/// Boot-only reservation skips every protected half-open physical range and
+/// returns the additional ranges which the buddy must exclude.
+pub unsafe fn reserve_from_regions(
+    usable: &[UsableRegion],
+    protected: &[(u64, u64)],
+    want_2m: usize,
+    want_1g: usize,
+) -> Vec<(u64, u64)>;
 pub fn alloc_hugepage_2m() -> Result<HugeFrame, HugeAllocError>;
 pub fn alloc_hugepage_1g() -> Result<HugeFrame, HugeAllocError>;
 /// Strict node-selection primitives used by NUMA policy consumers.
 pub fn alloc_hugepage_2m_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
 pub fn alloc_hugepage_1g_on(node: usize) -> Result<HugeFrame, HugeAllocError>;
+/// All-or-nothing vector allocation with one pool-lock transaction.
+pub fn alloc_hugepages_with(
+    size: HugeSize,
+    policies: &[Mempolicy],
+    local: usize,
+) -> Result<Vec<HugeFrame>, HugeAllocError>;
 // Exported from the `hugepage` module.
 pub fn node_stats(node: usize) -> HugeNodeStats;
 
@@ -164,6 +282,22 @@ impl RegionPerms {
 }
 
 impl AddressSpace {
+    /// Allocate an architecture user root. On aarch64 this also reserves one
+    /// lifetime-scoped process ASID when the hardware pool has capacity.
+    pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// Install this address space's architecture root for the current CPU.
+    pub fn activate(&self) -> Result<(), AddressSpaceError>;
+    /// One ownership-integrated same-root page-out submission.
+    pub unsafe fn swap_out_private_batch(
+        &self,
+        base: VirtAddr,
+        pages: usize,
+    ) -> Result<usize, SwapError>;
+    /// Execute selected ranges in bounded batches with partial-progress data.
+    pub unsafe fn swap_out_reclaim_plan(
+        &self,
+        plan: &ReclaimBatchPlan,
+    ) -> SwapBatchReport;
     /// Materialize every recorded base-page region; used for exec/fork build.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
     /// Materialize only current regions intersecting a page-aligned user range.
@@ -185,6 +319,12 @@ impl AddressSpace {
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool;
     /// Return the registered hardware leaf size (4 KiB, 2 MiB, or 1 GiB).
     pub fn mapped_page_size(&self, vaddr: VirtAddr) -> Option<u64>;
+    /// Sum base-page and hardware-huge VMA spans without allocation.
+    pub fn mapped_bytes(&self) -> u64;
+    /// Allocation-free mapped/resident/writable-nonexec aggregate counters.
+    pub fn memory_stats(&self) -> AddressSpaceMemoryStats;
+    /// Length of the base-page or hardware-huge region starting at `base`.
+    pub fn region_len_at_base(&self, base: VirtAddr) -> Option<u64>;
     /// Copy resident bytes through owned physical backing without user faults.
     pub fn copy_user_bytes_nofault(&self, vaddr: VirtAddr, dst: &mut [u8])
         -> usize;
@@ -243,8 +383,58 @@ pub unsafe fn x86_64::paging::map_4kb_scatter_range(
     root: PhysAddr,
     base: VirtAddr,
     backing: &[PhysAddr],
-    flags_for: impl FnMut(PhysAddr) -> PtFlags,
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
 ) -> Result<(), MapError>;
+
+/// Rewrite resident x86_64 scatter backing under one root-lock hold and one
+/// local invalidation phase; zero entries remain lazy/unmapped.
+pub unsafe fn x86_64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
+/// aarch64 scatter installation takes the same root lock once and publishes
+/// all fresh descriptors with one DSB/ISB sequence.
+pub unsafe fn aarch64::paging::map_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
+/// Rewrite a contiguous scatter-backed aarch64 run under one root lock. All
+/// old leaves are cleared and invalidated before any replacement is installed;
+/// zero backing entries remain lazy holes.
+pub unsafe fn aarch64::paging::rewrite_4kb_scatter_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    backing: &[PhysAddr],
+    flags_for: impl FnMut(usize, PhysAddr) -> PtFlags,
+) -> Result<(), MapError>;
+
+/// Clear a contiguous aarch64 leaf run under one root lock, issuing one
+/// last-level all-ASID TLBI per VA bracketed by one shared barrier sequence.
+pub unsafe fn aarch64::paging::unmap_4kb_range(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError>;
+
+/// Tagged invalidation applies locally and targets only conservatively
+/// resident busy peers. Remote-only variants are used after batched paging
+/// helpers have already completed their local invalidation phase.
+pub fn tlb_shootdown::shootdown(req: ShootdownRequest);
+pub fn tlb_shootdown::shootdown_remote(req: ShootdownRequest);
+pub fn tlb_shootdown::shootdown_remote_full_for_tag(tag: u16);
+/// Residency is published before a context load and cleared only after a
+/// local invalidation. Publication and remote mask sampling use a StoreLoad
+/// barrier pair. Idle debt is discharged before the next task dispatch.
+pub fn tlb_shootdown::set_active_as(cpu: u32, tag: u16);
+pub fn tlb_shootdown::clear_active_as(cpu: u32, tag: u16);
+pub fn tlb_shootdown::mark_idle(cpu: u32);
+pub fn tlb_shootdown::mark_busy(cpu: u32);
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
@@ -357,7 +547,20 @@ x86_64 is rejected at runtime.
 - `DomainId` 0 is reserved for the Frame's own data; no driver may claim it.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
-- Buddy allocator's free lists are per-NUMA-node once NUMA is introduced.
+- Buddy allocator free lists and their IRQ-safe locks are per-NUMA-node and
+  cache-line isolated. Order-0 allocation/free is fronted by a bounded,
+  cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
+  under one zone-lock acquisition, while cached pages remain included in
+  free-page and order-0 statistics. Batched final-owner return uses fixed
+  64-frame stack chunks and holds the cache lock through buddy publication of
+  any displaced entries, so freeing never allocates after owner count zero and
+  cache drains cannot observe a frame in neither location. A base-page refill
+  or folio allocation holds only one zone lock at a time; nearest-node fallback
+  releases the failed zone before trying the next, so unrelated NUMA nodes do
+  not serialize on a global frame lock. Coordinated draining bypasses new cache
+  insertion before high-order retry; runtime-hotplug nodes bypass the cache so
+  exact-range offline admission continues to observe every free frame in the
+  buddy.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range
@@ -393,6 +596,24 @@ x86_64 is rejected at runtime.
   COW. Hardware leaves remain read-only while their backing-frame refcount is
   greater than one. A write fault is recoverable only when both WRITE and COW
   are present; `mprotect(PROT_READ)` therefore cannot be mistaken for COW.
+  Fork retains all resident private backing through one batched operation
+  while the parent region transaction is held. The batch groups frames by
+  refcount shard, locks each touched shard once, and increments once per input
+  occurrence; unbacked zero sentinels and externally owned SHARED mappings are
+  excluded. Multi-page materialization and parent permission rewriting snapshot
+  COW counts by shard while holding the relevant address-space region lock. A
+  concurrent last-owner decrement may conservatively leave a leaf read-only;
+  a sole-owner frame cannot become newly shared without that same region
+  transaction, so the snapshot cannot incorrectly grant WRITE to shared
+  backing. Region teardown, MAP_FIXED punching, and MADV_DONTNEED retire leaves
+  and complete the required TLB flush before dropping backing owners through
+  the allocator's batch interface.
+  The buddy implementation pre-reserves its final-owner result before locking
+  a COW shard, locks each touched shard once, and sends only final-owner /
+  unregistered frames through scalar-equivalent cgroup uncharge and optional
+  scrub. It then groups without allocation into bounded NUMA-cache/buddy
+  transactions that retain the cache lock until displaced cached frames are
+  visible in the zone; alternative allocators use the scalar default.
 - Base-page relocation installs the disjoint destination before removing the
   source, publishes backing ownership exactly once, invalidates source
   translations before freeing a truncated tail, and leaves the source intact
@@ -403,11 +624,107 @@ x86_64 is rejected at runtime.
   lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
   inspect only the predecessor/successor or intersecting tree range; backing
   ownership and TLB ordering are unchanged by this metadata index invariant.
+  The periodic NUMA sampler seeks to the VMA containing or succeeding its
+  page-aligned cursor and stops at the first eligible resident slot, rather
+  than rescanning all preceding VMAs/pages under the IRQ-safe region lock.
+- Anonymous and file-backed demand faults reserve a page-scoped ticket before
+  leaving the address-space region lock. Frame allocation, page zeroing, and
+  filesystem callbacks run without that IRQ-disabling lock, so faults on
+  distinct pages of one shared address space may progress concurrently. The
+  winning ticket republishes backing and installs its leaf while holding the
+  region lock; structural VMA removal cancels every covered ticket before a
+  replacement can appear. A cancelled anonymous allocation remains owned by
+  the fault path and returns to the frame allocator; a cancelled file alias is
+  released through its backing-owner hook.
+- COW write faults use the same page-scoped exclusion principle. The ticket
+  owner takes a temporary source-frame reference before releasing the region
+  lock, allocates and copies outside that lock, and republishes only if the
+  same VMA still owns the same source page with WRITE+COW authority. A
+  cancelled copy frees its unpublished destination and drops only the pin; a
+  successful copy drops both the old region ownership and the pin after the
+  new backing is visible. Faults on unrelated pages therefore do not serialize
+  on a 4 KiB allocation/copy, while teardown cannot recycle a source mid-copy.
 - Every AS-private x86_64 page-table frame has one live entry in the fixed
   atomic ownership registry. Open-addressed probing never overwrites a live
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
+- Final-owner address-space teardown preallocates top-level detachment storage,
+  clears every private root descriptor under one short root-shard transaction,
+  and releases that shard before walking intermediate tables or entering the
+  frame allocator. The global shared-mapping transaction ends after all leaf
+  retirement and external backing release, before private intermediate-table
+  reclaim. The last-`Arc` contract proves that the detached root cannot be
+  active, repopulated, or gain a new shared alias. Intermediate and root frames
+  return in bounded 64-frame batches; x86_64 still requires a live ownership-
+  registry entry at every reclaimed level, so copied kernel tables remain
+  outside the detached set and can never enter a batch.
+- PSS is a range-selection weight, never evidence that physical memory was
+  released. Watermark progress advances only by conservative reverse-map
+  `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
+- Boot huge-page reservation never claims the architecture-reserved low-memory
+  window or any caller-protected physical range. The loaded kernel image is a
+  mandatory protected range, and every successful claim is returned as a buddy
+  exclusion before the same usable map is donated. Free 2 MiB and 1 GiB frames
+  are partitioned by physical NUMA node, so strict-node allocate, free, and
+  per-node statistics are O(1); boot pre-reserves each node stack for its total
+  outstanding reservation so a later free cannot grow a vector while holding
+  the huge-pool IRQ-safe lock. Multi-frame allocation precomputes each policy
+  order before taking that lock, pops the complete vector in one critical
+  section, and rolls every pop back to its original node before returning an
+  exhaustion error; callers never observe partial batch ownership. On x86_64,
+  `map_huge_region` holds one per-root page-table mutation lock across every
+  fresh huge leaf in the region; a failed leaf releases that lock before
+  ordinary rollback unmaps, and no backing is published to region metadata
+  until the complete leaf batch succeeds.
+- aarch64 page-table writers are serialized by the same 64-way root-physical
+  lock sharding model as x86_64. Base-page scatter installation holds one shard
+  across the run and publishes all fresh descriptors with one `DSB ISHST` /
+  `ISB`; contiguous teardown clears all leaves before issuing per-VA
+  `VAALE1IS` operations bracketed by one `DSB ISHST` / `DSB ISH` / `ISB`.
+  MAP_FIXED punching, MADV_DONTNEED, region teardown, and fresh huge-region
+  installation use those root transactions, so unrelated address spaces do
+  not serialize and a same-root intermediate-table race cannot orphan leaves.
+  Permission and COW write-protect rewrites use one break-before-make
+  transaction per region: all old leaves are cleared, one batched all-ASID
+  invalidation completes, then all non-zero replacements are installed and
+  published once. Parent `rematerialize` is a real rewrite on both supported
+  architectures; it may not be a no-op after fork while the parent's live leaf
+  is still writable. Contiguous mapping and clearing cache the current L3
+  table, so up to 512 adjacent 4 KiB leaves share one L0/L1/L2 walk in each
+  phase without weakening the root-lock, publication, or
+  invalidate-before-reuse transaction.
+- x86_64 scatter installation, permission changes, and COW write-protect
+  rewrites hold one root mutation shard per region. Their helpers cache the
+  current leaf table, so up to 512 adjacent 4 KiB pages share one
+  PML4/PDPT/PD walk; permission changes directly replace present descriptors.
+  Each transaction completes one bounded local invalidation phase after the
+  final leaf write;
+  `AddressSpace` then issues only the remote half of a range shootdown for a
+  peer-active small run, or one full non-global local/remote flush for a large
+  multi-region rewrite. No backing becomes reusable in this permission-only
+  path, and zero lazy sentinels are never installed as physical address zero.
+  A successful x86_64 map promotes USER/WRITABLE requirements into every
+  intermediate descriptor only after proving the destination leaf absent;
+  requirements are derived independently per leaf, failed maps leave existing
+  permissions unchanged, and leaf flags remain the final authority.
+- A swap-out batch reserves one contiguous slot run, performs one backend
+  vector write, validates every same-root leaf before publishing any swap PTE,
+  and retires stale translations once before returning any victim frame to the
+  allocator. Failure before PTE publication leaves every mapping resident and
+  releases the complete slot run.
+- A swap-in batch validates and reads every requested slot into unpublished
+  frames before atomically replacing the same-root swap leaves. Failure leaves
+  all PTEs and slots unchanged. Backend I/O runs without the global swap-device
+  lock or a page-table mutation lock held.
+- Live anonymous-private x86_64 swap uses region-table transitions
+  `Evicting -> Swapped -> Loading -> Resident`. PTE publication transfers the
+  corresponding `Region::phys` ownership before TLB invalidation/free; page-in
+  republishes Region ownership before retiring slots. A fault on `Swapped`
+  collects consecutive leaves ahead of the fault for one vector read/PTE
+  commit. Teardown atomically clears all stable swap leaves and discards their
+  slots as one backend batch. Shared, COW, file-backed, and locked pages are
+  ineligible until reverse-map/slot-sharing semantics are defined.
 
 ## 5. Architecture notes
 
@@ -431,6 +748,29 @@ x86_64 is rejected at runtime.
 ### aarch64
 - Paging: 4-level, 4 KiB granule (default) or 16 KiB / 64 KiB granules
   on platforms that prefer them, 48-bit VA.
+- `AddressSpace::activate` installs the address space's TTBR0 low-half root;
+  scheduler polling saves and restores the incoming TTBR0 so kernel tasks never
+  inherit a user root. Each live process root receives a unique ASID from the
+  hardware-supported namespace after tags 1..=16, which remain reserved for
+  domain roots. A switch to a nonzero lifetime tag does not flush; final
+  `AddressSpace` teardown broadcasts `TLBI ASIDE1IS` before making that tag
+  reusable. Pool exhaustion falls back safely to ASID 0 with a local full
+  invalidation on every distinct-root switch.
+- Final-owner TTBR0 teardown clears all valid L0 table descriptors under the
+  root mutation shard, then drops the shard before walking the now-inactive
+  subtrees and returning translation-table frames in bounded allocator batches.
+  The later ASID retirement still invalidates the lifetime tag before reuse;
+  no CPU can execute the retired root during the unlocked reclaim walk.
+- Page-table mutation invalidates by VA for every ASID across the
+  inner-shareable domain (`VAAE1IS` / `VAALE1IS`). This is required because
+  the mutated root need not be the TTBR0 context active on the issuing CPU.
+  Mutators take a 64-way root-physical lock; contiguous base-page teardown
+  batches the required barrier sequence around the complete run rather than
+  paying it once per leaf, while still issuing one last-level TLBI operand per
+  page for CPUs that do not implement range TLBI. Permission changes obey
+  break-before-make across the whole run: the invalidate barrier sequence
+  completes before replacement descriptors are stored, and one publication
+  barrier makes the replacement run visible.
 - MTE: memory tag is 4 bits, stored in the top byte of the address plus
   tag storage. We assign one tag per domain.
 - TBI1/TBI0 enabled; TCR_EL1 configured for MTE.
@@ -509,8 +849,8 @@ breakdown. Modules in tree:
   `try_dealloc_atomic` for IRQ-context callers.
 - `heap.rs` — hybrid bootstrap-bump → slab `#[global_allocator]`,
   `BOOTSTRAP_CAPACITY = 8 << 20`.
-- `hugepage.rs` — boot-reserved 2 MiB / 1 GiB pool (cmdline
-  `hugepages_2m=N` / `hugepages_1g=N`), no buddy fallback.
+- `hugepage.rs` — boot-reserved, protected-range-aware, per-NUMA-node 2 MiB /
+  1 GiB pools (cmdline `hugepages_2m=N` / `hugepages_1g=N`), no buddy fallback.
 - `atomic_pool.rs` — driver-side `AtomicPool<T>` fixed-capacity
   pool for IRQ-critical paths that can't tolerate even
   `try_alloc_atomic` failure.

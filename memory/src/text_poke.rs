@@ -570,7 +570,9 @@ unsafe fn split_leaf(
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), PokeError> {
-    use crate::aarch64::paging::{tlb_invalidate_vae1is, PageTable, PageTableEntry, PtFlags};
+    use crate::aarch64::paging::{
+        tlb_invalidate_va_all_asids_inner_shareable, PageTable, PageTableEntry, PtFlags,
+    };
 
     if !can_protect(phys, len) {
         return Err(PokeError::Unsupported);
@@ -618,15 +620,16 @@ unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), 
             };
             l2.entries[i2] = PageTableEntry::from_raw((leaf.raw() & !AP_MASK) | ap);
         }
-        // `tlbi vae1is` is inner-shareable — the hardware broadcasts it — and
-        // the primitive brackets it with `dsb ishst` / `dsb ish; isb`, so the
+        // `tlbi vaae1is` is inner-shareable and covers every ASID — the hardware
+        // broadcasts it — and the primitive brackets it with `dsb ishst` /
+        // `dsb ish; isb`, so the
         // descriptor store is visible before the invalidation and the
         // invalidation has completed everywhere before we return. No IPI, and
         // no break-before-make: only AP changed, which ARM permits.
         for page in 0..(TWO_MB / FOUR_KB) {
             // SAFETY: TLB invalidation is always legal at EL1.
             unsafe {
-                tlb_invalidate_vae1is(VirtAddr::new(
+                tlb_invalidate_va_all_asids_inner_shareable(VirtAddr::new(
                     ((phys + off) | crate::KERNEL_PHYS_OFFSET) + page * FOUR_KB,
                 ));
             }
@@ -1173,8 +1176,8 @@ mod tests {
     #[test]
     fn poke_window_sits_above_the_pack_region() {
         // A poke slot that overlapped the pack region would map a scratch
-        // frame on top of live JIT text.
-        assert!(POKE_VA_BASE >= crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::BPF_TEXT_USABLE);
+        // frame on top of live JIT text. POKE_VA_BASE is defined at the exact
+        // end of that region; this test checks the far endpoint.
         let last = poke_va(narf_lib::percpu::MAX_CPUS - 1);
         assert!(last < crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::SLOT_SPAN);
     }

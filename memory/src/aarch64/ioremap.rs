@@ -11,10 +11,9 @@
 //! the safest default for MMIO BARs that need predictable
 //! ordering with respect to driver writes.
 //!
-//! TLB invalidation: `tlbi vae1` covers the local CPU; the
-//! existing aarch64 broadcast happens via the SGI_TLB_SHOOTDOWN
-//! IPI (mirror of x86_64). The `dsb ish + isb` dance after each
-//! invalidation pairs the broadcast.
+//! TLB invalidation uses `tlbi vaae1is`, which broadcasts the VA invalidation
+//! for every ASID across the inner-shareable domain. This covers shared TTBR1
+//! mappings even while peers execute under distinct process ASIDs.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -25,7 +24,7 @@ use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::aarch64::paging::{
-    self, map_4kb, read_ttbr1_el1, tlb_invalidate_vae1is, MapError, PtFlags,
+    self, map_4kb, read_ttbr1_el1, tlb_invalidate_va_all_asids_inner_shareable, MapError, PtFlags,
 };
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
@@ -138,7 +137,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
                 let v_j = VirtAddr::new(range.base + off_j);
                 // SAFETY: tlbi is always legal at EL1.
                 unsafe {
-                    tlb_invalidate_vae1is(v_j);
+                    tlb_invalidate_va_all_asids_inner_shareable(v_j);
                 }
                 // No unmap_4kb on aarch64 yet — leave the L3
                 // entry; the caller's vmalloc::free is enough
@@ -153,7 +152,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         // system — same as the x86_64 INVLPG broadcast.
         // SAFETY: tlbi at EL1 always legal.
         unsafe {
-            tlb_invalidate_vae1is(v);
+            tlb_invalidate_va_all_asids_inner_shareable(v);
         }
     }
 
@@ -180,7 +179,7 @@ pub unsafe fn iounmap(m: IoMapping) {
         let v = VirtAddr::new(m.virt + off);
         // SAFETY: TLB invalidation is always safe.
         unsafe {
-            tlb_invalidate_vae1is(v);
+            tlb_invalidate_va_all_asids_inner_shareable(v);
         }
     }
     let _ = paging::translate; // silence unused
