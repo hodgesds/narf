@@ -727,6 +727,24 @@ pub trait FileOps: Send + Sync {
         self.poll_readiness()
     }
 
+    /// The durable per-descriptor readiness cell backing blocking `poll`/
+    /// `epoll` waits, if this file has one.
+    ///
+    /// `Some` opts the descriptor into the arm/notify wake path
+    /// ([`narf_lib::readiness::Readiness`]): a parked waiter registers in the
+    /// cell and is woken the instant `set` records a matching readiness edge —
+    /// a durable, per-fd, IRQ-safe wake with no reliance on a fallback re-scan,
+    /// and it subsumes `poll_readiness` (the cell's level `mask`),
+    /// `poll_edge_token` (its `seq`), and `readiness_notifies` (waking is
+    /// intrinsic to every `set`). `None` (the default) keeps the legacy
+    /// level-scan + generation-guard path, so descriptors migrate one at a
+    /// time. Sockets, pipes, eventfds, mqueues, ttys — anything whose readiness
+    /// transitions asynchronously — override this as they migrate; always-ready
+    /// files (regular files) never need it.
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        None
+    }
+
     /// Monotonic source-local tokens for edge-triggered readiness.
     ///
     /// A readiness provider that can transition away from and back to the
