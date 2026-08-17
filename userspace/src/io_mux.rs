@@ -31,6 +31,11 @@ pub struct EventFd {
     readable_token: AtomicU64,
     /// Advances when a saturated counter becomes writable again.
     writable_token: AtomicU64,
+    /// Durable per-fd readiness cell — the migration target that will replace
+    /// the two edge tokens + the free-function `notify`. Mirrors POLL_IN
+    /// (counter > 0) and POLL_OUT (counter < MAX-1); every counter change
+    /// publishes the new level via `set`, which wakes armed poll/epoll waiters.
+    readiness: narf_lib::readiness::Readiness,
 }
 
 pub const EFD_SEMAPHORE: u32 = 1;
@@ -42,7 +47,24 @@ impl EventFd {
             semaphore: (flags & EFD_SEMAPHORE) != 0,
             readable_token: AtomicU64::new(u64::from(initval != 0)),
             writable_token: AtomicU64::new(0),
+            readiness: narf_lib::readiness::Readiness::new(
+                POLL_OUT | if initval != 0 { POLL_IN } else { 0 },
+            ),
         })
+    }
+
+    /// Recompute the durable readiness cell from the current counter and
+    /// publish the transition (POLL_IN = counter > 0, POLL_OUT = counter <
+    /// MAX-1). Called after every counter change; `set` bumps its edge sequence
+    /// and wakes armed waiters only on a rising edge. Kept alongside the legacy
+    /// edge tokens + `notify` during the migration.
+    fn sync_readiness(&self) {
+        let c = self.counter.load(Ordering::Acquire);
+        let readable = c > 0;
+        let writable = c < u64::MAX - 1;
+        let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
+        let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
+        self.readiness.set(add, clear);
     }
 }
 
@@ -81,6 +103,7 @@ impl FileOps for EventFd {
             if was_saturated {
                 self.writable_token.fetch_add(1, Ordering::Release);
             }
+            self.sync_readiness();
             buf[..8].copy_from_slice(&v.to_le_bytes());
             Ok(8)
         })
@@ -133,6 +156,7 @@ impl FileOps for EventFd {
             // this notify the eventfd is parkable, so the poll parks and this
             // write wakes it promptly. notify(0) = wake-all (an eventfd carries
             // no kernel TCB key); best-effort, mirrors the AF_UNIX send path.
+            self.sync_readiness();
             narf_net::readiness::notify(0);
             Ok(8)
         })
@@ -187,6 +211,10 @@ impl FileOps for EventFd {
             self.readable_token.load(Ordering::Acquire),
             self.writable_token.load(Ordering::Acquire),
         )
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
     }
 }
 
