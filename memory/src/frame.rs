@@ -1338,6 +1338,20 @@ pub fn free_frame_batch(frames: &[PhysFrame]) {
     }
 }
 
+/// Free base frames addressed directly as `PhysAddr`, without first collecting
+/// a region-sized `Vec<PhysFrame>`. Semantically identical to
+/// [`free_frame_batch`] but allocation-free, so address-space teardown can hand
+/// its backing list straight in even when memory is exhausted. Zero and
+/// low-reserved entries are skipped, matching the `PhysFrame` path.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
+pub fn free_phys_batch(phys_list: &[PhysAddr]) {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_free_caller(core::panic::Location::caller());
+    if current_alloc().is_some() {
+        buddy_free_phys_batch(phys_list);
+    }
+}
+
 /// Return a batch whose frames are known to have exactly one owner and are not
 /// present in the COW registry. Page-table teardown uses this after detaching
 /// the final inactive root and removing every table ownership registration.
@@ -1422,18 +1436,31 @@ fn buddy_unreferenced_route(f: PhysFrame) -> Option<(usize, u64)> {
     Some((zone_idx, buddy::frame_no(f)))
 }
 
-fn buddy_free_frame_batch(frames: &[PhysFrame]) {
-    let valid: Vec<PhysAddr> = frames
-        .iter()
-        .map(|frame| frame.start_address())
-        .filter(|phys| phys.raw() >= LOW_RESERVED_BYTES)
-        .collect();
-    let released = cow::dec_ref_batch(&valid);
+/// Window size for the allocation-free batched free path. A whole
+/// address-space teardown is processed in fixed windows of this many frames
+/// so the transient stack storage is bounded regardless of the region size —
+/// freeing memory must never allocate memory proportional to the amount being
+/// freed. Each window still amortises COW-shard lock acquisition (one lock per
+/// touched shard per window) and publishes through `FRAME_RETURN_CHUNK` spills.
+const FREE_BATCH_WINDOW: usize = 256;
 
-    // From this point onward no heap allocation is permitted: every entry in
-    // `released` has already lost its final owner. Complete scalar-equivalent
-    // accounting/scrub first, then publish through fixed-size stack chunks.
-    for &phys in &released {
+/// Return one window (`<= FREE_BATCH_WINDOW`) of already-filtered final-owner
+/// candidates. No heap allocation occurs: released frames are collected into a
+/// stack buffer, scrubbed, then published through fixed-size cache/zone chunks.
+fn free_final_owner_window(valid: &[PhysAddr]) {
+    debug_assert!(valid.len() <= FREE_BATCH_WINDOW);
+    let mut released = [PhysAddr::new(0); FREE_BATCH_WINDOW];
+    let mut released_len = 0usize;
+    cow::dec_ref_batch_each(valid, |phys| {
+        released[released_len] = phys;
+        released_len += 1;
+    });
+    let released = &released[..released_len];
+
+    // From here no allocation is permitted: every entry has already lost its
+    // final owner. Complete scalar-equivalent accounting/scrub with the COW
+    // shard locks dropped, then publish through fixed-size stack chunks.
+    for &phys in released {
         buddy_prepare_unreferenced_frame(phys);
     }
     if !ALLOC.initialised.load(Ordering::Acquire) {
@@ -1445,7 +1472,7 @@ fn buddy_free_frame_batch(frames: &[PhysFrame]) {
     for node in 0..node_count {
         let mut chunk = [0u64; FRAME_RETURN_CHUNK];
         let mut chunk_len = 0usize;
-        for &phys in &released {
+        for &phys in released {
             let zone_idx = if numa_aware {
                 phys_to_node(phys.raw())
             } else {
@@ -1462,6 +1489,50 @@ fn buddy_free_frame_batch(frames: &[PhysFrame]) {
             }
         }
         free_order0_chunk_to_zone(node, &chunk[..chunk_len]);
+    }
+}
+
+fn buddy_free_frame_batch(frames: &[PhysFrame]) {
+    let mut valid = [PhysAddr::new(0); FREE_BATCH_WINDOW];
+    let mut valid_len = 0usize;
+    for frame in frames {
+        let phys = frame.start_address();
+        if phys.raw() < LOW_RESERVED_BYTES {
+            continue;
+        }
+        valid[valid_len] = phys;
+        valid_len += 1;
+        if valid_len == FREE_BATCH_WINDOW {
+            free_final_owner_window(&valid[..valid_len]);
+            valid_len = 0;
+        }
+    }
+    if valid_len != 0 {
+        free_final_owner_window(&valid[..valid_len]);
+    }
+}
+
+/// Free a batch of physical frames addressed directly (no `PhysFrame`
+/// wrapper). Shares the allocation-free window machinery so an address-space
+/// teardown can hand its backing list straight in without first collecting a
+/// region-sized `Vec<PhysFrame>` — that intermediate allocation is exactly
+/// what failed under memory pressure.
+pub(crate) fn buddy_free_phys_batch(phys_list: &[PhysAddr]) {
+    let mut valid = [PhysAddr::new(0); FREE_BATCH_WINDOW];
+    let mut valid_len = 0usize;
+    for &phys in phys_list {
+        if phys.raw() < LOW_RESERVED_BYTES {
+            continue;
+        }
+        valid[valid_len] = phys;
+        valid_len += 1;
+        if valid_len == FREE_BATCH_WINDOW {
+            free_final_owner_window(&valid[..valid_len]);
+            valid_len = 0;
+        }
+    }
+    if valid_len != 0 {
+        free_final_owner_window(&valid[..valid_len]);
     }
 }
 
@@ -1803,6 +1874,44 @@ pub mod cow {
         releasable
     }
 
+    /// Drop one owner for every non-zero input, invoking `on_release(phys)`
+    /// for each frame whose final COW owner was removed (or which was never
+    /// registered). Unlike [`dec_ref_batch`] this allocates nothing: the
+    /// caller supplies the sink, so freeing memory never depends on a
+    /// recursive allocation. That is a hard requirement for the teardown and
+    /// OOM-reaper paths, which run precisely when memory is exhausted.
+    ///
+    /// Each touched shard is locked at most once: the outer loop walks the
+    /// shard space and, for each shard, scans the input for the frames that
+    /// map to it. `on_release` runs while the shard lock is held, so it must
+    /// only record the address (e.g. into a stack buffer) — it must not take
+    /// the zone/cache locks, which would invert the established lock order.
+    /// Callers scrub/publish released frames after this returns.
+    pub fn dec_ref_batch_each(frames: &[PhysAddr], mut on_release: impl FnMut(PhysAddr)) {
+        for (shard, refcounts) in REFCOUNTS.iter().enumerate() {
+            let mut guard = None;
+            for &phys in frames {
+                let key = phys.raw();
+                if key == 0 || ref_shard(key) != shard {
+                    continue;
+                }
+                let g = guard.get_or_insert_with(|| refcounts.map.lock());
+                let Some(map) = g.as_mut() else {
+                    on_release(phys);
+                    continue;
+                };
+                let Some(entry) = map.get(&key) else {
+                    on_release(phys);
+                    continue;
+                };
+                if entry.fetch_sub(1, Ordering::AcqRel) <= 1 {
+                    map.remove(&key);
+                    on_release(phys);
+                }
+            }
+        }
+    }
+
     /// Read-only peek at a frame's refcount. Returns 0 if the
     /// frame was never registered; otherwise the current count.
     pub fn count(phys: PhysAddr) -> u32 {
@@ -2047,6 +2156,64 @@ fn smoke_order0_frame_cache_batch_free_is_bounded() -> narf_kernel_test::TestRes
 narf_kernel_test::kernel_test_in!(
     "memory/frame",
     smoke_order0_frame_cache_batch_free_is_bounded
+);
+
+/// A teardown larger than one `FREE_BATCH_WINDOW` must free every frame with
+/// no allocation proportional to the batch size (the region-sized `Vec` that
+/// used to sit on this path panicked the kernel under memory pressure). This
+/// exercises the multi-window `free_phys_batch` entry across the window
+/// boundary and asserts free-page accounting is fully restored and the frames
+/// are reusable — a leak or a stranded window would fail both.
+#[cfg(feature = "kernel-test")]
+fn smoke_free_phys_batch_spans_windows_without_leak() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !ALLOC.initialised.load(Ordering::Acquire) {
+        return TestResult::Skip("allocator not initialised");
+    }
+    let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+        current_cpu_node().min(MAX_NUMA_NODES - 1)
+    } else {
+        0
+    };
+
+    const FRAMES: usize = FREE_BATCH_WINDOW + 8;
+    let free_before = node_free(node);
+    let mut phys = Vec::with_capacity(FRAMES);
+    for _ in 0..FRAMES {
+        match alloc_pages_on(node, 0) {
+            Ok(frame) => {
+                if ALLOC.numa_aware.load(Ordering::Acquire)
+                    && phys_to_node(frame.start_address().raw()) != node
+                {
+                    phys.push(frame.start_address());
+                    free_phys_batch(&phys);
+                    return TestResult::Skip("allocation fell back to another NUMA node");
+                }
+                phys.push(frame.start_address());
+            }
+            Err(_) => {
+                free_phys_batch(&phys);
+                return TestResult::Skip("not enough order-0 frames for windowed free smoke");
+            }
+        }
+    }
+
+    free_phys_batch(&phys);
+    if node_free(node) != free_before {
+        return TestResult::Fail("windowed free_phys_batch changed free-page accounting");
+    }
+    // A stranded window would leak frames; confirm the pool handed them back.
+    match alloc_pages_on(node, 0) {
+        Ok(frame) => free_pages(frame, 0),
+        Err(_) => return TestResult::Fail("frames not reusable after windowed free"),
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "memory/frame",
+    smoke_free_phys_batch_spans_windows_without_leak
 );
 
 #[derive(Copy, Clone, Debug)]

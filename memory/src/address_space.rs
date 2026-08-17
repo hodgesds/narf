@@ -553,6 +553,14 @@ pub struct NumaRegionSnapshot {
     pub node_pages: [u64; crate::frame::MAX_NUMA_NODES],
 }
 
+/// Allocation-free process memory totals used by procfs and exit accounting.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressSpaceMemoryStats {
+    pub mapped_bytes: u64,
+    pub resident_pages: u64,
+    pub writable_nonexec_bytes: u64,
+}
+
 const MAX_NUMA_HINTS: usize = 64;
 
 #[derive(Debug)]
@@ -2178,27 +2186,26 @@ impl AddressSpace {
     /// Borrowed (SHARED) frames belong to an external registry — never
     /// freed here. Callers must have completed the cross-CPU flush first.
     fn free_region_frames(&self, region: &Region) {
-        use crate::frame::{free_frame_batch, PhysFrame};
         if region.perms.contains(RegionPerms::SHARED) {
             for phys in &region.phys {
                 release_shared_phys(*phys);
             }
             return;
         }
-        let pages = (region.len + 0xFFF) >> 12;
-        let frames: Vec<PhysFrame> = region
-            .phys
-            .iter()
-            .take(pages as usize)
-            .copied()
-            .filter(|phys| phys.raw() != 0)
-            .map(PhysFrame::new)
-            .collect();
+        let pages = ((region.len + 0xFFF) >> 12) as usize;
+        // Hand the backing list straight to the allocation-free batched free.
+        // Collecting a region-sized `Vec<PhysFrame>` here allocated memory
+        // proportional to the region in order to *free* memory, and panicked
+        // the kernel when a large teardown ran with the frame pool already
+        // exhausted. `free_phys_batch` windows the list with bounded stack
+        // storage and skips zero/low-reserved entries internally.
+        //
         // No `__pagetable_is_registered` guard here: a region's backing list
         // only ever holds DATA frames. Leaf retirement and the cross-CPU TLB
         // flush completed before this call, so the allocator may now drop all
-        // owners while locking each touched COW shard once.
-        free_frame_batch(&frames);
+        // owners while locking each touched COW shard once per window.
+        let phys = &region.phys[..pages.min(region.phys.len())];
+        crate::frame::free_phys_batch(phys);
     }
 
     /// Number of mapped regions.
@@ -4342,6 +4349,76 @@ impl AddressSpace {
     /// so callers can iterate without holding the lock.
     pub fn regions_snapshot(&self) -> Vec<Region> {
         self.regions.lock().snapshot()
+    }
+
+    /// Total virtual bytes covered by base-page and hardware-huge regions.
+    ///
+    /// Unlike [`Self::regions_snapshot`], this does not clone each region's
+    /// per-page backing vector. It is safe to use from exit/OOM accounting,
+    /// where allocating metadata proportional to a dying task's address space
+    /// can otherwise turn memory pressure into a kernel allocator panic.
+    pub fn mapped_bytes(&self) -> u64 {
+        self.memory_stats().mapped_bytes
+    }
+
+    /// Allocation-free aggregate virtual/resident memory accounting.
+    ///
+    /// The result includes base-page and hardware-huge regions. Lazy base-page
+    /// slots whose physical entry is zero contribute virtual bytes but not
+    /// resident pages.
+    pub fn memory_stats(&self) -> AddressSpaceMemoryStats {
+        let mut stats = AddressSpaceMemoryStats::default();
+        {
+            let huge = self.huge_regions.lock();
+            for region in huge.iter() {
+                stats.mapped_bytes = stats.mapped_bytes.saturating_add(region.len);
+                let page_bytes = region.frames.first().map_or(0, |frame| frame.size_bytes());
+                stats.resident_pages = stats
+                    .resident_pages
+                    .saturating_add((region.frames.len() as u64).saturating_mul(page_bytes >> 12));
+                if region.perms.contains(RegionPerms::WRITE)
+                    && !region.perms.contains(RegionPerms::EXEC)
+                {
+                    stats.writable_nonexec_bytes =
+                        stats.writable_nonexec_bytes.saturating_add(region.len);
+                }
+            }
+        }
+        {
+            let regions = self.regions.lock();
+            for region in regions.iter() {
+                stats.mapped_bytes = stats.mapped_bytes.saturating_add(region.len);
+                stats.resident_pages = stats.resident_pages.saturating_add(
+                    region.phys.iter().filter(|phys| phys.as_u64() != 0).count() as u64,
+                );
+                if region.perms.contains(RegionPerms::WRITE)
+                    && !region.perms.contains(RegionPerms::EXEC)
+                {
+                    stats.writable_nonexec_bytes =
+                        stats.writable_nonexec_bytes.saturating_add(region.len);
+                }
+            }
+        }
+        stats
+    }
+
+    /// Length of the region whose start address is exactly `base`.
+    pub fn region_len_at_base(&self, base: VirtAddr) -> Option<u64> {
+        let base = base.as_u64();
+        if let Some(len) = self
+            .huge_regions
+            .lock()
+            .iter()
+            .find(|region| region.base.as_u64() == base)
+            .map(|region| region.len)
+        {
+            return Some(len);
+        }
+        self.regions
+            .lock()
+            .iter()
+            .find(|region| region.base.as_u64() == base)
+            .map(|region| region.len)
     }
 
     /// Materialise all pending regions into actual page-table entries.
