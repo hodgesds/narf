@@ -203,6 +203,19 @@ immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
 system activity. A write after the final reader closes raises `SIGPIPE` and
 returns `EPIPE`.
+Readiness wakeups are being consolidated behind a single durable per-descriptor
+cell (`narf_lib::readiness::Readiness`): registering a waiter and checking the
+current readiness are fused under one lock, so a `poll`/`epoll` waiter can never
+register after the edge it was waiting for — the lost-wakeup race is
+unrepresentable rather than merely guarded by a re-checked generation and a
+fallback tick. Every readiness change wakes its intersecting waiters
+intrinsically (there is no per-source "does this notify" flag to drift out of
+sync), and the level mask and the edge sequence advance together under that same
+lock. The wake this delivers is required to be durable end-to-end: a readiness
+source firing from IRQ context re-queues the stable, task-id-addressed run slot
+with a lossless atomic, never an allocation-bearing waker drop deferred through
+a bounded queue — so a readiness edge is never dropped and then recovered only
+by a coarse fallback tick.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 Private futex wait queues are keyed by `(address-space identity, user address)`;
