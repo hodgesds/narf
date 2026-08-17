@@ -15,6 +15,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+pub mod args;
 pub mod info;
 
 #[cfg(target_arch = "x86_64")]
@@ -23,22 +24,43 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+pub use args::KernelCmdline;
 pub use info::{validate_memory_map, BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
 
 /// Bootloader-supplied kernel command-line as a `&'static str`.
 /// Empty before the per-arch `parse_raw` runs, or when the loader
-/// passed no cmdline. See `boot/specification/cmdline.md` (TBD)
-/// for the recognized flag set; today the kernel parses:
+/// passed no cmdline.
 ///
-/// - `safe_mode` / `safe_mode=N` — equivalent to `stop_at=subsys`.
-/// - `stop_at=<stage>` — halt initcall execution after the named
-///   stage. Valid: early, core, postcore, arch, subsys, fs,
-///   device, late.
+/// This is the raw string. Consumers that want to interrogate
+/// individual tokens must go through the single structured parser —
+/// [`args()`] / [`KernelCmdline`] — rather than re-splitting it inline;
+/// that is the one place the tokenizing and key/value rules live.
 ///
-/// Anything else is ignored. Unknown flags do not abort boot.
+/// Recognized tokens today (see the module docs on [`args`]): `safe_mode`,
+/// `stop_at=<stage>`, `nosmp`, `root=<spec>`, `systemd_pid1`, `no_redis`,
+/// `hugepages_2m=N`, `hugepages_1g=N`, `mt_echo_threads=N`,
+/// `rcu_stall_panic`, plus feature-gated `trace_comm=`, `test_subsystem=`,
+/// `bpf_bench[_n]`, `bpf_fuzz_{n,seed,trace}`. Unknown tokens are ignored
+/// and never abort boot; the full string is still exposed via
+/// `/proc/cmdline` for userspace (systemd's own `systemd.*` params).
 #[cfg(target_arch = "x86_64")]
 pub fn cmdline() -> &'static str {
     x86_64::cmdline()
+}
+
+/// The bootloader cmdline wrapped in the structured [`KernelCmdline`]
+/// parser. This is the entry point every in-kernel consumer should use:
+///
+/// ```ignore
+/// if narf_boot::args().has_flag("systemd_pid1") { /* ... */ }
+/// let comm = narf_boot::args().value("trace_comm");
+/// ```
+///
+/// The wrapper is zero-copy (it borrows the same `&'static str`
+/// [`cmdline`] returns), so calling it per-lookup is free.
+#[must_use]
+pub fn args() -> KernelCmdline<'static> {
+    KernelCmdline::new(cmdline())
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -388,18 +388,14 @@ const VALS_PER_LINE: usize = 16;
 /// Whether the cmdline asked for a bench run (`bpf_bench`).
 #[must_use]
 pub fn requested() -> bool {
-    narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "bpf_bench")
+    narf_boot::args().has_flag("bpf_bench")
 }
 
 /// `bpf_bench_n=<N>` from the cmdline, or 0 for "use each declaration".
 #[must_use]
 pub fn requested_n() -> u32 {
-    narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("bpf_bench_n="))
-        .and_then(|v| v.parse::<u32>().ok())
+    narf_boot::args()
+        .parse_value::<u32>("bpf_bench_n")
         .unwrap_or(0)
 }
 

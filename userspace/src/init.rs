@@ -16,6 +16,20 @@
 //! Argv / envp / aux can be passed via `spawn_pid1_with_argv`; the
 //! single-arg `spawn_pid1_from_bytes` uses an empty argv (init
 //! reads its config from the staged initramfs or hardcoded paths).
+//!
+//! # Kernel cmdline → init argv / environ (NOT wired)
+//!
+//! Linux's `init/main.c` splits the leftover kernel cmdline into the
+//! init process's argv (bare words + everything after a `--`) and
+//! environment (`key=value` tokens). NARF does **not** thread the
+//! cmdline into PID 1 today: the boot path (`frame::bare_main`) spawns
+//! init / getty with a fixed argv, and `systemd_pid1` mode spawns
+//! systemd with a fixed argv + envp. systemd instead reads its own
+//! `systemd.*` params directly from `/proc/cmdline` (kept faithful to
+//! the full bootloader string). The structural Linux split is
+//! implemented and unit-tested as `narf_boot::KernelCmdline::init_argv`
+//! / `::init_environ` for when a real init-arg wiring lands; hooking it
+//! into `spawn_rooted_pid1` / `spawn_one` is the remaining follow-up.
 
 extern crate alloc;
 

@@ -401,61 +401,35 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     );
 }
 
-/// Parse `stop_at=<stage>` and `safe_mode[=...]` from a kernel
-/// command-line. Returns the highest stage that should run; defaults
-/// to `Stage::Late` (run everything). Unknown stage names fall back
-/// to `Stage::Late` with no error — diagnostics-only.
-/// Parse `key=N` out of cmdline, returning N as `usize`. Used by
-/// the hugepage pre-reservation path for `hugepages_2m=N` and
-/// `hugepages_1g=N`. Returns 0 if absent or malformed — the
-/// hugepage path treats 0 as "no reservation".
-fn parse_cmdline_count(cmdline: &str, key: &str) -> usize {
-    for tok in cmdline.split_ascii_whitespace() {
-        if let Some((k, v)) = tok.split_once('=') {
-            if k == key {
-                return v.parse().unwrap_or(0);
-            }
-        }
-    }
-    0
-}
-
-fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
+/// Parse `stop_at=<stage>` and `safe_mode[=...]` from the structured
+/// kernel command-line ([`narf_boot::args`]). Returns the highest stage
+/// that should run; defaults to `Stage::Late` (run everything). Unknown
+/// stage names are ignored with no error — diagnostics-only. Multiple
+/// `stop_at=` tokens take the earliest (lowest) stage.
+fn parse_stop_at(args: &narf_boot::KernelCmdline) -> narf_init::Stage {
     use narf_init::Stage;
     let mut last = Stage::Late;
-    for tok in cmdline.split_ascii_whitespace() {
-        let (key, val) = match tok.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (tok, ""),
+    for val in args.values("stop_at") {
+        let s = match val {
+            "early" => Stage::Early,
+            "core" => Stage::Core,
+            "postcore" => Stage::PostCore,
+            "arch" => Stage::Arch,
+            "subsys" => Stage::Subsys,
+            "fs" => Stage::Fs,
+            "device" => Stage::Device,
+            "late" => Stage::Late,
+            _ => continue,
         };
-        match key {
-            "stop_at" => {
-                let s = match val {
-                    "early" => Stage::Early,
-                    "core" => Stage::Core,
-                    "postcore" => Stage::PostCore,
-                    "arch" => Stage::Arch,
-                    "subsys" => Stage::Subsys,
-                    "fs" => Stage::Fs,
-                    "device" => Stage::Device,
-                    "late" => Stage::Late,
-                    _ => continue,
-                };
-                if (s as u8) < (last as u8) {
-                    last = s;
-                }
-            }
-            "safe_mode" => {
-                // Stop after Subsys: the kernel core, drivers
-                // registry, ACPI, MMU + heap are up; PCI probe,
-                // FS mount, FB-console, and userspace spawn are
-                // all skipped.
-                if (Stage::Subsys as u8) < (last as u8) {
-                    last = Stage::Subsys;
-                }
-            }
-            _ => {}
+        if (s as u8) < (last as u8) {
+            last = s;
         }
+    }
+    // Stop after Subsys: the kernel core, drivers registry, ACPI, MMU +
+    // heap are up; PCI probe, FS mount, FB-console, and userspace spawn
+    // are all skipped. `safe_mode` accepts a bare flag or `safe_mode=N`.
+    if args.has_key("safe_mode") && (Stage::Subsys as u8) < (last as u8) {
+        last = Stage::Subsys;
     }
     last
 }
@@ -1247,8 +1221,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // out of the usable regions BEFORE the buddy gets them.
             // Whatever's left (head misalignment + tail of each
             // region) is donated to the buddy via init_from_map.
-            let want_2m = parse_cmdline_count(narf_boot::cmdline(), "hugepages_2m");
-            let want_1g = parse_cmdline_count(narf_boot::cmdline(), "hugepages_1g");
+            let want_2m = narf_boot::args()
+                .parse_value::<usize>("hugepages_2m")
+                .unwrap_or(0);
+            let want_1g = narf_boot::args()
+                .parse_value::<usize>("hugepages_1g")
+                .unwrap_or(0);
             let kernel_exclude = [(kstart, kend)];
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
                 // SAFETY: `regions` is the bootloader's usable-RAM map, the
@@ -2080,9 +2058,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // emulation is incomplete and #GPs the BSP
                 // mid-IPI), and as a fallback on real silicon
                 // when SMP isn't a critical-path requirement.
-                let nosmp = narf_boot::cmdline()
-                    .split_ascii_whitespace()
-                    .any(|t| t == "nosmp");
+                let nosmp = narf_boot::args().has_flag("nosmp");
                 if nosmp {
                     let _ = writeln!(
                         console::Writer,
@@ -3490,7 +3466,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // `stop_at=subsys`. Useful for narrowing real-HW
             // bring-up failures: each stage that completes prints
             // a summary line, the next stage is the suspect.
-            let last_stage = parse_stop_at(narf_boot::cmdline());
+            let last_stage = parse_stop_at(&narf_boot::args());
             if last_stage != narf_init::Stage::Late {
                 let _ = writeln!(
                     console::Writer,
@@ -3642,9 +3618,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the
         // affected set and CI threads it here. Absent/empty ⇒ run all.
-        let selected = narf_boot::cmdline()
-            .split_ascii_whitespace()
-            .find_map(|arg| arg.strip_prefix("test_subsystem="));
+        let selected = narf_boot::args().value("test_subsystem");
         match selected {
             Some(list) if !list.is_empty() => {
                 let wanted: alloc::vec::Vec<&str> =
@@ -4115,10 +4089,7 @@ fn boot_userspace_init() {
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.
     #[cfg(feature = "syscall-trace")]
-    if let Some(prefix) = narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("trace_comm="))
-    {
+    if let Some(prefix) = narf_boot::args().value("trace_comm") {
         narf_userspace::syscall::set_trace_comm(prefix);
         let _ = writeln!(
             console::Writer,
@@ -4129,20 +4100,14 @@ fn boot_userspace_init() {
     // FAIL with a reportable errno — light enough to reach a late boot phase
     // that the full trace's serial flood would never let the boot reach.
     #[cfg(feature = "syscall-trace")]
-    if narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "trace_errors_only")
-    {
+    if narf_boot::args().has_flag("trace_errors_only") {
         narf_userspace::syscall::set_trace_errors_only(true);
         let _ = writeln!(console::Writer, "  boot-init: syscall-trace errors-only");
     }
     // `cgevt_trace` (bare flag): print every cgroup.events `populated`
     // transition so a service whose start job hangs on the cgroup settling
     // (e.g. a Type=oneshot in a fresh user slice) can be pinned.
-    if narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "cgevt_trace")
-    {
+    if narf_boot::args().has_flag("cgevt_trace") {
         narf_filesystem::cgroupfs::set_cgevt_trace(true);
         let _ = writeln!(console::Writer, "  boot-init: cgroup events trace");
     }
@@ -5041,9 +5006,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     // `_start_rust`), so /mnt + /mnt/{dev,run,tmp,sys,proc} + the chroot
     // cgroup2 mount are live before this task ever runs. init/getty are
     // skipped: there is no NARF login shell in this mode.
-    let systemd_pid1 = narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "systemd_pid1");
+    let systemd_pid1 = narf_boot::args().has_flag("systemd_pid1");
     if systemd_pid1 {
         let systemd_path = "/mnt/usr/lib/systemd/systemd";
         let systemd = narf_userspace::process::read_path_from_vfs(systemd_path);
@@ -5086,9 +5049,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         // sets so redis's heavy startup can't starve netserve's RX path on
         // a single CI vcpu past the host deadline (the net-smoke flake).
         #[cfg(not(feature = "mt-echo"))]
-        if !narf_boot::cmdline()
-            .split_whitespace()
-            .any(|t| t == "no_redis")
+        if !narf_boot::args().has_flag("no_redis")
             && !narf_verification::NARF_REDIS_SERVER_ELF.is_empty()
         {
             spawn_one_argv(
@@ -5116,7 +5077,9 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         // the harness can sweep it without rebuilding the kernel.
         #[cfg(feature = "mt-echo")]
         if !narf_verification::NARF_MT_ECHO_ELF.is_empty() {
-            let n = parse_cmdline_count(narf_boot::cmdline(), "mt_echo_threads");
+            let n = narf_boot::args()
+                .parse_value::<usize>("mt_echo_threads")
+                .unwrap_or(0);
             let threads = if n == 0 {
                 (narf_lib::smp::cpu_count() as usize).max(1)
             } else {

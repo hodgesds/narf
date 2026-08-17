@@ -137,9 +137,8 @@ mod stall_wd {
             YES => return true,
             _ => {}
         }
-        let on = narf_boot::cmdline()
-            .split_ascii_whitespace()
-            .any(|t| t == "rcu_stall_panic" || t == "rcu_stall_panic=1");
+        let args = narf_boot::args();
+        let on = args.has_flag("rcu_stall_panic") || args.value("rcu_stall_panic") == Some("1");
         CACHED.store(if on { YES } else { NO }, Ordering::Relaxed);
         on
     }

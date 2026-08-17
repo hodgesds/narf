@@ -168,17 +168,12 @@ const PINNED_SEEDS: &[u64] = &[
 
 /// `bpf_fuzz_n=<N>` from the cmdline, or `None`.
 fn cmdline_iters() -> Option<u32> {
-    narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("bpf_fuzz_n="))
-        .and_then(|v| v.parse::<u32>().ok())
+    narf_boot::args().parse_value::<u32>("bpf_fuzz_n")
 }
 
 /// `bpf_fuzz_seed=<N>` from the cmdline (decimal or `0x`-prefixed), or `None`.
 fn cmdline_seed() -> Option<u64> {
-    let v = narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("bpf_fuzz_seed="))?;
+    let v = narf_boot::args().value("bpf_fuzz_seed")?;
     match v.strip_prefix("0x") {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => v.parse::<u64>().ok(),
@@ -195,9 +190,7 @@ fn cmdline_seed() -> Option<u64> {
 /// comparison left to fail and no seed printed afterwards. With this, the last
 /// seed on the console is the one that did it.
 fn cmdline_trace() -> bool {
-    narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "bpf_fuzz_trace")
+    narf_boot::args().has_flag("bpf_fuzz_trace")
 }
 
 // ── PRNG ────────────────────────────────────────────────────────────
