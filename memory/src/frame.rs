@@ -858,12 +858,13 @@ impl AllocContext {
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
     if ctx == AllocContext::User && crate::reclaim::user_alloc_would_breach_reserve() {
-        // Wake the reclaimer so it can shed clean cache and let the retry
-        // succeed. Under an overcommit policy that permits it (Heuristic /
-        // Always), also arm the OOM killer so sustained user pressure reclaims
-        // a hog rather than only failing the faulting task. Under `Never` (the
-        // default) this stays a graceful ENOMEM — no process is killed.
-        crate::reclaim::wake_kswapd();
+        // Wake the local node's reclaimer so it can shed clean cache and let
+        // the retry succeed. Under an overcommit policy that permits it
+        // (Heuristic / Always), also arm the OOM killer so sustained user
+        // pressure reclaims a hog rather than only failing the faulting task.
+        // Under `Never` (the default) this stays a graceful ENOMEM — no
+        // process is killed.
+        crate::reclaim::wake_kswapd(current_cpu_node());
         if crate::reclaim::user_pressure_arms_oom() {
             crate::reclaim::signal_oom_needed();
         }
