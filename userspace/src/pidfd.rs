@@ -42,6 +42,16 @@ pub struct PidFdState {
     /// minted *after* the target has already exited starts with this
     /// already true.
     pub exited: AtomicBool,
+    /// Durable per-fd wake cell (see `narf_lib::readiness`) — the migration
+    /// target that gives a `poll`/`epoll` parked on this pidfd a TARGETED wake
+    /// on target-exit instead of the coarse ~10ms lost-wake backstop / the
+    /// `notify(0)` herd. A pidfd is a ONE-WAY LATCH: `POLL_IN` goes true when
+    /// the target exits and never clears (the process stays exited; a pidfd
+    /// read does not consume readiness), and it is never writable —
+    /// `poll_readiness` never reports `POLLOUT` — so `POLL_OUT` is kept out of
+    /// the mask entirely. The legacy `notify(0)` in `notify_exit` stays
+    /// belt-and-suspenders during the migration; this cell is ADDITIVE.
+    pub readiness: narf_lib::readiness::Readiness,
 }
 
 impl PidFdState {
@@ -50,6 +60,13 @@ impl PidFdState {
             pid,
             tid: AtomicU64::new(tid),
             exited: AtomicBool::new(exited),
+            // Seed the cell from `exited`: a live target is not readable (0),
+            // but a pidfd minted AFTER the target already exited must be born
+            // readable in the cell too — its rising edge (`notify_exit`) has
+            // already fired, so without the seed a poller arming on the cell
+            // would park for an edge that never re-fires. Matches the `exited`
+            // flag and `poll_readiness` for the already-zombie mint.
+            readiness: narf_lib::readiness::Readiness::new(if exited { POLL_IN } else { 0 }),
         })
     }
 
@@ -147,6 +164,15 @@ pub fn notify_exit(pid: u64) -> bool {
     let found = st.is_some();
     if let Some(st) = st {
         st.exited.store(true, Ordering::Release);
+        // Latch POLL_IN into the durable readiness cell beside the store above.
+        // A poll/epoll armed on this pidfd's cell is woken by this TARGETED set
+        // (rising edge → fires exactly the parked waiters, under one lock,
+        // drop-free/IRQ-safe) rather than relying on the coarse `notify(0)` herd
+        // below. Since a pidfd is a one-way latch, "sync" is just set(POLL_IN, 0)
+        // — it never clears (the process stays exited, and a pidfd read does not
+        // consume readiness). The store happened first, so any waiter arriving
+        // between this set and its own arm still observes POLL_IN via the level.
+        st.readiness.set(POLL_IN, 0);
     }
     // Wake any task parked in epoll_wait/poll on a pidfd: systemd 257 tracks
     // every service child by epolling its pidfd for POLLIN-on-exit, and blocks
@@ -216,5 +242,17 @@ impl FileOps for PidFdFile {
 
     fn pidfd_target_pid(&self) -> Option<u64> {
         Some(self.state.pid)
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        // Durable per-fd wake: the shared cell latches POLL_IN on target exit
+        // (`notify_exit` → `set(POLL_IN, 0)`), so a poll/epoll waiter armed on it
+        // is fired directly instead of through the ~10ms lost-wake backstop. The
+        // cell is reachable straight through the Arc field, so the default
+        // `arm_readiness`/`disarm_readiness` (which delegate here) suffice — no
+        // override needed, unlike the lock-guarded AF_UNIX ring. One-way latch,
+        // so there is no consume-side sync: a pidfd read leaves the process
+        // exited, and `poll_readiness` above stays the belt-and-suspenders scan.
+        Some(&self.state.readiness)
     }
 }
