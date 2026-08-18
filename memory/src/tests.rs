@@ -5802,6 +5802,82 @@ fn smoke_memory_anon_reclaim_scan_drives_swap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_anon_reclaim_scan_drives_swap);
 
+/// CLOCK aging: the scan must spare a recently-accessed (A-bit set) page — its
+/// bit cleared for a second chance — and reclaim it only on a later pass once
+/// it stays cold. Proves the scan no longer swaps out hot pages.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_anon_reclaim_clock_second_chance() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 4;
+    let base = VirtAddr::new(0x0000_0080_0040_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for _ in 0..N {
+        match crate::alloc_frame() {
+            Ok(f) => phys.push(f.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        // Freshly-mapped leaves have A=0 (no access happened). Mark page 1 as
+        // recently accessed, as hardware would on a real touch.
+        let hot = VirtAddr::new(base.as_u64() + 4096);
+        // SAFETY: aspace owns a live root; `hot` is a materialized 4 KiB leaf.
+        if !unsafe { crate::x86_64::paging::__set_accessed_for_test(aspace.root, hot) } {
+            return TestResult::Fail("could not set the accessed bit on the hot page");
+        }
+
+        // Pass 1: the hot page (index 1) is spared and splits the run; the scan
+        // clears its A-bit as the second chance.
+        let mut pass1 = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut pass1, 64);
+        if pass1.iter().map(|c| c.pages).sum::<usize>() != N - 1 {
+            return TestResult::Fail("pass 1 did not spare exactly the hot page");
+        }
+        if pass1.iter().any(|c| {
+            c.base.as_u64() <= hot.as_u64()
+                && hot.as_u64() < c.base.as_u64() + (c.pages as u64) * 4096
+        }) {
+            return TestResult::Fail("pass 1 included the recently-accessed page");
+        }
+
+        // Pass 2: the second chance is spent (A now clear), so every page is
+        // cold and the whole region coalesces into one reclaimable run.
+        let mut pass2 = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut pass2, 64);
+        if pass2.len() != 1 || pass2[0].pages != N || pass2[0].base.as_u64() != base.as_u64() {
+            return TestResult::Fail("pass 2 did not reclaim the cooled page in one run");
+        }
+        TestResult::Pass
+    })();
+
+    let _ = aspace.unmap_region(base);
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_anon_reclaim_clock_second_chance);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.

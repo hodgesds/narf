@@ -2620,12 +2620,18 @@ impl AddressSpace {
     /// [`Self::swap_out_reclaim_plan`] without the executor rejecting them.
     /// `mapcount` is 1 and `expected_free_pages` equals the run length because
     /// a private anonymous page has a single mapping, so evicting it frees its
-    /// frame. `age` is 0 pending per-page access-bit sampling; the planner
-    /// falls back to yield then address order.
+    /// frame.
     ///
-    /// Read-only and side-effect-free (only takes the region lock). The scan
-    /// fills a fixed stack buffer under the lock and copies into `out` after
-    /// releasing it, so it never allocates while holding the region lock.
+    /// Aging is a CLOCK / second-chance pass over the leaf accessed (A) bits
+    /// (see [`crate::x86_64::paging::test_and_clear_accessed`]): a page whose A
+    /// bit is set was touched since the previous scan, so it is spared and its
+    /// bit cleared; only a page still cold (A clear) since the last pass becomes
+    /// a candidate. Every emitted candidate is therefore in the coldest tier, so
+    /// `age` is 0 and the planner orders by yield then address. Because the scan
+    /// clears A bits it is NOT read-only — it mutates leaf PTEs (an approximate
+    /// hint, no TLB shootdown; see the helper) — but it only reads the region
+    /// table and fills a fixed stack buffer under the region lock, copying into
+    /// `out` after releasing it, so it never allocates while holding that lock.
     #[cfg(target_arch = "x86_64")]
     pub fn collect_anon_reclaim_candidates(
         &self,
@@ -2657,27 +2663,50 @@ impl AddressSpace {
                     continue;
                 }
                 let npages = region.phys.len();
+                let root = self.root;
                 let mut i = 0usize;
                 while i < npages {
                     let va = region.base.as_u64() + (i as u64) * 4096;
-                    // Skip holes (unbacked) and pages mid-swap-transition.
+                    // Skip holes (unbacked) and pages mid-swap-transition — no
+                    // agable PTE there.
                     if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&va) {
                         i += 1;
                         continue;
                     }
-                    // Extend a maximal resident, non-transitioning run.
+                    // CLOCK reference step: clear+read the leaf accessed bit. A
+                    // warm page (A was set) is given a second chance — its bit is
+                    // cleared and it is skipped this pass; only a cold page
+                    // (untouched since the previous pass) starts a reclaim run.
+                    // SAFETY: `root` is this space's live identity-reachable root.
+                    let cold = unsafe {
+                        crate::x86_64::paging::test_and_clear_accessed(root, VirtAddr::new(va))
+                    } == Some(false);
+                    if !cold {
+                        i += 1;
+                        continue;
+                    }
+                    // Extend a maximal cold run, ageing each page as we go.
                     let run_base = va;
-                    let mut run_len = 0usize;
-                    while i < npages {
+                    let mut run_len = 1usize;
+                    i += 1;
+                    while i < npages && collected + run_len < max_pages {
                         let cva = region.base.as_u64() + (i as u64) * 4096;
                         if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&cva) {
                             break;
                         }
-                        run_len += 1;
-                        i += 1;
-                        if collected + run_len >= max_pages {
+                        // SAFETY: `root` is this space's live identity-reachable root.
+                        let cold = unsafe {
+                            crate::x86_64::paging::test_and_clear_accessed(root, VirtAddr::new(cva))
+                        } == Some(false);
+                        if !cold {
+                            // Warm page: its A-bit was just cleared (second
+                            // chance). Consume it so the outer loop doesn't
+                            // re-examine the now-cold bit and wrongly include it.
+                            i += 1;
                             break;
                         }
+                        run_len += 1;
+                        i += 1;
                     }
                     scratch[n] = Some(ReclaimRangeCandidate {
                         address_space_root: self.root,
