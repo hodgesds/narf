@@ -233,6 +233,52 @@ pub fn watermark_high() -> u64 {
     WMARK_HIGH.load(Ordering::Relaxed)
 }
 
+// ── Swappiness (vm.swappiness analogue) ────────────────────────────
+//
+// The single knob that balances kswapd's reclaim pressure between the file
+// cache and anonymous (swap-backed) memory. On a scale of 0..=200, higher
+// values push more of the reclaim target onto anonymous pages (swap out
+// aggressively), lower values favour dropping clean file cache first.
+// kswapd reads this to split its per-pass target: `anon_share = target *
+// swappiness / 200`, `file_share = target - anon_share`. Linux defaults to
+// 60 and (since it raised the ceiling for the cost model) clamps to
+// [0, 200]. `memory` can't depend on `filesystem`, so the sysctl handler
+// for `/proc/sys/vm/swappiness` drives this knob just like `min_free_kbytes`
+// drives `set_min_free_pages`.
+
+/// Upper clamp on swappiness — Linux's `vm.swappiness` ceiling.
+const SWAPPINESS_MAX: u64 = 200;
+/// Default swappiness, matching Linux's `vm.swappiness` default.
+const SWAPPINESS_DEFAULT: u64 = 60;
+static SWAPPINESS: AtomicU64 = AtomicU64::new(SWAPPINESS_DEFAULT);
+
+/// Runtime override of the reclaim swappiness — the analogue of Linux's
+/// `vm.swappiness` sysctl. Clamped to [0, 200]. kswapd reads this via
+/// [`swappiness`] to split its reclaim target between file cache and
+/// anonymous memory. Intended to back `/proc/sys/vm/swappiness`.
+pub fn set_swappiness(value: u64) {
+    SWAPPINESS.store(value.min(SWAPPINESS_MAX), Ordering::Relaxed);
+}
+
+/// The current swappiness (0..=200; default 60). kswapd uses this to weight
+/// anonymous vs. file-cache reclaim per pass.
+pub fn swappiness() -> u64 {
+    SWAPPINESS.load(Ordering::Relaxed)
+}
+
+/// Pure balance math (no global state): split a reclaim `target` into
+/// `(anon_share, file_share)` for the given `swappiness`. `anon_share =
+/// target * swappiness / 200`, `file_share = target - anon_share`, so the
+/// two always sum to `target` and a swappiness of 0 asks for no anon reclaim
+/// up front (kswapd's SPILL fallback still swaps anon if the file cache is
+/// exhausted). Split out so it can be unit-tested without touching kswapd.
+pub fn split_reclaim_target(target: usize, swappiness: u64) -> (usize, usize) {
+    let sw = swappiness.min(SWAPPINESS_MAX) as usize;
+    let anon_share = target.saturating_mul(sw) / (SWAPPINESS_MAX as usize);
+    let file_share = target - anon_share;
+    (anon_share, file_share)
+}
+
 /// `true` when free memory has fallen below the `low` watermark — the
 /// signal that reclaim should run. `false` when watermarks are unset.
 pub fn under_low_watermark() -> bool {
@@ -834,6 +880,83 @@ mod anon_reclaimer_tests {
         result
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_anon_dispatch);
+}
+
+/// Swappiness-knob tests. Always compiled so they register + run under
+/// `cargo xtask test`. Exercise the default, the [0, 200] clamp, a
+/// set/get round-trip, and the pure `split_reclaim_target` balance math;
+/// the live value is restored afterwards so the boot default is unperturbed.
+mod swappiness_tests {
+    use super::{set_swappiness, split_reclaim_target, swappiness, SWAPPINESS_DEFAULT};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_reclaim_swappiness_default_and_roundtrip() -> TestResult {
+        let saved = swappiness();
+        let result = (|| {
+            set_swappiness(SWAPPINESS_DEFAULT);
+            if swappiness() != SWAPPINESS_DEFAULT {
+                return TestResult::Fail("swappiness default should be 60");
+            }
+            // Round-trip an in-range value.
+            set_swappiness(100);
+            if swappiness() != 100 {
+                return TestResult::Fail("swappiness set/get should round-trip 100");
+            }
+            // Boundary values pass through unclamped.
+            set_swappiness(0);
+            if swappiness() != 0 {
+                return TestResult::Fail("swappiness should accept 0");
+            }
+            set_swappiness(200);
+            if swappiness() != 200 {
+                return TestResult::Fail("swappiness should accept the 200 ceiling");
+            }
+            // Above the ceiling clamps down to 200.
+            set_swappiness(1000);
+            if swappiness() != 200 {
+                return TestResult::Fail("swappiness above 200 must clamp to 200");
+            }
+            TestResult::Pass
+        })();
+        set_swappiness(saved);
+        result
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_swappiness_default_and_roundtrip
+    );
+
+    fn smoke_reclaim_swappiness_split_math() -> TestResult {
+        // The two shares always sum to the target.
+        for &(target, sw) in &[(1000usize, 60u64), (1000, 0), (1000, 200), (37, 90)] {
+            let (anon, file) = split_reclaim_target(target, sw);
+            if anon + file != target {
+                return TestResult::Fail("anon_share + file_share must equal target");
+            }
+        }
+        // swappiness=0 asks for no anon up front; all pressure on file cache.
+        let (anon0, file0) = split_reclaim_target(1000, 0);
+        if anon0 != 0 || file0 != 1000 {
+            return TestResult::Fail("swappiness=0 should put the whole target on file cache");
+        }
+        // swappiness=200 asks for the whole target as anon.
+        let (anon200, file200) = split_reclaim_target(1000, 200);
+        if anon200 != 1000 || file200 != 0 {
+            return TestResult::Fail("swappiness=200 should put the whole target on anon");
+        }
+        // Default 60: anon = 1000*60/200 = 300, file = 700.
+        let (anon60, file60) = split_reclaim_target(1000, 60);
+        if anon60 != 300 || file60 != 700 {
+            return TestResult::Fail("swappiness=60 should split 300 anon / 700 file");
+        }
+        // Above-ceiling swappiness is clamped by the split too.
+        let (anon_big, _) = split_reclaim_target(1000, 10_000);
+        if anon_big != 1000 {
+            return TestResult::Fail("split must clamp swappiness to 200");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_swappiness_split_math);
 }
 
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
