@@ -564,6 +564,20 @@ pub struct SocketFile {
     /// new one before its next epoll scan, leaving the sampled mask at POLLIN
     /// throughout. Each enqueue is nevertheless a new accept-ready edge.
     listener_readable_token: AtomicU64,
+    /// Durable per-fd readiness cell for a connectionless datagram inbox
+    /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
+    /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
+    /// of the queue; it lives here on the `SocketFile` and `arm_readiness`
+    /// serves it. POLL_IN when the inbox is non-empty, POLL_OUT always (a dgram
+    /// socket is always sendable). A send that enqueues sets POLL_IN (targeted
+    /// wake of the parked reader); a recv that drains to empty clears it. The
+    /// legacy `dgram_readable_token` + `notify(0)` stay belt-and-suspenders.
+    dgram_readiness: narf_lib::readiness::Readiness,
+    /// Durable per-fd readiness cell for a listener's pending accept queue.
+    /// POLL_IN when a connection is pending (accept won't block). A `connect`
+    /// that enqueues a pending server end sets it; an `accept` that drains to
+    /// empty clears it. Legacy `listener_readable_token` + `notify(0)` kept.
+    listener_readiness: narf_lib::readiness::Readiness,
     /// `unix-latency-trace` only: tid that called `listen()` on this socket.
     /// The starved-accept sweep runs inside the watchdog's timer trap, where
     /// walking every task's fd table to find the acceptor would take the fd
@@ -1028,6 +1042,10 @@ impl SocketFile {
             dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             dgram_readable_token: AtomicU64::new(0),
             listener_readable_token: AtomicU64::new(0),
+            // A fresh dgram socket is always sendable, not yet readable; a fresh
+            // listener has no pending connection.
+            dgram_readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
+            listener_readiness: narf_lib::readiness::Readiness::new(0),
             #[cfg(feature = "unix-latency-trace")]
             listen_owner_tid: AtomicU64::new(0),
             #[cfg(feature = "unix-latency-trace")]
@@ -2051,6 +2069,14 @@ impl FileOps for SocketFile {
                     || listen_id
                         .map(narf_net::tcp_stack::listen_has_pending)
                         .unwrap_or(false);
+                // Reconcile the durable accept cell against this level so it
+                // clears once accept drains the queue (else a re-arm spuriously
+                // returns Ready and a timed poll spins). The connect enqueue set
+                // the rising POLL_IN edge that fired the parked acceptor.
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
                 if ready {
                     narf_filesystem::POLL_IN
                 } else {
@@ -2059,10 +2085,15 @@ impl FileOps for SocketFile {
             }
             SocketState::UnixListener { pending, .. }
             | SocketState::Inet6Listener { pending, .. } => {
-                if pending.is_empty() {
-                    0
-                } else {
+                let ready = !pending.is_empty();
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
                     narf_filesystem::POLL_IN
+                } else {
+                    0
                 }
             }
             SocketState::UnixConnected { rx, tx, .. }
@@ -2092,6 +2123,14 @@ impl FileOps for SocketFile {
                 if !inbox.is_empty() {
                     bits |= narf_filesystem::POLL_IN;
                 }
+                // Reconcile the durable datagram cell's POLL_IN against this
+                // level so a recv that drained the inbox stops reporting
+                // readable in the cell (POLL_OUT stays — always sendable). The
+                // send enqueue set the rising POLL_IN edge that fired the reader.
+                self.dgram_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
                 bits
             }
             SocketState::InetWired { tcb_id, .. } => {
@@ -2241,38 +2280,80 @@ impl FileOps for SocketFile {
         if !want_in && !want_out {
             return None;
         }
-        let (rx, tx) = match &*self.state.lock() {
+        // Classify the socket under one short lock, cloning any rings needed.
+        enum Arm {
+            Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Dgram,
+            Listener,
+            Legacy,
+        }
+        let arm = match &*self.state.lock() {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
-            | SocketState::Inet6Connected { rx, tx, .. } => (rx.clone(), tx.clone()),
-            _ => return None,
+            | SocketState::Inet6Connected { rx, tx, .. } => Arm::Connected(rx.clone(), tx.clone()),
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
+            SocketState::UnixListener { .. }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. } => Arm::Listener,
+            _ => Arm::Legacy,
         };
-        // Arm off the state lock: the cloned Arcs keep the rings alive, and a
-        // concurrent close latches POLL_IN|POLL_HUP into the cell, so `arm`
-        // still observes readiness rather than parking on a dead ring.
-        let mut ready = 0u32;
-        if want_in {
-            if let Poll::Ready(bits) = rx.readiness().arm(
-                task_id,
-                narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
-                waker,
-            ) {
-                ready |= bits;
+        match arm {
+            // Unmigrated states (raw / netlink / kernel-TCP / bypass): the
+            // caller keeps the legacy edge-token + backstop path.
+            Arm::Legacy => None,
+            // Connected stream: dual rx/tx ring cells. Arm off the state lock —
+            // the cloned Arcs keep the rings alive, and a concurrent close
+            // latches POLL_IN|POLL_HUP into the cell, so `arm` still observes
+            // readiness rather than parking on a dead ring. POLL_HUP is folded
+            // into both so a peer close wakes a reader AND a writer.
+            Arm::Connected(rx, tx) => {
+                let mut ready = 0u32;
+                if want_in {
+                    if let core::task::Poll::Ready(bits) = rx.readiness().arm(
+                        task_id,
+                        narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                        waker,
+                    ) {
+                        ready |= bits;
+                    }
+                }
+                if want_out {
+                    if let core::task::Poll::Ready(bits) = tx.readiness().arm(
+                        task_id,
+                        narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+                        waker,
+                    ) {
+                        ready |= bits;
+                    }
+                }
+                if ready != 0 {
+                    Some(Poll::Ready(ready))
+                } else {
+                    Some(Poll::Pending)
+                }
             }
-        }
-        if want_out {
-            if let Poll::Ready(bits) = tx.readiness().arm(
+            // Connectionless datagram: one SocketFile-level cell carrying
+            // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
+            // inbox is non-empty. Arming with the caller's interest returns
+            // Ready immediately for the always-writable case.
+            Arm::Dgram => Some(self.dgram_readiness.arm(
                 task_id,
-                narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+                interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
                 waker,
-            ) {
-                ready |= bits;
+            )),
+            // Listener: only ever POLL_IN-ready (a pending connection to
+            // accept). A POLL_OUT-only interest has nothing durable to wait for,
+            // so fall back to the legacy path.
+            Arm::Listener => {
+                if want_in {
+                    Some(
+                        self.listener_readiness
+                            .arm(task_id, narf_filesystem::POLL_IN, waker),
+                    )
+                } else {
+                    None
+                }
             }
-        }
-        if ready != 0 {
-            Some(Poll::Ready(ready))
-        } else {
-            Some(Poll::Pending)
         }
     }
 
@@ -2281,15 +2362,38 @@ impl FileOps for SocketFile {
     /// no-op). Returns `false` for unmigrated states so the caller runs its
     /// legacy disarm path.
     fn disarm_readiness(&self, task_id: u64) -> bool {
-        let (rx, tx) = match &*self.state.lock() {
+        enum D {
+            Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Dgram,
+            Listener,
+            Legacy,
+        }
+        let d = match &*self.state.lock() {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
-            | SocketState::Inet6Connected { rx, tx, .. } => (rx.clone(), tx.clone()),
-            _ => return false,
+            | SocketState::Inet6Connected { rx, tx, .. } => D::Connected(rx.clone(), tx.clone()),
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
+            SocketState::UnixListener { .. }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. } => D::Listener,
+            _ => D::Legacy,
         };
-        rx.readiness().disarm(task_id);
-        tx.readiness().disarm(task_id);
-        true
+        match d {
+            D::Legacy => false,
+            D::Connected(rx, tx) => {
+                rx.readiness().disarm(task_id);
+                tx.readiness().disarm(task_id);
+                true
+            }
+            D::Dgram => {
+                self.dgram_readiness.disarm(task_id);
+                true
+            }
+            D::Listener => {
+                self.listener_readiness.disarm(task_id);
+                true
+            }
+        }
     }
 }
 
@@ -3746,6 +3850,10 @@ impl SocketFile {
                         listener
                             .listener_readable_token
                             .fetch_add(1, Ordering::Release);
+                        // Durable per-fd wake: fire the acceptor armed on the
+                        // listener's cell directly. poll_readiness clears it when
+                        // accept drains the queue.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -4083,6 +4191,8 @@ impl SocketFile {
                     let mut lst = listener.state.lock();
                     if let SocketState::InetListener { pending, .. } = &mut *lst {
                         pending.push_back(server_end);
+                        // Durable accept wake; poll_readiness clears on accept.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -4289,6 +4399,11 @@ impl SocketFile {
                     dest_sock
                         .dgram_readable_token
                         .fetch_add(1, Ordering::Release);
+                    // Durable per-fd wake: fire the reader armed on the
+                    // destination's datagram cell directly (targeted), so it
+                    // does not depend on the notify(0) herd + backstop below.
+                    // poll_readiness reconciles the cell on the consume side.
+                    dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
                     // Wake a reader parked in poll/epoll on the destination.
                     // Without this a peer blocked in epoll_wait(-1)/poll(-1) on
                     // a bound UDP socket never wakes for a loopback datagram —
@@ -4502,6 +4617,10 @@ impl SocketFile {
                     dest_sock
                         .dgram_readable_token
                         .fetch_add(1, Ordering::Release);
+                    // Durable per-fd wake: fire the reader armed on the dest's
+                    // datagram cell directly (state->cell lock order; the cell
+                    // has its own lock). poll_readiness clears it on consume.
+                    dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —
@@ -4720,6 +4839,8 @@ impl SocketFile {
                     let mut lst = listener.state.lock();
                     if let SocketState::Inet6Listener { pending, .. } = &mut *lst {
                         pending.push_back(server_end);
+                        // Durable accept wake; poll_readiness clears on accept.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
