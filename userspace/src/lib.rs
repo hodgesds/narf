@@ -65,6 +65,7 @@ mod mapped_file;
 #[cfg(feature = "linux-compat")]
 pub mod mount_api;
 #[cfg(feature = "linux-compat")]
+pub mod anon_reclaim;
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;
