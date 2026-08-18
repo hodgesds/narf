@@ -597,14 +597,15 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // user tasks), starves every peer: a compositor looping poll() over
     // {wayland, DRM, input, dbus, ...} otherwise wedges the whole session.
     //
-    // We park even when the set contains a "silent" fd (pipe/eventfd/tty — one
-    // that becomes ready via a write firing no readiness notify). The park path
-    // already arms the ~10 ms lost-wake backstop (`net_io_wait` below →
-    // `park_fire_deadline_ns`, clamped under any finite timeout), so a silent
-    // readiness edge is picked up within one backstop tick by the re-executed
-    // scan rather than being missed — a bounded ≤10 ms latency in place of a
-    // 100%-CPU spin. A closed fd is caught by `poll_scan`'s POLLNVAL on the
-    // first pass below (immediate return, no park). Only a non-blocking poll or
+    // We park even when the set contains an fd that becomes ready via a write
+    // (pipe/eventfd/tty). Task #32's per-fd `Readiness` migration gives each such
+    // fd a DURABLE wake that fires on that ready transition, so the park is
+    // revived by the fd's own cell — the ~10 ms lost-wake backstop that used to
+    // catch a missed edge is deleted (per-fd wake, not a periodic re-scan). An
+    // fd type that STILL fired no readiness notify would strand here; closing any
+    // such gap is exactly the remaining scope of the per-fd migration. A closed
+    // fd is caught by `poll_scan`'s POLLNVAL on the first pass below (immediate
+    // return, no park). Only a non-blocking poll or
     // one with no task context (early boot) still takes the one-shot busy path.
     let can_park = timeout != 0 && uctx_opt.is_some();
     if !can_park {

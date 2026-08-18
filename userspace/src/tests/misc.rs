@@ -1932,47 +1932,48 @@ kernel_test_in!(
 
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
-/// A blocking park's lost-wake fallback timer must fire a ~10 ms backstop for
-/// BOTH infinite parks AND finite io-wait parks (poll/epoll with a real
-/// timeout), while a plain finite sleep still fires at its real deadline.
-/// Pins the fix for a QtDBus worker poll()ing the system bus with the 25 s
-/// D-Bus method timeout: a lost cross-core io-wake used to strand it the full
-/// 25 s (wheel armed at the real deadline) instead of self-healing in ~10 ms.
+/// Task #32 DELETED the ~10 ms lost-wake backstop: every readiness source now
+/// fires a durable targeted wake, so `park_fire_deadline_ns` is the IDENTITY —
+/// a finite park fires at its REAL deadline (no clamp), and an infinite park
+/// (`u64::MAX`) gets an inert never-firing timer, relying purely on its
+/// registered wakers. (Previously infinite + finite io-wait parks were clamped
+/// to a ~10 ms backstop — e.g. a QtDBus worker poll()ing the 25 s D-Bus method
+/// timeout; that clamp is gone now that the io-waiter wake is durable.)
 #[cfg(target_arch = "x86_64")]
-fn smoke_userspace_park_io_wait_fallback_backstop() -> TestResult {
+fn smoke_userspace_park_fire_deadline_is_identity() -> TestResult {
     use crate::user_task::park_fire_deadline_ns;
-    const FB: u64 = 10_000_000; // 10 ms in ns
     let now = 1_000_000_000; // arbitrary "now"
 
-    // Infinite park → ~10 ms backstop regardless of io-wait.
-    if park_fire_deadline_ns(u64::MAX, now, false) != now + FB {
-        return TestResult::Fail("infinite park did not use the 10ms backstop");
+    // Infinite park → u64::MAX (inert timer), NOT a 10 ms backstop, regardless
+    // of io-wait.
+    if park_fire_deadline_ns(u64::MAX, now, false) != u64::MAX {
+        return TestResult::Fail("infinite park must return u64::MAX (backstop deleted)");
     }
-    if park_fire_deadline_ns(u64::MAX, now, true) != now + FB {
-        return TestResult::Fail("infinite io-wait park did not use the 10ms backstop");
+    if park_fire_deadline_ns(u64::MAX, now, true) != u64::MAX {
+        return TestResult::Fail("infinite io-wait park must return u64::MAX (backstop deleted)");
     }
 
-    // Finite io-wait park with a FAR deadline (25 s) → clamped to now+10 ms.
+    // Finite io-wait park with a FAR deadline (25 s) → its REAL deadline, NOT
+    // clamped (the durable io-waiter wake revives it earlier in practice).
     let far = now + 25_000_000_000;
-    if park_fire_deadline_ns(far, now, true) != now + FB {
-        return TestResult::Fail("finite io-wait park was not clamped to the 10ms backstop");
+    if park_fire_deadline_ns(far, now, true) != far {
+        return TestResult::Fail("finite io-wait park must fire at its real deadline (no clamp)");
     }
 
-    // Finite NON-io park (plain sleep) → fires at the real deadline, unclamped.
+    // Finite NON-io park (plain sleep) → its real deadline.
     if park_fire_deadline_ns(far, now, false) != far {
-        return TestResult::Fail("finite sleep park was wrongly clamped");
+        return TestResult::Fail("finite sleep park must fire at its real deadline");
     }
 
-    // A finite io-wait park whose deadline is already < 10 ms out must NOT be
-    // pushed OUT to 10 ms (never overshoot the real deadline).
+    // A near deadline is returned unchanged too.
     let near = now + 2_000_000; // 2 ms
     if park_fire_deadline_ns(near, now, true) != near {
-        return TestResult::Fail("near io-wait deadline was overshot past the real deadline");
+        return TestResult::Fail("near deadline must be returned unchanged");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_park_io_wait_fallback_backstop);
+kernel_test_in!("userspace", smoke_userspace_park_fire_deadline_is_identity);
 
 /// A global readiness notification that races an epoll/poll waiter's
 /// registration is not evidence that *this* interest set is ready.  The

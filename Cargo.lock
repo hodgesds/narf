@@ -2178,7 +2178,6 @@ dependencies = [
  "narf-abi",
  "narf-arch",
  "narf-block",
- "narf-boot",
  "narf-bpf",
  "narf-bpf-btf",
  "narf-bpf-isa",
