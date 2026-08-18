@@ -24,7 +24,49 @@
 // 2. The "buddy" of a block at frame number F, order N is the block
 //    starting at frame number `F XOR (1 << N)`.
 // 3. Two buddies can coalesce iff both are free and both are blocks
-//    of the SAME order N (i.e., neither has been further split).
+//    of the SAME order N (i.e., neither has been further split) AND
+//    both belong to the SAME migratetype partition (see below).
+//
+// ── Anti-fragmentation: migratetype partitioning ────────────────────
+//
+// Free blocks are grouped by mobility class (`MigrateType`: UNMOVABLE
+// vs MOVABLE), mirroring Linux's per-migratetype free lists. Grouping
+// keeps long-lived UNMOVABLE allocations (page tables, slab pages, DMA)
+// out of the contiguous regions that bulk-freed MOVABLE user pages live
+// in, so a fork/exec/exit storm frees its user pages back into a few
+// large coalescible runs instead of a checkerboard of unmovable holes.
+// This raises higher-order allocation success under fragmentation with
+// NO page migration required — it only changes WHERE a free block is
+// filed, never moves live data.
+//
+// When a migratetype's own partition can't serve a request, the
+// allocator STEALS a higher-order block from the fallback migratetype
+// (`FALLBACK_ORDER`) and converts the whole split block to the
+// requesting type (Linux's whole-block steal), so a single steal
+// doesn't permanently scatter the donor pool.
+//
+// ── Design note: the eventual MIGRATION step (NOT yet implemented) ───
+//
+// Linux compaction goes further: it MIGRATES movable pages — copies a
+// page's contents to a new frame and rewrites every PTE that mapped the
+// old frame — to actively assemble higher-order free blocks on demand.
+// NARF CANNOT do this soundly today because it has NO reverse map
+// (rmap): there is no per-frame descriptor recording which
+// address-space PTEs (and COW/shmem aliases) reference a given physical
+// frame. Frame state is only the buddy free-list plus the COW refcount
+// shards; nothing maps frame -> mappings. Blindly copying a movable
+// page and repointing one caller would leave every other alias dangling.
+//
+// The migration step becomes implementable once a per-frame rmap exists
+// (frame -> list of (address_space, virtual_page) referrers). At that
+// point a compaction pass would, for a target movable block: (1) allocate
+// a replacement movable frame, (2) copy contents, (3) walk the rmap
+// updating every referrer PTE under the relevant AS locks with a TLB
+// shootdown, (4) free the old frame — coalescing it with its now-free
+// buddies. Until rmap lands, the partitioning above is the honest,
+// migration-free anti-fragmentation slice; `MigrateType::Movable` names
+// the pages that WOULD be migratable so the accounting is already in
+// place for that future work.
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -41,6 +83,77 @@ pub const MAX_ORDER: u8 = 13;
 
 /// Number of orders inclusive (0..=MAX_ORDER).
 pub const NUM_ORDERS: usize = (MAX_ORDER as usize) + 1;
+
+/// Mobility class of an allocation — Linux's "migratetype", minus the
+/// migration machinery (see the anti-fragmentation design note below).
+///
+/// Free blocks are partitioned by migratetype so that long-lived
+/// UNMOVABLE allocations (page tables, slab pages, kernel objects) do
+/// not fragment the contiguous regions that MOVABLE allocations (user
+/// anonymous/file pages — freed in bulk on process exit) live in, and
+/// vice versa. Keeping the two classes clustered means a movable region
+/// tends to free back into one large coalescible block instead of a
+/// checkerboard of unmovable holes, which is what starves higher-order
+/// allocations under fragmentation.
+///
+/// Ordering is deliberate: `UNMOVABLE` first so it is the natural
+/// `Default` and index 0. The fallback preference order in
+/// `FALLBACK_ORDER` is derived from these indices.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum MigrateType {
+    /// Kernel-internal allocations that can never be relocated because
+    /// something holds a raw physical/direct-map pointer to them: page
+    /// tables, slab backing pages, DMA buffers, per-CPU data.
+    Unmovable = 0,
+    /// User-backing pages (anonymous, file, shmem). In Linux these are
+    /// migratable; in NARF they are merely *grouped* (no migration yet),
+    /// so that a fork/exec/exit storm frees them back into large
+    /// contiguous runs rather than peppering the unmovable pool.
+    Movable = 1,
+}
+
+/// Number of migratetypes tracked.
+pub const NUM_MIGRATE_TYPES: usize = 2;
+
+impl MigrateType {
+    /// Free-list partition index for this migratetype.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Reconstruct a migratetype from its partition index. Any
+    /// out-of-range value maps to `Unmovable`, the conservative default
+    /// (an unmovable block is never wrongly relocated).
+    #[inline]
+    pub const fn from_index(idx: usize) -> Self {
+        match idx {
+            1 => MigrateType::Movable,
+            _ => MigrateType::Unmovable,
+        }
+    }
+}
+
+impl Default for MigrateType {
+    #[inline]
+    fn default() -> Self {
+        MigrateType::Unmovable
+    }
+}
+
+/// Fallback search order per requested migratetype. When a request
+/// cannot be served from its own partition, the allocator steals from
+/// the next migratetype in this list (Linux's `fallbacks[]`). The
+/// requested type always appears first. With only two types the table is
+/// trivial, but it is expressed as data so adding RECLAIMABLE later is a
+/// one-line change.
+const FALLBACK_ORDER: [[MigrateType; NUM_MIGRATE_TYPES]; NUM_MIGRATE_TYPES] = [
+    // Unmovable request: prefer unmovable, else steal movable.
+    [MigrateType::Unmovable, MigrateType::Movable],
+    // Movable request: prefer movable, else steal unmovable.
+    [MigrateType::Movable, MigrateType::Unmovable],
+];
 
 /// Returns the size in bytes of a block at `order`.
 #[inline]
@@ -303,8 +416,12 @@ pub fn audit_note_alloc_caller(loc: &'static core::panic::Location<'static>) {
 /// XOR-based buddy lookup is straightforward shifts.
 #[derive(Debug)]
 pub struct BuddyZone {
-    /// `free_lists[N]` holds frame numbers of free blocks of order N.
-    free_lists: [Vec<u64>; NUM_ORDERS],
+    /// `free_lists[M][N]` holds frame numbers of free order-N blocks
+    /// belonging to migratetype `M` (see `MigrateType`). Partitioning by
+    /// mobility is the anti-fragmentation mechanism: unmovable and
+    /// movable free blocks are kept in separate pools so they don't
+    /// checkerboard each other's contiguous regions.
+    free_lists: [[Vec<u64>; NUM_ORDERS]; NUM_MIGRATE_TYPES],
     /// Total frames in this zone (free + allocated). For stats.
     total_frames: usize,
     /// Free frames in this zone (sum of `(order_frames(N) * len)` across
@@ -323,8 +440,9 @@ pub struct BuddyZone {
 impl BuddyZone {
     pub const fn new() -> Self {
         const NEW_VEC: Vec<u64> = Vec::new();
+        const NEW_ORDERS: [Vec<u64>; NUM_ORDERS] = [NEW_VEC; NUM_ORDERS];
         Self {
-            free_lists: [NEW_VEC; NUM_ORDERS],
+            free_lists: [NEW_ORDERS; NUM_MIGRATE_TYPES],
             #[cfg(feature = "frame-alloc-audit")]
             audit: false,
             total_frames: 0,
@@ -399,7 +517,11 @@ impl BuddyZone {
         let mut bytes = 0usize;
         for order in 0..NUM_ORDERS {
             let cap = (self.total_frames >> order).max(64) + 64;
-            bytes = bytes.saturating_add(cap * core::mem::size_of::<u64>());
+            // Reserved once per migratetype partition: a block may live
+            // in either partition, and stealing moves it between them
+            // (all under `frame::ALLOC.lock()`), so every partition needs
+            // the pessimistic per-order bound to stay Vec-growth-free.
+            bytes = bytes.saturating_add(cap * core::mem::size_of::<u64>() * NUM_MIGRATE_TYPES);
         }
         bytes
     }
@@ -427,9 +549,15 @@ impl BuddyZone {
             // 2·total_frames·8 bytes of capacity, reserved once at boot while the
             // allocator is still bump.
             let cap = (self.total_frames >> order).max(64) + 64;
-            let need = cap.saturating_sub(self.free_lists[order].capacity());
-            if need > 0 {
-                self.free_lists[order].reserve_exact(need);
+            // Every migratetype partition gets the full pessimistic bound
+            // so that stealing a block between partitions (which pushes to
+            // the destination list under the frame lock) can never trigger
+            // a `Vec` growth → slab → recursive-lock deadlock.
+            for mt in 0..NUM_MIGRATE_TYPES {
+                let need = cap.saturating_sub(self.free_lists[mt][order].capacity());
+                if need > 0 {
+                    self.free_lists[mt][order].reserve_exact(need);
+                }
             }
         }
     }
@@ -444,6 +572,14 @@ impl BuddyZone {
     ///     crossing into another node's region).
     ///   - The range doesn't overlap any already-donated frames.
     pub fn donate(&mut self, first_frame: u64, frame_count: u64) {
+        self.donate_as(first_frame, frame_count, MigrateType::Movable);
+    }
+
+    /// Donate a range, seeding it into a specific migratetype partition.
+    /// Boot/hotplug RAM is seeded `Movable` (Linux marks fresh pageblocks
+    /// movable) so the bulk user allocations inherit the large contiguous
+    /// runs; unmovable kernel allocations steal from it on demand.
+    pub fn donate_as(&mut self, first_frame: u64, frame_count: u64, mt: MigrateType) {
         let mut start = first_frame;
         let end = first_frame + frame_count;
         self.total_frames += frame_count as usize;
@@ -461,7 +597,7 @@ impl BuddyZone {
                 }
                 order -= 1;
             }
-            self.free_lists[order as usize].push(start);
+            self.free_lists[mt.index()][order as usize].push(start);
             start += order_frames(order);
         }
     }
@@ -485,8 +621,13 @@ impl BuddyZone {
             needed[order as usize] += 1;
             start += order_frames(order);
         }
+        // `donate`/`donate_as(Movable)` push into the Movable partition,
+        // so that is the partition whose capacity headroom must cover the
+        // range.
+        let mt = MigrateType::Movable.index();
         needed.iter().enumerate().all(|(order, need)| {
-            self.free_lists[order].len().saturating_add(*need) <= self.free_lists[order].capacity()
+            self.free_lists[mt][order].len().saturating_add(*need)
+                <= self.free_lists[mt][order].capacity()
         })
     }
 
@@ -504,13 +645,15 @@ impl BuddyZone {
             return false;
         }
         let mut covered = 0u64;
-        for (order, list) in self.free_lists.iter().enumerate() {
-            let span = order_frames(order as u8);
-            for &block in list {
-                let overlap_lo = block.max(first_frame);
-                let overlap_hi = block.saturating_add(span).min(end);
-                if overlap_lo < overlap_hi {
-                    covered = covered.saturating_add(overlap_hi - overlap_lo);
+        for partition in self.free_lists.iter() {
+            for (order, list) in partition.iter().enumerate() {
+                let span = order_frames(order as u8);
+                for &block in list {
+                    let overlap_lo = block.max(first_frame);
+                    let overlap_hi = block.saturating_add(span).min(end);
+                    if overlap_lo < overlap_hi {
+                        covered = covered.saturating_add(overlap_hi - overlap_lo);
+                    }
                 }
             }
         }
@@ -518,24 +661,29 @@ impl BuddyZone {
             return false;
         }
 
-        for order in (0..NUM_ORDERS).rev() {
-            let span = order_frames(order as u8);
-            let mut index = 0;
-            while index < self.free_lists[order].len() {
-                let block = self.free_lists[order][index];
-                let block_end = block + span;
-                if block >= end || block_end <= first_frame {
-                    index += 1;
-                    continue;
+        // A block crossing the range boundary is split in place; its
+        // outside fragments are returned to the SAME migratetype partition
+        // they were removed from, preserving the mobility grouping.
+        for mt in 0..NUM_MIGRATE_TYPES {
+            for order in (0..NUM_ORDERS).rev() {
+                let span = order_frames(order as u8);
+                let mut index = 0;
+                while index < self.free_lists[mt][order].len() {
+                    let block = self.free_lists[mt][order][index];
+                    let block_end = block + span;
+                    if block >= end || block_end <= first_frame {
+                        index += 1;
+                        continue;
+                    }
+                    self.free_lists[mt][order].swap_remove(index);
+                    Self::retain_outside_range(
+                        &mut self.free_lists[mt],
+                        block,
+                        order as u8,
+                        first_frame,
+                        end,
+                    );
                 }
-                self.free_lists[order].swap_remove(index);
-                Self::retain_outside_range(
-                    &mut self.free_lists,
-                    block,
-                    order as u8,
-                    first_frame,
-                    end,
-                );
             }
         }
         self.free_frames -= frame_count as usize;
@@ -565,17 +713,51 @@ impl BuddyZone {
         Self::retain_outside_range(lists, block + half, child_order, remove_lo, remove_hi);
     }
 
-    /// Allocate a block of `order` frames. Splits a higher-order
-    /// block if necessary; pushes the unused half back to the
-    /// next-lower order's list. Returns `None` on exhaustion.
+    /// Allocate a block of `order` frames for the default (`Unmovable`)
+    /// migratetype. Splits a higher-order block if necessary; pushes the
+    /// unused half back to the next-lower order's list. Returns `None` on
+    /// exhaustion.
+    ///
+    /// Most kernel call sites want unmovable memory (page tables, slab,
+    /// DMA), so this is the conservative default. User-backing allocations
+    /// should call [`BuddyZone::alloc_mt`] with `MigrateType::Movable` to
+    /// keep those pages clustered away from the unmovable pool.
     pub fn alloc(&mut self, order: u8) -> Option<u64> {
+        self.alloc_mt(order, MigrateType::Unmovable)
+    }
+
+    /// Allocate a block of `order` frames of migratetype `mt`.
+    ///
+    /// Serves the request from `mt`'s own partition first. If that
+    /// partition has no block at or above `order`, it steals from the next
+    /// migratetype in `FALLBACK_ORDER` — the whole higher-order block is
+    /// migrated into `mt`'s partition as it is split down, so future frees
+    /// of the returned block land back in `mt` (Linux's steal-the-whole-
+    /// block heuristic, which prevents a single steal from permanently
+    /// scattering the donor pool).
+    pub fn alloc_mt(&mut self, order: u8, mt: MigrateType) -> Option<u64> {
         if order > MAX_ORDER {
             return None;
         }
-        // Walk up to find a non-empty list at order >= requested.
+        for &src_mt in &FALLBACK_ORDER[mt.index()] {
+            if let Some(frame) = self.alloc_within(order, src_mt, mt) {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    /// Try to satisfy an order-`order` request by splitting a block from
+    /// the `src_mt` partition, placing all split-off buddies (and the
+    /// returned block's accounting) into the `dst_mt` partition. When
+    /// `src_mt == dst_mt` this is the ordinary same-partition split; when
+    /// they differ it is a cross-migratetype steal.
+    fn alloc_within(&mut self, order: u8, src_mt: MigrateType, dst_mt: MigrateType) -> Option<u64> {
+        // Walk up to find a non-empty list at order >= requested in the
+        // source partition.
         let mut found_order = order;
         while found_order <= MAX_ORDER {
-            if !self.free_lists[found_order as usize].is_empty() {
+            if !self.free_lists[src_mt.index()][found_order as usize].is_empty() {
                 break;
             }
             found_order += 1;
@@ -583,14 +765,15 @@ impl BuddyZone {
         if found_order > MAX_ORDER {
             return None;
         }
-        let frame = self.free_lists[found_order as usize].pop()?;
-        // Split down to the requested order. Each split halves a
-        // block: keep the lower half for the caller, push the
-        // upper half onto the lower order's free list.
+        let frame = self.free_lists[src_mt.index()][found_order as usize].pop()?;
+        // Split down to the requested order. Each split halves a block:
+        // keep the lower half for the caller, push the upper half onto the
+        // DESTINATION partition's lower-order free list so the entire
+        // stolen block converts to `dst_mt`.
         while found_order > order {
             found_order -= 1;
             let buddy = frame + order_frames(found_order);
-            self.free_lists[found_order as usize].push(buddy);
+            self.free_lists[dst_mt.index()][found_order as usize].push(buddy);
         }
         self.free_frames -= order_frames(order) as usize;
         self.note_alloc(frame, order);
@@ -603,75 +786,106 @@ impl BuddyZone {
     /// boot). Walks the order-N free list looking for a block whose
     /// END frame fits below the ceiling.
     pub fn alloc_below(&mut self, order: u8, max_frame_no_excl: u64) -> Option<u64> {
+        self.alloc_below_mt(order, max_frame_no_excl, MigrateType::Unmovable)
+    }
+
+    /// Ceiling-constrained allocation of migratetype `mt`. Searches `mt`'s
+    /// own partition first, then steals from the fallback migratetype; a
+    /// stolen block's split-off buddies are placed into `mt`'s partition,
+    /// mirroring [`BuddyZone::alloc_mt`].
+    pub fn alloc_below_mt(
+        &mut self,
+        order: u8,
+        max_frame_no_excl: u64,
+        mt: MigrateType,
+    ) -> Option<u64> {
         if order > MAX_ORDER {
             return None;
         }
         let need = order_frames(order);
-        // Try the exact-order list first (fast path).
-        if let Some(idx) = self.find_below(order, max_frame_no_excl) {
-            let frame = self.free_lists[order as usize].swap_remove(idx);
-            self.free_frames -= need as usize;
-            self.note_alloc(frame, order);
-            return Some(frame);
-        }
-        // Fallback: walk higher orders for a block whose lower half
-        // fits under the ceiling, then split repeatedly.
-        for src in (order + 1)..=MAX_ORDER {
-            if let Some(idx) = self.find_below(src, max_frame_no_excl) {
-                let frame = self.free_lists[src as usize].swap_remove(idx);
-                let mut cur = src;
-                while cur > order {
-                    cur -= 1;
-                    let buddy = frame + order_frames(cur);
-                    self.free_lists[cur as usize].push(buddy);
-                }
+        for &src_mt in &FALLBACK_ORDER[mt.index()] {
+            // Try the exact-order list first (fast path).
+            if let Some(idx) = self.find_below(order, max_frame_no_excl, src_mt) {
+                let frame = self.free_lists[src_mt.index()][order as usize].swap_remove(idx);
                 self.free_frames -= need as usize;
                 self.note_alloc(frame, order);
                 return Some(frame);
+            }
+            // Fallback: walk higher orders for a block whose lower half
+            // fits under the ceiling, then split repeatedly, converting the
+            // block to `mt`.
+            for src in (order + 1)..=MAX_ORDER {
+                if let Some(idx) = self.find_below(src, max_frame_no_excl, src_mt) {
+                    let frame = self.free_lists[src_mt.index()][src as usize].swap_remove(idx);
+                    let mut cur = src;
+                    while cur > order {
+                        cur -= 1;
+                        let buddy = frame + order_frames(cur);
+                        self.free_lists[mt.index()][cur as usize].push(buddy);
+                    }
+                    self.free_frames -= need as usize;
+                    self.note_alloc(frame, order);
+                    return Some(frame);
+                }
             }
         }
         None
     }
 
-    /// Find the index of a block at `order` whose END falls below
-    /// `max_frame_no_excl`. Linear scan of the order's free list.
-    fn find_below(&self, order: u8, max_frame_no_excl: u64) -> Option<usize> {
+    /// Find the index of a block at `order` in the `mt` partition whose
+    /// END falls below `max_frame_no_excl`. Linear scan of the order's
+    /// free list.
+    fn find_below(&self, order: u8, max_frame_no_excl: u64, mt: MigrateType) -> Option<usize> {
         let blk = order_frames(order);
-        self.free_lists[order as usize]
+        self.free_lists[mt.index()][order as usize]
             .iter()
             .position(|&f| f + blk <= max_frame_no_excl)
     }
 
-    /// Free a block at `frame` of `order`, attempting to coalesce
-    /// with its buddy upward as long as the buddy is also free.
+    /// Free a block at `frame` of `order` into the default (`Unmovable`)
+    /// partition, coalescing with its buddy upward as long as the buddy is
+    /// also free WITHIN THE SAME PARTITION.
     pub fn free(&mut self, frame: u64, order: u8) {
+        self.free_mt(frame, order, MigrateType::Unmovable);
+    }
+
+    /// Free a block at `frame` of `order` into migratetype `mt`'s
+    /// partition. Coalescing only merges a buddy that is free in the same
+    /// partition, so unmovable and movable blocks never merge across the
+    /// mobility boundary — that is what keeps each class's contiguous
+    /// regions intact.
+    pub fn free_mt(&mut self, frame: u64, order: u8, mt: MigrateType) {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
         self.note_free(frame, order);
-        self.free_inner(frame, order);
+        self.free_inner(frame, order, mt);
     }
 
     /// Return a block that was already recorded free while resident in a
     /// per-CPU cache. This updates/coalesces buddy metadata without emitting a
-    /// second audit transition.
+    /// second audit transition. Cached frames are order-0 base pages fed by
+    /// the order-0 fast path; they rejoin the `Unmovable` partition.
     pub(crate) fn free_cached(&mut self, frame: u64, order: u8) {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
-        self.free_inner(frame, order);
+        self.free_inner(frame, order, MigrateType::Unmovable);
     }
 
-    fn free_inner(&mut self, frame: u64, order: u8) {
+    fn free_inner(&mut self, frame: u64, order: u8, mt: MigrateType) {
         self.free_frames += order_frames(order) as usize;
+        let mt = mt.index();
         let mut cur_order = order;
         let mut cur_frame = frame;
         while cur_order < MAX_ORDER {
             let buddy = buddy_of(cur_frame, cur_order);
-            // Look for buddy in the same-order free list.
-            if let Some(idx) = self.free_lists[cur_order as usize]
+            // Look for buddy in the same-order free list of the SAME
+            // migratetype partition. A buddy of a different migratetype is
+            // deliberately not merged.
+            if let Some(idx) = self.free_lists[mt][cur_order as usize]
                 .iter()
                 .position(|&f| f == buddy)
             {
-                self.free_lists[cur_order as usize].swap_remove(idx);
+                self.free_lists[mt][cur_order as usize].swap_remove(idx);
                 // Coalesced block starts at min(cur_frame, buddy).
                 cur_frame = cur_frame.min(buddy);
                 cur_order += 1;
@@ -679,7 +893,7 @@ impl BuddyZone {
             }
             break;
         }
-        self.free_lists[cur_order as usize].push(cur_frame);
+        self.free_lists[mt][cur_order as usize].push(cur_frame);
     }
 
     /// Number of free frames in this zone (sum across all orders).
@@ -687,9 +901,19 @@ impl BuddyZone {
         self.free_frames
     }
 
-    /// Number of free buddy blocks at `order` (not base pages).
+    /// Number of free buddy blocks at `order` (not base pages), summed
+    /// across every migratetype partition.
     pub fn free_block_count(&self, order: u8) -> usize {
-        self.free_lists
+        (0..NUM_MIGRATE_TYPES)
+            .map(|mt| self.free_block_count_mt(order, MigrateType::from_index(mt)))
+            .sum()
+    }
+
+    /// Number of free buddy blocks at `order` in migratetype `mt`'s
+    /// partition. Used by `/proc/pagetypeinfo` and the anti-fragmentation
+    /// tests.
+    pub fn free_block_count_mt(&self, order: u8, mt: MigrateType) -> usize {
+        self.free_lists[mt.index()]
             .get(order as usize)
             .map_or(0, alloc::vec::Vec::len)
     }
@@ -704,25 +928,46 @@ impl BuddyZone {
     /// No-alloc O(N²) so it can run from inside the buddy lock
     /// without deadlocking through the slab. Used by the smoke-test
     /// runner to pinpoint corruption.
+    /// Overlap-check spans every migratetype partition: a frame covered by
+    /// both an unmovable and a movable free block would be a real
+    /// double-free bug, so the two pools are compared against each other,
+    /// not just within a partition.
     pub fn validate_no_overlap(&self) -> Result<(), (u64, u8, u8)> {
-        for oa in 0..NUM_ORDERS {
-            let span_a = order_frames(oa as u8);
-            for (ia, &sa) in self.free_lists[oa].iter().enumerate() {
-                let ea = sa + span_a;
-                // Other entries at the same order, after index ia.
-                for &sb in self.free_lists[oa][ia + 1..].iter() {
-                    let eb = sb + span_a;
-                    if sa < eb && sb < ea {
-                        return Err((sa.max(sb), oa as u8, oa as u8));
-                    }
-                }
-                // Entries at any higher order.
-                for ob in (oa + 1)..NUM_ORDERS {
-                    let span_b = order_frames(ob as u8);
-                    for &sb in self.free_lists[ob].iter() {
-                        let eb = sb + span_b;
+        // Compare every (partition_a, order_a, block_a) against every
+        // strictly-later (partition_b, order_b, block_b) in a single flat
+        // ordering keyed by (mt, order, index). No allocation.
+        for mta in 0..NUM_MIGRATE_TYPES {
+            for oa in 0..NUM_ORDERS {
+                let span_a = order_frames(oa as u8);
+                for (ia, &sa) in self.free_lists[mta][oa].iter().enumerate() {
+                    let ea = sa + span_a;
+                    // Remaining entries in the SAME (mt, order) list.
+                    for &sb in self.free_lists[mta][oa][ia + 1..].iter() {
+                        let eb = sb + span_a;
                         if sa < eb && sb < ea {
-                            return Err((sa.max(sb), oa as u8, ob as u8));
+                            return Err((sa.max(sb), oa as u8, oa as u8));
+                        }
+                    }
+                    // Higher orders in the SAME partition.
+                    for ob in (oa + 1)..NUM_ORDERS {
+                        let span_b = order_frames(ob as u8);
+                        for &sb in self.free_lists[mta][ob].iter() {
+                            let eb = sb + span_b;
+                            if sa < eb && sb < ea {
+                                return Err((sa.max(sb), oa as u8, ob as u8));
+                            }
+                        }
+                    }
+                    // Every order in every LATER partition.
+                    for mtb in (mta + 1)..NUM_MIGRATE_TYPES {
+                        for ob in 0..NUM_ORDERS {
+                            let span_b = order_frames(ob as u8);
+                            for &sb in self.free_lists[mtb][ob].iter() {
+                                let eb = sb + span_b;
+                                if sa < eb && sb < ea {
+                                    return Err((sa.max(sb), oa as u8, ob as u8));
+                                }
+                            }
                         }
                     }
                 }
@@ -746,22 +991,25 @@ impl BuddyZone {
     /// frame-allocator lock for the duration. Allocating here
     /// would recurse and deadlock.
     pub fn drain_into(&mut self, dest: &mut BuddyZone, predicate: impl Fn(u64) -> bool) {
-        for order in 0..NUM_ORDERS {
-            let mut i = 0;
-            while i < self.free_lists[order].len() {
-                let frame = self.free_lists[order][i];
-                if predicate(frame) {
-                    self.free_lists[order].swap_remove(i);
-                    let block_frames = order_frames(order as u8) as usize;
-                    self.free_frames -= block_frames;
-                    self.total_frames -= block_frames;
-                    dest.free_lists[order].push(frame);
-                    dest.free_frames += block_frames;
-                    dest.total_frames += block_frames;
-                    // Don't increment i — swap_remove pulled a
-                    // new element into position i.
-                } else {
-                    i += 1;
+        for mt in 0..NUM_MIGRATE_TYPES {
+            for order in 0..NUM_ORDERS {
+                let mut i = 0;
+                while i < self.free_lists[mt][order].len() {
+                    let frame = self.free_lists[mt][order][i];
+                    if predicate(frame) {
+                        self.free_lists[mt][order].swap_remove(i);
+                        let block_frames = order_frames(order as u8) as usize;
+                        self.free_frames -= block_frames;
+                        self.total_frames -= block_frames;
+                        // Preserve the migratetype grouping across the move.
+                        dest.free_lists[mt][order].push(frame);
+                        dest.free_frames += block_frames;
+                        dest.total_frames += block_frames;
+                        // Don't increment i — swap_remove pulled a
+                        // new element into position i.
+                    } else {
+                        i += 1;
+                    }
                 }
             }
         }
@@ -852,11 +1100,12 @@ mod tests {
     fn donate_carves_largest_aligned_blocks() {
         let mut z = BuddyZone::new();
         // 1024 frames starting at frame 0 = single order-10 block.
+        // `donate` seeds the Movable partition (fresh RAM is movable).
         z.donate(0, 1024);
-        assert_eq!(z.free_lists[10].len(), 1);
-        assert_eq!(z.free_lists[10][0], 0);
+        assert_eq!(z.free_lists[MigrateType::Movable.index()][10].len(), 1);
+        assert_eq!(z.free_lists[MigrateType::Movable.index()][10][0], 0);
         for o in 0..10 {
-            assert!(z.free_lists[o].is_empty());
+            assert!(z.free_lists[MigrateType::Movable.index()][o].is_empty());
         }
         assert_eq!(z.free_frame_count(), 1024);
     }
@@ -870,8 +1119,9 @@ mod tests {
         // Frame 2: order-1 (2 frames) → frames 2..4
         // Frame 4: order-1 (2 frames) → frames 4..6
         // Frame 6: order-0 (1 frame) → frame 6
-        assert_eq!(z.free_lists[0].len(), 2); // frames 1 and 6
-        assert_eq!(z.free_lists[1].len(), 2); // frames 2 and 4
+        let mv = MigrateType::Movable.index();
+        assert_eq!(z.free_lists[mv][0].len(), 2); // frames 1 and 6
+        assert_eq!(z.free_lists[mv][1].len(), 2); // frames 2 and 4
         assert_eq!(z.free_frame_count(), 6);
     }
 
@@ -884,7 +1134,9 @@ mod tests {
         z.free(f, 0);
         assert_eq!(z.free_frame_count(), 1024);
         // After full coalesce, we should be back to 1 order-10 block.
-        assert_eq!(z.free_lists[10].len(), 1);
+        // `alloc(0)` (Unmovable) stole and converted the whole block to
+        // Unmovable, so it coalesces back there — sum across partitions.
+        assert_eq!(z.free_block_count(10), 1);
     }
 
     #[test]
@@ -896,11 +1148,12 @@ mod tests {
         let f = z.alloc(0).unwrap();
         assert_eq!(f, 0);
         // After this, we should have a free block at every order
-        // from 0 to 9 (the buddies that were pushed back).
+        // from 0 to 9 (the buddies that were pushed back). They live in
+        // the Unmovable partition since `alloc(0)` stole the block there.
         for o in 0..=9 {
-            assert_eq!(z.free_lists[o].len(), 1, "order {} should have 1 block", o);
+            assert_eq!(z.free_block_count(o), 1, "order {} should have 1 block", o);
         }
-        assert_eq!(z.free_lists[10].len(), 0);
+        assert_eq!(z.free_block_count(10), 0);
         assert_eq!(z.free_frame_count(), 1023);
     }
 
@@ -929,9 +1182,9 @@ mod tests {
         z.free(b, 0);
         assert_eq!(z.free_frame_count(), 4);
         // After full coalesce, only the order-2 block remains.
-        assert_eq!(z.free_lists[2].len(), 1);
+        assert_eq!(z.free_block_count(2), 1);
         for o in [0, 1] {
-            assert!(z.free_lists[o].is_empty());
+            assert_eq!(z.free_block_count(o), 0);
         }
     }
 

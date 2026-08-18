@@ -836,6 +836,21 @@ pub enum AllocContext {
     User,
 }
 
+impl AllocContext {
+    /// Mobility class for anti-fragmentation grouping. Kernel allocations
+    /// are UNMOVABLE (page tables, slab, DMA hold raw physical pointers);
+    /// user-backing allocations are MOVABLE (the pages that WOULD be
+    /// migratable and that free back in bulk on process teardown). See the
+    /// migratetype design note in `buddy.rs`.
+    #[inline]
+    pub fn migrate_type(self) -> buddy::MigrateType {
+        match self {
+            AllocContext::Kernel => buddy::MigrateType::Unmovable,
+            AllocContext::User => buddy::MigrateType::Movable,
+        }
+    }
+}
+
 /// Central reserve gate. Returns `Exhausted` (and wakes the reclaimer) when a
 /// `User` allocation would breach the `min` watermark reserve; `Kernel`
 /// allocations always pass. Enforced once, here, so every allocation entry
@@ -1288,6 +1303,20 @@ fn buddy_alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
 /// is one frame (same as `alloc_frame_on`); `order=10` is 4 MiB.
 /// Phase-1 buddy allocator entry point.
 pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocError> {
+    // Default higher-order allocations to the kernel/UNMOVABLE class.
+    alloc_pages_on_ctx(node, order, AllocContext::Kernel)
+}
+
+/// Allocate a contiguous `1 << order` block, classified for
+/// anti-fragmentation grouping by `ctx` (Kernel → UNMOVABLE, User →
+/// MOVABLE). The multi-frame buddy path files the block — and any
+/// split-off buddies — into the matching migratetype partition so
+/// unmovable and movable contiguous regions don't fragment each other.
+pub fn alloc_pages_on_ctx(
+    node: usize,
+    order: u8,
+    ctx: AllocContext,
+) -> Result<PhysFrame, FrameAllocError> {
     if order > MAX_ORDER {
         return Err(FrameAllocError::Exhausted);
     }
@@ -1299,7 +1328,7 @@ pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocErr
     if !crate::cgroup_charge::try_charge(charge_bytes) {
         return Err(FrameAllocError::Exhausted);
     }
-    let r = alloc_pages_on_inner(node, order);
+    let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
     #[cfg(feature = "cgroup")]
     if r.is_err() {
         crate::cgroup_charge::uncharge(charge_bytes);
@@ -1307,7 +1336,11 @@ pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocErr
     r
 }
 
-fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocError> {
+fn alloc_pages_on_inner(
+    node: usize,
+    order: u8,
+    mt: buddy::MigrateType,
+) -> Result<PhysFrame, FrameAllocError> {
     if !ALLOC.initialised.load(Ordering::Acquire) {
         return Err(FrameAllocError::Uninitialised);
     }
@@ -1335,9 +1368,9 @@ fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocE
     let ceil = buddy::early_ceiling_frame();
     let try_alloc = |z: &mut BuddyZone| -> Option<u64> {
         if ceil == u64::MAX {
-            z.alloc(order)
+            z.alloc_mt(order, mt)
         } else {
-            z.alloc_below(order, ceil)
+            z.alloc_below_mt(order, ceil, mt)
         }
     };
     let first_try = {
@@ -1371,9 +1404,20 @@ fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocE
     Err(FrameAllocError::Exhausted)
 }
 
-/// Free a contiguous block of `1 << order` frames previously
-/// returned from `alloc_pages_on`.
+/// Free a contiguous block of `1 << order` frames previously returned
+/// from `alloc_pages_on` (the kernel/UNMOVABLE default).
 pub fn free_pages(frame: PhysFrame, order: u8) {
+    free_pages_ctx(frame, order, AllocContext::Kernel);
+}
+
+/// Free a contiguous block classified by `ctx`, so the block returns to
+/// the migratetype partition it was allocated from. A block allocated via
+/// [`alloc_pages_on_ctx`] MUST be freed with the matching `ctx`: NARF has
+/// no per-frame migratetype record (no pageblock bitmap yet), so the
+/// caller supplies the mobility, and a mismatch would misfile the block
+/// into the wrong partition (harmless for correctness — the free lists
+/// only group, they don't gate reuse — but it would blur the grouping).
+pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
     if order > MAX_ORDER {
         return;
     }
@@ -1401,7 +1445,10 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
     if order == 0 && free_order0_to_cache(zone_idx, frame_no) {
         return;
     }
-    ZONES[zone_idx].0.lock().free(frame_no, order);
+    ZONES[zone_idx]
+        .0
+        .lock()
+        .free_mt(frame_no, order, ctx.migrate_type());
 }
 
 /// Return a previously-allocated frame to the pool. Dispatches

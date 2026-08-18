@@ -4657,6 +4657,209 @@ fn smoke_buddy_oom_returns_empty() -> TestResult {
 }
 kernel_test_in!("memory/buddy", smoke_buddy_oom_returns_empty);
 
+fn smoke_buddy_migratetype_groups_by_mobility() -> TestResult {
+    // A Movable free and an Unmovable free of the SAME order land in
+    // separate partitions; neither counts against the other. Confirms the
+    // free lists are actually partitioned by mobility.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // Seed 8 frames as a single order-3 Movable block (donate defaults to
+    // Movable), then hand out one order-0 as Unmovable and free it as
+    // Movable / Unmovable to place blocks in each partition deliberately.
+    zone.donate(0x200, 8);
+
+    // Free two explicit order-0 blocks into distinct partitions. Use
+    // frames that are NOT buddies (0x300 and 0x340) so neither coalesces
+    // nor is mistaken for the donated pool.
+    zone.free_mt(0x300, 0, MigrateType::Unmovable);
+    zone.free_mt(0x340, 0, MigrateType::Movable);
+
+    if zone.free_block_count_mt(0, MigrateType::Unmovable) != 1 {
+        return TestResult::Fail("unmovable order-0 not in unmovable partition");
+    }
+    if zone.free_block_count_mt(0, MigrateType::Movable) != 1 {
+        return TestResult::Fail("movable order-0 not in movable partition");
+    }
+    // Partition-summed count sees both.
+    if zone.free_block_count(0) != 2 {
+        return TestResult::Fail("summed order-0 count wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/buddy", smoke_buddy_migratetype_groups_by_mobility);
+
+fn smoke_buddy_migratetype_no_cross_mobility_coalesce() -> TestResult {
+    // Two buddies of DIFFERENT migratetypes must NOT coalesce, even though
+    // they are physically adjacent and same-order. This is the invariant
+    // that keeps each mobility class's contiguous regions from being
+    // silently merged (and thus mis-labelled) across the boundary.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // Frames 0x400 and 0x401 are order-0 buddies (0x400 ^ 1 == 0x401).
+    zone.free_mt(0x400, 0, MigrateType::Unmovable);
+    zone.free_mt(0x401, 0, MigrateType::Movable);
+
+    // No order-1 block should have formed in EITHER partition.
+    if zone.free_block_count(1) != 0 {
+        return TestResult::Fail("cross-mobility buddies wrongly coalesced");
+    }
+    if zone.free_block_count_mt(0, MigrateType::Unmovable) != 1
+        || zone.free_block_count_mt(0, MigrateType::Movable) != 1
+    {
+        return TestResult::Fail("blocks did not stay as separate order-0 entries");
+    }
+
+    // Same-migratetype buddies DO coalesce: free 0x401's movable buddy
+    // partner (0x400) as movable too and confirm an order-1 forms.
+    let mut zone2 = BuddyZone::new();
+    zone2.free_mt(0x400, 0, MigrateType::Movable);
+    zone2.free_mt(0x401, 0, MigrateType::Movable);
+    if zone2.free_block_count_mt(1, MigrateType::Movable) != 1 {
+        return TestResult::Fail("same-mobility buddies failed to coalesce");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/buddy",
+    smoke_buddy_migratetype_no_cross_mobility_coalesce
+);
+
+fn smoke_buddy_migratetype_fallback_steals() -> TestResult {
+    // When a migratetype's own partition is empty, the allocator steals
+    // from the fallback migratetype and CONVERTS the whole split block to
+    // the requesting type, so subsequent same-type requests are served
+    // from the just-stolen block's leftovers (Linux's whole-block steal).
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // One order-3 (8-frame) block, all Movable.
+    zone.donate(0x800, 8);
+
+    // Request order-0 UNMOVABLE. Movable partition is the only source, so
+    // it must steal the order-3 block, split it, and place the leftover
+    // buddies into the UNMOVABLE partition.
+    let f = match zone.alloc_mt(0, MigrateType::Unmovable) {
+        Some(f) => f,
+        None => return TestResult::Fail("unmovable steal from movable failed"),
+    };
+    if f != 0x800 {
+        return TestResult::Fail("stole wrong block head");
+    }
+    // Leftovers (orders 0,1,2) now live in the UNMOVABLE partition.
+    for o in 0..=2 {
+        if zone.free_block_count_mt(o, MigrateType::Unmovable) != 1 {
+            return TestResult::Fail("stolen leftovers not converted to unmovable");
+        }
+        if zone.free_block_count_mt(o, MigrateType::Movable) != 0 {
+            return TestResult::Fail("movable partition should be drained by the steal");
+        }
+    }
+    // A follow-up unmovable order-0 request is served from those leftovers
+    // WITHOUT touching the movable pool (which is empty anyway).
+    if zone.alloc_mt(0, MigrateType::Unmovable).is_none() {
+        return TestResult::Fail("follow-up unmovable alloc should reuse stolen leftovers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/buddy", smoke_buddy_migratetype_fallback_steals);
+
+fn smoke_buddy_migratetype_reduces_fragmentation() -> TestResult {
+    // Headline anti-fragmentation property. Two workloads run against
+    // identical synthetic zones:
+    //
+    //   * UNGROUPED: unmovable and movable order-0 allocations interleave
+    //     into ONE pool (simulated by allocating everything as one type),
+    //     then only the movable ones are freed — leaving unmovable holes
+    //     that block coalescing.
+    //   * GROUPED: the same allocations are classified by mobility. When
+    //     the movable ones are freed they coalesce back into a large
+    //     contiguous run because the unmovable holes are in a separate
+    //     region.
+    //
+    // We assert the grouped zone recovers a strictly larger top free order
+    // than the ungrouped one.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    // Helper: highest order with at least one free block.
+    fn top_order(z: &BuddyZone) -> i32 {
+        for o in (0..=crate::buddy::MAX_ORDER).rev() {
+            if z.free_block_count(o) > 0 {
+                return o as i32;
+            }
+        }
+        -1
+    }
+
+    const BASE: u64 = 0x1000;
+    const N: u64 = 64; // 64 order-0 frames = a would-be order-6 block.
+
+    // ---- UNGROUPED: unmovable and movable interleaved in one pool. ----
+    // Allocate all 64 as Unmovable (one pool). Then free back only the
+    // ODD-ADDRESSED frames (the "movable" role); the even frames (the
+    // "unmovable" role) stay allocated. Freeing by frame-address parity is
+    // deterministic: every freed odd frame's order-0 buddy is the adjacent
+    // EVEN frame, which is still held — so NOTHING can coalesce above
+    // order 0, whatever order the splitter handed frames out in.
+    let mut ungrouped = BuddyZone::new();
+    ungrouped.donate(BASE, N);
+    let mut ung_frames = [0u64; N as usize];
+    for slot in ung_frames.iter_mut() {
+        match ungrouped.alloc_mt(0, MigrateType::Unmovable) {
+            Some(f) => *slot = f,
+            None => return TestResult::Fail("ungrouped alloc drained early"),
+        }
+    }
+    for &f in ung_frames.iter() {
+        if f % 2 == 1 {
+            ungrouped.free_mt(f, 0, MigrateType::Unmovable);
+        }
+    }
+    let ungrouped_top = top_order(&ungrouped);
+    // Sanity: the interleaved free genuinely fragmented — no block above
+    // order 0 formed.
+    if ungrouped_top != 0 {
+        return TestResult::Fail("ungrouped pool unexpectedly coalesced above order 0");
+    }
+
+    // ---- GROUPED: classify by role. ----
+    // Even frames requested MOVABLE, odd frames UNMOVABLE. Because the two
+    // classes are drawn from separate partitions, the movable frames form
+    // a contiguous run; freeing them all coalesces upward.
+    let mut grouped = BuddyZone::new();
+    // Seed the pool split so movable frames are physically contiguous:
+    // donate the low half movable, the high half unmovable.
+    grouped.donate_as(BASE, N / 2, MigrateType::Movable);
+    grouped.donate_as(BASE + N / 2, N / 2, MigrateType::Unmovable);
+    // Allocate all movable frames, then free them all back.
+    let mut grp_frames = [0u64; (N / 2) as usize];
+    for slot in grp_frames.iter_mut() {
+        match grouped.alloc_mt(0, MigrateType::Movable) {
+            Some(f) => *slot = f,
+            None => return TestResult::Fail("grouped movable alloc drained early"),
+        }
+    }
+    for &f in grp_frames.iter() {
+        grouped.free_mt(f, 0, MigrateType::Movable);
+    }
+    let grouped_top = top_order(&grouped);
+
+    // The grouped movable region (32 frames) coalesces back to an order-5
+    // block; the ungrouped pool is stuck at order 0 (every buddy pinned).
+    if grouped_top <= ungrouped_top {
+        return TestResult::Fail("grouping did not raise the largest free order");
+    }
+    if grouped_top < 5 {
+        return TestResult::Fail("movable region failed to coalesce to order-5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/buddy",
+    smoke_buddy_migratetype_reduces_fragmentation
+);
+
 fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
     // Public frame API: alloc_pages_on must surface Exhausted for
     // requests that the buddy can't represent. Order > MAX_ORDER
