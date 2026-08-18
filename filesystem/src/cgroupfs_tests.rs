@@ -1402,6 +1402,11 @@ fn smoke_cgroup_memory_high_triggers_reclaim() -> TestResult {
         if !events.contains("high 1") {
             return fail("memory.events high counter not bumped", pid);
         }
+        // Undo the chain-wide charge so the shared root MemoryState is left as
+        // we found it — `high` committed on this cgroup AND its root ancestor,
+        // and rmdir of the child does not uncharge the root. Leaking it here
+        // pollutes later tests that read the root's memory.current.
+        let _ = memory::charge_hook_for_test(pid, -OVER_HIGH);
         task_exited(pid);
         TestResult::Pass
     });
@@ -1584,6 +1589,10 @@ fn smoke_cgroup_memory_max_reclaim_relieves() -> TestResult {
             return TestResult::Fail("attach pid failed");
         }
         let clear = |pid: u64| {
+            // Undo the chain-wide 4096 commit so the shared root MemoryState is
+            // left clean for later tests (rmdir of the child never uncharges
+            // the root ancestor).
+            let _ = memory::charge_hook_for_test(pid, -4096);
             *RELIEF_STATE.lock() = None;
             task_exited(pid);
         };
@@ -1775,36 +1784,42 @@ fn smoke_cgroup_with_chain_states_walk() -> TestResult {
     // The chain carries state at leaf, mid, and root. Root limit files remain
     // hidden by their Linux CFTYPE_NOT_ON_ROOT placement, but the root state is
     // still the hierarchy-wide accounting endpoint. Order is bottom-up.
+    // Snapshot each level's baseline. The root MemoryState is shared across the
+    // whole suite and may already carry charge from other tests, so this asserts
+    // the per-level DELTA of a chain-wide charge, not an absolute value — that is
+    // exactly what hierarchical propagation means and it is robust to any
+    // residual root usage the ordering happens to leave.
+    let parse_current = |s: alloc::string::String| s.trim().parse::<u64>().unwrap_or(u64::MAX);
     let mut visited = 0usize;
-    let mut currents = alloc::vec::Vec::new();
+    let mut before = alloc::vec::Vec::new();
     with_chain_states(pid, "memory", |s: &Arc<dyn ControllerState>| {
         visited += 1;
-        currents.push(s.read("memory.current"));
+        before.push(parse_current(s.read("memory.current")));
     });
     if visited != 3 {
         teardown(pid);
         return TestResult::Fail("with_chain_states did not visit leaf+mid+root exactly");
     }
 
-    // Charge the leaf's chain: all three levels must move (chain-wide charge).
+    // Charge the leaf's chain: all three levels must move by 4096 (chain-wide).
     if !memory::charge_hook_for_test(pid, 4096) {
         teardown(pid);
         return TestResult::Fail("chain charge denied");
     }
-    let leaf_cur = read_current(&leaf);
-    let mid_cur = read_current(&mid);
-    let mut charged_chain = alloc::vec::Vec::new();
+    let mut after = alloc::vec::Vec::new();
     with_chain_states(pid, "memory", |s: &Arc<dyn ControllerState>| {
-        charged_chain.push(s.read("memory.current"));
+        after.push(parse_current(s.read("memory.current")));
     });
     let _ = memory::charge_hook_for_test(pid, -4096);
     teardown(pid);
-    if leaf_cur != 4096
-        || mid_cur != 4096
-        || charged_chain.len() != 3
-        || charged_chain.iter().any(|current| current != "4096\n")
+    if before.len() != 3
+        || after.len() != 3
+        || after
+            .iter()
+            .zip(before.iter())
+            .any(|(a, b)| a.wrapping_sub(*b) != 4096)
     {
-        return TestResult::Fail("chain walk did not charge leaf, mid, and root");
+        return TestResult::Fail("chain walk did not charge leaf, mid, and root by 4096");
     }
     TestResult::Pass
 }
