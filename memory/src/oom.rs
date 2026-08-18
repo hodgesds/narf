@@ -100,6 +100,14 @@ pub fn is_armed() -> bool {
     OOM_KILLER.lock().is_some()
 }
 
+/// Test-only: clear the installed OOM policy so a test's mock killer never
+/// leaks into another test or the live kernel. Mirrors
+/// [`reclaim::__reset_anon_reclaimer_for_test`](crate::reclaim::__reset_anon_reclaimer_for_test).
+#[doc(hidden)]
+pub fn __reset_oom_killer_for_test() {
+    *OOM_KILLER.lock() = None;
+}
+
 /// Ask the installed policy to kill one victim and queue it for the reaper.
 /// Returns the killed process's pid (for the caller to log a Linux-style
 /// "Out of memory: Killed process N" line), or `None` if nothing was

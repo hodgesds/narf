@@ -1327,6 +1327,391 @@ fn smoke_cgroup_memory_max_two_phase() -> TestResult {
 #[cfg(feature = "cgroup-memory")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_memory_max_two_phase);
 
+// ── memory.high drives a best-effort reclaim throttle ───────────────
+//
+// A positive charge that pushes a level over `memory.high` must invoke
+// direct reclaim (`narf_memory::reclaim::try_to_free`) sized to the
+// over-`high` deficit, but — because `high` is a throttle, not a wall —
+// still commit the charge and bump the `high` event counter. We observe
+// the reclaim *attempt* by registering a mock shrinker whose `scan`
+// records that it was consulted; the shrinker frees nothing, so usage is
+// unchanged by reclaim and the charge commits regardless.
+#[cfg(feature = "cgroup-memory")]
+static HIGH_RECLAIM_SCANS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "cgroup-memory")]
+fn high_reclaim_count() -> usize {
+    // Report 1 so proportional-pressure `shrink_all` always scans us.
+    1
+}
+
+#[cfg(feature = "cgroup-memory")]
+fn high_reclaim_scan(_nr: usize) -> usize {
+    HIGH_RECLAIM_SCANS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    0 // frees nothing; the point is that reclaim was attempted
+}
+
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_high_triggers_reclaim() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+
+    // Arm the mock shrinker so `try_to_free` -> `shrink_all` consults it.
+    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+        name: "cgroup-high-test",
+        count: high_reclaim_count,
+        scan: high_reclaim_scan,
+    });
+    HIGH_RECLAIM_SCANS.store(0, Ordering::Relaxed);
+
+    let out = with_root_controller("memory", "t_mem_high", |cg| {
+        let pid: u64 = 4_200_000_010;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let fail = |msg: &'static str, pid: u64| -> TestResult {
+            task_exited(pid);
+            TestResult::Fail(msg)
+        };
+        // high=4096, max unset. A charge that crosses high must reclaim.
+        if write_attr(cg, "memory.high", b"4096").is_err() {
+            return fail("set memory.high failed", pid);
+        }
+        // Charge far past high so the reclaim target (deficit pages) is
+        // larger than any real shrinker can satisfy — that guarantees
+        // `shrink_all`'s loop reaches our mock instead of stopping early
+        // once a live cache frees enough. `high` is a throttle, so the
+        // over-high charge still commits.
+        const OVER_HIGH: i64 = 256 * 1024 * 1024;
+        if !memory::charge_hook_for_test(pid, OVER_HIGH) {
+            return fail("over-high charge was denied (high must not be a wall)", pid);
+        }
+        if HIGH_RECLAIM_SCANS.load(Ordering::Relaxed) == 0 {
+            return fail(
+                "crossing memory.high did not trigger a reclaim attempt",
+                pid,
+            );
+        }
+        if read_current(cg) != OVER_HIGH as u64 {
+            return fail("over-high charge did not commit usage", pid);
+        }
+        let events = read_attr(cg, "memory.events").unwrap_or_default();
+        if !events.contains("high 1") {
+            return fail("memory.events high counter not bumped", pid);
+        }
+        task_exited(pid);
+        TestResult::Pass
+    });
+
+    // Never leak the mock shrinker into the live kernel or other tests.
+    narf_memory::reclaim::__reset_shrinkers_for_test();
+    out
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_high_triggers_reclaim
+);
+
+// ── memory.max: reclaim, then OOM, then deny ────────────────────────
+//
+// A charge over `memory.max` must (1) attempt direct reclaim, and (2) if
+// still over, consult the OOM policy before denying. We register a mock
+// shrinker that frees nothing and a mock OOM killer that records it was
+// consulted and returns `None` (nothing eligible). The charge must be
+// denied (ENOMEM), the reclaim + OOM paths must both have run, and the
+// breaching level's `max` + `oom` event counters must be bumped. Because
+// no task was actually killed (`None`), `oom_kill` stays 0.
+#[cfg(feature = "cgroup-memory")]
+static MAX_RECLAIM_SCANS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "cgroup-memory")]
+static MAX_OOM_CONSULTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "cgroup-memory")]
+fn max_reclaim_count() -> usize {
+    1
+}
+#[cfg(feature = "cgroup-memory")]
+fn max_reclaim_scan(_nr: usize) -> usize {
+    MAX_RECLAIM_SCANS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    0
+}
+
+#[cfg(feature = "cgroup-memory")]
+struct NoVictimOomKiller;
+#[cfg(feature = "cgroup-memory")]
+impl narf_memory::oom::OomKiller for NoVictimOomKiller {
+    fn select_victim(&self) -> Option<narf_memory::oom::OomVictim> {
+        MAX_OOM_CONSULTED.store(true, core::sync::atomic::Ordering::Relaxed);
+        None
+    }
+}
+#[cfg(feature = "cgroup-memory")]
+static NO_VICTIM_OOM_KILLER: NoVictimOomKiller = NoVictimOomKiller;
+
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_max_reclaim_then_oom() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+
+    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+        name: "cgroup-max-test",
+        count: max_reclaim_count,
+        scan: max_reclaim_scan,
+    });
+    narf_memory::oom::register_oom_killer(&NO_VICTIM_OOM_KILLER);
+    MAX_RECLAIM_SCANS.store(0, Ordering::Relaxed);
+    MAX_OOM_CONSULTED.store(false, Ordering::Relaxed);
+
+    let out = with_root_controller("memory", "t_mem_max_oom", |cg| {
+        let pid: u64 = 4_200_000_011;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let fail = |msg: &'static str, pid: u64| -> TestResult {
+            task_exited(pid);
+            TestResult::Fail(msg)
+        };
+        if write_attr(cg, "memory.max", b"4096").is_err() {
+            return fail("set memory.max failed", pid);
+        }
+        // Charge far past max so the reclaim target exceeds what any real
+        // shrinker can satisfy, guaranteeing `shrink_all` reaches our mock.
+        // Reclaim frees nothing here -> OOM (no victim) -> deny.
+        const OVER_MAX: i64 = 256 * 1024 * 1024;
+        if memory::charge_hook_for_test(pid, OVER_MAX) {
+            return fail(
+                "over-max charge was allowed despite failed reclaim/OOM",
+                pid,
+            );
+        }
+        if MAX_RECLAIM_SCANS.load(Ordering::Relaxed) == 0 {
+            return fail("over-max charge did not attempt reclaim", pid);
+        }
+        if !MAX_OOM_CONSULTED.load(Ordering::Relaxed) {
+            return fail("over-max charge did not consult the OOM policy", pid);
+        }
+        if read_current(cg) != 0 {
+            return fail("denied charge mutated current (not two-phase)", pid);
+        }
+        let events = read_attr(cg, "memory.events").unwrap_or_default();
+        if !events.contains("max 1") || !events.contains("oom 1") {
+            return fail("memory.events max/oom counters not bumped on denial", pid);
+        }
+        // No task was actually killed (select_victim -> None), so no oom_kill.
+        if !events.contains("oom_kill 0") {
+            return fail("oom_kill bumped without an actual kill", pid);
+        }
+        task_exited(pid);
+        TestResult::Pass
+    });
+
+    narf_memory::reclaim::__reset_shrinkers_for_test();
+    narf_memory::oom::__reset_oom_killer_for_test();
+    out
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_max_reclaim_then_oom
+);
+
+// ── memory.max: reclaim relieves the breach, charge then commits ────
+//
+// When direct reclaim frees enough that the level is back at/under
+// `memory.max`, the charge must proceed without invoking OOM or denying.
+// A mock shrinker whose `scan` uncharges the breaching cgroup simulates
+// reclaim actually freeing this cgroup's pages; after it runs, the
+// re-check passes and the charge commits.
+//
+// This isolated test does not populate the filesystem page cache, so the
+// only live `count() > 0` shrinker `shrink_all` iterates is this mock —
+// the page-cache shrinker reports 0 reclaimable pages and is skipped, so
+// the mock is always reached regardless of registration order.
+#[cfg(feature = "cgroup-memory")]
+static RELIEF_STATE: narf_lib::sync::IrqSafeSpinLock<
+    Option<Arc<dyn crate::cgroupfs::ControllerState>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Bytes the relief mock shrinker uncharges from the parked cgroup on
+/// scan. Sized larger than any real shrinker can free so `shrink_all`'s
+/// loop is never satisfied before it reaches this mock.
+#[cfg(feature = "cgroup-memory")]
+const RELIEF_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(feature = "cgroup-memory")]
+fn relief_reclaim_count() -> usize {
+    (RELIEF_BYTES / narf_memory::PAGE_SIZE) as usize
+}
+#[cfg(feature = "cgroup-memory")]
+fn relief_reclaim_scan(_nr: usize) -> usize {
+    // Uncharge the parked cgroup's committed bytes so the max re-check
+    // passes, simulating reclaim freeing this cgroup's resident pages.
+    if let Some(state) = RELIEF_STATE.lock().clone() {
+        if let Some(m) = state
+            .as_any()
+            .downcast_ref::<crate::cgroupfs::memory::MemoryState>()
+        {
+            m.charge(-(RELIEF_BYTES as i64));
+            return (RELIEF_BYTES / narf_memory::PAGE_SIZE) as usize;
+        }
+    }
+    0
+}
+
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_max_reclaim_relieves() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    use crate::cgroupfs::{memory, with_chain_states};
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+
+    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+        name: "cgroup-relief-test",
+        count: relief_reclaim_count,
+        scan: relief_reclaim_scan,
+    });
+
+    let out = with_root_controller("memory", "t_mem_relief", |cg| {
+        let pid: u64 = 4_200_000_012;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let clear = |pid: u64| {
+            *RELIEF_STATE.lock() = None;
+            task_exited(pid);
+        };
+        let fail = |msg: &'static str, pid: u64| -> TestResult {
+            *RELIEF_STATE.lock() = None;
+            task_exited(pid);
+            TestResult::Fail(msg)
+        };
+        // Park this cgroup's MemoryState so the mock shrinker can uncharge it.
+        with_chain_states(pid, "memory", |s| {
+            *RELIEF_STATE.lock() = Some(s.clone());
+        });
+        if RELIEF_STATE.lock().is_none() {
+            return fail("could not resolve memory state for pid", pid);
+        }
+        // max == RELIEF_BYTES. Prime usage to exactly max so the next
+        // charge breaches it and reclaim (uncharging RELIEF_BYTES) is what
+        // makes room.
+        let max_str = alloc::format!("{RELIEF_BYTES}");
+        if write_attr(cg, "memory.max", max_str.as_bytes()).is_err() {
+            return fail("set memory.max failed", pid);
+        }
+        // Prime usage to == max directly on the state, no reclaim yet.
+        if let Some(s) = RELIEF_STATE.lock().clone() {
+            if let Some(m) = s.as_any().downcast_ref::<memory::MemoryState>() {
+                if !m.charge(RELIEF_BYTES as i64) {
+                    return fail("priming charge to max was denied", pid);
+                }
+            }
+        }
+        // Now charge 4096 more: would exceed max -> reclaim uncharges
+        // RELIEF_BYTES -> re-check passes -> the 4096 charge commits.
+        if !memory::charge_hook_for_test(pid, 4096) {
+            return fail(
+                "charge was denied even though reclaim relieved the breach",
+                pid,
+            );
+        }
+        if read_current(cg) != 4096 {
+            return fail("post-reclaim current is not the expected 4096", pid);
+        }
+        // The OOM path must NOT have been taken: oom_kill stays 0.
+        let events = read_attr(cg, "memory.events").unwrap_or_default();
+        if !events.contains("oom_kill 0") {
+            return fail("oom_kill bumped though reclaim relieved the breach", pid);
+        }
+        clear(pid);
+        let _ = Ordering::Relaxed;
+        TestResult::Pass
+    });
+
+    narf_memory::reclaim::__reset_shrinkers_for_test();
+    *RELIEF_STATE.lock() = None;
+    out
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_max_reclaim_relieves
+);
+
+// ── memory.max / memory.high write→read roundtrip drives live limits ─
+//
+// Writing a limit must both round-trip through the file (read-back) AND
+// change live enforcement: raising `memory.max` lets a previously-denied
+// charge succeed, and setting `memory.high` makes an over-`high` charge
+// trigger reclaim. This proves the write handlers wire straight into the
+// `can_charge` / `over_high_by` paths, not just a display field.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_limit_write_drives_enforcement() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+
+    with_root_controller("memory", "t_mem_livelimit", |cg| {
+        let pid: u64 = 4_200_000_013;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let fail = |msg: &'static str, pid: u64| -> TestResult {
+            task_exited(pid);
+            TestResult::Fail(msg)
+        };
+
+        // max=4096: a 8192 charge is denied.
+        if write_attr(cg, "memory.max", b"4096").is_err() {
+            return fail("set memory.max=4096 failed", pid);
+        }
+        if read_attr(cg, "memory.max").unwrap_or_default().trim() != "4096" {
+            return fail("memory.max read-back != 4096", pid);
+        }
+        if memory::charge_hook_for_test(pid, 8192) {
+            return fail("charge over the live memory.max was allowed", pid);
+        }
+
+        // Raise the live limit to max: the same charge now commits.
+        if write_attr(cg, "memory.max", b"max").is_err() {
+            return fail("set memory.max=max failed", pid);
+        }
+        if read_attr(cg, "memory.max").unwrap_or_default().trim() != "max" {
+            return fail("memory.max read-back != max", pid);
+        }
+        if !memory::charge_hook_for_test(pid, 8192) {
+            return fail("charge denied after raising memory.max to unlimited", pid);
+        }
+        if read_current(cg) != 8192 {
+            return fail("charge after raising max did not commit", pid);
+        }
+
+        // high write round-trips and reads back the stored limit.
+        if write_attr(cg, "memory.high", b"16384").is_err() {
+            return fail("set memory.high failed", pid);
+        }
+        if read_attr(cg, "memory.high").unwrap_or_default().trim() != "16384" {
+            return fail("memory.high read-back != 16384", pid);
+        }
+
+        // Cleanup: drop the committed usage.
+        let _ = memory::charge_hook_for_test(pid, -8192);
+        task_exited(pid);
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_limit_write_drives_enforcement
+);
+
 // ── with_chain_states walks the cgroup + every ancestor ─────────────
 //
 // Enable memory on the root AND on a mid-level cgroup, so a leaf pid's
