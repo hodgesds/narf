@@ -673,6 +673,16 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 /// - Other finite parks (plain `sleep`/`nanosleep`) fire at their real deadline.
 pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
     const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
+    // NOTE (task #32): the per-fd Readiness migration makes this backstop
+    // REDUNDANT as a lost-wake net — every readiness source now fires a targeted
+    // wake. But a boot with it removed (park returns the real deadline) strands
+    // the scheduler: cpu 0 accrues ready tasks with pops=0 while every other CPU
+    // stays idle-halted and resched_ipi_sent=0 (STALL-WD panic, trap.rs:442).
+    // This 10 ms timer is ALSO a scheduler heartbeat that kicks halted CPUs to
+    // run already-ready tasks; a targeted wake does not reliably resched a
+    // halted CPU on its own. Deleting the backstop therefore needs the
+    // wake->resched-IPI path fixed first (a separate scheduler change), not just
+    // the fd migration. Kept until then.
     if deadline_ns == u64::MAX {
         now_ns.saturating_add(FALLBACK_NS)
     } else if net_io_wait {
