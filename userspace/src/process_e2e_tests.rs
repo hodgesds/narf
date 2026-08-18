@@ -295,18 +295,27 @@ fn smoke_process_vdso_region_perms_are_cow_writable() -> TestResult {
     use narf_memory::RegionPerms;
     let p = crate::vdso::VDSO_CODE_PERMS;
     if !p.contains(RegionPerms::WRITE) {
-        return TestResult::Fail("vDSO perms lost WRITE — cow_split declines ld.so's write, #PF at boot");
+        return TestResult::Fail(
+            "vDSO perms lost WRITE — cow_split declines ld.so's write, #PF at boot",
+        );
     }
     if !p.contains(RegionPerms::COW) {
-        return TestResult::Fail("vDSO perms lost COW — cow_split declines ld.so's write, #PF at boot");
+        return TestResult::Fail(
+            "vDSO perms lost COW — cow_split declines ld.so's write, #PF at boot",
+        );
     }
     if !p.contains(RegionPerms::READ) || !p.contains(RegionPerms::EXEC) {
-        return TestResult::Fail("vDSO perms must stay READ|EXEC (it is executed read-only until patched)");
+        return TestResult::Fail(
+            "vDSO perms must stay READ|EXEC (it is executed read-only until patched)",
+        );
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace/process", smoke_process_vdso_region_perms_are_cow_writable);
+kernel_test_in!(
+    "userspace/process",
+    smoke_process_vdso_region_perms_are_cow_writable
+);
 
 // ── Smoke 2: fork return values — parent sees child PID, not zero ─────
 //
@@ -3374,14 +3383,18 @@ fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
         let _ = crate::task::release_task(TID);
         crate::pidfd::__test_reset();
-        return TestResult::Fail("pidfd for a ZOMBIE task must be readable via the authoritative fallback");
+        return TestResult::Fail(
+            "pidfd for a ZOMBIE task must be readable via the authoritative fallback",
+        );
     }
 
     // Reaped (gone from the registry): still POLLIN.
     let _ = crate::task::release_task(TID);
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
         crate::pidfd::__test_reset();
-        return TestResult::Fail("pidfd for a REAPED (gone) task must be readable via the fallback");
+        return TestResult::Fail(
+            "pidfd for a REAPED (gone) task must be readable via the fallback",
+        );
     }
 
     crate::pidfd::__test_reset();

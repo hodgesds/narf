@@ -2211,10 +2211,7 @@ fn smoke_epoll_epollet_write_retriggers_readable() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-kernel_test_in!(
-    "userspace",
-    smoke_epoll_epollet_write_retriggers_readable
-);
+kernel_test_in!("userspace", smoke_epoll_epollet_write_retriggers_readable);
 
 /// A full stream is not writable; consuming one byte must publish exactly one
 /// EPOLLOUT edge for the full-to-space transition.

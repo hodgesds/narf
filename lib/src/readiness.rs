@@ -248,11 +248,23 @@ mod tests {
         assert_eq!(r.waiter_count(), 1);
         // The edge arrives AFTER we registered: the durable case.
         r.set(IN, 0);
-        assert_eq!(n.load(Ordering::SeqCst), 1, "set must wake the armed waiter");
-        assert_eq!(r.waiter_count(), 1, "set is drop-free: the woken waiter is kept");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "set must wake the armed waiter"
+        );
+        assert_eq!(
+            r.waiter_count(),
+            1,
+            "set is drop-free: the woken waiter is kept"
+        );
         // The level is now visible; re-arm returns Ready and clears the entry.
         assert_eq!(r.arm(1, IN, &w), Poll::Ready(IN));
-        assert_eq!(r.waiter_count(), 0, "re-arm on Ready clears the registration");
+        assert_eq!(
+            r.waiter_count(),
+            0,
+            "re-arm on Ready clears the registration"
+        );
     }
 
     #[test]
@@ -295,13 +307,21 @@ mod tests {
         // an idempotent runnable-bit store, harmless.
         r.set(0, IN); // clear (no wake, no bump)
         r.set(IN, 0); // rise again
-        assert_eq!(n.load(Ordering::SeqCst), 2, "kept waiter re-fires on next edge");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            2,
+            "kept waiter re-fires on next edge"
+        );
         // Only disarm (task context) removes it.
         r.disarm(1);
         assert_eq!(r.waiter_count(), 0);
         r.set(0, IN);
         r.set(IN, 0);
-        assert_eq!(n.load(Ordering::SeqCst), 2, "disarmed waiter never fires again");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            2,
+            "disarmed waiter never fires again"
+        );
     }
 
     #[test]

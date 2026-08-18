@@ -4083,10 +4083,7 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
         .map_region(Region {
             base: VirtAddr::new(VADDR),
             len: 4096,
-            perms: RegionPerms::READ
-                | RegionPerms::WRITE
-                | RegionPerms::EXEC
-                | RegionPerms::COW,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC | RegionPerms::COW,
             phys: alloc::vec![master],
         })
         .is_err()
@@ -4107,7 +4104,9 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
     // took a fatal #PF.
     // SAFETY: VADDR names the just-mapped present region.
     if unsafe { as_.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
-        return TestResult::Fail("cow_split_on_write rejected the vDSO write (the boot regression)");
+        return TestResult::Fail(
+            "cow_split_on_write rejected the vDSO write (the boot regression)",
+        );
     }
     // Mirror the production #PF flow: cow_split only repoints region.phys;
     // remap_page rewrites the live leaf.
@@ -4119,7 +4118,9 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
     let split = as_.lookup(VirtAddr::new(VADDR)).expect("post-split region");
     let private_phys = split.phys[0];
     if private_phys == master {
-        return TestResult::Fail("split must allocate a private frame, not write through the master");
+        return TestResult::Fail(
+            "split must allocate a private frame, not write through the master",
+        );
     }
     // The private copy carries the master's bytes (memcpy proof).
     // SAFETY: identity-mapped.
@@ -4149,7 +4150,10 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
     TestResult::Pass
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-kernel_test_in!("memory", smoke_memory_vdso_shaped_cow_region_splits_on_write);
+kernel_test_in!(
+    "memory",
+    smoke_memory_vdso_shaped_cow_region_splits_on_write
+);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
