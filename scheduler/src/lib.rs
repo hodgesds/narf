@@ -3446,6 +3446,24 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
     false
 }
 
+/// Arch-agnostic cooperative yield for contended in-kernel spin-waits whose
+/// lock holder may be a descheduled stackful task homed on THIS CPU (see
+/// [`stackful::cooperative_yield`]). Returns `true` if a yield happened,
+/// `false` when there is nothing to yield to (no stackful task, or an arch
+/// without the own-stack model) — the caller should then plain-spin.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn cooperative_yield() -> bool {
+    stackful::cooperative_yield()
+}
+
+/// Non-x86_64 stub: no own-stack cooperative scheduler, so the caller spins.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn cooperative_yield() -> bool {
+    false
+}
+
 /// Deadline-driven counterpart to `responsive_spin`. Polls
 /// `done()` until it returns true or the wall-clock `deadline`
 /// passes; same `sleep_pumps`-tick cadence in between. Use this
