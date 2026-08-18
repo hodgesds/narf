@@ -6828,6 +6828,264 @@ kernel_test_in!(
     smoke_memory_reap_anonymous_reclaims_and_is_idempotent
 );
 
+/// Build a fresh user AS with `pages` resident private-anonymous base pages
+/// mapped at `vbase`, wrapped in an `Arc` (as the reaper holds it). Returns
+/// `None` (skip) if `new_for_user`, frame allocation, or materialize fails.
+/// The caller must `core::mem::forget` the extracted AS (via `Arc::into_inner`)
+/// to keep the reap frame-accounting isolated from page-table teardown.
+#[cfg(target_arch = "x86_64")]
+fn build_reapable_as(vbase: u64, pages: usize) -> Option<alloc::sync::Arc<crate::AddressSpace>> {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = unsafe { AddressSpace::new_for_user() }.ok()?;
+    let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+    for _ in 0..pages {
+        match crate::alloc_frame() {
+            Ok(f) => phys_list.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return None;
+            }
+        }
+    }
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: (pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: phys_list,
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return None;
+    }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return None;
+    }
+    Some(alloc::sync::Arc::new(a))
+}
+
+/// Leak an `Arc<AddressSpace>`'s page tables the same way the sibling smoke does
+/// (via `core::mem::forget` on the inner AS), keeping reap frame-accounting
+/// isolated. Requires `arc` to be the sole owner.
+#[cfg(target_arch = "x86_64")]
+fn forget_sole_as(arc: alloc::sync::Arc<crate::AddressSpace>) {
+    if let Some(inner) = alloc::sync::Arc::into_inner(arc) {
+        core::mem::forget(inner);
+    }
+}
+
+/// A victim whose region lock is transiently held is REQUEUED (not dropped) by
+/// `reap_all`, then reaped once the lock is released — proving a transient
+/// `try_lock` failure never strands the victim's frames.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_requeues_locked_victim() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0C00_0000u64;
+    let pages = 4usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4242,
+        tid: 4242,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    // While the region lock is held, reap_all cannot make progress: the victim
+    // must be requeued (not dropped) and no frames freed.
+    let freed_while_locked = as_arc.with_regions_locked(oom::reap_all);
+    if freed_while_locked != 0 {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reaped while region lock held");
+    }
+    if test_support::queued_len() != 1 {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("locked victim was dropped, not requeued");
+    }
+    if !oom::reap_pending() {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reap_pending cleared with a victim still queued");
+    }
+
+    // Lock released: the next pass reaps the resident pages and empties queue.
+    let freed = oom::reap_all();
+    if freed != pages {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("requeued victim not reaped after lock released");
+    }
+    if test_support::queued_len() != 0 || oom::reap_pending() {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("queue not drained after successful reap");
+    }
+    forget_sole_as(as_arc);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_oom_reaper_requeues_locked_victim);
+
+/// A permanently-blocked victim is retried exactly `REAP_MAX_RETRIES` times and
+/// then abandoned (accounted, not silently leaked) — the bounded-retry contract.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_honors_retry_bound() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0D00_0000u64;
+    let pages = 2usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4343,
+        tid: 4343,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    let abandoned_before = test_support::abandoned_count();
+
+    // Hold the region lock across the whole retry sequence so every pass sees a
+    // try_lock failure. The victim enters with retries_left = MAX_RETRIES, so it
+    // survives MAX_RETRIES requeues and is abandoned on the pass after that.
+    let outcome = as_arc.with_regions_locked(|| {
+        // MAX_RETRIES passes: each decrements the budget and requeues.
+        for _ in 0..test_support::MAX_RETRIES {
+            let _ = oom::reap_all();
+            if test_support::queued_len() != 1 {
+                return Err("victim dropped before retry bound reached");
+            }
+        }
+        // One more pass with the budget exhausted: victim abandoned, queue empty.
+        let _ = oom::reap_all();
+        if test_support::queued_len() != 0 {
+            return Err("victim not abandoned after retry bound exhausted");
+        }
+        Ok(())
+    });
+
+    if let Err(msg) = outcome {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail(msg);
+    }
+    if test_support::abandoned_count() != abandoned_before + 1 {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("abandonment not accounted");
+    }
+    if oom::reap_pending() {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reap_pending set after abandonment with empty queue");
+    }
+    // The AS was never reaped (lock held throughout); its frames belong to the
+    // AS still. Drop the Arc so its own teardown frees them (no leak).
+    drop(as_arc);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_oom_reaper_honors_retry_bound);
+
+/// A `vm_shared` (formerly-multithreaded) victim is NOT reaped while another
+/// `Arc` clone exists (a live sibling thread), but IS reaped once that clone is
+/// dropped (last thread exited => reaper is sole owner) — the vm_shared
+/// soundness gate.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0E00_0000u64;
+    let pages = 3usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+    // Mark it multithreaded and simulate a still-live sibling thread by holding
+    // an extra Arc clone (a scheduler slot's clone in production).
+    as_arc.mark_vm_shared();
+    let sibling = as_arc.clone();
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4444,
+        tid: 4444,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    // Sibling still live (strong_count > 1): reap_all must defer, not reap.
+    let freed_live = oom::reap_all();
+    if freed_live != 0 {
+        test_support::drain_queue();
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reaped a vm_shared AS with a live sibling");
+    }
+    if test_support::queued_len() != 1 {
+        test_support::drain_queue();
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("vm_shared victim dropped instead of requeued");
+    }
+
+    // Last thread exits: drop the sibling clone, then our own local clone, so
+    // the only remaining Arc is the queued victim's — the reaper is now the sole
+    // owner (strong_count == 1) and may safely reap the formerly-vm_shared AS.
+    // We deliberately hold no clone during reap: reap_all consumes and drops the
+    // queued victim, whose Drop teardown (a safe no-op over the zeroed backing)
+    // reclaims the page tables. No post-reap AS access, so no use-after-free.
+    drop(sibling);
+    let before_reap = crate::frame::stats().free;
+    drop(as_arc);
+
+    let freed = oom::reap_all();
+    if freed != pages {
+        test_support::drain_queue();
+        return TestResult::Fail("vm_shared AS not reaped after sole ownership");
+    }
+    if test_support::queued_len() != 0 || oom::reap_pending() {
+        return TestResult::Fail("queue not drained after vm_shared reap");
+    }
+    // The reaped data frames returned to the pool.
+    if crate::frame::stats().free < before_reap + pages {
+        return TestResult::Fail("reaped vm_shared frames did not return to pool");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner
+);
+
 /// Frame-backed vmalloc: a 64 KiB `valloc` (the order-4 size that defeats a
 /// contiguous buddy block under fragmentation) must map a usable,
 /// virtually-contiguous region backed by scattered frames; `vfree` must FULLY
