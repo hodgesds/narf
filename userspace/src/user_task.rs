@@ -657,6 +657,65 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
 
+/// Default lost-wake backstop interval: ~1 tick @ 100 Hz.
+pub(crate) const DEFAULT_PARK_BACKSTOP_NS: u64 = 10_000_000;
+
+/// Sentinel meaning "not yet resolved from the kernel command line".
+const PARK_BACKSTOP_UNRESOLVED: u64 = u64::MAX;
+
+/// Cached backstop interval, resolved once (lazily) from `narf_boot::args()`.
+/// `PARK_BACKSTOP_UNRESOLVED` until the first park reads the cmdline.
+static PARK_BACKSTOP_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(PARK_BACKSTOP_UNRESOLVED);
+
+/// Resolve the park backstop interval (ns) from a kernel command line.
+///
+/// DIAGNOSTIC knob for task #32 (per-fd wake vs the 10 ms backstop). The
+/// backstop is a lost-wake safety net that also, today, doubles as a scheduler
+/// heartbeat kicking halted CPUs. To A/B-test the *pure* per-fd Readiness wake
+/// path without a rebuild, boot with the backstop disabled:
+///
+/// - `no_park_backstop`         → disabled (0)
+/// - `park_backstop=off` / `=0` → disabled (0)
+/// - `park_backstop_ns=N`       → explicit interval in ns (`0` also disables)
+/// - (absent)                   → [`DEFAULT_PARK_BACKSTOP_NS`] (safe default)
+///
+/// This is scaffolding, not a permanent config knob: the end state is the
+/// backstop deleted once the wake→resched-IPI path reliably reschedules a
+/// halted CPU on a targeted wake. Default keeps the backstop ON so nothing
+/// regresses.
+fn resolve_park_backstop_ns(args: &narf_boot::KernelCmdline) -> u64 {
+    if args.has_flag("no_park_backstop") {
+        return 0;
+    }
+    if let Some(v) = args.value("park_backstop") {
+        if v.eq_ignore_ascii_case("off") || v == "0" {
+            return 0;
+        }
+    }
+    if let Some(ns) = args.parse_value::<u64>("park_backstop_ns") {
+        return ns;
+    }
+    DEFAULT_PARK_BACKSTOP_NS
+}
+
+/// The active lost-wake backstop interval (ns), or `0` when disabled.
+///
+/// Resolved once from the live kernel cmdline and cached; racing first-readers
+/// converge on the same value (the resolve is a pure function of the cmdline).
+/// A `0` return means every backstop arm site below should skip arming and rely
+/// purely on the type-specific (per-fd Readiness / io-waiter / signal) wake.
+pub(crate) fn park_backstop_ns() -> u64 {
+    use core::sync::atomic::Ordering;
+    let cached = PARK_BACKSTOP_NS.load(Ordering::Relaxed);
+    if cached != PARK_BACKSTOP_UNRESOLVED {
+        return cached;
+    }
+    let resolved = resolve_park_backstop_ns(&narf_boot::args());
+    PARK_BACKSTOP_NS.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
 /// Absolute-ns time at which to fire the lost-wake fallback timer for a park
 /// with the given absolute `deadline_ns`.
 ///
@@ -671,22 +730,19 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 ///   working io-waker still short-circuits the common case; this only bounds the
 ///   worst case, matching what infinite parks already do.
 /// - Other finite parks (plain `sleep`/`nanosleep`) fire at their real deadline.
+///
+/// When the backstop is disabled ([`park_backstop_ns`] == 0, via the
+/// `no_park_backstop` diagnostic flag) every park returns its real deadline, so
+/// an infinite park gets no timer at all and relies purely on the per-fd wake.
 pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
-    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-    // NOTE (task #32): the per-fd Readiness migration makes this backstop
-    // REDUNDANT as a lost-wake net — every readiness source now fires a targeted
-    // wake. But a boot with it removed (park returns the real deadline) strands
-    // the scheduler: cpu 0 accrues ready tasks with pops=0 while every other CPU
-    // stays idle-halted and resched_ipi_sent=0 (STALL-WD panic, trap.rs:442).
-    // This 10 ms timer is ALSO a scheduler heartbeat that kicks halted CPUs to
-    // run already-ready tasks; a targeted wake does not reliably resched a
-    // halted CPU on its own. Deleting the backstop therefore needs the
-    // wake->resched-IPI path fixed first (a separate scheduler change), not just
-    // the fd migration. Kept until then.
+    let fallback = park_backstop_ns();
+    if fallback == 0 {
+        return deadline_ns;
+    }
     if deadline_ns == u64::MAX {
-        now_ns.saturating_add(FALLBACK_NS)
+        now_ns.saturating_add(fallback)
     } else if net_io_wait {
-        now_ns.saturating_add(FALLBACK_NS).min(deadline_ns)
+        now_ns.saturating_add(fallback).min(deadline_ns)
     } else {
         deadline_ns
     }
@@ -993,9 +1049,14 @@ fn park_should_block(
         // the next tick — a robust backstop for any lost type-specific wake.
         // Convert via `ns_to_cycles` (precise inverse of `cycles_to_ns`), NOT
         // `* cycles_per_ns()` — see the deadline-park note above.
+        // Disabled by the `no_park_backstop` diagnostic flag → rely on the
+        // byte-waker alone (see `park_backstop_ns`).
+        let backstop = park_backstop_ns();
+        if backstop == 0 {
+            return true;
+        }
         let now = narf_scheduler::narf_time::monotonic_ns();
-        const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-        let fire = narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
+        let fire = narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(backstop));
         // `refresh_waker_at` — keep the slot's deadline current across
         // repeated parks through one handle (see the deadline-park note).
         let refreshed = sleep_handle.is_some_and(|h| {
@@ -1987,9 +2048,15 @@ impl core::future::Future for UserTaskFuture {
                     // wheel slot is just a lost-wake / pending-signal safety
                     // net that bounds the worst case to ~one tick. sleep_pumps
                     // still run in the executor's own idle path every round.
-                    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
+                    // Disabled by the `no_park_backstop` diagnostic flag → no
+                    // lost-wake timer; rely purely on the io-waiter/futex/signal
+                    // wake (see `park_backstop_ns`).
+                    let backstop = park_backstop_ns();
+                    if backstop == 0 {
+                        return core::task::Poll::Pending;
+                    }
                     let fallback_cycles =
-                        narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
+                        narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(backstop));
                     // `refresh_waker_at` — keep the slot's fire time current
                     // across parks that reuse this handle (a stale earlier
                     // deadline would pin the backstop; see park_should_block).
@@ -3095,4 +3162,79 @@ pub fn spawn_user_process_resume(
     spec: narf_scheduler::TaskSpec,
 ) -> narf_scheduler::TaskId {
     prepare_user_process_resume(process, state, spec).spawn()
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod park_backstop_tests {
+    //! Unit coverage for the `park_backstop_ns` diagnostic boot flag
+    //! (task #32): resolving the lost-wake backstop interval from the kernel
+    //! command line. Pure function of a `KernelCmdline`, so no boot needed.
+    use super::{resolve_park_backstop_ns, DEFAULT_PARK_BACKSTOP_NS};
+    use narf_boot::KernelCmdline;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_backstop_default_when_absent() -> TestResult {
+        // A realistic boot cmdline with no backstop token keeps the 10 ms default.
+        let a = KernelCmdline::new("quiet root=PARTLABEL=NARF_ROOT systemd_pid1 nosmp");
+        if resolve_park_backstop_ns(&a) != DEFAULT_PARK_BACKSTOP_NS {
+            return TestResult::Fail("absent token must keep the default backstop");
+        }
+        // Empty cmdline → default too.
+        if resolve_park_backstop_ns(&KernelCmdline::new("")) != DEFAULT_PARK_BACKSTOP_NS {
+            return TestResult::Fail("empty cmdline must keep the default backstop");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("user_task/backstop", smoke_backstop_default_when_absent);
+
+    fn smoke_backstop_disabled_spellings() -> TestResult {
+        // Every documented "off" spelling resolves to 0 (backstop disabled).
+        for cl in [
+            "quiet no_park_backstop",
+            "park_backstop=off",
+            "park_backstop=OFF", // case-insensitive
+            "park_backstop=0",
+            "park_backstop_ns=0",
+        ] {
+            if resolve_park_backstop_ns(&KernelCmdline::new(cl)) != 0 {
+                return TestResult::Fail("disable spelling did not resolve to 0");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("user_task/backstop", smoke_backstop_disabled_spellings);
+
+    fn smoke_backstop_explicit_ns() -> TestResult {
+        // Explicit interval is honored verbatim.
+        if resolve_park_backstop_ns(&KernelCmdline::new("park_backstop_ns=2500000")) != 2_500_000 {
+            return TestResult::Fail("park_backstop_ns=N must set N ns");
+        }
+        // Unparseable value falls through to the safe default (never panics).
+        if resolve_park_backstop_ns(&KernelCmdline::new("park_backstop_ns=bogus"))
+            != DEFAULT_PARK_BACKSTOP_NS
+        {
+            return TestResult::Fail("unparseable ns must fall back to the default");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("user_task/backstop", smoke_backstop_explicit_ns);
+
+    fn smoke_backstop_off_precedence() -> TestResult {
+        // `no_park_backstop` disables even when an explicit ns is also present.
+        if resolve_park_backstop_ns(&KernelCmdline::new(
+            "park_backstop_ns=9999 no_park_backstop",
+        )) != 0
+        {
+            return TestResult::Fail("no_park_backstop must override park_backstop_ns");
+        }
+        // A non-disabling `park_backstop=on`-style value falls through (unknown
+        // value is not treated as off); explicit ns still wins when present.
+        if resolve_park_backstop_ns(&KernelCmdline::new("park_backstop=keep park_backstop_ns=7"))
+            != 7
+        {
+            return TestResult::Fail("non-off park_backstop value must not force a default");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("user_task/backstop", smoke_backstop_off_precedence);
 }
