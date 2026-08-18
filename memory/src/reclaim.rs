@@ -717,6 +717,125 @@ pub fn try_to_free(target: usize) -> usize {
     freed + shrink_all(target - freed)
 }
 
+// ── Pluggable anonymous-memory reclaim (swap) ──────────────────────
+//
+// `try_to_free` (frame LRU + shrinkers) reclaims in-kernel caches. Anonymous
+// USER pages can only be reclaimed by swapping them out, which requires
+// enumerating resident user address spaces and issuing swap I/O — knowledge
+// this crate lacks (it has no task/scheduler dependency). Mirroring the
+// `oom::OomKiller` seam, an upper layer implements `AnonReclaimer` and
+// registers it; kswapd calls `reclaim_anon_pages` under watermark pressure.
+//
+// Unlike `try_to_free`, this runs in kthread (kswapd) context and MAY
+// allocate (it builds candidate lists), so it must NEVER be called from the
+// allocation-failure path.
+
+/// Pluggable anonymous-memory reclaimer. Implemented by a layer that can
+/// enumerate resident user address spaces (the task/scheduler layer) and
+/// installed with [`register_anon_reclaimer`]. An out-of-tree crate can
+/// supply a different swap policy the same way. See
+/// [`AddressSpace::collect_anon_reclaim_candidates`](crate::address_space::AddressSpace::collect_anon_reclaim_candidates)
+/// and [`plan_reclaim_ranges`] for the pieces an implementation composes.
+pub trait AnonReclaimer: Send + Sync {
+    /// Swap out cold anonymous pages toward `target_pages`; return the number
+    /// of physical pages actually released. Runs in kswapd (kthread) context
+    /// and may allocate; must never be called from the allocation-failure path.
+    fn reclaim_anon(&self, target_pages: usize) -> usize;
+}
+
+static ANON_RECLAIMER: IrqSafeSpinLock<Option<&'static dyn AnonReclaimer>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install the anonymous-reclaim policy. Intended to be called once at boot;
+/// last registration wins.
+pub fn register_anon_reclaimer(reclaimer: &'static dyn AnonReclaimer) {
+    *ANON_RECLAIMER.lock() = Some(reclaimer);
+}
+
+/// True once an anon reclaimer is installed.
+pub fn anon_reclaimer_armed() -> bool {
+    ANON_RECLAIMER.lock().is_some()
+}
+
+/// Ask the installed policy to swap out up to `target_pages` cold anonymous
+/// pages; returns the number of physical pages released, or 0 if no policy is
+/// installed. kswapd calls this after `try_to_free` when still under the
+/// watermark. Safe to call in kthread context (may allocate).
+pub fn reclaim_anon_pages(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+    // `&'static dyn AnonReclaimer` is Copy, so drop the registry lock before
+    // calling into the (possibly allocating) policy.
+    let reclaimer = match *ANON_RECLAIMER.lock() {
+        Some(r) => r,
+        None => return 0,
+    };
+    reclaimer.reclaim_anon(target_pages)
+}
+
+/// Test-only: clear the installed anon reclaimer so a test's mock never leaks
+/// into another test or the live kernel.
+#[doc(hidden)]
+pub fn __reset_anon_reclaimer_for_test() {
+    *ANON_RECLAIMER.lock() = None;
+}
+
+/// `AnonReclaimer` seam tests. Always compiled so they register + run under
+/// `cargo xtask test`. A mock reclaimer verifies target forwarding, the
+/// released-page return, and the unregistered no-op; the registry is cleared
+/// after so the mock never leaks into the live kernel.
+mod anon_reclaimer_tests {
+    use super::{
+        __reset_anon_reclaimer_for_test, anon_reclaimer_armed, reclaim_anon_pages,
+        register_anon_reclaimer, AnonReclaimer,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    static SEEN_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+    /// Reports it released `min(target, 7)` pages and records the target it saw.
+    struct MockAnon;
+    impl AnonReclaimer for MockAnon {
+        fn reclaim_anon(&self, target_pages: usize) -> usize {
+            SEEN_TARGET.store(target_pages, Ordering::Relaxed);
+            target_pages.min(7)
+        }
+    }
+    static MOCK: MockAnon = MockAnon;
+
+    fn smoke_reclaim_anon_dispatch() -> TestResult {
+        __reset_anon_reclaimer_for_test();
+        let result = (|| {
+            // Unregistered: dispatch is a no-op regardless of target.
+            if anon_reclaimer_armed() || reclaim_anon_pages(100) != 0 {
+                return TestResult::Fail("unregistered anon reclaim should free nothing");
+            }
+            register_anon_reclaimer(&MOCK);
+            if !anon_reclaimer_armed() {
+                return TestResult::Fail("register_anon_reclaimer did not arm the seam");
+            }
+            // Zero target short-circuits before dispatch.
+            SEEN_TARGET.store(usize::MAX, Ordering::Relaxed);
+            if reclaim_anon_pages(0) != 0 || SEEN_TARGET.load(Ordering::Relaxed) != usize::MAX {
+                return TestResult::Fail("zero-target must short-circuit before dispatch");
+            }
+            // Non-zero: target is forwarded and the released count is returned.
+            if reclaim_anon_pages(100) != 7 || SEEN_TARGET.load(Ordering::Relaxed) != 100 {
+                return TestResult::Fail("dispatch did not forward target / return released");
+            }
+            if reclaim_anon_pages(3) != 3 {
+                return TestResult::Fail("dispatch did not return min(target, released)");
+            }
+            TestResult::Pass
+        })();
+        __reset_anon_reclaimer_for_test();
+        result
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_anon_dispatch);
+}
+
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
 /// register in the in-kernel `narf.tests` section and actually run under
 /// `cargo xtask test` — unlike the host-only `#[cfg(test)] mod tests`

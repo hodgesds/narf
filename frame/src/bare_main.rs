@@ -140,7 +140,16 @@ async fn kswapd_kthread() {
         let mut pass = 0;
         while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark() {
             let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
-            let freed = narf_memory::reclaim::try_to_free(target);
+            let mut freed = narf_memory::reclaim::try_to_free(target);
+            if freed < target {
+                // Clean caches + shrinkers couldn't cover the deficit; swap out
+                // cold anonymous user pages for the remainder. This runs in the
+                // kthread context (may allocate candidate lists), NOT on the
+                // allocation-failure path, and is a no-op until a policy is
+                // installed / on arches without swap.
+                freed =
+                    freed.saturating_add(narf_memory::reclaim::reclaim_anon_pages(target - freed));
+            }
             if freed == 0 {
                 // No forward progress — nothing more to shed this wake.
                 break;
@@ -3906,6 +3915,10 @@ fn boot_userspace_init() {
     // highest-badness process (and the reaper reclaim it) once in-kernel
     // reclaim can no longer hold the free pool above the emergency watermark.
     narf_userspace::oom::install();
+    // Install the anon-reclaim policy so kswapd can swap out cold private
+    // anonymous pages once clean caches + shrinkers no longer cover the
+    // watermark deficit (before resorting to the OOM killer).
+    narf_userspace::anon_reclaim::install();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.

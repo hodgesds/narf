@@ -5620,6 +5620,188 @@ fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_address_space_batched_swap_lifecycle);
 
+/// The anon-reclaim VMA scan must emit exactly the runs the swap executor
+/// accepts: page-aligned resident private-anon runs (split at holes), never
+/// shared/locked/file/COW/PROT_NONE regions, and bounded by `max_pages`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_collect_anon_reclaim_candidates() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+
+    // Region A: 4 private-anon RW pages, resident except a hole at index 2 →
+    // the scan should split it into runs [0,1] and [3].
+    let base_a = VirtAddr::new(0x0000_0080_0010_0000);
+    let mut phys_a = alloc::vec::Vec::with_capacity(4);
+    for i in 0..4usize {
+        if i == 2 {
+            phys_a.push(PhysAddr::new(0));
+            continue;
+        }
+        match crate::alloc_frame() {
+            Ok(f) => phys_a.push(f.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    if aspace
+        .map_region(Region {
+            base: base_a,
+            len: 4 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_a,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region A failed");
+    }
+
+    // Region B: resident but SHARED → ineligible, contributes nothing.
+    let base_b = VirtAddr::new(0x0000_0080_0020_0000);
+    let mut phys_b = alloc::vec::Vec::with_capacity(1);
+    match crate::alloc_frame() {
+        Ok(f) => phys_b.push(f.start_address()),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    }
+    if aspace
+        .map_region(Region {
+            base: base_b,
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            phys: phys_b,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region B failed");
+    }
+    // SAFETY: aspace owns a live root and the validated regions.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        let mut out = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut out, 64);
+        if out.len() != 2 {
+            return TestResult::Fail("expected 2 runs (hole-split; shared skipped)");
+        }
+        let r0 = out.iter().find(|c| c.base.as_u64() == base_a.as_u64());
+        let r1 = out
+            .iter()
+            .find(|c| c.base.as_u64() == base_a.as_u64() + 3 * 4096);
+        let (r0, r1) = match (r0, r1) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return TestResult::Fail("runs not at the expected bases"),
+        };
+        if r0.pages != 2 || r1.pages != 1 {
+            return TestResult::Fail("hole did not split runs into [0,1] + [3]");
+        }
+        for c in &out {
+            if c.address_space_root != aspace.root
+                || c.mapcount != 1
+                || c.expected_free_pages != c.pages
+                || c.locked
+            {
+                return TestResult::Fail("candidate fields wrong");
+            }
+        }
+        // max_pages bound: asking for 1 stops the first run at a single page.
+        let mut bounded = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut bounded, 1);
+        if bounded.first().map(|c| c.pages) != Some(1) {
+            return TestResult::Fail("max_pages=1 did not bound the first run to 1 page");
+        }
+        TestResult::Pass
+    })();
+
+    let _ = aspace.unmap_region(base_a);
+    let _ = aspace.unmap_region(base_b);
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_collect_anon_reclaim_candidates);
+
+/// End-to-end anon reclaim: the VMA scan's candidates must feed
+/// `plan_reclaim_ranges` and `swap_out_reclaim_plan` and actually swap the
+/// pages out — proving the scan emits executor-compatible ranges (the risk the
+/// hand-built swap-lifecycle test cannot catch).
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_anon_reclaim_scan_drives_swap() -> TestResult {
+    use crate::reclaim::plan_reclaim_ranges;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr, ZramBackend};
+
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Skip("another swap lifecycle is active");
+    }
+    crate::install_swap_backend(ZramBackend::new());
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 3;
+    let base = VirtAddr::new(0x0000_0080_0030_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for index in 0..N {
+        let frame = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame owned by the new region.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0x70 + index as u8, 4096) };
+        phys.push(frame);
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated private region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        let mut candidates = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut candidates, N);
+        if candidates.iter().map(|c| c.pages).sum::<usize>() != N {
+            return TestResult::Fail("scan did not surface all N resident pages");
+        }
+        let plan = plan_reclaim_ranges(&candidates, N, N);
+        // SAFETY: test owns this live address space and its private resident run.
+        let report = unsafe { aspace.swap_out_reclaim_plan(&plan) };
+        if report.error.is_some() || report.swapped_pages != N {
+            return TestResult::Fail("scan candidates did not swap out cleanly");
+        }
+        let snapshot = aspace.regions_snapshot();
+        if snapshot[0].phys.iter().any(|e| e.raw() != 0) {
+            return TestResult::Fail("page-out did not transfer Region ownership");
+        }
+        if crate::swap_stats().resident != N as u64 {
+            return TestResult::Fail("swap accounting did not charge every page");
+        }
+        TestResult::Pass
+    })();
+
+    // Teardown discards the swap slots (Region::phys is all zero → swapped).
+    let _ = aspace.unmap_region(base);
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Fail("teardown leaked swap slots");
+    }
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_anon_reclaim_scan_drives_swap);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.

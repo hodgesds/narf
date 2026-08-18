@@ -2608,6 +2608,97 @@ impl AddressSpace {
         }
     }
 
+    /// Append cold private-anonymous reclaim candidates from this address
+    /// space to `out`, stopping once the emitted runs cover at least
+    /// `max_pages` resident pages (or a fixed per-call run cap is hit).
+    ///
+    /// Emits page-aligned contiguous runs of resident (`phys != 0`),
+    /// non-transitioning pages drawn only from regions the swap executor
+    /// accepts — private anonymous mappings (not `SHARED` / `FILE_DEMAND` /
+    /// `COW` / `LOCKED`) with non-zero prot — so the runs feed
+    /// [`crate::reclaim::plan_reclaim_ranges`] and then
+    /// [`Self::swap_out_reclaim_plan`] without the executor rejecting them.
+    /// `mapcount` is 1 and `expected_free_pages` equals the run length because
+    /// a private anonymous page has a single mapping, so evicting it frees its
+    /// frame. `age` is 0 pending per-page access-bit sampling; the planner
+    /// falls back to yield then address order.
+    ///
+    /// Read-only and side-effect-free (only takes the region lock). The scan
+    /// fills a fixed stack buffer under the lock and copies into `out` after
+    /// releasing it, so it never allocates while holding the region lock.
+    #[cfg(target_arch = "x86_64")]
+    pub fn collect_anon_reclaim_candidates(
+        &self,
+        out: &mut Vec<crate::reclaim::ReclaimRangeCandidate>,
+        max_pages: usize,
+    ) {
+        use crate::reclaim::ReclaimRangeCandidate;
+        if max_pages == 0 {
+            return;
+        }
+        // Per-call cap on distinct runs. Anonymous regions are usually
+        // contiguous so a handful of runs cover them; a heavily fragmented
+        // space is bounded here and revisited on kswapd's next pass. A fixed
+        // buffer keeps the scan allocation-free under the region lock.
+        const MAX_RUNS: usize = 64;
+        let mut scratch: [Option<ReclaimRangeCandidate>; MAX_RUNS] = [None; MAX_RUNS];
+        let mut n = 0usize;
+        let mut collected = 0usize;
+        {
+            let table = self.regions.lock();
+            'regions: for region in table.iter() {
+                // Match swap_out_private_batch's eligibility exactly.
+                if region.perms.contains(RegionPerms::LOCKED)
+                    || region.perms.contains(RegionPerms::SHARED)
+                    || region.perms.contains(RegionPerms::FILE_DEMAND)
+                    || region.perms.contains(RegionPerms::COW)
+                    || region.perms.prot_only().0 == 0
+                {
+                    continue;
+                }
+                let npages = region.phys.len();
+                let mut i = 0usize;
+                while i < npages {
+                    let va = region.base.as_u64() + (i as u64) * 4096;
+                    // Skip holes (unbacked) and pages mid-swap-transition.
+                    if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&va) {
+                        i += 1;
+                        continue;
+                    }
+                    // Extend a maximal resident, non-transitioning run.
+                    let run_base = va;
+                    let mut run_len = 0usize;
+                    while i < npages {
+                        let cva = region.base.as_u64() + (i as u64) * 4096;
+                        if region.phys[i].raw() == 0 || table.swap_pages.contains_key(&cva) {
+                            break;
+                        }
+                        run_len += 1;
+                        i += 1;
+                        if collected + run_len >= max_pages {
+                            break;
+                        }
+                    }
+                    scratch[n] = Some(ReclaimRangeCandidate {
+                        address_space_root: self.root,
+                        base: VirtAddr::new(run_base),
+                        pages: run_len,
+                        mapcount: 1,
+                        expected_free_pages: run_len,
+                        age: 0,
+                        locked: false,
+                    });
+                    n += 1;
+                    collected += run_len;
+                    if n == MAX_RUNS || collected >= max_pages {
+                        break 'regions;
+                    }
+                }
+            }
+        }
+        out.extend(scratch.iter().take(n).filter_map(|c| *c));
+    }
+
     /// Swap one bounded run of private resident pages with a single backend
     /// vector operation and one TLB retirement.
     ///
