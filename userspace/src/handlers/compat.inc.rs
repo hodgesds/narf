@@ -2580,6 +2580,17 @@ pub(crate) static SIGNAL_PENDING: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 static SIGNAL_READABLE_GEN: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+/// Per-task generation bumped on EVERY signal raise (unlike SIGNAL_READABLE_GEN,
+/// which bumps only on the empty->non-empty transition and also feeds the
+/// signalfd EPOLLET edge token). A poll/epoll park snapshots this before its
+/// scan (beside `epoll_park_gen`) and the park routine re-checks it after
+/// registering the signal waker: a raise in the scan->register window (which
+/// `is_signal_pending`'s block-filter misses for a BLOCKED signal a signalfd
+/// reads) advances the generation and forces a re-execution instead of a park
+/// on the ~10 ms lost-wake backstop. Edge, not level, so a STANDING
+/// blocked-pending signal with no fresh raise never spins.
+static SIGNAL_RAISE_GEN: SignalBitsTable =
+    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 #[inline]
 fn signal_bits_bucket(task: u64) -> usize {
@@ -3491,6 +3502,7 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 pub fn signal_init() {
     signal_bits_clear(&SIGNAL_PENDING);
     signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -3500,6 +3512,7 @@ pub fn signal_init() {
 pub fn __test_signal_reset() {
     signal_bits_clear(&SIGNAL_PENDING);
     signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
     sigqueue_clear();
@@ -3513,6 +3526,12 @@ pub fn signal_pending_of(task: u64) -> u64 {
 
 pub fn signal_readable_generation(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_READABLE_GEN, task)
+}
+
+/// Per-task raise generation — bumped on every signal raise. See
+/// [`SIGNAL_RAISE_GEN`]. Read by the poll/epoll park's signalfd lost-wake guard.
+pub fn signal_raise_generation(task: u64) -> u64 {
+    signal_bits_get(&SIGNAL_RAISE_GEN, task)
 }
 
 /// POSIX default action for a signal when no handler is installed.
@@ -4409,6 +4428,13 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
             *generation = generation.wrapping_add(1);
         });
     }
+    // Bump the raise generation on EVERY raise (not just was_empty): the
+    // signalfd park guard needs to see a second signal arriving while a first
+    // is still pending, so a poll/epoll parked on a signalfd whose mask matches
+    // the SECOND signal is not stranded on the backstop. See [`SIGNAL_RAISE_GEN`].
+    signal_bits_update_or_init(&SIGNAL_RAISE_GEN, task, |generation| {
+        *generation = generation.wrapping_add(1);
+    });
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
     // promptly rather than only at the next self-driven re-poll.
@@ -4510,6 +4536,8 @@ pub fn ensure_signal_pending_slot(task: u64) {
     // The IRQ raise advances readability on the first pending signal. Seed
     // that row here too so the IRQ path never allocates.
     let _ = signal_bits_update(&SIGNAL_READABLE_GEN, task, |_| {});
+    // Same for the raise generation the signalfd park guard reads.
+    let _ = signal_bits_update(&SIGNAL_RAISE_GEN, task, |_| {});
 }
 
 /// Alloc-free, IRQ-safe variant of `raise_signal_pending`: OR the
@@ -4545,6 +4573,11 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
             });
             return false;
         }
+        // Raise generation, every raise (alloc-free existing-only; the row is
+        // pre-seeded by `ensure_signal_pending_slot`). See [`SIGNAL_RAISE_GEN`].
+        let _ = signal_bits_update_existing(&SIGNAL_RAISE_GEN, task, |generation| {
+            *generation = generation.wrapping_add(1);
+        });
         return true;
     }
     false

@@ -53,6 +53,49 @@ fn smoke_abi_signal_kill_null_signal() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
+/// The per-task raise generation (SIGNAL_RAISE_GEN) advances on EVERY signal
+/// raise — including a second signal arriving while a first is still pending
+/// (NOT the empty->non-empty transition that SIGNAL_READABLE_GEN tracks). This
+/// is the invariant the signalfd poll/epoll park guard relies on: it snapshots
+/// this generation before its scan and re-checks it after registering the
+/// signal waker, so a raise in the scan->register window forces a re-execution
+/// instead of a park on the ~10 ms backstop. `is_signal_pending`'s block-filter
+/// cannot cover that window for a BLOCKED signal (the canonical signalfd case),
+/// so the block-agnostic raise generation is what closes it. A bump ONLY on
+/// was_empty would strand a poller whose signalfd watches the SECOND signal.
+fn smoke_abi_signal_raise_generation_bumps_every_raise() -> TestResult {
+    with_setup(|| {
+        // FAKE_TASK starts clean (see smoke_abi_signal_kill_null_signal), so the
+        // reset also zeroed SIGNAL_RAISE_GEN.
+        let g0 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        // First raise: SIGUSR1 (10). was_empty == true.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 10)) != Some(0) {
+            return Err("kill(self, SIGUSR1) failed");
+        }
+        let g1 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        if g1 == g0 {
+            return Err("raise generation did not advance on the first raise");
+        }
+        // Second raise while SIGUSR1 is still pending: SIGUSR2 (12). was_empty ==
+        // false — this is the case a was_empty-only counter would miss.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 12)) != Some(0) {
+            return Err("kill(self, SIGUSR2) failed");
+        }
+        let g2 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        if g2 == g1 {
+            return Err(
+                "raise generation did not advance on a second (non-was_empty) raise — a \
+                 signalfd watching the second signal would strand on the backstop",
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_raise_generation_bumps_every_raise
+);
+
 fn smoke_abi_signal_kill_neg() -> TestResult {
     with_setup(|| {
         // signum >= 32 → -EINVAL (Linux parity; was a non-Ok InvalidOp

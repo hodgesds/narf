@@ -628,6 +628,12 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         (*uctx_ptr)
             .epoll_park_gen
             .store(narf_net::readiness::generation(), Ordering::Release);
+        // Same scan→register lost-wake guard for a parked signalfd (see
+        // UserTaskCtx::signal_park_gen): snapshot the raise generation before
+        // the scan so a signal raised in the window is caught by the park.
+        (*uctx_ptr)
+            .signal_park_gen
+            .store(crate::handlers::signal_raise_generation(task), Ordering::Release);
     }
 
     // Park deadline. `blocking_deadline_ns` persists across the RIP-rewind

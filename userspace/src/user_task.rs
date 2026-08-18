@@ -109,6 +109,17 @@ pub struct UserTaskCtx {
     /// activity into a tight epoll/poll return loop. A real missed
     /// source wake is recovered by the bounded I/O backstop timer.
     pub epoll_park_gen: AtomicU64,
+    /// `crate::handlers::signal_raise_generation()` snapshot taken by
+    /// `sys_poll`/`sys_epoll_wait`/mqueue just before its final readiness
+    /// check, beside `epoll_park_gen`. After registering the signal + I/O
+    /// wakers, the park path re-reads the live raise generation; if it advanced
+    /// AND a signal is pending, a raise landed in the scan→register window and
+    /// the task self-wakes to re-execute. This is the signalfd lost-wake guard:
+    /// `is_signal_pending`'s block-filter misses a BLOCKED signal (the canonical
+    /// signalfd case), so the block-agnostic raise generation closes the window
+    /// that would otherwise fall to the ~10 ms backstop. Edge, not level, so a
+    /// standing blocked-pending signal never spins. Mirrors `futex_park_gen`.
+    pub signal_park_gen: AtomicU64,
     /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
     /// means this I/O wait is not epoll). After registering the task waker,
     /// the park path passively re-scans this instance before switching out.
@@ -443,6 +454,7 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
+            signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
             futex_namespace: AtomicU64::new(0),
@@ -782,6 +794,34 @@ fn park_should_block(
                     // re-execution for the already-level-ready event instead
                     // of relying on the timer-wheel backstop.
                     crate::handlers::drop_io_waiter(task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    return false;
+                }
+                // signalfd lost-wake guard. A signalfd reads BLOCKED signals,
+                // which the `is_signal_pending` recheck above filters out
+                // (pending & !SIGNAL_MASK). Re-check the block-agnostic raise
+                // generation snapshotted before this poll/epoll's scan (beside
+                // `epoll_park_gen`): if a signal was raised in the
+                // scan→register window AND one is pending, re-execute so the
+                // woken poller re-scans the signalfd now, instead of parking
+                // until the ~10 ms backstop. The signal waker registered above
+                // covers any raise AFTER this point. Edge (generation), not
+                // level (raw pending), so a standing blocked-pending signal with
+                // no fresh raise does not spin — the re-exec re-snapshots.
+                let raise_gen = crate::handlers::signal_raise_generation(task_id);
+                if uc.signal_park_gen.load(Ordering::Acquire) != raise_gen
+                    && crate::handlers::signal_pending_of(task_id) != 0
+                {
+                    // Advance the snapshot before re-executing: poll/epoll/mqueue
+                    // re-snapshot on their next park, but the other net_io_wait
+                    // parks (blocking socket recv, etc.) do NOT — without this a
+                    // standing blocked-pending signal would refire the guard and
+                    // spin them. Storing the observed generation makes the next
+                    // compare equal so they park, while a genuinely NEW raise
+                    // still advances past it.
+                    uc.signal_park_gen.store(raise_gen, Ordering::Release);
+                    crate::handlers::drop_io_waiter(task_id);
+                    crate::handlers::drop_signal_waker(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
                 }

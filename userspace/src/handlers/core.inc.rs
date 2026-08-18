@@ -6940,6 +6940,7 @@ fn release_task_tables(tid: u64) {
     // Signal state.
     signal_bits_remove(&SIGNAL_PENDING, tid);
     signal_bits_remove(&SIGNAL_READABLE_GEN, tid);
+    signal_bits_remove(&SIGNAL_RAISE_GEN, tid);
     signal_bits_remove(&SIGNAL_MASK, tid);
     if let Some(m) = SIGACTION_TABLE.lock().as_mut() {
         m.remove(&tid);

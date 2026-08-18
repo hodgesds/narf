@@ -1008,6 +1008,10 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
             (*uctx_ptr)
                 .epoll_park_gen
                 .store(narf_net::readiness::generation(), Ordering::Release);
+            // signalfd lost-wake guard snapshot (see UserTaskCtx::signal_park_gen).
+            (*uctx_ptr)
+                .signal_park_gen
+                .store(crate::handlers::signal_raise_generation(task), Ordering::Release);
         }
     }
 

@@ -185,6 +185,14 @@ fn park_would_block(ctx: &mut dyn TrapContext, handle_id: u64, timeout_ptr: u64)
             user.net_io_wait.store(true, Ordering::Release);
             user.epoll_park_gen
                 .store(narf_net::readiness::generation(), Ordering::Release);
+            // Keep the signalfd park guard's snapshot fresh on this net_io_wait
+            // park too (see UserTaskCtx::signal_park_gen); without it a signal
+            // pending during an mq wait would trip the guard's stale-generation
+            // compare and spin.
+            user.signal_park_gen.store(
+                crate::handlers::signal_raise_generation(crate::handlers::current_task_id()),
+                Ordering::Release,
+            );
             ctx.save_user_state(user.state.get() as *mut u8);
             *user.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
