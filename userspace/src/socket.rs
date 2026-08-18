@@ -89,11 +89,39 @@ fn kernel_nl_sockaddr_body() -> Vec<u8> {
     alloc::vec![0u8, 0, 0, 0, 0, 0, 1, 0, 0, 0]
 }
 
-/// Post-uevent-emit wake: bump the readiness generation + wake io waiters
-/// so a parked `NETLINK_KOBJECT_UEVENT` monitor's poll/epoll resumes and
-/// reads the new event. Installed into `narf_filesystem::uevent` when a
-/// netlink socket is created.
+/// Durable readiness cells of every subscribed uevent monitor. Registered at
+/// subscribe time (group-1 bind on NETLINK_KOBJECT_UEVENT); `uevent_wake_hook`
+/// sets POLL_IN on each so a uevent emit wakes ONLY the monitors. Weak so a
+/// closed monitor's cell is pruned lazily and never leaks.
+static UEVENT_READINESS_SUBS: IrqSafeSpinLock<
+    alloc::vec::Vec<alloc::sync::Weak<narf_lib::readiness::Readiness>>,
+> = IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Register a monitor's cell for `uevent_wake_hook` to fire. Idempotent enough:
+/// a re-bind pushes a second Weak to the same cell, which `set` handles (the
+/// pruning pass drops dead ones).
+fn register_uevent_readiness(cell: &Arc<narf_lib::readiness::Readiness>) {
+    UEVENT_READINESS_SUBS.lock().push(Arc::downgrade(cell));
+}
+
+/// Post-uevent-emit wake. A new uevent makes EVERY subscribed monitor readable
+/// (they all see it), so set POLL_IN on each registered cell — a targeted wake
+/// of just the parked monitors, not the whole io-waiter herd. Dead cells are
+/// pruned in the same pass. The `notify(0)` stays belt-and-suspenders (it also
+/// bumps the readiness generation the epoll_park_gen guard relies on).
+/// Installed into `narf_filesystem::uevent` when a netlink socket is created.
 fn uevent_wake_hook() {
+    {
+        let mut subs = UEVENT_READINESS_SUBS.lock();
+        subs.retain(|weak| {
+            if let Some(cell) = weak.upgrade() {
+                cell.set(narf_filesystem::POLL_IN, 0);
+                true
+            } else {
+                false
+            }
+        });
+    }
     narf_net::readiness::notify(0);
 }
 
@@ -658,6 +686,15 @@ pub struct SocketFile {
     /// groups=0 socket — receiving those is the entire purpose of a worker
     /// monitor.
     netlink_uevent_subscribed: AtomicBool,
+    /// Durable readiness cell for a NETLINK_KOBJECT_UEVENT monitor. The uevent
+    /// source is a SHARED broadcast (every subscriber sees every event), so the
+    /// cell is an `Arc` registered in `UEVENT_READINESS_SUBS` at subscribe time;
+    /// `uevent_wake_hook` sets POLL_IN on every registered cell when a uevent is
+    /// emitted, waking ONLY the parked monitors — not the whole io-waiter herd
+    /// the old `notify(0)` kicked (an SMP IPI storm on a busy desktop).
+    /// poll_readiness reconciles it against `subscribed && reader.has_pending()`.
+    /// notify(0) stays belt-and-suspenders during the migration.
+    uevent_readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
@@ -1068,6 +1105,7 @@ impl SocketFile {
             netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_uevent_subscribed: AtomicBool::new(false),
+            uevent_readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
         });
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
@@ -1243,6 +1281,9 @@ impl SocketFile {
         if self.protocol == NETLINK_KOBJECT_UEVENT && (groups & 1) != 0 {
             self.netlink_uevent_subscribed
                 .store(true, Ordering::Release);
+            // Register this monitor's durable cell so a uevent emit wakes it
+            // directly (targeted) instead of via the notify(0) herd.
+            register_uevent_readiness(&self.uevent_readiness);
         }
         {
             let mut memberships = self.netlink_memberships.lock();
@@ -2168,6 +2209,14 @@ impl FileOps for SocketFile {
                 if self.netlink_uevent_subscribed.load(Ordering::Acquire) && reader.has_pending() {
                     bits |= narf_filesystem::POLL_IN;
                 }
+                // Reconcile the durable cell against this level so a monitor that
+                // drained its reader stops reporting POLL_IN in the cell (else a
+                // re-arm spuriously returns Ready and a timed poll spins). The
+                // emit set the rising edge that fired the parked monitor.
+                self.uevent_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
                 bits
             }
             SocketState::NetlinkRoute { replies } => {
@@ -2285,6 +2334,7 @@ impl FileOps for SocketFile {
             Connected(Arc<RingBuf>, Arc<RingBuf>),
             Dgram,
             Listener,
+            Uevent,
             Legacy,
         }
         let arm = match &*self.state.lock() {
@@ -2295,6 +2345,7 @@ impl FileOps for SocketFile {
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
             | SocketState::Inet6Listener { .. } => Arm::Listener,
+            SocketState::NetlinkUevent { .. } => Arm::Uevent,
             _ => Arm::Legacy,
         };
         match arm {
@@ -2354,6 +2405,19 @@ impl FileOps for SocketFile {
                     None
                 }
             }
+            // uevent monitor: only POLL_IN-ready (a queued event). poll_readiness
+            // reconciled the cell against subscribed && reader.has_pending, and
+            // uevent_wake_hook sets its rising edge on an emit.
+            Arm::Uevent => {
+                if want_in {
+                    Some(
+                        self.uevent_readiness
+                            .arm(task_id, narf_filesystem::POLL_IN, waker),
+                    )
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -2366,6 +2430,7 @@ impl FileOps for SocketFile {
             Connected(Arc<RingBuf>, Arc<RingBuf>),
             Dgram,
             Listener,
+            Uevent,
             Legacy,
         }
         let d = match &*self.state.lock() {
@@ -2376,6 +2441,7 @@ impl FileOps for SocketFile {
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
             | SocketState::Inet6Listener { .. } => D::Listener,
+            SocketState::NetlinkUevent { .. } => D::Uevent,
             _ => D::Legacy,
         };
         match d {
@@ -2391,6 +2457,10 @@ impl FileOps for SocketFile {
             }
             D::Listener => {
                 self.listener_readiness.disarm(task_id);
+                true
+            }
+            D::Uevent => {
+                self.uevent_readiness.disarm(task_id);
                 true
             }
         }
