@@ -38,6 +38,15 @@ use narf_linux_perf_uapi::{
 };
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Lock-free count of live perf events (the refcount that gates
+/// `narf_lib::perf::enabled()`). Read by the stall-watchdog to tell whether a
+/// perf test leaked an event, leaving the per-syscall `drain_irq_samples` scan
+/// permanently armed. Never takes the registry lock — the watchdog may run
+/// while a wedged CPU holds it.
+pub fn dbg_active_perf_events() -> usize {
+    ACTIVE_PERF_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+}
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
@@ -2669,7 +2678,13 @@ pub(crate) fn drain_irq_samples() {
     // every syscall dispatch, so an unconditional scan taxes the whole system
     // (and monopolizes the CPU) even when nobody is profiling. `enabled()` is a
     // single read-mostly load flipped only on the first attach / last detach.
-    if !narf_lib::perf::enabled() {
+    // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
+    // can desync from the count (a stall-watchdog probe caught active_events=0
+    // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
+    // dispatch / task switch for the rest of the run — monopolizing the CPU (a
+    // scheduler stall once the preemption backstop is gone; task #32). The
+    // refcount is the source of truth: 0 live events means nothing to do.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let mut notify = false;
@@ -3011,7 +3026,13 @@ fn schedule_group(leader: &PerfEventFile, cpu: usize, registry: &[Weak<PerfEvent
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
     account_cpu_user_switch(running);
-    if !narf_lib::perf::enabled() {
+    // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
+    // can desync from the count (a stall-watchdog probe caught active_events=0
+    // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
+    // dispatch / task switch for the rest of the run — monopolizing the CPU (a
+    // scheduler stall once the preemption backstop is gone; task #32). The
+    // refcount is the source of truth: 0 live events means nothing to do.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let cpu = narf_lib::percpu::current_cpu();
@@ -4321,22 +4342,26 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     }
 }
 
-/// The syscall-return drain must be a no-op when no perf event is attached.
-///
-/// `drain_irq_samples` runs on every syscall dispatch. With the `enabled()`
-/// gate it returns before locking the registry or scanning MAX_CPUS * depth
-/// pending slots when nobody is profiling; without it, that scan taxes every
-/// syscall and monopolizes the CPU. This proves a staged slot is left
-/// untouched while perf is disabled and is consumed once perf is enabled.
-fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
+/// The syscall-return drain must be a no-op when NO perf event is registered —
+/// EVEN IF the global `perf::enabled()` software-counter bit is on. The
+/// stall-watchdog turns `enabled()` on for its `syscalls` forward-progress
+/// counter and never balances it, so `drain_irq_samples` gates on the
+/// ACTIVE_PERF_EVENTS refcount (the source of truth for "are there sample
+/// events"), NOT that bool. A stale-true bool must not drag the per-syscall
+/// scan of MAX_CPUS * depth slots along and monopolize the CPU (which stalled
+/// the scheduler once the preemption backstop was gone; task #32). Proves a
+/// staged slot is left UNTOUCHED whenever the refcount is 0, either bool state.
+fn smoke_perf_drain_skips_without_active_events() -> narf_kernel_test::TestResult {
+    // The refcount is the gate; this test is only meaningful with it at 0.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) != 0 {
+        return narf_kernel_test::TestResult::Skip("a perf event is active");
+    }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
     // Use a quiescent slot so a concurrently-staged real sample is never eaten.
     let ring = &PENDING_TRACES[cpu];
     let Some(slot) = ring.iter().find(|s| s.state.load(Ordering::Acquire) == 0) else {
-        // Whole ring busy (not expected at rest) — nothing safe to probe.
         return narf_kernel_test::TestResult::Skip("PENDING_TRACES ring busy");
     };
-
     let saved_enabled = narf_lib::perf::enabled();
 
     // Stage a bogus trace whose type_id matches no event.
@@ -4344,16 +4369,17 @@ fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
     slot.len.store(0, Ordering::Relaxed);
     slot.state.store(2, Ordering::Release);
 
-    // Disabled: the fast path must return before touching the rings.
+    // enabled=false: the fast path returns.
     narf_lib::perf::set_enabled(false);
     drain_irq_samples();
     let after_disabled = slot.state.load(Ordering::Acquire);
 
-    // Enabled: the same drain must consume the slot (no matching event, so it
-    // is simply cleared to state 0).
+    // enabled=true but STILL zero active events (the watchdog-leak shape): the
+    // drain must STILL skip on the refcount gate, leaving the slot untouched.
+    // Before the refcount gate this scanned the rings on every syscall.
     narf_lib::perf::set_enabled(true);
     drain_irq_samples();
-    let after_enabled = slot.state.load(Ordering::Acquire);
+    let after_enabled_no_events = slot.state.load(Ordering::Acquire);
 
     // Restore global + slot state regardless of the outcome.
     slot.state.store(0, Ordering::Release);
@@ -4361,13 +4387,13 @@ fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
     narf_lib::perf::set_enabled(saved_enabled);
 
     if after_disabled != 2 {
-        return narf_kernel_test::TestResult::Fail("disabled drain consumed a pending slot");
+        return narf_kernel_test::TestResult::Fail("drain scanned the rings with enabled=false");
     }
-    if after_enabled != 0 {
+    if after_enabled_no_events != 2 {
         return narf_kernel_test::TestResult::Fail(
-            "enabled drain did not consume the pending slot",
+            "drain scanned the rings with enabled=true and zero active events (refcount gate broken)",
         );
     }
     narf_kernel_test::TestResult::Pass
 }
-narf_kernel_test::kernel_test_in!("syscall_abi", smoke_perf_drain_skips_when_disabled);
+narf_kernel_test::kernel_test_in!("syscall_abi", smoke_perf_drain_skips_without_active_events);

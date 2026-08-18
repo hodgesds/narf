@@ -741,6 +741,36 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
     }
 }
 
+/// Send an NMI IPI to the target APIC. Delivery mode 0b100 (NMI) is
+/// non-maskable, so it lands even on a CPU spinning with IF=0 — the only way
+/// to sample the RIP of a CPU wedged in an interrupts-disabled loop (the
+/// stall-watchdog's stuck-CPU probe). Same ICR routing as [`send_init_ipi`].
+///
+/// # Safety
+/// LAPIC must have been initialized by `init_bsp`.
+#[inline]
+pub unsafe fn send_nmi_ipi(target_apic_id: u32) {
+    // NMI (delivery mode 0b100 = 0x400), level=assert (bit 14), edge,
+    // destination=physical.
+    let icr_lo: u32 = 0x0000_4400;
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let dest = (target_apic_id as u64) << 32;
+        // SAFETY: MSR 0x830 is x2APIC ICR.
+        unsafe {
+            wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
+        }
+    } else {
+        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
+        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB). Write HI (dest)
+        // before LO (triggers the IPI).
+        unsafe {
+            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
+            core::ptr::write_volatile(lapic_lo, icr_lo);
+        }
+    }
+}
+
 /// Send a STARTUP IPI (SIPI) to the target APIC.
 ///
 /// `vector_page` is the page-aligned physical address of the AP
