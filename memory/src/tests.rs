@@ -5724,6 +5724,84 @@ fn smoke_memory_collect_anon_reclaim_candidates() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_collect_anon_reclaim_candidates);
 
+/// End-to-end anon reclaim: the VMA scan's candidates must feed
+/// `plan_reclaim_ranges` and `swap_out_reclaim_plan` and actually swap the
+/// pages out — proving the scan emits executor-compatible ranges (the risk the
+/// hand-built swap-lifecycle test cannot catch).
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_anon_reclaim_scan_drives_swap() -> TestResult {
+    use crate::reclaim::plan_reclaim_ranges;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr, ZramBackend};
+
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Skip("another swap lifecycle is active");
+    }
+    crate::install_swap_backend(ZramBackend::new());
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 3;
+    let base = VirtAddr::new(0x0000_0080_0030_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for index in 0..N {
+        let frame = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: fresh private frame owned by the new region.
+        unsafe { core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0x70 + index as u8, 4096) };
+        phys.push(frame);
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated private region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        let mut candidates = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut candidates, N);
+        if candidates.iter().map(|c| c.pages).sum::<usize>() != N {
+            return TestResult::Fail("scan did not surface all N resident pages");
+        }
+        let plan = plan_reclaim_ranges(&candidates, N, N);
+        // SAFETY: test owns this live address space and its private resident run.
+        let report = unsafe { aspace.swap_out_reclaim_plan(&plan) };
+        if report.error.is_some() || report.swapped_pages != N {
+            return TestResult::Fail("scan candidates did not swap out cleanly");
+        }
+        let snapshot = aspace.regions_snapshot();
+        if snapshot[0].phys.iter().any(|e| e.raw() != 0) {
+            return TestResult::Fail("page-out did not transfer Region ownership");
+        }
+        if crate::swap_stats().resident != N as u64 {
+            return TestResult::Fail("swap accounting did not charge every page");
+        }
+        TestResult::Pass
+    })();
+
+    // Teardown discards the swap slots (Region::phys is all zero → swapped).
+    let _ = aspace.unmap_region(base);
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Fail("teardown leaked swap slots");
+    }
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_anon_reclaim_scan_drives_swap);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.
