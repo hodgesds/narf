@@ -1906,6 +1906,107 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
     Some((e.flags(), 1 << 12))
 }
 
+/// Run `f` on the present 4 KiB leaf PTE that maps `virt`, under the per-root
+/// page-table walk lock, returning `Some(f(..))`. `None` if `virt` is not
+/// mapped by a present 4 KiB leaf (unmapped, or a huge leaf). The lock is held
+/// for the whole call so the leaf cannot be freed by a concurrent unmap.
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+unsafe fn with_leaf_mut<R>(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    f: impl FnOnce(&mut PageTableEntry) -> R,
+) -> Option<R> {
+    if !is_canonical(virt) {
+        return None;
+    }
+    // Serialise against concurrent map/unmap on the same root.
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: caller guarantees `pml4_phys` is identity-reachable.
+    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let e = pml4.entries[idx.pml4];
+    if !e.is_present() {
+        return None;
+    }
+    // SAFETY: a present non-leaf PML4 entry names a live PDPT frame.
+    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pdpt.entries[idx.pdpt];
+    if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
+        return None;
+    }
+    // SAFETY: a present non-huge PDPT entry names a live PD frame.
+    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pd.entries[idx.pd];
+    if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
+        return None;
+    }
+    // SAFETY: a present non-huge PD entry names a live PT frame; the walk lock
+    // keeps it live for the mutation below.
+    let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+    let leaf = &mut pt.entries[idx.pt];
+    if !leaf.is_present() {
+        return None;
+    }
+    Some(f(leaf))
+}
+
+/// Test-and-clear the ACCESSED (A) bit of the 4 KiB leaf mapping `virt`,
+/// returning whether it was set — the CLOCK "reference" step used by anon
+/// reclaim aging. `None` if `virt` is not mapped by a present 4 KiB leaf
+/// (unmapped, or a huge leaf; huge pages are not aged here).
+///
+/// The A-bit is an APPROXIMATE LRU hint. This clears it in the PTE but issues
+/// **no TLB shootdown**, so a CPU holding a cached translation may not re-set A
+/// until that entry is naturally evicted. A momentarily-stale reading only
+/// makes a hot page look cold for one reclaim pass — recovered by the swap-in
+/// fault, which re-sets A — and is never a correctness hazard. Skipping the
+/// shootdown deliberately keeps aging off the remote-shootdown path so it can
+/// run under a caller's region lock without deadlock. The per-root page-table
+/// lock still serialises the read-modify-write against concurrent map/unmap.
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+pub unsafe fn test_and_clear_accessed(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<bool> {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: forwarded to the caller's identity-reachability guarantee.
+    unsafe {
+        with_leaf_mut(pml4_phys, virt, |leaf| {
+            // Clear ONLY the A bit with an atomic AND. The CPU updates the A/D
+            // bits asynchronously and does not honor the SW walk lock, so a
+            // read-construct-write could clobber a concurrently-set D bit; an
+            // atomic mask touches nothing else. `PageTableEntry` is a
+            // `repr(transparent)` u64, so the leaf reinterprets as `AtomicU64`;
+            // it is 8-byte aligned within a 4 KiB-aligned table and the walk
+            // lock keeps it live. Relaxed suffices — A is a hint.
+            let atomic = &*(leaf as *mut PageTableEntry as *const AtomicU64);
+            let prev = atomic.fetch_and(!PtFlags::ACCESSED.bits(), Ordering::Relaxed);
+            prev & PtFlags::ACCESSED.bits() != 0
+        })
+    }
+}
+
+/// Test-only: set the ACCESSED bit on the 4 KiB leaf mapping `virt` so a test
+/// can exercise the CLOCK second-chance path deterministically — hardware sets
+/// this bit on a real access, which a kernel-test address space (never loaded
+/// into `CR3`) does not perform. Returns `true` if a present 4 KiB leaf was
+/// updated.
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+#[doc(hidden)]
+pub unsafe fn __set_accessed_for_test(pml4_phys: PhysAddr, virt: VirtAddr) -> bool {
+    // SAFETY: forwarded to the caller's identity-reachability guarantee.
+    unsafe {
+        with_leaf_mut(pml4_phys, virt, |leaf| {
+            let set = PtFlags(leaf.flags().bits() | PtFlags::ACCESSED.bits());
+            *leaf = PageTableEntry::new(leaf.addr(), set);
+        })
+    }
+    .is_some()
+}
+
 /// Resolve the physical address currently mapped at `virt`, if any.
 /// Returns `None` when the walk hits a not-present entry. Treats huge
 /// pages (1 GiB at PDPT level, 2 MiB at PD level) as first-class —
