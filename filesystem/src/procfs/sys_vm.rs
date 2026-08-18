@@ -17,6 +17,9 @@
 //!     reflects `reclaim::watermark_min() * 4`.
 //!   - `watermark_scale_factor` — drives the reclaim band gap via
 //!     `narf_memory::reclaim::set_watermark_scale_factor`.
+//!   - `swappiness`         — drives kswapd's file-vs-anon reclaim balance
+//!     via `narf_memory::reclaim::set_swappiness`; read reflects the live
+//!     `reclaim::swappiness()`.
 //!   - `overcommit_memory` — selects the live overcommit policy
 //!     (0=heuristic, 1=always, 2=never) via
 //!     `narf_memory::reclaim::set_overcommit_mode`.
@@ -56,7 +59,6 @@ use crate::FsError;
 // One `AtomicU64` per writable key so reads/writes are lock-free.
 // All statics are const-initialised to Linux defaults.
 
-static SWAPPINESS: AtomicU64 = AtomicU64::new(60);
 static VFS_CACHE_PRESSURE: AtomicU64 = AtomicU64::new(100);
 static DIRTY_BACKGROUND_RATIO: AtomicU64 = AtomicU64::new(10);
 static DIRTY_BACKGROUND_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -131,13 +133,15 @@ fn drop_caches_write(s: &str) -> Result<(), FsError> {
 /// Register every `/proc/sys/vm/*` sysctl. Called once at boot.
 /// Idempotent — repeated calls replace the existing entries.
 pub fn register_all() {
-    // swappiness: 0-200; default 60. Stub: stored, not consulted.
+    // swappiness: 0-200; default 60. WIRED to the reclaimer's file-vs-anon
+    // balance: kswapd splits each reclaim pass's target by this value. Reads
+    // reflect the LIVE knob. Linux ref: `mm/vmscan.c` `vm.swappiness`.
     register_sysctl(SysctlEntry {
         path: "vm/swappiness",
-        read: || read_u64(&SWAPPINESS),
+        read: || read_val(narf_memory::reclaim::swappiness()),
         write: Some(|s| {
             let v = parse_u64_max(s, 200)?;
-            SWAPPINESS.store(v, Ordering::Relaxed);
+            narf_memory::reclaim::set_swappiness(v);
             Ok(())
         }),
         perms: 0o644,
@@ -388,9 +392,13 @@ fn ensure_registered() {
 
 fn smoke_vm_swappiness_default() -> TestResult {
     ensure_registered();
-    // Reset to default before reading to isolate from other tests.
-    SWAPPINESS.store(60, Ordering::Relaxed);
-    match sysctl_read(&["sys", "vm", "swappiness"]) {
+    // Reset the LIVE knob to its default before reading to isolate from
+    // other tests, then restore whatever it was.
+    let saved = narf_memory::reclaim::swappiness();
+    narf_memory::reclaim::set_swappiness(60);
+    let read = sysctl_read(&["sys", "vm", "swappiness"]);
+    narf_memory::reclaim::set_swappiness(saved);
+    match read {
         Some(s) if s == "60\n" => TestResult::Pass,
         other => {
             let _ = other;
@@ -402,12 +410,19 @@ kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_swappiness_default);
 
 fn smoke_vm_swappiness_write_roundtrip() -> TestResult {
     ensure_registered();
-    SWAPPINESS.store(60, Ordering::Relaxed);
+    let saved = narf_memory::reclaim::swappiness();
+    // Write drives the live reclaim knob, not a local shadow copy.
     let w = sysctl_write(&["sys", "vm", "swappiness"], b"200\n");
+    let live = narf_memory::reclaim::swappiness();
+    let readback = sysctl_read(&["sys", "vm", "swappiness"]);
+    narf_memory::reclaim::set_swappiness(saved);
     if !matches!(w, Some(Ok(_))) {
         return TestResult::Fail("vm/swappiness write '200' failed");
     }
-    match sysctl_read(&["sys", "vm", "swappiness"]) {
+    if live != 200 {
+        return TestResult::Fail("vm/swappiness write '200' did not update the live knob");
+    }
+    match readback {
         Some(s) if s == "200\n" => TestResult::Pass,
         _ => TestResult::Fail("vm/swappiness read after write '200' did not return '200\\n'"),
     }

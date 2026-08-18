@@ -140,16 +140,37 @@ async fn kswapd_kthread() {
         let mut pass = 0;
         while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark() {
             let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
-            let mut freed = narf_memory::reclaim::try_to_free(target);
-            if freed < target {
-                // Clean caches + shrinkers couldn't cover the deficit; swap out
-                // cold anonymous user pages for the remainder. This runs in the
-                // kthread context (may allocate candidate lists), NOT on the
-                // allocation-failure path, and is a no-op until a policy is
-                // installed / on arches without swap.
-                freed =
-                    freed.saturating_add(narf_memory::reclaim::reclaim_anon_pages(target - freed));
+
+            // Split the target between anonymous (swap) and file-cache reclaim
+            // per `vm.swappiness`: higher swappiness pushes more onto anon.
+            // Both sources run in kthread context (may allocate candidate
+            // lists), NOT on the allocation-failure path, so `try_to_free`
+            // stays allocation-free while the balancing lives only here.
+            let (anon_share, file_share) = narf_memory::reclaim::split_reclaim_target(
+                target,
+                narf_memory::reclaim::swappiness(),
+            );
+
+            // Anon reclaim is a no-op until a swap policy is installed / on
+            // arches without swap; file reclaim drives clean caches + shrinkers.
+            let anon_freed = narf_memory::reclaim::reclaim_anon_pages(anon_share);
+            let file_freed = narf_memory::reclaim::try_to_free(file_share);
+
+            // SPILL: whichever source undershot its share, redirect the
+            // shortfall to the other. This is why swappiness=0 still swaps anon
+            // once the file cache is exhausted (and vice versa) — matching
+            // Linux's fallback when one list can't meet the goal.
+            let anon_short = anon_share - anon_freed.min(anon_share);
+            let file_short = file_share - file_freed.min(file_share);
+            let mut spill = 0;
+            if file_short > 0 {
+                spill += narf_memory::reclaim::reclaim_anon_pages(file_short);
             }
+            if anon_short > 0 {
+                spill += narf_memory::reclaim::try_to_free(anon_short);
+            }
+
+            let freed = anon_freed.saturating_add(file_freed).saturating_add(spill);
             if freed == 0 {
                 // No forward progress — nothing more to shed this wake.
                 break;

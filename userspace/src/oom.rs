@@ -68,6 +68,9 @@ impl OomKiller for ProcessOomKiller {
             tid,
             rss_pages,
             address_space,
+            // The reap queue seeds the retry budget on enqueue
+            // (`request_oom_relief`); the policy leaves it at 0.
+            retries_left: 0,
         })
     }
 }

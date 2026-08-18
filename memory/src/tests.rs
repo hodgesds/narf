@@ -4657,6 +4657,209 @@ fn smoke_buddy_oom_returns_empty() -> TestResult {
 }
 kernel_test_in!("memory/buddy", smoke_buddy_oom_returns_empty);
 
+fn smoke_buddy_migratetype_groups_by_mobility() -> TestResult {
+    // A Movable free and an Unmovable free of the SAME order land in
+    // separate partitions; neither counts against the other. Confirms the
+    // free lists are actually partitioned by mobility.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // Seed 8 frames as a single order-3 Movable block (donate defaults to
+    // Movable), then hand out one order-0 as Unmovable and free it as
+    // Movable / Unmovable to place blocks in each partition deliberately.
+    zone.donate(0x200, 8);
+
+    // Free two explicit order-0 blocks into distinct partitions. Use
+    // frames that are NOT buddies (0x300 and 0x340) so neither coalesces
+    // nor is mistaken for the donated pool.
+    zone.free_mt(0x300, 0, MigrateType::Unmovable);
+    zone.free_mt(0x340, 0, MigrateType::Movable);
+
+    if zone.free_block_count_mt(0, MigrateType::Unmovable) != 1 {
+        return TestResult::Fail("unmovable order-0 not in unmovable partition");
+    }
+    if zone.free_block_count_mt(0, MigrateType::Movable) != 1 {
+        return TestResult::Fail("movable order-0 not in movable partition");
+    }
+    // Partition-summed count sees both.
+    if zone.free_block_count(0) != 2 {
+        return TestResult::Fail("summed order-0 count wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/buddy", smoke_buddy_migratetype_groups_by_mobility);
+
+fn smoke_buddy_migratetype_no_cross_mobility_coalesce() -> TestResult {
+    // Two buddies of DIFFERENT migratetypes must NOT coalesce, even though
+    // they are physically adjacent and same-order. This is the invariant
+    // that keeps each mobility class's contiguous regions from being
+    // silently merged (and thus mis-labelled) across the boundary.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // Frames 0x400 and 0x401 are order-0 buddies (0x400 ^ 1 == 0x401).
+    zone.free_mt(0x400, 0, MigrateType::Unmovable);
+    zone.free_mt(0x401, 0, MigrateType::Movable);
+
+    // No order-1 block should have formed in EITHER partition.
+    if zone.free_block_count(1) != 0 {
+        return TestResult::Fail("cross-mobility buddies wrongly coalesced");
+    }
+    if zone.free_block_count_mt(0, MigrateType::Unmovable) != 1
+        || zone.free_block_count_mt(0, MigrateType::Movable) != 1
+    {
+        return TestResult::Fail("blocks did not stay as separate order-0 entries");
+    }
+
+    // Same-migratetype buddies DO coalesce: free 0x401's movable buddy
+    // partner (0x400) as movable too and confirm an order-1 forms.
+    let mut zone2 = BuddyZone::new();
+    zone2.free_mt(0x400, 0, MigrateType::Movable);
+    zone2.free_mt(0x401, 0, MigrateType::Movable);
+    if zone2.free_block_count_mt(1, MigrateType::Movable) != 1 {
+        return TestResult::Fail("same-mobility buddies failed to coalesce");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/buddy",
+    smoke_buddy_migratetype_no_cross_mobility_coalesce
+);
+
+fn smoke_buddy_migratetype_fallback_steals() -> TestResult {
+    // When a migratetype's own partition is empty, the allocator steals
+    // from the fallback migratetype and CONVERTS the whole split block to
+    // the requesting type, so subsequent same-type requests are served
+    // from the just-stolen block's leftovers (Linux's whole-block steal).
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    let mut zone = BuddyZone::new();
+    // One order-3 (8-frame) block, all Movable.
+    zone.donate(0x800, 8);
+
+    // Request order-0 UNMOVABLE. Movable partition is the only source, so
+    // it must steal the order-3 block, split it, and place the leftover
+    // buddies into the UNMOVABLE partition.
+    let f = match zone.alloc_mt(0, MigrateType::Unmovable) {
+        Some(f) => f,
+        None => return TestResult::Fail("unmovable steal from movable failed"),
+    };
+    if f != 0x800 {
+        return TestResult::Fail("stole wrong block head");
+    }
+    // Leftovers (orders 0,1,2) now live in the UNMOVABLE partition.
+    for o in 0..=2 {
+        if zone.free_block_count_mt(o, MigrateType::Unmovable) != 1 {
+            return TestResult::Fail("stolen leftovers not converted to unmovable");
+        }
+        if zone.free_block_count_mt(o, MigrateType::Movable) != 0 {
+            return TestResult::Fail("movable partition should be drained by the steal");
+        }
+    }
+    // A follow-up unmovable order-0 request is served from those leftovers
+    // WITHOUT touching the movable pool (which is empty anyway).
+    if zone.alloc_mt(0, MigrateType::Unmovable).is_none() {
+        return TestResult::Fail("follow-up unmovable alloc should reuse stolen leftovers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/buddy", smoke_buddy_migratetype_fallback_steals);
+
+fn smoke_buddy_migratetype_reduces_fragmentation() -> TestResult {
+    // Headline anti-fragmentation property. Two workloads run against
+    // identical synthetic zones:
+    //
+    //   * UNGROUPED: unmovable and movable order-0 allocations interleave
+    //     into ONE pool (simulated by allocating everything as one type),
+    //     then only the movable ones are freed — leaving unmovable holes
+    //     that block coalescing.
+    //   * GROUPED: the same allocations are classified by mobility. When
+    //     the movable ones are freed they coalesce back into a large
+    //     contiguous run because the unmovable holes are in a separate
+    //     region.
+    //
+    // We assert the grouped zone recovers a strictly larger top free order
+    // than the ungrouped one.
+    use crate::buddy::{BuddyZone, MigrateType};
+
+    // Helper: highest order with at least one free block.
+    fn top_order(z: &BuddyZone) -> i32 {
+        for o in (0..=crate::buddy::MAX_ORDER).rev() {
+            if z.free_block_count(o) > 0 {
+                return o as i32;
+            }
+        }
+        -1
+    }
+
+    const BASE: u64 = 0x1000;
+    const N: u64 = 64; // 64 order-0 frames = a would-be order-6 block.
+
+    // ---- UNGROUPED: unmovable and movable interleaved in one pool. ----
+    // Allocate all 64 as Unmovable (one pool). Then free back only the
+    // ODD-ADDRESSED frames (the "movable" role); the even frames (the
+    // "unmovable" role) stay allocated. Freeing by frame-address parity is
+    // deterministic: every freed odd frame's order-0 buddy is the adjacent
+    // EVEN frame, which is still held — so NOTHING can coalesce above
+    // order 0, whatever order the splitter handed frames out in.
+    let mut ungrouped = BuddyZone::new();
+    ungrouped.donate(BASE, N);
+    let mut ung_frames = [0u64; N as usize];
+    for slot in ung_frames.iter_mut() {
+        match ungrouped.alloc_mt(0, MigrateType::Unmovable) {
+            Some(f) => *slot = f,
+            None => return TestResult::Fail("ungrouped alloc drained early"),
+        }
+    }
+    for &f in ung_frames.iter() {
+        if f % 2 == 1 {
+            ungrouped.free_mt(f, 0, MigrateType::Unmovable);
+        }
+    }
+    let ungrouped_top = top_order(&ungrouped);
+    // Sanity: the interleaved free genuinely fragmented — no block above
+    // order 0 formed.
+    if ungrouped_top != 0 {
+        return TestResult::Fail("ungrouped pool unexpectedly coalesced above order 0");
+    }
+
+    // ---- GROUPED: classify by role. ----
+    // Even frames requested MOVABLE, odd frames UNMOVABLE. Because the two
+    // classes are drawn from separate partitions, the movable frames form
+    // a contiguous run; freeing them all coalesces upward.
+    let mut grouped = BuddyZone::new();
+    // Seed the pool split so movable frames are physically contiguous:
+    // donate the low half movable, the high half unmovable.
+    grouped.donate_as(BASE, N / 2, MigrateType::Movable);
+    grouped.donate_as(BASE + N / 2, N / 2, MigrateType::Unmovable);
+    // Allocate all movable frames, then free them all back.
+    let mut grp_frames = [0u64; (N / 2) as usize];
+    for slot in grp_frames.iter_mut() {
+        match grouped.alloc_mt(0, MigrateType::Movable) {
+            Some(f) => *slot = f,
+            None => return TestResult::Fail("grouped movable alloc drained early"),
+        }
+    }
+    for &f in grp_frames.iter() {
+        grouped.free_mt(f, 0, MigrateType::Movable);
+    }
+    let grouped_top = top_order(&grouped);
+
+    // The grouped movable region (32 frames) coalesces back to an order-5
+    // block; the ungrouped pool is stuck at order 0 (every buddy pinned).
+    if grouped_top <= ungrouped_top {
+        return TestResult::Fail("grouping did not raise the largest free order");
+    }
+    if grouped_top < 5 {
+        return TestResult::Fail("movable region failed to coalesce to order-5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/buddy",
+    smoke_buddy_migratetype_reduces_fragmentation
+);
+
 fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
     // Public frame API: alloc_pages_on must surface Exhausted for
     // requests that the buddy can't represent. Order > MAX_ORDER
@@ -6623,6 +6826,264 @@ fn smoke_memory_reap_anonymous_reclaims_and_is_idempotent() -> TestResult {
 kernel_test_in!(
     "memory",
     smoke_memory_reap_anonymous_reclaims_and_is_idempotent
+);
+
+/// Build a fresh user AS with `pages` resident private-anonymous base pages
+/// mapped at `vbase`, wrapped in an `Arc` (as the reaper holds it). Returns
+/// `None` (skip) if `new_for_user`, frame allocation, or materialize fails.
+/// The caller must `core::mem::forget` the extracted AS (via `Arc::into_inner`)
+/// to keep the reap frame-accounting isolated from page-table teardown.
+#[cfg(target_arch = "x86_64")]
+fn build_reapable_as(vbase: u64, pages: usize) -> Option<alloc::sync::Arc<crate::AddressSpace>> {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = unsafe { AddressSpace::new_for_user() }.ok()?;
+    let mut phys_list = alloc::vec::Vec::with_capacity(pages);
+    for _ in 0..pages {
+        match crate::alloc_frame() {
+            Ok(f) => phys_list.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return None;
+            }
+        }
+    }
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: (pages as u64) * 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: phys_list,
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return None;
+    }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return None;
+    }
+    Some(alloc::sync::Arc::new(a))
+}
+
+/// Leak an `Arc<AddressSpace>`'s page tables the same way the sibling smoke does
+/// (via `core::mem::forget` on the inner AS), keeping reap frame-accounting
+/// isolated. Requires `arc` to be the sole owner.
+#[cfg(target_arch = "x86_64")]
+fn forget_sole_as(arc: alloc::sync::Arc<crate::AddressSpace>) {
+    if let Some(inner) = alloc::sync::Arc::into_inner(arc) {
+        core::mem::forget(inner);
+    }
+}
+
+/// A victim whose region lock is transiently held is REQUEUED (not dropped) by
+/// `reap_all`, then reaped once the lock is released — proving a transient
+/// `try_lock` failure never strands the victim's frames.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_requeues_locked_victim() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0C00_0000u64;
+    let pages = 4usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4242,
+        tid: 4242,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    // While the region lock is held, reap_all cannot make progress: the victim
+    // must be requeued (not dropped) and no frames freed.
+    let freed_while_locked = as_arc.with_regions_locked(oom::reap_all);
+    if freed_while_locked != 0 {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reaped while region lock held");
+    }
+    if test_support::queued_len() != 1 {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("locked victim was dropped, not requeued");
+    }
+    if !oom::reap_pending() {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reap_pending cleared with a victim still queued");
+    }
+
+    // Lock released: the next pass reaps the resident pages and empties queue.
+    let freed = oom::reap_all();
+    if freed != pages {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail("requeued victim not reaped after lock released");
+    }
+    if test_support::queued_len() != 0 || oom::reap_pending() {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("queue not drained after successful reap");
+    }
+    forget_sole_as(as_arc);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_oom_reaper_requeues_locked_victim);
+
+/// A permanently-blocked victim is retried exactly `REAP_MAX_RETRIES` times and
+/// then abandoned (accounted, not silently leaked) — the bounded-retry contract.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_honors_retry_bound() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0D00_0000u64;
+    let pages = 2usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4343,
+        tid: 4343,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    let abandoned_before = test_support::abandoned_count();
+
+    // Hold the region lock across the whole retry sequence so every pass sees a
+    // try_lock failure. The victim enters with retries_left = MAX_RETRIES, so it
+    // survives MAX_RETRIES requeues and is abandoned on the pass after that.
+    let outcome = as_arc.with_regions_locked(|| {
+        // MAX_RETRIES passes: each decrements the budget and requeues.
+        for _ in 0..test_support::MAX_RETRIES {
+            let _ = oom::reap_all();
+            if test_support::queued_len() != 1 {
+                return Err("victim dropped before retry bound reached");
+            }
+        }
+        // One more pass with the budget exhausted: victim abandoned, queue empty.
+        let _ = oom::reap_all();
+        if test_support::queued_len() != 0 {
+            return Err("victim not abandoned after retry bound exhausted");
+        }
+        Ok(())
+    });
+
+    if let Err(msg) = outcome {
+        test_support::drain_queue();
+        forget_sole_as(as_arc);
+        return TestResult::Fail(msg);
+    }
+    if test_support::abandoned_count() != abandoned_before + 1 {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("abandonment not accounted");
+    }
+    if oom::reap_pending() {
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reap_pending set after abandonment with empty queue");
+    }
+    // The AS was never reaped (lock held throughout); its frames belong to the
+    // AS still. Drop the Arc so its own teardown frees them (no leak).
+    drop(as_arc);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_oom_reaper_honors_retry_bound);
+
+/// A `vm_shared` (formerly-multithreaded) victim is NOT reaped while another
+/// `Arc` clone exists (a live sibling thread), but IS reaped once that clone is
+/// dropped (last thread exited => reaper is sole owner) — the vm_shared
+/// soundness gate.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner() -> TestResult {
+    use crate::oom::{self, test_support, OomVictim};
+
+    test_support::arm_queue();
+    test_support::drain_queue();
+
+    let vbase = 0x0000_0080_0E00_0000u64;
+    let pages = 3usize;
+    let Some(as_arc) = build_reapable_as(vbase, pages) else {
+        return TestResult::Skip("could not build reapable AS");
+    };
+    // Mark it multithreaded and simulate a still-live sibling thread by holding
+    // an extra Arc clone (a scheduler slot's clone in production).
+    as_arc.mark_vm_shared();
+    let sibling = as_arc.clone();
+
+    if !test_support::enqueue(OomVictim {
+        pid: 4444,
+        tid: 4444,
+        rss_pages: pages,
+        address_space: as_arc.clone(),
+        retries_left: 0,
+    }) {
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("victim not enqueued");
+    }
+
+    // Sibling still live (strong_count > 1): reap_all must defer, not reap.
+    let freed_live = oom::reap_all();
+    if freed_live != 0 {
+        test_support::drain_queue();
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("reaped a vm_shared AS with a live sibling");
+    }
+    if test_support::queued_len() != 1 {
+        test_support::drain_queue();
+        drop(sibling);
+        forget_sole_as(as_arc);
+        return TestResult::Fail("vm_shared victim dropped instead of requeued");
+    }
+
+    // Last thread exits: drop the sibling clone, then our own local clone, so
+    // the only remaining Arc is the queued victim's — the reaper is now the sole
+    // owner (strong_count == 1) and may safely reap the formerly-vm_shared AS.
+    // We deliberately hold no clone during reap: reap_all consumes and drops the
+    // queued victim, whose Drop teardown (a safe no-op over the zeroed backing)
+    // reclaims the page tables. No post-reap AS access, so no use-after-free.
+    drop(sibling);
+    let before_reap = crate::frame::stats().free;
+    drop(as_arc);
+
+    let freed = oom::reap_all();
+    if freed != pages {
+        test_support::drain_queue();
+        return TestResult::Fail("vm_shared AS not reaped after sole ownership");
+    }
+    if test_support::queued_len() != 0 || oom::reap_pending() {
+        return TestResult::Fail("queue not drained after vm_shared reap");
+    }
+    // The reaped data frames returned to the pool.
+    if crate::frame::stats().free < before_reap + pages {
+        return TestResult::Fail("reaped vm_shared frames did not return to pool");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_oom_reaper_defers_vm_shared_until_sole_owner
 );
 
 /// Frame-backed vmalloc: a 64 KiB `valloc` (the order-4 size that defeats a

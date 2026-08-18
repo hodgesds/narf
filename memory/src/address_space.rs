@@ -2070,16 +2070,38 @@ impl AddressSpace {
     /// Reclaim the resident private, unlocked, anonymous frames of this address
     /// space out from under a victim the OOM killer has already SIGKILLed,
     /// without waiting for it to schedule and run its own exit teardown.
-    /// Returns the number of base pages freed. See `crate::oom` for the whole
+    /// Returns the number of base pages freed. Equivalent to
+    /// [`reap_anonymous_owned`](Self::reap_anonymous_owned) with
+    /// `sole_owner = false` (so a still-`vm_shared` AS is left alone), reporting
+    /// only the freed-page count. Prefer the `_owned` form from the reaper,
+    /// which can also reap a `vm_shared` AS once it is confirmed single-owner
+    /// and distinguishes "blocked, retry" from "nothing to do".
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn reap_anonymous(&self) -> usize {
+        match self.reap_anonymous_owned(false) {
+            crate::oom::ReapOutcome::Reaped(n) => n,
+            crate::oom::ReapOutcome::Nothing | crate::oom::ReapOutcome::Blocked => 0,
+        }
+    }
+
+    /// Reclaim the resident private, unlocked, anonymous frames of a SIGKILLed
+    /// victim, reporting whether the pass made progress, found nothing, or was
+    /// temporarily blocked and should be retried. See `crate::oom` for the whole
     /// soundness argument; in brief:
     ///
     ///   * The reaper holds an `Arc` to this AS, so the last-`Arc` `Drop`
     ///     teardown (which frees the same frames) cannot run concurrently —
     ///     no double free.
-    ///   * Only single-threaded (`!vm_shared`) victims are reaped, and the
-    ///     region table is taken with `try_lock`. So no sibling thread is
-    ///     mid-fault on this table and no CPU is spinning on this lock while
-    ///     the forced shootdown below waits for acks — that would deadlock.
+    ///   * No sibling thread may be mid-fault on this table. For a
+    ///     single-threaded (`!vm_shared`) victim that holds by construction. For
+    ///     a formerly-multithreaded (`vm_shared`) victim, `sole_owner` — passed
+    ///     by the reaper as `Arc::strong_count(as) == 1` — proves every sibling
+    ///     thread has exited and dropped its scheduler-slot `Arc`, so none is
+    ///     live; a `vm_shared` victim that is not yet `sole_owner` returns
+    ///     [`ReapOutcome::Blocked`] to be retried later. The region table is
+    ///     taken with `try_lock` (a failure also returns `Blocked`), so no CPU
+    ///     is spinning on it while the forced shootdown below waits for acks —
+    ///     that would deadlock.
     ///   * A forced full user-TLB shootdown lands before any frame is freed, so
     ///     a CPU still momentarily running the doomed task cannot alias a reused
     ///     frame through a stale entry; its next access re-faults, and the
@@ -2088,12 +2110,20 @@ impl AddressSpace {
     /// SHARED (borrowed) and LOCKED regions, huge regions, and swap slots are
     /// left for the victim's own exit, matching every other teardown path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    pub fn reap_anonymous(&self) -> usize {
-        if self.root.as_u64() == 0 || self.is_vm_shared() {
-            return 0;
+    pub fn reap_anonymous_owned(&self, sole_owner: bool) -> crate::oom::ReapOutcome {
+        use crate::oom::ReapOutcome;
+        if self.root.as_u64() == 0 {
+            return ReapOutcome::Nothing;
+        }
+        // A `vm_shared` AS may be resident on a live sibling until the LAST
+        // thread exits; reap it only once the reaper is the sole `Arc` holder
+        // (no scheduler slot references it => no live thread). Otherwise defer.
+        if self.is_vm_shared() && !sole_owner {
+            return ReapOutcome::Blocked;
         }
         let Some(mut regions) = self.regions.try_lock() else {
-            return 0;
+            // Lock transiently held; a later pass retries.
+            return ReapOutcome::Blocked;
         };
 
         // Pass 1: tear down every reapable leaf PTE with local invalidation.
@@ -2108,14 +2138,17 @@ impl AddressSpace {
             reaped_any = true;
         }
         if !reaped_any {
-            return 0;
+            return ReapOutcome::Nothing;
         }
 
         // ONE forced full user-TLB shootdown across ALL CPUs. Unlike the
         // vm_shared-gated `flush_region_broadcast`, the reaper runs cross-task
-        // and cannot assume the doomed AS is resident only on the local CPU.
-        // No CPU can be spinning on this region lock (`!vm_shared` + we hold it
-        // via try_lock), so the ack-wait cannot deadlock.
+        // and cannot assume the doomed AS is resident only on the local CPU;
+        // for a formerly-`vm_shared` victim this flushes any stale entry left on
+        // a CPU a now-dead thread last ran on. No CPU can be spinning on this
+        // region lock (we hold it via try_lock; no live thread can contend it —
+        // `!vm_shared`, or `sole_owner` proves all siblings exited), so the
+        // ack-wait cannot deadlock.
         #[cfg(target_arch = "x86_64")]
         {
             // SAFETY: CPL=0; the local invalidation phase completed above.
@@ -2140,12 +2173,28 @@ impl AddressSpace {
                 }
             }
         }
-        freed
+        ReapOutcome::Reaped(freed)
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn reap_anonymous(&self) -> usize {
         0
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn reap_anonymous_owned(&self, _sole_owner: bool) -> crate::oom::ReapOutcome {
+        crate::oom::ReapOutcome::Nothing
+    }
+
+    /// Run `body` while holding this AS's region-table lock, so the crate's own
+    /// tests can exercise the reaper's `try_lock`-failure (requeue) path — while
+    /// the lock is held, [`reap_anonymous_owned`](Self::reap_anonymous_owned)
+    /// returns [`ReapOutcome::Blocked`](crate::oom::ReapOutcome::Blocked).
+    /// Test-support only; consumed by x86_64-only reaper smokes.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn with_regions_locked<R>(&self, body: impl FnOnce() -> R) -> R {
+        let _guard = self.regions.lock();
+        body()
     }
 
     /// Tear down every leaf PTE of `region` with LOCAL invalidation only
