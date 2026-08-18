@@ -676,17 +676,45 @@ pub fn __reset_shrinkers_for_test() {
     *SHRINKERS.lock() = [None; MAX_SHRINKERS];
 }
 
+/// Test-only: clear the per-page frame LRU (slots + both lists + stats) so a
+/// test's registered pages never leak into another test. Mirrors
+/// [`__reset_shrinkers_for_test`]; both exist because the reclaim unit tests
+/// share the global `STATE`/`SHRINKERS` statics and the in-kernel test runner
+/// executes them sequentially without forking.
+#[doc(hidden)]
+pub fn __reset_lru_for_test() {
+    let mut state = STATE.lock();
+    state.slots.clear();
+    state.active.clear();
+    state.inactive.clear();
+    state.reclaim_count = 0;
+    state.reclaim_attempts = 0;
+    state.sweep_count = 0;
+}
+
 /// Free up to `target` reclaimable pages for a caller under allocation
 /// pressure — the direct-reclaim entry point. Returns the number freed.
 ///
 /// ALLOCATION-FREE: this is called from `GlobalAlloc::alloc` when an
 /// allocation fails, where allocating is precisely what must not happen.
-/// It therefore drives only the shrinker path (`shrink_all`), which is
-/// allocation-free; the per-page frame LRU (`reclaim_target_pages`) is
-/// NOT yet included because it snapshots into a `Vec` — it will join once
-/// it is made allocation-free (and once a producer registers frames).
+/// Both arms it drives are allocation-free:
+///   1. the per-page frame LRU (`reclaim_target_pages`) — reclaims the
+///      oldest cold tracked frames first (proper aging), and
+///   2. the shrinker path (`shrink_all`) for the remaining deficit —
+///      count/scan reclaimers such as the page cache.
+///
+/// The frame LRU runs first so per-page aging decides eviction order
+/// before the coarser shrinkers run; with no frames registered it simply
+/// returns 0 and the shrinkers carry the whole target.
 pub fn try_to_free(target: usize) -> usize {
-    shrink_all(target)
+    if target == 0 {
+        return 0;
+    }
+    let freed = reclaim_target_pages(target);
+    if freed >= target {
+        return freed;
+    }
+    freed + shrink_all(target - freed)
 }
 
 /// Watermark-math tests. Always compiled (not `#[cfg(test)]`) so they
@@ -934,6 +962,76 @@ mod shrinker_tests {
         result
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_proportional);
+}
+
+/// Frame-LRU ↔ `try_to_free` integration tests. Always compiled so they
+/// register + run under `cargo xtask test`. (The crate's `#[cfg(test)] mod
+/// tests` cannot link on the host — it references kernel-only symbols such
+/// as `__text_start` — so those host-only tests never execute anywhere;
+/// this module gives the direct-reclaim path real in-kernel coverage.)
+/// Exercises the allocation-free `reclaim_target_pages` batch path through
+/// the `try_to_free` entry point, including the multi-batch loop. Resets the
+/// LRU + shrinker registries before/after so pages never leak between tests.
+mod frame_lru_tests {
+    use super::{
+        __reset_lru_for_test, __reset_shrinkers_for_test, lru_stats, register_page, try_to_free,
+        PageEntry, PageFlags, PhysAddr, ReclaimFn, ReclaimOutcome, INITIAL_AGE,
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn handler_always_freed(_phys: PhysAddr) -> ReclaimOutcome {
+        ReclaimOutcome::Freed
+    }
+
+    fn mk_entry(phys_raw: u64, reclaim_fn: ReclaimFn) -> PageEntry {
+        PageEntry {
+            phys: PhysAddr::new(phys_raw),
+            reclaim_fn,
+            flags: PageFlags::empty(),
+            age: INITIAL_AGE,
+        }
+    }
+
+    fn smoke_try_to_free_drains_frame_lru() -> TestResult {
+        __reset_lru_for_test();
+        __reset_shrinkers_for_test();
+        // More pages than one BATCH (8) so try_to_free must loop the
+        // allocation-free batch path across a batch boundary.
+        for i in 0..10 {
+            let _ = register_page(mk_entry(0x30_0000 + i * 0x1000, handler_always_freed));
+        }
+        let result = (|| {
+            if lru_stats().inactive != 10 {
+                return TestResult::Fail("setup: expected 10 inactive pages");
+            }
+            // With no shrinkers registered the whole target comes from the
+            // frame LRU. Ask for 2 — get exactly 2; the shrinker arm isn't
+            // reached because the LRU already satisfies the target.
+            if try_to_free(2) != 2 {
+                return TestResult::Fail("try_to_free did not free 2 from the frame LRU");
+            }
+            if lru_stats().total != 8 {
+                return TestResult::Fail("try_to_free left the wrong tracked count");
+            }
+            // Ask for more than remain, spanning the 8-page batch boundary —
+            // caps at the 8 still tracked.
+            if try_to_free(100) != 8 {
+                return TestResult::Fail("try_to_free did not drain across batches");
+            }
+            if lru_stats().total != 0 {
+                return TestResult::Fail("frame LRU not fully drained");
+            }
+            // Zero target is a no-op.
+            if try_to_free(0) != 0 {
+                return TestResult::Fail("try_to_free(0) should be a no-op");
+            }
+            TestResult::Pass
+        })();
+        __reset_lru_for_test();
+        __reset_shrinkers_for_test();
+        result
+    }
+    kernel_test_in!("memory/reclaim", smoke_try_to_free_drains_frame_lru);
 }
 
 /// Reclaim handler outcome. The owner reports back what happened
@@ -1415,87 +1513,76 @@ pub fn reclaim_target_pages(n: usize) -> usize {
     // lock, drop the lock, invoke handlers, then re-acquire to
     // apply outcomes. Repeat until we hit `n` or run out.
     //
-    // Batch size of 8 is a balance between lock-thrash and
-    // worst-case wasted candidates if the first reclaim frees
-    // everyone else (very rare). It also bounds stack growth from
-    // the Vec.
+    // ALLOCATION-FREE: the batch lives in fixed-size stack arrays, never
+    // the heap. `reclaim_target_pages` runs on the direct-reclaim path
+    // (`try_to_free`), reached precisely when allocation is already
+    // failing, so it must not allocate. Batch size 8 balances lock-thrash
+    // against the rare case where the first reclaim would have freed the
+    // rest; every field is `Copy`, so the scratch arrays need no drop glue.
     const BATCH: usize = 8;
+    type Candidate = (PageHandle, PhysAddr, PageFlags, ReclaimFn, bool);
 
     while freed < n {
-        // Pull a batch of candidates from the tail.
-        let batch: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimFn, bool)> = {
+        let take = core::cmp::min(BATCH, n - freed);
+
+        // Pull a batch of candidates from the inactive tail under the
+        // lock (oldest cold pages first). Survivors are re-queued after
+        // the lock is dropped and handlers have run.
+        let mut cand: [Option<Candidate>; BATCH] = [None; BATCH];
+        let mut cand_len = 0usize;
+        {
             let mut state = STATE.lock();
-            let take = core::cmp::min(BATCH, n - freed);
-            let mut out: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimFn, bool)> = Vec::new();
-            // Pop from the back (oldest cold pages). We re-queue
-            // any survivors after the lock is dropped + handlers
-            // have run.
-            for _ in 0..take {
+            for slot in cand.iter_mut().take(take) {
                 let Some(handle) = state.inactive.pop_back() else {
                     break;
                 };
                 let Some(idx) = state.find(handle) else {
-                    // Stale list entry — shouldn't happen, but if
-                    // it does just drop it and keep going.
+                    // Stale list entry — shouldn't happen; drop it and
+                    // keep going (wastes a batch slot, as before).
                     continue;
                 };
                 let entry = state.slots[idx].entry;
                 let locked = entry.flags.contains(PageFlags::LOCKED);
-                out.push((handle, entry.phys, entry.flags, entry.reclaim_fn, locked));
+                *slot = Some((handle, entry.phys, entry.flags, entry.reclaim_fn, locked));
+                cand_len += 1;
             }
-            out
-        };
+        }
 
-        if batch.is_empty() {
+        if cand_len == 0 {
             break;
         }
 
-        // Outside the lock — invoke handlers.
-        let mut results: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimOutcome)> =
-            Vec::with_capacity(batch.len());
-        for (handle, phys, flags, reclaim_fn, locked) in batch {
-            if locked {
-                results.push((handle, phys, flags, ReclaimOutcome::Locked));
+        // Outside the lock — invoke each handler and, for `DeferToPager`,
+        // hand the frame to the installed pager (which may allocate / take
+        // its own locks, so it must run with no reclaim lock held). The
+        // pager result is diagnostic-only until the Wave C+1 side-table
+        // lands (see `ReclaimOutcome::DeferToPager`) — a successful
+        // page-out does not yet free the frame or record `(handle, phys) →
+        // SwapSlot` for `page_in` recovery — so we discard it here.
+        // `outc` mirrors `cand` slot-for-slot.
+        let mut outc: [Option<(PageHandle, ReclaimOutcome)>; BATCH] = [None; BATCH];
+        for (slot, out) in cand.iter().zip(outc.iter_mut()) {
+            let Some((handle, phys, flags, reclaim_fn, locked)) = *slot else {
                 continue;
+            };
+            let outcome = if locked {
+                ReclaimOutcome::Locked
+            } else {
+                reclaim_fn(phys)
+            };
+            if outcome == ReclaimOutcome::DeferToPager {
+                let _ = crate::pager::page_out_via_installed(phys, flags);
             }
-            let outcome = reclaim_fn(phys);
-            results.push((handle, phys, flags, outcome));
-        }
-
-        // Pager dispatch happens *outside* the state lock — the
-        // pager impl may take its own locks / allocate / touch the
-        // heap. Collect the page-out results here, then apply
-        // bookkeeping under the state lock below.
-        //
-        // Wave C scope note: a successful `page_out` does **not**
-        // yet free the physical frame or maintain a reverse-mapping
-        // side-table mapping `(handle, phys) → SwapSlot`. Owners
-        // currently have no way to recover the page via `page_in`;
-        // the deliverable for this wave is the *seam*, not a live
-        // swap. Wave C+1 will:
-        //   1. free the frame on `Ok(slot)`,
-        //   2. record the slot in a side-table keyed by handle,
-        //   3. surface the slot to the owner so it can call
-        //      `pager::page_in` on demand.
-        // Until then we treat `DeferToPager → Ok(_)` as a no-op
-        // bookkeeping-wise (keep the page tracked, same as
-        // `Locked`) so the system stays correct.
-        let mut pager_dispositions: Vec<(
-            PageHandle,
-            Result<crate::pager::SwapSlot, crate::pager::PagerError>,
-        )> = Vec::new();
-        for (handle, phys, flags, outcome) in &results {
-            if matches!(outcome, ReclaimOutcome::DeferToPager) {
-                let res = crate::pager::page_out_via_installed(*phys, *flags);
-                pager_dispositions.push((*handle, res));
-            }
+            *out = Some((handle, outcome));
         }
 
         // Apply outcomes under the lock.
         {
             let mut state = STATE.lock();
-            let mut pager_iter = pager_dispositions.into_iter();
-            for (handle, _phys, _flags, outcome) in results {
+            for out in outc.iter() {
+                let Some((handle, outcome)) = *out else {
+                    continue;
+                };
                 state.reclaim_attempts = state.reclaim_attempts.wrapping_add(1);
                 match outcome {
                     ReclaimOutcome::Freed => {
@@ -1510,10 +1597,10 @@ pub fn reclaim_target_pages(n: usize) -> usize {
                             state.slots[idx].entry.flags =
                                 state.slots[idx].entry.flags.union(PageFlags::DIRTY);
                         }
-                        // Push to front of inactive (newest cold)
-                        // so the next call doesn't immediately
-                        // retry the same dirty page — the writeback
-                        // path gets a chance to clean it.
+                        // Push to front of inactive (newest cold) so the
+                        // next call doesn't immediately retry the same
+                        // dirty page — the writeback path gets a chance
+                        // to clean it.
                         state.inactive.push_front(handle);
                     }
                     ReclaimOutcome::Locked => {
@@ -1524,30 +1611,23 @@ pub fn reclaim_target_pages(n: usize) -> usize {
                         state.inactive.push_front(handle);
                     }
                     ReclaimOutcome::DeferToPager => {
-                        // Pull the matching pager result. The pre-
-                        // pass above pushed one entry per
-                        // `DeferToPager` outcome in iteration order,
-                        // so the head of the iterator is ours.
-                        let _ = pager_iter.next();
-                        // TODO(wave-C+1): on Ok(slot), free the
-                        // frame and stash the slot in a side-table.
-                        // For now, leave the page tracked on
-                        // inactive — same disposition as Locked —
-                        // so subsequent reclaim passes can retry.
+                        // Page was handed to the pager above; keep it
+                        // tracked on inactive (same disposition as Locked)
+                        // until the Wave C+1 side-table frees it on
+                        // success, so subsequent passes can retry.
                         state.inactive.push_front(handle);
                     }
                 }
             }
         }
 
-        // If the batch produced no `Freed`s, we'd loop forever on
-        // a list full of Dirty / Locked pages. Detect and bail.
+        // If the batch produced no `Freed`s, we'd loop forever on a list
+        // full of Dirty / Locked pages. Detect and bail. If we got *some*
+        // freed but no more candidates could pop next iteration, the loop
+        // exits naturally via the empty batch.
         if freed == 0 {
             break;
         }
-        // Likewise: if we got *some* freed but no more candidates
-        // could pop next iteration, the loop naturally exits via
-        // the empty batch.
     }
 
     freed
