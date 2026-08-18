@@ -5147,11 +5147,17 @@ impl RingBuf {
             )
         };
         let readable = data || closed;
-        let add = (if readable { narf_filesystem::POLL_IN } else { 0 })
-            | (if space { narf_filesystem::POLL_OUT } else { 0 })
+        let add = (if readable {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }) | (if space { narf_filesystem::POLL_OUT } else { 0 })
             | (if closed { narf_filesystem::POLL_HUP } else { 0 });
-        let clear = (if readable { 0 } else { narf_filesystem::POLL_IN })
-            | (if space { 0 } else { narf_filesystem::POLL_OUT })
+        let clear = (if readable {
+            0
+        } else {
+            narf_filesystem::POLL_IN
+        }) | (if space { 0 } else { narf_filesystem::POLL_OUT })
             | (if closed { 0 } else { narf_filesystem::POLL_HUP });
         self.readiness.set(add, clear);
     }

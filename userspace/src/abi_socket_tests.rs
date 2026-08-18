@@ -929,7 +929,11 @@ fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
         const EISCONN: i64 = -56;
         let srv = open_unix_stream()?;
         let (addr, alen) = unix_sockaddr(b"/abi-connect-twice");
-        if call(Syscall::SocketBind.raw(), a2(srv, addr.as_ptr() as u64, alen)).ok_or("bind status")?
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
             != 0
         {
             return Err("bind failed");
@@ -938,16 +942,22 @@ fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
             return Err("listen failed");
         }
         let cli = open_unix_stream()?;
-        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen))
-            .ok_or("connect status")?
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
             != 0
         {
             return Err("first connect failed");
         }
         // Second connect on the SAME connected fd: EISCONN, and it must NOT
         // enqueue a ghost server endpoint.
-        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen))
-            .ok_or("connect2 status")?
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect2 status")?
             != EISCONN
         {
             return Err("second connect on a connected fd did not return -EISCONN");
@@ -976,7 +986,8 @@ fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
         }
         // No ghost queued: a non-blocking accept4 on the now-empty listener must
         // return EAGAIN, not a second (dead) connection.
-        if call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, SOCK_NONBLOCK)).ok_or("accept4 status")?
+        if call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, SOCK_NONBLOCK))
+            .ok_or("accept4 status")?
             != EAGAIN
         {
             return Err("a ghost pending connection was left queued after EISCONN");
@@ -3802,8 +3813,11 @@ fn smoke_abi_socket_send_full_ring_reports_eagain() -> TestResult {
         if got <= 0 {
             return Err("draining the peer returned no bytes");
         }
-        let resumed = call(Syscall::SocketSend.raw(), a3(fd0, sink.as_ptr() as u64, 1, 0))
-            .ok_or("post-drain send status")?;
+        let resumed = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, sink.as_ptr() as u64, 1, 0),
+        )
+        .ok_or("post-drain send status")?;
         if resumed <= 0 {
             return Err("send did not resume after the peer freed ring space");
         }

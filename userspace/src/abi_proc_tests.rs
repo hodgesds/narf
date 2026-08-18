@@ -1026,9 +1026,11 @@ fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
             // T's controlling terminal is the console; its fg pgrp is LEADER.
             crate::handlers::set_controlling_tty_console(T_TASK);
             narf_filesystem::console_tty::set_fg_pgrp(LEADER_TASK);
-            let info =
-                crate::handlers::proc_task_info(T_PID, narf_filesystem::procfs::TaskInfoQuery::Basic)
-                    .ok_or("proc_task_info returned None for a live task")?;
+            let info = crate::handlers::proc_task_info(
+                T_PID,
+                narf_filesystem::procfs::TaskInfoQuery::Basic,
+            )
+            .ok_or("proc_task_info returned None for a live task")?;
             if info.tty_nr != CONSOLE_DEV {
                 return Err("tty_nr was not the console device (5,1) for a console-ctty task");
             }
@@ -1039,9 +1041,11 @@ fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
             }
             // Detached from the controlling tty → tty_nr 0, tpgid -1 (Linux).
             crate::handlers::detach_controlling_tty(T_TASK);
-            let info2 =
-                crate::handlers::proc_task_info(T_PID, narf_filesystem::procfs::TaskInfoQuery::Basic)
-                    .ok_or("proc_task_info returned None after detach")?;
+            let info2 = crate::handlers::proc_task_info(
+                T_PID,
+                narf_filesystem::procfs::TaskInfoQuery::Basic,
+            )
+            .ok_or("proc_task_info returned None after detach")?;
             if info2.tty_nr != 0 || info2.tpgid != -1 {
                 return Err("a task with no controlling tty must render tty_nr 0, tpgid -1");
             }
