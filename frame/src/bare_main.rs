@@ -147,8 +147,8 @@ async fn kswapd_kthread() {
                 // kthread context (may allocate candidate lists), NOT on the
                 // allocation-failure path, and is a no-op until a policy is
                 // installed / on arches without swap.
-                freed = freed
-                    .saturating_add(narf_memory::reclaim::reclaim_anon_pages(target - freed));
+                freed =
+                    freed.saturating_add(narf_memory::reclaim::reclaim_anon_pages(target - freed));
             }
             if freed == 0 {
                 // No forward progress — nothing more to shed this wake.

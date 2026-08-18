@@ -43,6 +43,7 @@ pub mod container;
 #[cfg(feature = "linux-compat")]
 pub mod linux_compat;
 
+pub mod anon_reclaim;
 #[cfg(feature = "linux-compat")]
 pub(crate) mod bpf_iter;
 pub mod coredump;
@@ -65,7 +66,6 @@ mod mapped_file;
 #[cfg(feature = "linux-compat")]
 pub mod mount_api;
 #[cfg(feature = "linux-compat")]
-pub mod anon_reclaim;
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;
