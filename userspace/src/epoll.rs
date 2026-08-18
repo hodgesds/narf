@@ -1256,6 +1256,24 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // owns delivery; a strict no-op until an fd migrates.
                         if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
                             instance.arm_readiness_cells(task, &w);
+                            // Register-then-recheck — closes the collect_ready ->
+                            // arm lost-wake window. A fd that went ready AFTER the
+                            // top collect_ready but before/at `arm_readiness_cells`
+                            // fired its `set` while no waker was armed, and no
+                            // future `set` will re-fire it, so parking here would
+                            // STRAND the wait forever (this is exactly what the
+                            // epoll-park census flags as `STRAND`, now unmasked
+                            // since the 10ms park backstop was deleted).
+                            // `poll_readiness()` non-destructively mirrors
+                            // collect_ready's exact delivery filters; if it now
+                            // reports deliverable, self-wake so the park
+                            // re-executes and delivers instead of stranding.
+                            // Mirrored filters mean a benign always-writable
+                            // EPOLLOUT or an already-consumed EPOLLET edge does
+                            // NOT trigger, so this cannot spin.
+                            if instance.poll_readiness() != 0 {
+                                w.wake_by_ref();
+                            }
                         }
                         // SAFETY: Valid memory or trusted environment
                         unsafe {
