@@ -1388,6 +1388,10 @@ impl SocketFile {
         target
             .netlink_readable_token
             .fetch_add(1, Ordering::Release);
+        // Durable targeted wake (see the broadcast path): fire the target's
+        // armed `uevent_readiness` cell so an epoll consumer cannot miss this
+        // unicast delivery; `notify(0)` remains the non-epoll fallback.
+        target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
@@ -1440,10 +1444,23 @@ impl SocketFile {
             target
                 .netlink_readable_token
                 .fetch_add(1, Ordering::Release);
+            // Durable, targeted, lost-wake-proof wake: fire the target's
+            // `uevent_readiness` cell (armed by its epoll registration,
+            // `Arm::Uevent`). `Readiness::set` wakes the exact registered
+            // waiter under its lock — the same mechanism the group-1 RING path
+            // and every AF_UNIX ring already use. Previously the group-2 inbox
+            // path had no way to set this cell, so a subscriber's durable arm
+            // never fired and delivery leaned entirely on the `notify(0)` herd
+            // below; that herd stays only as the fallback for a NON-epoll
+            // waiter (a plain `recv`/`ppoll` blocker parks on the generation
+            // guard, not this cell) and for non-uevent netlink families whose
+            // cell this is not.
+            target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
             delivered += 1;
         }
         if delivered > 0 {
-            // Wake any parked poll/epoll waiter on a subscribed socket.
+            // Fallback herd wake for non-epoll waiters + non-uevent families
+            // (see the per-target durable wake above).
             narf_net::readiness::notify(0);
         }
         SocketOpResult::Ok(buf.len() as u64)
@@ -6413,6 +6430,117 @@ fn smoke_netlink_group_broadcast_advances_edge_token() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_group_broadcast_advances_edge_token
+);
+
+/// A host-test waker that counts wakes via an `Arc<AtomicU32>` smuggled through
+/// the `RawWaker` data pointer (mirrors `lib/src/readiness.rs`'s test waker).
+fn counting_waker(counter: &alloc::sync::Arc<core::sync::atomic::AtomicU32>) -> core::task::Waker {
+    use core::sync::atomic::Ordering as O;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    type Cell = core::sync::atomic::AtomicU32;
+    fn clone(p: *const ()) -> RawWaker {
+        // SAFETY: `p` is an `Arc<Cell>` raw ptr minted below / by a prior clone.
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        let cloned = arc.clone();
+        let _ = alloc::sync::Arc::into_raw(arc);
+        RawWaker::new(alloc::sync::Arc::into_raw(cloned) as *const (), &VTABLE)
+    }
+    fn wake(p: *const ()) {
+        // SAFETY: consumes the Waker's ref.
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        arc.fetch_add(1, O::Relaxed);
+    }
+    fn wake_by_ref(p: *const ()) {
+        // SAFETY: borrows without consuming (re-leak the ref).
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        arc.fetch_add(1, O::Relaxed);
+        let _ = alloc::sync::Arc::into_raw(arc);
+    }
+    fn drop_fn(p: *const ()) {
+        // SAFETY: drops the Waker's ref.
+        unsafe { drop(alloc::sync::Arc::from_raw(p as *const Cell)) }
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+    let raw = alloc::sync::Arc::into_raw(counter.clone()) as *const ();
+    // SAFETY: `raw` + VTABLE form a valid RawWaker per the fns above.
+    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+}
+
+/// The durable-wake migration: a group-2 broadcast must fire the subscriber's
+/// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not
+/// merely advance a token the herd `notify(0)` happens to re-check. This is the
+/// "impossible to miss by design" guarantee: the arm and the set serialize on
+/// the cell lock, so a broadcast in the check->register window can never be
+/// lost. Without the migration the group-2 inbox path never touched this cell.
+fn smoke_netlink_group_broadcast_fires_durable_waker() -> TestResult {
+    use core::sync::atomic::Ordering as O;
+    use core::task::Poll;
+    const UDEV_GROUP_MASK: u32 = 2;
+    const OTHER_GROUP_MASK: u32 = 4;
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let bystander = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    for (sock, mask) in [(&listener, UDEV_GROUP_MASK), (&bystander, OTHER_GROUP_MASK)] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    // Arm each cell exactly as an epoll registration would (Arm::Uevent ->
+    // uevent_readiness.arm), with a distinct counting waker.
+    let want = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let idle = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let want_waker = counting_waker(&want);
+    let idle_waker = counting_waker(&idle);
+    if listener
+        .uevent_readiness
+        .arm(1, narf_filesystem::POLL_IN, &want_waker)
+        != Poll::Pending
+    {
+        return TestResult::Fail("subscriber cell should arm Pending before any broadcast");
+    }
+    if bystander
+        .uevent_readiness
+        .arm(1, narf_filesystem::POLL_IN, &idle_waker)
+        != Poll::Pending
+    {
+        return TestResult::Fail("bystander cell should arm Pending before any broadcast");
+    }
+
+    // udevd re-broadcasts a processed device to group 2.
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: b"add@/devices/platform/narf-drm/card0",
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("group-2 broadcast send failed");
+    }
+
+    // Positive: the subscriber's durable waker fired.
+    if want.load(O::Relaxed) == 0 {
+        return TestResult::Fail(
+            "group-2 broadcast did not fire the armed durable waker — wake can still be missed",
+        );
+    }
+    // Negative: a socket in a different group got no durable wake from it.
+    if idle.load(O::Relaxed) != 0 {
+        return TestResult::Fail("a non-group-2 socket's durable waker fired on a group-2 send");
+    }
+    listener.uevent_readiness.disarm(1);
+    bystander.uevent_readiness.disarm(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_group_broadcast_fires_durable_waker
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {
