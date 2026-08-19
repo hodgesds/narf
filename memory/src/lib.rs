@@ -44,6 +44,7 @@ pub mod oom;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
+pub mod rmap;
 pub mod ro_after_init;
 // The slab writes intrusive free-list links + per-block canaries INTO freed
 // blocks; under KASAN those blocks are poisoned, so the slab's own accesses
