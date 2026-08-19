@@ -4624,6 +4624,7 @@ pub(crate) fn terminate_current_task(
     // is killed by a signal rather than exit_group()ing, record WHICH signal —
     // pairs with the USEREXIT line in sys_exit_group so a flapping user@N.service
     // reports its cause on the console without the syscall-trace firehose.
+    #[cfg(feature = "cgroup")]
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         let comm = proc_comm_of(pid).unwrap_or_default();
         let cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
@@ -5472,6 +5473,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // Diagnostic: pid the CLONE_PIDFD pidfd is minted under. Compare with the
     // PIDFD-EXIT line for the same process's exit — a mismatch (or a
     // pidfd_found=false there) is the reap-hang root cause.
+    #[cfg(feature = "cgroup")]
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() && flags & CLONE_PIDFD != 0 && ca.pidfd != 0
     {
         use core::fmt::Write as _;
@@ -7638,6 +7640,10 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
 fn on_child_exit(child_pid: u64, child_tid: u64) {
+    // `child_tid` is consumed only by the cgroup-gated PIDFD-EXIT probe
+    // below; keep it live for the no-cgroup build.
+    #[cfg(not(feature = "cgroup"))]
+    let _ = child_tid;
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
     #[cfg(feature = "linux-compat")]
@@ -7652,6 +7658,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // the one the exit path reports — so its POLLIN-on-exit never fires and
     // systemd supervises a ghost (start job hangs "running"). Pair with the
     // PIDFD-MINT line at the CLONE_PIDFD site.
+    #[cfg(feature = "cgroup")]
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         use core::fmt::Write as _;
         let comm =

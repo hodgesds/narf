@@ -11,6 +11,7 @@ pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
     // HERE — comm is still live and the code is arg0 — gated on the light
     // cgevt_trace flag so it never fires in a normal boot. exit code 0 = a
     // clean/requested stop; non-zero maps to a systemd EXIT_* failure class.
+    #[cfg(feature = "cgroup")]
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         let comm = proc_comm_of_task(tid).unwrap_or_default();
         let cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
