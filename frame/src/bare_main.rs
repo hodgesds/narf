@@ -4107,6 +4107,7 @@ fn boot_userspace_init() {
     // `cgevt_trace` (bare flag): print every cgroup.events `populated`
     // transition so a service whose start job hangs on the cgroup settling
     // (e.g. a Type=oneshot in a fresh user slice) can be pinned.
+    #[cfg(feature = "cgroup")]
     if narf_boot::args().has_flag("cgevt_trace") {
         narf_filesystem::cgroupfs::set_cgevt_trace(true);
         let _ = writeln!(console::Writer, "  boot-init: cgroup events trace");
