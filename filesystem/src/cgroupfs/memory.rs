@@ -35,13 +35,14 @@
 //! kernel-wide frame LRU + shrinkers, and it runs in the allocator charge
 //! path, so it can only drive the *allocation-free* reclaim arms — it
 //! must NOT call `reclaim_anon_pages` (that may allocate; it is kswapd's
-//! job). Likewise the `max`-breach OOM uses the global
-//! `request_oom_relief`, whose `OomKiller::select_victim` picks the
-//! highest-badness task system-wide; victim selection is **not** yet
-//! scoped to the breaching cgroup's members. Follow-ups: (1) a per-cgroup
-//! reclaim LRU keyed on the cgroup's resident frames; (2) a
-//! cgroup-scoped OOM victim filter so `memory.oom.group` /
-//! per-cgroup limits kill inside the offending subtree.
+//! job). The `max`-breach OOM is **cgroup-scoped**: it collects the member
+//! pids of the charging task's cgroup subtree ([`super::oom_candidate_pids`])
+//! and calls `request_oom_relief_in`, so `OomKiller::select_victim_in` kills
+//! the highest-badness task INSIDE the offending hierarchy (an empty/unkillable
+//! subtree fails the charge as ENOMEM rather than reaching outside the cgroup).
+//! Follow-ups: (1) a per-cgroup reclaim LRU keyed on the cgroup's resident
+//! frames; (2) exact scoping when an ANCESTOR's limit breached (map the
+//! breaching MemoryState back to its cgroup) + `memory.oom.group` kill-all.
 //! * **`memory.current` / `memory.peak` — REAL.** Live charged-byte
 //!   totals, summed from actual frame allocations attributed to the
 //!   cgroup's tasks (no fabricated numbers).
@@ -193,10 +194,13 @@ fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
             if m.can_charge(amount) {
                 continue;
             }
-            // Still over: ask the OOM policy to kill a task (global victim
-            // selection today — see the module-level scope note), then give
-            // the freed frames one more re-check.
-            let killed = narf_memory::oom::request_oom_relief().is_some();
+            // Still over: ask the OOM policy to kill a task WITHIN this cgroup's
+            // subtree — cgroup v2 kills inside the offending hierarchy, not
+            // machine-wide — then give the freed frames one more re-check. An
+            // empty/unkillable subtree yields `None`, so the charge is failed as
+            // ENOMEM rather than reaching outside the cgroup.
+            let candidates = super::oom_candidate_pids(pid);
+            let killed = narf_memory::oom::request_oom_relief_in(&candidates).is_some();
             if killed {
                 m.note_oom_kill_event();
             }

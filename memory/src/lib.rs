@@ -39,11 +39,13 @@ pub mod hugepage;
 pub mod kasan;
 pub mod kaslr;
 pub mod mempolicy;
+pub mod migrate;
 pub mod numa_tier;
 pub mod oom;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
+pub mod rmap;
 pub mod ro_after_init;
 // The slab writes intrusive free-list links + per-block canaries INTO freed
 // blocks; under KASAN those blocks are poisoned, so the slab's own accesses

@@ -233,6 +233,42 @@ pub fn watermark_high() -> u64 {
     WMARK_HIGH.load(Ordering::Relaxed)
 }
 
+/// A NUMA node's proportional share of a global watermark, sized by its
+/// fraction of managed RAM. Pure (no globals) so it is unit-testable; mirrors
+/// Linux distributing per-zone watermarks by zone size. `0` when the global
+/// watermark or the grand total is `0`.
+fn node_watermark_share(global: u64, node_total: u64, grand_total: u64) -> u64 {
+    if global == 0 || grand_total == 0 {
+        return 0;
+    }
+    global.saturating_mul(node_total) / grand_total
+}
+
+/// Node `node`'s share of a live global watermark, from the frame allocator's
+/// per-node totals.
+fn node_share_of(global: u64, node: usize) -> u64 {
+    node_watermark_share(
+        global,
+        crate::frame::node_total(node) as u64,
+        WMARK_TOTAL_PAGES.load(Ordering::Relaxed),
+    )
+}
+
+/// True when NUMA `node`'s free pages have fallen below its share of the `low`
+/// watermark — the per-node signal that its `kswapd<node>` should reclaim.
+/// `false` when watermarks are unset.
+pub fn under_low_watermark_node(node: usize) -> bool {
+    let low = node_share_of(WMARK_LOW.load(Ordering::Relaxed), node);
+    low != 0 && (crate::frame::node_free(node) as u64) < low
+}
+
+/// Pages NUMA `node`'s kswapd should reclaim to lift it back to its share of
+/// the `high` watermark (`0` once it is at/above that share).
+pub fn reclaim_goal_node(node: usize) -> usize {
+    let high = node_share_of(WMARK_HIGH.load(Ordering::Relaxed), node);
+    high.saturating_sub(crate::frame::node_free(node) as u64) as usize
+}
+
 // ── Swappiness (vm.swappiness analogue) ────────────────────────────
 //
 // The single knob that balances kswapd's reclaim pressure between the file
@@ -325,7 +361,11 @@ static OOM_NEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// OOM-kill. Called from the frame allocator's exhaustion path.
 pub fn signal_oom_needed() {
     OOM_NEEDED.store(true, Ordering::Release);
-    wake_kswapd();
+    // Genuine kernel exhaustion is global: wake EVERY node's kswapd so each
+    // reclaims its own node and the OOM/reap backlog is drained (every kthread
+    // checks the OOM signal after its reclaim pass regardless of its own
+    // watermark; the signal is single-consumer, so exactly one kill results).
+    wake_all_kswapd();
 }
 
 /// Consume the pending-OOM signal (the reclaimer checks this before killing).
@@ -387,22 +427,35 @@ pub fn user_pressure_arms_oom() -> bool {
     !matches!(overcommit_mode(), OvercommitMode::Never)
 }
 
-/// Install the reclaimer wake hook (the kernel binary passes a `fn()` that
-/// wakes its parked kswapd/reaper kthread). Call once at boot.
-pub fn set_kswapd_wake_hook(hook: fn()) {
+/// Install the reclaimer wake hook (the kernel binary passes a `fn(usize)` that
+/// wakes the parked `kswapd<node>` kthread for the given NUMA node). Call once
+/// at boot.
+pub fn set_kswapd_wake_hook(hook: fn(usize)) {
     KSWAPD_WAKE_HOOK.store(hook as usize, Ordering::Release);
 }
 
-/// Wake the parked reclaimer kthread, if one is installed. Cheap and safe to
-/// call from the allocation path: the hook only flags + wakes a waker. No-op
-/// before the kthread is spawned.
-pub fn wake_kswapd() {
+/// Wake the parked `kswapd<node>` kthread for NUMA `node`, if one is installed.
+/// Cheap and safe to call from the allocation path: the hook only flags + wakes
+/// a waker. No-op before the kthreads are spawned. The allocator passes its
+/// local (pressured) node so only that node's kswapd is roused.
+pub fn wake_kswapd(node: usize) {
     let p = KSWAPD_WAKE_HOOK.load(Ordering::Acquire);
     if p != 0 {
-        // SAFETY: `p` was stored by `set_kswapd_wake_hook` from a live `fn()`,
-        // and `fn()` and `usize` are the same width on every target here.
-        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
-        hook();
+        // SAFETY: `p` was stored by `set_kswapd_wake_hook` from a live
+        // `fn(usize)`, and `fn(usize)` and `usize` are the same width here.
+        let hook: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(p) };
+        hook(node);
+    }
+}
+
+/// Wake EVERY online node's `kswapd<node>`. Used on genuine GLOBAL kernel
+/// exhaustion (not a single node's reserve breach): all nodes are pressured, so
+/// each node's kswapd should reclaim its own node in parallel and drain the OOM
+/// backlog. No-op before the kthreads are spawned.
+pub fn wake_all_kswapd() {
+    let nodes = (crate::frame::online_node_count() as usize).max(1);
+    for node in 0..nodes {
+        wake_kswapd(node);
     }
 }
 
@@ -965,7 +1018,10 @@ mod swappiness_tests {
 /// below. They exercise the pure `compute_watermarks`, so they never
 /// touch the live boot-installed watermark globals.
 mod watermark_tests {
-    use super::{compute_watermarks, derive_band, WMARK_MIN_CEIL_PAGES, WMARK_MIN_FLOOR_PAGES};
+    use super::{
+        compute_watermarks, derive_band, node_watermark_share, WMARK_MIN_CEIL_PAGES,
+        WMARK_MIN_FLOOR_PAGES,
+    };
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_reclaim_watermarks_ordered_and_scaled() -> TestResult {
@@ -1041,6 +1097,27 @@ mod watermark_tests {
         TestResult::Pass
     }
     kernel_test_in!("memory/reclaim", smoke_reclaim_watermark_scale_factor);
+
+    fn smoke_reclaim_node_watermark_share() -> TestResult {
+        // A node's share of a global watermark is proportional to its fraction
+        // of managed RAM: a 25%-of-RAM node gets 25% of the watermark, and the
+        // shares of a full partition sum back to the global value.
+        if node_watermark_share(1000, 250, 1000) != 250 {
+            return TestResult::Fail("25%-of-RAM node should get 25% of the watermark");
+        }
+        let a = node_watermark_share(1000, 250, 1000);
+        let b = node_watermark_share(1000, 750, 1000);
+        if a + b != 1000 {
+            return TestResult::Fail("per-node shares of a full partition must sum to global");
+        }
+        // Degenerate inputs are 0 (unset watermark / empty machine), never a
+        // divide-by-zero.
+        if node_watermark_share(0, 250, 1000) != 0 || node_watermark_share(1000, 250, 0) != 0 {
+            return TestResult::Fail("zero global or zero grand-total must yield 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/reclaim", smoke_reclaim_node_watermark_share);
 }
 
 /// Pure range-planner tests, registered in the in-kernel test image.

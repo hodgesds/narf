@@ -63,6 +63,7 @@ pub mod loader;
 #[cfg(feature = "linux-compat")]
 pub mod lsm;
 mod mapped_file;
+pub mod migrate;
 #[cfg(feature = "linux-compat")]
 pub mod mount_api;
 #[cfg(feature = "linux-compat")]

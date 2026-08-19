@@ -2060,7 +2060,8 @@ impl AddressSpace {
         // threaded process's stale entries can only live HERE, and the
         // per-page local INVLPGs above already dropped them.
         self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
-        // Pass 3: free the frames this region owns.
+        // Pass 3: free the frames this region owns (and drop their rmap entries;
+        // see free_region_frames).
         self.free_region_frames(region);
     }
 
@@ -2316,6 +2317,15 @@ impl AddressSpace {
     /// Borrowed (SHARED) frames belong to an external registry — never
     /// freed here. Callers must have completed the cross-CPU flush first.
     fn free_region_frames(&self, region: &Region) {
+        // Drop this region's reverse-map entries (frame → (this AS, va)) before
+        // the frames are freed/released. This is the single teardown choke point
+        // that BOTH `unmap_region` and `unmap_region_pages` route through.
+        for (i, p) in region.phys.iter().enumerate() {
+            if p.raw() != 0 {
+                let va = VirtAddr::new(region.base.as_u64() + (i as u64) * 4096);
+                crate::rmap::remove(*p, self.root, va);
+            }
+        }
         if region.perms.contains(RegionPerms::SHARED) {
             for phys in &region.phys {
                 release_shared_phys(*phys);
@@ -2866,6 +2876,8 @@ impl AddressSpace {
                         assert_eq!(region.phys[index], *phys);
                         region.phys[index] = PhysAddr::new(0);
                     }
+                    // Evicted to swap → no longer resident here; drop its rmap.
+                    crate::rmap::remove(*phys, self.root, VirtAddr::new(va));
                     table.swap_pages.insert(va, SwapPageState::Swapped);
                 }
             })
@@ -3041,6 +3053,8 @@ impl AddressSpace {
                         assert_eq!(region.phys[index], PhysAddr::new(0));
                         region.phys[index] = *phys;
                     }
+                    // Faulted back in and resident again → re-record its rmap.
+                    crate::rmap::add(*phys, self.root, VirtAddr::new(va));
                     table.swap_pages.remove(&va);
                 }
             });
@@ -3159,7 +3173,10 @@ impl AddressSpace {
                 Err(_) => Err(AddressSpaceError::NotImplemented),
             }
         })?;
-        if !published {
+        if published {
+            // The fresh frame is now mapped + owned at `v`; record its rmap.
+            crate::rmap::add(phys, self.root, VirtAddr::new(v));
+        } else {
             // The ticket was cancelled before publication, so ownership never
             // left this fault path. A file hook supplies one external alias
             // reference, balanced through the normal shared release hook.
@@ -4809,6 +4826,9 @@ impl AddressSpace {
                         return Err(AddressSpaceError::Overlap);
                     }
                 }
+                // The page is now mapped at `v` (Ok or idempotent AlreadyMapped;
+                // every error arm returned above). Record the reverse mapping.
+                crate::rmap::add(p, self.root, v);
             }
         }
         Ok(())
@@ -4880,6 +4900,8 @@ impl AddressSpace {
                         return Err(AddressSpaceError::Overlap);
                     }
                 }
+                // The page is now mapped at `v`; record the reverse mapping.
+                crate::rmap::add(p, self.root, v);
             }
         }
         Ok(())
@@ -5200,6 +5222,10 @@ impl AddressSpace {
                     .expect("COW region disappeared under its lock");
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
                 region.phys[page_idx] = new_phys;
+                // This owner's page now maps its private copy: move its rmap
+                // entry (other COW sharers of `old_phys` keep theirs).
+                crate::rmap::remove(old_phys, self.root, VirtAddr::new(v));
+                crate::rmap::add(new_phys, self.root, VirtAddr::new(v));
                 regions.cow_pages.remove(&v);
                 true
             } else {
@@ -5356,9 +5382,223 @@ impl AddressSpace {
         region.phys[page_idx] = new_phys;
         drop(regions);
 
+        // The page now maps a fresh frame on the target node: move its rmap
+        // entry so a later reverse-map walk finds the live frame.
+        crate::rmap::remove(old_phys, self.root, page_va);
+        crate::rmap::add(new_phys, self.root, page_va);
+
         self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
         Ok(old_node)
+    }
+
+    /// Copy `old_phys` → `new_phys` and atomically repoint the leaf at
+    /// `page_va` from old to new, rolling the leaf back to `old_phys` if the
+    /// replacement cannot be installed. Returns `Ok` when `new_phys` is mapped,
+    /// `Err(())` (mapping restored to `old_phys`) otherwise.
+    ///
+    /// The relocation core of [`Self::relocate_page`]. It does NOT touch
+    /// `Region.phys`, the reverse map, the cross-CPU TLB broadcast, or free
+    /// either frame — the caller owns that bookkeeping under the region lock.
+    /// `perms` is copied out of the region so no borrow is held across the call.
+    /// (`migrate_page_to_node` predates this and still inlines the equivalent
+    /// mechanics; folding it onto this helper is a follow-up.)
+    ///
+    /// # Safety
+    /// `self.root` must be a live root; `page_va` must currently map `old_phys`
+    /// in a private region, and `new_phys` must be a fresh, exclusively-owned
+    /// frame; the direct map must be live.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn relocate_leaf(
+        &self,
+        page_va: VirtAddr,
+        perms: RegionPerms,
+        old_phys: PhysAddr,
+        new_phys: PhysAddr,
+    ) -> Result<(), ()> {
+        // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_phys.kernel_ptr::<u8>(),
+                new_phys.kernel_mut_ptr::<u8>(),
+                crate::frame::PAGE_SIZE as usize,
+            );
+        }
+        // SAFETY: the live AS owns the root; `page_va` + both frames validated
+        // by the caller from the private region.
+        let map_result = unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                let mut flags = PtFlags::USER;
+                if user_page_writable(perms, new_phys) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                let _ = unmap_4kb_local(self.root, page_va);
+                map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                let mut flags = if user_page_writable(perms, new_phys) {
+                    PtFlags::AP_RW_EL0
+                } else {
+                    PtFlags::AP_RO_EL0
+                };
+                if !perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
+                let _ = unmap_4kb(self.root, page_va);
+                map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
+            }
+        };
+        if map_result.is_err() {
+            // Best-effort rollback: restore the original mapping so the page
+            // stays valid at `old_phys` (which the caller then keeps + frees the
+            // unused `new_phys`).
+            // SAFETY: same root/page/backing invariants as above.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::x86_64::paging::{map_4kb, PtFlags};
+                    let mut flags = PtFlags::USER;
+                    if user_page_writable(perms, old_phys) {
+                        flags |= PtFlags::WRITABLE;
+                    }
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags |= PtFlags::NO_EXEC;
+                    }
+                    let _ = map_4kb(self.root, page_va, old_phys, flags);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use crate::aarch64::paging::{map_4kb, PtFlags};
+                    let mut flags = if user_page_writable(perms, old_phys) {
+                        PtFlags::AP_RW_EL0
+                    } else {
+                        PtFlags::AP_RO_EL0
+                    };
+                    if !perms.contains(RegionPerms::EXEC) {
+                        flags = flags | PtFlags::UXN | PtFlags::PXN;
+                    }
+                    let _ = map_4kb(self.root, page_va, old_phys, flags);
+                }
+            }
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Relocate one resident private page at `vaddr` to a FRESH frame on its own
+    /// NUMA node — the compaction primitive. Unlike [`Self::migrate_page_to_node`]
+    /// it always moves the page to a new physical frame (there is no "already on
+    /// the target node" short-circuit), so a caller defragmenting physical
+    /// memory can evacuate a specific frame. Returns the new backing frame.
+    ///
+    /// Rejects SHARED, huge, lazy/unmapped, and COW-shared pages (a COW-shared
+    /// frame has other owners whose PTEs this single-AS call cannot rewrite —
+    /// that is the multi-owner migration follow-up). Serialized by the region
+    /// lock against concurrent faults/unmaps in this address space.
+    ///
+    /// # Safety
+    /// Same address-space-root / direct-map prerequisites as
+    /// [`Self::migrate_page_to_node`].
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn relocate_page(&self, vaddr: VirtAddr) -> Result<PhysAddr, AddressSpaceError> {
+        // SAFETY: forwarded to the caller's live-root / direct-map contract.
+        unsafe { self.relocate_page_inner(vaddr, None) }
+    }
+
+    /// Like [`Self::relocate_page`] but relocates ONLY if the page still maps
+    /// `expected_src`; returns [`AddressSpaceError::Unmapped`] if it moved out
+    /// from under the caller (a concurrent fault/unmap). Used by
+    /// [`crate::migrate::migrate_frame`] to evacuate one specific physical frame
+    /// race-safely.
+    ///
+    /// # Safety
+    /// Same prerequisites as [`Self::relocate_page`].
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn relocate_frame_at(
+        &self,
+        vaddr: VirtAddr,
+        expected_src: PhysAddr,
+    ) -> Result<PhysAddr, AddressSpaceError> {
+        // SAFETY: forwarded to the caller's live-root / direct-map contract.
+        unsafe { self.relocate_page_inner(vaddr, Some(expected_src)) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn relocate_page_inner(
+        &self,
+        vaddr: VirtAddr,
+        expected: Option<PhysAddr>,
+    ) -> Result<PhysAddr, AddressSpaceError> {
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let v = page_va.as_u64();
+        let mut regions = self.regions.lock();
+        let region = regions
+            .containing_mut(v)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if region.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+        let old_phys = *region
+            .phys
+            .get(page_idx)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if old_phys.raw() == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // Migration of a SPECIFIC frame (compaction) bails if the page moved out
+        // from under us since rmap named it (a concurrent fault/unmap/COW), so it
+        // never relocates the wrong page.
+        if let Some(exp) = expected {
+            if old_phys != exp {
+                return Err(AddressSpaceError::Unmapped);
+            }
+        }
+        // A COW-shared frame has other owners; relocating it here would leave
+        // their PTEs pointing at the freed source. Refuse — multi-owner
+        // migration (rmap-walk every owner) is a follow-up.
+        if crate::frame::cow::count(old_phys) > 1 {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        // Also refuse a page mid-swap-transition.
+        if regions.swap_pages.contains_key(&v) {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        let region = regions
+            .containing_mut(v)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let perms = region.perms;
+        // SAFETY: page_va maps old_phys on old_phys's own node keeps the copy
+        // local; alloc on that node.
+        let node = unsafe { crate::frame::narf_phys_node(old_phys.raw()) };
+        let new_frame = crate::frame::alloc_user_frame_on_strict(node)
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        let new_phys = new_frame.start_address();
+        // SAFETY: live root; page_va maps old_phys; new_phys is a fresh frame.
+        if unsafe { self.relocate_leaf(page_va, perms, old_phys, new_phys) }.is_err() {
+            crate::frame::free_frame(new_frame);
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        region.phys[page_idx] = new_phys;
+        drop(regions);
+
+        // Move the reverse mapping to the live frame, flush peers before the
+        // source is freed, then release it.
+        crate::rmap::remove(old_phys, self.root, page_va);
+        crate::rmap::add(new_phys, self.root, page_va);
+        self.flush_region_broadcast(page_va, 1);
+        crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
+        Ok(new_phys)
     }
 
     /// Move one resident private page to the closest node in the next slower

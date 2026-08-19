@@ -61,28 +61,35 @@ static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 )))]
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
-/// Set by `kswapd_wake` when the allocator wants the reclaimer to run. A flag
-/// (not just a waker) so a wake that races the kthread's park is never lost.
-static KSWAPD_WORK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Per-NUMA-node reclaimer signal, one flag per node (one `kswapd<node>`
+/// each): set by `kswapd_wake` so a wake that races the kthread's park is
+/// never lost.
+static KSWAPD_WORK: [core::sync::atomic::AtomicBool; narf_memory::frame::MAX_NUMA_NODES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; narf_memory::frame::MAX_NUMA_NODES];
 
-/// The parked reclaimer kthread's waker, installed on each park.
-static KSWAPD_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Each parked `kswapd<node>`'s waker, installed on its park.
+static KSWAPD_WAKER: [narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>;
+    narf_memory::frame::MAX_NUMA_NODES] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; narf_memory::frame::MAX_NUMA_NODES];
 
-/// Wake the reclaimer kthread. Installed into `narf_memory::reclaim` as the
-/// wake hook (`set_kswapd_wake_hook`) and called from the frame allocator when
-/// a userspace allocation pushes against the `min` reserve. Cheap and safe
-/// from any context: it only sets a flag and wakes a stored waker.
-fn kswapd_wake() {
+/// Wake NUMA `node`'s reclaimer kthread. Installed into `narf_memory::reclaim`
+/// as the wake hook (`set_kswapd_wake_hook`) and called from the frame
+/// allocator with its local (pressured) node when a userspace allocation
+/// pushes against the `min` reserve. Cheap and safe from any context: it only
+/// sets a flag and wakes a stored waker. Out-of-range nodes are ignored.
+fn kswapd_wake(node: usize) {
     use core::sync::atomic::Ordering;
-    KSWAPD_WORK.store(true, Ordering::Release);
-    let waker = KSWAPD_WAKER.lock().clone();
+    let Some(work) = KSWAPD_WORK.get(node) else {
+        return;
+    };
+    work.store(true, Ordering::Release);
+    let waker = KSWAPD_WAKER[node].lock().clone();
     if let Some(w) = waker {
         w.wake();
     }
 }
 
-/// The kswapd / OOM-reaper kthread — the wakeable reclaimer NARF's watermarks
+/// The per-node kswapd / OOM-reaper kthread (kswapd0, kswapd1, …) — the wakeable reclaimer NARF's watermarks
 /// launch. Linux's kswapd is event-driven: the allocator wakes it when a zone
 /// falls below its low watermark, and it reclaims until the zone is balanced at
 /// the high watermark, then sleeps. This is the faithful shape (superseding the
@@ -107,20 +114,21 @@ fn kswapd_wake() {
     feature = "boot-smoke",
     feature = "idt-selftest"
 )))]
-async fn kswapd_kthread() {
+async fn kswapd_kthread(node: usize) {
     use core::sync::atomic::Ordering;
-    // Bound the passes per wake so a persistently-unbalanced zone can't spin
-    // the kthread; a still-pressured zone re-wakes it on the next allocation.
+    // Bound the passes per wake so a persistently-unbalanced node can't spin
+    // the kthread; a still-pressured node re-wakes it on the next allocation.
     const MAX_PASSES: usize = 64;
     loop {
-        // Park until the allocator signals work. Register-then-recheck closes
-        // the wake/park race (a wake between the swap and the store still runs).
+        // Park until the allocator signals work for THIS node. Register-then-
+        // recheck closes the wake/park race (a wake between the swap and the
+        // store still runs).
         core::future::poll_fn(|cx| {
-            if KSWAPD_WORK.swap(false, Ordering::AcqRel) {
+            if KSWAPD_WORK[node].swap(false, Ordering::AcqRel) {
                 return core::task::Poll::Ready(());
             }
-            *KSWAPD_WAKER.lock() = Some(cx.waker().clone());
-            if KSWAPD_WORK.swap(false, Ordering::AcqRel) {
+            *KSWAPD_WAKER[node].lock() = Some(cx.waker().clone());
+            if KSWAPD_WORK[node].swap(false, Ordering::AcqRel) {
                 core::task::Poll::Ready(())
             } else {
                 core::task::Poll::Pending
@@ -138,8 +146,8 @@ async fn kswapd_kthread() {
         // kills, so it is safe to run freely under the routine transient dips a
         // fork/vmalloc storm produces.
         let mut pass = 0;
-        while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark() {
-            let target = narf_memory::reclaim::reclaim_goal_pages().max(cpu_floor);
+        while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark_node(node) {
+            let target = narf_memory::reclaim::reclaim_goal_node(node).max(cpu_floor);
 
             // Split the target between anonymous (swap) and file-cache reclaim
             // per `vm.swappiness`: higher swappiness pushes more onto anon.
@@ -194,6 +202,16 @@ async fn kswapd_kthread() {
             }
         }
         narf_memory::oom::reap_all();
+
+        // Gentle background compaction, node 0 only: when this node was actually
+        // under memory pressure this wake (`pass > 0`), consolidate a couple of
+        // movable order-3 blocks so higher-order allocations can succeed instead
+        // of falling back to vmalloc. Bounded and off the allocation path, so it
+        // never blocks a faulting task. x86_64 only (migration is x86-only).
+        #[cfg(target_arch = "x86_64")]
+        if node == 0 && pass > 0 {
+            let _ = narf_memory::migrate::compact_scan(3, 2);
+        }
     }
 }
 
@@ -3798,12 +3816,22 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
-    // Spawn the wakeable kswapd/OOM-reaper kthread now that the scheduler's
+    // Spawn one wakeable kswapd/OOM-reaper kthread per online NUMA node
+    // (`kswapd0`, `kswapd1`, … — matching Linux), now that the scheduler's
     // ready queues are live and BEFORE `run_until_empty` (with boot-init the
-    // user futures loop forever, so the executor never returns). It parks
-    // immediately and runs only when the allocator wakes it under memory
+    // user futures loop forever, so the executor never returns). Each parks
+    // immediately and runs only when the allocator wakes ITS node under memory
     // pressure. Not boot-init-gated: any workload can hit the reserve.
-    narf_scheduler::spawn_stackful(kswapd_kthread());
+    {
+        let nodes = (narf_memory::frame::online_node_count() as usize)
+            .min(narf_memory::frame::MAX_NUMA_NODES);
+        for node in 0..nodes.max(1) {
+            let tid = narf_scheduler::spawn_stackful(kswapd_kthread(node));
+            // Name it `kswapd<node>` so it shows up like Linux's per-node
+            // reclaimers (e.g. in /proc/<pid>/comm).
+            narf_userspace::handlers::set_proc_comm(tid.raw(), &alloc::format!("kswapd{node}"));
+        }
+    }
 
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
@@ -3940,6 +3968,9 @@ fn boot_userspace_init() {
     // anonymous pages once clean caches + shrinkers no longer cover the
     // watermark deficit (before resorting to the OOM killer).
     narf_userspace::anon_reclaim::install();
+    // Install the root→AddressSpace resolver so physical-frame migration
+    // (compaction) can map a frame's rmap owners back to their address spaces.
+    narf_userspace::migrate::install();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.

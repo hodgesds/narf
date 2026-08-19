@@ -116,6 +116,15 @@ pub trait OomKiller: Send + Sync {
     /// Called from the memory-pressure path: it must not allocate on the
     /// failure path and must not block.
     fn select_victim(&self) -> Option<OomVictim>;
+
+    /// Select the highest-badness victim RESTRICTED to `pids` — the member set
+    /// of a cgroup subtree that breached `memory.max`. Returns `None` when no
+    /// listed pid is an eligible victim (the charge is then failed as ENOMEM
+    /// rather than killing outside the offending cgroup, matching cgroup v2).
+    /// The default ignores the filter for policies without cgroup awareness.
+    fn select_victim_in(&self, _pids: &[u64]) -> Option<OomVictim> {
+        self.select_victim()
+    }
 }
 
 static OOM_KILLER: IrqSafeSpinLock<Option<&'static dyn OomKiller>> = IrqSafeSpinLock::new(None);
@@ -173,7 +182,21 @@ pub fn request_oom_relief() -> Option<u64> {
     // `&'static dyn OomKiller` is Copy, so this drops the registry lock before
     // calling into the (possibly allocating) policy.
     let killer = (*OOM_KILLER.lock())?;
-    let mut victim = killer.select_victim()?;
+    enqueue_victim(killer.select_victim()?)
+}
+
+/// Cgroup-scoped variant: kill one victim chosen ONLY from `pids` (a cgroup
+/// subtree that breached `memory.max`). Returns the killed pid, or `None` when
+/// no listed pid is eligible — in which case the caller fails the charge as
+/// ENOMEM rather than killing outside the offending cgroup (cgroup v2 semantics).
+pub fn request_oom_relief_in(pids: &[u64]) -> Option<u64> {
+    let killer = (*OOM_KILLER.lock())?;
+    enqueue_victim(killer.select_victim_in(pids)?)
+}
+
+/// Queue a selected victim for the async reaper and return its pid. Shared by
+/// the global and cgroup-scoped OOM entry points.
+fn enqueue_victim(mut victim: OomVictim) -> Option<u64> {
     let pid = victim.pid;
     let tid = victim.tid;
     // Seed the requeue budget here (not in the policy): a victim whose region
