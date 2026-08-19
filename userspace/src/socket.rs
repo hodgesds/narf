@@ -1382,6 +1382,12 @@ impl SocketFile {
                 sender_portid: sender,
                 group: 0,
             });
+        // Advance the readable edge on ARRIVAL so an EPOLLET consumer re-fires
+        // (see `poll_edge_token`'s inbox check). Bumping only on recv left the
+        // token unchanged across a fresh delivery.
+        target
+            .netlink_readable_token
+            .fetch_add(1, Ordering::Release);
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
@@ -1428,6 +1434,12 @@ impl SocketFile {
                     sender_portid: sender,
                     group: group_mask,
                 });
+            // Advance the readable edge on ARRIVAL so an EPOLLET group-2
+            // monitor (logind) re-fires and drains this broadcast; see
+            // `poll_edge_token`'s inbox check.
+            target
+                .netlink_readable_token
+                .fetch_add(1, Ordering::Release);
             delivered += 1;
         }
         if delivered > 0 {
@@ -2263,6 +2275,21 @@ impl FileOps for SocketFile {
     }
 
     fn poll_edge_token(&self) -> (u64, u64) {
+        // A userspace unicast/multicast sitting in the inbox is readable
+        // regardless of the per-state token or kernel-group membership. This
+        // mirrors the same top-level check in `poll_readiness`: without it, an
+        // EPOLLET consumer never sees an EDGE for an inbox delivery, so it never
+        // re-reports POLL_IN and never drains it. The load-bearing case is
+        // logind's `sd-device` monitor, an edge-triggered subscriber to the
+        // UDEV_MONITOR_UDEV group (group 2): udevd re-broadcasts each processed
+        // device there (carrying the `master-of-seat` tag), the broadcast lands
+        // in this inbox, but a group-2 socket is not `netlink_uevent_subscribed`
+        // (only group 1 is) so the NetlinkUevent arm below yields token 0 and
+        // the edge never advanced — logind never learned the DRM card became a
+        // seat master, so seat0 stayed `CanGraphical=false` and the greeter hung.
+        if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
+            return (self.netlink_readable_token.load(Ordering::Acquire), 0);
+        }
         match &*self.state.lock() {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
@@ -6312,6 +6339,80 @@ fn smoke_netlink_multicast_skips_nonsubscribers_and_sender() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_multicast_skips_nonsubscribers_and_sender
+);
+
+/// EPOLLET regression: a group-2 (UDEV_MONITOR_UDEV) broadcast landing in a
+/// subscriber's inbox must ADVANCE its `poll_edge_token`, not just satisfy
+/// `poll_readiness`. An edge-triggered consumer keys entirely off the token
+/// changing; if it never advances, the consumer never re-reports POLL_IN and
+/// never drains the delivery. The load-bearing case is logind's `sd-device`
+/// monitor: udevd re-broadcasts the processed DRM card (carrying the
+/// `master-of-seat` tag) to group 2, but a group-2 socket is not
+/// `netlink_uevent_subscribed` (only group 1 is), so before the fix the edge
+/// stayed 0 and logind never learned seat0 was graphical. The positive
+/// multicast test above only exercises a level-triggered `recv`.
+fn smoke_netlink_group_broadcast_advances_edge_token() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2;
+    const OTHER_GROUP_MASK: u32 = 4; // group 3 — must NOT receive a group-2 send
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let bystander = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    for (sock, mask) in [(&listener, UDEV_GROUP_MASK), (&bystander, OTHER_GROUP_MASK)] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    // Baseline: empty inboxes, no edge, not readable.
+    let (rx0, _) = listener.poll_edge_token();
+    let (by0, _) = bystander.poll_edge_token();
+    if listener.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("group-2 listener falsely readable before any broadcast");
+    }
+
+    // udevd re-broadcasts a processed device (its tags travel in the payload).
+    let payload = b"add@/devices/platform/narf-drm/card0";
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: payload,
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("group-2 broadcast send failed");
+    }
+
+    // Positive: the subscriber's readable edge advanced AND it is now readable.
+    let (rx1, _) = listener.poll_edge_token();
+    if rx1 == rx0 {
+        return TestResult::Fail(
+            "edge token did not advance on inbox delivery — an EPOLLET monitor never re-fires",
+        );
+    }
+    if listener.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("group-2 listener not readable after broadcast");
+    }
+
+    // Negative: a socket in a different group gets neither the delivery nor an
+    // edge from the group-2 broadcast.
+    let (by1, _) = bystander.poll_edge_token();
+    if by1 != by0 {
+        return TestResult::Fail("a non-group-2 socket saw a spurious edge from a group-2 send");
+    }
+    if bystander.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("a non-group-2 socket became readable on a group-2 send");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_group_broadcast_advances_edge_token
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {
