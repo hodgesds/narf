@@ -5601,6 +5601,80 @@ impl AddressSpace {
         Ok(new_phys)
     }
 
+    /// Repoint one owner's shared COW page at `vaddr` from `expected_src` to the
+    /// pre-copied, shared `dst` frame — one step of multi-owner
+    /// [`crate::migrate::migrate_frame`]. Under the region lock: verifies the
+    /// page still maps `expected_src` (else the owner raced — COW-split or
+    /// unmapped — and `Err(())` is returned so the caller drops this owner),
+    /// installs a READ-ONLY leaf for `dst` (so a later write still faults into a
+    /// proper COW split against `dst`'s shared refcount), repoints `Region.phys`
+    /// and the reverse map, and flushes. Does NOT copy, allocate, free, or touch
+    /// the COW refcount — the caller owns `dst`'s content and the src→dst
+    /// refcount move.
+    ///
+    /// # Safety
+    /// `self.root` must be a live root; `dst` must be a live frame holding a copy
+    /// of `expected_src`'s contents; the direct map must be live.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn repoint_shared_page(
+        &self,
+        vaddr: VirtAddr,
+        expected_src: PhysAddr,
+        dst: PhysAddr,
+    ) -> Result<(), ()> {
+        if self.root.as_u64() == 0 {
+            return Err(());
+        }
+        let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let v = page_va.as_u64();
+        let mut regions = self.regions.lock();
+        let (page_idx, perms) = {
+            let region = regions.containing(v).ok_or(())?;
+            let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+            if region.phys.get(page_idx).copied() != Some(expected_src) {
+                return Err(()); // raced: no longer maps the source
+            }
+            (page_idx, region.perms)
+        };
+        // Install a READ-ONLY leaf for `dst`: the page stays COW-shared, so a
+        // write must fault into cow_split against dst's refcount.
+        // SAFETY: live root; page_va currently maps expected_src.
+        let installed = unsafe {
+            use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+            let mut flags = PtFlags::USER;
+            if !perms.contains(RegionPerms::EXEC) {
+                flags |= PtFlags::NO_EXEC;
+            }
+            let _ = unmap_4kb_local(self.root, page_va);
+            map_4kb(self.root, page_va, dst, flags).is_ok()
+        };
+        if !installed {
+            // Best-effort restore of the original mapping so the page stays valid.
+            // SAFETY: same live-root / backing contract.
+            unsafe {
+                use crate::x86_64::paging::{map_4kb, PtFlags};
+                let mut flags = PtFlags::USER;
+                if user_page_writable(perms, expected_src) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                let _ = map_4kb(self.root, page_va, expected_src, flags);
+            }
+            return Err(());
+        }
+        regions
+            .containing_mut(v)
+            .expect("region vanished under its own lock")
+            .phys[page_idx] = dst;
+        drop(regions);
+        crate::rmap::remove(expected_src, self.root, page_va);
+        crate::rmap::add(dst, self.root, page_va);
+        self.flush_region_broadcast(page_va, 1);
+        Ok(())
+    }
+
     /// Move one resident private page to the closest node in the next slower
     /// memory tier.
     ///
