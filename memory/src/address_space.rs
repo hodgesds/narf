@@ -5508,6 +5508,34 @@ impl AddressSpace {
     /// [`Self::migrate_page_to_node`].
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn relocate_page(&self, vaddr: VirtAddr) -> Result<PhysAddr, AddressSpaceError> {
+        // SAFETY: forwarded to the caller's live-root / direct-map contract.
+        unsafe { self.relocate_page_inner(vaddr, None) }
+    }
+
+    /// Like [`Self::relocate_page`] but relocates ONLY if the page still maps
+    /// `expected_src`; returns [`AddressSpaceError::Unmapped`] if it moved out
+    /// from under the caller (a concurrent fault/unmap). Used by
+    /// [`crate::migrate::migrate_frame`] to evacuate one specific physical frame
+    /// race-safely.
+    ///
+    /// # Safety
+    /// Same prerequisites as [`Self::relocate_page`].
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn relocate_frame_at(
+        &self,
+        vaddr: VirtAddr,
+        expected_src: PhysAddr,
+    ) -> Result<PhysAddr, AddressSpaceError> {
+        // SAFETY: forwarded to the caller's live-root / direct-map contract.
+        unsafe { self.relocate_page_inner(vaddr, Some(expected_src)) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn relocate_page_inner(
+        &self,
+        vaddr: VirtAddr,
+        expected: Option<PhysAddr>,
+    ) -> Result<PhysAddr, AddressSpaceError> {
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
         }
@@ -5527,6 +5555,14 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::Unmapped)?;
         if old_phys.raw() == 0 {
             return Err(AddressSpaceError::Unmapped);
+        }
+        // Migration of a SPECIFIC frame (compaction) bails if the page moved out
+        // from under us since rmap named it (a concurrent fault/unmap/COW), so it
+        // never relocates the wrong page.
+        if let Some(exp) = expected {
+            if old_phys != exp {
+                return Err(AddressSpaceError::Unmapped);
+            }
         }
         // A COW-shared frame has other owners; relocating it here would leave
         // their PTEs pointing at the freed source. Refuse — multi-owner
