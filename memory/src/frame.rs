@@ -1112,6 +1112,41 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
     result
 }
 
+/// Drain every CPU's cache for `node` into the zone and run `f` with the
+/// per-CPU cache BYPASSED — but WITHOUT holding the zone lock across `f`, so `f`
+/// may itself allocate / free / reserve frames (which take the zone lock).
+///
+/// This is what memory compaction needs: draining makes every currently-free
+/// frame visible in the zone free lists (so `reserve_frame_range` can hold it),
+/// and the bypass routes `f`'s own allocs/frees straight to the zone (so a
+/// just-migrated frame is immediately reservable and a destination allocation
+/// never comes from the cache). The node's allocations run cache-cold for the
+/// duration; keep `f` bounded.
+pub fn with_node_cache_bypassed<R>(node: usize, f: impl FnOnce() -> R) -> R {
+    let node = node.min(MAX_NUMA_NODES - 1);
+    let drain = &FRAME_CACHE_DRAIN[node];
+    let _drain_guard = drain.lock.lock();
+    drain.bypass.store(true, Ordering::Release);
+    for cpu_cache in &FRAME_CACHES {
+        let mut cache = cpu_cache.0.lock();
+        let local = &mut cache.nodes[node];
+        if local.len == 0 {
+            continue;
+        }
+        let mut zone = ZONES[node].0.lock();
+        let drained = local.len;
+        while local.len != 0 {
+            local.len -= 1;
+            zone.free_cached(local.frames[local.len], 0);
+        }
+        FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+    }
+    // The zone lock is released here; `f` takes it per operation as needed.
+    let result = f();
+    drain.bypass.store(false, Ordering::Release);
+    result
+}
+
 /// Wait for every cache operation that may have observed the old bypass value.
 /// The caller publishes a persistent bypass first, then calls this before
 /// making newly hot-plugged frames visible in the buddy.
@@ -1463,6 +1498,40 @@ pub fn free_frame(f: PhysFrame) {
     crate::buddy::audit_note_free_caller(core::panic::Location::caller());
     if let Some(a) = current_alloc() {
         a.free_frame(f);
+    }
+}
+
+/// Reserve a fully-free physical frame range: pull it out of the buddy free
+/// lists so a later allocation can't hand it out. Returns `false` WITHOUT
+/// mutation if any frame in the range is already allocated. The range must lie
+/// within a single NUMA node's zone (a buddy block always does).
+///
+/// Memory compaction uses this to hold migration destinations OUTSIDE the block
+/// it is evacuating (and to re-hold each just-migrated frame), so migration
+/// never lands a page back in the block being freed. Balance with
+/// [`free_movable_range`].
+pub fn reserve_frame_range(base: PhysAddr, count: u64) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let node = node_for_phys(base.raw());
+    let first_frame = base.raw() >> 12;
+    ZONES[node].0.lock().remove_free_range(first_frame, count)
+}
+
+/// Return a range previously taken with [`reserve_frame_range`] (or a run of
+/// freshly-evacuated frames) to the buddy as MOVABLE order-0 frames, coalescing
+/// with free buddies. Compaction releases a fully-evacuated block this way so it
+/// coalesces up to a higher order. The whole run must lie in one node's zone.
+pub fn free_movable_range(base: PhysAddr, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let node = node_for_phys(base.raw());
+    let first_frame = base.raw() >> 12;
+    let mut zone = ZONES[node].0.lock();
+    for i in 0..count {
+        zone.free_mt(first_frame + i, 0, buddy::MigrateType::Movable);
     }
 }
 

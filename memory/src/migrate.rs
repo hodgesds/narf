@@ -102,6 +102,98 @@ pub fn migrate_frame(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     }
 }
 
+/// Why a compaction attempt on a physical block could not free it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CompactError {
+    /// The block holds an allocated frame that is not a migratable user page
+    /// (kernel / slab / DMA — no rmap owner), so it can't be fully freed.
+    Unmovable,
+    /// A movable page could not be migrated out (relocation failed, raced, or
+    /// COW-shared / multi-owner).
+    MigrateFailed,
+    /// A frame was taken by a concurrent allocation before it could be reserved;
+    /// the attempt is abandoned cleanly, leaving the block as found.
+    Raced,
+}
+
+/// Compact the naturally-aligned order-`order` physical block based at `base` (a
+/// run of `2^order` frames): migrate every movable user page out of it so the
+/// whole block becomes free and the buddy coalesces it back to order `order`.
+/// Returns the number of pages migrated.
+///
+/// [`crate::rmap`] is the movability oracle — a frame with an rmap owner is a
+/// migratable user page; an allocated frame WITHOUT one is unmovable
+/// (kernel/slab/DMA) → [`CompactError::Unmovable`]. Free frames in the block are
+/// reserved up front, and each migrated frame is re-reserved the moment it
+/// frees, so every migration destination lands OUTSIDE the block. On any failure
+/// the reservations are released, leaving the block as it was found; on success
+/// the whole run is released as one coalescing free.
+#[cfg(target_arch = "x86_64")]
+pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError> {
+    let count = 1u64 << order;
+    let node = crate::frame::node_for_phys(base.raw());
+
+    fn release(reserved: &[PhysAddr]) {
+        for r in reserved {
+            crate::frame::free_movable_range(*r, 1);
+        }
+    }
+
+    // Under a cache drain + bypass so the block's currently-free frames are
+    // visible in the zone free lists (reservable), and every alloc/free below
+    // routes straight to the zone rather than a per-CPU cache — so a just-
+    // migrated frame is immediately reservable and no destination allocation
+    // comes from the block.
+    crate::frame::with_node_cache_bypassed(node, || {
+        // Frames pulled out of the free lists (released at the end / on failure).
+        let mut reserved: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+        // Allocated user pages to evacuate.
+        let mut movable: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+
+        // Pass 1: classify each frame; reserve the free ones.
+        for i in 0..count {
+            let phys = PhysAddr::new(base.raw() + i * 4096);
+            if crate::rmap::owner_count(phys) >= 1 {
+                movable.push(phys);
+            } else if crate::frame::reserve_frame_range(phys, 1) {
+                reserved.push(phys); // was free, now held
+            } else {
+                // Allocated but not an rmap-owned user page → unmovable.
+                release(&reserved);
+                return Err(CompactError::Unmovable);
+            }
+        }
+
+        // Pass 2: migrate movable pages out. Destinations can be neither our
+        // reserved frames (out of the free lists) nor the not-yet-migrated
+        // movable frames (still allocated), so they land outside the block.
+        // Re-reserve each frame the instant migration frees it.
+        let mut migrated = 0usize;
+        for phys in &movable {
+            match migrate_frame(*phys) {
+                Ok(_new) => {
+                    if crate::frame::reserve_frame_range(*phys, 1) {
+                        reserved.push(*phys);
+                        migrated += 1;
+                    } else {
+                        release(&reserved);
+                        return Err(CompactError::Raced);
+                    }
+                }
+                Err(_) => {
+                    release(&reserved);
+                    return Err(CompactError::MigrateFailed);
+                }
+            }
+        }
+
+        // Pass 3: the whole block is now reserved → release it, coalescing to
+        // order.
+        release(&reserved);
+        Ok(migrated)
+    })
+}
+
 /// Test-only: clear the installed resolver so a test's mock never leaks.
 #[doc(hidden)]
 pub fn __reset_resolver_for_test() {
@@ -249,4 +341,77 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_relocates);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_compact_block_evacuates_movable() -> TestResult {
+        use super::{compact_block, CompactError};
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let f = match crate::alloc_frame() {
+            Ok(x) => x.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let va = VirtAddr::new(0x0000_0080_00A0_0000);
+        if aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![f],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { aspace.materialize() }.is_err() {
+            return TestResult::Fail("materialize failed");
+        }
+        *TEST_AS.lock() = Some(aspace.clone());
+        register_address_space_resolver(&SINGLE_AS_RESOLVER);
+
+        let result = (|| {
+            // The order-0 "block" is the single movable frame: compaction must
+            // migrate it out (dest from elsewhere) and free the frame.
+            match compact_block(f, 0) {
+                Ok(1) => {}
+                other => {
+                    let _ = other;
+                    return TestResult::Fail("compact_block should migrate the one movable frame");
+                }
+            }
+            if aspace.regions_snapshot()[0].phys[0] == f {
+                return TestResult::Fail("compaction did not move the page off its frame");
+            }
+            if crate::rmap::owner_count(f) != 0 {
+                return TestResult::Fail("compaction left an rmap entry on the evacuated frame");
+            }
+            // An unmovable allocated frame (raw alloc, no rmap owner) cannot be
+            // compacted and must not be touched.
+            let g = match crate::alloc_frame() {
+                Ok(x) => x.start_address(),
+                Err(_) => return TestResult::Skip("frame allocator drained"),
+            };
+            let verdict = compact_block(g, 0);
+            crate::frame::free_frame(crate::frame::PhysFrame::new(g));
+            if verdict != Err(CompactError::Unmovable) {
+                return TestResult::Fail("an unmovable allocated frame must yield Unmovable");
+            }
+            TestResult::Pass
+        })();
+
+        *TEST_AS.lock() = None;
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_compact_block_evacuates_movable);
 }
