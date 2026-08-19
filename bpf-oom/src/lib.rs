@@ -47,8 +47,11 @@ use alloc::sync::Arc;
 
 use narf_capabilities::{Cap, CapKind, CapType, Grant};
 
+pub mod ctx;
 pub mod live;
 pub mod policy;
+
+pub use ctx::{OomCtx, OOM_CTX_SIZE};
 
 pub use policy::{
     clear_policy, has_candidate_source, native_fallback_count, policy_installed,
@@ -84,21 +87,26 @@ narf_bpf_structops::struct_ops! {
     /// A BPF-supplied OOM victim-selection policy.
     ///
     /// Called from `memory`'s pressure path in atomic context: `badness` and
-    /// `veto` once per *candidate*, `notify_kill` once per *selection*. The
-    /// context tuple is scalars only — there is no task pointer to chase and
-    /// nothing to `probe_read`, which is what lets the whole policy run under
-    /// `run_atomic` with no mediation.
+    /// `veto` once per *candidate*, `notify_kill` once per *selection*.
+    ///
+    /// `#[ctx_region]`: each method receives a read-only copy of [`OomCtx`] as
+    /// a bounded `(data, data_end)` region rather than scalar arguments, which
+    /// is what lets the context carry eight fields instead of the four words a
+    /// context tuple holds. There is still no task pointer to chase and nothing
+    /// to `probe_read` — the region is plain integers the hook filled in, so
+    /// the whole policy runs under `run_atomic_region` with no mediation.
     #[cap(OomPolicy)]
     #[install(install_bpf_oom_policy)]
     #[desc(BPF_OOM_POLICY_OPS)]
     #[adapter(BpfOomPolicyOps)]
+    #[ctx_region]
     #[commit(commit_bpf_oom_policy)]
     #[optional(veto, notify_kill)]
     pub trait BpfOomPolicy {
         /// Score a candidate. **Higher is killed first; `0` declines to rank
-        /// it.** `total_pages` is the machine's frame count, so a program can
-        /// scale `oom_score_adj` against RAM the way Linux's `oom_badness()`
-        /// does.
+        /// it.** [`OomCtx::total_pages`] is the machine's frame count, so a
+        /// program can scale `oom_score_adj` against RAM the way Linux's
+        /// `oom_badness()` does.
         ///
         /// `0` is a *soft* exclusion. If a program declines every candidate —
         /// which is also what a program that traps looks like, since both
@@ -110,7 +118,7 @@ narf_bpf_structops::struct_ops! {
         ///
         /// Required: a set without it is rejected at install, because a policy
         /// that cannot rank is not a policy.
-        fn badness(&self, pid: u64, rss_pages: u64, oom_score_adj: i64, total_pages: u64) -> u64;
+        fn badness(&self, ctx: &OomCtx) -> u64;
 
         /// Exclude a candidate from consideration: **nonzero vetoes.**
         ///
@@ -123,14 +131,14 @@ narf_bpf_structops::struct_ops! {
         /// reads "nothing excluded", which is the safe default; as an
         /// eligibility test it would read "nothing eligible" and exclude every
         /// candidate the moment a program set omitted the method.
-        fn veto(&self, pid: u64, rss_pages: u64, oom_score_adj: i64) -> u32;
+        fn veto(&self, ctx: &OomCtx) -> u32;
 
         /// Told which candidate the policy cost, after the kill is initiated.
         ///
         /// For a program keeping its own accounting in a map. The return value
         /// is ignored — by the time this runs the victim is already terminal,
         /// so a program that traps here cannot un-kill anything.
-        fn notify_kill(&self, pid: u64, rss_pages: u64) -> i32;
+        fn notify_kill(&self, ctx: &OomCtx) -> i32;
     }
 }
 

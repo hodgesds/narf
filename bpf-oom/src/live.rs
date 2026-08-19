@@ -42,7 +42,11 @@ impl CandidateSource for LiveTasks {
             let Some(address_space) = narf_scheduler::address_space_of(TaskId(tid)) else {
                 continue;
             };
-            let rss_pages = address_space.mapped_bytes() / PAGE_SIZE;
+            // One walk of the region tables, not three: `mapped_bytes()` is
+            // `memory_stats().mapped_bytes`, so taking the whole stat block
+            // costs nothing extra and fills the rest of the candidate.
+            let stats = address_space.memory_stats();
+            let rss_pages = stats.mapped_bytes / PAGE_SIZE;
             if rss_pages == 0 {
                 continue;
             }
@@ -51,6 +55,9 @@ impl CandidateSource for LiveTasks {
                 tid,
                 rss_pages,
                 oom_score_adj: i64::from(narf_userspace::handlers::proc_oom_adj_of(pid)),
+                mapped_bytes: stats.mapped_bytes,
+                resident_pages: stats.resident_pages,
+                writable_nonexec_bytes: stats.writable_nonexec_bytes,
                 address_space,
             });
         }

@@ -5,9 +5,13 @@
 //! programmable.** A BPF program cannot walk the task list, resolve an address
 //! space, or queue a signal — those need allocation, locks, and pointers no
 //! verified program may hold. What it *can* do is answer "how bad is this
-//! candidate?" over a handful of scalars, in atomic context, in bounded time.
+//! candidate?" over a structure of plain integers, in atomic context, in
+//! bounded time.
 //! So the scoring loop below enumerates candidates natively, asks the installed
-//! program set for a score per candidate, and does the killing itself.
+//! program set for a score per candidate, and does the killing itself. What the
+//! program sees is [`OomCtx`] — a read-only structure the hook fills in, passed
+//! as a bounded region rather than as scalar arguments, so the context is not
+//! capped at the four words a struct_ops context tuple holds.
 //!
 //! # Why a [`CandidateSource`] indirection
 //!
@@ -27,7 +31,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::address_space::AddressSpace;
 use narf_memory::oom::{OomKiller, OomVictim};
 
-use crate::BpfOomPolicy;
+use crate::{BpfOomPolicy, OomCtx};
 
 /// `oom_score_adj` sentinel meaning "never OOM-kill this task" (Linux
 /// `OOM_SCORE_ADJ_MIN`), honoured by the native fallback exactly as
@@ -49,6 +53,16 @@ pub struct OomCandidate {
     pub rss_pages: u64,
     /// The task's `oom_score_adj` bias, `-1000..=1000`.
     pub oom_score_adj: i64,
+    /// Mapped bytes, unrounded. Published to a program as
+    /// [`OomCtx::mapped_bytes`](crate::OomCtx::mapped_bytes); a source with no
+    /// finer number than `rss_pages` may leave it 0.
+    pub mapped_bytes: u64,
+    /// Pages with a live physical frame. See
+    /// [`OomCtx::resident_pages`](crate::OomCtx::resident_pages).
+    pub resident_pages: u64,
+    /// Writable non-executable bytes — approximately the anonymous working set.
+    /// See [`OomCtx::writable_nonexec_bytes`](crate::OomCtx::writable_nonexec_bytes).
+    pub writable_nonexec_bytes: u64,
     /// The address space the reaper reclaims. Held as an `Arc` so pinning the
     /// victim for [`OomVictim`] is a refcount bump, not a lookup that could
     /// race the task's exit.
@@ -64,6 +78,8 @@ impl core::fmt::Debug for OomCandidate {
             .field("tid", &self.tid)
             .field("rss_pages", &self.rss_pages)
             .field("oom_score_adj", &self.oom_score_adj)
+            .field("mapped_bytes", &self.mapped_bytes)
+            .field("resident_pages", &self.resident_pages)
             .finish_non_exhaustive()
     }
 }
@@ -202,6 +218,24 @@ pub fn native_fallback_count() -> usize {
     NATIVE_FALLBACKS.load(Ordering::Acquire)
 }
 
+/// Build the read-only structure a program reads its context out of.
+///
+/// The adapter copies this before the program sees it, so the candidate itself
+/// is never exposed — and there is nothing here to expose beyond integers
+/// anyway (the `Arc<AddressSpace>` stays on this side of the seam).
+fn ctx_of(c: &OomCandidate, total_pages: u64) -> OomCtx {
+    OomCtx {
+        pid: c.pid,
+        tid: c.tid,
+        rss_pages: c.rss_pages,
+        oom_score_adj: c.oom_score_adj,
+        total_pages,
+        mapped_bytes: c.mapped_bytes,
+        resident_pages: c.resident_pages,
+        writable_nonexec_bytes: c.writable_nonexec_bytes,
+    }
+}
+
 /// Rank every candidate and kill the worst.
 ///
 /// Called from `memory`'s pressure path. It allocates (the candidate snapshot
@@ -243,20 +277,21 @@ fn select_victim() -> Option<OomVictim> {
     let mut best: Option<(i64, OomCandidate)> = None;
     let mut fallback: Option<(i64, OomCandidate)> = None;
     for c in source.candidates() {
+        // One context per candidate, built once and shared by both calls; the
+        // adapter hands each program its own copy.
+        let ctx = ctx_of(&c, total_pages);
         // Hard exclusion first, so a vetoed candidate is not even eligible for
         // the fallback ranking.
         if let Some(p) = policy {
-            if p.veto(c.pid, c.rss_pages, c.oom_score_adj) != 0 {
+            if p.veto(&ctx) != 0 {
                 continue;
             }
         }
         // A program's score is unsigned; clamping at `i64::MAX` keeps it
         // orderable without a wrapping cast turning a huge score negative.
-        let ranked = policy.and_then(|p| {
-            match p.badness(c.pid, c.rss_pages, c.oom_score_adj, total_pages) {
-                0 => None,
-                n => Some(i64::try_from(n).unwrap_or(i64::MAX)),
-            }
+        let ranked = policy.and_then(|p| match p.badness(&ctx) {
+            0 => None,
+            n => Some(i64::try_from(n).unwrap_or(i64::MAX)),
         });
         match ranked {
             Some(score) => {
@@ -285,7 +320,7 @@ fn select_victim() -> Option<OomVictim> {
     // Tell the program which candidate it cost, after the kill is initiated so
     // a trapping or declining program cannot stop one. Unbound ⇒ no call.
     if let Some(p) = policy {
-        let _ = p.notify_kill(victim.pid, victim.rss_pages);
+        let _ = p.notify_kill(&ctx_of(&victim, total_pages));
     }
     Some(OomVictim {
         pid: victim.pid,

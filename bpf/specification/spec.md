@@ -428,7 +428,48 @@ borrowed slice. The JIT emits a direct read only for a verifier-published
 runtime guard. Frames remain immutable: stores are rejected by the context
 descriptor, and `XDP_TX`/`XDP_REDIRECT` remain unsupported.
 
-### 3.16 Native arena atomics
+### 3.16 Region contexts (`struct_ops` beyond four words)
+
+A struct_ops method packs its arguments into the context tuple, which is
+`MAX_CTX_WORDS` — four — words wide. That is the whole context a hook can
+describe, and it is the reason `BpfOomPolicy::badness` (four scalars: pid, RSS,
+`oom_score_adj`, total pages) had no room for the resident-page count, the
+writable-anonymous size, or a cgroup id.
+
+A **region ctx** removes the ceiling by reusing §3.15's mechanism for something
+other than packets: the program enters with `(data, data_end)` over a read-only
+structure the hook fills in, and reads fields out of it after proving each read
+in bounds. `PtrKind::Mem`/`MemEnd` is the verifier's general model of a
+dynamically-bounded region, so this needs no new verifier rule — only a second
+`TypeKey` (`narf_bpf::ctx_region`), distinct from the packet key so a region
+pointer is not interchangeable with a packet one and the XDP adjust intrinsics
+cannot reach it. Unlike `XDP_CTX`, `data` is `READONLY`: a hook context
+describes state the program is asked about, so a store through it fails
+verification.
+
+`BpfProg::load_region_ctx` verifies against that shape and
+`BpfProg::run_atomic_region` binds the region per invocation; each refuses the
+other kind, and `run_atomic`/`run_atomic_interpreted` refuse a region-ctx
+program, so there is no path on which a bounded pointer is unbacked. A region
+ctx is atomic-only (`RegionCtxRequiresAtomic`) for the same reason a typed probe
+object is: nothing keeps the borrow alive across an await.
+
+In `struct_ops!`, a trait declares `#[ctx_region]` and every method takes one
+`&C` where `C: CtxStruct` — an unsafe trait whose contract is `#[repr(C)]`,
+padding-free, pointer-free plain data, because the structure is copied verbatim
+into a buffer a hostile program reads. The generated adapter passes that copy,
+not the original. `StructOpsDesc::region_ctx` records the shape and `validate`
+rejects a program loaded for the other one (`WrongCtxShape`) — the same class of
+silent failure as binding a sleepable program, where a mismatch would install
+cleanly and then answer every call with `DEFAULT_RET`.
+
+Fields are append-only: a loaded program keeps reading the offset it was
+compiled against. Growing a ctx struct is compatible in the direction that
+matters — an old program's bounds proof still passes, and a program compiled
+against a wider struct than the running kernel publishes fails its own bounds
+check and takes its fallback path rather than reading past the end.
+
+### 3.17 Native arena atomics
 
 The x86_64 and aarch64 JITs lower naturally aligned word and doubleword arena
 atomics after computing the same `slot_base + zero_extend(handle + off16)`

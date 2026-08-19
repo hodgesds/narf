@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest};
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, CondOp, Decoded, Insn, Reg, Size, Source};
 use narf_bpf_structops::{ProgSet, StructOpsError};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, CapKind, Grant};
@@ -28,9 +28,11 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::address_space::AddressSpace;
 
+use crate::ctx::offset;
 use crate::policy::{CandidateSource, OomCandidate};
 use crate::{
-    bootstrap_oom_policy_authority, install_bpf_oom_policy, BpfOomPolicy, BpfOomPolicyOps,
+    bootstrap_oom_policy_authority, install_bpf_oom_policy, BpfOomPolicy, BpfOomPolicyOps, OomCtx,
+    OOM_CTX_SIZE,
 };
 
 // ── program-building helpers ─────────────────────────────────────────
@@ -81,6 +83,27 @@ fn ldx(dst: u8, src: u8, off: i16) -> Decoded {
     }
 }
 
+/// `r{dst} = r{src}` (64-bit).
+fn mov_reg(dst: u8, src: u8) -> Decoded {
+    Decoded::Mov {
+        wide: true,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        sign_extend: None,
+    }
+}
+
+/// `if r{dst} > r{src} goto +off` (64-bit, unsigned).
+fn jgt_reg(dst: u8, src: u8, off: i16) -> Decoded {
+    Decoded::JumpCond {
+        wide: true,
+        op: CondOp::Gt,
+        dst: r(dst),
+        src: Source::Reg(r(src)),
+        off,
+    }
+}
+
 /// `r{dst} op= imm` (64-bit).
 fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
     Decoded::Alu {
@@ -93,29 +116,55 @@ fn alu_imm(op: AluOp, dst: u8, v: i32) -> Decoded {
 
 const EXIT: Decoded = Decoded::Exit;
 
-fn load(name: &str, insns: Vec<Insn>, ctx: Context) -> Result<Arc<BpfProg>, &'static str> {
-    BpfProg::load(
-        load_cap(),
-        LoadRequest {
-            name: String::from(name),
-            insns,
-            context: ctx,
-            maps: Vec::new(),
-            map_indices: Vec::new(),
-            load_references: Vec::new(),
-        },
-    )
-    .map_err(|_| "load rejected")
+fn request(name: &str, insns: Vec<Insn>, ctx: Context) -> LoadRequest {
+    LoadRequest {
+        name: String::from(name),
+        insns,
+        context: ctx,
+        maps: Vec::new(),
+        map_indices: Vec::new(),
+        load_references: Vec::new(),
+    }
 }
 
-/// A program returning the context word at `word` verbatim.
+/// Load a program the way this hook dispatches: against a region ctx.
+fn load(name: &str, insns: Vec<Insn>, ctx: Context) -> Result<Arc<BpfProg>, &'static str> {
+    BpfProg::load_region_ctx(load_cap(), request(name, insns, ctx)).map_err(|_| "load rejected")
+}
+
+/// Load with the ordinary four-scalar ctx — the *wrong* shape for this hook,
+/// for the smoke that proves the mismatch is caught at install.
+fn load_scalar_ctx(name: &str, insns: Vec<Insn>) -> Result<Arc<BpfProg>, &'static str> {
+    BpfProg::load(load_cap(), request(name, insns, Context::Atomic)).map_err(|_| "load rejected")
+}
+
+/// A program returning the `OomCtx` field at byte `off`.
 ///
-/// `badness` sees `(pid, rss_pages, oom_score_adj, total_pages)` in words 0..3,
-/// so this is how a smoke says "rank by RSS" or "rank by pid" without a
-/// jump-carrying program whose failure mode would be harder to read than the
-/// behaviour it is meant to prove.
-fn prog_returns_ctx(name: &str, word: i16) -> Result<Arc<BpfProg>, &'static str> {
-    load(name, asm(&[ldx(0, 1, word * 8), EXIT]), Context::Atomic)
+/// The three-instruction prologue is the proof obligation a region ctx buys its
+/// safety with: load `data`/`data_end`, and prove `data + off + 8 <= data_end`
+/// before dereferencing. A program that skips it does not load — which is the
+/// point, and is asserted directly by
+/// `smoke_bpf_oom_unproved_field_read_is_rejected`.
+///
+/// Falls to `r0 = 0` when the region is short, so a program compiled against a
+/// wider `OomCtx` than the kernel publishes declines to rank rather than
+/// reading rubbish.
+fn prog_returns_field(name: &str, off: i16) -> Result<Arc<BpfProg>, &'static str> {
+    load(
+        name,
+        asm(&[
+            ldx(2, 1, 0),                               // r2 = data
+            ldx(3, 1, 8),                               // r3 = data_end
+            mov_reg(4, 2),                              // r4 = data
+            alu_imm(AluOp::Add, 4, i32::from(off) + 8), // r4 = data + off + 8
+            jgt_reg(4, 3, 2),                           // short region -> r0 = 0
+            ldx(0, 2, off),                             // r0 = *(u64 *)(data + off)
+            EXIT,
+            mov_imm(0, 0),
+            EXIT,
+        ]),
+        Context::Atomic,
+    )
 }
 
 /// A program returning the constant `v`.
@@ -168,6 +217,13 @@ impl CandidateSource for FakeTasks {
                 tid,
                 rss_pages,
                 oom_score_adj,
+                // Derived rather than tabulated: these exist so the ctx has
+                // fields beyond the four a context tuple could carry, and a
+                // fixed relationship to `rss_pages` is enough to tell "the
+                // program read offset 40" from "the program read offset 16".
+                mapped_bytes: rss_pages * 4096,
+                resident_pages: rss_pages / 2,
+                writable_nonexec_bytes: rss_pages * 1024,
                 address_space: Arc::clone(space),
             })
             .collect()
@@ -252,11 +308,14 @@ fn smoke_bpf_oom_descriptor_registered() -> TestResult {
             None => return TestResult::Fail("descriptor is missing an optional method"),
         }
     }
-    // The ctx tuple is the method's real argument list: four words for
-    // `badness`, which is also exactly `MAX_CTX_WORDS` — a fifth argument would
-    // be a compile error, not a silent truncation.
-    if badness.ctx.len() != 4 {
-        return TestResult::Fail("badness ctx tuple was not derived from the signature");
+    // A region-ctx trait's methods all carry the same two-word ctx — the
+    // `(data, data_end)` pair — and the descriptor must say so, because that is
+    // what `validate` compares a bound program's load shape against.
+    if !d.region_ctx {
+        return TestResult::Fail("descriptor does not declare a region ctx");
+    }
+    if badness.ctx.len() != 2 {
+        return TestResult::Fail("badness ctx is not the (data, data_end) pair");
     }
     TestResult::Pass
 }
@@ -264,31 +323,85 @@ kernel_test_in!("bpf/oom", smoke_bpf_oom_descriptor_registered);
 
 // ── the adapter ──────────────────────────────────────────────────────
 
-fn smoke_bpf_oom_adapter_passes_all_four_ctx_words() -> TestResult {
-    // Each program returns a different context word, so the answers prove the
-    // adapter packed the arguments in signature order rather than zeroing,
-    // repeating, or truncating the tail.
-    for (word, expect) in [(0i16, 11u64), (1, 22), (2, 33), (3, 44)] {
-        let Ok(p) = prog_returns_ctx("oom_ctx", word) else {
-            return TestResult::Fail("load rejected the ctx program");
+fn smoke_bpf_oom_adapter_publishes_every_ctx_field() -> TestResult {
+    // The reason the region ctx exists: eight fields, where a context tuple
+    // holds four words. Each program reads a different offset, so the answers
+    // prove the adapter laid the structure out as `ctx::offset` promises rather
+    // than zeroing, repeating, or truncating past the fourth word — the exact
+    // failure the scalar form could not even express.
+    let ctx = OomCtx {
+        pid: 11,
+        tid: 22,
+        rss_pages: 33,
+        oom_score_adj: 44,
+        total_pages: 55,
+        mapped_bytes: 66,
+        resident_pages: 77,
+        writable_nonexec_bytes: 88,
+    };
+    let fields: [(i16, u64); 8] = [
+        (offset::PID, 11),
+        (offset::TID, 22),
+        (offset::RSS_PAGES, 33),
+        (offset::OOM_SCORE_ADJ, 44),
+        (offset::TOTAL_PAGES, 55),
+        (offset::MAPPED_BYTES, 66),
+        (offset::RESIDENT_PAGES, 77),
+        (offset::WRITABLE_NONEXEC_BYTES, 88),
+    ];
+    for (off, expect) in fields {
+        let Ok(p) = prog_returns_field("oom_field", off) else {
+            return TestResult::Fail("load rejected a bounds-checked field read");
         };
         let ops = BpfOomPolicyOps::new(ProgSet::new().with("badness", p));
-        if BpfOomPolicy::badness(&ops, 11, 22, 33, 44) != expect {
-            return TestResult::Fail("adapter did not pass an argument in ctx order");
+        if BpfOomPolicy::badness(&ops, &ctx) != expect {
+            return TestResult::Fail("adapter published a ctx field at the wrong offset");
         }
     }
+
+    // A read one word past the end must take the program's short-region branch
+    // rather than returning whatever follows the buffer. This is the bound the
+    // region ctx is worth having: the same program shape that reads field 7
+    // reads nothing at field 8.
+    let Ok(past) = prog_returns_field("oom_past_end", OOM_CTX_SIZE as i16) else {
+        return TestResult::Fail("load rejected the past-the-end program");
+    };
+    let ops = BpfOomPolicyOps::new(ProgSet::new().with("badness", past));
+    if BpfOomPolicy::badness(&ops, &ctx) != 0 {
+        return TestResult::Fail("a read past data_end was not bounded");
+    }
+
     // Unbound optionals fall back rather than fabricate: `veto` must read as
     // "no veto" (0) or an unbound optional would exclude every candidate.
-    let Ok(p) = prog_returns_ctx("oom_ctx0", 1) else {
-        return TestResult::Fail("load rejected the ctx program");
+    let Ok(p) = prog_returns_field("oom_field_rss", offset::RSS_PAGES) else {
+        return TestResult::Fail("load rejected the field program");
     };
     let ops = BpfOomPolicyOps::new(ProgSet::new().with("badness", p));
-    if BpfOomPolicy::veto(&ops, 1, 2, 3) != 0 || BpfOomPolicy::notify_kill(&ops, 1, 2) != 0 {
+    if BpfOomPolicy::veto(&ops, &ctx) != 0 || BpfOomPolicy::notify_kill(&ops, &ctx) != 0 {
         return TestResult::Fail("unbound optional method did not fall back");
     }
     TestResult::Pass
 }
-kernel_test_in!("bpf/oom", smoke_bpf_oom_adapter_passes_all_four_ctx_words);
+kernel_test_in!("bpf/oom", smoke_bpf_oom_adapter_publishes_every_ctx_field);
+
+fn smoke_bpf_oom_unproved_field_read_is_rejected() -> TestResult {
+    // The other half of the bound: a program that dereferences `data` without
+    // first comparing against `data_end` is rejected at load. Without this the
+    // bounds check in every other program here would be a convention rather
+    // than an enforced obligation.
+    let insns = asm(&[ldx(2, 1, 0), ldx(0, 2, offset::RSS_PAGES), EXIT]);
+    if load("oom_unproved", insns, Context::Atomic).is_ok() {
+        return TestResult::Fail("load accepted a field read with no data_end proof");
+    }
+    // And `data_end` itself is a bound, not a pointer: reading through it is
+    // rejected however carefully it is compared.
+    let insns = asm(&[ldx(3, 1, 8), ldx(0, 3, 0), EXIT]);
+    if load("oom_deref_end", insns, Context::Atomic).is_ok() {
+        return TestResult::Fail("load accepted a dereference of data_end");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf/oom", smoke_bpf_oom_unproved_field_read_is_rejected);
 
 // ── the program decides the victim ───────────────────────────────────
 
@@ -302,7 +415,7 @@ fn smoke_bpf_oom_program_picks_the_victim() -> TestResult {
     let cap = bootstrap_oom_policy_authority();
 
     // Rank by RSS: pid 10 (900 pages) is worst.
-    let Ok(by_rss) = prog_returns_ctx("oom_by_rss", 1) else {
+    let Ok(by_rss) = prog_returns_field("oom_by_rss", offset::RSS_PAGES) else {
         return TestResult::Fail("load rejected the badness program");
     };
     if install_bpf_oom_policy(&cap, ProgSet::new().with("badness", by_rss)).is_err() {
@@ -332,7 +445,7 @@ fn smoke_bpf_oom_program_picks_the_victim() -> TestResult {
     // Re-install a program ranking by pid: pid 30 now wins despite being
     // mid-sized. Proves the *program's* value decides — not RSS, not a cached
     // answer — and that a re-install swaps the live policy.
-    let Ok(by_pid) = prog_returns_ctx("oom_by_pid", 0) else {
+    let Ok(by_pid) = prog_returns_field("oom_by_pid", offset::PID) else {
         restore_live();
         return TestResult::Fail("load rejected the second badness program");
     };
@@ -359,12 +472,23 @@ fn smoke_bpf_oom_veto_excludes_candidates() -> TestResult {
     // badness = RSS (pid 10 would win), veto = pid - 30 (nonzero, i.e. vetoed,
     // for every pid but 30). The pid-30 task is mid-sized, so it can only be
     // selected if the veto actually excluded the two larger-ranked candidates.
-    let Ok(by_rss) = prog_returns_ctx("oom_veto_rss", 1) else {
+    let Ok(by_rss) = prog_returns_field("oom_veto_rss", offset::RSS_PAGES) else {
         return TestResult::Fail("load rejected the badness program");
     };
     let Ok(spare_30) = load(
         "oom_veto",
-        asm(&[ldx(0, 1, 0), alu_imm(AluOp::Sub, 0, 30), EXIT]),
+        asm(&[
+            ldx(2, 1, 0), // r2 = data
+            ldx(3, 1, 8), // r3 = data_end
+            mov_reg(4, 2),
+            alu_imm(AluOp::Add, 4, i32::from(offset::PID) + 8),
+            jgt_reg(4, 3, 3),           // short -> no veto
+            ldx(0, 2, offset::PID),     // r0 = pid
+            alu_imm(AluOp::Sub, 0, 30), // 0 (no veto) iff pid == 30
+            EXIT,
+            mov_imm(0, 0),
+            EXIT,
+        ]),
         Context::Atomic,
     ) else {
         return TestResult::Fail("load rejected the veto program");
@@ -533,7 +657,7 @@ fn smoke_bpf_oom_rejects_wrong_cap() -> TestResult {
     // The right shape, the wrong authority: a program-load cap, not an
     // OOM-policy cap.
     let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
-    let Ok(prog) = prog_returns_ctx("oom_badcap", 1) else {
+    let Ok(prog) = prog_returns_field("oom_badcap", offset::RSS_PAGES) else {
         return TestResult::Fail("load rejected the badness program");
     };
     let outcome = install_bpf_oom_policy(&wrong, ProgSet::new().with("badness", prog));
@@ -586,6 +710,38 @@ fn smoke_bpf_oom_rejects_incomplete_and_unknown_sets() -> TestResult {
 }
 kernel_test_in!("bpf/oom", smoke_bpf_oom_rejects_incomplete_and_unknown_sets);
 
+fn smoke_bpf_oom_rejects_scalar_ctx_program() -> TestResult {
+    if arm_fake(&[(10, 110, 900, 0)]).is_err() {
+        return TestResult::Fail("could not arm the fake candidate source");
+    }
+    crate::clear_policy();
+    let cap = bootstrap_oom_policy_authority();
+
+    // A perfectly good program, loaded for the wrong context *shape*: it holds
+    // `ctx[0]`/`ctx[1]` as scalars, so `run_atomic_region` declines it and every
+    // call would return `DEFAULT_RET`. The policy would look installed and rank
+    // nothing — the same silent failure the sleepable check exists to prevent,
+    // one layer down.
+    let Ok(scalar) = load_scalar_ctx("oom_scalar", asm(&[mov_imm(0, 7), EXIT])) else {
+        return TestResult::Fail("load rejected the scalar-ctx program");
+    };
+    let outcome = install_bpf_oom_policy(&cap, ProgSet::new().with("badness", scalar));
+    let leaked = crate::policy_installed();
+    restore_live();
+    match outcome {
+        Err(StructOpsError::WrongCtxShape {
+            method: "badness",
+            region_ctx: true,
+        }) => {}
+        _ => return TestResult::Fail("install accepted a scalar-ctx program"),
+    }
+    if leaked {
+        return TestResult::Fail("a rejected install still reached the live slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf/oom", smoke_bpf_oom_rejects_scalar_ctx_program);
+
 fn smoke_bpf_oom_rejects_sleepable_program() -> TestResult {
     if arm_fake(&[(10, 110, 900, 0)]).is_err() {
         return TestResult::Fail("could not arm the fake candidate source");
@@ -594,13 +750,34 @@ fn smoke_bpf_oom_rejects_sleepable_program() -> TestResult {
     let cap = bootstrap_oom_policy_authority();
 
     // Selection runs from the memory-pressure path, which dispatches through
-    // `run_atomic`: a sleepable program would decline every call and the policy
-    // would look installed while ranking nothing. Rejected by type at install.
-    let Ok(sleepy) = load(
-        "oom_sleepy",
+    // `run_atomic_region`: a sleepable program would decline every call and the
+    // policy would look installed while ranking nothing.
+    //
+    // Two gates, and the outer one is the load itself — a ctx region is
+    // borrowed for one non-preemptible call, so there is nothing to keep it
+    // alive across an await and `load_region_ctx` refuses a sleepable program
+    // outright.
+    if load(
+        "oom_sleepy_region",
         asm(&[mov_imm(0, 5), EXIT]),
         Context::Sleepable,
-    ) else {
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("load_region_ctx accepted a sleepable program");
+    }
+    // The inner gate still has to hold, because a sleepable program can be
+    // loaded some *other* way and then bound here. Install must reject it on
+    // context before it ever reaches the ctx-shape check.
+    let Ok(sleepy) = BpfProg::load(
+        load_cap(),
+        request(
+            "oom_sleepy",
+            asm(&[mov_imm(0, 5), EXIT]),
+            Context::Sleepable,
+        ),
+    )
+    .map_err(|_| "load rejected") else {
         return TestResult::Fail("load rejected the sleepable program");
     };
     let outcome = install_bpf_oom_policy(&cap, ProgSet::new().with("badness", sleepy));
@@ -625,7 +802,7 @@ fn smoke_bpf_oom_commit_requires_a_candidate_source() -> TestResult {
     crate::clear_policy();
     crate::policy::__clear_candidate_source_for_test();
     let cap = bootstrap_oom_policy_authority();
-    let Ok(p) = prog_returns_ctx("oom_nosource", 1) else {
+    let Ok(p) = prog_returns_field("oom_nosource", offset::RSS_PAGES) else {
         restore_live();
         return TestResult::Fail("load rejected the badness program");
     };
@@ -660,7 +837,7 @@ fn smoke_bpf_oom_commit_reaches_memory_slot() -> TestResult {
         return TestResult::Fail("could not arm the fake candidate source");
     }
     let cap = bootstrap_oom_policy_authority();
-    let Ok(by_rss) = prog_returns_ctx("oom_live_rss", 1) else {
+    let Ok(by_rss) = prog_returns_field("oom_live_rss", offset::RSS_PAGES) else {
         return TestResult::Fail("load rejected the badness program");
     };
     if install_bpf_oom_policy(&cap, ProgSet::new().with("badness", by_rss)).is_err() {

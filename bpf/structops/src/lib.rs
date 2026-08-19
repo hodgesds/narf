@@ -34,6 +34,12 @@ pub mod types {
     pub use narf_bpf::types::{BpfRet, BpfType};
 }
 
+/// The hook-context descriptor a `#[ctx_region]` trait's methods carry.
+/// Re-exported so the macro's `$crate::ctx::…` paths resolve here.
+pub mod ctx {
+    pub use narf_bpf::prog::REGION_CTX;
+}
+
 /// The capability primitives the generated install fn is cap-gated on.
 /// Re-exported so the macro's `$crate::reexport::…` paths resolve here.
 pub mod reexport {
@@ -41,8 +47,8 @@ pub mod reexport {
 }
 
 pub use structops::{
-    descriptors, install, installed_count, is_installed, validate, Binding, MethodDesc, ProgSet,
-    StructOpsDesc, StructOpsError,
+    descriptors, install, installed_count, is_installed, validate, with_ctx_bytes, Binding,
+    CtxStruct, MethodDesc, ProgSet, StructOpsDesc, StructOpsError,
 };
 
 /// Force-link anchor + boot-log stat: how many `struct_ops!` traits are
