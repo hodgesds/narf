@@ -202,6 +202,16 @@ async fn kswapd_kthread(node: usize) {
             }
         }
         narf_memory::oom::reap_all();
+
+        // Gentle background compaction, node 0 only: when this node was actually
+        // under memory pressure this wake (`pass > 0`), consolidate a couple of
+        // movable order-3 blocks so higher-order allocations can succeed instead
+        // of falling back to vmalloc. Bounded and off the allocation path, so it
+        // never blocks a faulting task. x86_64 only (migration is x86-only).
+        #[cfg(target_arch = "x86_64")]
+        if node == 0 && pass > 0 {
+            let _ = narf_memory::migrate::compact_scan(3, 2);
+        }
     }
 }
 

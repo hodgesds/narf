@@ -194,6 +194,41 @@ pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError
     })
 }
 
+/// Proactive compaction driver: consolidate free memory by compacting up to
+/// `max_blocks` order-`order` blocks that currently hold movable (user-mapped)
+/// pages, returning the number of pages migrated. Candidate blocks are the
+/// order-`order` blocks containing rmap-tracked frames, so the scan is directed
+/// at movable memory instead of walking all of RAM.
+///
+/// Bounded by `max_blocks` so a background caller (kswapd) does a little gentle
+/// consolidation per pass rather than a full sweep. This is a first-cut policy:
+/// it does not yet order candidates by yield or use Linux's dual (free/migrate)
+/// scanner, so it can migrate a page more than once across passes; the sound
+/// per-block mechanism is [`compact_block`].
+#[cfg(target_arch = "x86_64")]
+pub fn compact_scan(order: usize, max_blocks: usize) -> usize {
+    if order == 0 || max_blocks == 0 {
+        return 0;
+    }
+    let block_bytes = (1u64 << order) << 12;
+    let block_mask = !(block_bytes - 1);
+    // Distinct order-`order` block bases covering the tracked (movable) frames.
+    let mut candidates: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    crate::rmap::for_each_tracked_frame(|phys| {
+        let base = phys.raw() & block_mask;
+        if candidates.len() < max_blocks && !candidates.contains(&base) {
+            candidates.push(base);
+        }
+    });
+    let mut migrated = 0usize;
+    for base in candidates {
+        if let Ok(n) = compact_block(PhysAddr::new(base), order) {
+            migrated = migrated.saturating_add(n);
+        }
+    }
+    migrated
+}
+
 /// Test-only: clear the installed resolver so a test's mock never leaks.
 #[doc(hidden)]
 pub fn __reset_resolver_for_test() {
@@ -414,4 +449,22 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_compact_block_evacuates_movable);
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_compact_scan_guards_and_runs() -> TestResult {
+        use super::compact_scan;
+        // Degenerate arguments do nothing.
+        if compact_scan(0, 4) != 0 || compact_scan(3, 0) != 0 {
+            return TestResult::Fail("compact_scan must no-op on order 0 / max_blocks 0");
+        }
+        // With no resolver installed, any candidate blocks fail to migrate, so a
+        // scan is a safe no-op returning 0 rather than panicking.
+        __reset_resolver_for_test();
+        if compact_scan(3, 4) != 0 {
+            return TestResult::Fail("compact_scan with no resolver should migrate nothing");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_compact_scan_guards_and_runs);
 }

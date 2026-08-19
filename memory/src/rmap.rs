@@ -136,6 +136,24 @@ pub fn for_each_owner(phys: PhysAddr, mut f: impl FnMut(Owner)) {
     }
 }
 
+/// Visit every physical frame currently tracked (i.e. mapped by at least one
+/// owner). Snapshots each shard's keys under its lock, then invokes `f` with the
+/// lock RELEASED, so the callback may migrate frames / take page-table locks.
+/// Used by the compaction driver to find movable (user-mapped) frames.
+pub fn for_each_tracked_frame(mut f: impl FnMut(PhysAddr)) {
+    for shard in RMAP.iter() {
+        let frames: Vec<u64> = shard
+            .map
+            .lock()
+            .as_ref()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        for key in frames {
+            f(PhysAddr::new(key));
+        }
+    }
+}
+
 /// Test-only: clear all rmap shards so a test's entries never leak into another
 /// test or the live kernel.
 #[doc(hidden)]
