@@ -26,8 +26,12 @@ struct ProcessOomKiller;
 
 static PROCESS_OOM_KILLER: ProcessOomKiller = ProcessOomKiller;
 
-impl OomKiller for ProcessOomKiller {
-    fn select_victim(&self) -> Option<OomVictim> {
+impl ProcessOomKiller {
+    /// Pick the highest-badness eligible user process and SIGKILL it, optionally
+    /// RESTRICTED to `filter` (a cgroup subtree's member pids). `None` filter
+    /// considers every task (global OOM); `Some(pids)` considers only listed
+    /// pids (cgroup `memory.max` OOM).
+    fn select_scoped(&self, filter: Option<&[u64]>) -> Option<OomVictim> {
         let total_pages = narf_memory::frame::stats().total.max(1) as i64;
         let mut best: Option<(u64, u64, usize, i64, Arc<AddressSpace>)> = None;
 
@@ -35,6 +39,12 @@ impl OomKiller for ProcessOomKiller {
             // Never target init (pid 1) or kernel identities (pid 0).
             if pid <= 1 {
                 continue;
+            }
+            // Cgroup-scoped OOM: skip anything outside the offending subtree.
+            if let Some(pids) = filter {
+                if !pids.contains(&pid) {
+                    continue;
+                }
             }
             // Only user processes have an address space to reclaim; a kernel
             // task (or an already-reaped zombie off the ready queue) resolves
@@ -72,6 +82,16 @@ impl OomKiller for ProcessOomKiller {
             // (`request_oom_relief`); the policy leaves it at 0.
             retries_left: 0,
         })
+    }
+}
+
+impl OomKiller for ProcessOomKiller {
+    fn select_victim(&self) -> Option<OomVictim> {
+        self.select_scoped(None)
+    }
+
+    fn select_victim_in(&self, pids: &[u64]) -> Option<OomVictim> {
+        self.select_scoped(Some(pids))
     }
 }
 

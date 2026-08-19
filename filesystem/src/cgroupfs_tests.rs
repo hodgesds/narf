@@ -1721,6 +1721,79 @@ kernel_test_in!(
     smoke_cgroup_memory_limit_write_drives_enforcement
 );
 
+// ── memory.max OOM is scoped to the breaching cgroup's subtree ───────
+//
+// A memory.max breach must ask the OOM policy to kill a task INSIDE the
+// offending cgroup (cgroup v2), not machine-wide. A recording killer captures
+// the candidate pid set `select_victim_in` receives; the attached pid must be
+// in it, and — returning no victim — the over-max charge is denied.
+#[cfg(feature = "cgroup-memory")]
+static SCOPED_OOM_PIDS: narf_lib::sync::IrqSafeSpinLock<Option<alloc::vec::Vec<u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "cgroup-memory")]
+struct ScopeRecordingOomKiller;
+#[cfg(feature = "cgroup-memory")]
+impl narf_memory::oom::OomKiller for ScopeRecordingOomKiller {
+    fn select_victim(&self) -> Option<narf_memory::oom::OomVictim> {
+        // The scoped path must be taken; record an empty set so a global call
+        // is distinguishable from the scoped one below.
+        *SCOPED_OOM_PIDS.lock() = Some(alloc::vec::Vec::new());
+        None
+    }
+    fn select_victim_in(&self, pids: &[u64]) -> Option<narf_memory::oom::OomVictim> {
+        *SCOPED_OOM_PIDS.lock() = Some(pids.to_vec());
+        None
+    }
+}
+#[cfg(feature = "cgroup-memory")]
+static SCOPE_RECORDING_OOM_KILLER: ScopeRecordingOomKiller = ScopeRecordingOomKiller;
+
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_max_oom_scoped_to_subtree() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    narf_memory::oom::register_oom_killer(&SCOPE_RECORDING_OOM_KILLER);
+    *SCOPED_OOM_PIDS.lock() = None;
+
+    let out = with_root_controller("memory", "t_mem_scope", |cg| {
+        let pid: u64 = 4_200_000_014;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        if write_attr(cg, "memory.max", b"4096").is_err() {
+            task_exited(pid);
+            return TestResult::Fail("set memory.max failed");
+        }
+        // Charge far past max; no shrinker frees 256 MiB, so reclaim fails and
+        // the (scoped) OOM path runs. The recording killer returns no victim, so
+        // the charge must be denied.
+        const OVER_MAX: i64 = 256 * 1024 * 1024;
+        let allowed = memory::charge_hook_for_test(pid, OVER_MAX);
+        let saw = SCOPED_OOM_PIDS.lock().clone();
+        task_exited(pid);
+        if allowed {
+            return TestResult::Fail("over-max charge allowed despite failed reclaim/OOM");
+        }
+        match saw {
+            Some(pids) if pids.contains(&pid) => TestResult::Pass,
+            Some(_) => {
+                TestResult::Fail("scoped OOM candidate set did not include the cgroup's pid")
+            }
+            None => TestResult::Fail("memory.max OOM did not use the cgroup-scoped path"),
+        }
+    });
+
+    narf_memory::oom::__reset_oom_killer_for_test();
+    *SCOPED_OOM_PIDS.lock() = None;
+    out
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_max_oom_scoped_to_subtree
+);
+
 // ── with_chain_states walks the cgroup + every ancestor ─────────────
 //
 // Enable memory on the root AND on a mid-level cgroup, so a leaf pid's
