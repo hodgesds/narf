@@ -2060,7 +2060,8 @@ impl AddressSpace {
         // threaded process's stale entries can only live HERE, and the
         // per-page local INVLPGs above already dropped them.
         self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
-        // Pass 3: free the frames this region owns.
+        // Pass 3: free the frames this region owns (and drop their rmap entries;
+        // see free_region_frames).
         self.free_region_frames(region);
     }
 
@@ -2316,6 +2317,15 @@ impl AddressSpace {
     /// Borrowed (SHARED) frames belong to an external registry — never
     /// freed here. Callers must have completed the cross-CPU flush first.
     fn free_region_frames(&self, region: &Region) {
+        // Drop this region's reverse-map entries (frame → (this AS, va)) before
+        // the frames are freed/released. This is the single teardown choke point
+        // that BOTH `unmap_region` and `unmap_region_pages` route through.
+        for (i, p) in region.phys.iter().enumerate() {
+            if p.raw() != 0 {
+                let va = VirtAddr::new(region.base.as_u64() + (i as u64) * 4096);
+                crate::rmap::remove(*p, self.root, va);
+            }
+        }
         if region.perms.contains(RegionPerms::SHARED) {
             for phys in &region.phys {
                 release_shared_phys(*phys);
@@ -2866,6 +2876,8 @@ impl AddressSpace {
                         assert_eq!(region.phys[index], *phys);
                         region.phys[index] = PhysAddr::new(0);
                     }
+                    // Evicted to swap → no longer resident here; drop its rmap.
+                    crate::rmap::remove(*phys, self.root, VirtAddr::new(va));
                     table.swap_pages.insert(va, SwapPageState::Swapped);
                 }
             })
@@ -3041,6 +3053,8 @@ impl AddressSpace {
                         assert_eq!(region.phys[index], PhysAddr::new(0));
                         region.phys[index] = *phys;
                     }
+                    // Faulted back in and resident again → re-record its rmap.
+                    crate::rmap::add(*phys, self.root, VirtAddr::new(va));
                     table.swap_pages.remove(&va);
                 }
             });
@@ -3159,7 +3173,10 @@ impl AddressSpace {
                 Err(_) => Err(AddressSpaceError::NotImplemented),
             }
         })?;
-        if !published {
+        if published {
+            // The fresh frame is now mapped + owned at `v`; record its rmap.
+            crate::rmap::add(phys, self.root, VirtAddr::new(v));
+        } else {
             // The ticket was cancelled before publication, so ownership never
             // left this fault path. A file hook supplies one external alias
             // reference, balanced through the normal shared release hook.
@@ -4809,6 +4826,9 @@ impl AddressSpace {
                         return Err(AddressSpaceError::Overlap);
                     }
                 }
+                // The page is now mapped at `v` (Ok or idempotent AlreadyMapped;
+                // every error arm returned above). Record the reverse mapping.
+                crate::rmap::add(p, self.root, v);
             }
         }
         Ok(())
@@ -4880,6 +4900,8 @@ impl AddressSpace {
                         return Err(AddressSpaceError::Overlap);
                     }
                 }
+                // The page is now mapped at `v`; record the reverse mapping.
+                crate::rmap::add(p, self.root, v);
             }
         }
         Ok(())
@@ -5200,6 +5222,10 @@ impl AddressSpace {
                     .expect("COW region disappeared under its lock");
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
                 region.phys[page_idx] = new_phys;
+                // This owner's page now maps its private copy: move its rmap
+                // entry (other COW sharers of `old_phys` keep theirs).
+                crate::rmap::remove(old_phys, self.root, VirtAddr::new(v));
+                crate::rmap::add(new_phys, self.root, VirtAddr::new(v));
                 regions.cow_pages.remove(&v);
                 true
             } else {
@@ -5355,6 +5381,11 @@ impl AddressSpace {
         }
         region.phys[page_idx] = new_phys;
         drop(regions);
+
+        // The page now maps a fresh frame on the target node: move its rmap
+        // entry so a later reverse-map walk finds the live frame.
+        crate::rmap::remove(old_phys, self.root, page_va);
+        crate::rmap::add(new_phys, self.root, page_va);
 
         self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));

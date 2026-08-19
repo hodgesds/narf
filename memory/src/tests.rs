@@ -6081,6 +6081,268 @@ fn smoke_memory_anon_reclaim_clock_second_chance() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_anon_reclaim_clock_second_chance);
 
+/// The rmap wiring must record a `(root, va) → phys` reverse mapping for every
+/// resident page when a region is materialized, and drop it on unmap.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_rmap_tracks_materialized_region() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    crate::rmap::__reset_for_test();
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 3;
+    let base = VirtAddr::new(0x0000_0080_0050_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for _ in 0..N {
+        match crate::alloc_frame() {
+            Ok(f) => phys.push(f.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    let frames = phys.clone();
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        // Each resident frame has exactly one owner: (this AS root, its va).
+        for (i, p) in frames.iter().enumerate() {
+            let va = base.as_u64() + (i as u64) * 4096;
+            if crate::rmap::owner_count(*p) != 1 {
+                return TestResult::Fail("materialize did not record one rmap owner per page");
+            }
+            let mut matched = false;
+            crate::rmap::for_each_owner(*p, |o| {
+                if o.root == aspace.root && o.va.as_u64() == va {
+                    matched = true;
+                }
+            });
+            if !matched {
+                return TestResult::Fail("rmap owner did not match (root, va)");
+            }
+        }
+        TestResult::Pass
+    })();
+
+    // Unmap frees the frames AND drops their rmap entries.
+    let _ = aspace.unmap_region(base);
+    for p in &frames {
+        if crate::rmap::owner_count(*p) != 0 {
+            crate::rmap::__reset_for_test();
+            return TestResult::Fail("unmap did not clear the rmap entries");
+        }
+    }
+    crate::rmap::__reset_for_test();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_rmap_tracks_materialized_region);
+
+/// rmap across fork + COW-split: a fork-shared frame must gain a second owner,
+/// and a COW write-split must MOVE the writer's owner to its private copy while
+/// the other sharer keeps the original.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_rmap_fork_and_cow_split() -> TestResult {
+    use crate::frame::cow;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    crate::rmap::__reset_for_test();
+    cow::__test_clear();
+    // SAFETY: paging + frame allocator live in the kernel suite.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let p_frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let va = VirtAddr::new(0x0000_0080_0060_0000);
+    if parent
+        .map_region(Region {
+            base: va,
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![p_frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { parent.materialize() }.is_err() {
+        return TestResult::Fail("materialize parent failed");
+    }
+
+    let result = (|| {
+        if crate::rmap::owner_count(p_frame) != 1 {
+            return TestResult::Fail("parent materialize should give the frame one owner");
+        }
+        // SAFETY: fork's documented contract; paging is live.
+        let child = match unsafe { parent.clone_for_fork() } {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("clone_for_fork failed"),
+        };
+        // SAFETY: child owns a fresh root; materialize maps its COW-shared page.
+        if unsafe { child.materialize() }.is_err() {
+            return TestResult::Fail("materialize child failed");
+        }
+        // The shared frame now has two rmap owners (parent + child).
+        if crate::rmap::owner_count(p_frame) != 2 {
+            return TestResult::Fail("fork-shared frame should have 2 rmap owners");
+        }
+        // Split the child's page: writer gets a private copy.
+        // SAFETY: `va` names the child's present COW mapping.
+        if unsafe { child.cow_split_on_write(va) }.is_err() {
+            return TestResult::Fail("cow_split_on_write failed");
+        }
+        // SAFETY: pairs with the split to rewrite the leaf PTE.
+        if unsafe { child.remap_page(va) }.is_err() {
+            return TestResult::Fail("remap_page failed");
+        }
+        let c_new = child.lookup(va).expect("child region").phys[0];
+        if c_new == p_frame {
+            return TestResult::Fail("split should allocate a fresh child frame");
+        }
+        // rmap moved: shared frame keeps only the parent; child's copy has one.
+        if crate::rmap::owner_count(p_frame) != 1 {
+            return TestResult::Fail("post-split shared frame should keep only the parent owner");
+        }
+        if crate::rmap::owner_count(c_new) != 1 {
+            return TestResult::Fail("post-split child copy needs one rmap owner");
+        }
+        let mut parent_owns = false;
+        crate::rmap::for_each_owner(p_frame, |o| {
+            if o.root == parent.root && o.va == va {
+                parent_owns = true;
+            }
+        });
+        let mut child_owns = false;
+        crate::rmap::for_each_owner(c_new, |o| {
+            if o.root == child.root && o.va == va {
+                child_owns = true;
+            }
+        });
+        if !parent_owns || !child_owns {
+            return TestResult::Fail("post-split rmap owners do not match (root, va)");
+        }
+        TestResult::Pass
+    })();
+
+    // parent/child Drop free their frames + rmap entries; reset the shared state.
+    crate::rmap::__reset_for_test();
+    cow::__test_clear();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_rmap_fork_and_cow_split);
+
+/// rmap across a swap round-trip: swap-out must drop the evicted frame's rmap,
+/// and the fault-in must record the fresh frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_rmap_swap_roundtrip() -> TestResult {
+    use crate::reclaim::{plan_reclaim_ranges, ReclaimRangeCandidate};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr, ZramBackend};
+
+    if crate::swap_stats().resident != 0 {
+        return TestResult::Skip("another swap lifecycle is active");
+    }
+    crate::rmap::__reset_for_test();
+    crate::install_swap_backend(ZramBackend::new());
+    // SAFETY: paging + frame allocator live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 2;
+    let base = VirtAddr::new(0x0000_0080_0070_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for _ in 0..N {
+        match crate::alloc_frame() {
+            Ok(f) => phys.push(f.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    let old0 = phys[0];
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        if crate::rmap::owner_count(old0) != 1 {
+            return TestResult::Fail("materialize should record one rmap owner");
+        }
+        let plan = plan_reclaim_ranges(
+            &[ReclaimRangeCandidate {
+                address_space_root: aspace.root,
+                base,
+                pages: N,
+                mapcount: 1,
+                expected_free_pages: N,
+                age: 0,
+                locked: false,
+            }],
+            N,
+            N,
+        );
+        // SAFETY: test owns this live address space and its private resident run.
+        let report = unsafe { aspace.swap_out_reclaim_plan(&plan) };
+        if report.error.is_some() || report.swapped_pages != N {
+            return TestResult::Fail("swap-out did not evict every page");
+        }
+        // Evicted → rmap for the old frame is gone.
+        if crate::rmap::owner_count(old0) != 0 {
+            return TestResult::Fail("swap-out did not drop the evicted frame's rmap");
+        }
+        // Fault the first page back in.
+        // SAFETY: same live-root/fault contract as a real user #PF.
+        if unsafe { aspace.demand_alloc_page(base) }.is_err() {
+            return TestResult::Fail("swap fault-in failed");
+        }
+        let new0 = aspace.regions_snapshot()[0].phys[0];
+        if new0.raw() == 0 {
+            return TestResult::Fail("fault-in did not republish backing");
+        }
+        if crate::rmap::owner_count(new0) != 1 {
+            return TestResult::Fail("swap-in did not record the fresh frame's rmap");
+        }
+        TestResult::Pass
+    })();
+
+    let _ = aspace.unmap_region(base);
+    crate::rmap::__reset_for_test();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_rmap_swap_roundtrip);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.
