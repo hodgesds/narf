@@ -137,27 +137,6 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }
 
-/// `unix-latency-trace`: print a one-line park report for every task
-/// currently parked in a syscall.
-///
-/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
-/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
-/// the boot (an early RCU stall trips it around t+25 s), so on a real
-/// desktop run the census never fires. This one is called from ahead of
-/// that gate and repeats, which is what a process that freezes MINUTES
-/// into the session requires.
-///
-/// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
-/// healthy parked poller re-executes its syscall on a 1 ms deadline, so
-/// `scans`/`checks` climb. Both frozen across successive reports, with
-/// `parked=1`, is a park that never re-fires.
-///
-/// Called from the timer trap, so it inherits that context's hazards: it
-/// allocates (the snapshot Vec) and holds `Arc<Task>` clones. Both are
-/// things NARF's task-lifetime rules tell IRQ paths not to do. It is safe
-/// only because `TASKS` holds a ref for every task listed, so no drop here
-/// is ever the last one — and it is compiled out entirely without the
-/// feature. Do not promote this to a non-debug path.
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────
 //
 // "This process burns 41 s of user CPU before it starts serving" is where
@@ -280,8 +259,8 @@ fn dbg_profile_report() {
     let mut ceiling = u64::MAX;
     for _ in 0..8 {
         let mut best = (0usize, 0u64);
-        for i in 0..PROF_SLOTS {
-            let c = PROF_CNT[i].load(Ordering::Relaxed);
+        for (i, cnt) in PROF_CNT.iter().enumerate() {
+            let c = cnt.load(Ordering::Relaxed);
             if c > best.1 && c < ceiling {
                 best = (i, c);
             }
@@ -384,6 +363,27 @@ pub fn dbg_proc_roster() {
     dbg_profile_report();
 }
 
+/// `unix-latency-trace`: print a one-line park report for every task
+/// currently parked in a syscall.
+///
+/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
+/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
+/// the boot (an early RCU stall trips it around t+25 s), so on a real
+/// desktop run the census never fires. This one is called from ahead of
+/// that gate and repeats, which is what a process that freezes MINUTES
+/// into the session requires.
+///
+/// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
+/// healthy parked poller re-executes its syscall on a 1 ms deadline, so
+/// `scans`/`checks` climb. Both frozen across successive reports, with
+/// `parked=1`, is a park that never re-fires.
+///
+/// Called from the timer trap, so it inherits that context's hazards: it
+/// allocates (the snapshot Vec) and holds `Arc<Task>` clones. Both are
+/// things NARF's task-lifetime rules tell IRQ paths not to do. It is safe
+/// only because `TASKS` holds a ref for every task listed, so no drop here
+/// is ever the last one — and it is compiled out entirely without the
+/// feature. Do not promote this to a non-debug path.
 #[cfg(feature = "unix-latency-trace")]
 pub fn dbg_park_census(tag: &str) {
     use core::fmt::Write as _;

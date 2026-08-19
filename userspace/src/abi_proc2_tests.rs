@@ -976,6 +976,43 @@ fn smoke_abi_proc2_pid_comm_matches() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_comm_matches);
 
+// ── comm_matches_selectors: the trace_comm= selector grammar ──
+// Shared by proc_comm_of_task_matches (syscall trace) and the UNIXENQ/UNIXACC
+// latency filter (unix_latency_line_wanted). Prefix by default; `$` = exact;
+// comma-separated = any-of; empty selectors never match.
+fn smoke_comm_matches_selectors_grammar() -> TestResult {
+    use crate::handlers::comm_matches_selectors as m;
+    // (comm, selectors, expected). Covers prefix, `$` exact, comma any-of, and
+    // the empty-selector guard (an empty filter — or a stray trailing comma —
+    // must never silently widen the trace to everything).
+    let cases: &[(&str, &str, bool)] = &[
+        ("dbus-broker", "dbus-brok", true),
+        ("systemd-logind", "dbus-brok", false),
+        ("kwin_wayland", "kwin_wayland$", true),
+        ("kwin_wayland_wrapper", "kwin_wayland$", false),
+        (
+            "systemd-user-ru",
+            "dbus-broker,systemd-user-ru,systemd-logind",
+            true,
+        ),
+        (
+            "plasmashell",
+            "dbus-broker,systemd-user-ru,systemd-logind",
+            false,
+        ),
+        ("anything", "", false),
+        ("dbus-broker", "dbus-brok,", true),
+        ("plasmashell", "dbus-brok,", false),
+    ];
+    for &(comm, selectors, want) in cases {
+        if m(comm, selectors) != want {
+            return TestResult::Fail("comm_matches_selectors grammar mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_comm_matches_selectors_grammar);
+
 fn smoke_abi_proc2_pid_comm_truncated_to_15() -> TestResult {
     const PID: u64 = 0x574b;
     // 20 chars in; TASK_COMM_LEN-1 = 15 kept (set_proc_comm truncates).

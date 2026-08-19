@@ -3961,18 +3961,20 @@ impl SocketFile {
                     let comm =
                         crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
                             .unwrap_or_default();
-                    let path = match &uaddr {
-                        UnixAddr::Path(p) => p.as_str(),
-                        UnixAddr::Abstract(_) => "<abstract>",
-                        UnixAddr::Unnamed => "<unnamed>",
-                    };
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "UNIXENQ ms={} from={} path={}",
-                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
-                        comm,
-                        path,
-                    );
+                    if crate::syscall::unix_latency_line_wanted(&comm) {
+                        let path = match &uaddr {
+                            UnixAddr::Path(p) => p.as_str(),
+                            UnixAddr::Abstract(_) => "<abstract>",
+                            UnixAddr::Unnamed => "<unnamed>",
+                        };
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "UNIXENQ ms={} from={} path={}",
+                            narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                            comm,
+                            path,
+                        );
+                    }
                 }
                 // Wake a server parked in poll/accept on the listener so it
                 // accepts the new connection immediately (not on a fallback
@@ -5704,7 +5706,7 @@ pub fn unix_listener_stall_sweep() {
         // whose lock the interrupted CPU already holds is skipped, not waited
         // on — which is exactly why `listen_owner_tid` avoided this walk; the
         // try-lock makes it trap-safe.
-        let l_ptr = Arc::as_ptr(&l) as *const SocketFile;
+        let l_ptr = Arc::as_ptr(&l);
         for t2 in narf_scheduler::all_task_ids() {
             let tid2 = t2.0;
             let held_fd = crate::fd::try_with_table(tid2, |tab| {

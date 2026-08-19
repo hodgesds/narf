@@ -3765,6 +3765,19 @@ pub fn proc_argv_of_task_try(tid: u64) -> Option<alloc::vec::Vec<u8>> {
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
+/// Match a `comm` string against comma-separated `trace_comm=` selectors. A
+/// selector ending in `$` matches the complete name; others are prefixes. The
+/// single definition of the selector grammar, shared by the tid-keyed lookup
+/// below and the UNIXENQ/UNIXACC latency filter, so the two never drift.
+pub fn comm_matches_selectors(comm: &str, prefixes: &str) -> bool {
+    prefixes
+        .split(',')
+        .any(|selector| match selector.strip_suffix('$') {
+            Some(exact) => !exact.is_empty() && comm == exact,
+            None => !selector.is_empty() && comm.starts_with(selector),
+        })
+}
+
 /// Check a task's Linux `comm` name against comma-separated prefixes without
 /// cloning it. A selector ending in `$` matches the complete comm name; other
 /// selectors retain prefix semantics. Diagnostic paths call this on every
@@ -3775,12 +3788,7 @@ pub fn proc_comm_of_task_matches(tid: u64, prefixes: &str) -> bool {
     let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
         return false;
     };
-    prefixes
-        .split(',')
-        .any(|selector| match selector.strip_suffix('$') {
-            Some(exact) => !exact.is_empty() && comm == exact,
-            None => !selector.is_empty() && comm.starts_with(selector),
-        })
+    comm_matches_selectors(comm, prefixes)
 }
 
 // ── /proc/[pid]/comm writable hook ─────────────────────────────
@@ -6822,13 +6830,15 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             {
                 use core::fmt::Write as _;
                 let comm = proc_comm_of_task(task).unwrap_or_default();
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "UNIXACC ms={} by={} lfd={}",
-                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
-                    comm,
-                    fd,
-                );
+                if crate::syscall::unix_latency_line_wanted(&comm) {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "UNIXACC ms={} by={} lfd={}",
+                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                        comm,
+                        fd,
+                    );
+                }
             }
             let new_fd = match fd::with_table(task, |t| {
                 t.open(crate::fd::FdEntry {

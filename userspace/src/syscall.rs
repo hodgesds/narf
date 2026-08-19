@@ -3296,6 +3296,23 @@ pub fn set_trace_comm(prefix: &str) {
     let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
 }
 
+/// Whether a UNIXENQ/UNIXACC connect→accept latency line for a task whose comm
+/// is `comm` should be emitted. When a `trace_comm=` selector is explicitly set
+/// (only possible when `syscall-trace` is compiled in), restrict this
+/// system-wide firehose to the selected comms so a targeted trace stays
+/// readable; with no selector — including a pure `unix-latency-trace` build that
+/// has no `TRACE_COMM` at all — emit for every comm, which is the latency
+/// probe's whole point (catch a slow accept anywhere).
+#[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+pub fn unix_latency_line_wanted(comm: &str) -> bool {
+    #[cfg(feature = "syscall-trace")]
+    if let Some(filter) = TRACE_COMM.get() {
+        return crate::handlers::comm_matches_selectors(comm, filter);
+    }
+    let _ = comm;
+    true
+}
+
 /// Errors-only mode for the syscall trace (cmdline `trace_errors_only`). When
 /// set, the trace SKIPS the per-call SYSC entry line and only emits a SYSR
 /// line for calls that FAIL with a reportable errno (see
@@ -3328,8 +3345,7 @@ fn trace_errors_only() -> bool {
 #[cfg(feature = "syscall-trace")]
 fn is_reportable_syscall_error(value: u64) -> bool {
     let v = value as i64;
-    v <= -1
-        && v >= -4095
+    (-4095..=-1).contains(&v)
         && v != -11 /* EAGAIN */
         && v != -4 /* EINTR */
         && v != -2 /* ENOENT */
