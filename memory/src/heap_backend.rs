@@ -93,12 +93,26 @@ impl CapType for HeapAuthority {
 }
 
 // `&'static dyn HeapBackend` is a fat pointer (data + vtable). An
-// `AtomicPtr` can only hold one word, so we park the trait object
-// behind an `IrqSafeSpinLock<Option<…>>`. The lock is taken for
-// the entire duration of a dispatched call, which keeps the
-// vtable load + the indirect call atomic with respect to a swap.
+// `AtomicPtr` can only hold one word, so a CUSTOM (test-installed) backend is
+// parked behind this `IrqSafeSpinLock<Option<…>>`. It is ONLY consulted for the
+// CUSTOM kind — the two production backends are dispatched lock-free through the
+// `HEAP_BACKEND_KIND` discriminant below.
 static HEAP_BACKEND_SLOT: IrqSafeSpinLock<Option<&'static dyn HeapBackend>> =
     IrqSafeSpinLock::new(None);
+
+// Lock-free active-backend discriminant. `current_backend()` runs on EVERY
+// allocation; before this, it (and `install_default_if_unset`) took the global
+// `HEAP_BACKEND_SLOT` spinlock per-alloc, so 16 CPUs allocating under a
+// file-load storm serialized/livelocked on one IRQ-masked lock (all-CPU spin in
+// `IrqSafeSpinLock::lock`, confirmed by coredump). Production installs only the
+// two shipped `&'static` backends — bump at first alloc, then slab once at
+// `promote_to_slab` — so the active backend is an `AtomicU8` discriminant read
+// lock-free. Only a test-installed CUSTOM backend falls back to the slot.
+const K_UNSET: u8 = 0;
+const K_BUMP: u8 = 1;
+const K_SLAB: u8 = 2;
+const K_CUSTOM: u8 = 3;
+static HEAP_BACKEND_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(K_UNSET);
 
 /// The shipped bootstrap-bump backend. Backs allocations between
 /// `_start_rust` and `crate::heap::promote_to_slab()`. Zero-sized:
@@ -178,8 +192,24 @@ pub fn install_heap_backend(
     backend: &'static dyn HeapBackend,
 ) -> Result<(), HeapError> {
     cap.check_live()?;
-    *HEAP_BACKEND_SLOT.lock() = Some(backend);
+    set_active_backend(backend);
     Ok(())
+}
+
+/// Route an install through the lock-free discriminant. The two shipped
+/// backends dispatch lock-free; anything else is a CUSTOM backend parked in the
+/// slot (source of truth), with the slot written BEFORE the kind so a
+/// concurrent `current_backend` that observes `K_CUSTOM` always finds it.
+fn set_active_backend(backend: &'static dyn HeapBackend) {
+    let name = backend.name();
+    if name == BUMP_BACKEND.name() {
+        HEAP_BACKEND_KIND.store(K_BUMP, core::sync::atomic::Ordering::Release);
+    } else if name == SLAB_BACKEND.name() {
+        HEAP_BACKEND_KIND.store(K_SLAB, core::sync::atomic::Ordering::Release);
+    } else {
+        *HEAP_BACKEND_SLOT.lock() = Some(backend);
+        HEAP_BACKEND_KIND.store(K_CUSTOM, core::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Install `BUMP_BACKEND` if no backend is yet installed. Called
@@ -188,10 +218,16 @@ pub fn install_heap_backend(
 /// holding `Some(_)` is left alone, which is what makes a later
 /// `promote_to_slab` install of `SLAB_BACKEND` stick.
 pub(crate) fn install_default_if_unset() {
-    let mut slot = HEAP_BACKEND_SLOT.lock();
-    if slot.is_none() {
-        *slot = Some(&BUMP_BACKEND);
+    // Lock-free, and a no-op once any backend is installed (the common case on
+    // every allocation). Only the very first allocation transitions
+    // `K_UNSET -> K_BUMP`; a lost CAS means a peer installed first, which is
+    // fine. Never overwrites an already-installed backend (slab or custom).
+    use core::sync::atomic::Ordering;
+    if HEAP_BACKEND_KIND.load(Ordering::Acquire) != K_UNSET {
+        return;
     }
+    let _ =
+        HEAP_BACKEND_KIND.compare_exchange(K_UNSET, K_BUMP, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Crate-internal, uncapped install. The only caller is
@@ -201,17 +237,32 @@ pub(crate) fn install_default_if_unset() {
 /// out of the public surface so accidental uncapped swaps can't
 /// happen from outside the crate.
 pub(crate) fn install_uncapped(backend: &'static dyn HeapBackend) {
-    *HEAP_BACKEND_SLOT.lock() = Some(backend);
+    set_active_backend(backend);
 }
 
 /// Snapshot the active backend's `name()`. Returns `None` when no
 /// backend has been installed yet.
 pub fn current_heap_backend_name() -> Option<&'static str> {
-    HEAP_BACKEND_SLOT.lock().as_ref().map(|b| b.name())
+    use core::sync::atomic::Ordering;
+    match HEAP_BACKEND_KIND.load(Ordering::Acquire) {
+        K_BUMP => Some(BUMP_BACKEND.name()),
+        K_SLAB => Some(SLAB_BACKEND.name()),
+        K_CUSTOM => HEAP_BACKEND_SLOT.lock().as_ref().map(|b| b.name()),
+        _ => None,
+    }
 }
 
 /// Snapshot the currently-installed backend. `None` pre-install.
 #[inline]
 pub(crate) fn current_backend() -> Option<&'static dyn HeapBackend> {
-    *HEAP_BACKEND_SLOT.lock()
+    // Hot path: runs on EVERY allocation. Dispatch the two production backends
+    // lock-free through the discriminant; only a CUSTOM backend takes the slot
+    // lock. This is what removes the per-allocation global-lock livelock.
+    use core::sync::atomic::Ordering;
+    match HEAP_BACKEND_KIND.load(Ordering::Acquire) {
+        K_BUMP => Some(&BUMP_BACKEND),
+        K_SLAB => Some(&SLAB_BACKEND),
+        K_CUSTOM => *HEAP_BACKEND_SLOT.lock(),
+        _ => None,
+    }
 }
