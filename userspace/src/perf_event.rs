@@ -38,6 +38,15 @@ use narf_linux_perf_uapi::{
 };
 
 static ACTIVE_PERF_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Lock-free count of live perf events (the refcount that gates
+/// `narf_lib::perf::enabled()`). Read by the stall-watchdog to tell whether a
+/// perf test leaked an event, leaving the per-syscall `drain_irq_samples` scan
+/// permanently armed. Never takes the registry lock — the watchdog may run
+/// while a wedged CPU holds it.
+pub fn dbg_active_perf_events() -> usize {
+    ACTIVE_PERF_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+}
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
@@ -815,6 +824,20 @@ struct PerfEventFile {
     refresh_hup: AtomicBool,
     refresh_limit: AtomicU32,
     wakeup_pending: AtomicU32,
+    /// Durable per-fd readiness cell (see `narf_lib::readiness`). Carries
+    /// `POLL_IN` while the mmap ring holds unread records (data_head !=
+    /// data_tail) and `POLL_HUP` once a refresh budget is exhausted — exactly
+    /// the mask `poll_readiness` computes. It is the migration target that gives
+    /// a poll/epoll parked on this fd a targeted `set`-edge wake instead of the
+    /// coarse `narf_net::readiness::notify(0)` herd + ~10 ms lost-wake backstop.
+    /// A perf fd is never writable (`write` is `ReadOnly`; `poll_readiness` never
+    /// reports `POLL_OUT`), so the cell never carries `POLL_OUT`. Synced at the
+    /// ring produce path (`push_record`), at the refresh-HUP flip
+    /// (`consume_refresh`), and reconciled against the USERSPACE-advanced ring
+    /// tail in `poll_readiness` (the ring is drained from userspace via the
+    /// shared mmap, so there is no kernel-driven consume syscall to hook). The
+    /// legacy `notify(0)` calls stay belt-and-suspenders during migration.
+    readiness: narf_lib::readiness::Readiness,
     sample_period: AtomicU64,
     sample_period_left: AtomicU64,
     last_sample_period: AtomicU64,
@@ -1519,6 +1542,47 @@ impl PerfEventFile {
         mapping.write_u32(PERF_MMAP_LOCK_OFFSET, sequence.wrapping_add(2));
     }
 
+    /// Recompute the durable readiness cell from the current mmap ring occupancy
+    /// and the refresh-HUP flag, publishing the transition. `POLL_IN` while the
+    /// ring has unread records (data_head != data_tail), `POLL_HUP` once a refresh
+    /// budget is exhausted — the exact mask `poll_readiness` returns. The mmap
+    /// lock is read then RELEASED before `set` (the cell owns its own lock; the
+    /// two are never held together, matching the pipe.rs discipline). `set` bumps
+    /// the edge sequence and wakes armed waiters ONLY on a rising edge, all under
+    /// one lock (drop-free / IRQ-safe), so a concurrent `arm` cannot miss this
+    /// transition. Called at every ring produce (`push_record`), at the refresh
+    /// HUP flip (`consume_refresh`), and to reconcile against the userspace-
+    /// advanced tail (`poll_readiness`); the legacy `notify(0)` + wakeup-threshold
+    /// path stays belt-and-suspenders during the migration.
+    fn sync_readiness(&self) {
+        // Read the ring level under the mmap lock, then drop it BEFORE `set`.
+        let ring_readable = {
+            let mapping = self.mmap.lock();
+            match mapping.as_ref() {
+                Some(mapping) => {
+                    mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET)
+                        != mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET)
+                }
+                // No ring mapped yet: never POLL_IN-readable.
+                None => false,
+            }
+        };
+        let mut add = 0u32;
+        let mut clear = 0u32;
+        if ring_readable {
+            add |= narf_filesystem::POLL_IN;
+        } else {
+            clear |= narf_filesystem::POLL_IN;
+        }
+        if self.refresh_hup.load(Ordering::Acquire) {
+            add |= narf_filesystem::POLL_HUP;
+        } else {
+            clear |= narf_filesystem::POLL_HUP;
+        }
+        // mmap lock already dropped above; `set` takes only the cell's own lock.
+        self.readiness.set(add, clear);
+    }
+
     fn push_record_here(&self, record: &[u8]) -> RecordPush {
         if self.output_paused.load(Ordering::Acquire) {
             return RecordPush::Suppressed;
@@ -1562,12 +1626,33 @@ impl PerfEventFile {
     fn push_record(&self, record: &[u8]) -> bool {
         let target = self.output_target.lock().clone();
         let result = if let Some(target) = target {
-            target
+            match target
                 .as_any()
                 .and_then(|any| any.downcast_ref::<PerfEventFile>())
-                .map_or(RecordPush::Unmapped, |event| event.push_record_here(record))
+            {
+                Some(event) => {
+                    let pushed = event.push_record_here(record);
+                    if pushed == RecordPush::Committed {
+                        // Ring head advanced on the REDIRECTED target (its mmap,
+                        // not ours); republish that event's POLL_IN cell so a
+                        // poll/epoll parked on the OUTPUT fd wakes on the ring
+                        // transition. push_record_here has already released the
+                        // target's mmap lock, so this re-lock is deadlock-free.
+                        event.sync_readiness();
+                    }
+                    pushed
+                }
+                None => RecordPush::Unmapped,
+            }
         } else {
-            self.push_record_here(record)
+            let pushed = self.push_record_here(record);
+            if pushed == RecordPush::Committed {
+                // Ring head advanced; republish POLL_IN so a poll/epoll parked on
+                // this fd's durable cell wakes on the transition (belt-and-
+                // suspenders with push_record_here's wakeup-threshold notify).
+                self.sync_readiness();
+            }
+            pushed
         };
         if result == RecordPush::Full {
             self.sample_lost.fetch_add(1, Ordering::Relaxed);
@@ -1841,6 +1926,10 @@ impl PerfEventFile {
                 Ok(_) if limit == 1 => {
                     self.disable();
                     self.refresh_hup.store(true, Ordering::Release);
+                    // POLL_HUP just appeared; publish it into the durable cell so a
+                    // poll/epoll parked on this fd wakes on the hangup edge, not
+                    // only via the coarse notify(0) fallback at the drain sites.
+                    self.sync_readiness();
                     return true;
                 }
                 Ok(_) => return false,
@@ -2589,7 +2678,13 @@ pub(crate) fn drain_irq_samples() {
     // every syscall dispatch, so an unconditional scan taxes the whole system
     // (and monopolizes the CPU) even when nobody is profiling. `enabled()` is a
     // single read-mostly load flipped only on the first attach / last detach.
-    if !narf_lib::perf::enabled() {
+    // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
+    // can desync from the count (a stall-watchdog probe caught active_events=0
+    // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
+    // dispatch / task switch for the rest of the run — monopolizing the CPU (a
+    // scheduler stall once the preemption backstop is gone; task #32). The
+    // refcount is the source of truth: 0 live events means nothing to do.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let mut notify = false;
@@ -2931,7 +3026,13 @@ fn schedule_group(leader: &PerfEventFile, cpu: usize, registry: &[Weak<PerfEvent
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
     account_cpu_user_switch(running);
-    if !narf_lib::perf::enabled() {
+    // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
+    // can desync from the count (a stall-watchdog probe caught active_events=0
+    // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
+    // dispatch / task switch for the rest of the run — monopolizing the CPU (a
+    // scheduler stall once the preemption backstop is gone; task #32). The
+    // refcount is the source of truth: 0 live events means nothing to do.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
     let cpu = narf_lib::percpu::current_cpu();
@@ -3467,20 +3568,43 @@ impl FileOps for PerfEventFile {
     fn poll_readiness(&self) -> u32 {
         let mut readiness =
             u32::from(self.refresh_hup.load(Ordering::Acquire)) * narf_filesystem::POLL_HUP;
-        let mapping = self.mmap.lock();
-        let Some(mapping) = mapping.as_ref() else {
-            return readiness;
-        };
-        if mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET)
-            != mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET)
         {
-            readiness |= narf_filesystem::POLL_IN;
+            let mapping = self.mmap.lock();
+            if let Some(mapping) = mapping.as_ref() {
+                if mapping.read_u64_acquire(PERF_MMAP_DATA_HEAD_OFFSET)
+                    != mapping.read_u64_acquire(PERF_MMAP_DATA_TAIL_OFFSET)
+                {
+                    readiness |= narf_filesystem::POLL_IN;
+                }
+            }
         }
+        // Reconcile the durable cell against the level just read. The ring is
+        // drained from USERSPACE (it advances data_tail in the shared mmap with no
+        // kernel-driven consume syscall to hook), so this level query is where the
+        // kernel re-observes a consume and clears a now-stale POLL_IN. Without it,
+        // an armed `arm_readiness` would return Ready spuriously and a timed poll
+        // would spin-return 0 instead of parking. The mmap lock is dropped above;
+        // `set` takes only the cell lock, and a rising edge here is a legit wake.
+        let (add, clear) = (
+            readiness & (narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP),
+            (narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP) & !readiness,
+        );
+        self.readiness.set(add, clear);
         readiness
     }
 
     fn readiness_notifies(&self) -> bool {
         true
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        // The cell reaches this FileOps type directly through the Arc field, so the
+        // default `arm_readiness`/`disarm_readiness` (which delegate here) suffice —
+        // no override needed, unlike the lock-guarded socket ring. A poller arms it
+        // with POLL_IN (the poll/epoll layer folds HUP/ERR into every interest), and
+        // a record push (`push_record`) or refresh-HUP flip (`consume_refresh`)
+        // fires exactly this waiter via `set`.
+        Some(&self.readiness)
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -3672,12 +3796,30 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
     let count_user = attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0;
 
+    // A positive pid is in the CALLER's pid namespace (Linux
+    // kernel/events/core.c find_task_by_vpid). Translate inner -> outer once;
+    // the raw inner pid resolved to whatever ROOT-namespace task owned the
+    // same number, so `perf record -p <inner>` in a container profiled the
+    // wrong host task. An inner pid not bound in the caller's namespace is
+    // ESRCH. `target_outer` is the OUTER ProcessId, kept for the sample-record
+    // rendering below.
+    let target_outer = if pid > 0 {
+        match crate::handlers::accept_pid_from(task, pid as u64) {
+            Some(outer) => outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    } else {
+        0
+    };
     let target_task = if pid == 0 {
         task
     } else if pid > 0 {
-        match crate::handlers::pid_to_task_raw(pid as u64) {
+        match crate::handlers::pid_to_task_raw(target_outer) {
             Some(target) => target,
-            None if pid as u64 == task => task,
+            None if target_outer == task => task,
             None => {
                 ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
                 return;
@@ -3690,7 +3832,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let target_pid = if pid == 0 {
         crate::handlers::task_to_pid_raw(task).unwrap_or(task)
     } else if pid > 0 {
-        pid as u64
+        target_outer
     } else {
         u64::MAX
     };
@@ -4062,6 +4204,8 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             refresh_hup: AtomicBool::new(false),
             refresh_limit: AtomicU32::new(0),
             wakeup_pending: AtomicU32::new(0),
+            // Fresh event: no ring records (not readable), never writable, no HUP.
+            readiness: narf_lib::readiness::Readiness::new(0),
             sample_period: AtomicU64::new(sample_period),
             sample_period_left: AtomicU64::new(sample_period),
             last_sample_period: AtomicU64::new(sample_period),
@@ -4198,22 +4342,26 @@ fn is_supported_event(attr: &PerfEventAttr) -> bool {
     }
 }
 
-/// The syscall-return drain must be a no-op when no perf event is attached.
-///
-/// `drain_irq_samples` runs on every syscall dispatch. With the `enabled()`
-/// gate it returns before locking the registry or scanning MAX_CPUS * depth
-/// pending slots when nobody is profiling; without it, that scan taxes every
-/// syscall and monopolizes the CPU. This proves a staged slot is left
-/// untouched while perf is disabled and is consumed once perf is enabled.
-fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
+/// The syscall-return drain must be a no-op when NO perf event is registered —
+/// EVEN IF the global `perf::enabled()` software-counter bit is on. The
+/// stall-watchdog turns `enabled()` on for its `syscalls` forward-progress
+/// counter and never balances it, so `drain_irq_samples` gates on the
+/// ACTIVE_PERF_EVENTS refcount (the source of truth for "are there sample
+/// events"), NOT that bool. A stale-true bool must not drag the per-syscall
+/// scan of MAX_CPUS * depth slots along and monopolize the CPU (which stalled
+/// the scheduler once the preemption backstop was gone; task #32). Proves a
+/// staged slot is left UNTOUCHED whenever the refcount is 0, either bool state.
+fn smoke_perf_drain_skips_without_active_events() -> narf_kernel_test::TestResult {
+    // The refcount is the gate; this test is only meaningful with it at 0.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) != 0 {
+        return narf_kernel_test::TestResult::Skip("a perf event is active");
+    }
     let cpu = narf_lib::percpu::current_cpu().min(SAMPLE_CPU_SLOTS - 1);
     // Use a quiescent slot so a concurrently-staged real sample is never eaten.
     let ring = &PENDING_TRACES[cpu];
     let Some(slot) = ring.iter().find(|s| s.state.load(Ordering::Acquire) == 0) else {
-        // Whole ring busy (not expected at rest) — nothing safe to probe.
         return narf_kernel_test::TestResult::Skip("PENDING_TRACES ring busy");
     };
-
     let saved_enabled = narf_lib::perf::enabled();
 
     // Stage a bogus trace whose type_id matches no event.
@@ -4221,16 +4369,17 @@ fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
     slot.len.store(0, Ordering::Relaxed);
     slot.state.store(2, Ordering::Release);
 
-    // Disabled: the fast path must return before touching the rings.
+    // enabled=false: the fast path returns.
     narf_lib::perf::set_enabled(false);
     drain_irq_samples();
     let after_disabled = slot.state.load(Ordering::Acquire);
 
-    // Enabled: the same drain must consume the slot (no matching event, so it
-    // is simply cleared to state 0).
+    // enabled=true but STILL zero active events (the watchdog-leak shape): the
+    // drain must STILL skip on the refcount gate, leaving the slot untouched.
+    // Before the refcount gate this scanned the rings on every syscall.
     narf_lib::perf::set_enabled(true);
     drain_irq_samples();
-    let after_enabled = slot.state.load(Ordering::Acquire);
+    let after_enabled_no_events = slot.state.load(Ordering::Acquire);
 
     // Restore global + slot state regardless of the outcome.
     slot.state.store(0, Ordering::Release);
@@ -4238,13 +4387,13 @@ fn smoke_perf_drain_skips_when_disabled() -> narf_kernel_test::TestResult {
     narf_lib::perf::set_enabled(saved_enabled);
 
     if after_disabled != 2 {
-        return narf_kernel_test::TestResult::Fail("disabled drain consumed a pending slot");
+        return narf_kernel_test::TestResult::Fail("drain scanned the rings with enabled=false");
     }
-    if after_enabled != 0 {
+    if after_enabled_no_events != 2 {
         return narf_kernel_test::TestResult::Fail(
-            "enabled drain did not consume the pending slot",
+            "drain scanned the rings with enabled=true and zero active events (refcount gate broken)",
         );
     }
     narf_kernel_test::TestResult::Pass
 }
-narf_kernel_test::kernel_test_in!("syscall_abi", smoke_perf_drain_skips_when_disabled);
+narf_kernel_test::kernel_test_in!("syscall_abi", smoke_perf_drain_skips_without_active_events);

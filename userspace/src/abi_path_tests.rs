@@ -678,6 +678,72 @@ fn smoke_abi_path_statx_reports_mnt_id() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_reports_mnt_id);
 
+// systemd's `path_is_mount_point()` requests only STATX_TYPE|STATX_INO but
+// still relies on the returned mount ID. statx may return cheap additional
+// fields, and NARF must advertise this one so systemd can distinguish the
+// API-filesystem bind mounts it inherited from ordinary directories.
+fn smoke_abi_path_statx_systemd_mount_probe_includes_mnt_id() -> TestResult {
+    const STATX_TYPE_AND_INO: u32 = 0x0101;
+    const STATX_MNT_ID: u32 = 0x1000;
+    const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        // systemd asks this shape about the API filesystem's *mount root*.
+        let path = b"/p\0";
+        let mut buf = [0u8; 256];
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0x4800, // AT_STATX_SYNC_AS_STAT | AT_NO_AUTOMOUNT
+            arg3: STATX_TYPE_AND_INO as u64,
+            arg4: buf.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Statx.raw(), args) != Some(0) {
+            return Err("systemd-shaped statx probe should succeed");
+        }
+        let mask = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if mask & STATX_MNT_ID == 0 {
+            return Err("systemd-shaped statx probe omitted STATX_MNT_ID");
+        }
+        // struct statx: stx_attributes @ 8, stx_attributes_mask @ 56.
+        let attributes = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let attributes_mask = u64::from_ne_bytes(buf[56..64].try_into().unwrap());
+        if attributes_mask & STATX_ATTR_MOUNT_ROOT == 0 || attributes & STATX_ATTR_MOUNT_ROOT == 0 {
+            return Err("systemd-shaped statx probe omitted STATX_ATTR_MOUNT_ROOT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_statx_systemd_mount_probe_includes_mnt_id
+);
+
+// The MOUNT_ROOT support bit is available for every statx response, but its
+// value must not leak to children inside the mounted filesystem. Otherwise a
+// service manager would treat ordinary paths (for example /proc/sys) as mount
+// points and skip the mount it needs.
+fn smoke_abi_path_statx_mount_root_is_exact() -> TestResult {
+    const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        let mut buf = [0u8; 256];
+        if do_statx(AT_FDCWD, path.as_ptr() as u64, 0, 0x0101, &mut buf) != Some(0) {
+            return Err("statx of mount child should succeed");
+        }
+        let attributes = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let attributes_mask = u64::from_ne_bytes(buf[56..64].try_into().unwrap());
+        if attributes_mask & STATX_ATTR_MOUNT_ROOT == 0 {
+            return Err("statx of mount child omitted MOUNT_ROOT support bit");
+        }
+        if attributes & STATX_ATTR_MOUNT_ROOT != 0 {
+            return Err("statx reported a mount child as a mount root");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_statx_mount_root_is_exact);
+
 // ── lstat: Linux (path_ptr NUL-term, statbuf) → 0 / -1 ──
 
 fn smoke_abi_path_lstat_pos() -> TestResult {
@@ -2029,6 +2095,73 @@ fn smoke_abi_path_statx_at_empty_path_fd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_at_empty_path_fd);
+
+// Two independent opens of the SAME directory must be indistinguishable:
+// identical stx_ino AND identical stx_mnt_id. This is an identity invariant,
+// not a formatting one, and the existing statx smokes only check that the
+// fields are PRESENT.
+//
+// systemd's `path_is_root_at()` / `fds_inode_and_mount_same()` decide "have I
+// reached the root yet" by opening a reference directory and comparing it,
+// via statx(AT_EMPTY_PATH), against the fd it is walking. If two opens of one
+// directory disagree, that test can never say "yes" and the walk does not
+// terminate. `systemd-udevd` was caught doing exactly this on the Fedora
+// gate — an unbounded `openat("/") → statx(held_fd) → statx(new_fd) → close`
+// loop, which is what a never-satisfied root comparison looks like from the
+// syscall side, and it stops the daemon dead after two uevents.
+//
+// NARF fabricates inode numbers, so "same path, same identity" is a real
+// thing to get wrong here rather than something the filesystem hands over for
+// free — st_ino fabrication has already broken musl's DSO dedup once.
+fn smoke_abi_path_statx_same_dir_twice_has_stable_identity() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        let dir = b"/p ";
+        let mut fds = [0u64; 2];
+        for slot in fds.iter_mut() {
+            *slot = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, dir.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open(/p) should return a fd"),
+            };
+        }
+        let empty = b"\0";
+        let mut buf_a = [0u8; 256];
+        let mut buf_b = [0u8; 256];
+        let ra = do_statx(
+            fds[0],
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH_FLAG,
+            STATX_MNT_ID_BIT as u64,
+            &mut buf_a,
+        );
+        let rb = do_statx(
+            fds[1],
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH_FLAG,
+            STATX_MNT_ID_BIT as u64,
+            &mut buf_b,
+        );
+        for fd in fds {
+            let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+        }
+        if ra != Some(0) || rb != Some(0) {
+            return Err("statx(dirfd, \"\", AT_EMPTY_PATH) should return 0 for both opens");
+        }
+        if statx_u64(&buf_a, STATX_INO_OFF) != statx_u64(&buf_b, STATX_INO_OFF) {
+            return Err("two opens of the same directory reported different stx_ino");
+        }
+        if statx_u64(&buf_a, STATX_MNT_ID_OFF) != statx_u64(&buf_b, STATX_MNT_ID_OFF) {
+            return Err("two opens of the same directory reported different stx_mnt_id");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_statx_same_dir_twice_has_stable_identity
+);
 
 // AT_SYMLINK_NOFOLLOW gives lstat semantics: statx of a symlink WITH the
 // flag describes the LINK node (S_IFLNK), while statx WITHOUT it follows to

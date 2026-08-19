@@ -526,7 +526,7 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
@@ -546,12 +546,15 @@ mod tests {
         CURRENT_TASK.load(Ordering::Relaxed)
     }
 
-    struct TestFile(IrqSafeSpinLock<alloc::vec::Vec<u8>>);
+    struct TestFile {
+        bytes: IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+        writes: AtomicUsize,
+    }
 
     impl FileOps for TestFile {
         fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
             Box::pin(async move {
-                let bytes = self.0.lock();
+                let bytes = self.bytes.lock();
                 let start = offset as usize;
                 if start >= bytes.len() {
                     return Ok(0);
@@ -564,9 +567,10 @@ mod tests {
 
         fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
             Box::pin(async move {
+                self.writes.fetch_add(1, Ordering::Relaxed);
                 let start = offset as usize;
                 let end = start + buf.len();
-                let mut bytes = self.0.lock();
+                let mut bytes = self.bytes.lock();
                 if bytes.len() < end {
                     bytes.resize(end, 0);
                 }
@@ -577,7 +581,7 @@ mod tests {
 
         fn stat(&self) -> Stat {
             Stat {
-                size: self.0.lock().len() as u64,
+                size: self.bytes.lock().len() as u64,
                 blocks: 8,
                 mode: Mode::FILE_RW,
                 mtime_cycles: 0,
@@ -800,7 +804,10 @@ mod tests {
         crate::handlers::register_task_to_pid(TASK, PROCESS);
         crate::handlers::register_task_to_pid(WORKER_TASK, PROCESS);
 
-        let file = Arc::new(TestFile(IrqSafeSpinLock::new(vec![0; 4096])));
+        let file = Arc::new(TestFile {
+            bytes: IrqSafeSpinLock::new(vec![0; 4096]),
+            writes: AtomicUsize::new(0),
+        });
         let fd = crate::fd::with_table(TASK, |table| {
             table.open(crate::fd::FdEntry {
                 ops: Arc::clone(&file) as Arc<dyn FileOps>,
@@ -894,8 +901,29 @@ mod tests {
         if !matches!(fsync.ret, Some(ret) if ret.status == SyscallReturn::OK && ret.value == 0) {
             return TestResult::Fail("fsync on the mapped file failed");
         }
-        if &file.0.lock()[..8] != b"JOURNAL\0" {
+        if &file.bytes.lock()[..8] != b"JOURNAL\0" {
             return TestResult::Fail("MAP_SHARED file data was not written back by fsync");
+        }
+        if file.writes.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("aliased MAP_SHARED page was written more than once");
+        }
+
+        // A second fsync with no intervening mapped write must not rewrite the
+        // entire fallback mapping. Journald keeps multi-megabyte sparse
+        // mappings, so clean-page suppression is required for usable boot
+        // latency rather than merely being an optimization detail.
+        crate::handlers::sys_fsync(&mut fsync);
+        if file.writes.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("fsync rewrote a clean MAP_SHARED page");
+        }
+
+        // SAFETY: both mappings still retain the identity-mapped page.
+        unsafe {
+            *(second_region.phys[0].raw() as *mut u8).add(8) = b'!';
+        }
+        crate::handlers::sys_fsync(&mut fsync);
+        if file.writes.load(Ordering::Relaxed) != 2 || file.bytes.lock()[8] != b'!' {
+            return TestResult::Fail("a MAP_SHARED write after fsync was not persisted");
         }
 
         let _ = aspace.unmap_region(narf_memory::VirtAddr::new(second_base));

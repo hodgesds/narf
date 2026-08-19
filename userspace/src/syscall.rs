@@ -3267,6 +3267,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
 static TRACE_COMM: narf_lib::sync::OnceLock<alloc::string::String> =
     narf_lib::sync::OnceLock::new();
 
+/// syscall-trace park-dedup: `(tid<<12 | raw_num)` of the syscall the last
+/// traced park re-executed, or 0. A blocking syscall RIP-rewinds and
+/// re-executes on every ~10 ms backstop tick; this suppresses the identical
+/// re-execution lines (which flood the serial and slow the very boot being
+/// traced). Deliberately a single trace-only global — NOT a `UserTaskCtx` field
+/// — since `trace_comm` usually narrows the trace to one hot parker; an SMP
+/// race just costs an occasional un-deduped line, which is fine for a probe.
+#[cfg(feature = "syscall-trace")]
+static TRACE_LAST_PARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pack `(tid, raw syscall num)` into the [`TRACE_LAST_PARK`] key. tid=0 never
+/// occurs (TaskIds start at 1), so a packed key is never the 0 = "none" sentinel.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+fn trace_park_key(num: u32) -> u64 {
+    (crate::handlers::current_task_id() << 12) | (num as u64 & 0xFFF)
+}
+
 /// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
 /// A comma-separated list matches any of the listed prefixes.
 #[cfg(feature = "syscall-trace")]
@@ -3276,6 +3294,98 @@ pub fn set_trace_comm(prefix: &str) {
     // read path must remain lock-free so unmatched tasks do not perturb the
     // workload being diagnosed.
     let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
+}
+
+/// Whether a UNIXENQ/UNIXACC connect→accept latency line for a task whose comm
+/// is `comm` should be emitted. When a `trace_comm=` selector is explicitly set
+/// (only possible when `syscall-trace` is compiled in), restrict this
+/// system-wide firehose to the selected comms so a targeted trace stays
+/// readable; with no selector — including a pure `unix-latency-trace` build that
+/// has no `TRACE_COMM` at all — emit for every comm, which is the latency
+/// probe's whole point (catch a slow accept anywhere).
+#[cfg(any(feature = "syscall-trace", feature = "unix-latency-trace"))]
+pub fn unix_latency_line_wanted(comm: &str) -> bool {
+    #[cfg(feature = "syscall-trace")]
+    if let Some(filter) = TRACE_COMM.get() {
+        return crate::handlers::comm_matches_selectors(comm, filter);
+    }
+    let _ = comm;
+    true
+}
+
+/// Errors-only mode for the syscall trace (cmdline `trace_errors_only`). When
+/// set, the trace SKIPS the per-call SYSC entry line and only emits a SYSR
+/// line for calls that FAIL with a reportable errno (see
+/// `is_reportable_syscall_error`). This keeps the trace light enough to reach
+/// a late boot phase — the full trace floods the serial console so hard the
+/// boot never gets to e.g. the greeter's `locale1` activation (observer
+/// effect). Combine with a `trace_comm=` selector to watch one comm's failures
+/// (e.g. `trace_comm=systemd-executo trace_errors_only` shows exactly which
+/// sandbox-setup syscall makes a service's start job fail).
+#[cfg(feature = "syscall-trace")]
+static TRACE_ERRORS_ONLY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable errors-only trace mode (see [`TRACE_ERRORS_ONLY`]).
+#[cfg(feature = "syscall-trace")]
+pub fn set_trace_errors_only(v: bool) {
+    TRACE_ERRORS_ONLY.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "syscall-trace")]
+fn trace_errors_only() -> bool {
+    TRACE_ERRORS_ONLY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A syscall return worth reporting in errors-only mode: a negative value in
+/// the Linux errno band, EXCLUDING the high-frequency benign ones that flood a
+/// normal boot and are never the fatal step — EAGAIN (non-blocking I/O),
+/// EINTR (restart), ENOENT (path probing). The fatal sandbox op returns
+/// something else (EPERM/EINVAL/ENOSYS/EOPNOTSUPP/EACCES/…).
+#[cfg(feature = "syscall-trace")]
+fn is_reportable_syscall_error(value: u64) -> bool {
+    let v = value as i64;
+    (-4095..=-1).contains(&v)
+        && v != -11 /* EAGAIN */
+        && v != -4 /* EINTR */
+        && v != -2 /* ENOENT */
+        && v != -25 /* ENOTTY — terminal ioctl probes flood the trace */
+        && v != -3 /* ESRCH */
+        && v != -10 /* ECHILD */
+}
+
+/// Sandbox/exec setup syscalls. In errors-only mode these are ALSO logged at
+/// ENTRY (with decoded paths) even when they succeed, so the trace shows a
+/// service's mount/namespace/exec SEQUENCE and exactly where it stops — the
+/// key when a start job fails with no errno because the setup process runs
+/// under a comm the `trace_comm=` filter never matched (systemd's per-exec
+/// helper renames its comm), or blocks/bails on a semantically-wrong success.
+#[cfg(feature = "syscall-trace")]
+fn is_sandbox_syscall(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "mount"
+                | "umount2"
+                | "move_mount"
+                | "mount_setattr"
+                | "open_tree"
+                | "fsopen"
+                | "fsconfig"
+                | "fsmount"
+                | "fspick"
+                | "pivot_root"
+                | "chroot"
+                | "unshare"
+                | "setns"
+                | "clone"
+                | "clone3"
+                | "execve"
+                | "execveat"
+                | "exit_group"
+                | "exit"
+        )
+    )
 }
 
 /// Trace filter for the `syscall-trace` feature. Fedora desktop diagnostics
@@ -3405,8 +3515,25 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    // In errors-only mode still surface exit_group/exit ENTRY lines: a systemd
+    // executor that fails sandbox setup calls exit_group(<EXIT_* category>)
+    // instead of execve()'ing the service binary, so this one line names the
+    // failing category (226=NAMESPACE, 227=CGROUP, 209=STDIN, …) for a service
+    // whose start job fails with no reportable syscall errno.
+    // syscall-trace park-dedup: a blocking syscall RIP-rewinds and re-executes
+    // on every ~10 ms backstop tick. Log its FIRST park and its eventual wake,
+    // but suppress the hundreds of identical re-executions in between — they
+    // flood the serial (slowing the very boot being traced) and bury the real
+    // syscalls. A TRACE_LAST_PARK key matching this (tid,num) = a re-execution.
     #[cfg(feature = "syscall-trace")]
-    if syscall_trace_relevant(n) {
+    let trace_was_parked =
+        TRACE_LAST_PARK.load(core::sync::atomic::Ordering::Relaxed) == trace_park_key(num);
+    #[cfg(feature = "syscall-trace")]
+    let show_entry = syscall_trace_relevant(n)
+        && !trace_was_parked
+        && (!trace_errors_only() || is_sandbox_syscall(table.name_of(n)));
+    #[cfg(feature = "syscall-trace")]
+    if show_entry {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
@@ -3445,18 +3572,36 @@ pub fn kernel_syscall_entry_plain_with_state(
     // handler answering a bare -1 that glibc renders as EPERM). Printed as
     // a signed decimal so negative errnos are readable at a glance.
     #[cfg(feature = "syscall-trace")]
-    if syscall_trace_relevant(n) {
-        use core::fmt::Write as _;
+    {
         let r = ctx.ret;
-        let _ = writeln!(
-            narf_console::Writer,
-            "SYSR t={} {} = {} ({:#x}) st={:?}",
-            crate::handlers::current_task_id(),
-            table.name_of(n).unwrap_or("?"),
-            r.value as i64,
-            r.value,
-            r.status,
+        // A park re-executes with exactly `invalid_op()` (value 0, InvalidOp).
+        let parked_now = r == SyscallReturn::invalid_op();
+        TRACE_LAST_PARK.store(
+            if parked_now { trace_park_key(num) } else { 0 },
+            core::sync::atomic::Ordering::Relaxed,
         );
+        // Suppress ONLY a re-execution that parked again; the first park and any
+        // real return (including the wake) still log.
+        if syscall_trace_relevant(n) && !(parked_now && trace_was_parked) {
+            use core::fmt::Write as _;
+            let errors_only = trace_errors_only();
+            if !errors_only || is_reportable_syscall_error(r.value) {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "SYSR t={} {} = {} ({:#x}) st={:?}",
+                    crate::handlers::current_task_id(),
+                    table.name_of(n).unwrap_or("?"),
+                    r.value as i64,
+                    r.value,
+                    r.status,
+                );
+                // Errors-only mode suppresses the SYSC entry line, so decode the
+                // path args HERE to show which file/mount the failing op targeted.
+                if errors_only {
+                    trace_syscall_paths(table.name_of(n).unwrap_or("?"), args);
+                }
+            }
+        }
     }
     // PTRACE_SYSCALL exit-stop: after the syscall body, before returning to
     // user, stop again so the tracer can read the return value (rax). The

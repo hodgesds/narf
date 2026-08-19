@@ -33,8 +33,7 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // it can be re-bound (Linux frees the address when the socket inode is
     // unlinked — dbus/wayland unlink a stale socket before re-binding).
     let was_socket = crate::socket::unbind_path(path);
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| {
+    let outcome = current_resolve_parent_absolute(path, |_fs, parent, leaf| {
             poll_blocking(parent.unlink(leaf))
         });
     match outcome {

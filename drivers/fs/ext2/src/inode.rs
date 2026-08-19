@@ -82,6 +82,9 @@ pub struct Inode {
     /// `i_flags` (offset 32). Carries `I_FLAGS_INDEX` for HTREE dirs
     /// and `I_FLAGS_EXTENTS` for ext4 extent-tree inodes.
     pub flags: u32,
+    /// `i_generation` (offset 100). ext4 includes this value in inode,
+    /// directory-block, and external extent-node checksums.
+    pub generation: u32,
     /// `i_block[15]` — block pointers (12 direct + 3 indirect tiers).
     pub block: [u32; I_BLOCK_LEN],
 }
@@ -107,6 +110,7 @@ impl Inode {
         let links_count = u16::from_le_bytes([buf[26], buf[27]]);
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+        let generation = u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]]);
         let mut block = [0u32; I_BLOCK_LEN];
         for (i, b) in block.iter_mut().enumerate() {
             let off = 40 + i * 4;
@@ -123,6 +127,7 @@ impl Inode {
             blocks,
             links_count,
             flags,
+            generation,
             block,
         })
     }
@@ -142,6 +147,11 @@ impl Inode {
     /// `true` when the directory uses HTREE indexing (`EXT4_INDEX_FL`).
     pub fn is_htree(&self) -> bool {
         self.flags & I_FLAGS_INDEX != 0
+    }
+
+    /// `true` when this inode's `i_block` stores an ext4 extent root.
+    pub fn uses_extents(&self) -> bool {
+        self.flags & I_FLAGS_EXTENTS != 0
     }
 
     /// Encode this inode into a 128-byte buffer. Only fields we
@@ -164,6 +174,7 @@ impl Inode {
         buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
         buf[28..32].copy_from_slice(&self.blocks.to_le_bytes());
         buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
+        buf[100..104].copy_from_slice(&self.generation.to_le_bytes());
         for i in 0..I_BLOCK_LEN {
             let off = 40 + i * 4;
             buf[off..off + 4].copy_from_slice(&self.block[i].to_le_bytes());
@@ -185,6 +196,7 @@ impl Inode {
             blocks: 0,
             links_count: 1,
             flags: 0,
+            generation: 0,
             block: [0; I_BLOCK_LEN],
         }
     }
@@ -204,6 +216,7 @@ impl Inode {
             // dirent). The parent gets bumped separately for "..".
             links_count: 2,
             flags: 0,
+            generation: 0,
             block: [0; I_BLOCK_LEN],
         }
     }
@@ -223,6 +236,7 @@ impl Inode {
             blocks: 0,
             links_count: 1,
             flags: 0,
+            generation: 0,
             block: [0; I_BLOCK_LEN],
         }
     }

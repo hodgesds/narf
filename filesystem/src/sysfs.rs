@@ -347,6 +347,12 @@ impl Kobject {
         parts.reverse();
         let mut path = String::from("/sys");
         for part in &parts {
+            // The singleton mounted sysfs root is name-less: `/sys` is the
+            // mount point, not a kobject component.  Keep named standalone
+            // roots useful for tests and out-of-tree projections.
+            if part.is_empty() {
+                continue;
+            }
             path.push('/');
             path.push_str(part);
         }
@@ -472,7 +478,11 @@ fn ensure_root() -> Arc<Kobject> {
     if let Some(r) = g.as_ref() {
         return r.clone();
     }
-    let root = Kobject::new_root("sys");
+    // `/sys` is the mount point, so its root kobject must not contribute a
+    // second `sys` path component.  Device uevents derive DEVPATH by stripping
+    // this mount prefix and must therefore become `/devices/...`, never
+    // `/sys/devices/...`.
+    let root = Kobject::new_root("");
     *g = Some(root.clone());
     root
 }
@@ -730,7 +740,12 @@ pub fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
 
 // ── Auto-population ───────────────────────────────────────────────────
 
-/// Populate `/sys/class/block/<name>/` for every registered block device.
+/// Populate block-device sysfs views for every registered block device.
+///
+/// The canonical device kobject lives at `/sys/devices/virtual/block/<name>`.
+/// `/sys/class/block` and `/sys/block` are discovery views, whereas uevents
+/// must name the canonical `/sys/devices` path: systemd-udevd constructs an
+/// `sd_device` from `DEVPATH` and rejects class paths as non-device objects.
 /// Also registers under `/sys/block/<name>/` (flat view).
 /// Linux ref: `blk_register_queue` (block/blk-sysfs.c:852).
 pub fn populate_block_class() {
@@ -740,6 +755,9 @@ pub fn populate_block_class() {
         get_or_create_child(&class_dir, "block")
     };
     let sys_block = get_or_create_child(&root, "block");
+    let devices = get_or_create_child(&root, "devices");
+    let virtual_devices = get_or_create_child(&devices, "virtual");
+    let virtual_block = get_or_create_child(&virtual_devices, "block");
     let dev_dir = get_or_create_child(&root, "dev");
     let dev_block = get_or_create_child(&dev_dir, "block");
     let _dev_char = get_or_create_child(&dev_dir, "char");
@@ -756,34 +774,71 @@ pub fn populate_block_class() {
         let capacity = dev.dev.capacity();
         let lba_size = dev.dev.lba_size();
         let minor = idx as u32;
+        // A partition carries GPT/MBR metadata; its uevent must say
+        // DEVTYPE=partition so udev applies blkid and by-uuid rules instead
+        // of treating it as a whole disk. This distinction is what turns an
+        // fstab UUID into a satisfied systemd .device unit.
+        let devtype = if dev.partition.is_some() {
+            "partition"
+        } else {
+            "disk"
+        };
+        // A filesystem UUID is already discovered while registering a
+        // partition. Carry it through the ADD event so udev can associate the
+        // existing `/dev/disk/by-uuid/<uuid>` devfs alias with this device.
+        // SYSTEMD_ALIAS is required as well: device units are synthesized
+        // from the udev database, not by stat'ing an already-resolvable devfs
+        // symlink, so DEVLINKS alone does not satisfy fstab's UUID job.
+        let fs_identity = dev
+            .partition
+            .as_ref()
+            .filter(|partition| !partition.fs_uuid.is_empty())
+            .map(|partition| {
+                format!(
+                    "ID_FS_UUID={}\nID_FS_UUID_ENC={}\nID_FS_USAGE=filesystem\nDEVLINKS=/dev/disk/by-uuid/{}\nSYSTEMD_ALIAS=/dev/disk/by-uuid/{}\n",
+                    partition.fs_uuid,
+                    partition.fs_uuid,
+                    partition.fs_uuid,
+                    partition.fs_uuid
+                )
+            })
+            .unwrap_or_default();
 
-        // /sys/class/block/<name>/
-        let kobj = class_device_register(class_block.clone(), name);
-        kobject_add_attr(&kobj, "size", move || {
-            format!("{}\n", capacity * (lba_size as u64))
-        });
-        kobject_add_attr(&kobj, "removable", || "0\n".to_string());
-        kobject_add_attr(&kobj, "queue/scheduler", || "none\n".to_string());
+        // `/sys/class/block/<name>` remains a directory-shaped compatibility
+        // view for consumers which enumerate the class directly.  The actual
+        // device (and the ONLY kobject carrying `uevent`) is the canonical
+        // `/sys/devices/virtual/block/<name>` node below.
+        let class_kobj = class_device_register(class_block.clone(), name);
+        let kobj = get_or_create_child(&virtual_block, name);
+        for node in [&class_kobj, &kobj] {
+            kobject_add_attr(node, "size", move || {
+                format!("{}\n", capacity * (lba_size as u64))
+            });
+            kobject_add_attr(node, "removable", || "0\n".to_string());
+            kobject_add_attr(node, "queue/scheduler", || "none\n".to_string());
+            let dev_str = format!("{}:{}\n", BLOCK_EXT_MAJOR, minor);
+            kobject_add_attr(node, "dev", move || dev_str.clone());
+        }
         // `dev` (<major>:<minor>) + writable `uevent` (MAJOR/MINOR/DEVNAME)
         // are what `udevadm info` and the coldplug walker read to synthesise
         // an ADD carrying the block dev_t; without them udev can't create
         // /dev/<name>. Linux ref: `block/genhd.c` (disk_add) exposes the same
         // `dev` + `uevent` attrs. `subsystem` → /sys/class/block so the
         // coldplug walker derives SUBSYSTEM=block.
-        let dev_str = format!("{}:{}\n", BLOCK_EXT_MAJOR, minor);
-        kobject_add_attr(&kobj, "dev", move || dev_str.clone());
         add_writable_uevent(
             &kobj,
             format!(
-                "MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE=disk\n",
-                BLOCK_EXT_MAJOR, minor, name
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE={}\n{}",
+                BLOCK_EXT_MAJOR, minor, name, devtype, fs_identity
             ),
         );
-        kobj.add_symlink("subsystem", "../../../class/block");
-        // /sys/dev/block/<major>:<minor> → the class dir (udev by-devnum).
+        kobj.add_symlink("subsystem", "../../../../class/block");
+        // `/sys/dev/block/<major>:<minor>` points to the canonical device,
+        // as libudev's by-devnum lookup realpaths this link before opening
+        // `uevent` / `dev`.
         dev_block.add_symlink(
             format!("{}:{}", BLOCK_EXT_MAJOR, minor),
-            format!("../../class/block/{}", name),
+            format!("../../devices/virtual/block/{}", name),
         );
 
         // /sys/block/<name>/ — flat view
@@ -793,6 +848,34 @@ pub fn populate_block_class() {
         });
         kobject_add_attr(&flat, "removable", || "0\n".to_string());
     }
+}
+
+/// Queue an ADD uevent for every canonical block-device node.
+///
+/// Boot calls this after [`populate_block_class`] but before PID 1. This gives
+/// the udev daemon's bounded boot replay the EFI System Partition's canonical
+/// `/sys/devices/...` event even if the early userspace trigger helper cannot
+/// run. Re-emitting ADD is safe because udev's device-database update is
+/// idempotent.
+pub fn emit_block_device_add_events() -> usize {
+    let root = get_root();
+    let Some(devices) = root.get_child("devices") else {
+        return 0;
+    };
+    let Some(virtual_devices) = devices.get_child("virtual") else {
+        return 0;
+    };
+    let Some(virtual_block) = virtual_devices.get_child("block") else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in narf_block::block_devices() {
+        if let Some(kobj) = virtual_block.get_child(entry.name) {
+            kobject_emit_uevent(&kobj, UeventAction::Add);
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Populate `/sys/class/net/<iface>/` for every registered net interface.

@@ -60,17 +60,18 @@ pub mod hash_version {
 /// Offsets are relative to the start of the directory block.
 /// `.` is 12 bytes (4-byte inode, 2-byte rec_len, 1-byte name_len,
 /// 1-byte file_type, 4-byte name pad). `..` is also 12 bytes.
-/// So `dx_root_info` starts at byte 24, `dx_head` at byte 32, and `dx_entry[0]`
-/// at byte 40.
+/// So `dx_root_info` starts at byte 24 and `dx_entry[0]` at byte 32. The
+/// otherwise-unused hash word of entry zero is overlaid by `(limit, count)`;
+/// its block word remains at byte 36.
 pub const DX_ROOT_INFO_OFF: usize = 24;
 pub const DX_ROOT_HEAD_OFF: usize = 32;
-pub const DX_ROOT_ENTRIES_OFF: usize = 40;
+pub const DX_ROOT_ENTRIES_OFF: usize = 32;
 
 /// dx_node header — every non-root htree node also starts with a
 /// 12-byte fake dirent (inode = 0, rec_len = blocksize - reserved
 /// area, name_len = 0). Then a 4-byte dx_head, then the entries.
 pub const DX_NODE_HEAD_OFF: usize = 8;
-pub const DX_NODE_ENTRIES_OFF: usize = 12;
+pub const DX_NODE_ENTRIES_OFF: usize = 8;
 
 /// Decoded HTREE root metadata.
 #[derive(Debug, Clone, Copy)]
@@ -431,9 +432,15 @@ pub fn collect_sorted_leaf_entries(
 /// `Err` if the packed entries don't fit.
 pub fn repack_leaf_block(block: &mut [u8], entries: &[LeafEntry]) -> Result<(), SplitError> {
     let bs = block.len();
+    let has_checksum_tail = bs >= 12
+        && block[bs - 12..bs - 8] == [0; 4]
+        && block[bs - 8..bs - 6] == 12u16.to_le_bytes()
+        && block[bs - 6] == 0
+        && block[bs - 5] == 0xde;
+    let usable = if has_checksum_tail { bs - 12 } else { bs };
     // Measure total needed space.
     let needed: usize = entries.iter().map(|e| e.bytes.len()).sum();
-    if needed > bs {
+    if needed > usable {
         return Err(SplitError::Corrupt);
     }
     // Zero the block then write entries.
@@ -446,10 +453,17 @@ pub fn repack_leaf_block(block: &mut [u8], entries: &[LeafEntry]) -> Result<(), 
         block[pos..pos + len].copy_from_slice(&e.bytes);
         if i + 1 == entries.len() {
             // Stretch the last entry to fill the block.
-            let final_rec_len = (bs - pos) as u16;
+            let final_rec_len = (usable - pos) as u16;
             block[pos + 4..pos + 6].copy_from_slice(&final_rec_len.to_le_bytes());
         }
         pos += len;
+    }
+    if has_checksum_tail {
+        block[usable..usable + 4].fill(0);
+        block[usable + 4..usable + 6].copy_from_slice(&12u16.to_le_bytes());
+        block[usable + 6] = 0;
+        block[usable + 7] = 0xde;
+        block[usable + 8..usable + 12].fill(0);
     }
     Ok(())
 }

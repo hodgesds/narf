@@ -184,8 +184,13 @@ pub fn drain_and_render(fb: &FbWriter) {
     if !moved {
         return;
     }
-    // Snapshot-restore-then-draw cycle.
-    let mut g = SAVED.lock();
+    // Snapshot-restore-then-draw cycle. try_lock, NOT lock: the cursor is drawn
+    // concurrently from many CPUs, so a blocking acquire thundering-herds SAVED
+    // under load. If another CPU is mid-draw, skip — the next tick redraws (a
+    // dropped frame is invisible).
+    let Some(mut g) = SAVED.try_lock() else {
+        return;
+    };
     if let Some(prev) = g.take() {
         let _ = restore(fb, &prev);
     }
@@ -274,7 +279,10 @@ fn render_user_cursor(fb: &FbWriter) {
     // current position by clearing the "last drawn at" short-circuit.
     let gen = narf_console::scanout_gen();
     if gen != USER_LAST_GEN.swap(gen, Ordering::AcqRel) {
-        *USER_SAVED.lock() = None;
+        // try_lock, NOT lock: avoid a thundering-herd on concurrent draws.
+        if let Some(mut g) = USER_SAVED.try_lock() {
+            *g = None;
+        }
         USER_LAST_X.store(u32::MAX, Ordering::Release);
         USER_LAST_Y.store(u32::MAX, Ordering::Release);
     }
@@ -305,7 +313,10 @@ fn render_user_cursor(fb: &FbWriter) {
 
 /// Erase the currently-drawn cursor sprite (restore the saved background).
 fn erase_cursor(fb: &FbWriter) {
-    let mut g = USER_SAVED.lock();
+    // try_lock, NOT lock: avoid a thundering-herd on concurrent draws.
+    let Some(mut g) = USER_SAVED.try_lock() else {
+        return;
+    };
     if let Some(prev) = g.take() {
         let _ = restore(fb, &prev);
     }
@@ -324,7 +335,10 @@ fn render_cursor_at(fb: &FbWriter, ux: u32, uy: u32) {
         return;
     }
 
-    let mut g = USER_SAVED.lock();
+    // try_lock, NOT lock: avoid a thundering-herd on concurrent draws.
+    let Some(mut g) = USER_SAVED.try_lock() else {
+        return;
+    };
     // Erase the previous sprite first.
     if let Some(prev) = g.take() {
         let _ = restore(fb, &prev);

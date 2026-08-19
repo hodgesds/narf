@@ -73,5 +73,13 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // Record the attaching process as the segment's last-op pid (shm_lpid).
+    let caller = current_task_id();
+    let lpid = task_to_pid_raw(caller).unwrap_or(caller);
+    if let Some(m) = SHM_SEGMENTS.lock().as_mut() {
+        if let Some(seg) = m.get_mut(&shmid) {
+            seg.lpid = lpid;
+        }
+    }
     ctx.set_return(SyscallReturn::ok(base));
 }

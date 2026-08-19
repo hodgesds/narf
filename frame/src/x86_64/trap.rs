@@ -93,6 +93,25 @@ mod stall_wd {
     static LAST_CPL: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
     static LAST_TASK: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
     static LAST_STAGE: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
+    // NMI-sampled RIP/CS per CPU + a seq bumped on each sample. The trap-entry
+    // LAST_RIP above only updates when a CPU takes a trap; a CPU wedged in an
+    // IF=0 spin takes none, so its LAST_RIP stays 0 and hides the spin site.
+    // The dump NMIs such a CPU (non-maskable → lands anyway) and the NMI handler
+    // records its interrupted RIP here, revealing exactly where it is stuck.
+    static NMI_RIP: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static NMI_CS: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static NMI_SEQ: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+
+    /// Record the interrupted RIP/CS of the current CPU from an NMI trap frame.
+    /// Called from the NMI dispatch (vector 2) so the stuck-CPU probe can read
+    /// where a wedged CPU is spinning. Lock-free (NMI context).
+    pub fn record_nmi(cpu: usize, rip: u64, cs: u64) {
+        if cpu < MAXC {
+            NMI_RIP[cpu].store(rip, Ordering::Relaxed);
+            NMI_CS[cpu].store(cs, Ordering::Relaxed);
+            NMI_SEQ[cpu].fetch_add(1, Ordering::Release);
+        }
+    }
     // Stall detector state (checked on whichever CPU happens to tick).
     static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
     static LAST_SYSCALLS: AtomicU64 = AtomicU64::new(0);
@@ -137,9 +156,8 @@ mod stall_wd {
             YES => return true,
             _ => {}
         }
-        let on = narf_boot::cmdline()
-            .split_ascii_whitespace()
-            .any(|t| t == "rcu_stall_panic" || t == "rcu_stall_panic=1");
+        let args = narf_boot::args();
+        let on = args.has_flag("rcu_stall_panic") || args.value("rcu_stall_panic") == Some("1");
         CACHED.store(if on { YES } else { NO }, Ordering::Relaxed);
         on
     }
@@ -462,6 +480,49 @@ mod stall_wd {
             "STALL-WD: scheduler stalled (syscalls={sc}, progress={}); reporter_cpu={reporter}; resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:",
             narf_scheduler::forward_progress_count()
         );
+        // Stuck-CPU probe: a CPU spinning with IF=0 never updates its trap-entry
+        // LAST_RIP, hiding the spin site. NMI every non-reporter, non-halted CPU
+        // (NMI is non-maskable → lands anyway); its NMI handler records the live
+        // RIP into NMI_RIP, printed below. Bounded wait for the samples.
+        {
+            let before: [u64; MAXC] = core::array::from_fn(|c| NMI_SEQ[c].load(Ordering::Acquire));
+            let mut targeted: u64 = 0;
+            for cpu in 0..MAXC {
+                if cpu == reporter || (cpu != 0 && !narf_lib::smp::is_online(cpu as u32)) {
+                    continue;
+                }
+                let (_, awake, halted, _) = narf_scheduler::dbg_cpu_stall(cpu);
+                if halted || awake == 0 {
+                    continue; // idle-halted or nothing runnable — not a spin
+                }
+                if let Some(apic) = narf_acpi::apic_id_at(cpu) {
+                    // SAFETY: LAPIC initialised at boot.
+                    unsafe {
+                        narf_interrupts::x86_64::apic::send_nmi_ipi(apic as u32);
+                    }
+                    targeted |= 1u64 << cpu;
+                }
+            }
+            if targeted != 0 {
+                let now0 = narf_scheduler::narf_time::now_cycles();
+                let deadline =
+                    now0.wrapping_add(narf_scheduler::narf_time::ns_to_cycles(2_000_000));
+                while narf_scheduler::narf_time::now_cycles() < deadline {
+                    let mut pending = false;
+                    for cpu in 0..MAXC {
+                        if targeted & (1u64 << cpu) != 0
+                            && NMI_SEQ[cpu].load(Ordering::Acquire) == before[cpu]
+                        {
+                            pending = true;
+                        }
+                    }
+                    if !pending {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
         for cpu in 0..MAXC {
             if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
                 continue;
@@ -472,6 +533,8 @@ mod stall_wd {
             let task = LAST_TASK[cpu].load(Ordering::Relaxed);
             let stage = LAST_STAGE[cpu].load(Ordering::Relaxed);
             let contended_lock = narf_lib::sync::contended_irq_lock(cpu);
+            let nmi_rip = NMI_RIP[cpu].load(Ordering::Relaxed);
+            let nmi_cpl = (NMI_CS[cpu].load(Ordering::Relaxed) & 3) as u8;
             let verdict = if cpu == reporter {
                 "REPORTING"
             } else if locked {
@@ -487,8 +550,23 @@ mod stall_wd {
             };
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} contended_irq_lock={contended_lock:#x} -> {verdict}"
+                "STALL-WD cpu={cpu} ready_depth={depth} awake={awake} halted={halted} queue_locked={locked} task={task} stage={stage} cpl={cpl} rip={rip:#x} nmi_rip={nmi_rip:#x} nmi_cpl={nmi_cpl} contended_irq_lock={contended_lock:#x} -> {verdict}"
             );
+            // The counts above say a halted CPU has runnable work; only the
+            // per-slot state says which slot and why it is not running. An
+            // awake slot with `allowed=false` is circulating on a queue whose
+            // CPU its affinity mask excludes (watch `requeues`); an awake slot
+            // with `allowed=true` and flat `pops` is one the executor stopped
+            // visiting. Bounded by `DBG_READY_SLOTS_MAX` — this is a trap onto
+            // a synchronous console.
+            for (tid, awake_flag, home, aff, allowed, pops, requeues) in
+                narf_scheduler::dbg_ready_slots(cpu)
+            {
+                let _ = writeln!(
+                    TrapWriter,
+                    "STALL-WD   ready cpu={cpu} tid={tid} awake={awake_flag} home_cpu={home} aff={aff:#x} allowed={allowed} pops={pops} notawake_requeues={requeues}"
+                );
+            }
         }
         // Wheel + per-task park states: shows a task parked with an expired
         // (or absurdly far) deadline and whether a deliverable signal is
@@ -502,6 +580,15 @@ mod stall_wd {
             "STALL-WD wheel: occ={} next={:?} now_cyc={now_cyc} now_ns={now_ns}",
             narf_scheduler::narf_time::timer_wheel::occupied(),
             nd
+        );
+        // Perf state: a leaked live event keeps `drain_irq_samples` scanning on
+        // every syscall dispatch (perf_event.rs), which can monopolize a CPU.
+        // Lock-free reads only — a wedged CPU may hold the registry lock.
+        let _ = writeln!(
+            TrapWriter,
+            "STALL-WD perf: active_events={} enabled={}",
+            narf_userspace::perf_event::dbg_active_perf_events(),
+            narf_lib::perf::enabled()
         );
         if let Some((sector, head, avail, last_used, device_used, free, status)) =
             narf_drivers_virtio::blk_pci::stalled_queue_snapshot()
@@ -1030,13 +1117,26 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // `returning_to_user` so a redirect-to-kernel handler
         // (exit, longjmp) bypasses delivery cleanly.
         //
-        // `num` is forwarded so the hook can ask the restartable-
-        // syscall table whether the syscall the trap is returning
-        // from should be re-executed when SA_RESTART is set on
-        // the handler (in which case the arch's `deliver_signal`
-        // rewinds RIP - 2 to land on the `int 0x80` opcode).
+        // SYSCALL_NUM_NONE, NOT `num`: `kernel_syscall_entry` has
+        // already run this syscall to COMPLETION (a real value is
+        // in rax). A syscall that genuinely blocked and was
+        // interrupted delivers its signal — and takes any
+        // SA_RESTART RIP-rewind — at its own park/yield point,
+        // with the real syscall number, INSIDE the handler (see
+        // `maybe_deliver_signal_before_yield` / poll.rs); it never
+        // reaches this completion hook with the signal still
+        // pending. Forwarding the real `num` here would let an
+        // SA_RESTART signal delivered on the way out rewind RIP-2
+        // and RE-EXECUTE a syscall that already returned (with rax
+        // clobbered by its return value) — a completed
+        // connect/accept/read replayed. Passing the sentinel makes
+        // `is_restartable_syscall` short-circuit to false, so a
+        // completed syscall is never restarted. This is exactly
+        // what the `syscall`-instruction completion path does
+        // (`userspace/src/syscall.rs`, `SYSCALL_NUM_NONE`); the two
+        // gates must stay in parity.
         if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-            hook(&mut ctx, num);
+            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
         }
         return;
     }
@@ -1047,6 +1147,11 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // panic path — unhandled NMIs should be diagnostic, not fatal.
     // The NMI hardware contract is: edge-only, IF=0 throughout.
     if frame.vector == 2 {
+        // Stall-watchdog stuck-CPU probe: record where this CPU was interrupted
+        // so the reporter can print the spin site of a CPU wedged with IF=0
+        // (whose trap-entry LAST_RIP never updates). Cheap; NMI context.
+        #[cfg(feature = "stall-watchdog")]
+        stall_wd::record_nmi(narf_lib::percpu::current_cpu(), frame.rip, frame.cs);
         narf_interrupts::on_nmi();
         return;
     }

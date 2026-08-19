@@ -28,7 +28,12 @@ static mut MEMORY_MAP_LEN: usize = 0;
 /// Backing buffer for the bootloader-supplied command-line. Copied
 /// out of the transient bootinfo region during `parse_raw`, then
 /// borrowed as a `&'static str` for the rest of boot.
-const CMDLINE_CAP: usize = 512;
+///
+/// Sized to match Linux's `COMMAND_LINE_SIZE` (2048 on x86) so the full
+/// cmdline survives into `/proc/cmdline` — userspace (systemd's
+/// `systemd.*` params, etc.) reads its own tokens from there, so any
+/// truncation here silently drops them.
+const CMDLINE_CAP: usize = 2048;
 static mut CMDLINE_BUF: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
 static mut CMDLINE_LEN: usize = 0;
 

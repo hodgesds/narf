@@ -44,14 +44,31 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
-Deliberately under-specified at this stage. Expected shape:
+The Phase-B VirtIO-GPU render path is layered over the existing DRM primary
+and render nodes. It is deliberately small but wire-compatible with Mesa's
+virtgpu userspace ABI:
 
-- Inbound: framebuffer attach, command-buffer submit.
-- Outbound: presentation ring (driver -> compositor, whenever that arrives).
+- Render-node inbound: `GETPARAM`, `CONTEXT_INIT`, `RESOURCE_CREATE`,
+  `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, and bounded `EXECBUFFER`.
+  Handles are per-open, context creation is lazy, and opaque command streams
+  are passed to a host only after size and ownership validation.
+- Primary-node inbound: the existing framebuffer / modeset ioctls; an
+  accelerated buffer may be presented only after it is also registered as a
+  KMS framebuffer.
+- Outbound: completion is synchronous for v1; the transport must not claim
+  explicit-fence support until fence-fd and syncobj lifetime are implemented.
 - Linux-compatible DRM devfs nodes have stable metadata shared across
   lookups. Primary and render nodes start at the conservative devtmpfs policy
   `0600 root:root`; `set_owners`/`set_perms` persist the distribution policy
   subsequently applied by udev without embedding distribution-specific GIDs.
+- Each DRM card and its render node resolve to a distinct PCI sysfs parent
+  carrying that card's vendor/device IDs and `DRIVER` identity. This mapping
+  is required for libdrm/Mesa device discovery when multiple QEMU displays
+  (virtio-gpu plus a Bochs fallback) are present.
+- Once that sysfs projection is complete, the PCI parent, primary node, and
+  render node emit ordered ADD uevents inside the bounded boot replay window.
+  This is the interface by which udev applies the `master-of-seat` tag and
+  logind reports the default seat as graphical to display managers.
 
 ## 4. Invariants & safety properties
 

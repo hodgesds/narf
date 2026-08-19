@@ -189,20 +189,29 @@ pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
 pub fn wake_io_waiters(key: u64) {
     if key != 0 {
         if let Some(owner) = tcb_owner(key as u32) {
-            // Owner known: targeted wake iff it's parked. Its waker lives in
-            // the owner's shard (keyed by task id).
-            let waker = {
-                let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
-                g.as_mut().and_then(|m| m.remove(&owner))
-            };
-            if let Some(w) = waker {
-                wake_one(owner, w);
-            }
+            // Owner known: targeted wake iff it's parked.
+            wake_io_owner(owner);
             return;
         }
         // Untracked key → fall through to wake-all (safety net).
     }
     wake_all_io_waiters();
+}
+
+/// Wake ONLY `owner`'s parked I/O waker, if it is parked. The targeted-wake
+/// primitive: used by the TCB-keyed net path AND directly by AF_UNIX sends,
+/// which are point-to-point and know their peer's reader (the `RingBuf` owner),
+/// so they must wake that one task — never the whole parked-poller herd. The
+/// waker lives in the owner's shard (keyed by task id). A wrong/absent owner is
+/// safe: the readiness generation guard makes the real reader re-poll.
+pub(crate) fn wake_io_owner(owner: u64) {
+    let waker = {
+        let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
+        g.as_mut().and_then(|m| m.remove(&owner))
+    };
+    if let Some(w) = waker {
+        wake_one(owner, w);
+    }
 }
 
 /// Evdev dispatch wake bridge: bump the readiness generation + wake all
@@ -2098,6 +2107,10 @@ pub mod linux_compat {
     pub const STATX_BTIME: u32 = 0x0800;
     pub const STATX_MNT_ID: u32 = 0x1000;
 
+    // Linux 6.6+ uses this attribute for the cheap mount-point probe that
+    // systemd runs before attempting to mount its API filesystems.
+    pub const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+
     // ── Flag bits (fcntl.h AT_*) ─────────────────────────────────
     pub const AT_FDCWD: i32 = -100;
     pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
@@ -2544,7 +2557,7 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
     const EXDEV: i64 = -18;
     const ENOENT: i64 = -2;
     const EISDIR: i64 = -21;
-    let res = narf_filesystem::registry().resolve_two_parents_absolute(
+    let res = current_resolve_two_parents_absolute(
         old_abs,
         new_abs,
         |_fs, old_dir, old_leaf, new_dir, new_leaf| {
@@ -3542,7 +3555,24 @@ fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>
 /// copies local→remote (writev). Both sides live in the same AS here.
 fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let a = *ctx.args();
-    let pid = a.arg0;
+    #[allow(unused_mut)]
+    let mut pid = a.arg0;
+    // The target pid is in the CALLER's pid namespace (Linux
+    // find_get_task_by_vpid, mm/process_vm_access.c). Translate inner ->
+    // outer before the self/AS checks below: untranslated, a containerized
+    // process probing its own inner pid took the cross-AS path and failed,
+    // and a foreign inner pid resolved to whatever host task owned the same
+    // number — a host address-space identity oracle. Unmapped inner -> ESRCH.
+    #[cfg(feature = "container")]
+    {
+        match accept_pid_from(current_task_id(), pid) {
+            Some(outer) => pid = outer,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    }
     let local_ptr = a.arg1;
     let liovcnt = a.arg2 as usize;
     let remote_ptr = a.arg3;
@@ -4589,6 +4619,30 @@ pub(crate) fn terminate_current_task(
             ctx.rip()
         );
     }
+    // [PROBE] Light (cgevt_trace-gated) twin of the above for the systemd
+    // session-bringup investigation: if `systemd --user` (or an "(sd-*)" helper)
+    // is killed by a signal rather than exit_group()ing, record WHICH signal —
+    // pairs with the USEREXIT line in sys_exit_group so a flapping user@N.service
+    // reports its cause on the console without the syscall-trace firehose.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        let comm = proc_comm_of(pid).unwrap_or_default();
+        let cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
+        if comm == "systemd" || comm.starts_with("(sd") || cg.contains("user-957") {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "USEREXIT pid={} tid={} comm={} killed_by_signal={} core_dumped={} ip={:x} cg={}",
+                pid,
+                task,
+                comm,
+                signum,
+                core_dumped,
+                ctx.rip(),
+                cg
+            );
+        }
+    }
     stage_pending_termination(pid, encode_signaled_status(signum, core_dumped));
     // Robust-futex owner-died walk — must run HERE, in the dying task's
     // own trap context (its user AS is still active for the user-memory
@@ -4831,10 +4885,24 @@ fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> 
         Some(f) => f,
         None => return false,
     };
-    match cgroup_rel_path(&full) {
-        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(&rel, child_pid).is_ok(),
+    let rel = cgroup_rel_path(&full);
+    let ok = match &rel {
+        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(rel, child_pid).is_ok(),
         None => false,
+    };
+    // Diagnostic: which cgroup did the CLONE_INTO_CGROUP child actually land
+    // in? If `rel` fails to resolve (or attach fails) the caller falls back to
+    // parent inheritance, so the SERVICE cgroup never goes populated and
+    // systemd's oneshot cgroup-settle wait can hang.
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "CGATTACH pid={} full={} rel={:?} ok={}",
+            child_pid, full, rel, ok
+        );
     }
+    ok
 }
 
 /// Resolve an absolute path that lands inside a mounted cgroup2/cgroupfs to its
@@ -4989,6 +5057,21 @@ fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
     g.as_mut().and_then(|m| m.remove(&task_id_raw))
 }
 
+/// Test-only: install a clear_child_tid entry with an explicit private-futex
+/// namespace and no AS root (the exit path then skips the word write but still
+/// fires the wake), modelling a real thread whose private namespace is a live
+/// AddressSpace Arc pointer (always nonzero in production).
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_namespace: u64) {
+    set_clear_child_tid_with_as(
+        task_id_raw,
+        uaddr,
+        narf_memory::PhysAddr::new(0),
+        futex_namespace,
+    );
+}
+
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
 /// without consuming it. Returns just the uaddr; AS root is
 /// internal bookkeeping.
@@ -5071,14 +5154,26 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     }
 
     // NOW bump the counter (lost-wakeup gen guard) AND fire every parked waiter
-    // in this address space's PRIVATE futex namespace — AFTER the word write
-    // above, so a joiner's wake→re-read observes the cleared (0) word and
-    // proceeds instead of re-parking. Linux's clear_child_tid exit wake is a
-    // private futex wake; publishing it in namespace 0 misses pthread_join's
-    // FUTEX_WAIT_PRIVATE queue and degrades every join to the timer backstop.
+    // on this uaddr — AFTER the word write above, so a joiner's wake→re-read
+    // observes the cleared (0) word and proceeds instead of re-parking.
+    //
+    // Wake BOTH namespaces. Linux's mm_release fires the exit wake as
+    // `do_futex(tidptr, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
+    // (kernel/fork.c) — i.e. SHARED (namespace 0) — and glibc's pthread_join
+    // (`lll_futex_wait` on `__default_pthread_attr`-cleared child_tid) and
+    // musl's `__tl_lock` both wait SHARED on that word. Waking only the
+    // recorded private namespace therefore missed every glibc/musl joiner and
+    // degraded each join to the ~10 ms timer backstop (a lost-wake-shaped
+    // stall). Keep the private wake too so any private waiter on the word is
+    // still served; over-waking a namespace with no waiter is a cheap no-op.
     let key = futex_key(entry.futex_namespace, uaddr);
     futex_bump_counter_key(key);
     futex_wake_waiters_key(key, u32::MAX);
+    if entry.futex_namespace != 0 {
+        let shared_key = futex_key(0, uaddr);
+        futex_bump_counter_key(shared_key);
+        futex_wake_waiters_key(shared_key, u32::MAX);
+    }
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
@@ -5367,10 +5462,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // that exit (POLLIN never fires; systemd would supervise a ghost).
     // The fd itself is installed after the child's fd-table fork below.
     let pidfd_state = if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
-        Some(crate::pidfd::mint_for(child_visible_pid, true))
+        // tid=0: the child task does not exist yet (this mints BEFORE the
+        // spawn, on purpose). `set_tid` publishes the leader TaskId once the
+        // child is spawned below; until then the `exited` flag alone drives
+        // readiness, which the tiny mint→spawn window can only ever set true.
+        Some(crate::pidfd::mint_for(child_visible_pid, 0, true))
     } else {
         None
     };
+    // Diagnostic: pid the CLONE_PIDFD pidfd is minted under. Compare with the
+    // PIDFD-EXIT line for the same process's exit — a mismatch (or a
+    // pidfd_found=false there) is the reap-hang root cause.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && flags & CLONE_PIDFD != 0 && ca.pidfd != 0
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-MINT child_visible_pid={}",
+            child_visible_pid
+        );
+    }
 
     let proc = crate::UserProcess {
         pid: crate::ProcessId(child_visible_pid),
@@ -5441,6 +5553,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     };
     let child_tid = pending_child.task_id();
     proc_identity_fork(parent_pid, child_tid.raw());
+    // Publish the pidfd's target leader TaskId now that the child task exists.
+    // Only for a real process clone: for CLONE_THREAD the pidfd tracks the
+    // existing process leader, not this new thread, so leave it unresolved and
+    // let the `exited` cache drive it (unchanged from before pidfds grew a tid).
+    if !share_thread {
+        if let Some(st) = &pidfd_state {
+            st.set_tid(child_tid.raw());
+        }
+    }
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
@@ -5961,13 +6082,32 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
 /// the wait `options` (WUNTRACED selects stops, WCONTINUED selects
 /// continues) and the `want` pid filter. Returns `(child_pid,
 /// wstatus)` WITHOUT releasing the PID.
-fn reap_stopcont(parent: u64, want: i64, options: u32) -> Option<(u64, i32)> {
+/// Does an exited/candidate child `child_pid` (an outer ProcessId) satisfy a
+/// wait request? `want_pgid` != 0 selects a PROCESS-GROUP-scoped wait
+/// (`waitpid(0)` / `waitpid(-pgid)` / `waitid(P_PGID)`): the child matches iff
+/// its process group (its still-live PGID_TABLE entry — cleared only by
+/// `release_reaped_task` at the real reap) equals the TASK-space `want_pgid`.
+/// Otherwise `want_pid` decides: > 0 a specific outer pid, <= 0 any child.
+/// Linux `kernel/exit.c` `eligible_pid` / `__WNOTHREAD` filtering. (#29)
+fn wait_child_matches(child_pid: u64, want_pid: i64, want_pgid: u64) -> bool {
+    if want_pgid != 0 {
+        let child_task = pid_to_task_raw(child_pid).unwrap_or(child_pid);
+        return read_pgid(child_task) == want_pgid;
+    }
+    if want_pid > 0 {
+        child_pid == want_pid as u64
+    } else {
+        true
+    }
+}
+
+fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option<(u64, i32)> {
     let want_stop = options & WUNTRACED != 0;
     let want_cont = options & WCONTINUED != 0;
     let mut g = PENDING_STOPCONT.lock();
     let q = g.as_mut()?.get_mut(&parent)?;
     let idx = q.iter().position(|&(p, _w, cont)| {
-        if want > 0 && p != want as u64 {
+        if !wait_child_matches(p, want, want_pgid) {
             return false;
         }
         if cont {
@@ -6277,6 +6417,17 @@ pub(crate) fn stage_killed_termination(pid: u64) {
 /// wstatus into the user-space pointer (same as `sys_wait4` does on the
 /// fast path).
 fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: *mut i32) -> i64 {
+    // A process-group-scoped blocking wait (waitpid(0)/(-pgid)/P_PGID) stored
+    // its TASK-space target pgid on the parked task's UserTaskCtx; the sync
+    // paths pass it as an argument, but this poll-side reap re-derives it from
+    // the same task. 0 = no pgid filter (specific-pid / any-child wait). (#29)
+    let want_pgid = crate::user_task::current_user_task()
+        .map(|u| {
+            // SAFETY: the poll routine holds the parked task's UserTaskCtx
+            // pinned; we only read one atomic field.
+            unsafe { (*u).wait_child_want_pgid.load(Ordering::Acquire) }
+        })
+        .unwrap_or(0);
     // Job-control stop/continue notification FIRST. Linux reaps a child's
     // state changes in order — a stop or continue is reported before the
     // child's later exit — so a `waitpid(WCONTINUED)` after `kill(SIGCONT)`
@@ -6286,7 +6437,7 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
     // and a report is queued, so a plain wait falls straight through to the
     // exit reap below. These do NOT release the PID: the child is alive (or
     // its exit is still queued for the next wait).
-    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, options) {
+    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, want_pgid, options) {
         if !out_status.is_null() {
             // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
             // poll routine's stack frame for the duration of this call.
@@ -6305,14 +6456,9 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         let mut g = PENDING_EXITS.lock();
         let reaped = g.as_mut().and_then(|m| {
             let q = m.get_mut(&parent_id)?;
-            let idx = if want_pid > 0 {
-                q.iter().position(|&(p, _)| p == want_pid as u64)?
-            } else {
-                if q.is_empty() {
-                    return None;
-                }
-                0
-            };
+            let idx = q
+                .iter()
+                .position(|&(p, _)| wait_child_matches(p, want_pid, want_pgid))?;
             if peek {
                 Some(q[idx])
             } else {
@@ -6674,6 +6820,16 @@ pub fn __test_stage_pending_exit(parent: u64, child: u64, status: i32) {
     }
 }
 
+/// Drop every staged pending-exit for `parent`. Teardown counterpart to
+/// `__test_stage_pending_exit` for tests whose asserted path (e.g. an ECHILD
+/// early-return) intentionally does NOT reap the entry it staged.
+pub fn __test_clear_pending_exits(parent: u64) {
+    let mut g = PENDING_EXITS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&parent);
+    }
+}
+
 fn parent_of_set(child: u64, parent: u64) {
     let mut g = PARENT_OF.lock();
     if let Some(m) = g.as_mut() {
@@ -6786,6 +6942,7 @@ fn release_task_tables(tid: u64) {
     // Signal state.
     signal_bits_remove(&SIGNAL_PENDING, tid);
     signal_bits_remove(&SIGNAL_READABLE_GEN, tid);
+    signal_bits_remove(&SIGNAL_RAISE_GEN, tid);
     signal_bits_remove(&SIGNAL_MASK, tid);
     if let Some(m) = SIGACTION_TABLE.lock().as_mut() {
         m.remove(&tid);
@@ -7208,9 +7365,19 @@ pub fn __test_set_foreground_task(tid: u64) {
 /// by the `PENDING_EXITS` reap path, so this only gates the block-vs-ECHILD
 /// decision once no matching exit is queued: a true result means "a child is
 /// still running, block for it"; false means "no such child — return ECHILD".
-fn has_living_child(parent: u64, want: i64) -> bool {
+fn has_living_child(parent: u64, want: i64, want_pgid: u64) -> bool {
     let g = PARENT_OF.lock();
     let is_parent = match g.as_ref() {
+        // Process-group-scoped wait: a living child of `parent` whose group is
+        // `want_pgid`. Without this the any-child arm below reported "has child"
+        // for a group with none, so waitpid(-emptygroup) blocked/returned 0
+        // instead of ECHILD. (#29)
+        Some(m) if want_pgid != 0 => m.iter().any(|(&child, &p)| {
+            p == parent && {
+                let ct = pid_to_task_raw(child).unwrap_or(child);
+                read_pgid(ct) == want_pgid
+            }
+        }),
         Some(m) if want > 0 => m.get(&(want as u64)).copied() == Some(parent),
         Some(m) => m.values().any(|&p| p == parent),
         None => false,
@@ -7473,15 +7640,35 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
 fn on_child_exit(child_pid: u64, child_tid: u64) {
+    // `child_tid` is consumed only by the cgroup-gated PIDFD-EXIT probe
+    // below; keep it live for the no-cgroup build.
+    #[cfg(not(feature = "cgroup"))]
+    let _ = child_tid;
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
-    let _ = child_tid;
     #[cfg(feature = "linux-compat")]
     crate::ptrace::release_process(child_pid);
 
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
-    crate::pidfd::notify_exit(child_pid);
+    let _pidfd_found = crate::pidfd::notify_exit(child_pid);
+    // Diagnostic: does the exiting process's pid match a minted pidfd? A
+    // `pidfd_found=false` for a comm that systemd pidfd_spawn'd (e.g.
+    // systemd-user-ru) means the pidfd was minted under a DIFFERENT pid than
+    // the one the exit path reports — so its POLLIN-on-exit never fires and
+    // systemd supervises a ghost (start job hangs "running"). Pair with the
+    // PIDFD-MINT line at the CLONE_PIDFD site.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
+        use core::fmt::Write as _;
+        let comm =
+            proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let _ = writeln!(
+            narf_console::Writer,
+            "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
+            child_pid, child_tid, comm, _pidfd_found
+        );
+    }
 
     let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
@@ -7511,6 +7698,27 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
     const SIGCHLD: u32 = 17;
     let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(SIGCHLD));
+    // Record which child, in the PARENT's namespace, so the parent's signalfd
+    // (systemd PID 1's manager_dispatch_signal_fd) and SA_SIGINFO SIGCHLD
+    // handler name the child rather than reading si_pid == 0. Linux
+    // do_notify_parent fills si_pid = task_pid_nr_ns(child, parent_ns) and
+    // si_code = CLD_EXITED/KILLED/DUMPED. SIGCHLD is a standard signal, so
+    // this coalesces to the most recent child (Linux does too); the parent's
+    // wait loop reaps the rest.
+    {
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
+        const CLD_DUMPED: i32 = 3;
+        let si_code = if status & 0x7f == 0 {
+            CLD_EXITED
+        } else if status & 0x80 != 0 {
+            CLD_DUMPED
+        } else {
+            CLD_KILLED
+        };
+        let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
+        let _ = store_sigqueue_info(parent, SIGCHLD, si_code, 0, child_in_parent_ns);
+    }
     // A parent may be parked in epoll_wait on its signalfd rather than in
     // wait4. Publishing SIGCHLD without firing the signal waker leaves that
     // task asleep indefinitely: the earlier pidfd readiness notification can
@@ -7615,7 +7823,20 @@ pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
     if user_pid == 0 {
         return 0;
     }
-    pid_to_task_raw(user_pid).unwrap_or(user_pid)
+    // `user_pid` is a pid/pgid in the CALLER's pid namespace (Linux resolves
+    // both setpgid/getpgid/kill(-pgid)/TIOCSPGRP arguments via
+    // find_task_by_vpid — a virtual lookup). The pgid/sid/tty tables key on
+    // TaskId, reached through the OUTER ProcessId, so translate inner -> outer
+    // FIRST. Skipping this (the old `pid_to_task_raw(inner)`) resolved an
+    // in-namespace pgid to whatever ROOT-namespace process owned the same
+    // number — which for job control means signalling a host process group.
+    // An inner pid not bound in the caller's namespace has no valid target;
+    // return 0 (matches no real task) so delivery fails safe rather than
+    // aliasing a same-numbered host task.
+    match accept_pid_from(current_task_id(), user_pid) {
+        Some(outer) => pid_to_task_raw(outer).unwrap_or(outer),
+        None => 0,
+    }
 }
 #[cfg(not(feature = "container"))]
 #[inline]
@@ -8627,6 +8848,13 @@ struct ShmSegment {
     handle: u64,
     key: u32,
     len: u64,
+    /// Creator's OUTER ProcessId (shmid_ds.shm_cpid), set at shmget.
+    cpid: u64,
+    /// OUTER ProcessId of the last shmat (shmid_ds.shm_lpid); 0 until the
+    /// first attach. Rendered — translated into the reader's ns — by shmctl
+    /// IPC_STAT. shmdt unmaps by address (no shmid in hand) so it is not
+    /// tracked as a last-op here.
+    lpid: u64,
 }
 
 #[cfg(feature = "linux-compat")]

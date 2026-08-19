@@ -895,6 +895,82 @@ kernel_test_in!(
     smoke_pid_ns_ucred_reports_service_pid_to_manager
 );
 
+/// The OTHER half of `report_ucred_to`: a peer's stored HOST uid/gid are
+/// reported in the READER's user-namespace view (the inverse of the
+/// stamp-time `translate_*_to_host`). dbus-broker/logind gate their policy on
+/// the peer UID from SO_PEERCRED / SCM_CREDENTIALS, so a reader inside a child
+/// user-ns must see the peer as its in-ns id — and an unmapped host id must
+/// collapse to the overflow id, never leak the raw host id. Every prior ucred
+/// test passed uid/gid 0 in the initial ns, so this translation branch (guarded
+/// by `!ns.is_initial()`) had no coverage.
+#[cfg(feature = "container")]
+fn smoke_pid_ns_ucred_translates_peer_uid_to_reader_userns() -> TestResult {
+    use crate::namespaces::{IdMapEntry, UserNamespace, OVERFLOW_ID};
+    crate::namespaces::__test_reset_all();
+    crate::pid_ns::__test_reset();
+
+    // Reader lives in a child user-ns: inner uids [0,5) → host [1000,1005),
+    // inner gids [0,5) → host [2000,2005).
+    let reader: u64 = 0xB500;
+    let host = UserNamespace::new_initial();
+    let uns = UserNamespace::new_child(host, 1000);
+    let _ = uns.write_uid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 1000,
+        count: 5,
+    }]);
+    let _ = uns.write_gid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 2000,
+        count: 5,
+    }]);
+    crate::namespaces::setns_user(reader, uns);
+
+    // A peer whose stored host uid 1002 / gid 2003 is inside the reader's map
+    // must report as the reader's in-ns ids (inner 2 / inner 3).
+    let mapped = crate::handlers::report_ucred_to(
+        reader,
+        crate::socket::Ucred {
+            pid: 0,
+            uid: 1002,
+            gid: 2003,
+        },
+    );
+    if mapped.uid != 2 {
+        return TestResult::Fail("peer host uid 1002 did not report as reader-ns inner 2");
+    }
+    if mapped.gid != 3 {
+        return TestResult::Fail("peer host gid 2003 did not report as reader-ns inner 3");
+    }
+
+    // A peer whose host ids are OUTSIDE the reader's map collapse to the
+    // overflow id — never the raw host id (which would misidentify the peer to
+    // a dbus policy check).
+    let unmapped = crate::handlers::report_ucred_to(
+        reader,
+        crate::socket::Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 9999,
+        },
+    );
+    if unmapped.uid != OVERFLOW_ID {
+        return TestResult::Fail("unmapped host uid did not collapse to the overflow id");
+    }
+    if unmapped.gid != OVERFLOW_ID {
+        return TestResult::Fail("unmapped host gid did not collapse to the overflow id");
+    }
+
+    crate::namespaces::__test_reset_all();
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_pid_ns_ucred_translates_peer_uid_to_reader_userns
+);
+
 /// Exit cleanup: `release_outer` frees the dying task's inner slot for reuse so
 /// a recycled outer pid doesn't inherit a stale inner id. `on_child_exit` keys
 /// this by the TaskId (ns lookup) but frees by the ProcessId (the outer↔inner

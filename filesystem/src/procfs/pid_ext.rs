@@ -971,10 +971,21 @@ impl DirOps for ProcTaskTidDir {
     }
 }
 
+impl ProcTaskDir {
+    /// The single thread's tid AS SEEN BY THE READER. `self.pid` is the outer
+    /// ProcessId; a namespaced reader must see its inner tid, not the host
+    /// number (Linux `fs/proc/array.c` renders task/<tid> via the reader's ns).
+    /// NARF is single-thread-per-process, so tid == the reader's view of pid.
+    /// Identity in the root namespace / when no pid-ns hook is installed. (#16)
+    pub(crate) fn visible_tid(&self) -> u64 {
+        crate::procfs::pid_report(self.pid).unwrap_or(self.pid)
+    }
+}
+
 impl DirOps for ProcTaskDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
-        if tid == self.pid {
+        if tid == self.visible_tid() {
             Some(Arc::new(ProcDirMarker))
         } else {
             None
@@ -982,14 +993,14 @@ impl DirOps for ProcTaskDir {
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let tid: u64 = name.parse().ok()?;
-        if tid == self.pid {
+        if tid == self.visible_tid() {
             Some(Arc::new(ProcTaskTidDir { pid: self.pid }))
         } else {
             None
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        let s = self.pid.to_string();
+        let s = self.visible_tid().to_string();
         let leaked: &'static str = Box::leak(s.into_boxed_str());
         Box::new(
             [DirEntry {
@@ -1168,6 +1179,54 @@ fn smoke_task_dir_own_tid_only() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_task_dir_own_tid_only);
+
+/// #16: `/proc/<pid>/task/<tid>` renders the tid in the READER's namespace.
+/// With a pid-ns hook mapping outer pid 0x5150 → inner tid 7, a namespaced
+/// reader must see `task/7` and resolve it — never the host number 0x5150.
+fn smoke_task_dir_renders_reader_ns_tid() -> TestResult {
+    fn stub_current_outer() -> u64 {
+        0x5150
+    }
+    fn stub_resolve(inner: u64) -> Option<u64> {
+        // reader-inner → outer
+        if inner == 7 {
+            Some(0x5150)
+        } else {
+            Some(inner)
+        }
+    }
+    fn stub_report(outer: u64) -> Option<u64> {
+        // outer → reader-inner
+        if outer == 0x5150 {
+            Some(7)
+        } else {
+            Some(outer)
+        }
+    }
+
+    let snap = crate::procfs::__test_pidns_hooks_snapshot();
+    crate::procfs::install_proc_pidns_hooks(stub_current_outer, stub_resolve, stub_report);
+
+    let dir = ProcTaskDir { pid: 0x5150 };
+    let names: alloc::vec::Vec<alloc::string::String> =
+        dir.iter().map(|e| e.name.to_string()).collect();
+    let iter_ok = names.len() == 1 && names[0] == "7";
+    let lookup_inner_ok = dir.lookup("7").is_some() && dir.lookup_dir("7").is_some();
+    // The host outer number (0x5150 == 20816) must NOT resolve for the reader.
+    let outer_hidden = dir.lookup("20816").is_none() && dir.lookup_dir("20816").is_none();
+
+    crate::procfs::__test_pidns_hooks_restore(snap);
+
+    if iter_ok && lookup_inner_ok && outer_hidden {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("task dir must render/resolve the reader-ns inner tid, not the outer pid")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_task_dir_renders_reader_ns_tid
+);
 
 /// Smoke: `oom_score_adj` + `coredump_filter` are writable; `oom_score` is read-only.
 fn smoke_writable_files_have_rw_mode() -> TestResult {

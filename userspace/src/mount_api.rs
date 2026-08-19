@@ -230,6 +230,28 @@ fn context_options(context: &FsContext) -> String {
     rendered
 }
 
+/// Separate VFS mount attributes from filesystem-specific remount options.
+/// The registry does not yet persist per-mount RO/NOSWAP state, but Linux
+/// accepts these flags for tmpfs credentials mounts and systemd requires the
+/// reconfigure step to succeed before it attaches the detached mount.
+fn filesystem_reconfigure_options(context: &FsContext) -> String {
+    context
+        .options
+        .iter()
+        .filter(|(key, _)| key.as_str() != "ro" && key.as_str() != "noswap")
+        .fold(String::new(), |mut rendered, (key, value)| {
+            if !rendered.is_empty() {
+                rendered.push(',');
+            }
+            rendered.push_str(key);
+            if let Some(value) = value {
+                rendered.push('=');
+                rendered.push_str(value);
+            }
+            rendered
+        })
+}
+
 // ── fd-backed handles ───────────────────────────────────────────────
 struct FsContextFile {
     id: u64,
@@ -368,7 +390,16 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
             let result = with_contexts(|m| {
                 let context = m.get(&id)?;
                 let fs = context.created.as_ref()?;
-                Some(fs.reconfigure(&context_options(context)))
+                let options = filesystem_reconfigure_options(context);
+                // `ro` and `noswap` are VFS mount attributes. NARF's mount
+                // registry does not model them yet, so an otherwise-empty
+                // remount is a successful no-op rather than an invalid tmpfs
+                // option (systemd's credentials fs depends on this).
+                Some(if options.is_empty() {
+                    Ok(())
+                } else {
+                    fs.reconfigure(&options)
+                })
             });
             match result {
                 Some(Ok(())) => ctx.set_return(ok(0)),

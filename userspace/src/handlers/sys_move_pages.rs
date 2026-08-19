@@ -97,10 +97,18 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
     }
     let task = current_task_id();
     let visible_pid = task_to_pid_raw(task).unwrap_or(task);
-    let requested_pid = a.arg0;
-    if requested_pid != 0 && requested_pid != task && requested_pid != visible_pid {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: foreign process.
-        return;
+    // Linux (mm/migrate.c) resolves `pid` via find_task_by_vpid — in the
+    // CALLER's pid namespace. Translate the inner pid to its outer ProcessId
+    // before the self-comparison, so a container naming itself by getpid() is
+    // not rejected as a foreign process. Audit finding #20.
+    if a.arg0 != 0 {
+        match accept_pid_from(task, a.arg0) {
+            Some(outer) if outer == task || outer == visible_pid => {}
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: foreign process.
+                return;
+            }
+        }
     }
     let Some(as_ref) = current_address_space() else {
         ctx.set_return(SyscallReturn::invalid_op());

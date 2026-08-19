@@ -109,6 +109,17 @@ pub struct UserTaskCtx {
     /// activity into a tight epoll/poll return loop. A real missed
     /// source wake is recovered by the bounded I/O backstop timer.
     pub epoll_park_gen: AtomicU64,
+    /// `crate::handlers::signal_raise_generation()` snapshot taken by
+    /// `sys_poll`/`sys_epoll_wait`/mqueue just before its final readiness
+    /// check, beside `epoll_park_gen`. After registering the signal + I/O
+    /// wakers, the park path re-reads the live raise generation; if it advanced
+    /// AND a signal is pending, a raise landed in the scan→register window and
+    /// the task self-wakes to re-execute. This is the signalfd lost-wake guard:
+    /// `is_signal_pending`'s block-filter misses a BLOCKED signal (the canonical
+    /// signalfd case), so the block-agnostic raise generation closes the window
+    /// that would otherwise fall to the ~10 ms backstop. Edge, not level, so a
+    /// standing blocked-pending signal never spins. Mirrors `futex_park_gen`.
+    pub signal_park_gen: AtomicU64,
     /// epoll fd currently entering the park handshake, encoded as fd+1 (zero
     /// means this I/O wait is not epoll). After registering the task waker,
     /// the park path passively re-scans this instance before switching out.
@@ -190,6 +201,12 @@ pub struct UserTaskCtx {
     /// `want_pid` argument forwarded from `sys_wait4`: > 0 = wait
     /// for a specific child, ≤ 0 = any child.
     pub wait_child_want_pid: AtomicI64,
+
+    /// TASK-space process group a group-scoped blocking wait
+    /// (`waitpid(0)`/`waitpid(-pgid)`/`waitid(P_PGID)`) filters on; `0` = no
+    /// pgid filter (specific-pid or any-child wait). The poll-side reap
+    /// (`wait_child_check_fn`) reads this to match only children in the group.
+    pub wait_child_want_pgid: AtomicU64,
 
     /// on a successful reap. `0` = caller passed NULL (discard).
     /// For a `waitid(2)` wait this instead holds the `siginfo_t*`.
@@ -437,6 +454,7 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
+            signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
             futex_namespace: AtomicU64::new(0),
@@ -446,6 +464,7 @@ impl UserTaskCtx {
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
             wait_child_want_pid: AtomicI64::new(0),
+            wait_child_want_pgid: AtomicU64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
@@ -638,29 +657,18 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
 
-/// Absolute-ns time at which to fire the lost-wake fallback timer for a park
-/// with the given absolute `deadline_ns`.
+/// Absolute-ns time at which a finite park's wheel timer should fire.
 ///
-/// - Infinite parks (`u64::MAX`: pause / blocking poll·epoll·futex with no
-///   timeout) fire a ~10 ms backstop so a lost external wake self-heals.
-/// - FINITE **io-wait** parks (poll/epoll with a real timeout whose real wake
-///   is the io waker) ALSO get the ~10 ms backstop — clamped to never overshoot
-///   the real deadline. Without this a lost cross-core io-wake strands the task
-///   until the full finite deadline; a QtDBus worker poll()ing the system bus
-///   with the 25 s D-Bus method timeout otherwise sleeps out the whole 25 s, so
-///   kwin's `GetSession`/`TakeControl` times out and never opens the GPU. The
-///   working io-waker still short-circuits the common case; this only bounds the
-///   worst case, matching what infinite parks already do.
-/// - Other finite parks (plain `sleep`/`nanosleep`) fire at their real deadline.
-pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
-    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-    if deadline_ns == u64::MAX {
-        now_ns.saturating_add(FALLBACK_NS)
-    } else if net_io_wait {
-        now_ns.saturating_add(FALLBACK_NS).min(deadline_ns)
-    } else {
-        deadline_ns
-    }
+/// Task #32 DELETED the 10 ms lost-wake backstop: every readiness source now
+/// fires a durable targeted wake (per-fd `Readiness` cells / io-waiter / futex /
+/// signal), so a park no longer needs a periodic fallback re-poll. This is now
+/// the identity policy shared by the own-stack and async park sites:
+/// - a FINITE park fires at its real `deadline_ns` (sleep/nanosleep duration, or
+///   a poll/epoll timeout — the io-waiter normally wakes it earlier);
+/// - an INFINITE park (`u64::MAX`) gets `u64::MAX`, i.e. an inert timer that
+///   never fires, so it relies purely on its registered wakers.
+pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, _now_ns: u64, _net_io_wait: bool) -> u64 {
+    deadline_ns
 }
 
 /// Record the readiness generation observed after an I/O waiter has been
@@ -778,6 +786,34 @@ fn park_should_block(
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
                 }
+                // signalfd lost-wake guard. A signalfd reads BLOCKED signals,
+                // which the `is_signal_pending` recheck above filters out
+                // (pending & !SIGNAL_MASK). Re-check the block-agnostic raise
+                // generation snapshotted before this poll/epoll's scan (beside
+                // `epoll_park_gen`): if a signal was raised in the
+                // scan→register window AND one is pending, re-execute so the
+                // woken poller re-scans the signalfd now, instead of parking
+                // until the ~10 ms backstop. The signal waker registered above
+                // covers any raise AFTER this point. Edge (generation), not
+                // level (raw pending), so a standing blocked-pending signal with
+                // no fresh raise does not spin — the re-exec re-snapshots.
+                let raise_gen = crate::handlers::signal_raise_generation(task_id);
+                if uc.signal_park_gen.load(Ordering::Acquire) != raise_gen
+                    && crate::handlers::signal_pending_of(task_id) != 0
+                {
+                    // Advance the snapshot before re-executing: poll/epoll/mqueue
+                    // re-snapshot on their next park, but the other net_io_wait
+                    // parks (blocking socket recv, etc.) do NOT — without this a
+                    // standing blocked-pending signal would refire the guard and
+                    // spin them. Storing the observed generation makes the next
+                    // compare equal so they park, while a genuinely NEW raise
+                    // still advances past it.
+                    uc.signal_park_gen.store(raise_gen, Ordering::Release);
+                    crate::handlers::drop_io_waiter(task_id);
+                    crate::handlers::drop_signal_waker(task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    return false;
+                }
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
             //
@@ -826,9 +862,10 @@ fn park_should_block(
                     crate::fd::locks::register_waiter(fk, task_id, waker.clone());
                 }
             }
-            // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
-            // fallback so a lost external wake can't wedge; finite sleeps use
-            // the real deadline. The real wake is the io/futex/signal waker.
+            // Park on the timer wheel. Finite sleeps/timeouts arm at their real
+            // deadline; infinite parks (u64::MAX) get an inert never-firing timer
+            // (task #32 deleted the ~10ms lost-wake backstop) and rely purely on
+            // the durable io/futex/signal/per-fd Readiness waker.
             //
             // The wheel deadline is ABSOLUTE TSC cycles compared against
             // `now_cycles()` in `fire_due`. `deadline`/`now` are absolute
@@ -893,6 +930,19 @@ fn park_should_block(
         crate::handlers::drop_signal_waker(task_id);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
+        // Unqueue the futex waiter this park registered above. Linux's
+        // `futex_unqueue` removes the waiter on EVERY exit — woken, timed out,
+        // OR signal-interrupted. Leaving the entry queued makes a later
+        // FUTEX_WAKE(1) pop this now-dead "ghost", report a wake that reached
+        // no real waiter, and force-clear an unrelated park's deadline — the
+        // genuine waiter then only recovers on the ~10 ms backstop. That was
+        // the CachyOS greeter stall: Qt's timed condvar waits (pthread_cond_
+        // timedwait) each left a ghost, so pthread_cond_signal woke ghosts.
+        let fu = uc.futex_uaddr.load(Ordering::Acquire);
+        if fu != 0 {
+            let key = crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+            crate::handlers::futex_drop_waiter_key(key, task_id);
+        }
         uc.futex_uaddr.store(0, Ordering::Release);
         uc.futex_namespace.store(0, Ordering::Release);
         // The waiter-queue entry (if any) is dropped by the re-executed
@@ -916,16 +966,19 @@ fn park_should_block(
             uc.console_read_pending.store(false, Ordering::Release);
             return false; // a byte is ready → re-execute the read
         }
-        // ALSO arm a ~1-tick wheel fallback (like the deadline parks above):
-        // the serial/keyboard byte-waker is a single non-Arc registry slot, so
-        // a dropped/overwritten byte-ring wake would otherwise wedge the reader
-        // (e.g. getty/login at boot) forever. The fallback re-runs this check on
-        // the next tick — a robust backstop for any lost type-specific wake.
+        // ALSO arm a ~1-tick wheel fallback: the serial/keyboard byte-waker is a
+        // single non-Arc registry slot, so a dropped/overwritten byte-ring wake
+        // would otherwise wedge the reader (e.g. getty/login at boot) forever.
+        // The fallback re-runs this check on the next tick — a robust net for
+        // THIS non-durable mechanism. NOTE: this is NOT the task #32 poll/ppoll
+        // backstop (deleted): that guarded per-fd `Readiness` parks, which are
+        // now durable; the byte-waker slot is not, so its net stays.
         // Convert via `ns_to_cycles` (precise inverse of `cycles_to_ns`), NOT
         // `* cycles_per_ns()` — see the deadline-park note above.
+        const BYTE_WAKER_FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
         let now = narf_scheduler::narf_time::monotonic_ns();
-        const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-        let fire = narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
+        let fire =
+            narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(BYTE_WAKER_FALLBACK_NS));
         // `refresh_waker_at` — keep the slot's deadline current across
         // repeated parks through one handle (see the deadline-park note).
         let refreshed = sleep_handle.is_some_and(|h| {
@@ -940,6 +993,20 @@ fn park_should_block(
 
     // No park state set (shouldn't happen on a park site) → proceed.
     false
+}
+
+/// Test-only: drive one iteration of the own-stack park decision against a
+/// caller-supplied ctx, so kernel tests can pin the unpark paths' wait-queue
+/// hygiene (Linux `futex_unqueue` parity — kernel/futex/waitwake.c) without
+/// a live executor. Uses the production `park_should_block` unmodified.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_park_should_block(
+    uc: &UserTaskCtx,
+    waker: &core::task::Waker,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+) -> bool {
+    park_should_block(uc, waker, sleep_handle)
 }
 
 /// Own-stack blocking-syscall park: register the slot-waker + `kernel_switch`
@@ -1896,38 +1963,12 @@ impl core::future::Future for UserTaskFuture {
                     // external wake, NOT the timer tick, could revive it, so a
                     // single lost readiness wake wedged it permanently; and
                     // (2) the self-wake tick-paced its re-poll, gating off-box
-                    // round-trips at ~16.7 ms. Instead, PARK on the timer wheel
-                    // with a one-tick fallback deadline: the real wake is the
-                    // io-waiter / futex / signal wake (now re-polled PROMPTLY
-                    // by the scheduler's EXTERNAL_WAKE fast-repoll), and the
-                    // wheel slot is just a lost-wake / pending-signal safety
-                    // net that bounds the worst case to ~one tick. sleep_pumps
-                    // still run in the executor's own idle path every round.
-                    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
-                    let fallback_cycles =
-                        narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
-                    // `refresh_waker_at` — keep the slot's fire time current
-                    // across parks that reuse this handle (a stale earlier
-                    // deadline would pin the backstop; see park_should_block).
-                    let refreshed = this.sleep_handle.is_some_and(|h| {
-                        narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
-                            h,
-                            fallback_cycles,
-                            cx.waker().clone(),
-                        )
-                    });
-                    if !refreshed {
-                        this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
-                            fallback_cycles,
-                            cx.waker().clone(),
-                        )
-                        .ok();
-                        if this.sleep_handle.is_none() {
-                            // Wheel full / no arm callback: self-wake so the
-                            // task still makes progress (degraded, never wedged).
-                            cx.waker().wake_by_ref();
-                        }
-                    }
+                    // round-trips at ~16.7 ms. Task #32 DELETED the 10 ms
+                    // lost-wake backstop: an infinite io-wait park now arms NO
+                    // timer and relies purely on its durable wake — the io-waiter
+                    // / futex / signal wake (re-polled PROMPTLY by the scheduler's
+                    // EXTERNAL_WAKE fast-repoll) or the per-fd `Readiness` cell.
+                    // sleep_pumps still run in the executor's own idle path.
                     return core::task::Poll::Pending;
                 }
                 // Finite sleep (sys_sleep / nanosleep): PARK on the timer
@@ -1938,10 +1979,11 @@ impl core::future::Future for UserTaskFuture {
                 // re-polling us every 1ms. Register once; refresh across any
                 // spurious re-poll so we never leak a slot.
 
-                // Finite io-wait park: clamp the wheel fire to a ~10ms lost-wake
-                // backstop (same rationale as `park_fire_deadline_ns` in the
-                // own-stack path) so a lost cross-core io-wake self-heals in
-                // ~10ms instead of stranding until a long finite deadline.
+                // Finite io-wait park (poll/epoll with a real timeout): arm the
+                // wheel at its REAL deadline. Task #32 deleted the ~10ms lost-wake
+                // clamp — the io-waiter fires a durable wake that normally revives
+                // us long before the timeout, so `park_fire_deadline_ns` is now
+                // the identity (see its doc).
                 let fire_ns = park_fire_deadline_ns(
                     deadline,
                     now,
@@ -1980,7 +2022,19 @@ impl core::future::Future for UserTaskFuture {
             crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            // Unqueue the futex waiter this park registered (see the own-stack
+            // twin above): Linux's futex_unqueue removes it on timeout/signal
+            // too, so a later FUTEX_WAKE(1) can't pop a ghost.
+            let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
+            if fu != 0 {
+                let key = crate::handlers::futex_key(
+                    this.task.uctx.futex_namespace.load(Ordering::Acquire),
+                    fu,
+                );
+                crate::handlers::futex_drop_waiter_key(key, crate::handlers::current_task_id());
+            }
             this.task.uctx.futex_uaddr.store(0, Ordering::Release);
+            this.task.uctx.futex_namespace.store(0, Ordering::Release);
             this.task.uctx.sigwait_set.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);

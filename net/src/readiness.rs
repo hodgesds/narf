@@ -31,6 +31,16 @@ pub fn generation() -> u64 {
     GEN.load(Ordering::Acquire)
 }
 
+/// Bump the notify generation WITHOUT invoking the wake hook. Used by callers
+/// that do their own TARGETED wake (e.g. AF_UNIX point-to-point: wake only the
+/// peer's reader) but still need the generation to advance so a poller caught
+/// in the check→register→park race re-polls instead of sleeping out its
+/// deadline. Pairs with a direct waker fire in the high crate.
+#[inline]
+pub fn bump_generation() {
+    GEN.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Install the readiness hook. Called once from `narf-userspace` boot.
 pub fn set_hook(f: fn(u64)) {
     HOOK.store(f as usize, Ordering::Release);

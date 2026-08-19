@@ -985,6 +985,350 @@ fn smoke_abi_pathx_readlinkat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_readlinkat_neg);
 
+// ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
+//
+// systemd-logind resolves each seat-master DRM device by devnum:
+// `sd_device_new_from_devnum("226:0")` → `device_set_syspath(verify=true)` →
+// `chase("/sys/dev/char/226:0")`. `chase()` walks the path one component at a
+// time using the SYSCALL sequence a real sd-device uses:
+//   openat(parent_fd, "226:0", O_PATH|O_NOFOLLOW|O_CLOEXEC)  (open the link)
+//   fstat / newfstatat(fd, "", AT_EMPTY_PATH)                (S_ISLNK?)
+//   readlinkat(parent_fd, "226:0", buf)                      (target)
+//
+// A real boot logged `sd-device: Failed to get target of
+// '/sys/dev/char/226:0': Invalid argument` (EINVAL out of the readlink step),
+// so logind gave up on the GPU and seat0 never became graphical. This drives
+// that exact chase sequence against a sysfs symlink registered the way
+// `drivers/gpu/.../drm_sysfs_bridge.rs::char_dev_link` builds it: a `226:0`
+// symlink → `../../devices/platform/narf-drm/card0`, plus the real target
+// node so a FULL chase resolves.
+//
+// Whichever step returns the wrong thing (fd<0, non-S_IFLNK, EINVAL, wrong
+// target) IS the bug and is named in that step's assertion.
+fn smoke_abi_pathx_sysfs_drm_char_symlink_chase() -> TestResult {
+    use narf_filesystem::sysfs::{get_or_create_child, get_root, kobject_add_attr};
+
+    const O_PATH: u64 = 0o10000000;
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+
+    const LINK_PATH: &[u8] = b"/sys/dev/char/226:0\0";
+    const LINK_TARGET: &str = "../../devices/platform/narf-drm/card0";
+
+    with_setup(|| {
+        // Build the DRM char-dev symlink exactly as `char_dev_link` does, plus
+        // the real `card0` target node carrying a `uevent` attr so a full chase
+        // (symlink-followed) reaches a live node. get_root() is the GLOBAL
+        // sysfs kobject singleton, so this is additive and idempotent.
+        let root = get_root();
+        let devices = get_or_create_child(&root, "devices");
+        let platform = get_or_create_child(&devices, "platform");
+        let narf_drm = get_or_create_child(&platform, "narf-drm");
+        let card0 = get_or_create_child(&narf_drm, "card0");
+        kobject_add_attr(&card0, "uevent", || {
+            alloc::string::String::from(
+                "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
+            )
+        });
+        let dev = get_or_create_child(&root, "dev");
+        let dev_char = get_or_create_child(&dev, "char");
+        dev_char.add_symlink("226:0", LINK_TARGET);
+
+        // 1) openat(O_PATH|O_NOFOLLOW|O_CLOEXEC) — open the symlink NODE itself.
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                LINK_PATH.as_ptr() as u64,
+                O_PATH | O_NOFOLLOW | O_CLOEXEC,
+                0,
+            ),
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            Some(-2) => {
+                return Err(
+                    "openat(O_PATH|O_NOFOLLOW /sys/dev/char/226:0) returned ENOENT — \
+                            the sysfs DRM char symlink is unreachable through the syscall path",
+                )
+            }
+            _ => {
+                return Err("openat(O_PATH|O_NOFOLLOW /sys/dev/char/226:0) failed — \
+                            chase() cannot even open the DRM char symlink")
+            }
+        };
+
+        // 2) newfstatat(fd, "", AT_EMPTY_PATH) — chase() checks S_ISLNK.
+        let mut st = [0u8; 144];
+        let empty = b"\0";
+        let r = call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                fd,
+                empty.as_ptr() as u64,
+                st.as_mut_ptr() as u64,
+                AT_EMPTY_PATH,
+            ),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if r != Some(0) {
+            return Err("newfstatat(O_PATH fd, AT_EMPTY_PATH) failed — \
+                        chase() cannot fstat the opened DRM char link");
+        }
+        // st_mode is a u32 at byte offset 24 of the 144-byte struct stat.
+        let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+        if mode & S_IFMT != S_IFLNK {
+            return Err("fstat of the O_PATH|O_NOFOLLOW fd is not S_IFLNK — \
+                        chase() sees the DRM char node as a non-symlink");
+        }
+
+        // 3) readlink(path) — chase() reads the target. EINVAL here is the exact
+        //    real-boot failure ("Failed to get target ...: Invalid argument").
+        let mut buf = [0u8; 128];
+        match call_readlink(
+            LINK_PATH.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) {
+            Some(len) if len >= 0 => {
+                if &buf[..len as usize] != LINK_TARGET.as_bytes() {
+                    return Err("readlink(/sys/dev/char/226:0) returned the wrong target bytes");
+                }
+            }
+            Some(-22) => {
+                return Err("readlink(/sys/dev/char/226:0) returned EINVAL — THE BUG: \
+                            chase() treats the registered DRM char symlink as a non-symlink")
+            }
+            _ => {
+                return Err("readlink(/sys/dev/char/226:0) failed (non-EINVAL) — \
+                            chase() cannot read the DRM char symlink target")
+            }
+        }
+
+        // 4) readlinkat(parent_dirfd, "226:0", buf) — chase() actually reads the
+        //    leaf RELATIVE to the parent-directory fd it holds, not absolutely.
+        let parent = b"/sys/dev/char\0";
+        let pfd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                parent.as_ptr() as u64,
+                O_PATH | O_DIRECTORY | O_CLOEXEC,
+                0,
+            ),
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            _ => {
+                return Err("openat(O_PATH|O_DIRECTORY /sys/dev/char) failed — \
+                            chase() has no parent dirfd to readlinkat against")
+            }
+        };
+        let leaf = b"226:0\0";
+        let mut buf2 = [0u8; 128];
+        let rn = call(
+            Syscall::Readlinkat.raw(),
+            a3(
+                pfd,
+                leaf.as_ptr() as u64,
+                buf2.as_mut_ptr() as u64,
+                buf2.len() as u64,
+            ),
+        );
+        let _ = call(Syscall::Close.raw(), a0(pfd));
+        match rn {
+            Some(len) if len >= 0 && &buf2[..len as usize] == LINK_TARGET.as_bytes() => {}
+            Some(-22) => {
+                return Err("readlinkat(parent_fd, \"226:0\") returned EINVAL — \
+                            chase() cannot resolve the leaf against its parent dirfd")
+            }
+            _ => return Err("readlinkat(parent_fd, \"226:0\") did not return the DRM card target"),
+        }
+
+        // 5) Full chase outcome: following the symlink reaches the real card0
+        //    node and its `uevent` is statable — this is what lets logind bind
+        //    the seat master and mark seat0 graphical.
+        let mut st2 = [0u8; 144];
+        let uevent = b"/sys/dev/char/226:0/uevent\0";
+        if call_stat(uevent.as_ptr() as u64, st2.as_mut_ptr() as u64) != Some(0) {
+            return Err(
+                "stat(/sys/dev/char/226:0/uevent) failed — the DRM char symlink \
+                        does not chase through to the real card node",
+            );
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_sysfs_drm_char_symlink_chase);
+
+// ── sd-device chase() of /sys/dev/char/226:0 from a PRIVATE mount ns ──
+//
+// The isolated chase above resolves correctly, so if logind's real boot
+// failure is environmental the remaining suspect is the mount namespace:
+// logind runs `PrivateMounts=yes`, so `chase()` resolves through the task's
+// `MountNamespace`, not the global registry. `open`/`openat` go through
+// `current_resolve_absolute()` (namespace-aware, falls back to the global
+// registry), but `readlink`/`readlinkat` resolve via
+// `registry().resolve_absolute()` directly — an asymmetry that already bit
+// the directory-mutation syscalls (see
+// `smoke_abi_fsx2_rename_resolves_in_private_mount_namespace`).
+//
+// This drives the SAME chase (openat O_PATH|O_NOFOLLOW → fstat S_ISLNK →
+// readlinkat against the parent dirfd → readlink) from inside a private
+// mount namespace and asserts the readlink still returns the DRM card
+// target. If it reports EINVAL here while the isolated variant passed, the
+// namespace path is the bug.
+fn smoke_abi_pathx_sysfs_drm_char_chase_private_mount_ns() -> TestResult {
+    use narf_filesystem::sysfs::{get_or_create_child, get_root, kobject_add_attr};
+
+    const O_PATH: u64 = 0o10000000;
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_CLOEXEC: u64 = 0o2000000;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+
+    const LINK_PATH: &[u8] = b"/sys/dev/char/226:0\0";
+    const LINK_TARGET: &str = "../../devices/platform/narf-drm/card0";
+
+    with_setup(|| {
+        // Register the DRM char symlink + its target BEFORE entering the
+        // private namespace, mirroring boot order (the DRM sysfs projection is
+        // built at Stage::Late, well before logind starts).
+        let root = get_root();
+        let devices = get_or_create_child(&root, "devices");
+        let platform = get_or_create_child(&devices, "platform");
+        let narf_drm = get_or_create_child(&platform, "narf-drm");
+        let card0 = get_or_create_child(&narf_drm, "card0");
+        kobject_add_attr(&card0, "uevent", || {
+            alloc::string::String::from(
+                "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
+            )
+        });
+        let dev = get_or_create_child(&root, "dev");
+        let dev_char = get_or_create_child(&dev, "char");
+        dev_char.add_symlink("226:0", LINK_TARGET);
+
+        let result = (|| {
+            // logind's PrivateMounts=yes: its own private mount namespace.
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            if crate::handlers::current_mount_namespace().is_none() {
+                return Err("unshare did not install a mount namespace");
+            }
+
+            // 1) openat(O_PATH|O_NOFOLLOW) in the private namespace.
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    LINK_PATH.as_ptr() as u64,
+                    O_PATH | O_NOFOLLOW | O_CLOEXEC,
+                    0,
+                ),
+            ) {
+                Some(v) if v >= 0 => v as u64,
+                Some(-2) => {
+                    return Err("openat(/sys/dev/char/226:0) ENOENT in a private mount \
+                                namespace — the sysfs symlink is invisible through the ns")
+                }
+                _ => {
+                    return Err(
+                        "openat(O_PATH|O_NOFOLLOW /sys/dev/char/226:0) failed in a private ns",
+                    )
+                }
+            };
+
+            // 2) fstat → S_ISLNK.
+            let mut st = [0u8; 144];
+            let empty = b"\0";
+            let r = call(
+                Syscall::Newfstatat.raw(),
+                a3(
+                    fd,
+                    empty.as_ptr() as u64,
+                    st.as_mut_ptr() as u64,
+                    AT_EMPTY_PATH,
+                ),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            if r != Some(0) {
+                return Err("newfstatat(fd, AT_EMPTY_PATH) failed in a private ns");
+            }
+            let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+            if mode & S_IFMT != S_IFLNK {
+                return Err("fstat of the O_PATH fd is not S_IFLNK in a private mount namespace");
+            }
+
+            // 3) readlinkat against the held parent dirfd — the shape chase()
+            //    uses. EINVAL here while the isolated variant passed pins the
+            //    bug on the mount-namespace resolution asymmetry.
+            let parent = b"/sys/dev/char\0";
+            let pfd = match call(
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    parent.as_ptr() as u64,
+                    O_PATH | O_DIRECTORY | O_CLOEXEC,
+                    0,
+                ),
+            ) {
+                Some(v) if v >= 0 => v as u64,
+                _ => return Err("openat(/sys/dev/char) failed in a private ns"),
+            };
+            let leaf = b"226:0\0";
+            let mut buf = [0u8; 128];
+            let rn = call(
+                Syscall::Readlinkat.raw(),
+                a3(
+                    pfd,
+                    leaf.as_ptr() as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf.len() as u64,
+                ),
+            );
+            let _ = call(Syscall::Close.raw(), a0(pfd));
+            match rn {
+                Some(len) if len >= 0 && &buf[..len as usize] == LINK_TARGET.as_bytes() => {}
+                Some(-22) => {
+                    return Err(
+                        "readlinkat(parent_fd, \"226:0\") returned EINVAL in a private \
+                                mount namespace — chase() cannot read the DRM char symlink target",
+                    )
+                }
+                _ => return Err("readlinkat(parent_fd, \"226:0\") wrong result in a private ns"),
+            }
+
+            // 4) Absolute readlink through the namespace resolver too.
+            let mut buf2 = [0u8; 128];
+            match call_readlink(
+                LINK_PATH.as_ptr() as u64,
+                buf2.as_mut_ptr() as u64,
+                buf2.len() as u64,
+            ) {
+                Some(len) if len >= 0 && &buf2[..len as usize] == LINK_TARGET.as_bytes() => {}
+                Some(-22) => {
+                    return Err("readlink(/sys/dev/char/226:0) returned EINVAL in a private ns")
+                }
+                _ => return Err("readlink(/sys/dev/char/226:0) wrong result in a private ns"),
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_sysfs_drm_char_chase_private_mount_ns
+);
+
 // ── renameat (olddirfd, old NUL-term, newdirfd, new NUL-term) → 0/-1 ──
 
 fn smoke_abi_pathx_renameat_pos() -> TestResult {
@@ -1043,6 +1387,201 @@ fn smoke_abi_pathx_renameat2_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_pos);
+
+// The exact shape `sd-device` uses to publish a udev database entry:
+// write `<dir>/.#<id><random>`, then RENAME_NOREPLACE it onto `<dir>/<id>`.
+// The names carry `.`, `#`, `+` and `:`, none of which are special to
+// rename(2) but all of which are unusual enough to be worth pinning.
+//
+// The errno matters as much as the success. systemd's `rename_noreplace()`
+// falls back to a racy link/unlink dance ONLY on EINVAL, ENOSYS or ENOTTY;
+// any other error is returned to the caller verbatim. So a renameat2 that
+// reports ENOENT for a rename it simply did not perform makes udev give up
+// with "Failed to rename temporary database file ... No such file or
+// directory" and never write `/run/udev/data/<id>` at all — which is exactly
+// the failure the udev seat gate reports.
+fn smoke_abi_pathx_renameat2_udev_db_publish_shape() -> TestResult {
+    const RENAME_NOREPLACE: u64 = 1;
+    const TMP: &str = ".#+pci:0000:00:02.037385736e4f26399";
+    const FINAL: &str = "+pci:0000:00:02.0";
+    with_memfs(
+        "/p3",
+        "p3",
+        &[(TMP, b"E:ID_PATH=pci-0000:00:02.0\n")],
+        || {
+            let old = b"/p3/.#+pci:0000:00:02.037385736e4f26399\0";
+            let new = b"/p3/+pci:0000:00:02.0\0";
+            let r = call_raw(
+                Syscall::Renameat2.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: old.as_ptr() as u64,
+                    arg2: AT_FDCWD,
+                    arg3: new.as_ptr() as u64,
+                    arg4: RENAME_NOREPLACE,
+                    arg5: 0,
+                },
+            );
+            if r.status != SyscallReturn::OK {
+                return Err("renameat2 of a udev db temp file returned a non-OK NARF status");
+            }
+            match r.value as i64 {
+            0 => {}
+            -2 => {
+                return Err(
+                    "renameat2(RENAME_NOREPLACE) reported ENOENT — systemd's rename_noreplace only falls back on EINVAL/ENOSYS/ENOTTY, so udev gives up here",
+                )
+            }
+            _ => return Err("renameat2 of a udev db temp file did not succeed"),
+        }
+            // The published entry must be readable under its final name, and the
+            // temporary must be gone — a rename that reports success without
+            // moving anything leaves udev reading a stale database forever.
+            let mut buf = [0u8; 64];
+            let final_path = b"/p3/+pci:0000:00:02.0\0";
+            let fd = call_open(final_path.as_ptr() as u64, 0).unwrap_or(-1);
+            if fd < 0 {
+                return Err("renamed udev db entry is not openable under its final name");
+            }
+            let n = call(
+                Syscall::Read.raw(),
+                a2(fd as u64, buf.as_mut_ptr() as u64, 64),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            if n.unwrap_or(-1) <= 0 {
+                return Err("renamed udev db entry has no contents");
+            }
+            let tmp_path = b"/p3/.#+pci:0000:00:02.037385736e4f26399\0";
+            if call_open(tmp_path.as_ptr() as u64, 0).unwrap_or(-1) >= 0 {
+                return Err("the temporary udev db file still exists after a successful rename");
+            }
+            let _ = (TMP, FINAL);
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_udev_db_publish_shape
+);
+
+/// The same publish, but in a NESTED directory created at runtime — which is
+/// what `/run/udev/data/` actually is: systemd mounts /run, then udev
+/// `mkdir_parents()` its way to `data/`. The mount-root case above resolves
+/// its parent trivially; this one exercises a real multi-component walk to
+/// the parent before the rename.
+fn smoke_abi_pathx_renameat2_udev_db_publish_nested() -> TestResult {
+    const RENAME_NOREPLACE: u64 = 1;
+    with_memfs("/p4", "p4", &[], || {
+        // /p4/udev/data, built a component at a time like mkdir_parents.
+        for dir in [b"/p4/udev\0".as_ref(), b"/p4/udev/data\0".as_ref()] {
+            let r = call(Syscall::Mkdir.raw(), a1(dir.as_ptr() as u64, 0o755)).unwrap_or(-1);
+            if r != 0 && r != -17 {
+                return Err("mkdir of a udev database parent directory failed");
+            }
+        }
+        let tmp = b"/p4/udev/data/.#c226:0e270627d7a3faea1\0";
+        let fin = b"/p4/udev/data/c226:0\0";
+        // Create the temp entry the way sd-device does (O_CREAT|O_EXCL).
+        let fd = call_open(tmp.as_ptr() as u64, 0o100 | 0o200 | 0o1).unwrap_or(-1);
+        if fd < 0 {
+            return Err("could not create the temporary udev db file in a nested directory");
+        }
+        let payload = b"E:ID_FOR_SEAT=drm-pci\n";
+        let _ = call(
+            Syscall::Write.raw(),
+            a2(fd as u64, payload.as_ptr() as u64, payload.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        let r = call_raw(
+            Syscall::Renameat2.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: tmp.as_ptr() as u64,
+                arg2: AT_FDCWD,
+                arg3: fin.as_ptr() as u64,
+                arg4: RENAME_NOREPLACE,
+                arg5: 0,
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return Err("nested renameat2 returned a non-OK NARF status");
+        }
+        match r.value as i64 {
+            0 => {}
+            -2 => {
+                return Err(
+                    "nested renameat2(RENAME_NOREPLACE) reported ENOENT — this is the udev database publish failing",
+                )
+            }
+            _ => return Err("nested renameat2 of a udev db temp file did not succeed"),
+        }
+        if call_open(fin.as_ptr() as u64, 0).unwrap_or(-1) < 0 {
+            return Err("nested udev db entry is not openable under its final name");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_udev_db_publish_nested
+);
+
+/// Renaming a file that EXISTS must never report ENOENT. `/proc` has no
+/// rename support, so the honest answer is EPERM/EINVAL/EXDEV/EACCES — the
+/// errno family that says "this filesystem will not do that", not the one
+/// that says "the path you named is not there".
+///
+/// The distinction is load-bearing rather than pedantic. systemd's
+/// `rename_noreplace()` falls back to a link/unlink dance only on EINVAL,
+/// ENOSYS or ENOTTY, and callers throughout systemd treat ENOENT as "the
+/// source vanished, nothing to do". A rename handler that funnels every
+/// failure — including an unimplemented `DirOps::rename` — into ENOENT
+/// therefore turns a recoverable "unsupported" into a silent, permanent
+/// give-up. That is the shape of the udev database publish failure:
+/// "Failed to rename temporary database file ... No such file or directory"
+/// for a temporary file that was created successfully moments earlier.
+fn smoke_abi_pathx_rename_unsupported_is_not_enoent() -> TestResult {
+    with_setup(|| {
+        // A path that definitely exists and definitely cannot be renamed.
+        let old = b"/proc/self/stat\0";
+        let new = b"/proc/self/stat-renamed\0";
+        // Confirm the source exists, so an ENOENT below cannot be honest.
+        let fd = call_open(old.as_ptr() as u64, 0).unwrap_or(-1);
+        if fd < 0 {
+            // No procfs in this configuration — nothing to assert against.
+            return Ok(());
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        let r = call_raw(
+            Syscall::Renameat2.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: old.as_ptr() as u64,
+                arg2: AT_FDCWD,
+                arg3: new.as_ptr() as u64,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return Err("renameat2 on an unrenameable file returned a non-OK NARF status");
+        }
+        match r.value as i64 {
+            0 => Err("renameat2 claimed to rename a /proc entry"),
+            -2 => Err(
+                "renameat2 reported ENOENT for a file that exists — 'unsupported' must not be laundered into 'no such file' (systemd's rename_noreplace only falls back on EINVAL/ENOSYS/ENOTTY)",
+            ),
+            _ => Ok(()),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_rename_unsupported_is_not_enoent
+);
 
 fn smoke_abi_pathx_renameat2_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("old", b"x")], || {

@@ -118,6 +118,36 @@ static NEXT_CGROUP_ATTR_INO: core::sync::atomic::AtomicU64 =
 static CGROUP_ATTR_INOS: IrqSafeSpinLock<BTreeMap<(u64, &'static str), u64>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
+/// Runtime toggle for the `CGEVT` populated-transition trace (kernel cmdline
+/// `cgevt_trace`, set by boot-init). Off by default. Diagnostic only: prints
+/// each `cgroup.events` `populated` transition (`0->1` on the first member,
+/// `1->0` when it empties), walking up ancestors, so a service whose start job
+/// hangs waiting for its cgroup to settle can be pinned — did its cgroup ever
+/// go `1->0`, and at which path.
+static CGEVT_TRACE: AtomicBool = AtomicBool::new(false);
+
+/// Enable the `CGEVT` populated-transition trace (see [`CGEVT_TRACE`]).
+pub fn set_cgevt_trace(v: bool) {
+    CGEVT_TRACE.store(v, Ordering::Relaxed);
+}
+
+/// Absolute cgroup path a pid currently belongs to (root `/` if unplaced).
+/// Diagnostic helper for the USEREXIT probe so an exiting process can be
+/// attributed to its service cgroup (e.g. `.../user@957.service`) regardless
+/// of its comm.
+pub fn cgroup_path_of(pid: u64) -> String {
+    cgroup_of(pid).abs_path()
+}
+
+/// Whether the `CGEVT` trace is enabled. Reused as a lightweight runtime gate
+/// for the paired userspace exit-detection diagnostics (`CGATTACH`,
+/// `PIDFD-MINT`, `PIDFD-EXIT`) so they can be watched in a boot WITHOUT the
+/// `syscall-trace` firehose — which is heavy enough to change the failure mode
+/// of the very phase (systemd `--user` session bring-up) they diagnose.
+pub fn cgevt_trace_enabled() -> bool {
+    CGEVT_TRACE.load(Ordering::Relaxed)
+}
+
 fn alloc_cgroup_ino() -> u64 {
     NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed)
 }
@@ -402,6 +432,16 @@ impl Cgroup {
             let mut path = self.abs_path();
             path.push_str("/cgroup.events");
             crate::notify_modify(&path);
+            if CGEVT_TRACE.load(Ordering::Relaxed) {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "CGEVT {} populated {}->{}",
+                    self.abs_path(),
+                    was as u8,
+                    now as u8
+                );
+            }
         }
         if let Some(p) = &self.parent {
             p.notify_events();

@@ -88,12 +88,27 @@ pub mod splice {
                 u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
             let cur_rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]);
             let cur_name_len = block[off + 6];
+            let cur_file_type = block[off + 7];
 
             if cur_rec_len < 8 || (cur_rec_len & 3) != 0 {
                 return InsertResult::Corrupt;
             }
             if off + cur_rec_len as usize > blocksize {
                 return InsertResult::Corrupt;
+            }
+
+            // ext4 metadata_csum reserves the final 12-byte fake dirent as a
+            // checksum carrier. It looks like a reusable inode-zero slot to
+            // an ext2 splicer, so recognize its sentinel file type and leave
+            // it intact.
+            let checksum_tail = cur_inode == 0
+                && cur_rec_len == 12
+                && cur_name_len == 0
+                && cur_file_type == 0xde
+                && off + 12 == blocksize;
+            if checksum_tail {
+                off += 12;
+                continue;
             }
 
             // Duplicate-name check — only against live (inode != 0) entries.

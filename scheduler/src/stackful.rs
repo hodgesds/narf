@@ -1644,6 +1644,43 @@ pub unsafe fn yield_current_stackful() {
     user_fpu_restore();
 }
 
+/// Cooperatively yield the current stackful task to the executor, re-arming
+/// its slot waker first so it is re-polled promptly. Returns `true` if a yield
+/// happened, `false` if there is no stackful task on this CPU (the caller
+/// should fall back to a plain spin — there is nothing to yield to).
+///
+/// The right primitive for a CONTENDED in-kernel spin-wait whose lock holder
+/// may be a DESCHEDULED task homed on THIS CPU (virtio-blk's `ReqGate`): a pure
+/// `spin_loop` there monopolizes the CPU the holder needs to run on and
+/// livelocks (the `no_park_backstop` thundering-herd convoy). Yielding hands the
+/// CPU to the executor so it can run the holder, which then releases the lock;
+/// on re-poll the caller retries. Uses the same re-arm-then-`yield_current_stackful`
+/// switch-out as `maybe_resched_syscall_exit` / the own-stack park paths — the
+/// well-tested cooperative path, NOT `no_preempt`.
+#[cfg(target_arch = "x86_64")]
+pub fn cooperative_yield() -> bool {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
+    // its Box alive); `current_waker` is an IrqSafeSpinLock.
+    unsafe {
+        // Re-arm the slot waker so the executor keeps us Ready + re-polls us
+        // after the siblings (incl. the lock holder) run. Without this the
+        // just-cleared `awake` flag would leave us dormant forever.
+        let g = (*p).current_waker.lock();
+        if let Some(w) = g.as_ref() {
+            w.wake_by_ref();
+        }
+    }
+    // SAFETY: proven safe from syscall / in-kernel context — own_stack_park and
+    // maybe_resched_syscall_exit switch out through the same path.
+    unsafe { yield_current_stackful() };
+    true
+}
+
 /// Per-CPU "yield at the next syscall exit" request, set by syscall handlers
 /// that detect producer/consumer back-pressure (e.g. `rt_sigqueueinfo` onto a
 /// target whose signal queue is already backlogged — stress-ng --sigrt's
@@ -1761,6 +1798,14 @@ pub fn current_stackful_waker() -> Option<Waker> {
     }
     // SAFETY: in-flight task on this CPU; `current_waker` is an IrqSafeSpinLock.
     unsafe { (*p).current_waker.lock().as_ref().cloned() }
+}
+
+/// Non-x86_64: NARF has no stackful executor yet, so there is never a
+/// current stackful task — the own-stack durable-wake arming callers make
+/// (`poll`/`epoll`) simply see `None` and fall through to the legacy park.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn current_stackful_waker() -> Option<Waker> {
+    None
 }
 
 /// Mark the CURRENT stackful task complete and `kernel_switch` out — never

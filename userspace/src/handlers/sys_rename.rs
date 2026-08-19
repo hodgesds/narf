@@ -66,8 +66,7 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
         return;
     }
     let new_leaf = &new_path[new_split + 1..];
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
+    let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     match outcome {

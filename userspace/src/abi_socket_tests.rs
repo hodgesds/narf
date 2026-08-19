@@ -19,6 +19,7 @@ const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 const O_NONBLOCK: i64 = 0o4000;
 const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
@@ -383,6 +384,55 @@ fn smoke_abi_socket_accept4_empty_eagain() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_accept4_empty_eagain);
+
+fn smoke_abi_socket_accept4_uses_shared_nonblock_state() -> TestResult {
+    with_setup(|| {
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-accept4-shared-nonblock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)) != Some(0) {
+            return Err("listen failed");
+        }
+
+        // F_SETFL updates the SocketFile's shared open-file-description state
+        // and the descriptor snapshot. Simulate an inherited/remapped fd whose
+        // snapshot was rebuilt without status flags, as systemd socket
+        // activation exposed during the CachyOS boot.
+        if call(Syscall::Fcntl.raw(), a2(srv, F_SETFL, O_NONBLOCK as u64)) != Some(0) {
+            return Err("F_SETFL(O_NONBLOCK) failed");
+        }
+        let cleared = fd::with_table(FAKE_TASK, |table| {
+            table.get_mut(srv as u32).map(|entry| {
+                entry.status_flags &= !(O_NONBLOCK as u32);
+            })
+        })
+        .flatten()
+        .is_some();
+        if !cleared {
+            return Err("listener fd disappeared");
+        }
+        if !crate::handlers::__test_socket_listener_nonblock(srv as u32) {
+            return Err("accept4 ignored shared SocketFile O_NONBLOCK state");
+        }
+
+        let r =
+            call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, 0)).ok_or("accept4 status not Ok")?;
+        if r != EAGAIN {
+            return Err("empty inherited nonblocking listener did not return -EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_accept4_uses_shared_nonblock_state
+);
 
 // ───────────────────────────── SocketPair ─────────────────────────────
 
@@ -865,6 +915,94 @@ kernel_test_in!(
     smoke_abi_socket_unix_listener_connect_wakes_parked_poller
 );
 
+/// A second connect(2) on an already-connected AF_UNIX stream fd returns
+/// EISCONN and must NOT leave a GHOST pending connection. The old connect path
+/// pushed the server endpoint onto the listener's pending queue BEFORE
+/// validating the client's own state, so a retry (or any connect on a
+/// non-Fresh socket) enqueued a dead server half whose rx ring had no writer —
+/// accept() then returned a permanently POLLIN-silent fd. That is the
+/// dbus-broker system-bus strand fingerprint: an accepted connection that never
+/// becomes readable. After the fix the listener yields exactly ONE live,
+/// readable connection and no ghost.
+fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
+    with_setup(|| {
+        const EISCONN: i64 = -56;
+        let srv = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-connect-twice");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("listen failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect status")?
+            != 0
+        {
+            return Err("first connect failed");
+        }
+        // Second connect on the SAME connected fd: EISCONN, and it must NOT
+        // enqueue a ghost server endpoint.
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("connect2 status")?
+            != EISCONN
+        {
+            return Err("second connect on a connected fd did not return -EISCONN");
+        }
+        // Exactly ONE pending connection, and it is LIVE (a readable ring).
+        let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+        if conn < 0 {
+            return Err("accept did not return the one real connection");
+        }
+        let msg = b"ping";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(cli, msg.as_ptr() as u64, msg.len() as u64, 0),
+        ) != Some(msg.len() as i64)
+        {
+            return Err("client send on the accepted connection failed");
+        }
+        let mut buf = [0u8; 8];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(conn as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        )
+        .ok_or("recv status")?;
+        if n != msg.len() as i64 || &buf[..msg.len()] != msg {
+            return Err("accepted connection was not a live readable ring (ghost)");
+        }
+        // No ghost queued: a non-blocking accept4 on the now-empty listener must
+        // return EAGAIN, not a second (dead) connection.
+        if call(Syscall::SocketAccept4.raw(), a3(srv, 0, 0, SOCK_NONBLOCK))
+            .ok_or("accept4 status")?
+            != EAGAIN
+        {
+            return Err("a ghost pending connection was left queued after EISCONN");
+        }
+        let _ = call(Syscall::Close.raw(), a0(cli));
+        let _ = call(Syscall::Close.raw(), a0(conn as u64));
+        let _ = call(Syscall::Close.raw(), a0(srv));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_twice_no_ghost_pending
+);
+
 /// A listening AF_UNIX socket watched through an epoll fd that is ITSELF
 /// polled — libwayland's shape. `wl_event_loop` owns an epoll containing
 /// the display socket and hands its fd to the toolkit's main loop, which
@@ -977,6 +1115,98 @@ kernel_test_in!(
     smoke_abi_socket_listener_readable_through_nested_epoll
 );
 
+/// Socket-activation shape: an AF_UNIX listener already has PENDING connections
+/// BEFORE it is added to an epoll set. systemd queues client connections on the
+/// socket-activated listener, hands the fd to the daemon (dbus-broker /
+/// journald), and only THEN does the daemon `epoll_ctl(ADD)` it. The first
+/// `epoll_wait` MUST report the already-ready listener — both level and edge
+/// (EPOLLET owes an initial-readiness edge for an fd that is ready at ADD).
+///
+/// This is the exact strand a full-desktop boot dies on: the `/run/dbus/
+/// system_bus_socket` listener carries queued connections, dbus-broker adds the
+/// inherited fd to its epoll, `epoll_wait` never reports it, so it never
+/// `accept`s — the session bus wedges and the Plasma greeter hangs waiting for
+/// a bus reply that can't arrive. The neighbouring
+/// `..._readable_through_nested_epoll` cannot catch this: it registers the
+/// listener with epoll BEFORE the connection, so it exercises the arrival edge,
+/// never the already-pending-at-registration state.
+fn smoke_abi_socket_listener_pending_before_epoll_add_is_reported() -> TestResult {
+    with_setup(|| {
+        for (label, et) in [("level", 0u32), ("edge", crate::epoll::EPOLLET)] {
+            let srv = open_unix_stream()?;
+            let (addr, alen) = unix_sockaddr(if et == 0 {
+                b"/abi-pending-preadd-lvl"
+            } else {
+                b"/abi-pending-preadd-et"
+            });
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(srv, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err("listener bind failed");
+            }
+            if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+                return Err("listen failed");
+            }
+
+            // Queue a connection BEFORE the listener is watched — the socket
+            // sits readable with a pending accept, exactly as an inherited
+            // socket-activated fd does when the daemon finally epolls it.
+            let cli = open_unix_stream()?;
+            if call(
+                Syscall::SocketConnect.raw(),
+                a2(cli, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("connect status")?
+                != 0
+            {
+                return Err("client connect failed");
+            }
+
+            // NOW add the already-pending listener to a fresh epoll.
+            let epfd = call(Syscall::EpollCreate.raw(), a0(0)).ok_or("epoll_create status")?;
+            if epfd < 0 {
+                return Err("epoll_create failed");
+            }
+            let epfd = epfd as u64;
+            let mut interest = [0u8; 12];
+            interest[..4].copy_from_slice(&(1u32 | et).to_ne_bytes()); // EPOLLIN [| EPOLLET]
+            interest[4..].copy_from_slice(&0x4C49_5354u64.to_ne_bytes());
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(epfd, 1, srv, interest.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl ADD of the already-pending listener failed");
+            }
+
+            // The very first epoll_wait must report the already-pending
+            // listener. Missing it here is the dbus-broker never-accepts strand.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err(if et == 0 {
+                    "epoll_wait missed a listener already pending at ADD (level)"
+                } else {
+                    "epoll_wait missed a listener already pending at ADD (edge) — the socket-activation dbus-broker strand"
+                });
+            }
+            // And the accept it then issues must produce the connection.
+            let conn = call(Syscall::SocketAccept.raw(), a0(srv)).ok_or("accept status")?;
+            if conn < 0 {
+                return Err("accept after the epoll report returned no connection");
+            }
+            let _ = label;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_listener_pending_before_epoll_add_is_reported
+);
+
 /// A task parked in `epoll_wait` with an INFINITE timeout on a CONNECTED
 /// AF_UNIX socketpair must wake when its peer sends.
 ///
@@ -1035,6 +1265,69 @@ fn smoke_abi_socket_connected_pair_send_wakes_parked_epoll() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_connected_pair_send_wakes_parked_epoll
+);
+
+/// A connected AF_UNIX stream whose PEER closes must become POLLIN|POLLHUP:
+/// Linux reports POLLIN (so the reader runs read()→0=EOF and tears the
+/// connection down) AND POLLHUP. The close travels `SocketFile::drop` →
+/// `tx.close()`, which latches POLL_IN|POLL_HUP into the peer's rx ring — both
+/// its durable readiness cell (waking a reader armed on it) and, via
+/// `readiness::notify`, the legacy generation channel.
+///
+/// Same two-halves shape as the send-wake twin above:
+///   1. the close must publish a readiness wake (generation bump) — without it
+///      a reader parked in `poll(-1)`/`epoll_wait(-1)` never re-scans and the
+///      fd hangs forever instead of surfacing EOF. Invisible to any timeout-0
+///      scan, so it is asserted directly.
+///   2. the re-scan a woken poller runs must then report POLLIN|POLLHUP.
+fn smoke_abi_socket_connected_pair_peer_close_reports_hup() -> TestResult {
+    with_setup(|| {
+        const POLLIN: u16 = 0x1;
+        const POLLHUP: u16 = 0x10;
+        let (peer, rx) = make_pair(SOCK_STREAM)?;
+
+        // pollfd { fd: rx, events: POLLIN, revents: 0 } — 8 bytes.
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&(rx as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&POLLIN.to_le_bytes());
+        // Negative half: an open, idle pair must NOT report ready on POLLIN.
+        if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("open idle connected pair reported POLLIN before peer close");
+        }
+
+        let before = narf_net::readiness::generation();
+        // Drop the peer endpoint (its only fd). SocketFile::drop closes its tx
+        // ring, i.e. OUR rx ring → EOF.
+        if call(Syscall::Close.raw(), a0(peer)) != Some(0) {
+            return Err("closing the peer half failed");
+        }
+        // Half 1: peer close must publish a readiness wake.
+        if narf_net::readiness::generation() <= before {
+            return Err("peer close published no readiness wake for a parked poller");
+        }
+        // Half 2: the re-scan reports POLLIN (EOF) and POLLHUP. POLLHUP is
+        // reported even though only POLLIN was requested (poll_scan folds in
+        // POLL_ERR|POLL_HUP|POLL_NVAL unconditionally, matching Linux).
+        pfd[6..8].copy_from_slice(&0u16.to_ne_bytes());
+        match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+            Some(1) => {
+                let revents = u16::from_le_bytes(pfd[6..8].try_into().unwrap());
+                if revents & POLLIN == 0 {
+                    return Err("peer-closed stream did not report POLLIN (EOF)");
+                }
+                if revents & POLLHUP == 0 {
+                    return Err("peer-closed stream did not report POLLHUP");
+                }
+            }
+            _ => return Err("peer-closed stream was not reported ready by poll"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(rx));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connected_pair_peer_close_reports_hup
 );
 
 // ─────────────────────────── SocketShutdown ───────────────────────────
@@ -3146,6 +3439,191 @@ kernel_test_in!(
     smoke_abi_socket_notify_path_dgram_epollin_deliver
 );
 
+/// The WAKE channel for a delivered AF_UNIX datagram — the half every
+/// timeout-0 epoll scan in this file cannot see. A service's
+/// `sd_notify(READY=1)` sendto must (1) bump the readiness GENERATION, the
+/// only thing that breaks PID 1 out of an infinite-timeout `epoll_wait`
+/// re-park (a fresh scan finds the datagram whether or not anyone was
+/// notified, so scan-only tests stay green across a lost wake), and
+/// (2) make the re-executed scan report the fd readable. Mirrors
+/// `smoke_abi_socket_connected_pair_send_wakes_parked_epoll`, which pins the
+/// same two halves for connected STREAM pairs; named SOCK_DGRAM endpoints
+/// take a different send path (`dispatch_unix_dgram_with_fds`) with its own
+/// notify call, so a regression there is invisible to the stream test.
+/// Covers both address families sd_notify uses: a PATHNAME bind
+/// (/run/systemd/notify) and an ABSTRACT bind (@/org/freedesktop/systemd1/
+/// notify).
+fn smoke_abi_dgram_send_wakes_parked_reader() -> TestResult {
+    with_setup(|| {
+        for abstract_ns in [false, true] {
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (addr, alen) = if abstract_ns {
+                abstract_sockaddr(b"narf-dgram-wake")
+            } else {
+                unix_sockaddr(b"/abi-dgram-wake.sock")
+            };
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, addr.as_ptr() as u64, alen),
+            )
+            .ok_or("bind status")?
+                != 0
+            {
+                return Err(if abstract_ns {
+                    "bind() of the abstract dgram receiver failed"
+                } else {
+                    "bind() of the pathname dgram receiver failed"
+                });
+            }
+            let epfd = add_level_epollin(rx)?;
+
+            // Negative half: an idle bound dgram socket must not report
+            // ready, or a parked PID 1 degenerates into a recv/EAGAIN spin.
+            if epoll_ready_now(epfd)? != 0 {
+                return Err("idle dgram socket reported epoll-ready before any send");
+            }
+
+            let before = narf_net::readiness::generation();
+            let tx = open_unix(SOCK_DGRAM)?;
+            let payload = b"READY=1\n";
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            )
+            .ok_or("sendto status")?;
+            if sent != payload.len() as i64 {
+                return Err("sendto() of the notify datagram failed");
+            }
+
+            // Half 1: the wake channel. Without this bump a reader parked in
+            // `epoll_wait(-1)`/`poll(-1)` never re-runs its readiness scan and
+            // the READY=1 sits queued forever (Type=notify start job hangs).
+            if narf_net::readiness::generation() <= before {
+                return Err(if abstract_ns {
+                    "abstract dgram sendto published no readiness wake for a parked reader"
+                } else {
+                    "pathname dgram sendto published no readiness wake for a parked reader"
+                });
+            }
+            // Half 2: the scan a woken waiter re-executes must see the datagram.
+            if epoll_ready_now(epfd)? != 1 {
+                return Err("delivered dgram did not make the receiver epoll-readable");
+            }
+            // And the recv the woken reader issues must return the bytes.
+            let mut rbuf = [0u8; 16];
+            let got = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if got != payload.len() as i64 || &rbuf[..payload.len()] != payload {
+                return Err("woken reader did not receive the READY=1 bytes");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_dgram_send_wakes_parked_reader
+);
+
+/// Same two halves for the AF_INET SOCK_DGRAM (UDP loopback) sibling path.
+/// `dispatch_inet_dgram`'s Send enqueues into the destination inbox and
+/// advances `dgram_readable_token`, but — unlike the AF_UNIX dgram path —
+/// never calls `narf_net::readiness::notify`, so a reader parked in an
+/// infinite-timeout `epoll_wait`/`poll` on a bound UDP socket is never woken
+/// by a loopback datagram (the epoll park backstop re-checks the park
+/// condition without re-running the readiness scan). Delivery itself works —
+/// only the wake channel is missing.
+fn smoke_abi_inet_dgram_send_wakes_parked_reader() -> TestResult {
+    with_setup(|| {
+        // sockaddr_in: family(u16 LE) + port(u16 BE) + addr(u32 BE) + pad.
+        fn inet_sockaddr(ip: [u8; 4], port: u16) -> ([u8; 16], u64) {
+            let mut buf = [0u8; 16];
+            buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            buf[2..4].copy_from_slice(&port.to_be_bytes());
+            buf[4..8].copy_from_slice(&ip);
+            (buf, 16)
+        }
+        let rx = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) failed"),
+        };
+        let (raddr, ralen) = inet_sockaddr([127, 0, 0, 1], 47311);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, raddr.as_ptr() as u64, ralen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the UDP receiver failed");
+        }
+        let epfd = add_level_epollin(rx)?;
+        if epoll_ready_now(epfd)? != 0 {
+            return Err("idle UDP socket reported epoll-ready before any send");
+        }
+
+        // Sender must be bound first: NARF's InetDgram Send has no
+        // Linux-style sendto auto-bind (Fresh state → ENOTCONN).
+        let tx = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) for sender failed"),
+        };
+        let (taddr, talen) = inet_sockaddr([127, 0, 0, 1], 47312);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(tx, taddr.as_ptr() as u64, talen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() of the UDP sender failed");
+        }
+
+        let before = narf_net::readiness::generation();
+        let payload = b"udp-wake";
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: raddr.as_ptr() as u64,
+                arg5: ralen,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok_or("sendto status")?;
+        if sent != payload.len() as i64 {
+            return Err("UDP loopback sendto failed");
+        }
+
+        // Delivery half (works today): the scan sees the datagram.
+        if epoll_ready_now(epfd)? != 1 {
+            return Err("delivered UDP datagram did not make the receiver epoll-readable");
+        }
+        // Wake half: the generation bump that un-parks an infinite-timeout
+        // waiter. This is the missing notify in `dispatch_inet_dgram`.
+        if narf_net::readiness::generation() <= before {
+            return Err("UDP loopback sendto published no readiness wake for a parked reader");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_inet_dgram_send_wakes_parked_reader
+);
+
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
 /// half, and confirm a NEW fd (different number, usable) was installed.
 fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
@@ -3285,6 +3763,217 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_scm_rights_fd_passing);
+
+/// Send 8 KiB chunks into `fd`'s stream ring until it reports EAGAIN, asserting
+/// the non-blocking full-ring contract along the way: every return is either a
+/// positive accepted-byte count or EAGAIN — NEVER a bogus 0 for a non-empty
+/// buffer. The pre-fix full-ring path returned ok(0), which correct clients
+/// (sd-bus/dbus-broker) mis-handle as no-progress or a broken stream. Returns
+/// the total bytes the ring accepted before it filled.
+fn fill_stream_ring_until_eagain(fd: u64) -> Result<i64, &'static str> {
+    let chunk = [0x5au8; 8192];
+    let mut total: i64 = 0;
+    for _ in 0..256 {
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd, chunk.as_ptr() as u64, chunk.len() as u64, 0),
+        )
+        .ok_or("fill send status")?;
+        if r == EAGAIN {
+            return Ok(total);
+        }
+        if r <= 0 {
+            return Err("full-ring send returned a non-positive value other than EAGAIN");
+        }
+        total += r;
+    }
+    Err("stream ring never reported EAGAIN under continuous sending")
+}
+
+/// A non-blocking `send()` on a FULL AF_UNIX stream ring reports EAGAIN and
+/// recovers once the peer drains — it must never return a bogus 0-byte
+/// "success". Returning 0 for a non-empty buffer is not a value Linux send(2)
+/// ever produces; it made correct clients busy-loop or treat the stream as
+/// broken (a candidate for logind's "Connection reset by peer" when it asks
+/// systemd to StartTransientUnit the session scope over the system bus).
+fn smoke_abi_socket_send_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let accepted = fill_stream_ring_until_eagain(fd0)?;
+        if accepted <= 0 {
+            return Err("ring accepted no bytes before EAGAIN");
+        }
+        // Drain one chunk on the peer; the sender must then make progress.
+        let mut sink = [0u8; 8192];
+        let got = call(
+            Syscall::SocketRecv.raw(),
+            a3(fd1, sink.as_mut_ptr() as u64, sink.len() as u64, 0),
+        )
+        .ok_or("drain recv status")?;
+        if got <= 0 {
+            return Err("draining the peer returned no bytes");
+        }
+        let resumed = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, sink.as_ptr() as u64, 1, 0),
+        )
+        .ok_or("post-drain send status")?;
+        if resumed <= 0 {
+            return Err("send did not resume after the peer freed ring space");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd0));
+        let _ = call(Syscall::Close.raw(), a0(fd1));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_full_ring_reports_eagain
+);
+
+/// The non-fd `sendmsg()` path shares the full-ring contract: EAGAIN, not 0.
+fn smoke_abi_socket_sendmsg_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, _fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        let r = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("full-ring sendmsg status")?;
+        if r != EAGAIN {
+            return Err("sendmsg on a full ring did not report EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmsg_full_ring_reports_eagain
+);
+
+/// An fd-passing `sendmsg()` (SCM_RIGHTS) on a FULL ring must report EAGAIN and
+/// must NOT swallow the descriptor: after the peer drains, the retried send
+/// delivers the fd intact. The pre-fix path returned Ok(0) here AND dropped the
+/// fd batch on the floor — precisely the shape that breaks the logind→systemd
+/// scope-creation handshake and any AF_UNIX fd-passing under back-pressure.
+fn smoke_abi_socket_sendmsg_fd_full_ring_eagain_preserves_fd() -> TestResult {
+    with_setup(|| {
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+
+        // Build an fd-passing sendmsg: one payload byte + one SCM_RIGHTS fd.
+        let passed_fd = call(
+            Syscall::SocketOpen.raw(),
+            a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0),
+        )
+        .ok_or("passed fd status")? as i32;
+        if passed_fd < 0 {
+            return Err("passed-fd socket setup failed");
+        }
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&((16 + 4) as u64).to_le_bytes());
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_le_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&24u64.to_le_bytes());
+
+        // Full ring: the fd-passing sendmsg must report EAGAIN, not 0.
+        let blocked = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("full-ring fd sendmsg status")?;
+        if blocked != EAGAIN {
+            return Err("fd-passing sendmsg on a full ring did not report EAGAIN");
+        }
+
+        // Drain the peer completely so the ring has room again.
+        let mut sink = [0u8; 8192];
+        for _ in 0..256 {
+            let got = call(
+                Syscall::SocketRecv.raw(),
+                a3(fd1, sink.as_mut_ptr() as u64, sink.len() as u64, 0),
+            )
+            .ok_or("drain recv status")?;
+            if got == EAGAIN || got == 0 {
+                break;
+            }
+            if got < 0 {
+                return Err("drain recv error");
+            }
+        }
+
+        // Retry the SAME message — now it succeeds and still carries the fd.
+        let sent = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("retry fd sendmsg status")?;
+        if sent != payload.len() as i64 {
+            return Err("fd sendmsg did not succeed after the ring drained");
+        }
+
+        // recvmsg on the peer must install a fresh, distinct fd — proving the
+        // descriptor was NOT dropped by the EAGAIN'd first attempt.
+        let mut dst = [0u8; 16];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd1, rmsg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 {
+            return Err("recvmsg did not return the retried payload byte count");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            rmsg[40], rmsg[41], rmsg[42], rmsg[43], rmsg[44], rmsg[45], rmsg[46], rmsg[47],
+        ]) as usize;
+        if ctrllen < 16 + 4 {
+            return Err("SCM_RIGHTS fd was lost across the EAGAIN/retry");
+        }
+        let ctype = i32::from_le_bytes([rctrl[12], rctrl[13], rctrl[14], rctrl[15]]);
+        if ctype != SCM_RIGHTS {
+            return Err("received cmsg was not SCM_RIGHTS after retry");
+        }
+        let new_fd = i32::from_le_bytes([rctrl[16], rctrl[17], rctrl[18], rctrl[19]]);
+        if new_fd < 0 || new_fd as u64 == fd1 {
+            return Err("SCM_RIGHTS did not install a valid distinct fd after retry");
+        }
+        let _ = call(Syscall::Close.raw(), a0(new_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(passed_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd0));
+        let _ = call(Syscall::Close.raw(), a0(fd1));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmsg_fd_full_ring_eagain_preserves_fd
+);
 
 /// AF_UNIX datagrams carry SCM_RIGHTS too. This exercises the complete syscall
 /// path used by sd_notify FDSTORE: sendmsg parses the control record, the
@@ -4505,6 +5194,746 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_uevent_recv);
+
+/// Kernel uevent multicast reaches ONLY group-1 subscribers. A
+/// `NETLINK_KOBJECT_UEVENT` socket bound with `nl_groups == 0` must receive
+/// nothing from the kernel.
+///
+/// Linux ref: `net/netlink/af_netlink.c`. `netlink_bind` records the bind's
+/// `nl_groups` mask as the socket's multicast membership
+/// (`netlink_update_subscriptions` / `nlk->groups`), and kernel-originated
+/// broadcast (`netlink_broadcast` → `do_one_broadcast`) walks `nl_table`'s
+/// `mc_list` and skips any socket that is not a member of the destination
+/// group. Group 1 is the kernel uevent group (`MONITOR_GROUP_KERNEL`); a
+/// socket bound with groups=0 joined no group and is not on `mc_list`, so
+/// `kobject_uevent_env`'s broadcast never reaches it.
+///
+/// This is load-bearing for udev. `systemd-udevd` creates its per-worker
+/// device monitor with `device_monitor_new_full(&worker_monitor,
+/// MONITOR_GROUP_NONE, -1)` — groups=0 on purpose, because a worker monitor
+/// exists ONLY to receive the manager's unicast hand-offs, never the kernel
+/// multicast. NARF attached the kernel uevent ring reader to every proto-15
+/// socket unconditionally, so every worker also got the ring INCLUDING the
+/// boot-coldplug replay. Measured on the Fedora systemd gate: SEQNUM=2 was
+/// processed SEVEN times, by workers that were each forked exactly once. A
+/// worker re-processing a device-node device replies with
+/// `INOTIFY_WATCH_REMOVE=1` for an event the manager never sent it, which
+/// trips `assert(worker->event)` in `udev-manager.c:1199` and aborts the
+/// daemon.
+///
+/// The group-1 socket in the same test is not decoration: it is what keeps
+/// this from being satisfiable by breaking kernel uevent delivery outright.
+fn smoke_abi_netlink_uevent_group_none_gets_nothing() -> TestResult {
+    with_setup(|| {
+        // Both monitors must exist BEFORE the emit — a tail-started reader
+        // only ever sees future events, so a socket created after the emit
+        // would report "nothing" for a reason unrelated to membership.
+        let worker = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        // The udev worker-monitor shape: MONITOR_GROUP_NONE == nl_groups 0.
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(worker, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT, groups=0) failed");
+        }
+        // The udev manager-monitor shape: MONITOR_GROUP_KERNEL == group 1.
+        let manager = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(manager, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT, groups=1) failed");
+        }
+
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/abi-netlink-group-none"),
+            alloc::string::String::from("net"),
+        );
+
+        let mut buf = [0u8; 512];
+        if netlink_recv_flags(worker, &mut buf, MSG_DONTWAIT).ok_or("groups=0 recv status")?
+            != EAGAIN
+        {
+            return Err("a groups=0 netlink socket received a kernel uevent — Linux delivers kernel uevent multicast only to group-1 subscribers");
+        }
+
+        // The positive half: a real group-1 subscriber still gets the event.
+        let mut buf = [0u8; 512];
+        let n =
+            netlink_recv_flags(manager, &mut buf, MSG_DONTWAIT).ok_or("groups=1 recv status")?;
+        if n <= 0 {
+            return Err("a groups=1 netlink socket did not receive the kernel uevent");
+        }
+        if !window_contains(&buf[..n as usize], b"add@/devices/abi-netlink-group-none") {
+            return Err("the group-1 subscriber's datagram was not the emitted uevent");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(worker));
+        let _ = call(Syscall::Close.raw(), a0(manager));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_group_none_gets_nothing
+);
+
+/// An UNBOUND `NETLINK_KOBJECT_UEVENT` socket receives no kernel uevents.
+///
+/// Linux ref: multicast membership is established only by `netlink_bind`
+/// (or `NETLINK_ADD_MEMBERSHIP`); a socket that never bound has an empty
+/// `nlk->groups` and is not on the protocol's `mc_list`, so
+/// `netlink_broadcast` never considers it. `socket()` alone subscribes to
+/// nothing.
+fn smoke_abi_netlink_uevent_unbound_gets_nothing() -> TestResult {
+    with_setup(|| {
+        // Created before the emit so a tail-started reader WOULD see the
+        // event if delivery were not membership-gated.
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/abi-netlink-unbound"),
+            alloc::string::String::from("net"),
+        );
+        let mut buf = [0u8; 512];
+        if netlink_recv_flags(fd, &mut buf, MSG_DONTWAIT).ok_or("unbound recv status")? != EAGAIN {
+            return Err("an unbound netlink socket received a kernel uevent — Linux grants multicast membership only at bind");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_unbound_gets_nothing
+);
+
+/// `MSG_PEEK` on a connectionless AF_UNIX datagram must NOT consume the
+/// datagram: the next receive has to return the same message again.
+///
+/// The connectionless receive branch ignores its flags entirely and always
+/// pops the inbox, so a peek destroys the message it was only supposed to
+/// look at. Every size-probe consumer is affected — systemd's
+/// `next_datagram_size_fd()` is exactly `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)`
+/// and is what `sd-device-monitor` calls before every real receive, so a
+/// peek that eats the datagram silently loses it.
+///
+/// Linux ref: `unix_dgram_recvmsg` — MSG_PEEK takes a reference to the skb
+/// and leaves it on the queue.
+fn smoke_abi_socket_unix_dgram_msg_peek_does_not_consume() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-peek-dgram");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the abstract datagram receiver failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+        for payload in [b"FIRST---".as_ref(), b"SECOND--".as_ref()] {
+            let sent = call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            );
+            if sent != Some(payload.len() as i64) {
+                return Err("sendto of a test datagram failed");
+            }
+        }
+
+        // Peek: must return the FIRST datagram and leave it queued.
+        let mut peek = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, peek.as_mut_ptr() as u64, peek.len() as u64, MSG_PEEK),
+        )
+        .ok_or("MSG_PEEK recv status")?;
+        if n != 8 || &peek[..8] != b"FIRST---" {
+            return Err("MSG_PEEK did not return the first datagram");
+        }
+
+        // A real receive must still see FIRST — the peek consumed nothing.
+        let mut first = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, first.as_mut_ptr() as u64, first.len() as u64, 0),
+        )
+        .ok_or("recv-after-peek status")?;
+        if n != 8 || &first[..8] != b"FIRST---" {
+            return Err("MSG_PEEK consumed the datagram it only peeked at");
+        }
+
+        // And the queue must still hold the second, in order.
+        let mut second = [0u8; 16];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, second.as_mut_ptr() as u64, second.len() as u64, 0),
+        )
+        .ok_or("second recv status")?;
+        if n != 8 || &second[..8] != b"SECOND--" {
+            return Err("datagram order was not preserved across a peek");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_msg_peek_does_not_consume
+);
+
+/// `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)` on a connectionless AF_UNIX
+/// datagram must report the FULL datagram length, not the number of bytes
+/// copied (zero, for this probe shape).
+///
+/// This is systemd's `next_datagram_size_fd()` verbatim, and it is how
+/// `sd-device-monitor` sizes its receive buffer before every real recvmsg:
+/// answer 0 and it allocates nothing and then rejects the message as short
+/// (libudev drops anything under 32 bytes). Pairs with the peek test above —
+/// the probe is useless unless it is BOTH non-destructive and correctly
+/// sized.
+fn smoke_abi_socket_unix_dgram_peek_trunc_reports_full_size() -> TestResult {
+    with_setup(|| {
+        const MSG_PEEK: u64 = 0x02;
+        const MSG_TRUNC_F: u64 = 0x20;
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-peektrunc-dgram");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the abstract datagram receiver failed");
+        }
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\nSTATUS=probe-me\n";
+        if call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: tx,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: addr.as_ptr() as u64,
+                arg5: alen,
+                ..SyscallArgs::default()
+            },
+        ) != Some(payload.len() as i64)
+        {
+            return Err("sendto of the probe datagram failed");
+        }
+
+        // Zero-length probe: NULL buffer, length 0.
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, 0, 0, MSG_PEEK | MSG_TRUNC_F),
+        )
+        .ok_or("size-probe status")?;
+        if sized != payload.len() as i64 {
+            return Err("MSG_PEEK|MSG_TRUNC size probe did not report the full datagram length");
+        }
+
+        // A short buffer must report the full length too, while copying only
+        // what fits.
+        let mut short = [0u8; 4];
+        let sized = call(
+            Syscall::SocketRecv.raw(),
+            a3(
+                rx,
+                short.as_mut_ptr() as u64,
+                short.len() as u64,
+                MSG_PEEK | MSG_TRUNC_F,
+            ),
+        )
+        .ok_or("short-probe status")?;
+        if sized != payload.len() as i64 {
+            return Err("MSG_TRUNC with a short buffer did not report the full datagram length");
+        }
+
+        // And the probes consumed nothing: the real receive still gets it all.
+        let mut full = [0u8; 64];
+        let n = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, full.as_mut_ptr() as u64, full.len() as u64, 0),
+        )
+        .ok_or("real recv status")?;
+        if n != payload.len() as i64 || &full[..payload.len()] != payload {
+            return Err("size probes consumed or corrupted the datagram");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_peek_trunc_reports_full_size
+);
+
+/// A connectionless AF_UNIX datagram's ancillary data belongs to the RECORD
+/// that carried it, not to the socket. Two tasks receiving on one shared
+/// socket must each get the credentials of the datagram THEY dequeued.
+///
+/// `SocketFile` keeps `last_recv_cred` / `last_recv_fds` as socket-global
+/// slots: `dispatch_op(Recv)` writes them at dequeue, and the recvmsg
+/// syscall reads them back afterwards. That is not atomic per record. Any
+/// second receiver that dequeues in the window between the first receiver's
+/// dequeue and its ancillary extraction overwrites the slots, and the first
+/// receiver reports the SECOND sender's identity.
+///
+/// This is the shape `systemd-udevd` trips over. Its manager identifies which
+/// worker sent a notification purely from SCM_CREDENTIALS
+/// (`hashmap_get(manager->workers, &sender)`); attribute a worker's
+/// `INOTIFY_WATCH_REMOVE=1` to a DIFFERENT, idle worker and the manager hits
+/// `assert(worker->event)` at udev-manager.c:1199 and aborts the daemon.
+///
+/// Driven at the socket layer on purpose: the syscall path performs dequeue
+/// and extraction inside one call, so it cannot express the interleaving that
+/// the bug requires.
+fn smoke_abi_socket_unix_dgram_ancillary_is_per_record() -> TestResult {
+    use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult, AF_UNIX, SOCK_DGRAM};
+    with_setup(|| {
+        const SENDER_A: u64 = 0xDA01;
+        const SENDER_A_PID: u64 = 7001;
+        const SENDER_B: u64 = 0xDA02;
+        const SENDER_B_PID: u64 = 7002;
+        const RECEIVER_1: u64 = 0xDA11;
+        const RECEIVER_2: u64 = 0xDA12;
+
+        let addr = SockAddr {
+            family: AF_UNIX,
+            body: b"\0narf-ancillary-per-record".to_vec(),
+        };
+        let rx = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+        if !matches!(
+            rx.dispatch_op(SocketOp::Bind { addr: addr.clone() }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("bind of the shared datagram receiver failed");
+        }
+
+        // Two senders with distinct identities, exactly like two udev workers.
+        for (task, pid, payload) in [
+            (SENDER_A, SENDER_A_PID, b"FROM-A--".as_ref()),
+            (SENDER_B, SENDER_B_PID, b"FROM-B--".as_ref()),
+        ] {
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+            set_task(task);
+            let tx = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+            match tx.dispatch_op(SocketOp::Send {
+                buf: payload,
+                flags: 0,
+                addr: Some(addr.clone()),
+            }) {
+                SocketOpResult::Ok(_) => {}
+                _ => return Err("sender could not enqueue its datagram"),
+            }
+        }
+
+        // Interleave: BOTH receivers dequeue before EITHER extracts its
+        // ancillary data. This is the window a real recvmsg leaves open while
+        // it copies the payload out to userspace.
+        let mut buf1 = [0u8; 16];
+        let mut buf2 = [0u8; 16];
+        set_task(RECEIVER_1);
+        let first = rx.dispatch_op(SocketOp::Recv {
+            buf: &mut buf1,
+            flags: 0,
+        });
+        set_task(RECEIVER_2);
+        let second = rx.dispatch_op(SocketOp::Recv {
+            buf: &mut buf2,
+            flags: 0,
+        });
+        if !matches!(first, SocketOpResult::Received { .. })
+            || !matches!(second, SocketOpResult::Received { .. })
+        {
+            return Err("both receivers should have dequeued a datagram");
+        }
+        if &buf1[..8] != b"FROM-A--" || &buf2[..8] != b"FROM-B--" {
+            return Err("datagrams were not delivered FIFO to the two receivers");
+        }
+
+        // Now each extracts. Each must see ITS OWN record's sender.
+        set_task(RECEIVER_1);
+        let cred1 = rx.recvmsg_cred();
+        set_task(RECEIVER_2);
+        let cred2 = rx.recvmsg_cred();
+
+        if cred1.pid as u64 != SENDER_A_PID {
+            return Err(
+                "first receiver reported the wrong sender pid — socket-global ancillary slots were overwritten by the second receiver's dequeue",
+            );
+        }
+        if cred2.pid as u64 != SENDER_B_PID {
+            return Err("second receiver reported the wrong sender pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_ancillary_is_per_record
+);
+
+/// Datagram ORDER on a bound AF_UNIX receiver is global, not per-sender-
+/// socket: messages must be dequeued in the order they were sent, even when
+/// each one came from a DIFFERENT sender socket.
+///
+/// This is `sd_notify()`'s shape exactly. It does not keep a socket around —
+/// every call opens a fresh `AF_UNIX SOCK_DGRAM`, sends one datagram to
+/// `$NOTIFY_SOCKET`, and closes it. So a udev worker's three notifications
+/// (`INOTIFY_WATCH_REMOVE=1`, then `INOTIFY_WATCH_ADD=1`, then
+/// `PROCESSED=1`) arrive from three unrelated sockets, and the manager's
+/// correctness depends on seeing them in that order.
+///
+/// Reordering them is not a cosmetic fault. `on_worker_notify` DETACHES the
+/// worker's event for `PROCESSED=1` (udev-manager.c:1218) and asserts the
+/// event is present for `INOTIFY_WATCH_*` (:1199) — so a `PROCESSED=1`
+/// overtaking an earlier `INOTIFY_WATCH_REMOVE=1` from the same worker makes
+/// the manager abort. Every other route to that abort has been measured
+/// closed, which is why this ordering is worth pinning explicitly.
+fn smoke_abi_socket_unix_dgram_fifo_across_sender_sockets() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-notify-order");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the notify-order receiver failed");
+        }
+
+        // A worker's three notifications, each from its own fresh socket.
+        const MSGS: [&[u8]; 3] = [
+            b"INOTIFY_WATCH_REMOVE=1",
+            b"INOTIFY_WATCH_ADD=1---",
+            b"PROCESSED=1-----------",
+        ];
+        for payload in MSGS {
+            let tx = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            ) != Some(payload.len() as i64)
+            {
+                return Err("sd_notify-shaped send failed");
+            }
+            // sd_notify closes immediately; a queued datagram must outlive
+            // the socket that sent it.
+            let _ = call(Syscall::Close.raw(), a0(tx));
+        }
+
+        for (i, expect) in MSGS.iter().enumerate() {
+            let mut buf = [0u8; 32];
+            let n = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if n != expect.len() as i64 {
+                return Err("a queued datagram did not survive its sender socket closing");
+            }
+            if &buf[..expect.len()] != *expect {
+                return match i {
+                    0 => Err("first notification was not delivered first"),
+                    1 => Err("notifications from distinct sender sockets were reordered"),
+                    _ => Err("PROCESSED=1 overtook an earlier notification"),
+                };
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_fifo_across_sender_sockets
+);
+
+/// The same ordering guarantee when the senders are different TASKS, which
+/// is the real udev topology: many workers notifying one manager. Interleave
+/// them so a per-sender queue would be visible as reordering.
+fn smoke_abi_socket_unix_dgram_fifo_across_sender_tasks() -> TestResult {
+    with_setup(|| {
+        const WORKER_A: u64 = 0xE100;
+        const WORKER_B: u64 = 0xE101;
+
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"\0narf-notify-order-tasks");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind of the multi-task receiver failed");
+        }
+
+        // A, B, A, B — a per-sender queue drained sender-at-a-time would come
+        // back as A, A, B, B and fail here.
+        const ORDER: [(u64, &[u8]); 4] = [
+            (WORKER_A, b"A1"),
+            (WORKER_B, b"B1"),
+            (WORKER_A, b"A2"),
+            (WORKER_B, b"B2"),
+        ];
+        for (task, payload) in ORDER {
+            set_task(task);
+            let tx = open_unix(SOCK_DGRAM)?;
+            if call(
+                Syscall::SocketSend.raw(),
+                SyscallArgs {
+                    arg0: tx,
+                    arg1: payload.as_ptr() as u64,
+                    arg2: payload.len() as u64,
+                    arg4: addr.as_ptr() as u64,
+                    arg5: alen,
+                    ..SyscallArgs::default()
+                },
+            ) != Some(payload.len() as i64)
+            {
+                set_task(FAKE_TASK);
+                return Err("cross-task notify send failed");
+            }
+            let _ = call(Syscall::Close.raw(), a0(tx));
+        }
+        set_task(FAKE_TASK);
+
+        for (_, expect) in ORDER {
+            let mut buf = [0u8; 8];
+            let n = call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            )
+            .ok_or("recv status")?;
+            if n != expect.len() as i64 || &buf[..expect.len()] != expect {
+                return Err("datagrams from two sender tasks were not dequeued in send order");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_unix_dgram_fifo_across_sender_tasks
+);
+
+/// The recvmsg-side half of libudev's `device_monitor_receive_device()`
+/// checks. A uevent that passes every payload rule is STILL dropped unless
+/// the receive itself reports the right sender and credentials:
+///
+///   - `msg_name` must come back as a `sockaddr_nl` whose `nl_groups` is the
+///     KERNEL monitor group (1) and whose `nl_pid` is 0. A non-zero pid is
+///     treated as a spoofed multicast message and ignored.
+///   - an `SCM_CREDENTIALS` cmsg MUST be attached; "no sender credentials
+///     received" is an outright drop.
+///   - those credentials must carry uid 0, or `check_sender_uid()` rejects
+///     the message.
+///
+/// All three are silent at debug level, and journald is not up early enough
+/// in boot to capture them — which is exactly why udevd could receive every
+/// uevent we emit and still queue nothing. Pinned here so a regression names
+/// itself instead of presenting as "udev does nothing".
+fn smoke_abi_netlink_uevent_recvmsg_sender_and_creds() -> TestResult {
+    with_setup(|| {
+        const SCM_CREDENTIALS_TYPE: i32 = 2;
+        const MONITOR_GROUP_KERNEL: u32 = 1;
+
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/platform/narf-drm/card0"),
+            alloc::string::String::from("drm"),
+        );
+
+        let mut name = [0u8; 32];
+        let mut dst = [0u8; 512];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 128];
+        let mut msg = [0u8; 56];
+        msg[..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+
+        let n = call(Syscall::SocketRecvMsg.raw(), a2(fd, msg.as_ptr() as u64, 0))
+            .ok_or("recvmsg status")?;
+        if n <= 0 {
+            return Err("recvmsg on a uevent monitor returned no bytes");
+        }
+        // libudev drops anything under 32 bytes before looking at it.
+        if n < 32 {
+            return Err("uevent datagram is under libudev's 32-byte minimum");
+        }
+
+        // sockaddr_nl: nl_family u16 @0, nl_pad u16 @2, nl_pid u32 @4,
+        // nl_groups u32 @8.
+        let namelen = u32::from_ne_bytes(msg[8..12].try_into().unwrap());
+        if (namelen as usize) < 12 {
+            return Err("recvmsg did not return a full sockaddr_nl for the sender");
+        }
+        let nl_pid = u32::from_ne_bytes(name[4..8].try_into().unwrap());
+        let nl_groups = u32::from_ne_bytes(name[8..12].try_into().unwrap());
+        if nl_pid != 0 {
+            return Err("uevent sender nl_pid != 0 (libudev treats it as spoofed multicast)");
+        }
+        if nl_groups != MONITOR_GROUP_KERNEL {
+            return Err("uevent sender nl_groups is not the KERNEL monitor group");
+        }
+
+        // cmsghdr: cmsg_len u64 @0, cmsg_level i32 @8, cmsg_type i32 @12,
+        // then struct ucred { pid, uid, gid } u32 x3 @16.
+        let ctrllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("recvmsg attached no SCM_CREDENTIALS to the uevent");
+        }
+        let ctype = i32::from_le_bytes(ctrl[12..16].try_into().unwrap());
+        if ctype != SCM_CREDENTIALS_TYPE {
+            return Err("uevent ancillary data was not SCM_CREDENTIALS");
+        }
+        let uid = u32::from_le_bytes(ctrl[20..24].try_into().unwrap());
+        if uid != 0 {
+            return Err("uevent SCM_CREDENTIALS uid != 0 (check_sender_uid rejects it)");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_recvmsg_sender_and_creds
+);
+
+/// A LEVEL-triggered epoll on a uevent monitor must keep reporting the fd
+/// readable while events remain queued — including on the epoll_wait that
+/// follows a partial drain, when no new uevent has been emitted since.
+///
+/// This is the shape `systemd-udevd` runs: its monitor fd is registered
+/// level-triggered, it reads one event per wakeup, and it returns to
+/// `epoll_wait(-1)` with the rest of the queue still pending. Nothing emits
+/// a fresh uevent afterwards, so if that epoll_wait parks on the strength of
+/// "no new readiness notification arrived", the daemon sleeps forever on data
+/// that is already sitting in its socket.
+///
+/// That is exactly what was observed on the Fedora gate: udevd read seqnum 2
+/// and 3, went back to epoll_wait with seqnums 4..31 still queued, and stayed
+/// parked with a frozen park-check counter for 300 seconds — no workers, no
+/// `/run/udev/data`. Readiness REPORTING was never the problem
+/// (`poll_readiness` sets POLL_IN whenever the reader has pending events);
+/// the question this pins is whether epoll consults it before parking.
+fn smoke_abi_netlink_uevent_epoll_level_redelivers_pending() -> TestResult {
+    with_setup(|| {
+        const EPOLLIN: u32 = 1;
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        ) != Some(0)
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+
+        // Queue THREE events before epoll ever sees the fd, mirroring a boot
+        // coldplug that completed before the daemon started.
+        for i in 0..3u32 {
+            narf_filesystem::uevent::emit(
+                narf_filesystem::uevent::UeventAction::Add,
+                alloc::format!("/devices/epoll-level-{i}"),
+                alloc::string::String::from("drm"),
+            );
+        }
+
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create failed"),
+        };
+        let mut interest = [0u8; 12];
+        interest[..4].copy_from_slice(&EPOLLIN.to_ne_bytes());
+        interest[4..].copy_from_slice(&0xEEEEu64.to_ne_bytes());
+        if call(
+            Syscall::EpollCtl.raw(),
+            a3(epfd, 1, fd, interest.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("epoll_ctl ADD of the uevent monitor failed");
+        }
+
+        // Drain one event per wakeup, exactly as udevd does. Every iteration
+        // must wake: the queue is still non-empty and NOTHING emits a new
+        // uevent to supply a fresh readiness edge.
+        //
+        // A BLOCKING wait on purpose, with a finite timeout so a regression
+        // fails the suite instead of hanging it.
+        //
+        // KNOWN LIMIT: this harness has no user-task context, so even a
+        // blocking epoll_wait is answered by the immediate readiness scan and
+        // never reaches the own-stack park. That makes this test real
+        // coverage of the LEVEL-TRIGGERED contract but NOT a reproducer for
+        // the udevd wedge, whose distinguishing feature is a park whose
+        // re-check never runs (`dbg_park_checks` frozen). Reproducing that
+        // needs a test that actually parks — do not read this test passing as
+        // evidence the park path is correct.
+        const BLOCK_MS: u64 = 2_000;
+        for i in 0..3 {
+            let mut out = [0u8; 12];
+            let ready = call(
+                Syscall::EpollWait.raw(),
+                a3(epfd, out.as_mut_ptr() as u64, 1, BLOCK_MS),
+            )
+            .ok_or("epoll_wait status")?;
+            if ready != 1 {
+                return match i {
+                    0 => Err("epoll_wait did not report a monitor queued before registration"),
+                    _ => Err("epoll_wait parked with uevents still queued after a partial drain"),
+                };
+            }
+            let mut buf = [0u8; 512];
+            if netlink_recv(fd, &mut buf).unwrap_or(-1) <= 0 {
+                return Err("recv returned nothing for an epoll-reported readable monitor");
+            }
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(epfd));
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_uevent_epoll_level_redelivers_pending
+);
 
 /// A NETLINK_KOBJECT_UEVENT monitor is udevd's primary event source.  Its
 /// queue may be drained between epoll scans, so EPOLLET must see a subsequent

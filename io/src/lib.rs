@@ -309,10 +309,14 @@ pub fn free_coherent(mut buf: DmaBuffer) {
 }
 
 /// Largest single coherent DMA buffer, expressed as a buddy order.
-/// order 6 = 64 pages = 256 KiB — big enough for a 64 KiB block-driver
-/// payload with headroom, small enough that the physically-contiguous
-/// allocation stays reliable under fragmentation.
-const MAX_DMA_ORDER: u8 = 6;
+///
+/// order 10 = 1024 pages = 4 MiB. This admits one 1280×800 XRGB8888 virtio
+/// scanout (and the corresponding transient upload buffer) while retaining
+/// the simple single-segment DMA contract used by the existing drivers. It is
+/// intentionally not a general VRAM allocator: larger or fragmented 3D
+/// resources use the virtio-gpu backing-list path rather than raising this
+/// buddy allocation ceiling again.
+const MAX_DMA_ORDER: u8 = 10;
 
 fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaBuffer, IoError> {
     let page = PAGE_SIZE as usize;

@@ -137,27 +137,6 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }
 
-/// `unix-latency-trace`: print a one-line park report for every task
-/// currently parked in a syscall.
-///
-/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
-/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
-/// the boot (an early RCU stall trips it around t+25 s), so on a real
-/// desktop run the census never fires. This one is called from ahead of
-/// that gate and repeats, which is what a process that freezes MINUTES
-/// into the session requires.
-///
-/// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
-/// healthy parked poller re-executes its syscall on a 1 ms deadline, so
-/// `scans`/`checks` climb. Both frozen across successive reports, with
-/// `parked=1`, is a park that never re-fires.
-///
-/// Called from the timer trap, so it inherits that context's hazards: it
-/// allocates (the snapshot Vec) and holds `Arc<Task>` clones. Both are
-/// things NARF's task-lifetime rules tell IRQ paths not to do. It is safe
-/// only because `TASKS` holds a ref for every task listed, so no drop here
-/// is ever the last one — and it is compiled out entirely without the
-/// feature. Do not promote this to a non-debug path.
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────
 //
 // "This process burns 41 s of user CPU before it starts serving" is where
@@ -280,8 +259,8 @@ fn dbg_profile_report() {
     let mut ceiling = u64::MAX;
     for _ in 0..8 {
         let mut best = (0usize, 0u64);
-        for i in 0..PROF_SLOTS {
-            let c = PROF_CNT[i].load(Ordering::Relaxed);
+        for (i, cnt) in PROF_CNT.iter().enumerate() {
+            let c = cnt.load(Ordering::Relaxed);
             if c > best.1 && c < ceiling {
                 best = (i, c);
             }
@@ -384,6 +363,27 @@ pub fn dbg_proc_roster() {
     dbg_profile_report();
 }
 
+/// `unix-latency-trace`: print a one-line park report for every task
+/// currently parked in a syscall.
+///
+/// The watchdog's own `PARK-CENSUS` cannot serve this purpose: it runs
+/// behind `stall_wd`'s `DUMPED` gate, which latches on the first dump of
+/// the boot (an early RCU stall trips it around t+25 s), so on a real
+/// desktop run the census never fires. This one is called from ahead of
+/// that gate and repeats, which is what a process that freezes MINUTES
+/// into the session requires.
+///
+/// `scans` (`dbg_poll_scans`) is the progress signal that matters: a
+/// healthy parked poller re-executes its syscall on a 1 ms deadline, so
+/// `scans`/`checks` climb. Both frozen across successive reports, with
+/// `parked=1`, is a park that never re-fires.
+///
+/// Called from the timer trap, so it inherits that context's hazards: it
+/// allocates (the snapshot Vec) and holds `Arc<Task>` clones. Both are
+/// things NARF's task-lifetime rules tell IRQ paths not to do. It is safe
+/// only because `TASKS` holds a ref for every task listed, so no drop here
+/// is ever the last one — and it is compiled out entirely without the
+/// feature. Do not promote this to a non-debug path.
 #[cfg(feature = "unix-latency-trace")]
 pub fn dbg_park_census(tag: &str) {
     use core::fmt::Write as _;
@@ -450,10 +450,18 @@ pub fn dbg_park_census(tag: &str) {
                 // has the same defect for the same reason.) `stat().file_type`
                 // is the real discriminator: Socket vs Fifo vs Special is
                 // exactly the distinction a starved poller turns on.
-                let kind = if fd >= 0 {
+                // `rdy` = the fd's CURRENT poll_readiness (POLL_* bits). This
+                // is the smoking-gun discriminator for a parked poller: a task
+                // parked in ppoll on an fd whose `rdy` shows the bit it asked
+                // for (e.g. an eventfd `rdy=0x1` while events wants POLLIN) is
+                // a KERNEL wake bug (it should have returned); a task parked on
+                // an fd with `rdy=0x0` is correctly asleep and waiting for a
+                // producer that never came (e.g. a Qt dispatcher eventfd whose
+                // wakeUp write was elided in userspace).
+                let (kind, rdy) = if fd >= 0 {
                     crate::fd::try_with_table(t.tid, |tab| {
-                        tab.get(fd as u32)
-                            .map(|e| match e.ops.stat().mode.file_type {
+                        tab.get(fd as u32).map(|e| {
+                            let k = match e.ops.stat().mode.file_type {
                                 narf_filesystem::FileType::Socket => "sock",
                                 narf_filesystem::FileType::Fifo => "fifo",
                                 narf_filesystem::FileType::Special => "chr",
@@ -461,20 +469,23 @@ pub fn dbg_park_census(tag: &str) {
                                 narf_filesystem::FileType::File => "reg",
                                 narf_filesystem::FileType::Dir => "dir",
                                 narf_filesystem::FileType::Symlink => "lnk",
-                            })
+                            };
+                            (k, e.ops.poll_readiness())
+                        })
                     })
                     .flatten()
-                    .unwrap_or("?")
+                    .unwrap_or(("?", 0))
                 } else {
-                    "-"
+                    ("-", 0)
                 };
                 let _ = write!(
                     narf_console::TrapWriter,
-                    "{}{}/{:#x}/{}",
+                    "{}{}/{:#x}/{}:rdy={:#x}",
                     if i == 0 { "" } else { "," },
                     fd,
                     (slot >> 32) as u32,
-                    kind
+                    kind,
+                    rdy
                 );
             }
             let _ = writeln!(
@@ -733,6 +744,24 @@ pub fn mark_zombie(tid: u64) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// True if `tid`'s task has EXITED — it is a zombie (exited, not yet reaped)
+/// or already gone from the registry (reaped). A live/running task returns
+/// false. Because the registry holds exactly one entry per task from spawn to
+/// reap, "absent" is unambiguously "reaped".
+///
+/// This is the authoritative, pid-reuse-SAFE signal a pidfd needs: TaskIds are
+/// globally unique and never recycled, unlike the ProcessId that keys the
+/// pidfd `exited` cache. See `pidfd::PidFdFile::poll_readiness` — that cache
+/// can be missed if the pid is released back to the pool before the exiting
+/// task's observer fires, which would otherwise strand the pidfd
+/// un-signalable forever.
+pub fn task_has_exited(tid: u64) -> bool {
+    match task_get(tid) {
+        None => true,
+        Some(t) => t.state.load(Ordering::Acquire) == TASK_ZOMBIE,
     }
 }
 

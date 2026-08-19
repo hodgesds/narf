@@ -559,6 +559,15 @@ pub fn pts_indices() -> Vec<u32> {
     PTY_TABLE.lock().iter().map(|(i, _)| *i).collect()
 }
 
+/// Foreground process group (TASK-space) of PTY `index`, or 0 if the index is
+/// unknown or no fg pgrp has been installed. Backs `/proc/<pid>/stat`'s tpgid
+/// for a process whose controlling terminal is `/dev/pts/<index>`.
+pub fn pty_fg_pgrp(index: u32) -> u64 {
+    pts_lookup(index)
+        .map(|p| p.fg_pgrp.load(core::sync::atomic::Ordering::Acquire))
+        .unwrap_or(0)
+}
+
 /// Wave-76: open a fresh slave by master index. Used by the syscall
 /// layer to satisfy `TIOCGPTPEER` (musl/glibc prefer this over
 /// `ptsname()+open()`). Returns `None` if the master is gone, or

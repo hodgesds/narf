@@ -727,6 +727,55 @@ pub trait FileOps: Send + Sync {
         self.poll_readiness()
     }
 
+    /// The durable per-descriptor readiness cell backing blocking `poll`/
+    /// `epoll` waits, if this file has one.
+    ///
+    /// `Some` opts the descriptor into the arm/notify wake path
+    /// ([`narf_lib::readiness::Readiness`]): a parked waiter registers in the
+    /// cell and is woken the instant `set` records a matching readiness edge —
+    /// a durable, per-fd, IRQ-safe wake with no reliance on a fallback re-scan,
+    /// and it subsumes `poll_readiness` (the cell's level `mask`),
+    /// `poll_edge_token` (its `seq`), and `readiness_notifies` (waking is
+    /// intrinsic to every `set`). `None` (the default) keeps the legacy
+    /// level-scan + generation-guard path, so descriptors migrate one at a
+    /// time. Sockets, pipes, eventfds, mqueues, ttys — anything whose readiness
+    /// transitions asynchronously — override this as they migrate; always-ready
+    /// files (regular files) never need it.
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        None
+    }
+
+    /// Arm a `poll`/`epoll` waiter (identified by `task_id`) on this file's
+    /// durable readiness for `interest`, returning the
+    /// [`Poll`](core::task::Poll) result of the register-then-check, or `None`
+    /// if the file is still on the legacy path.
+    ///
+    /// The default delegates to [`Self::readiness`] — correct for a file whose
+    /// readiness is one directly-owned cell (eventfd, pipe). A file whose
+    /// readiness is COMPOSITE or lives behind a lock overrides this: an AF_UNIX
+    /// socket's rx/tx `RingBuf` cells sit inside its state lock, so it locks,
+    /// reaches each cell, and `arm`s them under the interest bits each covers.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.readiness().map(|r| r.arm(task_id, interest, waker))
+    }
+
+    /// Remove `task_id`'s registration from this file's durable readiness.
+    /// Returns whether the file is on the durable path at all. Default via
+    /// [`Self::readiness`]; composite / behind-a-lock files override.
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        if let Some(r) = self.readiness() {
+            r.disarm(task_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Monotonic source-local tokens for edge-triggered readiness.
     ///
     /// A readiness provider that can transition away from and back to the
@@ -1738,16 +1787,29 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
         .iter()
         .enumerate()
         .map(|(index, mount)| {
-            let parent = mounts[..index]
+            // Mounts normally arrive parent-first, but boot-time discovery can
+            // attach a known nested filesystem before its backing root is
+            // available (the ESP at /mnt/boot before the distro root at
+            // /mnt).  Parentage is a property of the finished mount tree, not
+            // attachment order, so consider later ancestors too.  Equal-path
+            // overmounts are the exception: their parent is the preceding
+            // layer in that stack, never a layer attached above them later.
+            let parent = mounts
                 .iter()
-                .filter(|candidate| {
-                    mount.path == candidate.path
-                        || candidate.path == "/"
+                .enumerate()
+                .filter(|(candidate_index, candidate)| {
+                    if *candidate_index == index {
+                        return false;
+                    }
+                    if mount.path == candidate.path {
+                        return *candidate_index < index;
+                    }
+                    candidate.path == "/"
                         || (mount.path.starts_with(candidate.path.as_str())
                             && mount.path.as_bytes().get(candidate.path.len()) == Some(&b'/'))
                 })
-                .max_by_key(|candidate| candidate.path.len())
-                .map(|candidate| candidate.id)
+                .max_by_key(|(candidate_index, candidate)| (candidate.path.len(), *candidate_index))
+                .map(|(_, candidate)| candidate.id)
                 .unwrap_or(0);
             (
                 mount.id,
@@ -1969,6 +2031,144 @@ impl MountNamespace {
             (m.fs.clone(), alloc::string::String::from(rel))
         };
         Some(f(&*fs, &rel))
+    }
+
+    /// Resolve `abs` to its parent directory + leaf within THIS namespace's
+    /// mount table, and run `f(fs, parent_dir, leaf)`.
+    ///
+    /// The namespace-aware twin of [`VfsRegistry::resolve_parent_absolute`],
+    /// and it has to exist for the same reason [`Self::resolve_absolute`]
+    /// does. Without it every directory-MUTATION syscall (rename, unlink,
+    /// rmdir, symlink) resolves against the GLOBAL registry while open/read
+    /// resolve against the task's namespace — so a task in a private mount
+    /// namespace can create a file it then cannot rename or remove, because
+    /// the parent is visible to one call and not the other.
+    ///
+    /// That asymmetry is what stopped udev dead: `systemd-udevd` runs with
+    /// `PrivateMounts=yes`, and `sd-device` publishes each database entry by
+    /// writing `/run/udev/data/.#<id><random>` and renaming it onto
+    /// `/run/udev/data/<id>`. The write succeeded and the rename returned
+    /// ENOENT, so no device was ever recorded.
+    pub fn resolve_parent_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str) -> R,
+    {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let last = abs.rfind('/')?;
+        let leaf = &abs[last + 1..];
+        if leaf.is_empty() {
+            return None;
+        }
+        let parent_path = &abs[..last];
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
+        // Resolve + walk under the lock, then release it BEFORE running `f`:
+        // `f` may block on block I/O and `inner` is an IrqSafeSpinLock, so
+        // holding it across `f` deadlocks the box (see `resolve_absolute`).
+        let (fs, dir) = {
+            let q = self.inner.lock();
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                let is_match = parent_path == m.path.as_str()
+                    || m.path == "/"
+                    || (parent_path.starts_with(m.path.as_str())
+                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'));
+                if is_match && best.map(|b| b.path.len()).unwrap_or(0) <= m.path.len() {
+                    best = Some(m);
+                }
+            }
+            let m = best?;
+            let rel = &parent_path[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            let mut dir = m.fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                dir = dir.lookup_dir(seg)?;
+            }
+            (m.fs.clone(), dir)
+        };
+        Some(f(&*fs, dir, leaf))
+    }
+
+    /// Namespace-scoped twin of [`VfsRegistry::resolve_two_parents_absolute`],
+    /// for cross-DIRECTORY rename. Same contract: both parents must land on
+    /// the same mount (that same-mount check IS the EXDEV test), both walks
+    /// happen under one lock so a concurrent mount cannot move one path out
+    /// from under the other, and the lock is released before `f` runs because
+    /// `f` performs the rename and may block on block I/O.
+    ///
+    /// Without this, a cross-directory rename inside a private mount
+    /// namespace resolves against the global registry and fails, exactly as
+    /// same-directory rename did before `resolve_parent_absolute` gained a
+    /// namespace-aware twin.
+    pub fn resolve_two_parents_absolute<R, F>(&self, a: &str, b: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str, Arc<dyn DirOps>, &str) -> R,
+    {
+        fn split(abs: &str) -> Option<(&str, &str)> {
+            if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+                return None;
+            }
+            let last = abs.rfind('/')?;
+            let leaf = &abs[last + 1..];
+            if leaf.is_empty() {
+                return None;
+            }
+            let parent = &abs[..last];
+            Some((if parent.is_empty() { "/" } else { parent }, leaf))
+        }
+        let (a_parent, a_leaf) = split(a)?;
+        let (b_parent, b_leaf) = split(b)?;
+        let (fs, a_dir, b_dir) = {
+            let q = self.inner.lock();
+            let best_mount = |parent_path: &str| -> Option<&Mount> {
+                let mut best: Option<&Mount> = None;
+                for m in q.iter() {
+                    let is_match = parent_path == m.path.as_str()
+                        || m.path == "/"
+                        || (parent_path.starts_with(m.path.as_str())
+                            && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'));
+                    if is_match && best.map(|x| x.path.len()).unwrap_or(0) <= m.path.len() {
+                        best = Some(m);
+                    }
+                }
+                best
+            };
+            let ma = best_mount(a_parent)?;
+            let mb = best_mount(b_parent)?;
+            if ma.path != mb.path {
+                return None;
+            }
+            let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
+                let rel = &parent_path[m.path.len()..];
+                let rel = rel.strip_prefix('/').unwrap_or(rel);
+                let mut dir = m.fs.root();
+                for seg in rel.split('/') {
+                    if seg.is_empty() || seg == "." {
+                        continue;
+                    }
+                    if seg == ".." {
+                        return None;
+                    }
+                    dir = dir.lookup_dir(seg)?;
+                }
+                Some(dir)
+            };
+            let a_dir = walk(ma, a_parent)?;
+            let b_dir = walk(mb, b_parent)?;
+            (ma.fs.clone(), a_dir, b_dir)
+        };
+        Some(f(&*fs, a_dir, a_leaf, b_dir, b_leaf))
     }
 
     /// Clone the filesystem object of the visible mount covering `abs`.

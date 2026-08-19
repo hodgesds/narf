@@ -48,6 +48,14 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+Linux `statx(2)` returns a stable `STATX_MNT_ID` whenever the resolved path
+has a covering NARF mount, even when the request mask names only basic fields.
+This is a deliberately useful Linux-permitted superset: service managers use
+the mount ID together with type and inode to decide whether inherited API
+filesystems are already mounted. `STATX_ATTR_MOUNT_ROOT` is advertised on
+every response and set exactly when the resolved path is the visible mount
+root, which is the modern systemd API-filesystem mount probe.
+
 Linux `munmap(addr, len)` rejects an unaligned address or zero length and
 rounds a non-page-multiple length upward. It removes only the overlapping
 range, splitting VMAs as needed so a surviving prefix or suffix retains its
@@ -195,6 +203,19 @@ immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
 system activity. A write after the final reader closes raises `SIGPIPE` and
 returns `EPIPE`.
+Readiness wakeups are being consolidated behind a single durable per-descriptor
+cell (`narf_lib::readiness::Readiness`): registering a waiter and checking the
+current readiness are fused under one lock, so a `poll`/`epoll` waiter can never
+register after the edge it was waiting for — the lost-wakeup race is
+unrepresentable rather than merely guarded by a re-checked generation and a
+fallback tick. Every readiness change wakes its intersecting waiters
+intrinsically (there is no per-source "does this notify" flag to drift out of
+sync), and the level mask and the edge sequence advance together under that same
+lock. The wake this delivers is required to be durable end-to-end: a readiness
+source firing from IRQ context re-queues the stable, task-id-addressed run slot
+with a lossless atomic, never an allocation-bearing waker drop deferred through
+a bounded queue — so a readiness edge is never dropped and then recovered only
+by a coarse fallback tick.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
 Private futex wait queues are keyed by `(address-space identity, user address)`;
@@ -503,6 +524,14 @@ fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
 `munmap(2)` or process group-dead teardown. This registry lives in userspace
 compatibility code so address-space regions do not gain a filesystem
 dependency.
+
+Generic filesystem mappings that cannot expose page-cache frames retain one
+canonical fallback page per open-file description and file offset, plus an
+exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that
+snapshot, write each changed canonical page once even when it has overlapping
+aliases, and advance the snapshot only after the full page write succeeds.
+Clean pages perform no filesystem write; the comparison is byte-exact rather
+than hash-based so collision cannot suppress persistence.
 
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the

@@ -94,6 +94,10 @@ pub enum VirtioPciError {
     NoCommonCfg,
     NoNotifyCfg,
     DeviceRejectedFeatures,
+    /// A virtio-gpu control command completed but returned an unexpected
+    /// protocol response type.  Keeping the raw code makes boot-time
+    /// scanout failures actionable without a separate tracing service.
+    UnexpectedResponse(u32),
     NoQueues,
     /// `queue_size` / `queue_num_max` returned 0.
     QueueTooSmall,
@@ -101,6 +105,9 @@ pub enum VirtioPciError {
     AddBufferFailed,
     /// Polled completion never observed (timeout).
     CompletionTimeout,
+    /// A bounded controlQ request cannot hold the caller's command stream.
+    /// Callers must split work at a protocol boundary instead of truncating.
+    RequestTooLarge,
 }
 
 /// Walk the standard cap list looking for the four virtio caps and

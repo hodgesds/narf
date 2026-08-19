@@ -190,6 +190,56 @@ fn smoke_abi_proc_getsid_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getsid_neg);
 
+// getsid(2) must return the session id in the caller's VISIBLE-pid space —
+// the ProcessId, never the raw scheduler TaskId. `setsid` records the sid in
+// TaskId space (SID_TABLE[tid] = tid), so getsid has to translate TaskId →
+// ProcessId on the way out, exactly as `getpgid`/`getpgrp` do via
+// `pgid_to_user`. The handler instead wrapped the raw sid in
+// `report_pid_to`, which is the IDENTITY in a non-container build and expects
+// an outer pid (not a TaskId) in a container build — so the mandatory
+// `task_to_pid_raw` hop was missing and a raw TaskId leaked to userspace in
+// EVERY build.
+//
+// agetty/login compare `getsid(0)` against `tcgetsid(fd)` (which goes through
+// `current_task_sid_user` → `pgid_to_user`, the CORRECT idiom) to confirm
+// they own the tty's session after TIOCSCTTY; when the two come from
+// different number spaces the check can only pass by coincidence.
+//
+// Exposed only when TaskId != ProcessId, which the default FAKE_TASK
+// (tid == pid == 99) hides — so drive a task whose registered pid differs.
+fn smoke_abi_proc_getsid_reports_visible_pid_space() -> TestResult {
+    with_setup(|| {
+        const LEADER_TID: u64 = 0x5501;
+        const LEADER_PID: u64 = 0x5502; // deliberately != LEADER_TID
+        set_task(LEADER_TID);
+        crate::handlers::register_task_to_pid(LEADER_TID, LEADER_PID);
+        crate::handlers::register_pid_task_mapping(LEADER_PID, LEADER_TID);
+
+        // Become a session leader: sid == pid, recorded in TaskId space.
+        if call(Syscall::Setsid.raw(), a0(0))
+            .filter(|&v| v >= 0)
+            .is_none()
+        {
+            set_task(FAKE_TASK);
+            return Err("setsid setup failed");
+        }
+        let sid = call(Syscall::Getsid.raw(), a0(0));
+        set_task(FAKE_TASK);
+        match sid {
+            Some(v) if v as u64 == LEADER_PID => Ok(()),
+            Some(v) if v as u64 == LEADER_TID => Err(
+                "getsid returned the raw scheduler TaskId instead of the visible ProcessId — the TaskId->pid translation is missing",
+            ),
+            Some(_) => Err("getsid returned an unexpected value"),
+            None => Err("getsid returned a non-Ok status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_getsid_reports_visible_pid_space
+);
+
 // ── prctl(2) — PR_SET/GET_NO_NEW_PRIVS round-trip + bad op ──
 
 fn smoke_abi_proc_prctl_pos() -> TestResult {
@@ -784,6 +834,232 @@ fn smoke_abi_proc_waitid_pidfd_badfd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_pidfd_badfd);
+
+// ── #29 pgid-filtered wait: wait4(pid<-1), wait4(0), waitid(P_PGID) ──
+//
+// A process-group-scoped wait must reap only children in the target group,
+// not "any child" (the old collapse). Each test stages two zombies in
+// DIFFERENT process groups under the caller and asserts the group-scoped wait
+// picks the matching one — never the first-queued one, which is what the
+// any-child collapse returned.
+
+/// Register `task`↔`pid` (both directions) and put `task` in process group
+/// `pgid` (a task-space pgid). Mirrors `abi_pidns_tests::register` locally.
+fn wt_register(task: u64, pid: u64, pgid: u64) {
+    crate::task::release_task(task);
+    let _ = crate::task::Task::new_registered(task, pid);
+    crate::handlers::register_task_to_pid(task, pid);
+    crate::handlers::register_pid_task_mapping(pid, task);
+    crate::handlers::__test_set_pgid(task, pgid);
+}
+
+// wait4(-pgid): reap the zombie in group -pid, not the first-queued sibling.
+fn smoke_abi_proc_wait4_pgid_selects_group() -> TestResult {
+    with_setup(|| {
+        const PARENT: u64 = 0x7000_0000;
+        const PARENT_PID: u64 = 0x7000_1000;
+        const GA_LEADER: u64 = 0x7000_0101; // group A leader task (pgid value)
+        const GB_LEADER: u64 = 0x7000_0102; // group B leader task
+        const GB_LEADER_PID: u64 = 0x7000_2102;
+        const C1_TASK: u64 = 0x7000_0201;
+        const C1_PID: u64 = 0x7000_1201; // in group A, queued FIRST
+        const C2_TASK: u64 = 0x7000_0202;
+        const C2_PID: u64 = 0x7000_1202; // in group B, queued SECOND
+
+        let result = {
+            wt_register(PARENT, PARENT_PID, PARENT);
+            wt_register(C1_TASK, C1_PID, GA_LEADER);
+            wt_register(C2_TASK, C2_PID, GB_LEADER);
+            // The group-B leader must be pid→task resolvable so pgid_from_user
+            // maps its pid back to GB_LEADER.
+            crate::handlers::register_task_to_pid(GB_LEADER, GB_LEADER_PID);
+            crate::handlers::register_pid_task_mapping(GB_LEADER_PID, GB_LEADER);
+
+            // Two zombies queued under PARENT: A first, B second.
+            crate::handlers::__test_stage_pending_exit(PARENT, C1_PID, 0);
+            crate::handlers::__test_stage_pending_exit(PARENT, C2_PID, 0);
+
+            set_task(PARENT);
+            // wait4(-(GB_LEADER_PID)) must reap C2 (group B), not C1.
+            let neg = (-(GB_LEADER_PID as i64)) as u64;
+            match call(Syscall::Wait4.raw(), a3(neg, 0, 0, 0)) {
+                Some(v) if v as u64 == C2_PID => Ok(()),
+                Some(v) if v as u64 == C1_PID => Err("wait4(-pgid) reaped the first-queued child in the WRONG group — pgid filter missing (collapsed to any child)"),
+                _ => Err("wait4(-pgid) returned an unexpected result"),
+            }
+        };
+        set_task(FAKE_TASK);
+        crate::handlers::__test_clear_pending_exits(PARENT);
+        for t in [PARENT, C1_TASK, C2_TASK, GB_LEADER] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_wait4_pgid_selects_group);
+
+// waitid(P_PGID, g): reap the zombie in group g, not the first-queued sibling.
+fn smoke_abi_proc_waitid_pgid_selects_group() -> TestResult {
+    with_setup(|| {
+        const PARENT: u64 = 0x7100_0000;
+        const PARENT_PID: u64 = 0x7100_1000;
+        const GA_LEADER: u64 = 0x7100_0101;
+        const GB_LEADER: u64 = 0x7100_0102;
+        const GB_LEADER_PID: u64 = 0x7100_2102;
+        const C1_TASK: u64 = 0x7100_0201;
+        const C1_PID: u64 = 0x7100_1201; // group A, queued FIRST
+        const C2_TASK: u64 = 0x7100_0202;
+        const C2_PID: u64 = 0x7100_1202; // group B, queued SECOND
+        const P_PGID: u64 = 2;
+        const WEXITED: u64 = 4;
+
+        let result = (|| {
+            wt_register(PARENT, PARENT_PID, PARENT);
+            wt_register(C1_TASK, C1_PID, GA_LEADER);
+            wt_register(C2_TASK, C2_PID, GB_LEADER);
+            crate::handlers::register_task_to_pid(GB_LEADER, GB_LEADER_PID);
+            crate::handlers::register_pid_task_mapping(GB_LEADER_PID, GB_LEADER);
+            crate::handlers::__test_stage_pending_exit(PARENT, C1_PID, 0);
+            crate::handlers::__test_stage_pending_exit(PARENT, C2_PID, 0);
+
+            set_task(PARENT);
+            // waitid(P_PGID, GB_LEADER_PID, NULL, WEXITED) → 0, reaps C2. Verify
+            // by confirming C1 (group A) is STILL queued afterward: a following
+            // waitid(P_PGID, GA_LEADER_PID) reaps C1.
+            match call(Syscall::Waitid.raw(), a3(P_PGID, GB_LEADER_PID, 0, WEXITED)) {
+                Some(0) => {}
+                _ => return Err("waitid(P_PGID, group B) did not succeed"),
+            }
+            // C2 consumed; C1 (group A) must remain. wait4(-1) now reaps C1.
+            match call(Syscall::Wait4.raw(), a3((-1i64) as u64, 0, 0, 0)) {
+                Some(v) if v as u64 == C1_PID => Ok(()),
+                Some(v) if v as u64 == C2_PID => Err("waitid(P_PGID, group B) reaped the WRONG (group A) child — pgid filter missing"),
+                _ => Err("follow-up wait4 returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::handlers::__test_clear_pending_exits(PARENT);
+        for t in [PARENT, C1_TASK, C2_TASK, GB_LEADER] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_waitid_pgid_selects_group);
+
+// has_living_child pgid branch: WNOHANG returns ECHILD when no LIVING child is
+// in the target group, 0 when one is — the old code answered "any child".
+fn smoke_abi_proc_wait4_pgid_echild_when_group_empty() -> TestResult {
+    with_setup(|| {
+        const PARENT: u64 = 0x7200_0000;
+        const PARENT_PID: u64 = 0x7200_1000;
+        const GA_LEADER: u64 = 0x7200_0101; // the child's group
+        const GA_LEADER_PID: u64 = 0x7200_2101;
+        const GB_LEADER: u64 = 0x7200_0102; // an EMPTY group (no child)
+        const GB_LEADER_PID: u64 = 0x7200_2102;
+        const CHILD_TASK: u64 = 0x7200_0201;
+        const CHILD_PID: u64 = 0x7200_1201; // living child in group A
+        const WNOHANG: u64 = 1;
+        const ECHILD: i64 = -10;
+
+        let result = (|| {
+            wt_register(PARENT, PARENT_PID, PARENT);
+            wt_register(CHILD_TASK, CHILD_PID, GA_LEADER);
+            crate::handlers::register_task_to_pid(GA_LEADER, GA_LEADER_PID);
+            crate::handlers::register_pid_task_mapping(GA_LEADER_PID, GA_LEADER);
+            crate::handlers::register_task_to_pid(GB_LEADER, GB_LEADER_PID);
+            crate::handlers::register_pid_task_mapping(GB_LEADER_PID, GB_LEADER);
+            // A LIVING child of PARENT in group A (no queued exit).
+            crate::handlers::__test_inject_parent_of(CHILD_PID, PARENT);
+
+            set_task(PARENT);
+            // Group A has a living child → WNOHANG returns 0 (not ECHILD).
+            let neg_a = (-(GA_LEADER_PID as i64)) as u64;
+            match call(Syscall::Wait4.raw(), a3(neg_a, 0, WNOHANG, 0)) {
+                Some(0) => {}
+                _ => {
+                    return Err(
+                        "wait4(-pgidA, WNOHANG) with a living group-A child should return 0",
+                    )
+                }
+            }
+            // Group B has NO child of PARENT → ECHILD (the old any-child check
+            // wrongly saw the group-A child and returned 0 here).
+            let neg_b = (-(GB_LEADER_PID as i64)) as u64;
+            match call(Syscall::Wait4.raw(), a3(neg_b, 0, WNOHANG, 0)) {
+                Some(v) if v == ECHILD => Ok(()),
+                Some(0) => Err("wait4(-pgidB, WNOHANG) returned 0 despite no child in group B — has_living_child ignored the pgid"),
+                _ => Err("wait4(-pgidB, WNOHANG) returned an unexpected result"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        for t in [PARENT, CHILD_TASK, GA_LEADER, GB_LEADER] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_wait4_pgid_echild_when_group_empty
+);
+
+// #32: proc_task_info fills stat fields 7-8 (tty_nr/tpgid) from the task's
+// controlling terminal + its foreground pgrp (translated), not hardcoded 0 0.
+fn smoke_abi_proc_stat_tty_fields_from_ctty() -> TestResult {
+    with_setup(|| {
+        const T_TASK: u64 = 0x7400_0000;
+        const T_PID: u64 = 0x7400_1000;
+        const LEADER_TASK: u64 = 0x7400_0101; // console fg pgrp (task-space)
+        const LEADER_PID: u64 = 0x7400_1101;
+        const CONSOLE_DEV: u64 = (5 << 8) | 1;
+
+        for (t, p) in [(T_TASK, T_PID), (LEADER_TASK, LEADER_PID)] {
+            crate::task::release_task(t);
+            let _ = crate::task::Task::new_registered(t, p);
+            crate::handlers::register_task_to_pid(t, p);
+            crate::handlers::register_pid_task_mapping(p, t);
+        }
+        let saved_fg = narf_filesystem::console_tty::fg_pgrp();
+        let result = (|| {
+            set_task(T_TASK);
+            // T's controlling terminal is the console; its fg pgrp is LEADER.
+            crate::handlers::set_controlling_tty_console(T_TASK);
+            narf_filesystem::console_tty::set_fg_pgrp(LEADER_TASK);
+            let info = crate::handlers::proc_task_info(
+                T_PID,
+                narf_filesystem::procfs::TaskInfoQuery::Basic,
+            )
+            .ok_or("proc_task_info returned None for a live task")?;
+            if info.tty_nr != CONSOLE_DEV {
+                return Err("tty_nr was not the console device (5,1) for a console-ctty task");
+            }
+            // tpgid is the fg pgrp rendered in the reader's ns (root ns here →
+            // the leader's outer pid), NOT the raw task-space id or 0.
+            if info.tpgid != LEADER_PID as i64 {
+                return Err("tpgid was not the fg pgrp's visible pid (pgid_to_user missing)");
+            }
+            // Detached from the controlling tty → tty_nr 0, tpgid -1 (Linux).
+            crate::handlers::detach_controlling_tty(T_TASK);
+            let info2 = crate::handlers::proc_task_info(
+                T_PID,
+                narf_filesystem::procfs::TaskInfoQuery::Basic,
+            )
+            .ok_or("proc_task_info returned None after detach")?;
+            if info2.tty_nr != 0 || info2.tpgid != -1 {
+                return Err("a task with no controlling tty must render tty_nr 0, tpgid -1");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        narf_filesystem::console_tty::set_fg_pgrp(saved_fg);
+        for t in [T_TASK, LEADER_TASK] {
+            crate::task::release_task(t);
+        }
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_stat_tty_fields_from_ctty);
 
 // ── fork(2) / vfork(2) — no live address space in the harness ──
 

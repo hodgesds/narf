@@ -511,3 +511,17 @@ argument = "User timer preemption remains inside the existing frame and schedule
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Procfs basic task snapshots now obtain only saturating allocation-free aggregate counters while holding the existing address-space region locks. The scan never transfers physical ownership or exposes frame addresses, counts a base page resident only when its authoritative physical slot is nonzero, and converts huge leaves to base-page equivalents without changing mappings. Detailed per-VMA NUMA data remains opt-in for maps/numa_maps; ordinary liveness and metadata reads cannot allocate kernel memory proportional to an untrusted task's region count."
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame boot edit only repeats the existing idempotent SysFs block-class projection after PCI probing has registered storage devices. It adds no TCB member, authority, domain transition, capability operation, mapping, or scheduler state; it exposes metadata already present in the block registry through the existing untrusted filesystem bridge."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The late SysFs projection reads block names, capacities, and immutable partition-identification metadata from the existing registry and creates only kernel-owned virtual kobjects. It does not dereference user memory, grant capabilities, access another domain's data, or modify block I/O, mount selection, or frame ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame boot edit mounts a second instance of the existing untrusted MemFs at the Linux /var/tmp runtime path beside the existing /tmp and /run mounts. It adds no TCB member, authority, domain transition, capability operation, scheduler state, or physical-frame ownership path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The new /var/tmp mount uses the same bootstrap mount authority and kernel-owned MemFs implementation already used for /tmp and /run, and is installed before userspace PID 1 starts. It grants no user pointer access or cross-domain memory access and does not alter capability checks or domain tags."

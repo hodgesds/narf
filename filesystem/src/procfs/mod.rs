@@ -75,6 +75,13 @@ pub struct ProcTaskInfo {
     /// Process group + session ids (stat fields 5-6).
     pub pgrp: u64,
     pub session: u64,
+    /// Controlling-terminal device number (stat field 7, `tty_nr`), Linux
+    /// `(major << 8) | minor`; 0 when the process has no controlling tty.
+    pub tty_nr: u64,
+    /// Foreground process group of the controlling tty (stat field 8, `tpgid`),
+    /// already rendered in the reader's namespace; -1 when there is no
+    /// controlling tty (Linux fills -1 there).
+    pub tpgid: i64,
     /// Consumed user CPU time in USER_HZ (100) ticks — stat field 14.
     pub utime_ticks: u64,
     /// In-syscall (kernel) CPU time in USER_HZ ticks — stat field 15.
@@ -198,6 +205,27 @@ pub fn install_proc_pidns_hooks(
     PID_REPORT_HOOK.store(report as usize, Ordering::Release);
 }
 
+/// Test-only: snapshot the three pid-namespace hook pointers so a test that
+/// installs stubs can restore the real hooks afterward (the procfs tests run in
+/// the same boot where userspace already installed them). Order matches
+/// `install_proc_pidns_hooks`: (current_outer, resolve, report).
+#[doc(hidden)]
+pub fn __test_pidns_hooks_snapshot() -> (usize, usize, usize) {
+    (
+        CURRENT_OUTER_PID_HOOK.load(Ordering::Acquire),
+        PID_RESOLVE_HOOK.load(Ordering::Acquire),
+        PID_REPORT_HOOK.load(Ordering::Acquire),
+    )
+}
+
+/// Test-only: restore hook pointers captured by `__test_pidns_hooks_snapshot`.
+#[doc(hidden)]
+pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize)) {
+    CURRENT_OUTER_PID_HOOK.store(snap.0, Ordering::Release);
+    PID_RESOLVE_HOOK.store(snap.1, Ordering::Release);
+    PID_REPORT_HOOK.store(snap.2, Ordering::Release);
+}
+
 pub(crate) fn current_pid() -> u64 {
     let v = CURRENT_PID_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -235,8 +263,8 @@ pub(crate) fn pid_resolve(n: u64) -> Option<u64> {
 
 /// Translate an outer ProcessId into the current reader's namespace view, or
 /// `None` if the process is invisible there. Falls back to identity (`Some(n)`)
-/// when the hook isn't installed. Backs cgroup.procs listing translation.
-#[cfg(feature = "cgroup")]
+/// when the hook isn't installed. Backs cgroup.procs listing translation and
+/// the `/proc/<pid>/task/<tid>` tid rendering.
 pub(crate) fn pid_report(n: u64) -> Option<u64> {
     let v = PID_REPORT_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -1702,8 +1730,12 @@ impl DirOps for ProcRoot {
             // /proc/thread-self → <pid>/task/<tid>; tid == pid in NARF.
             // Descending gives a ProcTaskTidDir that exposes `comm` etc.
             // Linux ref: `proc_thread_self_get_link` (fs/proc/self.c:80).
+            // Look up by the reader-visible tid (inner in a namespace), not the
+            // outer pid — ProcTaskDir::lookup_dir now matches on visible_tid. (#16)
             let pid = current_outer_pid();
-            return pid_ext::ProcTaskDir { pid }.lookup_dir(&pid.to_string());
+            let dir = pid_ext::ProcTaskDir { pid };
+            let tid = dir.visible_tid();
+            return dir.lookup_dir(&tid.to_string());
         }
         // Registry-backed subdirectory (e.g. "net").
         let snap = lookup_registry(&[name]);
@@ -2335,13 +2367,15 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     let rss_pages = info.resident_pages;
     let num_threads = info.num_threads.max(1); // field 20; 0 → 1
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.pid,
         info.comm,
         info.state,
         info.ppid,
         info.pgrp,
         info.session,
+        info.tty_nr, // field 7
+        info.tpgid,  // field 8
         info.utime_ticks,
         info.stime_ticks,
         num_threads,
@@ -2837,6 +2871,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         ppid: 2,
         pgrp: 3,
         session: 4,
+        tty_nr: 1281, // (5<<8)|1 — the console device
+        tpgid: 3,
         utime_ticks: 5,
         stime_ticks: 9,
         starttime_ticks: 6,
@@ -2849,10 +2885,14 @@ fn smoke_pid_stat_real_fields() -> TestResult {
     if f.len() != 52 {
         return TestResult::Fail("stat must have exactly 52 fields");
     }
-    // 0-based: ppid=3, pgrp=4, session=5, utime=13, starttime=21,
-    // vsize=22, rss=23.
+    // 0-based: ppid=3, pgrp=4, session=5, tty_nr=6, tpgid=7, utime=13,
+    // starttime=21, vsize=22, rss=23.
     if f[3] != "2" || f[4] != "3" || f[5] != "4" {
         return TestResult::Fail("ppid/pgrp/session must land in fields 4-6");
+    }
+    // #32: tty_nr/tpgid must render the real device + fg pgrp, not "0 0".
+    if f[6] != "1281" || f[7] != "3" {
+        return TestResult::Fail("tty_nr/tpgid must land in fields 7-8 (were hardcoded 0 0)");
     }
     if f[13] != "5" || f[14] != "9" {
         return TestResult::Fail("utime/stime must land in fields 14-15");
@@ -2929,6 +2969,8 @@ fn sample_info() -> ProcTaskInfo {
         ppid: 7,
         pgrp: 3,
         session: 3,
+        tty_nr: 0,
+        tpgid: -1,
         utime_ticks: 1,
         stime_ticks: 2,
         starttime_ticks: 9,

@@ -288,6 +288,26 @@ pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn 
 pub struct DriRenderFile {
     index: u32,
     metadata: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>,
+    /// Per-open virtio-gpu resource namespace. Kept even for a non-virtio
+    /// card; its dispatcher is selected by the DRM driver's advertised name.
+    virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
+}
+
+impl Drop for DriRenderFile {
+    fn drop(&mut self) {
+        // Quiesce the host resource before `DmaBuffer::drop` releases its
+        // pages. If the device is already gone or rejects teardown, retain
+        // the backing instead: a bounded process-exit leak is preferable to a
+        // host DMA use-after-free into another process's pages.
+        for resource in self.virtgpu.drain_resources() {
+            let released = narf_drivers_virtio::gpu_pci::probed_device()
+                .map(|dev| dev.destroy_virgl_resource(resource.resource_id).is_ok())
+                .unwrap_or(false);
+            if !released {
+                core::mem::forget(resource);
+            }
+        }
+    }
 }
 
 impl FileOps for DriRenderFile {
@@ -339,7 +359,20 @@ impl FileOps for DriRenderFile {
     /// modesetting ioctls with PermissionDenied (→ EACCES at the
     /// syscall layer).
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+            match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
         crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ true)
+    }
+
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
+            return crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len);
+        }
+        Err(FsError::Unsupported)
     }
 }
 
@@ -376,6 +409,7 @@ impl DirOps for DriDir {
                         return Some(Arc::new(DriRenderFile {
                             index: idx,
                             metadata,
+                            virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
                         }));
                     }
                 }
@@ -450,6 +484,54 @@ impl crate::drm_registry::DrmCard for BochsCard {
         // QEMU bochs-display subsystem device ID.
         // cfg+0x2E = 0x1100 on all QEMU bochs-display instances.
         0x1100
+    }
+    fn vbios_version(&self) -> Option<&str> {
+        None
+    }
+    fn gpu_busy_percent(&self) -> Option<u32> {
+        None
+    }
+    fn power_state(&self) -> &str {
+        "D0"
+    }
+}
+
+/// `DrmCard` metadata for the VirtIO-GPU transport.
+///
+/// The short driver name is intentionally Linux-compatible: Mesa uses the
+/// `DRM_IOCTL_VERSION` name to select its `virtio_gpu` backend before it
+/// opens the render node and issues the VIRTGPU-specific ioctls.
+#[derive(Debug)]
+pub struct VirtioGpuCard {
+    pub name_str: String,
+}
+
+impl VirtioGpuCard {
+    pub fn new(card_name: String) -> Self {
+        Self {
+            name_str: card_name,
+        }
+    }
+}
+
+impl crate::drm_registry::DrmCard for VirtioGpuCard {
+    fn name(&self) -> &str {
+        &self.name_str
+    }
+    fn driver(&self) -> &str {
+        "virtio_gpu"
+    }
+    fn vendor_id(&self) -> u16 {
+        0x1AF4
+    }
+    fn device_id(&self) -> u16 {
+        0x1050
+    }
+    fn subsystem_vendor(&self) -> u16 {
+        0x1AF4
+    }
+    fn subsystem_device(&self) -> u16 {
+        0x1050
     }
     fn vbios_version(&self) -> Option<&str> {
         None

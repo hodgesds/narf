@@ -194,6 +194,35 @@ pub fn inherit_into_child(parent_task: u64, child_task: u64, child_outer_pid: u6
     Some(inner)
 }
 
+/// The child's pid AS SEEN BY THE PARENT — the value fork(2)/clone(2) returns
+/// to the parent. Linux resolves this with `pid_vnr(pid)` in the CALLER's
+/// active pid namespace (`kernel/fork.c` `kernel_clone` → `nr = pid_vnr(pid)`),
+/// which is NOT necessarily the pid the child reports for ITSELF.
+///
+/// `child_outer` is the child's outer ProcessId; `child_self_inner` is the pid
+/// the child reports for itself (its inner pid in whatever namespace
+/// `inherit_into_child` placed it in). The two DIVERGE across a
+/// `CLONE_NEWPID` boundary:
+///
+///  * Parent in the ROOT namespace → the child's OUTER pid. This covers a
+///    plain root fork (outer == the return) AND `unshare(CLONE_NEWPID)` from
+///    the root (`unshare -fp`, runc/crun init): there the child is pid 1 in a
+///    NEW child namespace the parent is not in, but the parent must still see —
+///    and `waitpid` — the child by its pid in the PARENT's namespace. Returning
+///    the child's new-ns `1` made the parent's `waitpid` look for a child it
+///    has no record of (`PENDING_EXITS` is keyed by outer pid) → ECHILD.
+///  * Parent SHARES the child's namespace (ordinary container fork) → the
+///    child's inner pid there, which equals `child_self_inner` (its getpid()).
+///  * Parent is namespaced but the child went to a DIFFERENT (nested) namespace
+///    the flat model does not bind into the parent's ns → not representable;
+///    fall back to `child_self_inner` (prior behaviour) rather than 0.
+pub fn fork_return_to_parent(parent_task: u64, child_outer: u64, child_self_inner: u64) -> u64 {
+    match ns_of(parent_task) {
+        None => child_outer,
+        Some(pns) => pns.outer_to_inner(child_outer).unwrap_or(child_self_inner),
+    }
+}
+
 /// Linux `unshare(CLONE_NEWPID)` semantics: creates a fresh PID namespace for
 /// future children of `task`. The calling task itself remains in its current namespace.
 pub fn unshare_pid_ns_for_children(task: u64) -> Arc<PidNamespace> {
@@ -249,11 +278,33 @@ pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
             if let Some(inner) = ns.outer_to_inner(outer_pid) {
                 inner
             } else {
-                // Some callers pass the caller's own TaskId in the `outer_pid`
-                // slot; accept a direct TaskId→inner binding too.
-                // If that is not mapped either, Linux reports 0 for an
-                // ancestor or un-nested peer rather than leaking a host pid.
-                ns.outer_to_inner(task).unwrap_or_default()
+                // The fallback exists for callers that pass the caller's own
+                // TaskId (or its own outer pid, registered under a TaskId key)
+                // in the `outer_pid` slot — SELF-queries like getpid.
+                //
+                // As a GENERAL miss-fallback it FABRICATED identities: it
+                // retried the lookup with the OBSERVER'S TaskId as the key, and
+                // TaskIds and outer pids share the same small integers in a real
+                // boot. So whenever any process happened to be registered under
+                // an outer pid numerically equal to the observer's TaskId, EVERY
+                // unmapped pid translated to that process's inner pid. For udev
+                // that makes `hashmap_get(manager->workers, &sender)` find a
+                // valid-but-wrong worker, and `on_worker_notify` then detaches
+                // or asserts on the wrong worker's event (the
+                // `assert(worker->event)` abort at udev-manager.c:1199) — with
+                // no warning anywhere, because the borrowed identity is a real
+                // registered worker.
+                //
+                // Linux renders a pid that is not mapped into the observer's
+                // namespace as 0 (credential/peer-pid queries); never as
+                // someone else.
+                let is_self_query =
+                    outer_pid == task || crate::handlers::task_to_pid_raw(task) == Some(outer_pid);
+                if is_self_query {
+                    ns.outer_to_inner(task).unwrap_or_default()
+                } else {
+                    0
+                }
             }
         }
         None => outer_pid,

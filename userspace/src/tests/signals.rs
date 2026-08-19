@@ -259,6 +259,155 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 #[cfg(not(feature = "user-mode-e2e"))]
 kernel_test_in!("userspace", smoke_userspace_signal_delivery);
 
+// A signal delivered on the return of a syscall that ALREADY COMPLETED must
+// NOT be marked restartable — otherwise the arch `deliver_signal` would rewind
+// RIP by 2 (SA_RESTART) and REPLAY a syscall that already returned, re-running
+// it with `rax` clobbered by its return value (a completed connect/accept/read
+// executed twice).
+//
+// Both syscall gates enforce this the same way: once the handler has run to
+// completion they pass `SYSCALL_NUM_NONE` (not the real wire number) to the
+// delivery hook, so `is_restartable_syscall` short-circuits to `false`. The
+// `syscall`-instruction gate has always done this (userspace/src/syscall.rs);
+// the `int 0x80` gate (frame/src/x86_64/trap.rs) previously forwarded the real
+// number and could replay a completed syscall — this test pins both gates to
+// the same rule.
+//
+// The delivery decision that matters (`restartable_syscall`) is computed purely
+// from the syscall number, independent of the SA_RESTART flag. We install the
+// handler WITH SA_RESTART so the flag is not what suppresses the restart — the
+// only thing standing between "completed syscall" and "replayed syscall" is the
+// `restartable_syscall` bit, which the passed number flips. The arch side
+// (restartable_syscall == false ⇒ no RIP rewind even with SA_RESTART) is proven
+// by `smoke_x86_64_sa_restart_non_restartable_syscall` in frame/src/x86_64.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_completed_syscall_not_restartable() -> TestResult {
+    use crate::{
+        default_signal_delivery, install_core_syscalls, install_global, install_task_id_lookup,
+        signal_init, signal_pending_of, syscall::__test_clear_global, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xC0FE_1234);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    crate::sigaction_init();
+    signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let task = FAKE_TASK.load(Ordering::Relaxed);
+    // SIGUSR1 (10) handler with SA_RESTART, installed through the same
+    // shared-sighand path a real rt_sigaction uses. SA_NODEFER is set so a
+    // delivery does NOT auto-add SIGUSR1 to the task's signal mask (Linux
+    // blocks a signal during its own handler by default) — without it, the
+    // first delivery below would mask SIGUSR1 and the second would find
+    // nothing deliverable. SA_RESTART stays set because a completed syscall's
+    // replay keys on it; the point of the test is that the syscall NUMBER, not
+    // this flag, is what suppresses the replay.
+    crate::handlers::__test_set_sigaction_flags(
+        task,
+        10,
+        0xDEAD_BEEF,
+        crate::handlers::SA_RESTART | crate::handlers::SA_NODEFER,
+    );
+
+    // Synthetic context that captures the `SigDeliveryParams` the hook builds
+    // — specifically the `restartable_syscall` bit and whether SA_RESTART was
+    // carried through. `returning_to_user` is true so the hook's fast-path gate
+    // passes; `deliver_signal` returns true so the pending bit is consumed.
+    struct CapCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        restartable: Option<bool>,
+        had_sa_restart: Option<bool>,
+    }
+    impl TrapContext for CapCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            true
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.restartable = Some(p.restartable_syscall);
+            self.had_sa_restart = Some(p.flags & crate::handlers::SA_RESTART != 0);
+            true
+        }
+    }
+
+    // Raise SIGUSR1 pending, run the delivery hook with `syscall_no`, and report
+    // (restartable_syscall, had_sa_restart) as the hook computed them. Returns
+    // (None, None) if the signal was never delivered (setup failure).
+    let deliver_with = |syscall_no: u32| -> (Option<bool>, Option<bool>) {
+        crate::handlers::raise_signal_pending(task, 10);
+        if signal_pending_of(task) & crate::handlers::sig_bit(10) == 0 {
+            return (None, None);
+        }
+        let mut ctx = CapCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+            restartable: None,
+            had_sa_restart: None,
+        };
+        default_signal_delivery(&mut ctx, syscall_no);
+        (ctx.restartable, ctx.had_sa_restart)
+    };
+
+    // Case 1: the COMPLETED-syscall sentinel both gates now pass on return.
+    let (r_none, sa_none) = deliver_with(crate::handlers::SYSCALL_NUM_NONE);
+    // Case 2 (discriminator): the real number the OLD int-0x80 gate forwarded
+    // for a completed restartable read — proves the sentinel in case 1 is
+    // load-bearing (the test is not a no-op) and that a genuine restart is
+    // still reachable when a park point forwards the real number.
+    let (r_read, _sa_read) = deliver_with(Syscall::Read.raw());
+
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+
+    if sa_none != Some(true) {
+        return TestResult::Fail("SA_RESTART handler not delivered (test setup wrong)");
+    }
+    if r_none != Some(false) {
+        return TestResult::Fail(
+            "completed syscall (SYSCALL_NUM_NONE) marked restartable — would replay a returned syscall",
+        );
+    }
+    if r_read != Some(true) {
+        return TestResult::Fail(
+            "restartable syscall number (read) not marked restartable — legitimate SA_RESTART restart broken",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_completed_syscall_not_restartable
+);
+
 // Preemptive-signals wave: the alloc-free IRQ raise path. A signal
 // raised from the timer ISR (e.g. SIGALRM for a CPU-bound task) must
 // never allocate, so `raise_signal_pending_irq` only ORs the bit into a

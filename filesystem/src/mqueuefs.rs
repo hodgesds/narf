@@ -90,6 +90,9 @@ pub struct MqueueNotification {
     pub task_id: u64,
     pub method: i32,
     pub signal: i32,
+    /// `sigev_value` (the sigval union) registered at mq_notify time. Delivered
+    /// as the notification signal's `si_value` (Linux mqueue.c __do_notify).
+    pub value: u64,
 }
 
 #[derive(Debug)]
@@ -116,6 +119,17 @@ struct Queue {
     maxmsg: i64,
     msgsize: i64,
     state: IrqSafeSpinLock<QueueState>,
+    /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the migration
+    /// target that gives a poll/epoll parked on an mqd a TARGETED wake instead
+    /// of the `notify(0)` herd + ~10 ms backstop. POLL_IN when the queue holds a
+    /// message, POLL_OUT when it has room below `maxmsg` — exactly what
+    /// `poll_readiness` reports. Lives on the shared `Arc<Queue>`, so
+    /// `MqueueFile::readiness()` reaches it directly and the default
+    /// `arm_readiness`/`disarm_readiness` serve it. `send` sets the rising
+    /// POLL_IN edge; `receive` republishes the level. The legacy edge tokens +
+    /// the `notify(0)` fired by the mqueue syscall handlers stay
+    /// belt-and-suspenders during the migration.
+    readiness: narf_lib::readiness::Readiness,
 }
 
 impl Queue {
@@ -134,7 +148,27 @@ impl Queue {
                 writable_token: 0,
                 notification: None,
             }),
+            // A fresh queue is empty: has room (writable), no message (not
+            // readable).
+            readiness: narf_lib::readiness::Readiness::new(POLL_OUT),
         }
+    }
+
+    /// Recompute the durable readiness cell from the current message count:
+    /// POLL_IN iff non-empty, POLL_OUT iff below `maxmsg`. Reads the state under
+    /// its lock, then RELEASES it before `set` (the cell has its own lock; the
+    /// two are never held together). Called after every `send`/`receive`.
+    fn sync_readiness(&self) {
+        let (readable, writable) = {
+            let state = self.state.lock();
+            (
+                !state.messages.is_empty(),
+                state.messages.len() < self.maxmsg as usize,
+            )
+        };
+        let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
+        let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
+        self.readiness.set(add, clear);
     }
 }
 
@@ -237,6 +271,14 @@ impl FileOps for MqueueFile {
     fn poll_edge_token(&self) -> (u64, u64) {
         let state = self.queue.state.lock();
         (state.readable_token, state.writable_token)
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        // The cell reaches this FileOps type directly through the shared
+        // `Arc<Queue>`, so the default `arm_readiness`/`disarm_readiness`
+        // delegate here — a `send` (POLL_IN edge) or a `receive` (POLL_OUT edge)
+        // fires exactly the waiter armed on this mqd.
+        Some(&self.queue.readiness)
     }
 
     fn mq_queue_id(&self) -> Option<u64> {
@@ -474,11 +516,16 @@ pub fn send(
     if was_empty {
         state.readable_token = state.readable_token.wrapping_add(1);
     }
-    Ok(if was_empty {
+    let notification = if was_empty {
         state.notification.take()
     } else {
         None
-    })
+    };
+    drop(state);
+    // Durable per-fd wake: a send makes the queue readable (and possibly fills
+    // it); republish so a reader parked on this mqd's cell wakes directly.
+    file.queue.sync_readiness();
+    Ok(notification)
 }
 
 /// Install, replace-by-cancellation, or remove a Linux one-shot mq_notify
@@ -538,6 +585,10 @@ pub fn receive(handle_id: u64, buffer_len: usize) -> Result<(Vec<u8>, u32), Mque
     if was_full {
         state.writable_token = state.writable_token.wrapping_add(1);
     }
+    drop(state);
+    // Draining a message makes the queue writable (and possibly empties it);
+    // republish so a writer parked on this mqd's cell wakes directly.
+    file.queue.sync_readiness();
     Ok((message.bytes, message.priority))
 }
 

@@ -210,6 +210,20 @@ pub fn mode_state(index: u32) -> Option<Arc<IrqSafeSpinLock<crate::drm::card::Ca
         .and_then(|e| e.mode_state.clone())
 }
 
+/// DRM driver short-name for a registered card. Render-node dispatch uses it
+/// to select a driver-private UAPI without treating another card's ioctl
+/// number as though it belonged to virtio-gpu.
+pub fn driver_name(index: u32) -> Option<&'static str> {
+    let g = REGISTRY.lock();
+    // Every current driver name is a static literal. Avoid returning a borrow
+    // through the registry lock by maping the known virtio name explicitly;
+    // other names do not have a private render UAPI yet.
+    match g.cards.get(index as usize).map(|entry| entry.card.driver()) {
+        Some("virtio_gpu") => Some("virtio_gpu"),
+        _ => None,
+    }
+}
+
 /// Return the shared metadata for one card's primary or render node.
 pub(crate) fn node_metadata(
     index: u32,

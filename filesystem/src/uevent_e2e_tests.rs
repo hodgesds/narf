@@ -946,3 +946,252 @@ fn smoke_uevent_e2e_coldplug_skips_containers() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_skips_containers);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 15 — later device projections preserve the first replay boundary
+//
+// DRM and block sysfs are completed by separate Stage::Late initcalls. The
+// second begin must extend the existing window, not move its start past DRM.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_boot_replay_preserves_earliest_projection() -> TestResult {
+    reset();
+
+    // An incomplete early device must remain outside the bounded replay.
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/early/incomplete".to_string(),
+        "early".to_string(),
+    );
+
+    let drm_start = uevent::begin_boot_udevd_replay();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/platform/narf-drm/card0".to_string(),
+        "drm".to_string(),
+    );
+
+    let block_start = uevent::begin_boot_udevd_replay();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/virtual/block/vblk0p1".to_string(),
+        "block".to_string(),
+    );
+
+    if block_start != drm_start {
+        return TestResult::Fail("later projection advanced the boot replay boundary");
+    }
+    let events = uevent::boot_udevd_replay_reader().drain(8);
+    if events.len() != 2 || events[0].subsystem != "drm" || events[1].subsystem != "block" {
+        return TestResult::Fail("boot replay did not retain DRM followed by block ADD");
+    }
+    if events.iter().any(|event| event.subsystem == "early") {
+        return TestResult::Fail("boot replay included an incomplete early device");
+    }
+
+    reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_boot_replay_preserves_earliest_projection
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 13 — a boot-replay reader that falls behind the ring loses events
+//            SILENTLY, with no way to detect the gap.
+//
+// This is systemd-udevd's exact shape and it is not covered by smoke 8.
+// udevd's netlink socket is created by PID 1 for `systemd-udevd-kernel.socket`
+// and positioned with `boot_udevd_replay_reader()` — an ABSOLUTE seqnum
+// captured near the start of boot. Smoke 8 reads through `from_start()`,
+// which repositions onto the oldest survivor by construction and therefore
+// cannot observe this at all.
+//
+// If boot emits more than `UEVENT_RING_N` events after that boundary, the
+// coldplug ADDs the boundary exists to preserve are evicted before udevd
+// ever runs, and `read_from` just skips them: the reader's cursor is below
+// every surviving seqnum, so it silently resumes at the oldest survivor.
+//
+// LINUX-GAP: Linux does not lose a netlink monitor's events quietly. An
+// overrun socket receives -ENOBUFS, which is precisely how libudev learns it
+// must re-enumerate /sys instead of trusting its event stream. NARF has no
+// such signal, so a lagging udevd cannot tell "no events" from "your events
+// were dropped" — the difference between idling correctly and never creating
+// a single /dev node. Pinned here so closing it turns this test red.
+//
+// Linux ref: net/netlink/af_netlink.c::netlink_dump / netlink_overrun.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult {
+    reset();
+
+    // Boot marks the replay boundary once its device projection is complete.
+    let boundary = uevent::begin_boot_udevd_replay();
+
+    // The events the boundary exists to preserve — the ones udevd must see.
+    for i in 0..4 {
+        uevent::emit(
+            UeventAction::Add,
+            alloc::format!("/devices/coldplug-card{}", i),
+            "drm".to_string(),
+        );
+    }
+
+    // Boot then continues past the ring's capacity before udevd is started.
+    for i in 0..uevent::UEVENT_RING_N {
+        uevent::emit(
+            UeventAction::Add,
+            alloc::format!("/devices/later-noise{}", i),
+            "noise".to_string(),
+        );
+    }
+
+    // udevd finally starts and takes the boot-replay cursor.
+    let mut reader = uevent::boot_udevd_replay_reader();
+    let events = reader.drain(uevent::UEVENT_RING_N * 2);
+
+    // The cursor is genuinely below every surviving seqnum — that is what
+    // makes the loss undetectable rather than merely unlucky.
+    let oldest_surviving = match events.first() {
+        Some(e) => e.seqnum,
+        None => {
+            reset();
+            return TestResult::Fail("boot replay reader drained nothing at all");
+        }
+    };
+    if oldest_surviving <= boundary {
+        reset();
+        return TestResult::Fail("precondition: ring did not actually overrun the replay boundary");
+    }
+
+    // The DRM coldplug ADDs are gone, and the read reported success.
+    if events.iter().any(|e| e.subsystem == "drm") {
+        reset();
+        return TestResult::Fail("precondition: DRM coldplug events were not evicted");
+    }
+
+    // LINUX-GAP assertion: the reader is handed a clean, gap-free-looking
+    // batch. Nothing in the returned data, the cursor, or a status code says
+    // events were dropped. Linux would have raised ENOBUFS by now.
+    if events.len() != uevent::UEVENT_RING_N {
+        reset();
+        return TestResult::Fail("overrun drain did not return exactly the surviving window");
+    }
+    if !events.iter().all(|e| e.subsystem == "noise") {
+        reset();
+        return TestResult::Fail("surviving window contained something other than the tail");
+    }
+
+    reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_boot_replay_reader_silently_loses_overrun_window
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 14 — the wire format must satisfy every check libudev applies in
+//            `device_monitor_receive_device()` before it will build a device.
+//
+// udevd on the Fedora gate receives EVERY uevent we emit (seqnums 2..35,
+// including the DRM card0 ADD), drains its socket, and still queues no event
+// and spawns no worker — `event_run()` calls `worker_spawn()` unconditionally
+// and udevd issues zero clones. So the messages are arriving and being
+// dropped inside libudev's validation, which is silent (it logs at debug and
+// returns -EAGAIN, and journald is not up early enough to capture it).
+//
+// The rules, from systemd v258.9 `src/libsystemd/sd-device/device-monitor.c`,
+// in the order they are applied. One assertion per rule, so whichever is
+// violated names itself instead of leaving "libudev didn't like it".
+//
+// Rules 2-4 (sender nl_pid/nl_groups and the SCM_CREDENTIALS uid) live on the
+// recvmsg path, not in the payload, and are covered by the socket-layer
+// smokes; this pins the byte format.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_netlink_bytes_satisfy_libudev_validation() -> TestResult {
+    reset();
+    uevent::emit(
+        UeventAction::Add,
+        "/devices/platform/narf-drm/card0".to_string(),
+        "drm".to_string(),
+    );
+    let mut reader = UeventReader::from_start();
+    let events = reader.drain(1);
+    let Some(env) = events.into_iter().next() else {
+        reset();
+        return TestResult::Fail("no event to render");
+    };
+    let buf = env.to_netlink_bytes();
+    reset();
+
+    let n = buf.len();
+    // Rule 1: `if (n < 32) return -EINVAL` — short datagrams are dropped
+    // outright, before any parsing.
+    if n < 32 {
+        return TestResult::Fail("netlink uevent shorter than libudev's 32-byte minimum");
+    }
+    // Rule 5: `if (!memchr(message.buf, 0, n))` — there must be a NUL.
+    let Some(nul) = buf.iter().position(|&b| b == 0) else {
+        return TestResult::Fail("netlink uevent contains no NUL byte");
+    };
+    // Rule 6: a kernel message's header must contain "@/". libudev uses this
+    // to tell a kernel message from a "libudev"-magic one.
+    let header = &buf[..nul];
+    if !header.windows(2).any(|w| w == b"@/") {
+        return TestResult::Fail("netlink uevent header lacks the \"@/\" kernel marker");
+    }
+    // Rule 7: `offset = strlen(nulstr) + 1` must be strictly inside the
+    // message, or there are no properties to parse.
+    let offset = nul + 1;
+    if offset >= n {
+        return TestResult::Fail("netlink uevent has no properties after its header");
+    }
+    // Rule 8: device_new_from_nulstr() must find DEVPATH, SUBSYSTEM, ACTION
+    // and a NON-ZERO SEQNUM, or device_verify() rejects the device. The
+    // properties are NUL-separated KEY=value records.
+    let mut have_action = false;
+    let mut have_devpath = false;
+    let mut have_subsystem = false;
+    let mut seqnum_nonzero = false;
+    for rec in buf[offset..].split(|&b| b == 0) {
+        let Ok(kv) = core::str::from_utf8(rec) else {
+            return TestResult::Fail("netlink uevent property record is not valid UTF-8");
+        };
+        if let Some(v) = kv.strip_prefix("ACTION=") {
+            have_action = !v.is_empty();
+        } else if let Some(v) = kv.strip_prefix("DEVPATH=") {
+            // sd-device requires an absolute, /sys-relative devpath.
+            have_devpath = v.starts_with('/');
+        } else if let Some(v) = kv.strip_prefix("SUBSYSTEM=") {
+            have_subsystem = !v.is_empty();
+        } else if let Some(v) = kv.strip_prefix("SEQNUM=") {
+            seqnum_nonzero = v.parse::<u64>().map(|s| s > 0).unwrap_or(false);
+        }
+    }
+    if !have_action {
+        return TestResult::Fail("netlink uevent lacks a non-empty ACTION property");
+    }
+    if !have_devpath {
+        return TestResult::Fail("netlink uevent lacks an absolute DEVPATH property");
+    }
+    if !have_subsystem {
+        return TestResult::Fail("netlink uevent lacks a non-empty SUBSYSTEM property");
+    }
+    if !seqnum_nonzero {
+        return TestResult::Fail(
+            "netlink uevent lacks a non-zero SEQNUM (device_verify rejects 0)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "uevent_e2e",
+    smoke_uevent_netlink_bytes_satisfy_libudev_validation
+);

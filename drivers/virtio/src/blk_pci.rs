@@ -1324,22 +1324,46 @@ static CONTROLLER: IrqSafeSpinLock<Option<&'static InstalledDevice>> = IrqSafeSp
 struct ReqGate<'a>(&'a core::sync::atomic::AtomicBool);
 
 impl<'a> ReqGate<'a> {
-    /// Spin until the gate is ours. Interrupts keep their caller-supplied
-    /// state — the whole point — so timer ticks, RCU quiescent states and
-    /// the sleep pumps continue to run on this CPU while we wait.
+    /// Acquire the gate. Interrupts keep their caller-supplied state so timer
+    /// ticks, RCU quiescent states and the sleep pumps continue to run while we
+    /// wait.
+    ///
+    /// On contention we do NOT pure-`spin_loop`: the gate holder may be a
+    /// stackful task that was preempted mid-round-trip and is homed on THIS
+    /// CPU, so spinning would monopolize the very CPU it needs to run on and
+    /// livelock (the `no_park_backstop` thundering-herd convoy — the stall
+    /// watchdog catches N CPUs `SPIN-NOT-POLLING` here with the gate held but no
+    /// CPU in the critical section). After a short spin burst (cheap when the
+    /// gate is held only briefly by a holder running on another CPU) we
+    /// COOPERATIVELY YIELD so the executor can run the homed holder; it then
+    /// completes and releases the gate, and we retry on re-poll. Yielding uses
+    /// the well-tested own-stack yield path, not `no_preempt`.
     fn acquire(flag: &'a core::sync::atomic::AtomicBool) -> ReqGate<'a> {
-        while flag
-            .compare_exchange_weak(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            core::hint::spin_loop();
+        loop {
+            // Fast path: brief spin for a gate held only momentarily by a
+            // holder running on another CPU.
+            for _ in 0..128 {
+                if flag
+                    .compare_exchange_weak(
+                        false,
+                        true,
+                        core::sync::atomic::Ordering::Acquire,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return ReqGate(flag);
+                }
+                core::hint::spin_loop();
+            }
+            // Still contended: the holder may be descheduled and homed on THIS
+            // CPU. Yield to the executor so it can run it. Falls back to a spin
+            // when there is no stackful task to yield (e.g. early boot, or a
+            // non-x86_64 build without the own-stack model).
+            if !narf_scheduler::cooperative_yield() {
+                core::hint::spin_loop();
+            }
         }
-        ReqGate(flag)
     }
 }
 
@@ -1416,11 +1440,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         }));
     *CONTROLLER.lock() = Some(slot);
     // Register against the unified block-device registry.
-    narf_block::register_block_device(
-        "vblk0",
-        alloc::sync::Arc::new(VirtioBlkBlockSync)
-            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
-    );
+    let parent = alloc::sync::Arc::new(VirtioBlkBlockSync)
+        as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>;
+    narf_block::register_block_device("vblk0", parent.clone());
+    // Make GPT/MBR child devices visible to the root-mount walk. Without
+    // this, a partitioned virtio disk only exposes its whole-disk parent, so
+    // filesystem detection never reaches an ext4 root stored in a partition.
+    // A scan failure is non-fatal: unpartitioned virtio disks remain usable
+    // through the parent device just as before.
+    let _ = narf_block::partition::scan_and_register_partitions(parent, "vblk0");
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vblk0"),
         kind: narf_drivers::BoundKind::Block,

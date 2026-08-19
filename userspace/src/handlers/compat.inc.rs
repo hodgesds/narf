@@ -800,6 +800,19 @@ fn do_execve_resolved(
     }
     let path: &str = &path_owned;
 
+    // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
+    // fast boot even while the console is otherwise quiet): mark when the
+    // session reaches its compositor / shell. Its presence = the greeter got
+    // past the session-bus step and the desktop path is unblocked; its absence
+    // across a boot = still stuck. One substring check per execve (cold path).
+    if path.contains("kwin_wayland")
+        || path.contains("plasmashell")
+        || path.contains("kwin_wrapper")
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "SESSION-EXEC path={}", path);
+    }
+
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write as _;
@@ -1953,6 +1966,44 @@ where
     }
 }
 
+/// Namespace-aware `resolve_parent_absolute`. Every directory-MUTATION
+/// syscall must go through this rather than `registry()` directly, or a task
+/// in a private mount namespace can create a file it cannot then rename or
+/// unlink — see `MountNamespace::resolve_parent_absolute`.
+pub(crate) fn current_resolve_parent_absolute<R, F>(path: &str, f: F) -> Option<R>
+where
+    F: FnOnce(
+        &dyn narf_filesystem::FsInstance,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+    ) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_parent_absolute(path, f)
+    } else {
+        narf_filesystem::registry().resolve_parent_absolute(path, f)
+    }
+}
+
+/// Namespace-aware `resolve_two_parents_absolute` — the cross-DIRECTORY
+/// rename counterpart of [`current_resolve_parent_absolute`].
+pub(crate) fn current_resolve_two_parents_absolute<R, F>(a: &str, b: &str, f: F) -> Option<R>
+where
+    F: FnOnce(
+        &dyn narf_filesystem::FsInstance,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+        alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        &str,
+    ) -> R,
+{
+    if let Some(ns) = current_mount_namespace() {
+        ns.resolve_two_parents_absolute(a, b, f)
+    } else {
+        narf_filesystem::registry().resolve_two_parents_absolute(a, b, f)
+    }
+}
+
 pub(crate) fn current_clone_tree_at(
     path: &str,
 ) -> Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> {
@@ -2034,6 +2085,20 @@ fn current_mount_id_at(path: &str) -> Option<u64> {
         Some(ns) => ns.mount_id_at(path),
         None => narf_filesystem::registry().mount_id_at(path),
     }
+}
+
+/// Whether `path` is the visible root of a mount in the calling task's
+/// namespace. This is deliberately an exact-path lookup: a file *under* a
+/// mount inherits its mount ID, but is not itself a mount root.
+fn current_path_is_mount_root(path: &str) -> bool {
+    let path = if path == "/" {
+        path
+    } else {
+        path.trim_end_matches('/')
+    };
+    current_mount_namespace()
+        .map(|ns| ns.list().iter().any(|mount| mount == path))
+        .unwrap_or_else(|| narf_filesystem::registry().list().iter().any(|mount| mount == path))
 }
 
 pub(crate) fn current_mount_arc(
@@ -2514,6 +2579,17 @@ type SignalBitsTable = [SignalBitsBucket; SIGNAL_TABLE_BUCKETS];
 pub(crate) static SIGNAL_PENDING: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 static SIGNAL_READABLE_GEN: SignalBitsTable =
+    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+/// Per-task generation bumped on EVERY signal raise (unlike SIGNAL_READABLE_GEN,
+/// which bumps only on the empty->non-empty transition and also feeds the
+/// signalfd EPOLLET edge token). A poll/epoll park snapshots this before its
+/// scan (beside `epoll_park_gen`) and the park routine re-checks it after
+/// registering the signal waker: a raise in the scan->register window (which
+/// `is_signal_pending`'s block-filter misses for a BLOCKED signal a signalfd
+/// reads) advances the generation and forces a re-execution instead of a park
+/// on the ~10 ms lost-wake backstop. Edge, not level, so a STANDING
+/// blocked-pending signal with no fresh raise never spins.
+static SIGNAL_RAISE_GEN: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 #[inline]
@@ -3426,6 +3502,7 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
 pub fn signal_init() {
     signal_bits_clear(&SIGNAL_PENDING);
     signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -3435,6 +3512,7 @@ pub fn signal_init() {
 pub fn __test_signal_reset() {
     signal_bits_clear(&SIGNAL_PENDING);
     signal_bits_clear(&SIGNAL_READABLE_GEN);
+    signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
     sigqueue_clear();
@@ -3448,6 +3526,12 @@ pub fn signal_pending_of(task: u64) -> u64 {
 
 pub fn signal_readable_generation(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_READABLE_GEN, task)
+}
+
+/// Per-task raise generation — bumped on every signal raise. See
+/// [`SIGNAL_RAISE_GEN`]. Read by the poll/epoll park's signalfd lost-wake guard.
+pub fn signal_raise_generation(task: u64) -> u64 {
+    signal_bits_get(&SIGNAL_RAISE_GEN, task)
 }
 
 /// POSIX default action for a signal when no handler is installed.
@@ -3681,6 +3765,19 @@ pub fn proc_argv_of_task_try(tid: u64) -> Option<alloc::vec::Vec<u8>> {
     g.as_ref().and_then(|m| m.get(&tid).cloned())
 }
 
+/// Match a `comm` string against comma-separated `trace_comm=` selectors. A
+/// selector ending in `$` matches the complete name; others are prefixes. The
+/// single definition of the selector grammar, shared by the tid-keyed lookup
+/// below and the UNIXENQ/UNIXACC latency filter, so the two never drift.
+pub fn comm_matches_selectors(comm: &str, prefixes: &str) -> bool {
+    prefixes
+        .split(',')
+        .any(|selector| match selector.strip_suffix('$') {
+            Some(exact) => !exact.is_empty() && comm == exact,
+            None => !selector.is_empty() && comm.starts_with(selector),
+        })
+}
+
 /// Check a task's Linux `comm` name against comma-separated prefixes without
 /// cloning it. A selector ending in `$` matches the complete comm name; other
 /// selectors retain prefix semantics. Diagnostic paths call this on every
@@ -3691,12 +3788,7 @@ pub fn proc_comm_of_task_matches(tid: u64, prefixes: &str) -> bool {
     let Some(comm) = g.as_ref().and_then(|m| m.get(&tid)) else {
         return false;
     };
-    prefixes
-        .split(',')
-        .any(|selector| match selector.strip_suffix('$') {
-            Some(exact) => !exact.is_empty() && comm == exact,
-            None => !selector.is_empty() && comm.starts_with(selector),
-        })
+    comm_matches_selectors(comm, prefixes)
 }
 
 // ── /proc/[pid]/comm writable hook ─────────────────────────────
@@ -3992,6 +4084,29 @@ pub fn proc_task_info(
             }
         }
     }
+    // stat fields 7-8: controlling terminal device (tty_nr) + its foreground
+    // process group (tpgid). `task_ctty` resolves the boot-console default and
+    // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
+    // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
+    // (Linux). Linux dev_t = (major << 8) | minor: console (5,1); pts/N (136,N).
+    #[cfg(feature = "linux-compat")]
+    let (tty_nr, tpgid): (u64, i64) = match task_ctty(tid) {
+        None => (0, -1),
+        Some(ctty) => {
+            let (tty_nr, fg) = if ctty == CTTY_CONSOLE {
+                ((5u64 << 8) | 1, narf_filesystem::console_tty::fg_pgrp())
+            } else {
+                (
+                    (136u64 << 8) | ctty as u64,
+                    narf_filesystem::devfs_pty::pty_fg_pgrp(ctty),
+                )
+            };
+            let tpgid = if fg == 0 { -1 } else { pgid_to_user(fg) as i64 };
+            (tty_nr, tpgid)
+        }
+    };
+    #[cfg(not(feature = "linux-compat"))]
+    let (tty_nr, tpgid): (u64, i64) = (0, -1);
     // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
     // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
@@ -4024,6 +4139,8 @@ pub fn proc_task_info(
         // visible-pid + namespace view (same boundary getpgid()/getsid() use).
         pgrp: pgid_to_user(read_pgid(tid)),
         session: pgid_to_user(read_sid(tid)),
+        tty_nr,
+        tpgid,
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
@@ -4248,6 +4365,23 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// POSIX timer expiries to queue a signal without going through
 /// `sys_kill` (which expects a syscall trap frame). Mirrors the
 /// `*slot |= 1 << signum` step inside `sys_kill`.
+/// Record the sender's identity for a user-initiated signal (kill / tkill /
+/// tgkill) so the receiver's `signalfd` record and any `SA_SIGINFO` handler
+/// see `si_code == SI_USER` and `si_pid` = the sender's pid IN THE RECEIVER's
+/// pid namespace. Linux fills this unconditionally at `kernel/signal.c:1097`
+/// (`si_pid = task_tgid_nr_ns(current, task_active_pid_ns(t))`); NARF set only
+/// the pending bit, so every plain-kill receiver read `ssi_pid == 0` —
+/// indistinguishable from a kernel signal, which is what systemd PID 1's and
+/// udevd's signalfd dispatchers reject or misattribute. Standard signals
+/// coalesce, so this overwrites any prior queued instance (Linux does too).
+pub(crate) fn queue_sender_siginfo(target: u64, signum: u32) {
+    const SI_USER: i32 = 0;
+    let sender = current_task_id();
+    let sender_outer = task_to_pid_raw(sender).unwrap_or(sender);
+    let si_pid = report_pid_to(target, sender_outer) as u32;
+    let _ = store_sigqueue_info(target, signum, SI_USER, 0, si_pid);
+}
+
 pub fn raise_signal_pending(task: u64, signum: u32) {
     // Reject signal 0: it's the POSIX null signal (existence probe), never a
     // real signal. Setting pending bit 0 would later be taken by the delivery
@@ -4255,6 +4389,38 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // representable range at 63 (see SIGNAL_PENDING).
     if signum == 0 || signum > 64 {
         return;
+    }
+    // [PROBE] Name the SENDER of a termination signal aimed at a systemd
+    // manager/helper or any task in the user-957 session cgroup — to find who
+    // (PID1's job logic? logind? a timeout escalation?) tears down user@957
+    // before its manager can exec `systemd --user`. cgevt_trace-gated and
+    // limited to termination signals so the common per-signal path (SIGCHLD,
+    // SIGCONT, timers) pays nothing.
+    #[cfg(feature = "cgroup")]
+    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 6 | 15) {
+        let tgt_comm = proc_comm_of_task(task).unwrap_or_default();
+        let tgt_pid = task_to_pid_raw(task).unwrap_or(task);
+        let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(tgt_pid);
+        if tgt_comm == "systemd"
+            || tgt_comm.starts_with("(sd")
+            || tgt_comm.starts_with("(systemd")
+            || tgt_cg.contains("user-957")
+        {
+            let sender = current_task_id();
+            let sender_pid = task_to_pid_raw(sender).unwrap_or(sender);
+            let sender_comm = proc_comm_of_task(sender).unwrap_or_default();
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "SIGSEND sig={} -> pid={} comm={} cg={} FROM pid={} comm={}",
+                signum,
+                tgt_pid,
+                tgt_comm,
+                tgt_cg,
+                sender_pid,
+                sender_comm
+            );
+        }
     }
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
@@ -4271,6 +4437,13 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
             *generation = generation.wrapping_add(1);
         });
     }
+    // Bump the raise generation on EVERY raise (not just was_empty): the
+    // signalfd park guard needs to see a second signal arriving while a first
+    // is still pending, so a poll/epoll parked on a signalfd whose mask matches
+    // the SECOND signal is not stranded on the backstop. See [`SIGNAL_RAISE_GEN`].
+    signal_bits_update_or_init(&SIGNAL_RAISE_GEN, task, |generation| {
+        *generation = generation.wrapping_add(1);
+    });
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
     // promptly rather than only at the next self-driven re-poll.
@@ -4372,6 +4545,8 @@ pub fn ensure_signal_pending_slot(task: u64) {
     // The IRQ raise advances readability on the first pending signal. Seed
     // that row here too so the IRQ path never allocates.
     let _ = signal_bits_update(&SIGNAL_READABLE_GEN, task, |_| {});
+    // Same for the raise generation the signalfd park guard reads.
+    let _ = signal_bits_update(&SIGNAL_RAISE_GEN, task, |_| {});
 }
 
 /// Alloc-free, IRQ-safe variant of `raise_signal_pending`: OR the
@@ -4407,6 +4582,11 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
             });
             return false;
         }
+        // Raise generation, every raise (alloc-free existing-only; the row is
+        // pre-seeded by `ensure_signal_pending_slot`). See [`SIGNAL_RAISE_GEN`].
+        let _ = signal_bits_update_existing(&SIGNAL_RAISE_GEN, task, |generation| {
+            *generation = generation.wrapping_add(1);
+        });
         return true;
     }
     false
@@ -4588,6 +4768,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     if signum == 9 {
         // Fatal group kill: every live thread dies.
         for t in members {
+            queue_sender_siginfo(t, signum);
             signal_stopcont_interaction(t, signum);
             raise_signal_pending(t, signum);
             wake_signal(t);
@@ -4602,6 +4783,7 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     } else {
         members[0]
     };
+    queue_sender_siginfo(target, signum);
     signal_stopcont_interaction(target, signum);
     raise_signal_pending(target, signum);
     wake_signal(target);
@@ -4637,10 +4819,22 @@ fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
     if tid == linux_tid_for_task(caller) {
         return Some(caller);
     }
-    let is_non_leader_thread =
-        task_to_pid_raw(tid).is_some_and(|pid| pid_to_task_raw(pid) != Some(tid));
-    if is_non_leader_thread {
-        return Some(tid);
+    // A CLONE_THREAD sibling is a raw TaskId whose thread-group leader lives at
+    // task_to_pid_raw(tid) but is a DIFFERENT task. Its gettid() is that raw
+    // TaskId, so intra-process tkill must accept it directly.
+    if let Some(group_pid) = task_to_pid_raw(tid) {
+        if pid_to_task_raw(group_pid) != Some(tid) {
+            // #26: only accept the raw sibling tid if its thread group is
+            // visible in the CALLER's pid namespace. Without this a container
+            // that passed a raw TaskId numerically matching a HOST (or
+            // sibling-namespace) thread signalled across the boundary. Linux
+            // resolves tkill/tgkill tids via the caller's ns
+            // (kernel/signal.c find_task_by_vpid on the thread's pid).
+            // Identity/visible in the root ns → unchanged there.
+            #[cfg(feature = "container")]
+            crate::pid_ns::ns_visible_inner(caller, group_pid)?;
+            return Some(tid);
+        }
     }
     let pid = accept_pid_from(caller, tid)?;
     Some(pid_to_task_raw(pid).unwrap_or(pid))
@@ -6105,6 +6299,46 @@ pub fn default_sync_signal_delivery(
                         }
                     }
                 }
+                // The region CONTAINING the faulting address, with its perms
+                // — the decisive datum for a #PF. A write (error-code W=1) to a
+                // PRESENT page (P=1) whose region shows w=true means WRITE was
+                // granted but the leaf PTE was mapped read-only: a page-table
+                // permission-derivation bug (the mmap-scalability materializer
+                // regressed). A w=false region is a genuine PROT_READ mapping
+                // the task wrongly wrote to. This single line disambiguates.
+                #[cfg(feature = "linux-compat")]
+                {
+                    if let Some(pinfo) =
+                        proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
+                    {
+                        match pinfo
+                            .vmas
+                            .iter()
+                            .find(|v| info.addr >= v.start && info.addr < v.end)
+                        {
+                            Some(vma) => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  fault-vma={:016x}-{:016x} r={} w={} x={} shared={} {}",
+                                    vma.start,
+                                    vma.end,
+                                    vma.readable,
+                                    vma.writable,
+                                    vma.executable,
+                                    vma.shared,
+                                    vma.label
+                                );
+                            }
+                            None => {
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  fault-vma=<no region contains {:x}>",
+                                    info.addr
+                                );
+                            }
+                        }
+                    }
+                }
                 for i in 0..96u64 {
                     let mut w = [0u8; 8];
                     // SAFETY: copy_from_user range-validates the source VA and
@@ -6333,11 +6567,19 @@ pub fn __test_sigaction_reset() {
 /// through the same shared-sighand path a real `rt_sigaction` uses.
 #[doc(hidden)]
 pub fn __test_set_sigaction(task: u64, signum: usize, handler: u64) {
+    __test_set_sigaction_flags(task, signum, handler, 0);
+}
+
+/// Test hook: like `__test_set_sigaction` but with an explicit
+/// `sa_flags` (e.g. `SA_RESTART`), so a test can exercise the
+/// restart / altstack / siginfo delivery decisions.
+#[doc(hidden)]
+pub fn __test_set_sigaction_flags(task: u64, signum: usize, handler: u64, flags: u32) {
     if let Some(h) = sighand_of(task) {
         h.lock()[signum] = Some(SigAction {
             handler,
             restorer: 0,
-            flags: 0,
+            flags,
         });
     }
 }
@@ -6524,6 +6766,33 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
     Some(crate::socket::SockAddr { family, body })
 }
 
+/// Return the listener's shared open-file-description `O_NONBLOCK` state.
+///
+/// `SocketFile` is shared across dup, exec remapping, and SCM_RIGHTS while an
+/// `FdEntry` is only a descriptor-slot snapshot. Prefer the shared state so a
+/// transferred systemd activation socket cannot accidentally become blocking;
+/// retain the slot bit as a compatibility fallback for older construction
+/// paths that populated only `FdEntry::status_flags`.
+fn socket_listener_nonblock(
+    task: u64,
+    fd: u32,
+    socket: &crate::socket::SocketFile,
+) -> bool {
+    socket.is_nonblock()
+        || fd::with_table(task, |table| {
+            table
+                .get(fd)
+                .is_some_and(|entry| entry.status_flags & crate::fd::O_NONBLOCK != 0)
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn __test_socket_listener_nonblock(fd: u32) -> bool {
+    let task = current_task_id();
+    current_socket(fd)
+        .is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
+}
+
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -6562,13 +6831,15 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             {
                 use core::fmt::Write as _;
                 let comm = proc_comm_of_task(task).unwrap_or_default();
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "UNIXACC ms={} by={} lfd={}",
-                    narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
-                    comm,
-                    fd,
-                );
+                if crate::syscall::unix_latency_line_wanted(&comm) {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "UNIXACC ms={} by={} lfd={}",
+                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                        comm,
+                        fd,
+                    );
+                }
             }
             let new_fd = match fd::with_table(task, |t| {
                 t.open(crate::fd::FdEntry {
@@ -6597,12 +6868,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             // so the `syscall` instruction re-executes on resume (no
             // return value set), looping in-kernel until `Accepted`.
             let task = current_task_id();
-            let listen_nonblock = fd::with_table(task, |t| {
-                t.get(fd)
-                    .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
-            })
-            .flatten()
-            .unwrap_or(false);
+            let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
                 ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
                 return;

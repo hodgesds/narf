@@ -55,6 +55,11 @@ struct SharedFilePage {
     offset: u64,
     phys: PhysAddr,
     mappings: usize,
+    /// Exact bytes last read from, or successfully written to, the backing
+    /// file. Generic mappings cannot rely on hardware dirty bits here, so an
+    /// exact snapshot lets fsync skip clean pages without risking a hash
+    /// collision that could lose a write.
+    clean: Vec<u8>,
 }
 
 static SHARED_FILE_PAGES: IrqSafeSpinLock<Vec<SharedFilePage>> = IrqSafeSpinLock::new(Vec::new());
@@ -144,11 +149,17 @@ pub(crate) fn publish_shared_file_pages(
                     rejected.push(candidate);
                 }
             } else {
+                // SAFETY: `candidate` is a freshly allocated, identity-mapped
+                // fallback page which remains owned by this cache entry.
+                let clean = unsafe {
+                    core::slice::from_raw_parts(candidate.raw() as *const u8, 4096).to_vec()
+                };
                 pages.push(SharedFilePage {
                     ops: Arc::clone(ops),
                     offset: page_offset,
                     phys: candidate,
                     mappings: 0,
+                    clean,
                 });
                 canonical.push(candidate);
             }
@@ -392,11 +403,9 @@ fn flush_mappings(ops: &Arc<dyn FileOps>, mappings: Vec<FileWriteback>) -> Resul
                 continue;
             }
             let len = ((file_len - offset) as usize).min(4096);
-            // SAFETY: fallback file mappings own these frames until the VMA is
-            // unmapped. We copy before beginning async I/O, so the buffer is
-            // independent of the mapping after this point.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(phys.raw() as *const u8, len) }.to_vec();
+            let Some(bytes) = snapshot_dirty_page(ops, offset, *phys, len) else {
+                continue;
+            };
             let mut done = 0;
             while done < bytes.len() {
                 match crate::handlers::poll_io_to_completion(
@@ -406,9 +415,46 @@ fn flush_mappings(ops: &Arc<dyn FileOps>, mappings: Vec<FileWriteback>) -> Resul
                     Some(Ok(n)) => done += n,
                 }
             }
+            mark_page_clean(ops, offset, *phys, &bytes);
         }
     }
     Ok(())
+}
+
+/// Snapshot a fallback page only when it differs from the last file image.
+/// Holding the cache lock pins the page against final-unmap reclamation while
+/// its bytes are copied; filesystem I/O starts only after the lock is dropped.
+fn snapshot_dirty_page(
+    ops: &Arc<dyn FileOps>,
+    offset: u64,
+    phys: PhysAddr,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let pages = SHARED_FILE_PAGES.lock();
+    let page = pages
+        .iter()
+        .find(|page| page.offset == offset && page.phys == phys && Arc::ptr_eq(&page.ops, ops))?;
+    // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
+    // mapping release from removing and freeing the entry during this copy.
+    let current = unsafe { core::slice::from_raw_parts(phys.raw() as *const u8, len) };
+    if page.clean.get(..len) == Some(current) {
+        None
+    } else {
+        Some(current.to_vec())
+    }
+}
+
+/// Advance the exact clean image only after the whole page write succeeds.
+/// If userspace changes the mapped page during I/O, the stored snapshot still
+/// describes what reached the file, so the next fsync observes it as dirty.
+fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
+    let mut pages = SHARED_FILE_PAGES.lock();
+    if let Some(page) = pages
+        .iter_mut()
+        .find(|page| page.offset == offset && page.phys == phys && Arc::ptr_eq(&page.ops, ops))
+    {
+        page.clean[..bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 mod tests {

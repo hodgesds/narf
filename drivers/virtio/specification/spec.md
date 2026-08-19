@@ -39,12 +39,15 @@ blk/net/console/rng.
   native parallelism the moment we touch real hardware. `class_blk`
   and `class_net` modules consume the per-queue rings and present
   the unified block/net subsystem interfaces.
-- virtio-gpu exposes `offered_features()` and `host_offers_virgl()` so boot
-  diagnostics and the future render-node bridge can distinguish a portable
-  2D device from a VirGL-capable host. These report the pre-negotiation host
-  offer only. v1.1 continues to negotiate just `VIRTIO_F_VERSION_1`; it MUST
-  NOT accept `VIRTIO_GPU_F_VIRGL` until resource/context lifetime management
-  and the render-node execbuffer UAPI land together.
+- virtio-gpu exposes `offered_features()`, `host_offers_virgl()`, and
+  `virgl_enabled()`. The first two report the pre-negotiation host offer;
+  `virgl_enabled()` is true only after immutable negotiation accepts
+  `VIRTIO_GPU_F_VIRGL`. When enabled, the transport provides typed controlQ
+  operations for context creation/destruction, resource attachment, 3D
+  resource creation, and bounded `SUBMIT_3D` command streams. The DRM
+  render-node bridge owns per-open resource lifetime and validates all
+  user-provided command sizes before it calls this surface. A 2D-only host
+  remains supported with the feature clear.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.

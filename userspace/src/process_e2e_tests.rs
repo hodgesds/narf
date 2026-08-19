@@ -276,6 +276,47 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_fork_basic_wait4_reap);
 
+/// Regression guard (mmap-scalability rebase, PR #161 commit 289ba96a): the
+/// perms the REAL vDSO region is mapped with (`vdso::VDSO_CODE_PERMS`, used by
+/// `vdso::map_into`) MUST satisfy `cow_split_on_write`'s precondition — WRITE
+/// and COW — plus stay READ|EXEC. glibc's ld.so patches the vDSO dynamic
+/// section in place; cow_split recovers that present-RO write only when both
+/// WRITE and COW are set. The pre-rebase `READ|EXEC` mapping failed this once
+/// the rewrite tightened cow_split, so systemd PID 1's first vDSO write took a
+/// fatal #PF at boot. Bound to the SAME constant `map_into` uses, so a
+/// perm-drop is caught here — invisible to GHA CI, which runs no desktop/
+/// systemd boot. The split MECHANISM is covered end-to-end by
+/// `smoke_memory_vdso_shaped_cow_region_splits_on_write`. (Can't drive the
+/// real `map_into` in a unit test: it reads a global vDSO image that the
+/// xtask-test kernel never registers, and its AS teardown would touch the
+/// live kernel's shared master/vvar frames.)
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_vdso_region_perms_are_cow_writable() -> TestResult {
+    use narf_memory::RegionPerms;
+    let p = crate::vdso::VDSO_CODE_PERMS;
+    if !p.contains(RegionPerms::WRITE) {
+        return TestResult::Fail(
+            "vDSO perms lost WRITE — cow_split declines ld.so's write, #PF at boot",
+        );
+    }
+    if !p.contains(RegionPerms::COW) {
+        return TestResult::Fail(
+            "vDSO perms lost COW — cow_split declines ld.so's write, #PF at boot",
+        );
+    }
+    if !p.contains(RegionPerms::READ) || !p.contains(RegionPerms::EXEC) {
+        return TestResult::Fail(
+            "vDSO perms must stay READ|EXEC (it is executed read-only until patched)",
+        );
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_process_vdso_region_perms_are_cow_writable
+);
+
 // ── Smoke 2: fork return values — parent sees child PID, not zero ─────
 //
 // POSIX: fork() returns the child's PID in the parent and 0 in the
@@ -3268,7 +3309,7 @@ fn smoke_wave61_pidfd_signals_on_exit() -> TestResult {
 
     const PID: u64 = 0xA110;
     // assume_alive=true → exited=false at mint time.
-    let st = crate::pidfd::mint_for(PID, true);
+    let st = crate::pidfd::mint_for(PID, 0, true);
     let file = crate::pidfd::PidFdFile::new(st.clone());
 
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
@@ -3297,7 +3338,7 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 
     const PID: u64 = 0xDEAD;
     // assume_alive=false → exited bit initialised true.
-    let st = crate::pidfd::mint_for(PID, false);
+    let st = crate::pidfd::mint_for(PID, 0, false);
     let file = crate::pidfd::PidFdFile::new(st);
 
     if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
@@ -3310,6 +3351,57 @@ fn smoke_wave61_pidfd_zombie_immediate() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_wave61_pidfd_zombie_immediate);
 
+/// Regression: `PidFdFile::poll_readiness` must be AUTHORITATIVE — consult the
+/// target task's real state — not merely cache-driven off the `exited` flag.
+/// `notify_exit(pid)` is missed when the pid is released back to the pool
+/// before the exiting task's observer fires; the flag then stays false and a
+/// supervisor (systemd, Qt forkfd) blocks forever on a process that already
+/// exited. The fallback keys on the immutable, reuse-safe TaskId, so it must
+/// fire once the task is a zombie or gone from the registry — and must NOT
+/// fire while the task is alive.
+fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
+    use narf_filesystem::POLL_IN;
+
+    crate::pidfd::__test_reset();
+    const TID: u64 = 0x5150_0001;
+    const PID: u64 = 0x5150_0002;
+    // A live, registered task (state = TASK_RUNNING).
+    let _t = crate::task::Task::new_registered(TID, PID);
+
+    // `exited` flag never set + task ALIVE ⇒ not readable (no misfire).
+    let st = crate::pidfd::mint_for(PID, TID, true);
+    let file = crate::pidfd::PidFdFile::new(st);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN != 0 {
+        let _ = crate::task::release_task(TID);
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("pidfd for a LIVE task must not be readable via the fallback");
+    }
+
+    // Zombie (exited, not yet reaped): flag still unset, but the authoritative
+    // fallback must report POLLIN — this is the fix.
+    crate::task::mark_zombie(TID);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        let _ = crate::task::release_task(TID);
+        crate::pidfd::__test_reset();
+        return TestResult::Fail(
+            "pidfd for a ZOMBIE task must be readable via the authoritative fallback",
+        );
+    }
+
+    // Reaped (gone from the registry): still POLLIN.
+    let _ = crate::task::release_task(TID);
+    if narf_filesystem::FileOps::poll_readiness(&file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail(
+            "pidfd for a REAPED (gone) task must be readable via the fallback",
+        );
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_pidfd_authoritative_exit_fallback);
+
 /// Smoke 33: multiple pidfds for the same pid share state. Once one
 /// observes the exit, every other observer agrees.
 fn smoke_wave61_pidfd_shared_state() -> TestResult {
@@ -3318,8 +3410,8 @@ fn smoke_wave61_pidfd_shared_state() -> TestResult {
     crate::pidfd::__test_reset();
 
     const PID: u64 = 0xB055;
-    let a = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
-    let b = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let a = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
+    let b = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
 
     if narf_filesystem::FileOps::poll_readiness(&a) & POLL_IN != 0
         || narf_filesystem::FileOps::poll_readiness(&b) & POLL_IN != 0
@@ -3370,7 +3462,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     const PID: u64 = 4242;
 
     // First occupant: alive, then exits. Hold its fd across the reuse.
-    let old_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let old_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
     crate::pidfd::notify_exit(PID);
     if narf_filesystem::FileOps::poll_readiness(&old_fd) & POLL_IN == 0 {
         crate::pidfd::__test_reset();
@@ -3380,7 +3472,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     // Reaped: the number goes back to the pool and is handed to a new,
     // LIVE process.
     crate::release_pid(crate::ProcessId(PID));
-    let new_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, true));
+    let new_fd = crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(PID, 0, true));
 
     if narf_filesystem::FileOps::poll_readiness(&new_fd) & POLL_IN != 0 {
         crate::pidfd::__test_reset();
@@ -3975,23 +4067,49 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
         }
     }
 
-    // pthread_join uses FUTEX_WAIT_PRIVATE, so clear_child_tid must publish
-    // its exit wake in the shared AddressSpace Arc's private namespace.
-    // A namespace-0 wake only appears to work through the timer backstop and
-    // strands under SMP thread churn.
-    let namespace = Arc::as_ptr(&parent_as) as usize as u64;
-    let pre = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
+    // clear_child_tid's exit wake (fire_clear_child_tid_on_exit) must reach a
+    // pthread_join()er parked on the child-tid word.
+    //
+    // CORRECT LINUX SEMANTICS (this area has bitten us repeatedly — read
+    // carefully before touching): the kernel's exit-time wake in `mm_release`
+    // is `do_futex(child_tid, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
+    // (linux kernel/fork.c) — i.e. a SHARED (namespace-0) wake. glibc's
+    // pthread_join and musl's __tl_lock both FUTEX_WAIT on that word SHARED.
+    // So the exit wake MUST bump the SHARED (namespace-0) counter. A PRIVATE-
+    // only wake (the old bug) missed every glibc/musl joiner and quietly
+    // degraded each join to the ~10 ms timer backstop — a lost-wake-shaped
+    // stall that surfaced as the CachyOS Plasma greeter hang (Qt threads never
+    // rejoining). `fire_clear_child_tid_on_exit` now wakes BOTH namespaces:
+    // the recorded PRIVATE one (serves any private waiter on the word) AND the
+    // SHARED (namespace 0) one (the real Linux/glibc/musl target). This test
+    // therefore asserts BOTH counters bump — the shared assertion is the
+    // regression guard for the private-only bug; don't remove it.
+    let private_ns = Arc::as_ptr(&parent_as) as usize as u64;
+    let pre_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
+    let pre_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
 
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
-    // ca.child_tid.
+    // ca.child_tid in both namespaces.
     crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
 
-    let post = crate::handlers::__test_futex_wake_counter_scoped(namespace, ca.child_tid);
-    if post <= pre {
+    let post_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
+    let post_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
+    if post_private <= pre_private {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
-        return TestResult::Fail("CLONE_CHILD_CLEARTID exit did not bump futex counter");
+        return TestResult::Fail(
+            "CLONE_CHILD_CLEARTID exit did not bump the PRIVATE futex counter",
+        );
+    }
+    if post_shared <= pre_shared {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail(
+            "CLONE_CHILD_CLEARTID exit did not bump the SHARED (namespace-0) futex \
+             counter — Linux's mm_release wake carries no FUTEX_PRIVATE_FLAG and \
+             glibc pthread_join waits shared, so a private-only wake strands the join",
+        );
     }
 
     // The slot should be drained (single-shot per Linux semantics).
@@ -4832,3 +4950,442 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("userspace/process", smoke_process_coredump_e2e);
+
+// ── waitid(2) blocking-path smokes ────────────────────────────────────
+//
+// The CachyOS bring-up wedge that motivated these: the park census
+// repeatedly caught a parent parked in `waitid(pid, WEXITED)` whose child
+// was already `TASK_ZOMBIE`, with the whole boot stalled behind it
+// (systemd's first transaction, then journald, then systemd-remount-fs).
+// Two orderings can produce that, and they fail for different reasons, so
+// both are pinned here:
+//
+//   (A) the child exits BEFORE the parent calls waitid — the reap has to
+//       come off `PENDING_EXITS` on the fast path and never park at all;
+//   (B) the parent registers its wait-child waker BEFORE the child exits —
+//       `on_child_exit` has to fire that waker, or the park is unbounded.
+//
+// (B) is the one with no backstop: `own_stack_wait_child` arms no timer,
+// so a wake that never arrives is a permanent strand (and it does not tick
+// `dbg_park_checks` either, which is exactly why the census could not tell
+// a stranded waiter from a healthy idle one).
+//
+// Linux ref: kernel/exit.c::do_wait / do_notify_parent.
+
+/// waitid siginfo_t field offsets on LP64: si_signo@0, si_code@8,
+/// si_pid@16, si_status@24. Mirrors `encode_waitid_siginfo`.
+fn waitid_siginfo_fields(si: &[u8; 128]) -> (i32, i32, i32, i32) {
+    (
+        i32::from_ne_bytes(si[0..4].try_into().unwrap()), // si_signo
+        i32::from_ne_bytes(si[8..12].try_into().unwrap()), // si_code
+        i32::from_ne_bytes(si[16..20].try_into().unwrap()), // si_pid
+        i32::from_ne_bytes(si[24..28].try_into().unwrap()), // si_status
+    )
+}
+
+fn smoke_waitid_blocking_reaps_child_that_already_exited() -> TestResult {
+    // Kernel-test fixture: passes kernel stack pointers as stand-in user
+    // buffers, so the scoped opt-in is what keeps `validate_user_range`
+    // strict for real syscalls. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    const PARENT: u64 = 0xF0_51;
+    const CHILD: u64 = 0xC0_51;
+    const P_PID: u64 = 1;
+    const WEXITED: u64 = 4;
+    const SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Child exits FIRST, with a non-zero exit code so si_status is not
+    // confusable with a zeroed siginfo_t.
+    crate::handlers::stage_pending_termination(CHILD, 3 << 8);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
+
+    // Blocking waitid(P_PID, CHILD, &info, WEXITED, NULL) — no WNOHANG.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut si = [0u8; 128];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: P_PID,
+            arg1: CHILD,
+            arg2: si.as_mut_ptr() as u64,
+            arg3: WEXITED,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Waitid.raw(), &mut ctx);
+
+    let verdict = (|| {
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+            // -ECHILD here is the wedge: waitid could not see an exit that
+            // is already queued, so a real parent would have parked instead.
+            Some(r) if r.status == SyscallReturn::OK => {
+                return Err("waitid on an already-exited child did not return 0")
+            }
+            _ => return Err("waitid returned a non-OK NARF status"),
+        }
+        let (signo, code, pid, status) = waitid_siginfo_fields(&si);
+        if signo != SIGCHLD {
+            return Err("waitid siginfo si_signo was not SIGCHLD");
+        }
+        if code != CLD_EXITED {
+            return Err("waitid siginfo si_code was not CLD_EXITED");
+        }
+        if pid as u64 != CHILD {
+            return Err("waitid siginfo si_pid did not name the reaped child");
+        }
+        if status != 3 {
+            return Err("waitid siginfo si_status did not carry the exit code");
+        }
+        Ok(())
+    })();
+
+    teardown_process_state();
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_waitid_blocking_reaps_child_that_already_exited
+);
+
+/// Waker that records whether it was woken, so a test can assert the
+/// child-exit path actually fired the parent's registered waker rather
+/// than merely queueing the exit somewhere.
+mod wake_probe {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    pub static WOKEN: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn clone_fn(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    unsafe fn wake_fn(_p: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
+    unsafe fn drop_fn(_p: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_fn, wake_fn, wake_fn, drop_fn);
+
+    pub fn waker() -> Waker {
+        WOKEN.store(false, Ordering::Release);
+        // SAFETY: the vtable's fns ignore the data pointer entirely and
+        // only touch the static above, so a dangling `null` payload is
+        // never dereferenced.
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    }
+}
+
+fn smoke_waitid_child_exit_wakes_parked_parent() -> TestResult {
+    const PARENT: u64 = 0xF0_52;
+    const CHILD: u64 = 0xC0_52;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Parent is parked: its waker is registered and no exit is queued yet.
+    // This is the ordering with no timer backstop — if `on_child_exit`
+    // does not fire this waker, the parent never runs again.
+    crate::user_task::register_wait_child_waker(PARENT, wake_probe::waker());
+
+    let verdict = (|| {
+        let mut status = 0i32;
+        if crate::user_task::call_wait_child_check(PARENT, -1, 0, &mut status) != 0 {
+            return Err("precondition: nothing should be reapable before the child exits");
+        }
+        if wake_probe::WOKEN.load(Ordering::Acquire) {
+            return Err("precondition: the waker fired before any child exited");
+        }
+
+        // Child exits while the parent is parked.
+        crate::handlers::stage_pending_termination(CHILD, 5 << 8);
+        crate::user_task::notify_task_exited(CHILD, CHILD);
+
+        if !wake_probe::WOKEN.load(Ordering::Acquire) {
+            return Err("child exit did not wake the parent parked in waitid/wait4");
+        }
+        // The wake is only useful if the re-check now finds the child: a
+        // waker that fires onto an empty queue re-parks immediately.
+        let mut status = 0i32;
+        let reaped = crate::user_task::call_wait_child_check(PARENT, -1, 0, &mut status);
+        if reaped as u64 != CHILD {
+            return Err("post-wake re-check did not report the exited child");
+        }
+        if status != 5 << 8 {
+            return Err("post-wake re-check reported the wrong wstatus");
+        }
+        Ok(())
+    })();
+
+    crate::user_task::drop_wait_child_waker(PARENT);
+    teardown_process_state();
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_waitid_child_exit_wakes_parked_parent
+);
+
+// ── fork(2) process identity ─────────────────────────────────────────
+//
+// A forked child's `getpid()` must equal the pid its parent received from
+// fork, and its `getppid()` must equal the parent's `getpid()`. POSIX
+// requires the agreement; more practically, every process-tracking daemon
+// depends on it — systemd's `getpid_cached()` is reset in the child by
+// `safe_fork()` and then used for its log prefix, its sd_notify identity and
+// its own pid file, and udev's worker compares `si->ssi_pid` against
+// `worker->manager_pid` obtained this way.
+//
+// This was reasoned about from the source twice during the CachyOS bring-up
+// and got a wrong answer both times — once concluding the child inherited the
+// parent's pid (it does not) — which is exactly why it belongs in a test
+// rather than in a comment.
+//
+// Linux ref: kernel/fork.c::copy_process (the child's tgid is its own).
+
+// x86_64-only: uses the arch-gated PROC_PARENT_AS + AddressSpace::new_for_user,
+// matching the x86_64-gated kernel_test_in! registration below.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_fork_child_pid_identity() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_60;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let getpid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+    let getppid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPpid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        let parent_pid = getpid_now();
+        if parent_pid != PARENT {
+            return Err("parent getpid() did not report its own registered pid");
+        }
+
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+        let child_pid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("fork did not return a child pid to the parent"),
+        };
+        if child_pid == parent_pid {
+            return Err("fork handed the parent its OWN pid as the child's");
+        }
+
+        // The parent's identity must be untouched by having forked.
+        if getpid_now() != parent_pid {
+            return Err("parent getpid() changed across fork()");
+        }
+
+        let child_task = match crate::handlers::pid_to_task_raw(child_pid) {
+            Some(t) => t,
+            None => return Err("fork registered no PID->TaskId mapping for the child"),
+        };
+        if child_task == PARENT {
+            return Err("fork reused the parent's TaskId for the child");
+        }
+
+        // Now speak as the child.
+        LOOKUP_TASK.store(child_task, Ordering::Relaxed);
+        let seen = getpid_now();
+        if seen == parent_pid {
+            return Err("child getpid() returned the PARENT's pid");
+        }
+        if seen != child_pid {
+            return Err("child getpid() did not match the pid fork returned to the parent");
+        }
+        // Stable across calls — a one-shot answer would still break a daemon
+        // that caches it once and compares later.
+        if getpid_now() != child_pid {
+            return Err("child getpid() is not stable across calls");
+        }
+        if getppid_now() != parent_pid {
+            return Err("child getppid() did not report the parent's pid");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_fork_child_pid_identity);
+
+/// `CLONE_THREAD` creates a THREAD, not a process: it shares the caller's
+/// pid while getting its own TaskId. `getpid()` must therefore return the
+/// SAME value from both, even though `clone` handed the caller a distinct
+/// tid.
+///
+/// The pairing with the fork test above is the point. fork must give the
+/// child a NEW pid; CLONE_THREAD must NOT. A `getpid` implementation that
+/// simply returned the TaskId would pass neither, and one that always
+/// returned the group leader's pid would pass this and fail fork — so the
+/// two together pin the actual contract rather than one convenient half.
+///
+/// Linux ref: kernel/fork.c — a CLONE_THREAD child joins the caller's
+/// thread group, so `task_tgid_vnr()` (what getpid reports) is unchanged.
+// x86_64-only: uses the arch-gated PROC_PARENT_AS + AddressSpace::new_for_user,
+// matching the x86_64-gated kernel_test_in! registration below.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_clone_thread_shares_pid() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_61;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: see the fork test above — paging is live by the time smokes run.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let getpid_now = || -> u64 {
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::GetPid.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(u64::MAX)
+    };
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        let parent_pid = getpid_now();
+
+        // clone3 with a stack — the shape the desktop actually uses, and the
+        // one the sibling CLONE_SIGHAND smoke drives.
+        #[repr(C)]
+        #[derive(Default)]
+        struct ThreadCloneArgs {
+            flags: u64,
+            pidfd: u64,
+            child_tid: u64,
+            parent_tid: u64,
+            exit_signal: u64,
+            stack: u64,
+            stack_size: u64,
+            tls: u64,
+        }
+        let ca = ThreadCloneArgs {
+            flags: CLONE_VM | CLONE_SIGHAND | CLONE_THREAD,
+            stack: 0x7fff_fff0_0000,
+            stack_size: 0x1_0000,
+            ..Default::default()
+        };
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: &ca as *const ThreadCloneArgs as u64,
+                arg1: core::mem::size_of::<ThreadCloneArgs>() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+        let thread_tid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("clone3(CLONE_THREAD) did not return a thread tid"),
+        };
+        if thread_tid == PARENT {
+            return Err("clone(CLONE_THREAD) reused the caller's TaskId");
+        }
+
+        // Speak as the new thread: same process, so the same pid.
+        LOOKUP_TASK.store(thread_tid, Ordering::Relaxed);
+        let seen = getpid_now();
+        if seen != parent_pid {
+            return Err("CLONE_THREAD thread getpid() did not report the shared process pid");
+        }
+
+        // And the creator is unaffected.
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        if getpid_now() != parent_pid {
+            return Err("creator getpid() changed after CLONE_THREAD");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(m) => TestResult::Fail(m),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_clone_thread_shares_pid);

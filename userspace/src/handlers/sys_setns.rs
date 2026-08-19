@@ -8,9 +8,7 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
         let target = args.arg0;
         let nstype = args.arg1;
         const CLONE_NEWNS: u64 = 0x00020000;
-        const CLONE_NEWPID: u64 = 0x20000000;
         let caller = current_task_id();
-        let mut any = false;
 
         // ── fd-based setns (Linux primary path) ──────────────────
         //
@@ -57,96 +55,17 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
             return;
         }
 
-        // ── Legacy NARF TaskId path (kept for existing tests) ─────
-        //
-        // Resolve target: prefer outer-pid lookup, fall back to
-        // treating `target` as an outer TaskId directly.
-        let target_task = pid_to_task_raw(target).unwrap_or(target);
-
-        if nstype & CLONE_NEWPID != 0 {
-            match crate::pid_ns::ns_of(target_task) {
-                Some(ns) => {
-                    let outer = task_to_pid_raw(caller).unwrap_or(caller);
-                    let _ = crate::pid_ns::attach_to_ns(caller, outer, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        if nstype & CLONE_NEWNS != 0 {
-            match mount_namespace_of(target_task) {
-                Some(ns) => {
-                    install_mount_namespace(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        // Wave-72 — UTS / NET / IPC. Target must have an explicit
-        // per-task NS of the requested flavour; otherwise EINVAL.
-        if nstype & crate::namespaces::CLONE_NEWUTS != 0 {
-            match crate::namespaces::uts_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_uts(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWNET != 0 {
-            match crate::namespaces::net_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_net(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWIPC != 0 {
-            match crate::namespaces::ipc_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_ipc(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-        if nstype & crate::namespaces::CLONE_NEWUSER != 0 {
-            match crate::namespaces::user_ns_of(target_task) {
-                Some(ns) => {
-                    crate::namespaces::setns_user(caller, ns);
-                    any = true;
-                }
-                None => {
-                    ctx.set_return(SyscallReturn::ok(!0u64));
-                    return;
-                }
-            }
-        }
-
-        if !any {
-            // No supported nstype bits — Linux returns EINVAL.
-            ctx.set_return(SyscallReturn::ok(!0u64));
-            return;
-        }
-        ctx.set_return(SyscallReturn::ok(0));
+        // arg0 did not resolve to a namespace fd. Linux setns(2) requires an fd
+        // that refers to a namespace (opened from /proc/<pid>/ns/<flavour> or a
+        // pidfd); a bad or wrong-type fd is EBADF/EINVAL — never a pid. The old
+        // "legacy TaskId path" reinterpreted the fd NUMBER as an outer pid and
+        // joined that process's namespaces with NO pid-namespace translation — a
+        // containment hazard reachable by any caller passing a stray integer,
+        // and non-Linux. No caller or test depended on it (#34), so reject.
+        // NARF returns the bare -1 sentinel here; the LINUX-GAP is only the
+        // specific EBADF-vs-EINVAL split.
+        let _ = (target, nstype, caller);
+        ctx.set_return(SyscallReturn::ok(!0u64));
     }
     #[cfg(not(feature = "container"))]
     {

@@ -53,6 +53,8 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     };
     match result {
         crate::socket::SocketOpResult::Received { n, peer } => {
+            #[cfg(feature = "syscall-trace")]
+            crate::socket::dbg_dbus_peek("RX", &staging[..n]);
             // Kernel output field: clear caller stack contents before
             // ancillary/data truncation paths OR their flags into it.
             write_user_u32(msg_ptr + 48, 0);

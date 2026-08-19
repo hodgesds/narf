@@ -50,14 +50,13 @@ pub enum RootSelector {
 
 impl RootSelector {
     /// Parse the first `root=...` token from a kernel cmdline.
-    /// Returns `None` if no `root=` is present.
+    /// Returns `None` if no `root=` is present. Token discovery goes
+    /// through the single structured parser ([`narf_boot::KernelCmdline`]);
+    /// this function only maps the `root=` value onto a selector variant.
     pub fn from_cmdline(cmdline: &str) -> Option<Self> {
-        for tok in cmdline.split_ascii_whitespace() {
-            if let Some(rest) = tok.strip_prefix("root=") {
-                return Self::parse(rest);
-            }
-        }
-        None
+        narf_boot::KernelCmdline::new(cmdline)
+            .value("root")
+            .and_then(Self::parse)
     }
 
     /// Parse a single `root=` value (the part after the `=`).

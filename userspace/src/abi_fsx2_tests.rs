@@ -1514,6 +1514,249 @@ kernel_test_in!(
     smoke_abi_fsx2_move_mount_private_namespace_pos
 );
 
+/// Directory-MUTATION syscalls must resolve through the caller's mount
+/// namespace, exactly as `open` already does.
+///
+/// `open`/`read` go through `current_resolve_absolute()`, which consults the
+/// task's `MountNamespace` and falls back to the global registry. Every
+/// directory-mutation syscall — rename, renameat2, unlink, rmdir, symlink —
+/// instead calls `registry().resolve_parent_absolute()` directly, because no
+/// namespace-aware `current_resolve_parent_absolute` exists. A task in a
+/// private mount namespace can therefore CREATE a file it cannot afterwards
+/// rename or unlink: the parent resolves for one call and not the other.
+///
+/// This is what breaks udev. `systemd-udevd` runs with `PrivateMounts=yes`,
+/// and `sd-device` publishes a database entry by writing
+/// `/run/udev/data/.#<id><random>` and renaming it onto `/run/udev/data/<id>`.
+/// The write succeeds, the rename returns ENOENT because the parent is
+/// invisible to the global registry, and udevd reports "Failed to rename
+/// temporary database file ... No such file or directory" for every device.
+/// The same gap takes out its `/dev/char/<major>:<minor>` symlinks and
+/// `/run/udev/watch/`.
+fn smoke_abi_fsx2_rename_resolves_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            // Mounted ONLY in this namespace — the global registry never
+            // learns about it, which is the whole point.
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsdata", &[]));
+            if ns.mount_arc(&auth, "/abi-nsdata", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+
+            // sd-device's publish shape: create the temporary, then rename.
+            let tmp = b"/abi-nsdata/.#c226:0e270627d7a3faea1\0";
+            let fin = b"/abi-nsdata/c226:0\0";
+            let fd = call_open(tmp.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+            if fd < 0 {
+                return Err("open(O_CREAT) could not create a file in the private namespace");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+            let r = call(
+                Syscall::Rename.raw(),
+                a1(tmp.as_ptr() as u64, fin.as_ptr() as u64),
+            );
+            match r {
+                Some(0) => {}
+                Some(-2) => {
+                    return Err(
+                        "rename reported ENOENT for a file open() had just created — directory-mutation syscalls bypass the task's mount namespace",
+                    )
+                }
+                _ => return Err("rename in a private mount namespace did not succeed"),
+            }
+            // And the result must be visible under its new name.
+            let check = call_open(fin.as_ptr() as u64, 0).unwrap_or(-1);
+            if check < 0 {
+                return Err("renamed file is not openable under its final name");
+            }
+            let _ = call(Syscall::Close.raw(), a0(check as u64));
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_rename_resolves_in_private_mount_namespace
+);
+
+/// The rest of the directory-mutation family must resolve in the caller's
+/// mount namespace too — `renameat2`, `unlink`, `rmdir` and `symlink` were
+/// all routed through `current_resolve_parent_absolute()` alongside `rename`,
+/// and a fix proven on one syscall proves nothing about the other four.
+///
+/// Each arm here would report ENOENT against the global registry, because
+/// the mount exists only in this task's namespace.
+fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        const RENAME_NOREPLACE: u64 = 1;
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsmut", &[]));
+            if ns.mount_arc(&auth, "/abi-nsmut", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+
+            let make = |path: &[u8]| -> bool {
+                let fd = call_open(path.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+                if fd < 0 {
+                    return false;
+                }
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                true
+            };
+
+            // renameat2(RENAME_NOREPLACE)
+            let a = b"/abi-nsmut/r2-src\0";
+            let b = b"/abi-nsmut/r2-dst\0";
+            if !make(a) {
+                return Err("could not create the renameat2 source");
+            }
+            let r = call_raw(
+                Syscall::Renameat2.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: a.as_ptr() as u64,
+                    arg2: AT_FDCWD,
+                    arg3: b.as_ptr() as u64,
+                    arg4: RENAME_NOREPLACE,
+                    arg5: 0,
+                },
+            );
+            if r.value as i64 != 0 {
+                return Err("renameat2 did not resolve in the private mount namespace");
+            }
+
+            // unlink
+            let u = b"/abi-nsmut/to-unlink\0";
+            if !make(u) {
+                return Err("could not create the unlink target");
+            }
+            if call(Syscall::Unlink.raw(), a0(u.as_ptr() as u64)) != Some(0) {
+                return Err("unlink did not resolve in the private mount namespace");
+            }
+            if call_open(u.as_ptr() as u64, 0).unwrap_or(-1) >= 0 {
+                return Err("unlink reported success but the file is still there");
+            }
+
+            // symlink
+            let link = b"/abi-nsmut/a-link\0";
+            let target = b"r2-dst\0";
+            if call(
+                Syscall::Symlink.raw(),
+                a1(target.as_ptr() as u64, link.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("symlink did not resolve in the private mount namespace");
+            }
+
+            // rmdir
+            let d = b"/abi-nsmut/a-dir\0";
+            if call(Syscall::Mkdir.raw(), a1(d.as_ptr() as u64, 0o755)) != Some(0) {
+                return Err("mkdir did not resolve in the private mount namespace");
+            }
+            if call(Syscall::Rmdir.raw(), a0(d.as_ptr() as u64)) != Some(0) {
+                return Err("rmdir did not resolve in the private mount namespace");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace
+);
+
+/// Cross-DIRECTORY rename must resolve in the caller's mount namespace too.
+///
+/// `cross_dir_rename` takes a different path from the same-directory case —
+/// `resolve_two_parents_absolute`, whose same-mount check IS the EXDEV test —
+/// so it needed its own namespace-aware twin and its own test. Leaving it on
+/// the global registry would have kept exactly the udev-class bug alive for
+/// any rename that moves a name between two directories.
+fn smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        let result = (|| {
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("private mount namespace setup failed");
+            }
+            let ns = match crate::handlers::current_mount_namespace() {
+                Some(ns) => ns,
+                None => return Err("unshare did not install a mount namespace"),
+            };
+            let auth = narf_filesystem::bootstrap_mount_authority();
+            let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                alloc::sync::Arc::new(narf_filesystem::MemFs::with_seeds("nsxdir", &[]));
+            if ns.mount_arc(&auth, "/abi-nsxdir", fs).is_err() {
+                return Err("private-namespace mount setup failed");
+            }
+            for dir in [b"/abi-nsxdir/from\0".as_ref(), b"/abi-nsxdir/to\0".as_ref()] {
+                if call(Syscall::Mkdir.raw(), a1(dir.as_ptr() as u64, 0o755)) != Some(0) {
+                    return Err("mkdir of a cross-directory rename endpoint failed");
+                }
+            }
+            let src = b"/abi-nsxdir/from/entry\0";
+            let dst = b"/abi-nsxdir/to/entry\0";
+            let fd = call_open(src.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+            if fd < 0 {
+                return Err("could not create the cross-directory rename source");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+            match call(
+                Syscall::Rename.raw(),
+                a1(src.as_ptr() as u64, dst.as_ptr() as u64),
+            ) {
+                Some(0) => {}
+                Some(-2) => {
+                    return Err(
+                        "cross-directory rename reported ENOENT — cross_dir_rename bypasses the task's mount namespace",
+                    )
+                }
+                _ => return Err("cross-directory rename in a private namespace did not succeed"),
+            }
+            if call_open(dst.as_ptr() as u64, 0).unwrap_or(-1) < 0 {
+                return Err("cross-directory renamed file is not openable at its destination");
+            }
+            Ok(())
+        })();
+        crate::handlers::clear_current_mount_namespace_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace
+);
+
 fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;

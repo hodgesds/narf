@@ -208,6 +208,12 @@ impl Ring {
 
 static UEVENT_RING: IrqSafeSpinLock<Ring> = IrqSafeSpinLock::new(Ring::new());
 
+// First sequence number in the deliberately replayable boot-coldplug window.
+// It is set only after the relevant sysfs device model is complete. Earlier
+// bring-up uevents can predate their final kobjects and are not safe to replay
+// to a daemon that starts later in boot.
+static BOOT_UDEVD_REPLAY_START: AtomicUsize = AtomicUsize::new(0);
+
 // ── Public API ────────────────────────────────────────────────────────
 
 /// Emit a uevent into the ring.  Called by `kobject_emit_uevent`.
@@ -242,9 +248,86 @@ pub fn ring_len() -> usize {
     UEVENT_RING.lock().len()
 }
 
+/// Boot-coldplug replay health: `(replay_start, next_seqnum, ring_len,
+/// overrun)`. `replay_start` is 0 when no boot window was marked.
+///
+/// `overrun` is the load-bearing field: it is true once the oldest event
+/// still in the ring is NEWER than the replay boundary, which means part of
+/// the bounded coldplug window this boundary exists to preserve has already
+/// been evicted. A `systemd-udevd` started after that point silently resumes
+/// at the oldest survivor — `read_from` skips the gap and reports nothing
+/// unusual — so the daemon cannot distinguish "no devices to process" from
+/// "your device ADDs were dropped". Reported once at end of boot precisely
+/// because it is otherwise invisible from inside the guest.
+pub fn boot_replay_health() -> (u64, u64, usize, bool) {
+    let start = BOOT_UDEVD_REPLAY_START.load(Ordering::Acquire) as u64;
+    let ring = UEVENT_RING.lock();
+    let oldest = ring.entries.front().map(|e| e.seqnum);
+    let overrun = start != 0 && oldest.is_some_and(|o| o > start);
+    (start, ring.next_seqnum, ring.entries.len(), overrun)
+}
+
+/// `(seqnum, action, subsystem, devpath)` for every event still in the ring,
+/// oldest first, capped at `max`.
+///
+/// The counts from [`boot_replay_health`] say how much udevd was handed, not
+/// WHAT — and "udevd has events but writes no database" and "udevd was never
+/// told about the device it needs" look identical from outside. A boot
+/// coldplug is a handful of events, so listing them outright is cheaper than
+/// inferring the answer from the daemon's behaviour.
+pub fn boot_replay_dump(max: usize) -> Vec<(u64, &'static str, String, String)> {
+    let ring = UEVENT_RING.lock();
+    ring.entries
+        .iter()
+        .take(max)
+        .map(|e| {
+            (
+                e.seqnum,
+                e.action.as_str(),
+                e.subsystem.clone(),
+                e.devpath.clone(),
+            )
+        })
+        .collect()
+}
+
 /// The seqnum that the *next* emit will assign.
 pub fn next_seqnum() -> u64 {
     UEVENT_RING.lock().next_seqnum()
+}
+
+/// Begin (or extend) the bounded boot coldplug window consumed by
+/// `systemd-udevd`.
+///
+/// Call this after a sysfs device projection is complete and immediately
+/// before its corresponding ADD events. The first caller owns the replay
+/// boundary: later completed projections keep that earlier boundary instead
+/// of moving it forward and silently dropping already-queued devices. Normal
+/// uevent monitors remain tail-only.
+pub fn begin_boot_udevd_replay() -> u64 {
+    let start = next_seqnum();
+    match BOOT_UDEVD_REPLAY_START.compare_exchange(
+        0,
+        start as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => start,
+        Err(existing) => existing as u64,
+    }
+}
+
+/// Reader for the bounded boot coldplug window.
+///
+/// If boot did not mark such a window, retain ordinary tail-only netlink
+/// semantics instead of replaying arbitrary early bring-up events.
+pub fn boot_udevd_replay_reader() -> UeventReader {
+    let start = BOOT_UDEVD_REPLAY_START.load(Ordering::Acquire) as u64;
+    if start == 0 {
+        UeventReader::new()
+    } else {
+        UeventReader { next_seqnum: start }
+    }
 }
 
 // ── UeventReader ──────────────────────────────────────────────────────
@@ -351,4 +434,5 @@ pub fn __reset_for_test() {
     let mut ring = UEVENT_RING.lock();
     ring.entries.clear();
     ring.next_seqnum = 1;
+    BOOT_UDEVD_REPLAY_START.store(0, Ordering::Release);
 }

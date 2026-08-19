@@ -24,7 +24,7 @@ mod tests;
 pub use wall::{
     begin_leap_smear, cyc_to_ns_mult_shift, cycles_per_ns, cycles_to_ns, monotonic_ns, now_wall,
     ns_to_cycles, set_clock_hz, set_cycles_per_ns, set_wall_offset, set_wall_offset_uncapped,
-    WallClock, WallError, WallInstant,
+    wall_offset_ns, WallClock, WallError, WallInstant,
 };
 
 use core::future::Future;

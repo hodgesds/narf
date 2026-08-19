@@ -120,6 +120,8 @@ pub const fn ioc_size(cmd: u32) -> u32 {
 
 /// Linux DRM ioctl type byte — `DRM_IOCTL_BASE` in `drm.h`.
 pub const DRM_IOCTL_BASE: u32 = b'd' as u32;
+/// Driver-private DRM command base. VirtIO-GPU's UAPI uses this range.
+pub const DRM_COMMAND_BASE: u32 = 0x40;
 
 // ── Struct sizes (from `linux/include/uapi/drm/drm.h`) ────────────────
 //
@@ -250,6 +252,116 @@ pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = iowr(DRM_IOCTL_BASE, 0xC2, SZ_DR
 
 /// DRM_IOCTL_SYNCOBJ_WAIT = _IOWR('d', 0xc3, struct drm_syncobj_wait).
 pub const DRM_IOCTL_SYNCOBJ_WAIT: u32 = iowr(DRM_IOCTL_BASE, 0xC3, SZ_DRM_SYNCOBJ_WAIT);
+
+// ── VirtIO-GPU render-node ioctl numbers ─────────────────────────────
+// Layouts match libdrm's `virtgpu_drm.h`; these are deliberately kept here
+// rather than in userspace so the ioctl size is checked at the kernel gate.
+pub const DRM_IOCTL_VIRTGPU_MAP: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x01, 16);
+pub const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x02, 64);
+pub const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x03, 16);
+pub const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u32 =
+    iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x04, 56);
+pub const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x05, 16);
+pub const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 =
+    iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x07, 48);
+pub const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x09, 24);
+pub const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x0b, 16);
+
+/// `struct drm_virtgpu_map`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuMapUapi {
+    pub offset: u64,
+    pub handle: u32,
+    pub pad: u32,
+}
+/// `struct drm_virtgpu_getparam`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuGetParamUapi {
+    pub param: u64,
+    pub value: u64,
+}
+/// `struct drm_virtgpu_resource_create`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuResourceCreateUapi {
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+    pub bo_handle: u32,
+    pub res_handle: u32,
+    pub size: u32,
+    pub stride: u32,
+}
+/// `struct drm_virtgpu_resource_info`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuResourceInfoUapi {
+    pub bo_handle: u32,
+    pub res_handle: u32,
+    pub size: u32,
+    pub blob_mem: u32,
+}
+/// `struct drm_virtgpu_context_init`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuContextInitUapi {
+    pub num_params: u32,
+    pub pad: u32,
+    pub ctx_set_params: u64,
+}
+/// `struct drm_virtgpu_execbuffer` (fence and syncobj fields are rejected in
+/// v1; command and BO handle pointers are copied before transport submission).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuExecBufferUapi {
+    pub flags: u32,
+    pub size: u32,
+    pub command: u64,
+    pub bo_handles: u64,
+    pub num_bo_handles: u32,
+    pub fence_fd: i32,
+    pub ring_idx: u32,
+    pub syncobj_stride: u32,
+    pub num_in_syncobjs: u32,
+    pub num_out_syncobjs: u32,
+    pub in_syncobjs: u64,
+    pub out_syncobjs: u64,
+}
+/// `struct drm_virtgpu_3d_transfer_to_host`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuTransferToHostUapi {
+    pub bo_handle: u32,
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub w: u32,
+    pub h: u32,
+    pub d: u32,
+    pub level: u32,
+    pub offset: u32,
+    pub stride: u32,
+    pub layer_stride: u32,
+}
+/// `struct drm_virtgpu_get_caps`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuGetCapsUapi {
+    pub cap_set_id: u32,
+    pub cap_set_ver: u32,
+    pub addr: u64,
+    pub size: u32,
+    pub pad: u32,
+}
 
 // ── DRM_IOCTL_* wire-format struct mirrors ─────────────────────────────
 //

@@ -19,6 +19,18 @@ pub const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
 pub const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
 pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+pub const VIRTIO_GPU_CMD_GET_CAPSET: u32 = 0x0109;
+
+// VirGL 3D commands (VirtIO 1.2 §5.7.6.8). These commands are valid only
+// when VIRTIO_GPU_F_VIRGL was negotiated at device bring-up.
+pub const VIRTIO_GPU_CMD_CTX_CREATE: u32 = 0x0200;
+pub const VIRTIO_GPU_CMD_CTX_DESTROY: u32 = 0x0201;
+pub const VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+pub const VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
+pub const VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
+pub const VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
+pub const VIRTIO_GPU_CMD_SUBMIT_3D: u32 = 0x0207;
 
 pub const HDR_LEN: usize = 24;
 
@@ -61,6 +73,14 @@ pub const GET_DISPLAY_INFO_LEN: usize = HDR_LEN;
 
 pub fn build_get_display_info(out: &mut [u8]) {
     put_hdr(out, VIRTIO_GPU_CMD_GET_DISPLAY_INFO, 0, 0, 0);
+}
+
+pub const GET_CAPSET_LEN: usize = HDR_LEN + 8;
+
+pub fn build_get_capset(out: &mut [u8], capset_id: u32, capset_version: u32) {
+    put_hdr(out, VIRTIO_GPU_CMD_GET_CAPSET, 0, 0, 0);
+    out[24..28].copy_from_slice(&capset_id.to_le_bytes());
+    out[28..32].copy_from_slice(&capset_version.to_le_bytes());
 }
 
 // ── RESOURCE_CREATE_2D (§5.7.6.8) ──────────────────────────────────
@@ -239,4 +259,131 @@ pub fn decode_resource_flush(buf: &[u8]) -> ResourceFlush {
         height: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
         resource_id: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
     }
+}
+
+// ── VirGL 3D command builders (§5.7.6.8) ──────────────────────────
+
+/// Context creation payload. `debug_name` is limited to the 64-byte wire
+/// field and is copied without a trailing NUL (the length is explicit).
+pub const CTX_CREATE_BODY: usize = 72;
+pub const CTX_CREATE_LEN: usize = HDR_LEN + CTX_CREATE_BODY;
+
+pub fn build_ctx_create(out: &mut [u8], ctx_id: u32, debug_name: &[u8]) {
+    assert!(debug_name.len() <= 64);
+    put_hdr(out, VIRTIO_GPU_CMD_CTX_CREATE, 0, 0, ctx_id);
+    out[24..28].copy_from_slice(&(debug_name.len() as u32).to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes()); // context_init
+    out[32..96].fill(0);
+    out[32..32 + debug_name.len()].copy_from_slice(debug_name);
+}
+
+/// Context destroy contains only the standard control header whose ctx_id is
+/// the context being destroyed.
+pub const CTX_DESTROY_LEN: usize = HDR_LEN;
+
+pub fn build_ctx_destroy(out: &mut [u8], ctx_id: u32) {
+    put_hdr(out, VIRTIO_GPU_CMD_CTX_DESTROY, 0, 0, ctx_id);
+}
+
+/// Attach/detach a resource to/from a VirGL context.
+pub const CTX_RESOURCE_LEN: usize = HDR_LEN + 8;
+
+pub fn build_ctx_resource(out: &mut [u8], cmd: u32, ctx_id: u32, resource_id: u32) {
+    assert!(matches!(
+        cmd,
+        VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE | VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE
+    ));
+    put_hdr(out, cmd, 0, 0, ctx_id);
+    out[24..28].copy_from_slice(&resource_id.to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes());
+}
+
+/// Parameters of `RESOURCE_CREATE_3D`. Values are Gallium/virglrenderer
+/// enums supplied by the Mesa virtio driver; the transport does not interpret
+/// or translate them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResourceCreate3D {
+    pub resource_id: u32,
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+}
+
+pub const RESOURCE_CREATE_3D_LEN: usize = HDR_LEN + 48;
+
+pub fn build_resource_create_3d(out: &mut [u8], ctx_id: u32, r: ResourceCreate3D) {
+    put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, 0, 0, ctx_id);
+    let fields = [
+        r.resource_id,
+        r.target,
+        r.format,
+        r.bind,
+        r.width,
+        r.height,
+        r.depth,
+        r.array_size,
+        r.last_level,
+        r.nr_samples,
+        r.flags,
+        0,
+    ];
+    for (index, value) in fields.into_iter().enumerate() {
+        let start = HDR_LEN + index * 4;
+        out[start..start + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Build a `SUBMIT_3D` header and copy its opaque virgl command stream.
+/// The command stream immediately follows the 8-byte submit body.
+pub const SUBMIT_3D_PREFIX_LEN: usize = HDR_LEN + 8;
+
+pub fn build_submit_3d(out: &mut [u8], ctx_id: u32, commands: &[u8]) {
+    assert!(out.len() >= SUBMIT_3D_PREFIX_LEN + commands.len());
+    put_hdr(out, VIRTIO_GPU_CMD_SUBMIT_3D, 0, 0, ctx_id);
+    out[24..28].copy_from_slice(&(commands.len() as u32).to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes());
+    out[32..32 + commands.len()].copy_from_slice(commands);
+}
+
+/// A 3D transfer box shared by the host-to-guest and guest-to-host commands.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Transfer3D {
+    pub resource_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub offset: u64,
+    pub level: u32,
+    pub stride: u32,
+    pub layer_stride: u32,
+}
+
+pub const TRANSFER_3D_LEN: usize = HDR_LEN + 48;
+
+pub fn build_transfer_3d(out: &mut [u8], cmd: u32, ctx_id: u32, t: Transfer3D) {
+    assert!(matches!(
+        cmd,
+        VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D | VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D
+    ));
+    put_hdr(out, cmd, 0, 0, ctx_id);
+    let words = [t.x, t.y, t.z, t.width, t.height, t.depth];
+    for (index, word) in words.into_iter().enumerate() {
+        let start = HDR_LEN + index * 4;
+        out[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out[48..56].copy_from_slice(&t.offset.to_le_bytes());
+    out[56..60].copy_from_slice(&t.resource_id.to_le_bytes());
+    out[60..64].copy_from_slice(&t.level.to_le_bytes());
+    out[64..68].copy_from_slice(&t.stride.to_le_bytes());
+    out[68..72].copy_from_slice(&t.layer_stride.to_le_bytes());
 }

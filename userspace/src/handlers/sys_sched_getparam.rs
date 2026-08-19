@@ -10,7 +10,19 @@ pub(crate) fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let task = if pid == 0 { current_task_id() } else { pid };
+    // `pid` is resolved in the CALLER's pid namespace (Linux
+    // kernel/sched/syscalls.c), like sys_sched_getaffinity. Translate
+    // inner -> outer -> TaskId before keying the sched-param table. Audit
+    // finding #18.
+    let task = if pid == 0 {
+        current_task_id()
+    } else {
+        let Some(outer) = accept_pid_from(current_task_id(), pid) else {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            return;
+        };
+        proc_pid_to_tid(outer)
+    };
     let g = SCHED_PARAM_TABLE.lock();
     let val = g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0);
     // Write one i32 to user space under the SMAP bracket.

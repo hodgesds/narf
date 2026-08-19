@@ -1400,6 +1400,75 @@ fn smoke_abi_fdio_pipe_poll_hup_err() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_poll_hup_err);
 
+/// A pipe half whose PEER closes must PUBLISH a readiness wake, not only flip
+/// its poll mask. Without the wake a reader/writer parked in poll(-1)/
+/// epoll_wait(-1) never re-scans and hangs until the ~10 ms lost-wake backstop
+/// (before that backstop existed, forever). The close travels
+/// `PipeWrite`/`PipeRead::drop`, which latches POLL_HUP/POLL_ERR into the shared
+/// durable readiness cell (waking a waiter armed on it) AND bumps the legacy
+/// generation via `readiness::notify`.
+///
+/// Same two-halves shape as `smoke_abi_socket_connected_pair_peer_close_reports_hup`
+/// and the neighbouring `..._pipe_poll_hup_err` (which covers only the timeout-0
+/// mask, blind to a missing wake): assert the generation bump directly, then the
+/// re-scan's mask. Covers BOTH directions — writer close → reader POLLHUP,
+/// reader close → writer POLLERR.
+fn smoke_abi_fdio_pipe_peer_close_wakes_parked_poller() -> TestResult {
+    with_setup(|| {
+        const POLLIN: i16 = 0x001;
+        const POLLOUT: i16 = 0x004;
+        const POLLERR: i16 = 0x008;
+        const POLLHUP: i16 = 0x010;
+        fn poll1(fd: u32, events: i16) -> Result<i16, &'static str> {
+            let mut pfd = [0u8; 8];
+            pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+            pfd[4..6].copy_from_slice(&events.to_ne_bytes());
+            match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+                Some(n) if n >= 0 => Ok(i16::from_ne_bytes([pfd[6], pfd[7]])),
+                _ => Err("poll failed"),
+            }
+        }
+
+        // Reader parked on an empty pipe: the writer's close must wake it and
+        // then report POLLHUP so it runs read()→0=EOF.
+        let (rd, wr) = make_pipe()?;
+        if poll1(rd, POLLIN)? != 0 {
+            return Err("empty pipe with open writer reported readiness");
+        }
+        let before = narf_net::readiness::generation();
+        if call(Syscall::Close.raw(), a0(wr as u64)) != Some(0) {
+            return Err("closing writer failed");
+        }
+        if narf_net::readiness::generation() <= before {
+            return Err("writer close published no readiness wake for a parked reader");
+        }
+        if poll1(rd, POLLIN)? & POLLHUP == 0 {
+            return Err("writer-closed pipe did not report POLLHUP to the woken reader");
+        }
+        let _ = call(Syscall::Close.raw(), a0(rd as u64));
+
+        // Writer parked on a pipe: the reader's close must wake it and then
+        // report POLLERR (a following write would get EPIPE).
+        let (rd2, wr2) = make_pipe()?;
+        let before = narf_net::readiness::generation();
+        if call(Syscall::Close.raw(), a0(rd2 as u64)) != Some(0) {
+            return Err("closing reader failed");
+        }
+        if narf_net::readiness::generation() <= before {
+            return Err("reader close published no readiness wake for a parked writer");
+        }
+        if poll1(wr2, POLLOUT)? & POLLERR == 0 {
+            return Err("reader-closed pipe write end did not report POLLERR to the woken writer");
+        }
+        let _ = call(Syscall::Close.raw(), a0(wr2 as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe_peer_close_wakes_parked_poller
+);
+
 /// dup2(2) shares the open file description — the duplicate carries the
 /// description's status flags (O_NONBLOCK) and file offset
 /// (`fs/file.c::do_dup2`: both fds point at the same `struct file`).
@@ -1914,3 +1983,71 @@ fn smoke_abi_fdio_setlkw_unlock_wakes_waiters() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_setlkw_unlock_wakes_waiters);
+
+// F_GETLK must report the conflicting lock owner's pid in the CALLER's
+// namespace (Linux locks_translate_pid), not the raw scheduler TaskId the
+// lock table stores. lslocks/sqlite/dpkg read l_pid.
+fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
+    const F_GETLK: u64 = 5;
+    const F_WRLCK: i16 = 1;
+    const FOREIGN_TASK: u64 = 0xF0E1;
+    const FOREIGN_PID: u64 = 0xBEEF; // distinct from the TaskId
+    with_memfs("/lk", "lk", &[("f", b"hi")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/lk/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0), // O_RDWR
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/lk/f, O_RDWR) should succeed"),
+        };
+        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32)
+                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        })
+        .flatten()
+        .ok_or("fd should resolve to an ops key")?;
+
+        // A foreign owner (a TaskId) holds a whole-file write lock; that
+        // TaskId maps to a distinct visible pid.
+        crate::fd::locks::__test_reset();
+        crate::handlers::register_task_to_pid(FOREIGN_TASK, FOREIGN_PID);
+        crate::handlers::register_pid_task_mapping(FOREIGN_PID, FOREIGN_TASK);
+        let foreign = crate::fd::locks::Lock {
+            owner: FOREIGN_TASK,
+            ty: F_WRLCK,
+            start: 0,
+            len: 0,
+        };
+        if crate::fd::locks::try_set(key, foreign).is_err() {
+            return Err("installing the foreign holder should succeed");
+        }
+
+        // F_GETLK with a conflicting request returns the blocker's l_pid.
+        // struct flock: l_type@0(i16) l_whence@2(i16) l_start@8(i64)
+        // l_len@16(i64) l_pid@24(i32).
+        let mut fl = [0u8; 32];
+        fl[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
+        let r = call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_GETLK, fl.as_mut_ptr() as u64),
+        );
+        crate::fd::locks::__test_reset();
+        if r != Some(0) {
+            return Err("F_GETLK should return 0");
+        }
+        let l_pid = i32::from_le_bytes(fl[24..28].try_into().unwrap()) as u64;
+        match l_pid {
+            FOREIGN_PID => Ok(()),
+            FOREIGN_TASK => {
+                Err("F_GETLK reported the raw scheduler TaskId as l_pid instead of the visible pid")
+            }
+            _ => Err("F_GETLK reported an unexpected l_pid"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_getlk_reports_owner_visible_pid
+);

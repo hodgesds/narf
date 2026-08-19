@@ -25,7 +25,9 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 use narf_filesystem::FsError;
+use narf_io::DmaBuffer;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
 use crate::drm::render_node::DrmFileCtx;
@@ -46,13 +48,290 @@ use crate::drm_uapi::{
 /// `count_objs` field can't be used to force a huge allocation.
 const IOCTL_MAX_BUF: usize = 1024 * 1024;
 
+/// One render-node object's private GEM-like resource. It is deliberately
+/// owned by an open file, not the global DRM card: a process cannot submit or
+/// map another process's handle merely by guessing its integer value.
+pub(crate) struct VirtGpuResource {
+    handle: u32,
+    pub(crate) resource_id: u32,
+    buffer: DmaBuffer,
+}
+
+/// Per-open state for `/dev/dri/renderD<N+128>` on the virtio_gpu card.
+///
+/// The state belongs to `DriRenderFile`; it is never shared across opens.
+/// All mutable state is behind a lock because ioctl and mmap can arrive from
+/// different threads sharing the same fd.
+pub struct VirtGpuRenderState {
+    resources: narf_lib::sync::IrqSafeSpinLock<Vec<VirtGpuResource>>,
+    next_handle: AtomicU32,
+}
+
+impl core::fmt::Debug for VirtGpuRenderState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VirtGpuRenderState").finish_non_exhaustive()
+    }
+}
+
+impl VirtGpuRenderState {
+    pub fn new() -> Self {
+        Self {
+            resources: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
+            next_handle: AtomicU32::new(1),
+        }
+    }
+
+    fn find(&self, handle: u32) -> Option<(u32, u64, usize)> {
+        self.resources
+            .lock()
+            .iter()
+            .find(|r| r.handle == handle)
+            .map(|r| (r.resource_id, r.buffer.phys_addr().raw(), r.buffer.len()))
+    }
+
+    pub(crate) fn drain_resources(&self) -> Vec<VirtGpuResource> {
+        core::mem::take(&mut *self.resources.lock())
+    }
+}
+
+impl Default for VirtGpuRenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static NEXT_VIRTGPU_RESOURCE_ID: AtomicU32 = AtomicU32::new(2);
+
+fn read_uapi<T: Copy>(arg: usize) -> Result<T, FsError> {
+    // SAFETY: the ioctl caller supplied `arg`; copy_in constrains the exact
+    // fixed UAPI size and opens an SMAP window for a user address.
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<T>())? };
+    // SAFETY: bytes has exactly one T's byte length; read_unaligned accepts
+    // the Vec<u8> alignment and T is Copy plain UAPI data at every callsite.
+    Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+}
+
+fn write_uapi<T: Copy>(arg: usize, value: T) -> Result<(), FsError> {
+    // SAFETY: Copy UAPI structs are byte-stable and have exactly the source
+    // object size. The same ioctl arg was read/validated before this write.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(&value as *const T as *const u8, core::mem::size_of::<T>())
+    };
+    // SAFETY: see copy_out's contract; size is the fixed UAPI struct length.
+    unsafe { copy_out(arg, bytes) }
+}
+
+/// Dispatch the Mesa/libdrm virtgpu subset on a render-node fd.
+/// Unknown commands intentionally remain ENOTTY: advertising an ioctl that
+/// only partly implements fence or blob semantics causes Mesa to assume a
+/// guarantee the kernel cannot keep.
+pub fn dispatch_virtgpu_render(
+    cmd: u32,
+    arg: usize,
+    state: &VirtGpuRenderState,
+) -> Result<u64, FsError> {
+    use crate::drm_uapi::*;
+    match cmd {
+        DRM_IOCTL_VIRTGPU_GETPARAM => {
+            let mut req: DrmVirtGpuGetParamUapi = read_uapi(arg)?;
+            let available = narf_drivers_virtio::gpu_pci::probed_device()
+                .map(|d| d.virgl_enabled())
+                .unwrap_or(false);
+            req.value = match req.param {
+                // VIRTGPU_PARAM_3D_FEATURES and VIRTGPU_PARAM_CONTEXT_INIT.
+                1 | 6 => u64::from(available),
+                // Blob/host-visible/cross-device are not implemented.
+                _ => 0,
+            };
+            write_uapi(arg, req)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_CONTEXT_INIT => {
+            let _req: DrmVirtGpuContextInitUapi = read_uapi(arg)?;
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            dev.ensure_virgl_context()
+                .map_err(|_| FsError::Unsupported)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => {
+            let mut req: DrmVirtGpuResourceCreateUapi = read_uapi(arg)?;
+            let bytes = if req.size != 0 {
+                req.size as usize
+            } else {
+                (req.width as usize)
+                    .checked_mul(req.height as usize)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or(FsError::InvalidData)?
+            };
+            // The contiguous DMA provider currently guarantees at most 4 MiB.
+            if bytes == 0 || bytes > 4 * 1024 * 1024 {
+                return Err(FsError::InvalidData);
+            }
+            let buffer = narf_io::alloc_coherent(bytes, narf_lib::id::DomainId::DRIVER_0)
+                .map_err(|_| FsError::InvalidData)?;
+            let resource_id = NEXT_VIRTGPU_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            dev.create_virgl_resource(
+                narf_drivers_virtio::gpu_pci::cmd::ResourceCreate3D {
+                    resource_id,
+                    target: req.target,
+                    format: req.format,
+                    bind: req.bind,
+                    width: req.width,
+                    height: req.height,
+                    depth: req.depth,
+                    array_size: req.array_size,
+                    last_level: req.last_level,
+                    nr_samples: req.nr_samples,
+                    flags: req.flags,
+                },
+                buffer.phys_addr().raw(),
+                buffer.len() as u32,
+            )
+            .map_err(|_| FsError::InvalidData)?;
+            let handle = state.next_handle.fetch_add(1, Ordering::Relaxed);
+            state.resources.lock().push(VirtGpuResource {
+                handle,
+                resource_id,
+                buffer,
+            });
+            req.bo_handle = handle;
+            req.res_handle = resource_id;
+            req.size = bytes as u32;
+            write_uapi(arg, req)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
+            let mut req: DrmVirtGpuResourceInfoUapi = read_uapi(arg)?;
+            let (resource_id, _phys, len) =
+                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            req.res_handle = resource_id;
+            req.size = len as u32;
+            req.blob_mem = 0;
+            write_uapi(arg, req)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_MAP => {
+            let mut req: DrmVirtGpuMapUapi = read_uapi(arg)?;
+            state.find(req.handle).ok_or(FsError::InvalidData)?;
+            req.offset = (req.handle as u64) << 12;
+            write_uapi(arg, req)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => {
+            let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
+            let (resource_id, _phys, bytes) =
+                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let end =
+                (req.offset as usize).saturating_add(req.layer_stride.max(req.stride) as usize);
+            if end > bytes || req.w == 0 || req.h == 0 || req.d == 0 {
+                return Err(FsError::InvalidData);
+            }
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            dev.transfer_to_host_virgl(narf_drivers_virtio::gpu_pci::cmd::Transfer3D {
+                resource_id,
+                x: req.x,
+                y: req.y,
+                z: req.z,
+                width: req.w,
+                height: req.h,
+                depth: req.d,
+                offset: req.offset as u64,
+                level: req.level,
+                stride: req.stride,
+                layer_stride: req.layer_stride,
+            })
+            .map_err(|_| FsError::InvalidData)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_GET_CAPS => {
+            let mut req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
+            if req.cap_set_id != 1 || req.size == 0 || req.addr == 0 {
+                return Err(FsError::Unsupported);
+            }
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            let caps = dev
+                .virgl_capset(req.cap_set_id, req.cap_set_ver)
+                .map_err(|_| FsError::Unsupported)?;
+            let n = caps.len().min(req.size as usize);
+            // SAFETY: `req.addr` is non-zero, `n` is bounded by both the
+            // returned capset and the caller's declared buffer size, and
+            // copy_out validates the complete userspace destination range.
+            unsafe { copy_out(req.addr as usize, &caps[..n])? };
+            req.size = n as u32;
+            write_uapi(arg, req)?;
+            Ok(0)
+        }
+        DRM_IOCTL_VIRTGPU_EXECBUFFER => {
+            let req: DrmVirtGpuExecBufferUapi = read_uapi(arg)?;
+            // Explicit fences/rings/syncobjs have different completion and
+            // fd-lifetime rules. Do not silently ignore them.
+            if req.flags != 0
+                || req.ring_idx != 0
+                || req.syncobj_stride != 0
+                || req.num_in_syncobjs != 0
+                || req.num_out_syncobjs != 0
+                || req.size == 0
+                || req.size as usize
+                    > 4096 - narf_drivers_virtio::gpu_pci::cmd::SUBMIT_3D_PREFIX_LEN
+                || req.num_bo_handles > 256
+            {
+                return Err(FsError::Unsupported);
+            }
+            // Validate every referenced handle before touching the command
+            // pointer. This makes the resource ownership check independent of
+            // virgl command parsing (which belongs to the host renderer).
+            if req.num_bo_handles != 0 {
+                // SAFETY: the count is capped at 256 above, multiplication by
+                // four cannot overflow, and copy_in validates the entire
+                // userspace handle-array range before returning owned bytes.
+                let bytes =
+                    unsafe { copy_in(req.bo_handles as usize, req.num_bo_handles as usize * 4)? };
+                for chunk in bytes.chunks_exact(4) {
+                    let handle =
+                        u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
+                    state.find(handle).ok_or(FsError::PermissionDenied)?;
+                }
+            }
+            // SAFETY: the command size is non-zero and bounded to the
+            // controlQ request page above; copy_in validates the complete
+            // userspace source range and returns an owned buffer.
+            let commands = unsafe { copy_in(req.command as usize, req.size as usize)? };
+            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
+            dev.submit_virgl(&commands)
+                .map_err(|_| FsError::InvalidData)?;
+            Ok(0)
+        }
+        _ => Err(FsError::Unsupported),
+    }
+}
+
+/// Resolve a per-open VirtIO-GPU map offset for `sys_mmap`.
+pub fn dispatch_virtgpu_mmap(
+    state: &VirtGpuRenderState,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u64>, FsError> {
+    if offset & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
+        return Err(FsError::InvalidData);
+    }
+    let handle = (offset >> 12) as u32;
+    let (_resource_id, phys, bytes) = state.find(handle).ok_or(FsError::InvalidData)?;
+    if len > bytes {
+        return Err(FsError::InvalidData);
+    }
+    Ok((0..len / 4096)
+        .map(|page| phys + page as u64 * 4096)
+        .collect())
+}
+
 /// Read `N` bytes from a user-pointer into a kernel `Vec<u8>`.
 ///
 /// # Safety
 /// `uptr` must be a valid user-mode pointer for the calling task or a
 /// kernel-mode pointer (test-only). The caller must hold the syscall
 /// trap context (no IRQ context, AS still active).
-unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
+pub(crate) unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -69,7 +348,7 @@ unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
 }
 
 /// Write a kernel slice back into a user-pointer.
-unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
+pub(crate) unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -202,8 +481,8 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeDestroyDumb => handle_destroy_dumb(&mode_state, arg, &ctx),
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
-        IoctlCmd::ModeSetCrtc => handle_setcrtc(&mode_state, arg, &ctx),
-        IoctlCmd::ModePageFlip => handle_page_flip(&mode_state, arg, &ctx),
+        IoctlCmd::ModeSetCrtc => handle_setcrtc(card_index, &mode_state, arg, &ctx),
+        IoctlCmd::ModePageFlip => handle_page_flip(card_index, &mode_state, arg, &ctx),
         // CURSOR / CURSOR2 — no hardware cursor plane; funnel the pointer
         // position + visibility into narf_console so narf_fb's cursor
         // renderer composites a sprite onto the scanout. Without this the
@@ -1102,7 +1381,7 @@ fn free_dumb_backing(
 // Kept quiet after the opening frames — the first four of each event, then
 // every 512th — so a steady 60 fps costs a line every ~8 seconds.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
@@ -1125,6 +1404,7 @@ fn should_log(counter: &AtomicU64) -> (bool, u64) {
 ///
 /// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_setcrtc`.
 fn handle_setcrtc(
+    card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
@@ -1191,7 +1471,7 @@ fn handle_setcrtc(
 
     // Perform the blit if we have a valid source and a live scanout.
     if let Some(src) = src_phys {
-        blit_to_scanout(src, src_pitch, src_w, src_h);
+        present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
     }
@@ -1215,6 +1495,7 @@ fn note_missing_backing(op: &str, fb_id: u32) {
 ///
 /// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_page_flip_ioctl`.
 fn handle_page_flip(
+    card_index: u32,
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     ctx: &DrmFileCtx,
@@ -1284,11 +1565,84 @@ fn handle_page_flip(
     }
 
     if let Some(src) = src_phys {
-        blit_to_scanout(src, src_pitch, src_w, src_h);
+        present_frame(card_index, src, src_pitch, src_w, src_h);
     } else {
         note_missing_backing("PAGE_FLIP", req.fb_id);
     }
     Ok(0)
+}
+
+/// Present a dumb buffer on the card that accepted the KMS ioctl.
+///
+/// The QEMU profile keeps bochs as an emergency display fallback while
+/// virtio-gpu is card0.  Those are independent framebuffers: copying a
+/// virtio card's pixels through the global fbdev hook would silently draw on
+/// bochs instead.  Select the owning card here so the primary DRM node and
+/// the visible scanout always agree.
+fn present_frame(card_index: u32, src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+    if crate::drm_registry::driver_name(card_index) == Some("virtio_gpu") {
+        blit_to_virtio_scanout(src_phys, src_pitch, src_w, src_h);
+    } else {
+        blit_to_scanout(src_phys, src_pitch, src_w, src_h);
+    }
+}
+
+/// Blit pixels from a dumb buffer into virtio-gpu's scanout resource.
+///
+/// KMS dumb buffers are generic system-memory GEM objects, whereas the
+/// virtio device owns resource 1 as its host-visible scanout.  Copying into
+/// that resource then issuing TRANSFER_TO_HOST_2D + RESOURCE_FLUSH is the
+/// required bridge between the generic DRM KMS ABI and the virtio display.
+/// This is deliberately separate from the VirGL render-resource path: it
+/// makes ordinary KMS presentation correct before Mesa can rely on a 3D
+/// resource for rendering.
+fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+    let Some(virtio) = narf_drivers_virtio::gpu_pci::probed_device() else {
+        let (log, n) = should_log(&NOSCANOUT_N);
+        if log {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: virtio blit dropped — GPU controller unavailable (#{n})"
+            );
+        }
+        return;
+    };
+
+    let mode = virtio.mode();
+    let dst_w = mode.width.min(src_w);
+    let dst_h = mode.height.min(src_h);
+    let row_bytes = (dst_w as usize) * 4;
+    let dst_phys = virtio.scanout_phys();
+    let (log, n) = should_log(&BLIT_N);
+    if log {
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: virtio blit #{n} src {}x{} pitch={} -> scanout {}x{}",
+            src_w,
+            src_h,
+            src_pitch,
+            mode.width,
+            mode.height,
+        );
+    }
+
+    // A real DRM client is now driving this scanout.  Suppress kernel
+    // overlays before the frame is flushed so they cannot bleed over the
+    // compositor's pixels.
+    narf_console::fb_take_for_user();
+    for row in 0..dst_h as usize {
+        let src_row = src_phys + (row * src_pitch as usize) as u64;
+        let dst_row = dst_phys + (row * mode.width as usize * 4) as u64;
+        // SAFETY: both buffers are DMA allocations identity-mapped by the
+        // x86_64 kernel.  Row bounds are clamped to each buffer's geometry.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
+        }
+    }
+
+    if virtio.flush().is_err() {
+        let _ = writeln!(narf_console::Writer, "  drm: virtio scanout flush failed");
+    }
 }
 
 /// Blit pixels from a dumb buffer at `src_phys` into the active scanout.

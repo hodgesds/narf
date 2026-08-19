@@ -8,9 +8,14 @@ NARF.
 - **Scope:** Read/write access to ext2 volumes, integration with NARF's VFS
   (`narf_filesystem::FsInstance`), persistent inode data/mode/owner metadata,
   directory mutation, symlinks, and cap-bound DMA block I/O via `narf_io` +
-  `narf_block`.
+  `narf_block`. Ext4 volumes with `metadata_csum` / `csum_seed` are accepted
+  after their superblock CRC32C is verified. Clean volumes whose write-side
+  feature set is supported mount read/write; inode, classic-directory,
+  bitmap, group-descriptor, HTREE, and primary-superblock mutations regenerate
+  the corresponding CRC32C before returning.
 - **Out of Scope (this iteration):** journal writes (ext3+), HTREE leaf
-  splitting/rebalancing, extended attributes, `fsck`-style repair, and
+  splitting/rebalancing and multi-level insertion, extended attributes,
+  `fsck`-style repair, and
   extents-tree writes.
 
 ## 2. Assumptions
@@ -54,14 +59,40 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.
+- **Checksummed ext4 fails closed.** A volume carrying
+  `metadata_csum` verifies its superblock, group descriptors, inodes, and each
+  bitmap, classic-directory leaf, or HTREE index block before mutation. Writers
+  install dependent bitmap/directory checksums first, then the
+  group-descriptor/superblock checksum that names them. Unknown
+  read-only-compatible features, a dirty JBD2 log, and a non-empty orphan file
+  keep the volume read-only. One-level HTREE insertion into an existing leaf
+  and deletion from existing one-level HTREE leaves are supported; a full
+  leaf or multi-level mutation is rejected before mutation.
+- **Allocation metadata is serialized and quarantined by group.** Bitmap,
+  group-descriptor, and superblock-counter updates cannot interleave. A block
+  group whose bitmap checksum fails is skipped without mutation, allowing a
+  large volume to continue allocating from independently valid groups. Inode
+  allocation also monotonically advances ext4's `bg_itable_unused` boundary
+  before the updated group-descriptor checksum is persisted, so Linux does not
+  classify newly initialized inode slots as deleted.
 
 ## 5. Architecture notes
 
 - **Async-First:** All I/O is async on the `BlockDevice` trait.
-- **Write scope.** Legacy direct/indirect block writes and inode/directory
-  metadata persist. Extents-tree and journal writes remain unsupported.
+- **Write scope.** Legacy direct/indirect block allocation, inode metadata,
+  classic directory mutation, checksum-aware bitmaps/descriptors, and writes
+  inside an already mapped extent persist. Extent-tree growth/truncation,
+  HTREE leaf splitting/multi-level insertion, and dirty-journal commit remain
+  unsupported. Existing one-level HTREE leaves accept checksum-safe insertion
+  and deletion without changing the index.
+  If the JBD2 superblock and orphan file are both clean, stale `RECOVER` and
+  `ORPHAN_PRESENT` flags are cleared with a regenerated superblock checksum.
 - **Block-size flexibility.** Block size is `1024 << s_log_block_size`;
   the driver does not hard-code 4096.
+- **Damaged-group containment.** Allocation scans treat a checksum-invalid
+  bitmap as unavailable space in that group; targeted frees still fail closed
+  because silently leaking a known allocation is safer than clearing an
+  unverified bitmap bit.
 
 ## 6. Dependencies
 

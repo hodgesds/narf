@@ -53,8 +53,9 @@ use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
     class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
-    kobject_add_uevent_attr, Kobject,
+    kobject_add_uevent_attr, kobject_emit_uevent, Kobject,
 };
+use narf_filesystem::uevent::UeventAction;
 
 /// DRM major device number.
 ///
@@ -70,8 +71,19 @@ const DRM_MAJOR: u32 = 226;
 /// (drivers/gpu/drm/drm_sysfs.c, drm_drv.c).
 pub fn populate_drm_class() {
     let class_drm = class_register("drm");
+    let cards = crate::drm_registry::cards();
 
-    for card in crate::drm_registry::cards() {
+    // systemd-udevd starts after the Stage::Late device projections have
+    // already been built. Mark the first finished graphical projection as
+    // replayable before queuing its ADDs; later block-device coldplug extends
+    // the same window rather than replacing this boundary. Without the DRM
+    // ADD, 71-seat.rules never records `master-of-seat`, logind reports
+    // seat0.CanGraphical=false, and a display manager waits on a black screen.
+    if !cards.is_empty() {
+        narf_filesystem::uevent::begin_boot_udevd_replay();
+    }
+
+    for card in cards {
         let idx = {
             // Determine the index by looking it up in the registry.
             // The registry stores cards in insertion order so the
@@ -167,12 +179,23 @@ fn populate_card_node(
     // EGL's "failed to get compatible render device" — falls over regardless
     // of how correct the attributes are.
     //
-    // Linux: /sys/class/drm/card0/device -> ../../../0000:00:02.0, with the
-    // real node under /sys/devices/pci0000:00/. Mirror that. QEMU's
-    // bochs-display sits at 00:02.0.
-    let pci_addr = "0000:00:02.0";
+    // Each DRM card needs its OWN PCI parent.  Reusing bochs' 00:02.0 for
+    // every card made the second registration overwrite card0's uevent and
+    // config: libdrm then identified the virtio GPU as 1234:1111 with no
+    // usable driver, and Mesa/KWin rejected the render node.  These are the
+    // stable synthetic addresses used by NARF's QEMU profile; the important
+    // contract is a one-to-one card ↔ PCI kobject mapping, not a particular
+    // host slot number.
+    let pci_addr = match (card.vendor_id(), card.device_id()) {
+        // QEMU bochs-display.
+        (0x1234, 0x1111) => String::from("0000:00:02.0"),
+        // Modern virtio-gpu PCI transport.
+        (0x1af4, 0x1050) => String::from("0000:00:03.0"),
+        // Keep all other registered cards disjoint as well.
+        _ => format!("0000:00:{:02x}.0", 4u32.saturating_add(idx)),
+    };
     let pci_root = get_or_create_child(&devices, "pci0000:00");
-    let dev_kobj = get_or_create_child(&pci_root, pci_addr);
+    let dev_kobj = get_or_create_child(&pci_root, &pci_addr);
     // From /sys/devices/platform/narf-drm/card<N>, three levels up is
     // /sys/devices.
     kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
@@ -221,7 +244,7 @@ fn populate_card_node(
         let sub_vendor = card.subsystem_vendor();
         let sub_device = card.subsystem_device();
         let drv = driver.clone();
-        let addr = String::from(pci_addr);
+        let addr = pci_addr.clone();
         kobject_add_uevent_attr(
             &dev_kobj,
             format!(
@@ -430,6 +453,14 @@ fn populate_card_node(
         render_idx,
         &format!("../../devices/platform/narf-drm/{}", render_name),
     );
+
+    // Parent first, then the two DRM minors, matching Linux device
+    // registration ordering. The card ADD is the load-bearing event for
+    // systemd's 71-seat.rules (`seat` + `master-of-seat`); the parent and
+    // render ADDs make udev's PCI and render-node database views complete.
+    kobject_emit_uevent(&dev_kobj, UeventAction::Add);
+    kobject_emit_uevent(&kobj, UeventAction::Add);
+    kobject_emit_uevent(&render_kobj, UeventAction::Add);
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

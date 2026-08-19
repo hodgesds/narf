@@ -21,6 +21,11 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// GPT type GUID assigned by the UEFI specification to an EFI System
+/// Partition (ESP).  Kept in canonical on-disk GUID display order, matching
+/// [`crate::partition::format_guid`].
+pub const GPT_EFI_SYSTEM_PARTITION_TYPE_GUID: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlockIoError {
     /// Caller asked for a range outside the device's capacity.
@@ -51,6 +56,10 @@ pub trait BlockDeviceSync: Send + Sync {
 /// (`nvme0p1`, `usb-msc0p2`, ...).
 #[derive(Clone, Debug, Default)]
 pub struct PartitionMetadata {
+    /// GPT partition-type GUID in canonical 8-4-4-4-12 hex. Empty for MBR
+    /// partitions and whole-disk entries.  Consumers use this semantic type
+    /// rather than a device name or partition label to identify an ESP.
+    pub gpt_type_guid: alloc::string::String,
     /// UTF-8 partition name decoded from the GPT entry's UTF-16LE
     /// `partition_name` field. Empty for MBR partitions (which have
     /// no name slot) and for whole-disk entries.
@@ -58,6 +67,19 @@ pub struct PartitionMetadata {
     /// Per-partition GUID in canonical 8-4-4-4-12 hex. Empty for
     /// MBR partitions (which have no GUID).
     pub partuuid: alloc::string::String,
+    /// Filesystem volume UUID discovered from the partition's on-disk
+    /// superblock or boot record. Empty when the format is unknown or does
+    /// not carry a UUID. This backs Linux's `/dev/disk/by-uuid` aliases.
+    pub fs_uuid: alloc::string::String,
+}
+
+impl PartitionMetadata {
+    /// True exactly for a GPT EFI System Partition, independent of its name,
+    /// registration order, or filesystem volume UUID.
+    pub fn is_efi_system_partition(&self) -> bool {
+        self.gpt_type_guid
+            .eq_ignore_ascii_case(GPT_EFI_SYSTEM_PARTITION_TYPE_GUID)
+    }
 }
 
 /// One registered block device.

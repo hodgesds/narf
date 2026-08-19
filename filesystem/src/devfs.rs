@@ -72,21 +72,21 @@ struct MknodMetadata {
     gid: u32,
 }
 
-struct MknodNode {
+pub(crate) struct MknodNode {
     inode: u64,
     metadata: IrqSafeSpinLock<MknodMetadata>,
 }
 
 #[derive(Clone)]
-enum DynamicNode {
+pub(crate) enum DynamicNode {
     Device(Arc<MknodNode>),
     Symlink { target: String, inode: u64 },
     Directory(Arc<DynamicDirectory>),
 }
 
-type DynamicMap = alloc::collections::BTreeMap<String, DynamicNode>;
+pub(crate) type DynamicMap = alloc::collections::BTreeMap<String, DynamicNode>;
 
-struct DynamicDirectory {
+pub(crate) struct DynamicDirectory {
     inode: u64,
     perms: IrqSafeSpinLock<u16>,
     entries: IrqSafeSpinLock<DynamicMap>,
@@ -1419,7 +1419,7 @@ fn valid_leaf_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
-fn dynamic_lookup_file(
+pub(crate) fn dynamic_lookup_file(
     nodes: &IrqSafeSpinLock<DynamicMap>,
     name: &str,
 ) -> Option<Arc<dyn FileOps>> {
@@ -1439,7 +1439,7 @@ fn dynamic_lookup_dir(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Option
     }
 }
 
-fn dynamic_enumerate(nodes: &IrqSafeSpinLock<DynamicMap>) -> Vec<(String, FileType)> {
+pub(crate) fn dynamic_enumerate(nodes: &IrqSafeSpinLock<DynamicMap>) -> Vec<(String, FileType)> {
     nodes
         .lock()
         .iter()
@@ -1454,7 +1454,7 @@ fn dynamic_enumerate(nodes: &IrqSafeSpinLock<DynamicMap>) -> Vec<(String, FileTy
         .collect()
 }
 
-fn dynamic_symlink(
+pub(crate) fn dynamic_symlink(
     nodes: &IrqSafeSpinLock<DynamicMap>,
     name: &str,
     target: &str,
@@ -1501,7 +1501,10 @@ fn dynamic_mkdir(
     Ok(dir as Arc<dyn DirOps>)
 }
 
-fn dynamic_unlink(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Result<(), FsError> {
+pub(crate) fn dynamic_unlink(
+    nodes: &IrqSafeSpinLock<DynamicMap>,
+    name: &str,
+) -> Result<(), FsError> {
     let mut entries = nodes.lock();
     match entries.get(name) {
         Some(DynamicNode::Directory(_)) => Err(FsError::Busy),

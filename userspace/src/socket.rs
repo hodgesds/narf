@@ -89,12 +89,117 @@ fn kernel_nl_sockaddr_body() -> Vec<u8> {
     alloc::vec![0u8, 0, 0, 0, 0, 0, 1, 0, 0, 0]
 }
 
-/// Post-uevent-emit wake: bump the readiness generation + wake io waiters
-/// so a parked `NETLINK_KOBJECT_UEVENT` monitor's poll/epoll resumes and
-/// reads the new event. Installed into `narf_filesystem::uevent` when a
-/// netlink socket is created.
+/// Durable readiness cells of every subscribed uevent monitor. Registered at
+/// subscribe time (group-1 bind on NETLINK_KOBJECT_UEVENT); `uevent_wake_hook`
+/// sets POLL_IN on each so a uevent emit wakes ONLY the monitors. Weak so a
+/// closed monitor's cell is pruned lazily and never leaks.
+static UEVENT_READINESS_SUBS: IrqSafeSpinLock<
+    alloc::vec::Vec<alloc::sync::Weak<narf_lib::readiness::Readiness>>,
+> = IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Register a monitor's cell for `uevent_wake_hook` to fire. Idempotent enough:
+/// a re-bind pushes a second Weak to the same cell, which `set` handles (the
+/// pruning pass drops dead ones).
+fn register_uevent_readiness(cell: &Arc<narf_lib::readiness::Readiness>) {
+    UEVENT_READINESS_SUBS.lock().push(Arc::downgrade(cell));
+}
+
+/// Post-uevent-emit wake. A new uevent makes EVERY subscribed monitor readable
+/// (they all see it), so set POLL_IN on each registered cell — a targeted wake
+/// of just the parked monitors, not the whole io-waiter herd. Dead cells are
+/// pruned in the same pass. The `notify(0)` stays belt-and-suspenders (it also
+/// bumps the readiness generation the epoll_park_gen guard relies on).
+/// Installed into `narf_filesystem::uevent` when a netlink socket is created.
 fn uevent_wake_hook() {
+    {
+        let mut subs = UEVENT_READINESS_SUBS.lock();
+        subs.retain(|weak| {
+            if let Some(cell) = weak.upgrade() {
+                cell.set(narf_filesystem::POLL_IN, 0);
+                true
+            } else {
+                false
+            }
+        });
+    }
     narf_net::readiness::notify(0);
+}
+
+/// `syscall-trace` D-Bus peek. When the current task is a trace target, and
+/// `buf` looks like a D-Bus wire message (endianness byte + type + version 1),
+/// print `DBUS t=<tid> comm=<c> <TX|RX> <TYPE> serial=<n> hdr=[...ascii...]`.
+/// The header-field region carries the DESTINATION / INTERFACE / MEMBER /
+/// PATH strings as plain ASCII, so a raw string scan (no fragile field-array
+/// alignment parse) is enough to name a METHOD_CALL's target + method and
+/// spot the last unanswered call before a nested-event-loop park. Used to
+/// pin which synchronous D-Bus reply the CachyOS greeter's main thread is
+/// blocked awaiting.
+#[cfg(feature = "syscall-trace")]
+pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
+    use core::fmt::Write as _;
+    if buf.len() < 16 || !crate::syscall::syscall_trace_target_task() {
+        return;
+    }
+    let le = match buf[0] {
+        b'l' => true,
+        b'B' => false,
+        _ => return,
+    };
+    let ty = buf[1];
+    // version byte (buf[3]) is 1 for every D-Bus message; screens out
+    // non-D-Bus streams that happen to start with 'l'/'B'.
+    if ty == 0 || ty > 4 || buf[3] != 1 {
+        return;
+    }
+    let rd32 = |o: usize| -> u32 {
+        let b = [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]];
+        if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }
+    };
+    let serial = rd32(8);
+    let fields_len = rd32(12) as usize;
+    let tyname = match ty {
+        1 => "CALL",
+        2 => "RETURN",
+        3 => "ERROR",
+        4 => "SIGNAL",
+        _ => "?",
+    };
+    let tid = crate::handlers::current_task_id();
+    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
+    let _ = write!(
+        narf_console::Writer,
+        "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
+    );
+    let end = core::cmp::min(buf.len(), 16 + fields_len);
+    let mut run: usize = 0;
+    let mut start = 16;
+    for i in 16..end {
+        let b = buf[i];
+        if b.is_ascii_graphic() && b != b' ' {
+            if run == 0 {
+                start = i;
+            }
+            run += 1;
+        } else {
+            if run >= 3 {
+                for &c in &buf[start..start + run] {
+                    let _ = write!(narf_console::Writer, "{}", c as char);
+                }
+                let _ = write!(narf_console::Writer, " ");
+            }
+            run = 0;
+        }
+    }
+    if run >= 3 {
+        for &c in &buf[start..start + run] {
+            let _ = write!(narf_console::Writer, "{}", c as char);
+        }
+    }
+    let _ = writeln!(narf_console::Writer, "]");
 }
 
 pub const SOCK_STREAM: u32 = 1;
@@ -332,6 +437,15 @@ pub enum SocketOp<'a> {
     },
 }
 
+/// Ancillary data carried by one received connectionless AF_UNIX datagram,
+/// held between its dequeue and the recvmsg syscall's extraction of it.
+/// Keyed per receiving task — see `SocketFile::dgram_recv_ancillary`.
+#[derive(Default)]
+struct DgramRecvAncillary {
+    cred: Ucred,
+    fds: Vec<ScmRightsFile>,
+}
+
 #[derive(Debug)]
 pub enum SocketOpResult {
     Ok(u64),
@@ -446,15 +560,28 @@ pub struct SocketFile {
     peer_groups: IrqSafeSpinLock<Vec<u32>>,
     /// `SO_PASSCRED` — recvmsg attaches an `SCM_CREDENTIALS` cmsg when set.
     passcred: AtomicBool,
-    /// Credentials of the sender of the most recently received datagram.
-    /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
-    /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
-    last_recv_cred: IrqSafeSpinLock<Ucred>,
-    /// SCM_RIGHTS carried by the most recently received AF_UNIX datagram.
-    /// Datagram ancillary data is per-message, so this is overwritten exactly
-    /// when `dispatch_unix_dgram(Recv)` dequeues that message and consumed by
-    /// the following `recvmsg` (or discarded by a plain `read`).
-    last_recv_fds: IrqSafeSpinLock<Vec<ScmRightsFile>>,
+    /// Ancillary data of the connectionless AF_UNIX datagram most recently
+    /// dequeued BY EACH RECEIVING TASK, keyed by that task.
+    ///
+    /// Datagram ancillary data belongs to the RECORD that carried it, not to
+    /// the socket, and dequeue is not atomic with extraction: `dispatch_op
+    /// (Recv)` pops the packet and stashes its credentials here, and the
+    /// recvmsg syscall reads them back only after copying the payload out to
+    /// userspace. Socket-global slots therefore lose the association the
+    /// moment a SECOND receiver dequeues inside that window — the first
+    /// receiver goes on to report the second sender's identity.
+    ///
+    /// `systemd-udevd` is precisely that topology: many workers sending to
+    /// one manager, which identifies the sender purely from SCM_CREDENTIALS
+    /// (`hashmap_get(manager->workers, &sender)`). Attributing a worker's
+    /// `INOTIFY_WATCH_REMOVE=1` to a different, idle worker makes the manager
+    /// fail `assert(worker->event)` and abort.
+    ///
+    /// ORDER MATTERS for consumers: `unix_take_recv_fds` takes the rights and
+    /// leaves the entry; `recvmsg_cred` REMOVES it. Take the fds first, or
+    /// they are dropped with the entry. A plain `read(2)` wants neither and
+    /// calls `discard_dgram_recv_ancillary`.
+    dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
     /// Readable-transition generation for connectionless datagram inboxes.
     /// A bound AF_UNIX DGRAM socket is the systemd `$NOTIFY_SOCKET` shape:
     /// after an EPOLLET consumer drains it, a refill can occur before epoll
@@ -465,6 +592,20 @@ pub struct SocketFile {
     /// new one before its next epoll scan, leaving the sampled mask at POLLIN
     /// throughout. Each enqueue is nevertheless a new accept-ready edge.
     listener_readable_token: AtomicU64,
+    /// Durable per-fd readiness cell for a connectionless datagram inbox
+    /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
+    /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
+    /// of the queue; it lives here on the `SocketFile` and `arm_readiness`
+    /// serves it. POLL_IN when the inbox is non-empty, POLL_OUT always (a dgram
+    /// socket is always sendable). A send that enqueues sets POLL_IN (targeted
+    /// wake of the parked reader); a recv that drains to empty clears it. The
+    /// legacy `dgram_readable_token` + `notify(0)` stay belt-and-suspenders.
+    dgram_readiness: narf_lib::readiness::Readiness,
+    /// Durable per-fd readiness cell for a listener's pending accept queue.
+    /// POLL_IN when a connection is pending (accept won't block). A `connect`
+    /// that enqueues a pending server end sets it; an `accept` that drains to
+    /// empty clears it. Legacy `listener_readable_token` + `notify(0)` kept.
+    listener_readiness: narf_lib::readiness::Readiness,
     /// `unix-latency-trace` only: tid that called `listen()` on this socket.
     /// The starved-accept sweep runs inside the watchdog's timer trap, where
     /// walking every task's fd table to find the acceptor would take the fd
@@ -509,6 +650,51 @@ pub struct SocketFile {
     /// Userspace-to-userspace unicast datagrams, independent of each
     /// protocol's kernel reply queue so sender port IDs remain attributable.
     netlink_user_inbox: IrqSafeSpinLock<VecDeque<NetlinkUserPacket>>,
+    /// Membership in the KERNEL uevent multicast group (group 1) for a
+    /// `NETLINK_KOBJECT_UEVENT` socket. False until a `bind` whose
+    /// `sockaddr_nl.nl_groups` has bit 0 set.
+    ///
+    /// Linux ref: `net/netlink/af_netlink.c` — `netlink_bind` is what
+    /// establishes multicast membership, and kernel broadcast
+    /// (`netlink_broadcast` → `do_one_broadcast`) walks `mc_list` and skips
+    /// any socket that is not a member of the destination group. So an
+    /// unbound socket, or one bound with `nl_groups == 0`, receives no
+    /// kernel uevents at all.
+    ///
+    /// This matters because groups=0 is a shape udev uses ON PURPOSE:
+    /// `systemd-udevd` builds each worker's device monitor with
+    /// `device_monitor_new_full(&worker_monitor, MONITOR_GROUP_NONE, -1)`,
+    /// meaning "deliver me only the manager's unicast hand-offs". NARF used
+    /// to attach the kernel uevent ring to every proto-15 socket, so every
+    /// worker also replayed the boot coldplug set — SEQNUM=2 was processed
+    /// seven times by workers forked once each, and a worker re-processing a
+    /// device-node device answers with `INOTIFY_WATCH_REMOVE=1` for an event
+    /// the manager never assigned it, tripping `assert(worker->event)` in
+    /// `udev-manager.c:1199` and aborting the daemon.
+    ///
+    /// The ring READER is still created at `socket()` time, unchanged — the
+    /// cursor position, and the boot-coldplug-replay decision that depends
+    /// on the opening task's comm, must stay exactly as they were, because
+    /// the replay window is chosen relative to socket creation and a
+    /// bind-time reader would start at the wrong place. Only DELIVERY is
+    /// gated, at the same read-side points Linux gates multicast:
+    /// `recv`, poll readiness, the edge-trigger token, and `SIOCINQ`.
+    ///
+    /// Deliberately NOT gated: `netlink_user_inbox`. Manager unicasts and
+    /// group-2 (`MONITOR_GROUP_UDEV`) user broadcasts are membership-checked
+    /// separately in `broadcast_netlink_user`, and must keep flowing to a
+    /// groups=0 socket — receiving those is the entire purpose of a worker
+    /// monitor.
+    netlink_uevent_subscribed: AtomicBool,
+    /// Durable readiness cell for a NETLINK_KOBJECT_UEVENT monitor. The uevent
+    /// source is a SHARED broadcast (every subscriber sees every event), so the
+    /// cell is an `Arc` registered in `UEVENT_READINESS_SUBS` at subscribe time;
+    /// `uevent_wake_hook` sets POLL_IN on every registered cell when a uevent is
+    /// emitted, waking ONLY the parked monitors — not the whole io-waiter herd
+    /// the old `notify(0)` kicked (an SMP IPI storm on a busy desktop).
+    /// poll_readiness reconciles it against `subscribed && reader.has_pending()`.
+    /// notify(0) stays belt-and-suspenders during the migration.
+    uevent_readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
@@ -829,19 +1015,46 @@ impl SocketFile {
             // lives in the fs crate, which can't reach the net readiness layer
             // directly). Idempotent — a plain atomic store.
             narf_filesystem::uevent::set_wake_hook(uevent_wake_hook);
-            // Start at the ring TAIL — a netlink uevent monitor only receives
-            // events broadcast *after* it binds (Linux `NETLINK_KOBJECT_UEVENT`
-            // is not replayed on connect). Replaying the buffered boot-time
-            // "add" events to a late-connecting monitor is actively harmful:
-            // libudev/libinput does NOT de-dup them against its sysfs
-            // enumerate — it re-runs `evdev_device_create` for each replayed
-            // "add", and that second add tears the already-created input device
-            // back down (weston loses all keyboards/pointers ~5s after start).
-            // Existing devices are discovered via `udev_enumerate` (sysfs
-            // scan), not the monitor, so tail-start loses nothing.
-            SocketState::NetlinkUevent {
-                reader: narf_filesystem::uevent::UeventReader::new(),
+            // A generic monitor starts at the ring TAIL: Linux
+            // `NETLINK_KOBJECT_UEVENT` is not replayed on connect, and replaying
+            // boot-time ADDs to libinput can tear down an already-created input
+            // device.  systemd-udevd and PID 1 are the two deliberate
+            // exceptions. NARF's systemd boot path queues the storage ADDs
+            // before either has opened its monitor; without a bounded replay,
+            // PID 1 never activates the fstab-generated UUID .device unit.
+            // Replay only NARF's post-sysfs storage-coldplug window to the
+            // systemd's device manager and udev daemon. Replaying every early
+            // bring-up event is unsafe:
+            // some precede their completed kobject and make udevd open a stale
+            // DEVPATH. The marker is set immediately before the canonical
+            // block ADDs that satisfy fstab UUID dependencies.
+            let task = crate::handlers::current_task_id();
+            let reader = if crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
+                || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
+            {
+                narf_filesystem::uevent::boot_udevd_replay_reader()
+            } else {
+                narf_filesystem::uevent::UeventReader::new()
+            };
+            // Debug-feature only: which task opened a uevent monitor, and
+            // whether it got the bounded boot-coldplug replay. udevd opening
+            // MANY monitors, or a monitor opened without replay, are both
+            // invisible from inside the guest.
+            #[cfg(feature = "unix-latency-trace")]
+            {
+                use core::fmt::Write as _;
+                let comm = crate::handlers::proc_comm_of_task(task)
+                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  uevent-sock: created tid={} comm={} replay={}",
+                    task,
+                    comm,
+                    crate::handlers::proc_comm_of_task_matches(task, "systemd-udevd$")
+                        || crate::handlers::proc_comm_of_task_matches(task, "systemd$")
+                );
             }
+            SocketState::NetlinkUevent { reader }
         } else {
             SocketState::Fresh
         };
@@ -863,10 +1076,13 @@ impl SocketFile {
             local_groups: IrqSafeSpinLock::new(Vec::new()),
             peer_groups: IrqSafeSpinLock::new(Vec::new()),
             passcred: AtomicBool::new(false),
-            last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
-            last_recv_fds: IrqSafeSpinLock::new(Vec::new()),
+            dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             dgram_readable_token: AtomicU64::new(0),
             listener_readable_token: AtomicU64::new(0),
+            // A fresh dgram socket is always sendable, not yet readable; a fresh
+            // listener has no pending connection.
+            dgram_readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
+            listener_readiness: narf_lib::readiness::Readiness::new(0),
             #[cfg(feature = "unix-latency-trace")]
             listen_owner_tid: AtomicU64::new(0),
             #[cfg(feature = "unix-latency-trace")]
@@ -888,6 +1104,8 @@ impl SocketFile {
             netlink_admin: IrqSafeSpinLock::new(None),
             netfilter_admin: IrqSafeSpinLock::new(None),
             netlink_user_inbox: IrqSafeSpinLock::new(VecDeque::new()),
+            netlink_uevent_subscribed: AtomicBool::new(false),
+            uevent_readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
         });
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
@@ -1056,6 +1274,17 @@ impl SocketFile {
         };
         self.netlink_portid.store(portid, Ordering::Release);
         self.netlink_groups.store(groups, Ordering::Release);
+        // Joining group 1 on NETLINK_KOBJECT_UEVENT is what subscribes this
+        // socket to the KERNEL uevent multicast (Linux: `netlink_bind` →
+        // `netlink_update_subscriptions`). A groups=0 bind — udev's
+        // MONITOR_GROUP_NONE worker monitor — deliberately joins nothing.
+        if self.protocol == NETLINK_KOBJECT_UEVENT && (groups & 1) != 0 {
+            self.netlink_uevent_subscribed
+                .store(true, Ordering::Release);
+            // Register this monitor's durable cell so a uevent emit wakes it
+            // directly (targeted) instead of via the notify(0) herd.
+            register_uevent_readiness(&self.uevent_readiness);
+        }
         {
             let mut memberships = self.netlink_memberships.lock();
             memberships.retain(|group| *group > 32);
@@ -1077,6 +1306,33 @@ impl SocketFile {
                 self.netlink_peer_groups.load(Ordering::Acquire),
             )
         });
+        // Debug-feature only: udev's manager hands each device to a specific
+        // worker by netlink UNICAST to that worker's autobound portid
+        // (`device_monitor_send(monitor, &worker->address, dev)`). Log EVERY
+        // send's resolved destination, including the (0,0) case that falls
+        // through to "accept and discard" — a device silently dropped there
+        // reaches no worker at all, and a device delivered to the wrong
+        // worker makes that worker process an event it was never assigned,
+        // which is what `assert(worker->event)` catches.
+        #[cfg(feature = "unix-latency-trace")]
+        {
+            use core::fmt::Write as _;
+            static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                let task = crate::handlers::current_task_id();
+                let comm = crate::handlers::proc_comm_of_task(task).unwrap_or_default();
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  nl-send: tid={} comm={} proto={} to_port={} to_groups={} len={}",
+                    task,
+                    comm,
+                    self.protocol,
+                    destination.0,
+                    destination.1,
+                    buf.len()
+                );
+            }
+        }
         if destination == (0, 0) {
             return None;
         }
@@ -1126,6 +1382,16 @@ impl SocketFile {
                 sender_portid: sender,
                 group: 0,
             });
+        // Advance the readable edge on ARRIVAL so an EPOLLET consumer re-fires
+        // (see `poll_edge_token`'s inbox check). Bumping only on recv left the
+        // token unchanged across a fresh delivery.
+        target
+            .netlink_readable_token
+            .fetch_add(1, Ordering::Release);
+        // Durable targeted wake (see the broadcast path): fire the target's
+        // armed `uevent_readiness` cell so an epoll consumer cannot miss this
+        // unicast delivery; `notify(0)` remains the non-epoll fallback.
+        target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
@@ -1172,10 +1438,29 @@ impl SocketFile {
                     sender_portid: sender,
                     group: group_mask,
                 });
+            // Advance the readable edge on ARRIVAL so an EPOLLET group-2
+            // monitor (logind) re-fires and drains this broadcast; see
+            // `poll_edge_token`'s inbox check.
+            target
+                .netlink_readable_token
+                .fetch_add(1, Ordering::Release);
+            // Durable, targeted, lost-wake-proof wake: fire the target's
+            // `uevent_readiness` cell (armed by its epoll registration,
+            // `Arm::Uevent`). `Readiness::set` wakes the exact registered
+            // waiter under its lock — the same mechanism the group-1 RING path
+            // and every AF_UNIX ring already use. Previously the group-2 inbox
+            // path had no way to set this cell, so a subscriber's durable arm
+            // never fired and delivery leaned entirely on the `notify(0)` herd
+            // below; that herd stays only as the fallback for a NON-epoll
+            // waiter (a plain `recv`/`ppoll` blocker parks on the generation
+            // guard, not this cell) and for non-uevent netlink families whose
+            // cell this is not.
+            target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
             delivered += 1;
         }
         if delivered > 0 {
-            // Wake any parked poll/epoll waiter on a subscribed socket.
+            // Fallback herd wake for non-epoll waiters + non-uevent families
+            // (see the per-target durable wake above).
             narf_net::readiness::notify(0);
         }
         SocketOpResult::Ok(buf.len() as u64)
@@ -1338,7 +1623,15 @@ impl SocketFile {
             if matches!(&*self.state.lock(), SocketState::UnixConnected { .. }) {
                 *self.peer_cred.lock()
             } else {
-                *self.last_recv_cred.lock()
+                // Per-RECORD, keyed by the receiving task. Removing the entry
+                // here is what bounds the map; any rights still attached were
+                // not asked for and are dropped with it (see the field docs
+                // for the required take-fds-first ordering).
+                self.dgram_recv_ancillary
+                    .lock()
+                    .remove(&crate::handlers::current_task_id())
+                    .map(|a| a.cred)
+                    .unwrap_or_default()
             }
         } else {
             *self.peer_cred.lock()
@@ -1761,6 +2054,9 @@ impl FileOps for SocketFile {
                     // discard those rights now so a later recvmsg(2) cannot
                     // receive descriptors attached to already-consumed bytes.
                     drop(self.unix_take_recv_fds());
+                    // read(2) reports no credentials either, so clear the
+                    // whole per-record entry rather than leaving a cred behind.
+                    self.discard_dgram_recv_ancillary();
                     Ok(n)
                 }
                 // do_recv already distinguishes empty-but-open from EOF; pass
@@ -1843,6 +2139,14 @@ impl FileOps for SocketFile {
                     || listen_id
                         .map(narf_net::tcp_stack::listen_has_pending)
                         .unwrap_or(false);
+                // Reconcile the durable accept cell against this level so it
+                // clears once accept drains the queue (else a re-arm spuriously
+                // returns Ready and a timed poll spins). The connect enqueue set
+                // the rising POLL_IN edge that fired the parked acceptor.
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
                 if ready {
                     narf_filesystem::POLL_IN
                 } else {
@@ -1851,10 +2155,15 @@ impl FileOps for SocketFile {
             }
             SocketState::UnixListener { pending, .. }
             | SocketState::Inet6Listener { pending, .. } => {
-                if pending.is_empty() {
-                    0
-                } else {
+                let ready = !pending.is_empty();
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
                     narf_filesystem::POLL_IN
+                } else {
+                    0
                 }
             }
             SocketState::UnixConnected { rx, tx, .. }
@@ -1884,6 +2193,14 @@ impl FileOps for SocketFile {
                 if !inbox.is_empty() {
                     bits |= narf_filesystem::POLL_IN;
                 }
+                // Reconcile the durable datagram cell's POLL_IN against this
+                // level so a recv that drained the inbox stops reporting
+                // readable in the cell (POLL_OUT stays — always sendable). The
+                // send enqueue set the rising POLL_IN edge that fired the reader.
+                self.dgram_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
                 bits
             }
             SocketState::InetWired { tcb_id, .. } => {
@@ -1912,12 +2229,23 @@ impl FileOps for SocketFile {
                 narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
             }
             SocketState::NetlinkUevent { reader } => {
-                // Readable when an unread uevent is waiting; always writable
-                // (the udev monitor is read-only but POLL_OUT is harmless).
+                // Readable when an unread uevent is waiting AND this socket
+                // joined the kernel uevent group; always writable (the udev
+                // monitor is read-only but POLL_OUT is harmless). A
+                // non-member must never be reported readable: recv would
+                // answer EAGAIN and a level-triggered poller would spin.
                 let mut bits = narf_filesystem::POLL_OUT;
-                if reader.has_pending() {
+                if self.netlink_uevent_subscribed.load(Ordering::Acquire) && reader.has_pending() {
                     bits |= narf_filesystem::POLL_IN;
                 }
+                // Reconcile the durable cell against this level so a monitor that
+                // drained its reader stops reporting POLL_IN in the cell (else a
+                // re-arm spuriously returns Ready and a timed poll spins). The
+                // emit set the rising edge that fired the parked monitor.
+                self.uevent_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
                 bits
             }
             SocketState::NetlinkRoute { replies } => {
@@ -1964,6 +2292,21 @@ impl FileOps for SocketFile {
     }
 
     fn poll_edge_token(&self) -> (u64, u64) {
+        // A userspace unicast/multicast sitting in the inbox is readable
+        // regardless of the per-state token or kernel-group membership. This
+        // mirrors the same top-level check in `poll_readiness`: without it, an
+        // EPOLLET consumer never sees an EDGE for an inbox delivery, so it never
+        // re-reports POLL_IN and never drains it. The load-bearing case is
+        // logind's `sd-device` monitor, an edge-triggered subscriber to the
+        // UDEV_MONITOR_UDEV group (group 2): udevd re-broadcasts each processed
+        // device there (carrying the `master-of-seat` tag), the broadcast lands
+        // in this inbox, but a group-2 socket is not `netlink_uevent_subscribed`
+        // (only group 1 is) so the NetlinkUevent arm below yields token 0 and
+        // the edge never advanced — logind never learned the DRM card became a
+        // seat master, so seat0 stayed `CanGraphical=false` and the greeter hung.
+        if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
+            return (self.netlink_readable_token.load(Ordering::Acquire), 0);
+        }
         match &*self.state.lock() {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
@@ -1977,7 +2320,11 @@ impl FileOps for SocketFile {
                 (self.listener_readable_token.load(Ordering::Acquire), 0)
             }
             SocketState::NetlinkUevent { reader } => {
-                let rx_tok = if reader.has_pending() {
+                // No membership, no edge: an unsubscribed monitor must not
+                // advance its EPOLLET token on traffic it cannot receive.
+                let rx_tok = if self.netlink_uevent_subscribed.load(Ordering::Acquire)
+                    && reader.has_pending()
+                {
                     narf_filesystem::uevent_current_seqnum()
                 } else {
                     0
@@ -1997,6 +2344,169 @@ impl FileOps for SocketFile {
                 (rx_tok, 0)
             }
             _ => (0, 0),
+        }
+    }
+
+    /// Durable arm for a connected AF_UNIX/AF_INET stream socket. Both rings of
+    /// a connected pair carry a [`RingBuf::readiness`] cell, so we arm the SAME
+    /// task on whichever cell(s) the caller's interest touches: the rx ring for
+    /// POLL_IN (data arrival / EOF) and the tx ring for POLL_OUT (space frees).
+    /// POLL_HUP is folded into both interests so a peer close — which closes the
+    /// peer's rings, i.e. OUR rx (via its tx) and OUR tx (via its rx) — wakes a
+    /// reader AND a writer, even one blocked on a full ring. `arm` is fused with
+    /// the ring's `set` under one lock, so the classic "check-then-park" lost
+    /// wakeup is unrepresentable: any state the ring reaches before we insert
+    /// the waiter is already visible to this `arm`.
+    ///
+    /// Returns `None` for states not yet migrated (dgram/listener/netlink/…) or
+    /// an interest that touches neither direction, so the caller keeps the
+    /// legacy edge-token + 10 ms backstop path for those.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        use core::task::Poll;
+        let want_in = interest & narf_filesystem::POLL_IN != 0;
+        let want_out = interest & narf_filesystem::POLL_OUT != 0;
+        if !want_in && !want_out {
+            return None;
+        }
+        // Classify the socket under one short lock, cloning any rings needed.
+        enum Arm {
+            Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Dgram,
+            Listener,
+            Uevent,
+            Legacy,
+        }
+        let arm = match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => Arm::Connected(rx.clone(), tx.clone()),
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
+            SocketState::UnixListener { .. }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. } => Arm::Listener,
+            SocketState::NetlinkUevent { .. } => Arm::Uevent,
+            _ => Arm::Legacy,
+        };
+        match arm {
+            // Unmigrated states (raw / netlink / kernel-TCP / bypass): the
+            // caller keeps the legacy edge-token + backstop path.
+            Arm::Legacy => None,
+            // Connected stream: dual rx/tx ring cells. Arm off the state lock —
+            // the cloned Arcs keep the rings alive, and a concurrent close
+            // latches POLL_IN|POLL_HUP into the cell, so `arm` still observes
+            // readiness rather than parking on a dead ring. POLL_HUP is folded
+            // into both so a peer close wakes a reader AND a writer.
+            Arm::Connected(rx, tx) => {
+                let mut ready = 0u32;
+                if want_in {
+                    if let core::task::Poll::Ready(bits) = rx.readiness().arm(
+                        task_id,
+                        narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                        waker,
+                    ) {
+                        ready |= bits;
+                    }
+                }
+                if want_out {
+                    if let core::task::Poll::Ready(bits) = tx.readiness().arm(
+                        task_id,
+                        narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+                        waker,
+                    ) {
+                        ready |= bits;
+                    }
+                }
+                if ready != 0 {
+                    Some(Poll::Ready(ready))
+                } else {
+                    Some(Poll::Pending)
+                }
+            }
+            // Connectionless datagram: one SocketFile-level cell carrying
+            // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
+            // inbox is non-empty. Arming with the caller's interest returns
+            // Ready immediately for the always-writable case.
+            Arm::Dgram => Some(self.dgram_readiness.arm(
+                task_id,
+                interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                waker,
+            )),
+            // Listener: only ever POLL_IN-ready (a pending connection to
+            // accept). A POLL_OUT-only interest has nothing durable to wait for,
+            // so fall back to the legacy path.
+            Arm::Listener => {
+                if want_in {
+                    Some(
+                        self.listener_readiness
+                            .arm(task_id, narf_filesystem::POLL_IN, waker),
+                    )
+                } else {
+                    None
+                }
+            }
+            // uevent monitor: only POLL_IN-ready (a queued event). poll_readiness
+            // reconciled the cell against subscribed && reader.has_pending, and
+            // uevent_wake_hook sets its rising edge on an emit.
+            Arm::Uevent => {
+                if want_in {
+                    Some(
+                        self.uevent_readiness
+                            .arm(task_id, narf_filesystem::POLL_IN, waker),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Remove this task's waiter from both rings of a connected pair. Safe to
+    /// call even when only one side was armed (a `disarm` on an absent id is a
+    /// no-op). Returns `false` for unmigrated states so the caller runs its
+    /// legacy disarm path.
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        enum D {
+            Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Dgram,
+            Listener,
+            Uevent,
+            Legacy,
+        }
+        let d = match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => D::Connected(rx.clone(), tx.clone()),
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
+            SocketState::UnixListener { .. }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. } => D::Listener,
+            SocketState::NetlinkUevent { .. } => D::Uevent,
+            _ => D::Legacy,
+        };
+        match d {
+            D::Legacy => false,
+            D::Connected(rx, tx) => {
+                rx.readiness().disarm(task_id);
+                tx.readiness().disarm(task_id);
+                true
+            }
+            D::Dgram => {
+                self.dgram_readiness.disarm(task_id);
+                true
+            }
+            D::Listener => {
+                self.listener_readiness.disarm(task_id);
+                true
+            }
+            D::Uevent => {
+                self.uevent_readiness.disarm(task_id);
+                true
+            }
         }
     }
 }
@@ -2029,12 +2539,18 @@ impl SocketFile {
             | SocketState::NetlinkSockDiag { replies }
             | SocketState::NetlinkNetfilter { replies }
             | SocketState::NetlinkAudit { replies } => replies.front().map(Vec::len).unwrap_or(0),
-            SocketState::NetlinkUevent { reader } => reader
-                .peek(1)
-                .into_iter()
-                .next()
-                .map(|event| event.to_netlink_bytes().len())
-                .unwrap_or(0),
+            // A non-member of the kernel uevent group has nothing queued to
+            // report, so SIOCINQ is 0 — matching the EAGAIN its recv gives.
+            SocketState::NetlinkUevent { reader }
+                if self.netlink_uevent_subscribed.load(Ordering::Acquire) =>
+            {
+                reader
+                    .peek(1)
+                    .into_iter()
+                    .next()
+                    .map(|event| event.to_netlink_bytes().len())
+                    .unwrap_or(0)
+            }
             _ => 0,
         }
     }
@@ -2538,6 +3054,14 @@ impl SocketFile {
                 SocketOpResult::Ok(buf.len() as u64)
             }
             SocketOp::Recv { buf, flags } => {
+                // Kernel multicast reaches group-1 members only. A socket
+                // that never bound, or bound with nl_groups=0 (udev's
+                // MONITOR_GROUP_NONE worker monitor), is not on `mc_list`
+                // and sees an empty queue — EAGAIN, not somebody else's
+                // coldplug replay.
+                if !self.netlink_uevent_subscribed.load(Ordering::Acquire) {
+                    return SocketOpResult::Err(SockError::WouldBlock);
+                }
                 let ev = {
                     let mut g = self.state.lock();
                     match &mut *g {
@@ -2553,6 +3077,42 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
+                        // Boot-bringup diagnostic: WHO consumes each coldplug
+                        // uevent. "udevd was never handed the DRM add" and
+                        // "udevd read it and wrote no database" are the two
+                        // halves of the udev seat failure and are otherwise
+                        // indistinguishable — udevd's own log is unavailable
+                        // when journald has not started. Bounded by a hard
+                        // line budget so it can never become the stall it is
+                        // meant to explain.
+                        #[cfg(feature = "unix-latency-trace")]
+                        {
+                            use core::fmt::Write as _;
+                            static SHOWN: core::sync::atomic::AtomicU32 =
+                                core::sync::atomic::AtomicU32::new(0);
+                            // Generous: a 64-line budget was spent almost
+                            // entirely by PID 1's own monitor before udevd
+                            // started, which made udevd look like it read two
+                            // events and stopped. A capped probe going quiet
+                            // is indistinguishable from the thing it watches
+                            // going quiet.
+                            const BUDGET: u32 = 4000;
+                            if SHOWN.fetch_add(1, Ordering::Relaxed) < BUDGET {
+                                let task = crate::handlers::current_task_id();
+                                let comm = crate::handlers::proc_comm_of_task(task)
+                                    .unwrap_or_else(|| alloc::string::String::from("?"));
+                                let _ = writeln!(
+                                    narf_console::Writer,
+                                    "  uevent-rx: sock={:x} tid={} comm={} seq={} {}@{}",
+                                    Arc::as_ptr(self) as *const () as usize & 0xffffff,
+                                    task,
+                                    comm,
+                                    env.seqnum,
+                                    env.action.as_str(),
+                                    env.devpath
+                                );
+                            }
+                        }
                         self.note_netlink_receive(flags);
                         self.netlink_last_recv_group.store(1, Ordering::Release);
                         // Kernel netlink uevent wire format (NUL-separated,
@@ -3345,6 +3905,25 @@ impl SocketFile {
                     Some(l) => l,
                     None => return SocketOpResult::Err(SockError::ConnectionRefused),
                 };
+                // Reject an already-connected (or otherwise non-connectable) fd
+                // BEFORE minting/queuing any server endpoint. The old order
+                // pushed server_end onto the listener's pending queue and only
+                // THEN validated the client's state, so a second connect(2) on
+                // the same fd (Linux returns EISCONN) — or any connect on a
+                // non-Fresh socket — left a GHOST pending connection whose
+                // client half was never wired: its rx ring had no writer, so
+                // accept() returned a permanently POLLIN-silent fd. That is the
+                // dbus-broker system-bus strand — an accepted connection that
+                // never becomes readable, so the daemon never reads the client's
+                // AUTH and the client blocks forever. Peek the client state now;
+                // the commit happens after the server end is safely queued (so a
+                // listener torn down mid-connect leaves the client fd usable,
+                // not half-connected).
+                let local_addr = match &*self.state.lock() {
+                    SocketState::Fresh => None,
+                    SocketState::UnixBound { addr } => Some(addr.clone()),
+                    _ => return SocketOpResult::Err(SockError::AlreadyConnected),
+                };
                 // Mint two ring buffers; one direction each.
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
@@ -3385,8 +3964,31 @@ impl SocketFile {
                         listener
                             .listener_readable_token
                             .fetch_add(1, Ordering::Release);
+                        // Durable per-fd wake: fire the acceptor armed on the
+                        // listener's cell directly. poll_readiness clears it when
+                        // accept drains the queue.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
+                    }
+                }
+                // [VERIFY-PROBE] Unconditional: a SUCCESSFUL connect to a
+                // per-user session bus (/run/user/<uid>/bus) means user@<uid>'s
+                // systemd --user is up serving its bus — i.e. the D-Bus reset
+                // that was stopping user@957 is gone. Before the AF_UNIX
+                // targeted-wake fix the greeter only ever reached the SYSTEM bus.
+                // This prints in a CLEAN fast boot even while the console is
+                // otherwise quiet, giving a yes/no on the desktop path.
+                if let UnixAddr::Path(p) = &uaddr {
+                    if p.contains("/run/user/") && p.ends_with("/bus") {
+                        use core::fmt::Write as _;
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "SESSIONBUS-CONNECT path={} by={}",
+                            p,
+                            crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
+                                .unwrap_or_default()
+                        );
                     }
                 }
                 // Wayland/dbus connect-latency diagnostic: stamp WHO connected
@@ -3403,18 +4005,20 @@ impl SocketFile {
                     let comm =
                         crate::handlers::proc_comm_of_task(crate::handlers::current_task_id())
                             .unwrap_or_default();
-                    let path = match &uaddr {
-                        UnixAddr::Path(p) => p.as_str(),
-                        UnixAddr::Abstract(_) => "<abstract>",
-                        UnixAddr::Unnamed => "<unnamed>",
-                    };
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "UNIXENQ ms={} from={} path={}",
-                        narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
-                        comm,
-                        path,
-                    );
+                    if crate::syscall::unix_latency_line_wanted(&comm) {
+                        let path = match &uaddr {
+                            UnixAddr::Path(p) => p.as_str(),
+                            UnixAddr::Abstract(_) => "<abstract>",
+                            UnixAddr::Unnamed => "<unnamed>",
+                        };
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "UNIXENQ ms={} from={} path={}",
+                            narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
+                            comm,
+                            path,
+                        );
+                    }
                 }
                 // Wake a server parked in poll/accept on the listener so it
                 // accepts the new connection immediately (not on a fallback
@@ -3425,26 +4029,18 @@ impl SocketFile {
                 // forever (the connection sits unaccepted; observed as weston
                 // never serving an external client). See the send path above.
                 narf_net::readiness::notify(0);
-                // Configure our (client) end.
-                let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh | SocketState::UnixBound { .. } => {
-                        let local_addr = match &*state {
-                            SocketState::UnixBound { addr } => Some(addr.clone()),
-                            _ => None,
-                        };
-                        *state = SocketState::UnixConnected {
-                            tx: a_to_b,
-                            rx: b_to_a,
-                            local_addr,
-                        };
-                        drop(state);
-                        self.set_peer_cred(listener_cred);
-                        self.set_peer_groups(listener_groups);
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::AlreadyConnected),
-                }
+                // Commit the client end. Its state was validated (Fresh|Bound)
+                // BEFORE server_end was queued, so an already-connected fd was
+                // rejected up front and no ghost was ever created; `local_addr`
+                // was captured at that check.
+                *self.state.lock() = SocketState::UnixConnected {
+                    tx: a_to_b,
+                    rx: b_to_a,
+                    local_addr,
+                };
+                self.set_peer_cred(listener_cred);
+                self.set_peer_groups(listener_groups);
+                SocketOpResult::Ok(0)
             }
             SocketOp::Send {
                 buf,
@@ -3711,6 +4307,8 @@ impl SocketFile {
                     let mut lst = listener.state.lock();
                     if let SocketState::InetListener { pending, .. } = &mut *lst {
                         pending.push_back(server_end);
+                        // Durable accept wake; poll_readiness clears on accept.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -3906,15 +4504,32 @@ impl SocketFile {
                     fds: Vec::new(),
                 };
                 let mut ds = dest_sock.state.lock();
-                if let SocketState::InetDgram { inbox, .. } = &mut *ds {
+                let delivered = if let SocketState::InetDgram { inbox, .. } = &mut *ds {
                     inbox.push_back(pkt);
+                    true
+                } else {
+                    false // no bound InetDgram at the destination — dropped
+                };
+                drop(ds);
+                if delivered {
                     dest_sock
                         .dgram_readable_token
                         .fetch_add(1, Ordering::Release);
-                    SocketOpResult::Ok(buf.len() as u64)
-                } else {
-                    SocketOpResult::Ok(buf.len() as u64) // dropped
+                    // Durable per-fd wake: fire the reader armed on the
+                    // destination's datagram cell directly (targeted), so it
+                    // does not depend on the notify(0) herd + backstop below.
+                    // poll_readiness reconciles the cell on the consume side.
+                    dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
+                    // Wake a reader parked in poll/epoll on the destination.
+                    // Without this a peer blocked in epoll_wait(-1)/poll(-1) on
+                    // a bound UDP socket never wakes for a loopback datagram —
+                    // an infinite-timeout park breaks only on the readiness
+                    // generation bump, and the ~10 ms backstop re-checks the
+                    // park condition without re-running the readiness scan.
+                    // Mirrors the AF_UNIX dgram send path (dispatch_unix_dgram).
+                    narf_net::readiness::notify(0);
                 }
+                SocketOpResult::Ok(buf.len() as u64)
             }
             SocketOp::Recv { buf, flags: _ } => {
                 let mut state = self.state.lock();
@@ -4118,6 +4733,10 @@ impl SocketFile {
                     dest_sock
                         .dgram_readable_token
                         .fetch_add(1, Ordering::Release);
+                    // Durable per-fd wake: fire the reader armed on the dest's
+                    // datagram cell directly (state->cell lock order; the cell
+                    // has its own lock). poll_readiness clears it on consume.
+                    dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —
@@ -4125,26 +4744,100 @@ impl SocketFile {
                 narf_net::readiness::notify(0);
                 SocketOpResult::Ok(buf.len() as u64)
             }
-            SocketOp::Recv { buf, flags: _ } => {
+            SocketOp::Recv { buf, flags } => {
+                // MSG_PEEK must LOOK without consuming: Linux's
+                // `unix_dgram_recvmsg` takes a reference to the skb and leaves
+                // it queued. Ignoring the flag and popping destroys the very
+                // datagram the caller asked to inspect — and every size-probe
+                // consumer peeks first. systemd's `next_datagram_size_fd()` is
+                // exactly `recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC)`, which
+                // `sd-device-monitor` calls before every real receive.
+                let peek = flags & MSG_PEEK != 0;
                 let mut state = self.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *state {
-                    if let Some(pkt) = inbox.pop_front() {
-                        let n = core::cmp::min(buf.len(), pkt.payload.len());
-                        buf[..n].copy_from_slice(&pkt.payload[..n]);
-                        let body = pkt.peer_unix.map(|a| a.to_body()).unwrap_or_default();
-                        // Stash the sender's creds so a SO_PASSCRED recvmsg can
-                        // attach them as SCM_CREDENTIALS.
-                        *self.last_recv_cred.lock() = pkt.sender_cred;
-                        *self.last_recv_fds.lock() = pkt.fds;
-                        return SocketOpResult::Received {
-                            n,
-                            peer: Some(SockAddr {
-                                family: AF_UNIX,
-                                body,
-                            }),
+                    let Some(front) = inbox.front() else {
+                        return SocketOpResult::Err(SockError::WouldBlock);
+                    };
+                    let full_len = front.payload.len();
+                    let n = core::cmp::min(buf.len(), full_len);
+                    buf[..n].copy_from_slice(&front.payload[..n]);
+                    let body = front
+                        .peer_unix
+                        .clone()
+                        .map(|a| a.to_body())
+                        .unwrap_or_default();
+                    let sender_cred = front.sender_cred;
+                    let receiver = crate::handlers::current_task_id();
+                    // The udev-manager dispatch sequence, in dequeue order.
+                    // `assert(worker->event)` fires while HANDLING a datagram
+                    // and aborts before udevd can log which one; the last
+                    // line printed here before the abort IS the killer
+                    // datagram, with its sender named in both pid spaces.
+                    #[cfg(feature = "unix-latency-trace")]
+                    if !peek
+                        && crate::handlers::proc_comm_of_task_matches(receiver, "systemd-udevd$")
+                    {
+                        use core::fmt::Write as _;
+                        static SHOWN: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
+                            let outer = front.sender_cred.pid;
+                            let inner = crate::handlers::report_pid_to(receiver, outer as u64);
+                            let mut txt = alloc::string::String::new();
+                            for &b in front.payload.iter().take(40) {
+                                txt.push(if b == b'\n' {
+                                    '.'
+                                } else if b.is_ascii_graphic() || b == b' ' {
+                                    b as char
+                                } else {
+                                    '?'
+                                });
+                            }
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "  udevm-rx: outer={outer} inner={inner} payload={txt}"
+                            );
+                        }
+                    }
+                    if peek {
+                        // Per-message credentials are still reported for a
+                        // peek, but the SCM_RIGHTS batch stays attached to the
+                        // queued datagram: taking it here would hand the fds
+                        // to the peek and leave the real receive with none.
+                        self.dgram_recv_ancillary.lock().insert(
+                            receiver,
+                            DgramRecvAncillary {
+                                cred: sender_cred,
+                                fds: Vec::new(),
+                            },
+                        );
+                    } else if let Some(pkt) = inbox.pop_front() {
+                        // Stash this record's ancillary data against the
+                        // RECEIVING TASK so a concurrent receiver's dequeue
+                        // cannot overwrite it (see `dgram_recv_ancillary`).
+                        self.dgram_recv_ancillary.lock().insert(
+                            receiver,
+                            DgramRecvAncillary {
+                                cred: pkt.sender_cred,
+                                fds: pkt.fds,
+                            },
+                        );
+                    }
+                    let peer = Some(SockAddr {
+                        family: AF_UNIX,
+                        body,
+                    });
+                    // Report the DATAGRAM's real length when it did not fit, so
+                    // MSG_TRUNC answers a size probe instead of the truncated
+                    // copy length (0 for the zero-byte probe shape).
+                    if n < full_len {
+                        return SocketOpResult::ReceivedTruncated {
+                            copied: n,
+                            full_len,
+                            peer,
                         };
                     }
-                    return SocketOpResult::Err(SockError::WouldBlock);
+                    return SocketOpResult::Received { n, peer };
                 }
                 SocketOpResult::Err(SockError::NotConnected)
             }
@@ -4262,6 +4955,8 @@ impl SocketFile {
                     let mut lst = listener.state.lock();
                     if let SocketState::Inet6Listener { pending, .. } = &mut *lst {
                         pending.push_back(server_end);
+                        // Durable accept wake; poll_readiness clears on accept.
+                        listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -4327,7 +5022,7 @@ impl SocketFile {
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. }
             | SocketState::InetConnected { tx, .. }
-            | SocketState::Inet6Connected { tx, .. } => tx,
+            | SocketState::Inet6Connected { tx, .. } => tx.clone(),
             _ => return Err(SockError::NotConnected),
         };
         if tx.is_closed() {
@@ -4353,9 +5048,14 @@ impl SocketFile {
         // the task, which re-parks without re-running collect_ready, so the data
         // is never collected and the peer is never served (a finite-timeout
         // dispatcher like wl_2proc's `dispatch(50)` masked this via its deadline
-        // re-execute). notify(0) calls the same wake hook AND bumps the gen.
+        // re-execute). `wake_reader` bumps the gen too — but wakes ONLY the
+        // peer that reads this ring (its recorded owner), instead of `notify(0)`
+        // waking every parked poller. AF_UNIX is point-to-point, so the blanket
+        // wake was a thundering herd (SMP cross-core IPI storm) on ALL Unix /
+        // D-Bus traffic. Unknown owner (loopback INET, or a UNIX ring not yet
+        // read) falls back to wake-all, so correctness is preserved.
         if n > 0 {
-            narf_net::readiness::notify(0);
+            tx.wake_reader();
         }
         if n == 0 && !buf.is_empty() {
             Err(SockError::WouldBlock)
@@ -4381,6 +5081,10 @@ impl SocketFile {
             | SocketState::Inet6Connected { rx, .. } => rx,
             _ => return Err(SockError::NotConnected),
         };
+        // Claim this ring for the current reader (even on a WouldBlock read, so
+        // a reader that parks BEFORE data arrives is still recorded), so the
+        // peer's next send targets ONLY this task instead of waking the herd.
+        rx.set_owner(crate::handlers::current_task_id());
         let n = if flags & MSG_PEEK != 0 {
             rx.peek(buf)
         } else {
@@ -4416,6 +5120,17 @@ impl SocketFile {
             tx.write_stream_with_fds(buf, fds)
         };
         drop(state);
+        // Ring full (nothing fit) but there WAS data to send: the fd batch was
+        // not enqueued (write_*_with_fds bails before queuing when no bytes
+        // fit). Report EAGAIN so the caller waits for POLLOUT and RETRIES the
+        // whole sendmsg — re-attaching its SCM_RIGHTS fds — instead of seeing a
+        // bogus 0-byte "success". A 0 return from sendmsg is not a valid stream
+        // result: sd-bus/dbus-broker treat it as no-progress and either
+        // busy-loop or tear the connection down ("Connection reset by peer"),
+        // and the fds passed in this call would be silently dropped.
+        if n == 0 && !buf.is_empty() {
+            return Err(SockError::WouldBlock);
+        }
         // Wake a peer parked in poll/epoll/recv on the other end — same as
         // `do_send`. An fd-passing `sendmsg` (SCM_RIGHTS) is how libseat hands a
         // compositor its DRM/input fds; without this, a client blocked in
@@ -4447,11 +5162,27 @@ impl SocketFile {
         }
     }
 
+    /// Drop this task's pending datagram ancillary entry outright.
+    ///
+    /// `read(2)` has no ancillary output, so it wants neither the rights nor
+    /// the credentials; without this the entry would linger until the task's
+    /// next datagram receive overwrote it.
+    pub(crate) fn discard_dgram_recv_ancillary(&self) {
+        self.dgram_recv_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id());
+    }
+
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
     /// socket's receive ring (empty for non-unix sockets or when none were
     /// passed).
     pub(crate) fn unix_take_recv_fds(&self) -> Vec<ScmRightsFile> {
-        let from_dgram = core::mem::take(&mut *self.last_recv_fds.lock());
+        let from_dgram = self
+            .dgram_recv_ancillary
+            .lock()
+            .get_mut(&crate::handlers::current_task_id())
+            .map(|a| core::mem::take(&mut a.fds))
+            .unwrap_or_default();
         if !from_dgram.is_empty() {
             return from_dgram;
         }
@@ -4519,6 +5250,24 @@ pub struct RingBuf {
     closed: AtomicBool,
     readable_token: AtomicU64,
     writable_token: AtomicU64,
+    /// Task that READS this ring (the endpoint holding it as `rx`), for a
+    /// TARGETED readiness wake. AF_UNIX is point-to-point, so a send that fills
+    /// this ring should wake ONLY this reader — not every parked poller. The
+    /// old blanket `notify(0)` was a thundering herd (and, under SMP, a
+    /// cross-core IPI storm) on ALL Unix-socket / D-Bus traffic. 0 = unknown →
+    /// fall back to wake-all. Best-effort like TCP's TCB owner; the readiness
+    /// generation guard covers a stale/absent owner so it can never strand.
+    owner_task: AtomicU64,
+    /// Durable per-ring readiness cell — the migration target that replaces the
+    /// two edge tokens + `wake_reader`'s `notify` herd. A RingBuf is SHARED: it
+    /// is one endpoint's `rx` and the peer's `tx`, so its cell carries the full
+    /// triple — POLL_IN (buffered data, or closed → EOF), POLL_OUT (has space),
+    /// POLL_HUP (closed). The reader arms POLL_IN|POLL_HUP; the writer arms
+    /// POLL_OUT — both on the SAME cell, so a write that fills the ring wakes
+    /// the reader and a read that drains it wakes the writer, with no
+    /// cross-endpoint plumbing. Fused arm/set under one lock makes the lost
+    /// wakeup unrepresentable (see `narf_lib::readiness`).
+    readiness: narf_lib::readiness::Readiness,
 }
 
 struct RingInner {
@@ -4579,7 +5328,83 @@ impl RingBuf {
             closed: AtomicBool::new(false),
             readable_token: AtomicU64::new(0),
             writable_token: AtomicU64::new(0),
+            owner_task: AtomicU64::new(0),
+            // A fresh ring is empty: writable (has space), not readable, not
+            // closed.
+            readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
         }
+    }
+
+    /// Record the task that reads this ring (its `rx` endpoint owner), so a
+    /// send that fills it can wake ONLY that reader. See [`RingBuf::owner_task`].
+    #[inline]
+    fn set_owner(&self, task_id: u64) {
+        self.owner_task.store(task_id, Ordering::Relaxed);
+    }
+
+    /// The reader task recorded by [`RingBuf::set_owner`], or 0 if unknown.
+    #[inline]
+    fn owner(&self) -> u64 {
+        self.owner_task.load(Ordering::Relaxed)
+    }
+
+    /// Wake ONLY this ring's reader (the peer parked on it) and bump the
+    /// readiness generation — the point-to-point targeted wake that replaces
+    /// the blanket `notify(0)` herd on AF_UNIX data sends. When the reader is
+    /// unknown (owner 0: pre-registration, or an fd shared across tasks), fall
+    /// back to the conservative wake-all so correctness never depends on the
+    /// owner being right.
+    #[inline]
+    fn wake_reader(&self) {
+        let owner = self.owner();
+        if owner != 0 {
+            narf_net::readiness::bump_generation();
+            crate::handlers::wake_io_owner(owner);
+        } else {
+            narf_net::readiness::notify(0);
+        }
+    }
+
+    /// Recompute the durable readiness cell from the current ring state and
+    /// publish the transition. POLL_IN = buffered data OR closed (a closed ring
+    /// is permanently readable so a parked reader wakes to a 0-byte EOF read),
+    /// POLL_OUT = has space (a closed ring still reports writable so a parked
+    /// writer wakes to discover EPIPE), POLL_HUP = closed. `set` bumps the edge
+    /// sequence and wakes armed waiters only on a rising edge, all under one
+    /// lock (drop-free), so a concurrent `arm` can never miss this transition.
+    /// Called after every write/read/close that changes occupancy; kept
+    /// alongside the legacy edge tokens + `wake_reader` during the migration.
+    fn sync_readiness(&self) {
+        let closed = self.closed.load(Ordering::Acquire);
+        let (data, space) = {
+            let g = self.inner.lock();
+            (
+                g.len > 0 || !g.packets.is_empty(),
+                g.len < RING_CAP && g.packet_bytes < RING_CAP,
+            )
+        };
+        let readable = data || closed;
+        let add = (if readable {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }) | (if space { narf_filesystem::POLL_OUT } else { 0 })
+            | (if closed { narf_filesystem::POLL_HUP } else { 0 });
+        let clear = (if readable {
+            0
+        } else {
+            narf_filesystem::POLL_IN
+        }) | (if space { 0 } else { narf_filesystem::POLL_OUT })
+            | (if closed { 0 } else { narf_filesystem::POLL_HUP });
+        self.readiness.set(add, clear);
+    }
+
+    /// The durable readiness cell shared by both endpoints of this ring. The
+    /// reader arms POLL_IN|POLL_HUP, the writer arms POLL_OUT — see
+    /// [`RingBuf::readiness`] (the field).
+    #[inline]
+    fn readiness(&self) -> &narf_lib::readiness::Readiness {
+        &self.readiness
     }
 
     /// Take ancillary rights associated with the most recent receive.
@@ -4593,7 +5418,6 @@ impl RingBuf {
 
     fn write(&self, src: &[u8]) -> usize {
         let mut g = self.inner.lock();
-        let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
         for (i, &byte) in src.iter().enumerate().take(n) {
@@ -4602,17 +5426,26 @@ impl RingBuf {
         }
         g.len += n;
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
-        let became_readable = !was_readable && n != 0;
         drop(g);
-        if became_readable {
+        // Advance the readable edge on EVERY write that adds bytes, not only on
+        // the empty->non-empty transition. NARF's EPOLLET edge detection
+        // (poll_edge_token) keys on readable_token, and Linux re-fires an
+        // edge-triggered fd on every data arrival — so a follow-up write that
+        // lands on a still-unread ring must also produce a fresh edge. Bumping
+        // only on became-readable dropped the edge for bytes appended before the
+        // peer drained: an EPOLLET reader (dbus-broker on an accepted system-bus
+        // connection) never re-polled POLLIN and never read the client's
+        // follow-up bytes, stranding the D-Bus AUTH handshake (the mode-1
+        // desktop gate). Matches write_packet, which already bumps every write.
+        if n != 0 {
             self.readable_token.fetch_add(1, Ordering::Release);
+            self.sync_readiness();
         }
         n
     }
 
     fn write_stream_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>) -> usize {
         let mut g = self.inner.lock();
-        let was_readable = g.len > 0 || !g.packets.is_empty();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
         if n == 0 {
@@ -4631,11 +5464,12 @@ impl RingBuf {
                 fds,
             });
         }
-        let became_readable = !was_readable;
         drop(g);
-        if became_readable {
-            self.readable_token.fetch_add(1, Ordering::Release);
-        }
+        // See RingBuf::write: advance the readable edge on every data-bearing
+        // write so an EPOLLET reader re-fires on bytes appended before it
+        // drained. n > 0 here (the n == 0 case returned early above).
+        self.readable_token.fetch_add(1, Ordering::Release);
+        self.sync_readiness();
         n
     }
 
@@ -4656,6 +5490,7 @@ impl RingBuf {
         g.packet_bytes += src.len();
         drop(g);
         self.readable_token.fetch_add(1, Ordering::Release);
+        self.sync_readiness();
         src.len()
     }
 
@@ -4689,6 +5524,11 @@ impl RingBuf {
         drop(g);
         if became_writable {
             self.writable_token.fetch_add(1, Ordering::Release);
+        }
+        if n != 0 {
+            // Draining bytes can clear POLL_IN (ring now empty) and set POLL_OUT
+            // (space freed); republish so a writer parked on this ring wakes.
+            self.sync_readiness();
         }
         n
     }
@@ -4733,6 +5573,9 @@ impl RingBuf {
             if became_writable {
                 self.writable_token.fetch_add(1, Ordering::Release);
             }
+            // A record was consumed: POLL_IN may fall (queue now empty) and
+            // POLL_OUT may rise; republish for a writer parked on this ring.
+            self.sync_readiness();
         }
         Some((copied, full))
     }
@@ -4744,6 +5587,11 @@ impl RingBuf {
     fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.readable_token.fetch_add(1, Ordering::Release);
+            // Closing latches POLL_IN (EOF) + POLL_HUP so a reader parked on
+            // this ring wakes to a 0-byte read; POLL_OUT stays set so a parked
+            // writer wakes to discover EPIPE. Ordering matters: set closed
+            // (swap above), THEN sync so sync_readiness observes closed=true.
+            self.sync_readiness();
         }
     }
 
@@ -4892,6 +5740,49 @@ pub fn unix_listener_stall_sweep() {
             uc.futex_uaddr.load(Ordering::Relaxed),
             uc.sleep_deadline_ns.load(Ordering::Relaxed),
         );
+
+        // The owner above is only who called listen() — under socket
+        // activation that is PID 1, NOT the daemon that inherited the fd and
+        // actually accepts (dbus-broker / journald). Surface every task that
+        // holds an fd to THIS listener object (Arc identity) with its park
+        // state, so the census names the real stranded acceptor and the fd it
+        // watches. `try_with_table` keeps this a NON-BLOCKING read — a table
+        // whose lock the interrupted CPU already holds is skipped, not waited
+        // on — which is exactly why `listen_owner_tid` avoided this walk; the
+        // try-lock makes it trap-safe.
+        let l_ptr = Arc::as_ptr(&l);
+        for t2 in narf_scheduler::all_task_ids() {
+            let tid2 = t2.0;
+            let held_fd = crate::fd::try_with_table(tid2, |tab| {
+                tab.open_fd_numbers().into_iter().find(|&fd| {
+                    tab.get(fd)
+                        .and_then(|e| e.ops.as_any())
+                        .and_then(|a| a.downcast_ref::<SocketFile>())
+                        .is_some_and(|s| core::ptr::eq(s as *const SocketFile, l_ptr))
+                })
+            })
+            .flatten();
+            let Some(fd) = held_fd else {
+                continue;
+            };
+            let Some(task2) = crate::task::task_get(tid2) else {
+                continue;
+            };
+            let uc2 = &task2.uctx;
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "UNIXPEND-HOLDER name={name} tid={tid2} fd={fd} pid={} st={} parked={} scans={} checks={} pnfds={} epfd_enc={} netio={} deadline={:#x}",
+                task2.pid.load(Ordering::Relaxed),
+                task2.state.load(Ordering::Relaxed),
+                uc2.parked_in_syscall.load(Ordering::Relaxed) as u8,
+                uc2.dbg_poll_scans.load(Ordering::Relaxed),
+                uc2.dbg_park_checks.load(Ordering::Relaxed),
+                uc2.poll_wait_nfds.load(Ordering::Relaxed),
+                uc2.epoll_wait_fd.load(Ordering::Relaxed),
+                uc2.net_io_wait.load(Ordering::Relaxed) as u8,
+                uc2.sleep_deadline_ns.load(Ordering::Relaxed),
+            );
+        }
     }
 }
 
@@ -5183,6 +6074,138 @@ kernel_test_in!(
     smoke_unregistered_netlink_kernel_send_is_refused
 );
 
+/// systemd's device manager and systemd-udevd start after NARF queues the
+/// distro storage coldplug window. Both need that bounded replay; generic
+/// consumers (notably libinput) must remain tail-only.
+fn smoke_systemd_netlink_replays_boot_coldplug_only() -> TestResult {
+    use crate::handlers::{current_task_id, set_proc_comm};
+
+    narf_filesystem::uevent::__reset_for_test();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/early/stale"),
+        alloc::string::String::from("early"),
+    );
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/virtual/block/smoke-efi"),
+        alloc::string::String::from("block"),
+    );
+
+    let task = current_task_id();
+    set_proc_comm(task, "systemd-udevd");
+    let udevd = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let udevd_event = match &*udevd.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
+    set_proc_comm(task, "systemd");
+    let manager = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let manager_event = match &*manager.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
+    set_proc_comm(task, "libinput");
+    let generic = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let generic_pending = match &*generic.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.has_pending(),
+        _ => true,
+    };
+
+    narf_filesystem::uevent::__reset_for_test();
+    set_proc_comm(task, "");
+    if udevd_event.as_ref().map(|event| event.devpath.as_str())
+        != Some("/devices/virtual/block/smoke-efi")
+    {
+        return TestResult::Fail(
+            "systemd-udevd did not receive only the bounded boot coldplug window",
+        );
+    }
+    if manager_event.as_ref().map(|event| event.devpath.as_str())
+        != Some("/devices/virtual/block/smoke-efi")
+    {
+        return TestResult::Fail("systemd did not receive the bounded boot coldplug window");
+    }
+    if generic_pending {
+        return TestResult::Fail("generic uevent monitor replayed stale boot events");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_systemd_netlink_replays_boot_coldplug_only
+);
+
+/// EVERY replay-eligible monitor must receive the bounded boot-coldplug
+/// window — including the second one a single task opens.
+///
+/// PID 1 opens two `NETLINK_KOBJECT_UEVENT` sockets and they have different
+/// jobs: one is its own device manager's monitor, the other is the listening
+/// fd for `systemd-udevd-kernel.socket`, which is handed to `systemd-udevd`
+/// by socket activation. They are indistinguishable at `socket()` time — same
+/// task, same comm, same protocol — so any rule that grants the replay window
+/// "once per consumer" starves whichever one happens to be created second.
+///
+/// That is not hypothetical: an earlier attempt at a once-per-consumer grant
+/// did exactly this. udevd's inherited socket started at the ring TAIL
+/// (seqnum 11 in the Fedora gate) instead of the replay boundary (2), so it
+/// never saw `add@/devices/platform/narf-drm/card0` at seqnum 3 — the single
+/// event the whole udev seat gate depends on. Reverted, and pinned here.
+///
+/// Duplicate delivery to a FRESH monitor is harmless — it has consumed
+/// nothing — so erring toward re-delivery is the safe direction. If a udevd
+/// monitor-churn fix is ever needed, it must key on something that actually
+/// distinguishes these two sockets, not on the opening task.
+fn smoke_boot_coldplug_replay_reaches_every_eligible_monitor() -> TestResult {
+    use crate::handlers::{current_task_id, set_proc_comm};
+
+    narf_filesystem::uevent::__reset_for_test();
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    narf_filesystem::uevent::emit(
+        narf_filesystem::uevent::UeventAction::Add,
+        alloc::string::String::from("/devices/platform/narf-drm/card0"),
+        alloc::string::String::from("drm"),
+    );
+
+    let task = current_task_id();
+    set_proc_comm(task, "systemd");
+
+    // PID 1's own device-manager monitor.
+    let manager = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    // The listening fd for systemd-udevd-kernel.socket, opened by the SAME
+    // task moments later and later handed to udevd.
+    let activation = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+
+    let first = match &*manager.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+    let second = match &*activation.state.lock() {
+        SocketState::NetlinkUevent { reader } => reader.peek(1).into_iter().next(),
+        _ => None,
+    };
+
+    narf_filesystem::uevent::__reset_for_test();
+    set_proc_comm(task, "");
+
+    if first.as_ref().map(|e| e.devpath.as_str()) != Some("/devices/platform/narf-drm/card0") {
+        return TestResult::Fail("PID 1's own uevent monitor missed the boot coldplug window");
+    }
+    if second.as_ref().map(|e| e.devpath.as_str()) != Some("/devices/platform/narf-drm/card0") {
+        return TestResult::Fail(
+            "the socket-activation uevent fd missed the boot coldplug window (udevd would never see the DRM ADD)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_boot_coldplug_replay_reaches_every_eligible_monitor
+);
+
 /// A userspace multicast send must REACH the group's subscribers.
 ///
 /// This is task #12's root cause. `send_netlink_user` used to answer any
@@ -5333,6 +6356,191 @@ fn smoke_netlink_multicast_skips_nonsubscribers_and_sender() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_netlink_multicast_skips_nonsubscribers_and_sender
+);
+
+/// EPOLLET regression: a group-2 (UDEV_MONITOR_UDEV) broadcast landing in a
+/// subscriber's inbox must ADVANCE its `poll_edge_token`, not just satisfy
+/// `poll_readiness`. An edge-triggered consumer keys entirely off the token
+/// changing; if it never advances, the consumer never re-reports POLL_IN and
+/// never drains the delivery. The load-bearing case is logind's `sd-device`
+/// monitor: udevd re-broadcasts the processed DRM card (carrying the
+/// `master-of-seat` tag) to group 2, but a group-2 socket is not
+/// `netlink_uevent_subscribed` (only group 1 is), so before the fix the edge
+/// stayed 0 and logind never learned seat0 was graphical. The positive
+/// multicast test above only exercises a level-triggered `recv`.
+fn smoke_netlink_group_broadcast_advances_edge_token() -> TestResult {
+    const UDEV_GROUP_MASK: u32 = 2;
+    const OTHER_GROUP_MASK: u32 = 4; // group 3 — must NOT receive a group-2 send
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let bystander = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    for (sock, mask) in [(&listener, UDEV_GROUP_MASK), (&bystander, OTHER_GROUP_MASK)] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    // Baseline: empty inboxes, no edge, not readable.
+    let (rx0, _) = listener.poll_edge_token();
+    let (by0, _) = bystander.poll_edge_token();
+    if listener.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("group-2 listener falsely readable before any broadcast");
+    }
+
+    // udevd re-broadcasts a processed device (its tags travel in the payload).
+    let payload = b"add@/devices/platform/narf-drm/card0";
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: payload,
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("group-2 broadcast send failed");
+    }
+
+    // Positive: the subscriber's readable edge advanced AND it is now readable.
+    let (rx1, _) = listener.poll_edge_token();
+    if rx1 == rx0 {
+        return TestResult::Fail(
+            "edge token did not advance on inbox delivery — an EPOLLET monitor never re-fires",
+        );
+    }
+    if listener.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("group-2 listener not readable after broadcast");
+    }
+
+    // Negative: a socket in a different group gets neither the delivery nor an
+    // edge from the group-2 broadcast.
+    let (by1, _) = bystander.poll_edge_token();
+    if by1 != by0 {
+        return TestResult::Fail("a non-group-2 socket saw a spurious edge from a group-2 send");
+    }
+    if bystander.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("a non-group-2 socket became readable on a group-2 send");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_group_broadcast_advances_edge_token
+);
+
+/// A host-test waker that counts wakes via an `Arc<AtomicU32>` smuggled through
+/// the `RawWaker` data pointer (mirrors `lib/src/readiness.rs`'s test waker).
+fn counting_waker(counter: &alloc::sync::Arc<core::sync::atomic::AtomicU32>) -> core::task::Waker {
+    use core::sync::atomic::Ordering as O;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    type Cell = core::sync::atomic::AtomicU32;
+    fn clone(p: *const ()) -> RawWaker {
+        // SAFETY: `p` is an `Arc<Cell>` raw ptr minted below / by a prior clone.
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        let cloned = arc.clone();
+        let _ = alloc::sync::Arc::into_raw(arc);
+        RawWaker::new(alloc::sync::Arc::into_raw(cloned) as *const (), &VTABLE)
+    }
+    fn wake(p: *const ()) {
+        // SAFETY: consumes the Waker's ref.
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        arc.fetch_add(1, O::Relaxed);
+    }
+    fn wake_by_ref(p: *const ()) {
+        // SAFETY: borrows without consuming (re-leak the ref).
+        let arc = unsafe { alloc::sync::Arc::from_raw(p as *const Cell) };
+        arc.fetch_add(1, O::Relaxed);
+        let _ = alloc::sync::Arc::into_raw(arc);
+    }
+    fn drop_fn(p: *const ()) {
+        // SAFETY: drops the Waker's ref.
+        unsafe { drop(alloc::sync::Arc::from_raw(p as *const Cell)) }
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+    let raw = alloc::sync::Arc::into_raw(counter.clone()) as *const ();
+    // SAFETY: `raw` + VTABLE form a valid RawWaker per the fns above.
+    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+}
+
+/// The durable-wake migration: a group-2 broadcast must fire the subscriber's
+/// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not
+/// merely advance a token the herd `notify(0)` happens to re-check. This is the
+/// "impossible to miss by design" guarantee: the arm and the set serialize on
+/// the cell lock, so a broadcast in the check->register window can never be
+/// lost. Without the migration the group-2 inbox path never touched this cell.
+fn smoke_netlink_group_broadcast_fires_durable_waker() -> TestResult {
+    use core::sync::atomic::Ordering as O;
+    use core::task::Poll;
+    const UDEV_GROUP_MASK: u32 = 2;
+    const OTHER_GROUP_MASK: u32 = 4;
+    let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let listener = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    let bystander = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    for (sock, mask) in [(&listener, UDEV_GROUP_MASK), (&bystander, OTHER_GROUP_MASK)] {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: SocketFile::netlink_sockaddr(0, mask),
+            }),
+            SocketOpResult::Ok(_)
+        ) {
+            return TestResult::Fail("setup: netlink bind rejected a valid group mask");
+        }
+    }
+
+    // Arm each cell exactly as an epoll registration would (Arm::Uevent ->
+    // uevent_readiness.arm), with a distinct counting waker.
+    let want = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let idle = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let want_waker = counting_waker(&want);
+    let idle_waker = counting_waker(&idle);
+    if listener
+        .uevent_readiness
+        .arm(1, narf_filesystem::POLL_IN, &want_waker)
+        != Poll::Pending
+    {
+        return TestResult::Fail("subscriber cell should arm Pending before any broadcast");
+    }
+    if bystander
+        .uevent_readiness
+        .arm(1, narf_filesystem::POLL_IN, &idle_waker)
+        != Poll::Pending
+    {
+        return TestResult::Fail("bystander cell should arm Pending before any broadcast");
+    }
+
+    // udevd re-broadcasts a processed device to group 2.
+    if !matches!(
+        sender.dispatch_op(SocketOp::Send {
+            buf: b"add@/devices/platform/narf-drm/card0",
+            flags: 0,
+            addr: Some(SocketFile::netlink_sockaddr(0, UDEV_GROUP_MASK)),
+        }),
+        SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("group-2 broadcast send failed");
+    }
+
+    // Positive: the subscriber's durable waker fired.
+    if want.load(O::Relaxed) == 0 {
+        return TestResult::Fail(
+            "group-2 broadcast did not fire the armed durable waker — wake can still be missed",
+        );
+    }
+    // Negative: a socket in a different group got no durable wake from it.
+    if idle.load(O::Relaxed) != 0 {
+        return TestResult::Fail("a non-group-2 socket's durable waker fired on a group-2 send");
+    }
+    listener.uevent_readiness.disarm(1);
+    bystander.uevent_readiness.disarm(1);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_netlink_group_broadcast_fires_durable_waker
 );
 
 fn smoke_netlink_lists_high_membership_groups() -> TestResult {

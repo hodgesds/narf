@@ -1135,6 +1135,55 @@ fn smoke_abi_fsx_fsconfig_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_fsconfig_pos);
 
+fn smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos() -> TestResult {
+    with_setup(|| {
+        let fsname = b"tmpfs\0";
+        let key = b"ro\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: FSCONFIG_CMD_CREATE,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(CMD_CREATE) setup failed");
+        }
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 0,
+                arg2: key.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(SET_FLAG, ro) failed");
+        }
+        match call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: 7,
+                ..Default::default()
+            },
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("fsconfig(CMD_RECONFIGURE) must accept VFS ro flag"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos
+);
+
 fn smoke_abi_fsx_fsconfig_neg() -> TestResult {
     with_setup(|| {
         // No fs-context for fd 999 → EBADF.
@@ -1191,6 +1240,64 @@ fn smoke_abi_fsx_fsmount_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_fsmount_neg);
+
+// systemd's credential setup creates a tmpfs with the new mount API, then
+// reopens the detached mount with openat(mfd, ".", O_DIRECTORY|O_CLOEXEC)
+// before attaching it at /run/credentials/<unit>. Detached mounts are valid
+// directory fds but have no pathname, so this must not take openat's generic
+// pathless-fd EBADF branch.
+fn smoke_abi_fsx_fsmount_reopen_dot_pos() -> TestResult {
+    with_setup(|| {
+        let fsname = b"tmpfs\0";
+        let fsfd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        if call(
+            Syscall::Fsconfig.raw(),
+            SyscallArgs {
+                arg0: fsfd,
+                arg1: FSCONFIG_CMD_CREATE,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("fsconfig(CMD_CREATE) setup failed");
+        }
+        let mfd = match call(Syscall::Fsmount.raw(), a2(fsfd, 0, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsmount setup failed"),
+        };
+        let dot = b".\0";
+        const O_DIRECTORY: u64 = 0o200_000;
+        const O_CLOEXEC: u64 = 0o2_000_000;
+        let reopened = match call(
+            Syscall::Openat.raw(),
+            SyscallArgs {
+                arg0: mfd,
+                arg1: dot.as_ptr() as u64,
+                arg2: O_DIRECTORY | O_CLOEXEC,
+                ..Default::default()
+            },
+        ) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("openat(detached-mount, \".\") should reopen the mount"),
+        };
+        let to = b"/abi-reopened-mount\0";
+        match call(
+            Syscall::MoveMount.raw(),
+            SyscallArgs {
+                arg0: reopened,
+                arg3: to.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("reopened detached mount should be usable by move_mount"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_fsmount_reopen_dot_pos);
 
 // ── move_mount ────────────────────────────────────────────────────────
 //

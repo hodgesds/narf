@@ -212,12 +212,13 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // the child. Tasks in the root namespace skip the rebind (no
     // translation needed) but inherit_into_child returns None
     // silently in that case.
-    // fork(2)'s return value to the parent must be the child's pid in the
-    // PARENT's namespace, and it must agree with what the child's own getpid()
-    // reports (now that `inherit_into_child` keys the child's ns by TaskId, the
-    // child self-reports its INNER pid). Root-namespace parents keep the outer
-    // ProcessId (inherit_into_child returns None). These two facts are coupled:
-    // changing only one re-opens the mismatch (see project_pidns_flow_model).
+    // `child_ns_pid` tracks the child's SELF view — the pid the child's own
+    // getpid() reports (its inner pid in whatever namespace `inherit_into_child`
+    // places it into). fork(2)'s return value to the PARENT is derived from this
+    // below via `pid_ns::fork_return_to_parent`, which resolves the child's pid
+    // in the PARENT's namespace (Linux `pid_vnr` in the caller's ns). The two
+    // agree for an ordinary same-namespace fork but DIVERGE across a
+    // `unshare(CLONE_NEWPID)` boundary (see that function's contract).
     #[cfg(feature = "container")]
     let mut child_ns_pid = child_pid.raw();
     // Mount namespaces are implemented by the Linux-compat layer itself, not
@@ -258,15 +259,21 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     );
     // Parent-of bookkeeping was published above, BEFORE the spawn, to close
     // the SMP TRACEME race (see the comment at the `parent_of_set` call site).
-    // Return the child's pid in the parent's namespace (POSIX fork(2)
-    // contract). The parent's waitpid() passes this same value back as
-    // `want_pid`, which sys_wait4 translates back to the outer ProcessId before
-    // matching PENDING_EXITS. Root-namespace parents see the outer pid.
+    // Return the child's pid in the PARENT's namespace (POSIX fork(2) contract).
+    // The parent's waitpid() passes this same value back as `want_pid`, which
+    // sys_wait4 translates back to the outer ProcessId before matching
+    // PENDING_EXITS. `fork_return_to_parent` yields the outer pid for a root-ns
+    // parent (including one that just did `unshare(CLONE_NEWPID)`) and the
+    // child's in-namespace pid for an ordinary container fork.
     // All child-visible state is now installed, so it is safe for the child
     // to execute on another CPU.
     pending_child.spawn();
     #[cfg(feature = "container")]
-    ctx.set_return(SyscallReturn::ok(child_ns_pid));
+    ctx.set_return(SyscallReturn::ok(crate::pid_ns::fork_return_to_parent(
+        parent_pid,
+        child_pid.raw(),
+        child_ns_pid,
+    )));
     #[cfg(not(feature = "container"))]
     ctx.set_return(SyscallReturn::ok(child_pid.raw()));
 }

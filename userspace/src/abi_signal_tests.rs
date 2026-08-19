@@ -53,6 +53,49 @@ fn smoke_abi_signal_kill_null_signal() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
+/// The per-task raise generation (SIGNAL_RAISE_GEN) advances on EVERY signal
+/// raise — including a second signal arriving while a first is still pending
+/// (NOT the empty->non-empty transition that SIGNAL_READABLE_GEN tracks). This
+/// is the invariant the signalfd poll/epoll park guard relies on: it snapshots
+/// this generation before its scan and re-checks it after registering the
+/// signal waker, so a raise in the scan->register window forces a re-execution
+/// instead of a park on the ~10 ms backstop. `is_signal_pending`'s block-filter
+/// cannot cover that window for a BLOCKED signal (the canonical signalfd case),
+/// so the block-agnostic raise generation is what closes it. A bump ONLY on
+/// was_empty would strand a poller whose signalfd watches the SECOND signal.
+fn smoke_abi_signal_raise_generation_bumps_every_raise() -> TestResult {
+    with_setup(|| {
+        // FAKE_TASK starts clean (see smoke_abi_signal_kill_null_signal), so the
+        // reset also zeroed SIGNAL_RAISE_GEN.
+        let g0 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        // First raise: SIGUSR1 (10). was_empty == true.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 10)) != Some(0) {
+            return Err("kill(self, SIGUSR1) failed");
+        }
+        let g1 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        if g1 == g0 {
+            return Err("raise generation did not advance on the first raise");
+        }
+        // Second raise while SIGUSR1 is still pending: SIGUSR2 (12). was_empty ==
+        // false — this is the case a was_empty-only counter would miss.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 12)) != Some(0) {
+            return Err("kill(self, SIGUSR2) failed");
+        }
+        let g2 = crate::handlers::signal_raise_generation(FAKE_TASK);
+        if g2 == g1 {
+            return Err(
+                "raise generation did not advance on a second (non-was_empty) raise — a \
+                 signalfd watching the second signal would strand on the backstop",
+            );
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_raise_generation_bumps_every_raise
+);
+
 fn smoke_abi_signal_kill_neg() -> TestResult {
     with_setup(|| {
         // signum >= 32 → -EINVAL (Linux parity; was a non-Ok InvalidOp
@@ -386,6 +429,118 @@ fn smoke_abi_signal_signalfd_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_pos);
 
+// A signal sent by kill(2) must carry the SENDER's pid in the receiver's
+// namespace — Linux fills si_pid = task_tgid_nr_ns(current, receiver_ns) at
+// kernel/signal.c:1097. NARF's plain kill/tkill/tgkill path set only the
+// pending bit and queued no siginfo, so the receiver's signalfd read
+// ssi_pid == 0 — indistinguishable from a kernel-originated signal. systemd
+// PID 1 and udevd read $signalfd and key on ssi_pid; a sender of 0 is
+// dropped or misattributed.
+fn smoke_abi_signal_kill_signalfd_reports_sender_pid() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SENDER_TASK: u64 = 0x7710;
+        const SENDER_PID: u64 = 0x7700;
+
+        // Receiver (FAKE_TASK) installs a signalfd watching SIGUSR1.
+        let mask = (1u64 << (SIGUSR1 - 1)).to_le_bytes();
+        let sfd = match call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("signalfd(-1, &mask, 8, 0) did not return a fd"),
+        };
+
+        // A distinct sender task kills the receiver.
+        crate::handlers::register_task_to_pid(SENDER_TASK, SENDER_PID);
+        crate::handlers::register_pid_task_mapping(SENDER_PID, SENDER_TASK);
+        if crate::task::task_get(SENDER_TASK).is_none() {
+            let _ = crate::task::Task::new_registered(SENDER_TASK, SENDER_PID);
+        }
+        set_task(SENDER_TASK);
+        let sent = call(Syscall::Kill.raw(), a1(FAKE_TASK, SIGUSR1 as u64));
+        set_task(FAKE_TASK);
+        if sent != Some(0) {
+            crate::task::release_task(SENDER_TASK);
+            return Err("kill(receiver, SIGUSR1) did not succeed");
+        }
+
+        // The receiver's signalfd record must name the sender.
+        let mut rec = [0u8; 128];
+        let n = call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        );
+        crate::task::release_task(SENDER_TASK);
+        if n != Some(128) {
+            return Err("signalfd read did not return one record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // ssi_pid @ offset 12.
+        match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
+            SENDER_PID => Ok(()),
+            0 => Err("kill delivered ssi_pid == 0 — the sender pid was not recorded"),
+            _ => Err("kill recorded the wrong sender pid"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_kill_signalfd_reports_sender_pid
+);
+
+// SIGCHLD must name the exiting child in the PARENT's namespace. Linux
+// do_notify_parent fills si_pid = task_pid_nr_ns(child, parent_ns) and
+// si_code = CLD_EXITED/KILLED/DUMPED; NARF set only the pending bit, so the
+// parent's signalfd read ssi_pid == 0 and could not tell which child died.
+// systemd PID 1's manager_dispatch_signal_fd keys on ssi_pid.
+fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
+    with_setup(|| {
+        const SIGCHLD: u32 = 17;
+        const CLD_EXITED: i32 = 1;
+        const CHILD_PID: u64 = 0x7799;
+
+        // Parent (FAKE_TASK) watches SIGCHLD.
+        let mask = (1u64 << (SIGCHLD - 1)).to_le_bytes();
+        let sfd = match call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("signalfd(SIGCHLD) did not return a fd"),
+        };
+
+        // A child of FAKE_TASK exits with code 3.
+        crate::handlers::__test_inject_parent_of(CHILD_PID, FAKE_TASK);
+        crate::handlers::stage_pending_termination(CHILD_PID, 3 << 8);
+        crate::user_task::notify_task_exited(CHILD_PID, CHILD_PID);
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one SIGCHLD record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGCHLD {
+            return Err("signalfd record was not SIGCHLD");
+        }
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != CLD_EXITED {
+            return Err("SIGCHLD ssi_code was not CLD_EXITED");
+        }
+        match u32::from_le_bytes(rec[12..16].try_into().unwrap()) as u64 {
+            CHILD_PID => Ok(()),
+            0 => Err("SIGCHLD delivered ssi_pid == 0 — the child was not named"),
+            _ => Err("SIGCHLD named the wrong child pid"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
+
 fn smoke_abi_signal_signalfd_neg() -> TestResult {
     with_setup(|| {
         // fd_arg = 0 (>=0) but fd 0 is not a registered signalfd →
@@ -399,6 +554,147 @@ fn smoke_abi_signal_signalfd_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_neg);
+
+// ── pidfd_send_signal(2) siginfo payload ────────────────────────────
+//
+// With a non-NULL `info`, `pidfd_send_signal` is `rt_sigqueueinfo(2)`
+// addressed by pidfd: the caller's `siginfo_t` travels with the signal and
+// has to survive all the way to the target's `signalfd` read. systemd's
+// `pidref_sigqueue()` is precisely this call (SI_QUEUE + `si_pid =
+// getpid()`), and a udev worker's `on_sigusr1` drops any SIGUSR1 whose
+// `ssi_pid` is not its manager — so discarding the payload strands every
+// worker in `udev_watch_end()` and leaves `/run/udev/data` empty.
+
+/// x86_64 `siginfo_t` prefix in the layout userspace fills for sigqueue:
+/// si_signo@0, si_errno@4, si_code@8, si_pid@16, si_uid@20, si_value@24.
+fn sigqueue_siginfo(signum: u32, si_code: i32, si_pid: u32, si_value: u64) -> [u8; 32] {
+    let mut si = [0u8; 32];
+    si[0..4].copy_from_slice(&signum.to_le_bytes());
+    si[8..12].copy_from_slice(&si_code.to_le_bytes());
+    si[16..20].copy_from_slice(&si_pid.to_le_bytes());
+    si[20..24].copy_from_slice(&1000u32.to_le_bytes()); // si_uid
+    si[24..32].copy_from_slice(&si_value.to_le_bytes());
+    si
+}
+
+/// A signalfd watching exactly `signum` (sigset_t puts signal N at bit N-1).
+fn signalfd_watching(signum: u32) -> Result<u64, &'static str> {
+    let mask = (1u64 << (signum - 1)).to_le_bytes();
+    match call(
+        Syscall::Signalfd.raw(),
+        a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("signalfd(-1, &mask, 8, 0) did not return a fd"),
+    }
+}
+
+/// A pidfd for the harness task, whose `pidfd_send_signal` target is the
+/// same task the signalfd above belongs to.
+fn pidfd_for_self() -> Result<u64, &'static str> {
+    match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("pidfd_open(self) setup failed"),
+    }
+}
+
+fn smoke_abi_signal_pidfd_send_signal_delivers_siginfo() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SI_QUEUE: i32 = -1;
+        const SENDER_PID: u32 = 4242;
+        const SIVAL: u64 = 7;
+
+        let sfd = signalfd_watching(SIGUSR1)?;
+        let pidfd = pidfd_for_self()?;
+        let si = sigqueue_siginfo(SIGUSR1, SI_QUEUE, SENDER_PID, SIVAL);
+        if call(
+            Syscall::PidfdSendSignal.raw(),
+            a3(pidfd, SIGUSR1 as u64, si.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("pidfd_send_signal(SIGUSR1, &info) did not return 0");
+        }
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one signalfd_siginfo record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // ssi_code@8 and ssi_pid@12 are the two fields systemd reads via
+        // si_code_from_process() + its manager-pid comparison.
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != SI_QUEUE {
+            return Err("pidfd_send_signal dropped si_code (ssi_code != SI_QUEUE)");
+        }
+        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != SENDER_PID {
+            return Err("pidfd_send_signal dropped si_pid (ssi_pid != sender)");
+        }
+        // ssi_int@44 / ssi_ptr@48 carry sigqueue's sival payload.
+        if u64::from_le_bytes(rec[48..56].try_into().unwrap()) != SIVAL {
+            return Err("pidfd_send_signal dropped si_value (ssi_ptr)");
+        }
+        if u32::from_le_bytes(rec[44..48].try_into().unwrap()) != SIVAL as u32 {
+            return Err("pidfd_send_signal dropped si_value (ssi_int)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pidfd_send_signal_delivers_siginfo
+);
+
+fn smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+
+        let sfd = signalfd_watching(SIGUSR1)?;
+        let pidfd = pidfd_for_self()?;
+        if call(
+            Syscall::PidfdSendSignal.raw(),
+            a3(pidfd, SIGUSR1 as u64, 0, 0),
+        ) != Some(0)
+        {
+            return Err("pidfd_send_signal(SIGUSR1, NULL) did not return 0");
+        }
+
+        let mut rec = [0u8; 128];
+        if call(
+            Syscall::Read.raw(),
+            a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+        ) != Some(128)
+        {
+            return Err("signalfd read did not return one signalfd_siginfo record");
+        }
+        if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+            return Err("signalfd record named the wrong signal");
+        }
+        // A payload-less send is `kill(2)` shape: Linux's prepare_kill_siginfo
+        // synthesizes si_code = SI_USER (0) with si_pid naming the SENDER in
+        // the receiver's namespace. This test targets self, so ssi_pid is the
+        // caller's own pid. The whole class (kill/tkill/tgkill and this
+        // NULL-info arm) reports the sender together now — it used to read 0.
+        const SI_USER: i32 = 0;
+        if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != SI_USER {
+            return Err("payload-less pidfd_send_signal should report ssi_code SI_USER");
+        }
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if u32::from_le_bytes(rec[12..16].try_into().unwrap()) != my_pid {
+            return Err("payload-less pidfd_send_signal did not report the sender pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload
+);
 
 // ── Sigprocmask ─────────────────────────────────────────────────────
 // sys_sigprocmask(how, set, oldset, sigsetsize): sigsetsize!=8 → ok(-1);

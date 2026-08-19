@@ -47,6 +47,8 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         // SAFETY: SMAP bracket inside copy_from_user; p is a user VA.
         let _ = unsafe { copy_from_user(&mut total[old_len..], p) };
     }
+    #[cfg(feature = "syscall-trace")]
+    crate::socket::dbg_dbus_peek("TX", &total);
     let dest = if name_ptr != 0 && name_len >= 2 {
         copy_user_addr(name_ptr, name_len as u64)
     } else {

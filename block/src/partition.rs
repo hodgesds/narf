@@ -32,6 +32,58 @@ use crate::registry::{
 };
 use crate::BlockIoError;
 
+/// Best-effort filesystem UUID discovery used for `/dev/disk/by-uuid`.
+///
+/// This intentionally reads only immutable identification bytes while the
+/// partition scanner is already registering the child device. It is not a
+/// filesystem probe: the owning filesystem driver still validates and mounts
+/// the complete format later. FAT serials use Linux's eight-hex-digit form
+/// with a dash after four digits; ext UUIDs use their standard byte-order
+/// representation.
+fn discover_fs_uuid(dev: &dyn BlockDeviceSync) -> Option<String> {
+    let lba_bytes = dev.lba_size() as usize;
+    if lba_bytes < 512 {
+        return None;
+    }
+
+    let mut boot = alloc::vec![0u8; lba_bytes];
+    if dev.read(0, 1, &mut boot).is_ok() {
+        let fat_serial_offset = if boot.get(82..90) == Some(b"FAT32   ".as_slice()) {
+            Some(67)
+        } else if boot.get(54..62) == Some(b"FAT12   ".as_slice())
+            || boot.get(54..62) == Some(b"FAT16   ".as_slice())
+        {
+            Some(39)
+        } else {
+            None
+        };
+        if let Some(offset) = fat_serial_offset {
+            let serial = u32::from_le_bytes(boot[offset..offset + 4].try_into().ok()?);
+            return Some(format!("{:04X}-{:04X}", serial >> 16, serial & 0xffff));
+        }
+    }
+
+    // An ext superblock starts at byte 1024 and its UUID at +0x68. Read only
+    // the first few logical blocks needed to cover both the magic and UUID.
+    let required: usize = 1024 + 0x68 + 16;
+    let blocks = required.div_ceil(lba_bytes);
+    if blocks == 0 || blocks > u16::MAX as usize {
+        return None;
+    }
+    let mut bytes = alloc::vec![0u8; blocks * lba_bytes];
+    if dev.read(0, blocks as u16, &mut bytes).is_err()
+        || bytes.get(1024 + 0x38..1024 + 0x3a) != Some(&[0x53, 0xef][..])
+    {
+        return None;
+    }
+    let uuid = &bytes[1024 + 0x68..1024 + 0x68 + 16];
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+    ))
+}
+
 // ── Common signatures ──────────────────────────────────────────────
 
 /// Last two bytes of LBA 0 on a partitioned disk — both MBR and
@@ -449,8 +501,10 @@ pub fn scan_and_register_partitions(
             // Attach GPT metadata so root=PARTLABEL=… /
             // root=PARTUUID=… selectors match here.
             let meta = PartitionMetadata {
+                gpt_type_guid: format_guid(&p.type_guid),
                 partlabel: p.name.clone(),
                 partuuid: format_guid(&p.partition_guid),
+                fs_uuid: discover_fs_uuid(sub.as_ref()).unwrap_or_default(),
             };
             register_block_device_with_meta(static_name, sub, Some(meta));
             registered.push(name);

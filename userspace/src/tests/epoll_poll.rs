@@ -81,6 +81,105 @@ fn smoke_poll_one_fd_not_ready_returns_zero() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_poll_one_fd_not_ready_returns_zero);
 
+/// ppoll: an eventfd whose counter is nonzero is POLLIN-ready, so ppoll
+/// returns it (revents POLLIN), never parks. This is the EXACT shape a Qt
+/// event dispatcher relies on: it writes its wakeup eventfd, then the loop's
+/// ppoll must observe it readable and return to run posted events. If ppoll
+/// on a readable eventfd parked instead, any Qt nested `QEventLoop` would
+/// strand — which is the failure mode the CachyOS greeter
+/// (startplasma-login-wayland, blocked in KUpdateLaunchEnvironmentJob) shows.
+/// The prior ppoll tests only cover the empty-set / null-fds error arms;
+/// none exercised a real fd's readiness through the ppoll entry point.
+fn smoke_ppoll_eventfd_ready_returns_pollin() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let _task = setup_poll_test();
+    // Real eventfd2(initval=1, flags=0) → counter starts at 1 → POLL_IN ready.
+    let er = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 1,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if er.status != SyscallReturn::OK || er.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd2(1,0) returned -1");
+    }
+    let fd = er.value as u32;
+
+    // pollfd { fd, events=POLLIN, revents=0 }.
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+    // timespec {0,0} = nonblocking (a NULL timeout would block forever).
+    let ts: [u8; 16] = [0; 16];
+
+    let r = call(
+        Syscall::Ppoll,
+        SyscallArgs {
+            arg0: pfd.as_ptr() as u64,
+            arg1: 1,
+            arg2: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("ppoll should return 1 for a readable eventfd");
+    }
+    let revents = u16::from_ne_bytes([pfd[6], pfd[7]]);
+    if revents & (narf_filesystem::POLL_IN as u16) == 0 {
+        return TestResult::Fail("ppoll did not report POLLIN for the readable eventfd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_ppoll_eventfd_ready_returns_pollin);
+
+/// ppoll: an eventfd with counter 0 is NOT readable → nonblocking ppoll
+/// returns 0. Pairs with the ready case so an eventfd `poll_readiness`
+/// regression (readable-when-empty OR empty-when-readable) is caught from
+/// both directions through the ppoll path specifically.
+fn smoke_ppoll_eventfd_empty_returns_zero() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let _task = setup_poll_test();
+    // Real eventfd2(initval=0, flags=0) → counter 0 → NOT POLL_IN readable.
+    let er = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if er.status != SyscallReturn::OK || er.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd2(0,0) returned -1");
+    }
+    let fd = er.value as u32;
+
+    let mut pfd: [u8; 8] = [0; 8];
+    pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+    pfd[4..6].copy_from_slice(&(narf_filesystem::POLL_IN as u16).to_ne_bytes());
+    let ts: [u8; 16] = [0; 16];
+
+    let r = call(
+        Syscall::Ppoll,
+        SyscallArgs {
+            arg0: pfd.as_ptr() as u64,
+            arg1: 1,
+            arg2: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("ppoll should return 0 for an empty eventfd (nonblocking)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_ppoll_eventfd_empty_returns_zero);
+
 /// poll: invalid fd gives POLLNVAL in revents, returns 1
 fn smoke_poll_invalid_fd_returns_pollnval() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
@@ -921,6 +1020,113 @@ fn smoke_epoll_epollet_edge_triggered() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_epollet_edge_triggered);
 
+/// `EPOLL_CTL_MOD` must RE-ARM edge-triggered readiness. Linux re-checks the fd
+/// against its (possibly new) event mask on MOD and re-adds it to the ready
+/// list if currently ready — so a MOD acts as a fresh edge. NARF's `ctl_mod`
+/// updated `events`/`data` but left `last_mask`/`last_token` stale, so
+/// re-arming `EPOLLOUT|EPOLLET` on a still-writable fd whose `last_mask` already
+/// held POLLOUT gave `new_bits == 0` with no token change → the writable
+/// readiness was SWALLOWED. dbus-broker re-arms EPOLLOUT exactly this way to
+/// flush a queued reply; the swallowed edge stranded it, hanging the greeter's
+/// D-Bus round-trip and wedging the whole CachyOS boot (socket-activation
+/// cascade). `ReadyFile`'s edge token is a constant `(0,0)`, so ONLY a
+/// `last_mask` reset can re-deliver — this isolates the MOD-rearm path.
+fn smoke_epoll_ctl_mod_rearms_epollet_edge() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+
+    let epfd_r = call(
+        Syscall::EpollCreate,
+        SyscallArgs {
+            arg0: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if epfd_r.status != SyscallReturn::OK {
+        return TestResult::Fail("create failed");
+    }
+    let epfd = epfd_r.value as u32;
+
+    // Continuously-writable fd. EPOLLOUT == POLL_OUT == 0x4.
+    let watched = install_ready_file(task, narf_filesystem::POLL_OUT);
+    let mut ev = [0u8; 12];
+    let flags = crate::epoll::EPOLLOUT | crate::epoll::EPOLLET;
+    ev[..4].copy_from_slice(&flags.to_ne_bytes());
+    ev[4..12].copy_from_slice(&7u64.to_ne_bytes());
+
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+
+    let mut out_ev = [0u8; 12];
+    // First wait: last_mask 0 → POLLOUT rising edge → delivered.
+    let r1 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    // Second wait: same state, no new edge → 0. This sets up the stale
+    // last_mask == POLLOUT that the MOD must clear.
+    let r2 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    // Re-arm via MOD (same mask; Linux re-checks readiness on any MOD).
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_MOD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    // Third wait: MOD reset the edge state, so the still-writable fd is a fresh
+    // edge again → delivered.
+    let r3 = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+
+    if r1.status != SyscallReturn::OK || r1.value != 1 {
+        return TestResult::Fail("MOD-rearm: initial EPOLLOUT edge should deliver");
+    }
+    if r2.status != SyscallReturn::OK || r2.value != 0 {
+        return TestResult::Fail("MOD-rearm: same-state poll should return 0");
+    }
+    if r3.status != SyscallReturn::OK || r3.value != 1 {
+        return TestResult::Fail("MOD-rearm: EPOLL_CTL_MOD must re-report a ready fd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_ctl_mod_rearms_epollet_edge);
+
 /// Accepting the final AF_UNIX connection and receiving another connection
 /// before the next scan is a real EPOLLET edge even though both epoll samples
 /// see the listener as POLLIN. Event-driven accept loops may exercise this
@@ -1050,6 +1256,298 @@ fn smoke_epoll_epollet_unix_listener_drain_refill_before_wait() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_epoll_epollet_unix_listener_drain_refill_before_wait
+);
+
+/// The EXACT socket-activation-accept-strand shape (the CachyOS mode-1 desktop
+/// gate: dbus-broker stops accepting on /run/dbus/system_bus_socket, so late
+/// clients like systemd-user-runtime-dir hang and user@957 never gets a session
+/// bus). An EPOLLET listener whose queue was drained to EMPTY by a prior accept
+/// must, on the NEXT connect, deliver BOTH halves at once:
+///   (a) a readiness-GENERATION bump — the wake channel that breaks a server
+///       parked in epoll_wait(-1) out of its re-park (else it sleeps past the
+///       connection until an unrelated wake), and
+///   (b) the re-reported ACCEPT EDGE on the re-scan — the listener's POLLIN
+///       mask never dropped across accept→reconnect, so only the
+///       `listener_readable_token` advance distinguishes the new edge.
+/// The two existing tests cover these halves separately (edge via timeout=0,
+/// wake via a level poll on the first connect); neither covers them TOGETHER
+/// under EPOLLET after a drain-to-empty, which is precisely the strand.
+fn smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+
+    let open_stream = || {
+        call(
+            Syscall::SocketOpen,
+            SyscallArgs {
+                arg0: crate::socket::AF_UNIX as u64,
+                arg1: crate::socket::SOCK_STREAM as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let server = open_stream();
+    if server == u64::MAX {
+        return TestResult::Fail("listener socket failed");
+    }
+
+    let mut addr = [0u8; 128];
+    addr[..2].copy_from_slice(&crate::socket::AF_UNIX.to_le_bytes());
+    let path = b"/epoll-listener-drain-empty";
+    addr[2..2 + path.len()].copy_from_slice(path);
+    let addr_len = (2 + path.len()) as u64;
+    if call(
+        Syscall::SocketBind,
+        SyscallArgs {
+            arg0: server,
+            arg1: addr.as_ptr() as u64,
+            arg2: addr_len,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+        || call(
+            Syscall::SocketListen,
+            SyscallArgs {
+                arg0: server,
+                arg1: 16,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+            != 0
+    {
+        return TestResult::Fail("listener bind/listen failed");
+    }
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value;
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    event[4..12].copy_from_slice(&0xDECAFu64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: server,
+            arg3: event.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("listener epoll add failed");
+    }
+
+    let mut out = [0u8; 12];
+    let connect = |client: u64| {
+        call(
+            Syscall::SocketConnect,
+            SyscallArgs {
+                arg0: client,
+                arg1: addr.as_ptr() as u64,
+                arg2: addr_len,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let wait0 = |buf: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+
+    // First connection: take its initial edge, then accept to drain EMPTY.
+    let c1 = open_stream();
+    if c1 == u64::MAX || connect(c1) != 0 {
+        return TestResult::Fail("first connect failed");
+    }
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("initial EPOLLET listener edge missing");
+    }
+    if call(
+        Syscall::SocketAccept,
+        SyscallArgs {
+            arg0: server,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        == u64::MAX
+    {
+        return TestResult::Fail("first accept failed");
+    }
+    // Queue empty + edge already consumed: an EPOLLET re-scan sees no new edge.
+    if wait0(&mut out) != 0 {
+        return TestResult::Fail("drained EPOLLET listener still reported an edge");
+    }
+
+    // Second connection AFTER the drain-to-empty — the strand-critical enqueue.
+    let gen_before = narf_net::readiness::generation();
+    let c2 = open_stream();
+    if c2 == u64::MAX || connect(c2) != 0 {
+        return TestResult::Fail("post-drain connect failed");
+    }
+    // (a) wake channel: the generation MUST advance, or a server parked in
+    // epoll_wait(-1) never re-scans and the connection is never accepted.
+    if narf_net::readiness::generation() <= gen_before {
+        return TestResult::Fail(
+            "post-drain connect did not bump the readiness generation (parked epoll would sleep)",
+        );
+    }
+    // (b) edge: the re-scan MUST re-report POLLIN even though the mask never
+    // dropped — only listener_readable_token distinguishes this accept edge.
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("post-drain connect did not re-report the EPOLLET accept edge");
+    }
+    if call(
+        Syscall::SocketAccept,
+        SyscallArgs {
+            arg0: server,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        == u64::MAX
+    {
+        return TestResult::Fail("second accept (post-drain) failed");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty
+);
+
+/// EPOLLET must re-fire POLLIN when more data is appended to a still-unread
+/// stream ring. NARF keys the EPOLLET readable edge on `readable_token`; the
+/// old RingBuf::write bumped it only on the empty->non-empty transition, so a
+/// second write to a non-empty ring produced NO new edge and an edge-triggered
+/// reader that had not yet drained never re-polled POLLIN. That stranded
+/// dbus-broker on an accepted system-bus connection: the client's AUTH then its
+/// Hello arrive back-to-back and the second lands on the unread ring, so the
+/// broker never reads either and never replies (the mode-1 desktop gate). Linux
+/// re-fires an edge-triggered fd on every data arrival.
+fn smoke_epoll_epollet_refires_on_appended_stream_data() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+
+    let mut sv = [0i32; 2];
+    if call(
+        Syscall::SocketPair,
+        SyscallArgs {
+            arg0: crate::socket::AF_UNIX as u64,
+            arg1: crate::socket::SOCK_STREAM as u64,
+            arg3: sv.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("socketpair failed");
+    }
+    let (wfd, rfd) = (sv[0] as u64, sv[1] as u64);
+
+    let epfd = call(Syscall::EpollCreate, SyscallArgs::default()).value;
+    let mut event = [0u8; 12];
+    event[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    event[4..12].copy_from_slice(&0xDA7Au64.to_ne_bytes());
+    if call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: rfd,
+            arg3: event.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("epoll add failed");
+    }
+
+    let mut out = [0u8; 12];
+    let wait0 = |o: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: o.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    let send = |b: &[u8]| {
+        call(
+            Syscall::SocketSend,
+            SyscallArgs {
+                arg0: wfd,
+                arg1: b.as_ptr() as u64,
+                arg2: b.len() as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+
+    // First write: empty -> non-empty. The EPOLLET edge fires.
+    if send(b"A") != 1 {
+        return TestResult::Fail("first send failed");
+    }
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("initial EPOLLET POLLIN edge missing");
+    }
+    // Do NOT read: the reader's ring stays non-empty. Append a second byte.
+    if send(b"B") != 1 {
+        return TestResult::Fail("second send failed");
+    }
+    // The appended byte MUST produce a fresh EPOLLET edge (Linux re-fires on
+    // every data arrival). The old empty->non-empty-only bump swallowed it.
+    if wait0(&mut out) != 1 {
+        return TestResult::Fail("EPOLLET did not re-fire on data appended to an unread ring");
+    }
+    // Both bytes are present when the reader finally drains.
+    let mut buf = [0u8; 4];
+    let n = call(
+        Syscall::SocketRecv,
+        SyscallArgs {
+            arg0: rfd,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value;
+    if n != 2 || &buf[..2] != b"AB" {
+        return TestResult::Fail("reader did not receive both appended bytes");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_epollet_refires_on_appended_stream_data
 );
 
 /// EPOLLET must retain an enqueue edge that occurs after a drain but before
@@ -1301,6 +1799,28 @@ fn smoke_epoll_epollet_netlink_uevent_token_advances_on_new_uevents() -> TestRes
     .value as i32;
     if sock_fd < 0 {
         return TestResult::Fail("NETLINK_KOBJECT_UEVENT socket open failed");
+    }
+
+    // Join the kernel uevent multicast group (sockaddr_nl: family u16 @0,
+    // pad u16 @2, pid u32 @4, groups u32 @8; group 1 = MONITOR_GROUP_KERNEL).
+    // An UNBOUND netlink socket legitimately receives nothing, so without
+    // this bind there is no edge to observe.
+    let mut nl_addr = [0u8; 12];
+    nl_addr[..2].copy_from_slice(&crate::socket::AF_NETLINK.to_le_bytes());
+    nl_addr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if call(
+        Syscall::SocketBind,
+        SyscallArgs {
+            arg0: sock_fd as u64,
+            arg1: nl_addr.as_ptr() as u64,
+            arg2: nl_addr.len() as u64,
+            ..SyscallArgs::default()
+        },
+    )
+    .value
+        != 0
+    {
+        return TestResult::Fail("NETLINK_KOBJECT_UEVENT bind(groups=1) failed");
     }
 
     let epfd = call(
@@ -1597,10 +2117,17 @@ kernel_test_in!(
     smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out
 );
 
-/// Adding more bytes to an already-readable stream must not manufacture a
-/// second EPOLLIN edge. The consumer has already been told to drain to
-/// EAGAIN.
-fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
+/// Adding more bytes to an already-readable stream MUST re-fire the EPOLLIN
+/// edge. Linux calls `sk_data_ready()` on every sendmsg chunk UNCONDITIONALLY
+/// (net/unix/af_unix.c `unix_stream_sendmsg`: `__skb_queue_tail` then
+/// `sk_data_ready` inside the per-chunk send loop), so an edge-triggered reader
+/// is re-notified of newly-appended bytes even before it drains. NARF's old
+/// empty->non-empty-only readable edge dropped this, stranding dbus-broker on
+/// an accepted system-bus connection whose client sent AUTH then Hello (the
+/// mode-1 desktop gate). "Drain to EAGAIN" avoids MISSING already-arrived
+/// bytes; it does NOT suppress notification of NEW ones. (Renamed + inverted
+/// from the old `..._write_does_not_retrigger_readable`, which pinned the bug.)
+fn smoke_epoll_epollet_write_retriggers_readable() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
     // buffers. `validate_user_range` confines a real syscall to the user half,
@@ -1673,18 +2200,18 @@ fn smoke_epoll_epollet_write_does_not_retrigger_readable() -> TestResult {
             return TestResult::Fail("EPOLLET stream send failed");
         }
         let ready = wait(&mut out_ev).value;
-        if (index == 0 && ready != 1) || (index == 1 && ready != 0) {
-            return TestResult::Fail("EPOLLET retriggered unchanged readability");
+        // Both writes re-fire the edge: index 0 is empty->non-empty; index 1
+        // appends to a still-unread ring (Linux re-fires per data arrival).
+        let _ = index;
+        if ready != 1 {
+            return TestResult::Fail("EPOLLET did not re-fire on appended stream data");
         }
     }
 
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-kernel_test_in!(
-    "userspace",
-    smoke_epoll_epollet_write_does_not_retrigger_readable
-);
+kernel_test_in!("userspace", smoke_epoll_epollet_write_retriggers_readable);
 
 /// A full stream is not writable; consuming one byte must publish exactly one
 /// EPOLLOUT edge for the full-to-space transition.

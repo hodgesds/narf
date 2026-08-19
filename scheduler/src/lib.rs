@@ -3007,6 +3007,53 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
     None
 }
 
+/// Per-slot snapshot of `cpu`'s ready queue, newest-first, for the stall
+/// watchdog: `(tid, awake, home_cpu, affinity_bits, allowed_here, pops,
+/// not_awake_requeues)`.
+///
+/// [`dbg_cpu_stall`] reports that a halted CPU has runnable work, but not
+/// WHICH work or why it is not running, and the stall dump's summary counts
+/// are compatible with two completely different bugs. An awake slot that
+/// never runs is either an affinity bounce — it is queued on a CPU its mask
+/// excludes, so `run_until_empty` re-queues it WITHOUT consuming the flag and
+/// it circulates forever (`allowed_here == false`, `not_awake_requeues`
+/// climbing) — or a slot the executor simply stopped visiting (`allowed_here
+/// == true`, `pops` flat). Those need opposite fixes, and only per-slot state
+/// separates them.
+///
+/// Capped at [`DBG_READY_SLOTS_MAX`]: this runs from a timer trap onto a
+/// synchronous serial console, where dumping an unbounded queue would itself
+/// become the stall. `try_lock`, for the same reason [`dbg_slot_state`] uses
+/// it — blocking on the queue lock held by the CPU under investigation would
+/// deadlock the reporter.
+#[allow(clippy::type_complexity)]
+pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool, u64, u64)> {
+    let mut out = alloc::vec::Vec::new();
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return out;
+    }
+    let Some(g) = READY[cpu].try_lock() else {
+        return out;
+    };
+    let Some(d) = g.as_ref() else { return out };
+    for slot in d.iter().take(DBG_READY_SLOTS_MAX) {
+        let allowed = slot.spec.affinity.allowed;
+        out.push((
+            slot.id.raw(),
+            slot.awake.flag.load(Ordering::Acquire),
+            slot.awake.cpu.load(Ordering::Relaxed),
+            allowed.bits(),
+            allowed.contains(CpuId(cpu as u32)),
+            slot.awake.pops.load(Ordering::Relaxed),
+            slot.awake.not_awake_requeues.load(Ordering::Relaxed),
+        ));
+    }
+    out
+}
+
+/// Upper bound on [`dbg_ready_slots`] output — see its note on trap context.
+pub const DBG_READY_SLOTS_MAX: usize = 24;
+
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return (0, 0, false, false);
@@ -3396,6 +3443,24 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
         }
         core::hint::spin_loop();
     }
+    false
+}
+
+/// Arch-agnostic cooperative yield for contended in-kernel spin-waits whose
+/// lock holder may be a descheduled stackful task homed on THIS CPU (see
+/// [`stackful::cooperative_yield`]). Returns `true` if a yield happened,
+/// `false` when there is nothing to yield to (no stackful task, or an arch
+/// without the own-stack model) — the caller should then plain-spin.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn cooperative_yield() -> bool {
+    stackful::cooperative_yield()
+}
+
+/// Non-x86_64 stub: no own-stack cooperative scheduler, so the caller spins.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn cooperative_yield() -> bool {
     false
 }
 

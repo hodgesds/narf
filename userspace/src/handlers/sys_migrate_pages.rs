@@ -7,9 +7,18 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
     let visible_pid = task_to_pid_raw(task).unwrap_or(task);
-    if a.arg0 != 0 && a.arg0 != task && a.arg0 != visible_pid {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
-        return;
+    // Linux (mm/migrate.c:2541) resolves `pid` via find_task_by_vpid — in the
+    // CALLER's pid namespace. Translate the inner pid to its outer ProcessId
+    // before the self-comparison, so a container naming itself by getpid() (an
+    // inner value) is not rejected with a spurious EPERM. Audit finding #20.
+    if a.arg0 != 0 {
+        match accept_pid_from(task, a.arg0) {
+            Some(outer) if outer == task || outer == visible_pid => {}
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
+        }
     }
     if a.arg1 == 0 || a.arg1 > 64 || a.arg2 == 0 || a.arg3 == 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL

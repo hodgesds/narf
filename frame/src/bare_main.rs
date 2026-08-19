@@ -61,6 +61,37 @@ static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 )))]
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
+/// Volatile writable trees a distro PID 1 requires even when its block-backed
+/// root filesystem is mounted read-only. Keep `/var/tmp` separate from `/tmp`:
+/// systemd's `PrivateTmp` prepares and mounts both trees independently.
+const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 3] = [
+    ("/mnt/tmp", "/tmp"),
+    ("/mnt/var/tmp", "/var/tmp"),
+    ("/mnt/run", "/run"),
+];
+
+#[cfg(feature = "kernel-test")]
+fn smoke_distro_runtime_mount_plan_covers_private_tmp() -> narf_kernel_test::TestResult {
+    if DISTRO_WRITABLE_RUNTIME_MOUNTS
+        != [
+            ("/mnt/tmp", "/tmp"),
+            ("/mnt/var/tmp", "/var/tmp"),
+            ("/mnt/run", "/run"),
+        ]
+    {
+        return narf_kernel_test::TestResult::Fail(
+            "distro runtime mount plan must provide separate /tmp, /var/tmp, and /run trees",
+        );
+    }
+    narf_kernel_test::TestResult::Pass
+}
+
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "frame/boot",
+    smoke_distro_runtime_mount_plan_covers_private_tmp
+);
+
 /// Per-NUMA-node reclaimer signal, one flag per node (one `kswapd<node>`
 /// each): set by `kswapd_wake` so a wake that races the kthread's park is
 /// never lost.
@@ -370,61 +401,35 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     );
 }
 
-/// Parse `stop_at=<stage>` and `safe_mode[=...]` from a kernel
-/// command-line. Returns the highest stage that should run; defaults
-/// to `Stage::Late` (run everything). Unknown stage names fall back
-/// to `Stage::Late` with no error — diagnostics-only.
-/// Parse `key=N` out of cmdline, returning N as `usize`. Used by
-/// the hugepage pre-reservation path for `hugepages_2m=N` and
-/// `hugepages_1g=N`. Returns 0 if absent or malformed — the
-/// hugepage path treats 0 as "no reservation".
-fn parse_cmdline_count(cmdline: &str, key: &str) -> usize {
-    for tok in cmdline.split_ascii_whitespace() {
-        if let Some((k, v)) = tok.split_once('=') {
-            if k == key {
-                return v.parse().unwrap_or(0);
-            }
-        }
-    }
-    0
-}
-
-fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
+/// Parse `stop_at=<stage>` and `safe_mode[=...]` from the structured
+/// kernel command-line ([`narf_boot::args`]). Returns the highest stage
+/// that should run; defaults to `Stage::Late` (run everything). Unknown
+/// stage names are ignored with no error — diagnostics-only. Multiple
+/// `stop_at=` tokens take the earliest (lowest) stage.
+fn parse_stop_at(args: &narf_boot::KernelCmdline) -> narf_init::Stage {
     use narf_init::Stage;
     let mut last = Stage::Late;
-    for tok in cmdline.split_ascii_whitespace() {
-        let (key, val) = match tok.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (tok, ""),
+    for val in args.values("stop_at") {
+        let s = match val {
+            "early" => Stage::Early,
+            "core" => Stage::Core,
+            "postcore" => Stage::PostCore,
+            "arch" => Stage::Arch,
+            "subsys" => Stage::Subsys,
+            "fs" => Stage::Fs,
+            "device" => Stage::Device,
+            "late" => Stage::Late,
+            _ => continue,
         };
-        match key {
-            "stop_at" => {
-                let s = match val {
-                    "early" => Stage::Early,
-                    "core" => Stage::Core,
-                    "postcore" => Stage::PostCore,
-                    "arch" => Stage::Arch,
-                    "subsys" => Stage::Subsys,
-                    "fs" => Stage::Fs,
-                    "device" => Stage::Device,
-                    "late" => Stage::Late,
-                    _ => continue,
-                };
-                if (s as u8) < (last as u8) {
-                    last = s;
-                }
-            }
-            "safe_mode" => {
-                // Stop after Subsys: the kernel core, drivers
-                // registry, ACPI, MMU + heap are up; PCI probe,
-                // FS mount, FB-console, and userspace spawn are
-                // all skipped.
-                if (Stage::Subsys as u8) < (last as u8) {
-                    last = Stage::Subsys;
-                }
-            }
-            _ => {}
+        if (s as u8) < (last as u8) {
+            last = s;
         }
+    }
+    // Stop after Subsys: the kernel core, drivers registry, ACPI, MMU +
+    // heap are up; PCI probe, FS mount, FB-console, and userspace spawn
+    // are all skipped. `safe_mode` accepts a bare flag or `safe_mode=N`.
+    if args.has_key("safe_mode") && (Stage::Subsys as u8) < (last as u8) {
+        last = Stage::Subsys;
     }
     last
 }
@@ -1216,8 +1221,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // out of the usable regions BEFORE the buddy gets them.
             // Whatever's left (head misalignment + tail of each
             // region) is donated to the buddy via init_from_map.
-            let want_2m = parse_cmdline_count(narf_boot::cmdline(), "hugepages_2m");
-            let want_1g = parse_cmdline_count(narf_boot::cmdline(), "hugepages_1g");
+            let want_2m = narf_boot::args()
+                .parse_value::<usize>("hugepages_2m")
+                .unwrap_or(0);
+            let want_1g = narf_boot::args()
+                .parse_value::<usize>("hugepages_1g")
+                .unwrap_or(0);
             let kernel_exclude = [(kstart, kend)];
             let huge_excludes = if want_2m > 0 || want_1g > 0 {
                 // SAFETY: `regions` is the bootloader's usable-RAM map, the
@@ -2049,9 +2058,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // emulation is incomplete and #GPs the BSP
                 // mid-IPI), and as a fallback on real silicon
                 // when SMP isn't a critical-path requirement.
-                let nosmp = narf_boot::cmdline()
-                    .split_ascii_whitespace()
-                    .any(|t| t == "nosmp");
+                let nosmp = narf_boot::args().has_flag("nosmp");
                 if nosmp {
                     let _ = writeln!(
                         console::Writer,
@@ -2876,6 +2883,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Mount the UEFI EFI System Partition before PID 1 starts.  This
+            // is selected from the GPT ESP type GUID, never from a volatile
+            // device name or an image-specific FAT UUID.  Systemd then sees
+            // the already-mounted fstab target through /proc/self/mountinfo.
+            narf_init::register(narf_init::Stage::Late, "efi-system-partition-mount", || {
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                match narf_filesystem::root_mount::try_mount_efi_system_partition(&auth) {
+                    Ok(report) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: {:?} ESP on {} mounted at \"/boot\"",
+                            report.fs_type,
+                            report.device_name,
+                        );
+                        narf_init::InitResult::Ok
+                    }
+                    Err(narf_filesystem::root_mount::RootMountError::NoMountable) => {
+                        narf_init::InitResult::NotPresent
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  efi-mount: ESP mount failed: {:?}",
+                            error,
+                        );
+                        narf_init::InitResult::Error("EFI System Partition mount failed")
+                    }
+                }
+            });
+
             // Wave-50: secondary mount at /mnt. Walks the block
             // registry, skipping the device root-mount-auto already
             // consumed (FAT-on-nvme0 in QEMU), and mounts the first
@@ -3267,6 +3304,25 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::Ok
             });
 
+            // The early SysFs population happens before PCI probing, so it
+            // cannot see virtio-blk's GPT children. Re-populate the block
+            // class after all drivers have registered; systemd-udevd's
+            // coldplug then sees `/sys/class/block/vblk0p1/uevent` with
+            // DEVTYPE=partition and can satisfy fstab UUID .device units.
+            narf_init::register(narf_init::Stage::Late, "sysfs-block-class", || {
+                narf_filesystem::sysfs::populate_block_class();
+                // Only the finished block projection is replayable. Earlier
+                // bring-up uevents can predate their completed sysfs object.
+                narf_filesystem::uevent::begin_boot_udevd_replay();
+                let events = narf_filesystem::sysfs::emit_block_device_add_events();
+                let _ = writeln!(
+                    console::Writer,
+                    "  sysfs-block-class: queued {} canonical block ADD event(s)",
+                    events,
+                );
+                narf_init::InitResult::Ok
+            });
+
             // Make NARF's /dev reachable inside a chrooted /mnt rootfs, so a
             // real distro booted from the virtio-blk image (see distro_init /
             // distro_desktop) can open device files — /dev/fb0, /dev/dri,
@@ -3286,30 +3342,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 console::Writer,
                                 "  mnt-dev-bind: /dev bound at /mnt/dev (distro device access)"
                             );
-                            // Also give the chroot a writable /tmp (a fresh
-                            // in-memory FS) — a distro's runtime dir for
-                            // sockets/lock files (e.g. the Wayland display
-                            // socket) since the on-disk rootfs may be read-only.
-                            if !mounts.iter().any(|m| m == "/mnt/tmp") {
-                                let tmp = narf_filesystem::MemFs::new("tmpfs");
-                                let _ = narf_filesystem::registry().mount(&auth, "/mnt/tmp", tmp);
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  mnt-dev-bind: writable /tmp mounted at /mnt/tmp"
-                                );
-                            }
-                            // And a writable /run (tmpfs). udevd + most daemons
-                            // keep runtime state here (control socket, queue,
-                            // watch dir, /run/udev/data, /run/user/<uid>) which
-                            // need unlink/rename + nested dirs the ext2 rootfs
-                            // lacks. On real Linux /run is always tmpfs.
-                            if !mounts.iter().any(|m| m == "/mnt/run") {
-                                let run = narf_filesystem::MemFs::new("tmpfs");
-                                let _ = narf_filesystem::registry().mount(&auth, "/mnt/run", run);
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  mnt-dev-bind: writable /run mounted at /mnt/run"
-                                );
+                            // A read-only distro root still needs writable
+                            // runtime trees. /tmp carries sockets and locks,
+                            // /run carries daemon state, and /var/tmp is a
+                            // separate prerequisite for systemd PrivateTmp.
+                            for (mount_path, guest_path) in DISTRO_WRITABLE_RUNTIME_MOUNTS {
+                                if !mounts.iter().any(|m| m == mount_path) {
+                                    let fs = narf_filesystem::MemFs::new("tmpfs");
+                                    let _ =
+                                        narf_filesystem::registry().mount(&auth, mount_path, fs);
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  mnt-dev-bind: writable {} mounted at {}",
+                                        guest_path,
+                                        mount_path,
+                                    );
+                                }
                             }
                             // Bind /sys and /proc into the chroot too — libudev/
                             // libinput enumerate devices via /sys/class/*, and
@@ -3418,7 +3466,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // `stop_at=subsys`. Useful for narrowing real-HW
             // bring-up failures: each stage that completes prints
             // a summary line, the next stage is the suspect.
-            let last_stage = parse_stop_at(narf_boot::cmdline());
+            let last_stage = parse_stop_at(&narf_boot::args());
             if last_stage != narf_init::Stage::Late {
                 let _ = writeln!(
                     console::Writer,
@@ -3532,6 +3580,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
+    // Boot-coldplug replay health, once. `systemd-udevd` starts from the
+    // replay boundary, and if the ring has already evicted part of that
+    // window the daemon resumes at the oldest survivor without any error —
+    // it looks exactly like a correctly idle udevd that simply has no work.
+    // That ambiguity is unresolvable from inside the guest (journald may not
+    // even be up to record it), so the count is published here where the
+    // serial log always captures it.
+    {
+        let (replay_start, seqnum, ring, overrun) = narf_filesystem::uevent::boot_replay_health();
+        let _ = writeln!(
+            console::Writer,
+            "  uevent: seqnum={} ring={}/{} replay_start={} coldplug_overrun={}",
+            seqnum,
+            ring,
+            narf_filesystem::uevent::UEVENT_RING_N,
+            replay_start,
+            overrun
+        );
+        for (seq, action, subsystem, devpath) in narf_filesystem::uevent::boot_replay_dump(32) {
+            let _ = writeln!(
+                console::Writer,
+                "  uevent:   #{} {}@{} SUBSYSTEM={}",
+                seq,
+                action,
+                devpath,
+                subsystem
+            );
+        }
+    }
+
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
@@ -3540,9 +3618,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the
         // affected set and CI threads it here. Absent/empty ⇒ run all.
-        let selected = narf_boot::cmdline()
-            .split_ascii_whitespace()
-            .find_map(|arg| arg.strip_prefix("test_subsystem="));
+        let selected = narf_boot::args().value("test_subsystem");
         match selected {
             Some(list) if !list.is_empty() => {
                 let wanted: alloc::vec::Vec<&str> =
@@ -3695,6 +3771,44 @@ fn run_async_demo() -> ! {
                 console::Writer,
                 "  tsc: calibration failed — running in raw-tick units"
             );
+        }
+
+        // Anchor CLOCK_REALTIME to the CMOS RTC now that the TSC timebase is
+        // calibrated (so `monotonic_ns()` is accurate). Linux does this in
+        // `read_persistent_clock()` at boot. Without it the wall clock stays
+        // boot-relative — epoch 1970 — which makes PAM's `unix_chkpwd` see
+        // every account's password "changed in the future", derails
+        // `user@.service` (systemd --user) session setup so the user session
+        // bus never comes up, and skews every TLS/cert/mtime/timer check.
+        // Must run single-threaded (before SMP wake-ups: CMOS 0x70/0x71 is
+        // unsynchronised) and before the vDSO vvar is published, so both the
+        // kernel syscall and the vDSO fast path read real wall time.
+        // SAFETY: CPL=0, single-threaded here; CMOS ports 0x70/0x71 unowned.
+        match unsafe { narf_arch::x86_64::rtc::read_now() } {
+            Ok(rtc) => {
+                let unix_secs = rtc.to_unix_seconds();
+                if unix_secs > 0 {
+                    let target_ns = (unix_secs as i128) * 1_000_000_000;
+                    let mono_ns = narf_time::monotonic_ns() as i128;
+                    let offset_ns = (target_ns - mono_ns) as i64;
+                    narf_time::set_wall_offset_uncapped(offset_ns);
+                    let _ = writeln!(
+                        console::Writer,
+                        "  rtc: wall clock anchored to CMOS (unix {unix_secs}s, offset {offset_ns}ns)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  rtc: CMOS epoch <= 0 ({unix_secs}); wall clock left boot-relative"
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  rtc: CMOS read failed ({e:?}); wall clock left boot-relative"
+                );
+            }
         }
     }
 
@@ -3975,15 +4089,28 @@ fn boot_userspace_init() {
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.
     #[cfg(feature = "syscall-trace")]
-    if let Some(prefix) = narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("trace_comm="))
-    {
+    if let Some(prefix) = narf_boot::args().value("trace_comm") {
         narf_userspace::syscall::set_trace_comm(prefix);
         let _ = writeln!(
             console::Writer,
             "  boot-init: syscall-trace comm='{prefix}'"
         );
+    }
+    // `trace_errors_only` (bare flag) restricts the syscall trace to calls that
+    // FAIL with a reportable errno — light enough to reach a late boot phase
+    // that the full trace's serial flood would never let the boot reach.
+    #[cfg(feature = "syscall-trace")]
+    if narf_boot::args().has_flag("trace_errors_only") {
+        narf_userspace::syscall::set_trace_errors_only(true);
+        let _ = writeln!(console::Writer, "  boot-init: syscall-trace errors-only");
+    }
+    // `cgevt_trace` (bare flag): print every cgroup.events `populated`
+    // transition so a service whose start job hangs on the cgroup settling
+    // (e.g. a Type=oneshot in a fresh user slice) can be pinned.
+    #[cfg(feature = "cgroup")]
+    if narf_boot::args().has_flag("cgevt_trace") {
+        narf_filesystem::cgroupfs::set_cgevt_trace(true);
+        let _ = writeln!(console::Writer, "  boot-init: cgroup events trace");
     }
     // Build the shared vDSO + vvar pages now that the TSC/counter scale is
     // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
@@ -4880,9 +5007,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
     // `_start_rust`), so /mnt + /mnt/{dev,run,tmp,sys,proc} + the chroot
     // cgroup2 mount are live before this task ever runs. init/getty are
     // skipped: there is no NARF login shell in this mode.
-    let systemd_pid1 = narf_boot::cmdline()
-        .split_ascii_whitespace()
-        .any(|t| t == "systemd_pid1");
+    let systemd_pid1 = narf_boot::args().has_flag("systemd_pid1");
     if systemd_pid1 {
         let systemd_path = "/mnt/usr/lib/systemd/systemd";
         let systemd = narf_userspace::process::read_path_from_vfs(systemd_path);
@@ -4925,9 +5050,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         // sets so redis's heavy startup can't starve netserve's RX path on
         // a single CI vcpu past the host deadline (the net-smoke flake).
         #[cfg(not(feature = "mt-echo"))]
-        if !narf_boot::cmdline()
-            .split_whitespace()
-            .any(|t| t == "no_redis")
+        if !narf_boot::args().has_flag("no_redis")
             && !narf_verification::NARF_REDIS_SERVER_ELF.is_empty()
         {
             spawn_one_argv(
@@ -4955,7 +5078,9 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
         // the harness can sweep it without rebuilding the kernel.
         #[cfg(feature = "mt-echo")]
         if !narf_verification::NARF_MT_ECHO_ELF.is_empty() {
-            let n = parse_cmdline_count(narf_boot::cmdline(), "mt_echo_threads");
+            let n = narf_boot::args()
+                .parse_value::<usize>("mt_echo_threads")
+                .unwrap_or(0);
             let threads = if n == 0 {
                 (narf_lib::smp::cpu_count() as usize).max(1)
             } else {

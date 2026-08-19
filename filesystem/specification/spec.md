@@ -656,6 +656,20 @@ without leaving callers parked indefinitely.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+Block devices have canonical kobjects at
+`/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
+discovery views. Block `add` uevents and `/sys/dev/block/<major>:<minor>`
+links name the canonical device kobject, so systemd-udevd can construct an
+`sd_device`, apply filesystem-identification rules, and satisfy fstab UUID
+mount dependencies. Partition events with a discovered filesystem UUID carry
+both the existing `DEVLINKS=/dev/disk/by-uuid/<uuid>` path and the matching
+`SYSTEMD_ALIAS`; systemd device units are driven by the udev database rather
+than by probing whether the devfs symlink resolves.
+The bounded boot udev replay begins at the first completed late device
+projection and never advances past already-queued ADD events when another
+projection completes. This lets independently registered DRM and block
+devices share one coldplug window without replaying incomplete early-boot
+kobjects or dropping the graphical master before systemd-udevd starts.
 The perf discovery projection is
 `/sys/bus/event_source/devices/{cpu,software,narf_trace}`: it publishes PMU type numbers,
 the online CPU mask, and architecture-correct raw CPU PMU `format/*` bitfields
@@ -738,6 +752,23 @@ inodes, directories, symlinks, sparse data blocks, packed fragments, ID
 metadata, xattrs, stable inode identities, statx and statfs are decoded with
 strict `s_bytes_used` and decompression bounds. Every fallible mutation hook
 returns `FsError::ReadOnly`.
+
+### 3.12 EFI System Partition bootstrap mount
+
+`root_mount::try_mount_efi_system_partition()` attaches one FAT filesystem at
+both NARF's `/boot` and `/mnt/boot`, which is visible as `/boot` to the installed
+CachyOS PID 1 rooted at `/mnt`. It does so only when the registered GPT
+partition metadata has the UEFI EFI System Partition type GUID; it does not
+encode a block device name, partition label, or filesystem UUID. The nested
+attachment may precede the `/mnt` root attachment during boot, so mountinfo
+derives parentage from the finished tree rather than requiring parent-first
+registration. The boot initcall runs before PID 1 so systemd observes the
+existing fstab target through its mount table. After late block sysfs
+population, boot marks a bounded replay window and queues canonical
+`/devices/virtual/block/<name>` ADD events. udevd replays only that finished
+projection, not arbitrary earlier bring-up events; this lets it create the ESP
+UUID device unit even if its userspace trigger helper is unavailable during
+early setup.
 
 Zlib and legacy LZ4 images are supported. LZMA, LZO, XZ and Zstandard images
 are rejected at mount with `FsError::Unsupported` until bounded no_std

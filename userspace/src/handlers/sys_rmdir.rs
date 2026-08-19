@@ -19,8 +19,7 @@ pub(crate) fn sys_rmdir(ctx: &mut dyn TrapContext) {
 /// `rmdir` on an ALREADY-absolute path, so `sys_unlinkat(AT_REMOVEDIR)` can
 /// resolve against its dirfd first and share this body.
 pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
+    let outcome = current_resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
     match outcome {
         Some(Some(Ok(()))) => {
             #[cfg(feature = "linux-compat")]
