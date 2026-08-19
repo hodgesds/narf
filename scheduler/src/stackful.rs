@@ -1800,6 +1800,14 @@ pub fn current_stackful_waker() -> Option<Waker> {
     unsafe { (*p).current_waker.lock().as_ref().cloned() }
 }
 
+/// Non-x86_64: NARF has no stackful executor yet, so there is never a
+/// current stackful task — the own-stack durable-wake arming callers make
+/// (`poll`/`epoll`) simply see `None` and fall through to the legacy park.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn current_stackful_waker() -> Option<Waker> {
+    None
+}
+
 /// Mark the CURRENT stackful task complete and `kernel_switch` out — never
 /// returns (the executor observes `completed` and drops the task). The
 /// per-task-own-stack replacement for the longjmp-based task exit.
