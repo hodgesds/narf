@@ -56,9 +56,8 @@ pub fn resolve_address_space(root: PhysAddr) -> Option<Arc<AddressSpace>> {
 pub enum MigrateError {
     /// The frame has no recorded mapping (untracked, or already free).
     NotMapped,
-    /// The frame has more than one owner (COW-shared). Rewriting every owner's
-    /// PTE via [`crate::rmap::for_each_owner`] under a cross-AS lock order is the
-    /// multi-owner migration follow-up.
+    /// Retained for API compatibility; no longer returned. COW-shared frames are
+    /// now migrated by walking every rmap owner ([`migrate_frame_multi`]).
     MultiOwner,
     /// No live address space owns the frame's root (torn down, or no resolver
     /// installed).
@@ -71,35 +70,112 @@ pub enum MigrateError {
     Failed,
 }
 
-/// Relocate physical frame `src` to a fresh frame, repointing its owner's
-/// mapping, and return the new frame — the compaction primitive that evacuates a
+/// Relocate physical frame `src` to a fresh frame, repointing every mapping of
+/// it, and return the new frame — the compaction primitive that evacuates a
 /// specific frame so its buddy block can coalesce.
 ///
-/// SINGLE-OWNER only for now: a COW-shared frame (more than one rmap owner) is
-/// refused with [`MigrateError::MultiOwner`]; walking every owner and rewriting
-/// its PTE is the multi-owner follow-up. The relocation re-checks under the
-/// region lock that `src` is still mapped where rmap named it
-/// ([`AddressSpace::relocate_frame_at`]), so a concurrent fault/unmap yields
-/// [`MigrateError::Raced`] rather than moving the wrong page.
+/// Single-owner frames take the fast path ([`AddressSpace::relocate_frame_at`],
+/// which re-checks under the region lock that `src` is still mapped where rmap
+/// named it → [`MigrateError::Raced`] rather than moving the wrong page). A
+/// COW-shared frame (more than one rmap owner) is migrated by
+/// [`migrate_frame_multi`]. [`MigrateError::MultiOwner`] is retained in the API
+/// but no longer returned here.
 #[cfg(target_arch = "x86_64")]
 pub fn migrate_frame(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     match crate::rmap::owner_count(src) {
-        0 => return Err(MigrateError::NotMapped),
-        1 => {}
-        _ => return Err(MigrateError::MultiOwner),
+        0 => Err(MigrateError::NotMapped),
+        1 => {
+            let mut owner = None;
+            crate::rmap::for_each_owner(src, |o| owner = Some(o));
+            let owner = owner.ok_or(MigrateError::NotMapped)?;
+            let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
+            // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_at`
+            // re-validates the page under the region lock and only moves it if it
+            // still maps `src`.
+            match unsafe { aspace.relocate_frame_at(owner.va, src) } {
+                Ok(new) => Ok(new),
+                Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
+                Err(_) => Err(MigrateError::Failed),
+            }
+        }
+        _ => migrate_frame_multi(src),
     }
-    let mut owner = None;
-    crate::rmap::for_each_owner(src, |o| owner = Some(o));
-    let owner = owner.ok_or(MigrateError::NotMapped)?;
-    let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
-    // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_at`
-    // re-validates the page under the region lock and only moves it if it still
-    // maps `src`.
-    match unsafe { aspace.relocate_frame_at(owner.va, src) } {
-        Ok(new) => Ok(new),
-        Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
-        Err(_) => Err(MigrateError::Failed),
+}
+
+/// Migrate a COW-shared frame (`> 1` rmap owner) to a fresh shared frame.
+///
+/// Copies `src` into a new `dst`, pre-counts `dst`'s COW refcount to the owner
+/// count BEFORE any owner can reach it — so a write during migration faults into
+/// a proper COW split against `dst` rather than corrupting a co-owner — then
+/// repoints each owner atomically under its own region lock with a READ-ONLY
+/// leaf ([`AddressSpace::repoint_shared_page`]). An owner that raced (COW-split /
+/// unmapped `src` first) fails its repoint; its pre-counted `dst` reference is
+/// dropped and it keeps its own copy. `src`'s refcount is then released once per
+/// moved owner, and the physical frame is freed by whichever caller drops its
+/// last reference (the atomic `dec_ref` 1→0 transition, so never double-freed).
+#[cfg(target_arch = "x86_64")]
+fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
+    let mut owners: alloc::vec::Vec<crate::rmap::Owner> = alloc::vec::Vec::new();
+    crate::rmap::for_each_owner(src, |o| owners.push(o));
+    let n = owners.len();
+    if n < 2 {
+        // The count changed under us between the gate and the snapshot.
+        return Err(MigrateError::Raced);
     }
+
+    // Allocate `dst` on `src`'s node and copy the contents.
+    // SAFETY: `src` is a live frame naming its node.
+    let node = unsafe { crate::frame::narf_phys_node(src.raw()) };
+    let dst_frame =
+        crate::frame::alloc_user_frame_on_strict(node).map_err(|_| MigrateError::Failed)?;
+    let dst = dst_frame.start_address();
+    // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src.kernel_ptr::<u8>(),
+            dst.kernel_mut_ptr::<u8>(),
+            crate::frame::PAGE_SIZE as usize,
+        );
+    }
+
+    // Pre-count `dst` to `n` BEFORE installing any leaf, so a write during the
+    // migration faults into cow_split against a shared `dst`.
+    for _ in 1..n {
+        crate::frame::cow::inc_ref(dst);
+    }
+
+    // Repoint each owner atomically under its region lock.
+    let mut moved = 0usize;
+    for owner in &owners {
+        let ok = match resolve_address_space(owner.root) {
+            // SAFETY: `dst` holds a copy of `src`; the AS is a live pinned root.
+            Some(aspace) => unsafe { aspace.repoint_shared_page(owner.va, src, dst) }.is_ok(),
+            None => false,
+        };
+        if ok {
+            moved += 1;
+        } else {
+            // This owner did not move (raced / AS gone) → drop its pre-counted
+            // `dst` reference.
+            crate::frame::cow::dec_ref(dst);
+        }
+    }
+
+    if moved == 0 {
+        // Nobody moved; `dst` (now refcount 0) is unused.
+        crate::frame::free_frame(dst_frame);
+        return Err(MigrateError::Raced);
+    }
+
+    // Release `src`: one `free_frame` per owner we moved off it (repoint did not
+    // touch the refcount). `free_frame` dec_refs and returns the physical frame
+    // only from the caller that wins the atomic 1→0 transition, so it composes
+    // with a racing owner's own COW-split/unmap `free_frame` — exactly one caller
+    // frees the physical frame, and it is never double-freed or leaked.
+    for _ in 0..moved {
+        crate::frame::free_frame(crate::frame::PhysFrame::new(src));
+    }
+    Ok(dst)
 }
 
 /// Why a compaction attempt on a physical block could not free it.
@@ -376,6 +452,136 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_relocates);
+
+    // A resolver backed by several test-owned address spaces, so a fork-shared
+    // frame's owners (parent + child) both resolve.
+    #[cfg(target_arch = "x86_64")]
+    static TEST_AS_LIST: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+    #[cfg(target_arch = "x86_64")]
+    struct ListAsResolver;
+    #[cfg(target_arch = "x86_64")]
+    impl AddressSpaceResolver for ListAsResolver {
+        fn resolve(&self, root: PhysAddr) -> Option<Arc<AddressSpace>> {
+            TEST_AS_LIST.lock().iter().find(|a| a.root == root).cloned()
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    static LIST_AS_RESOLVER: ListAsResolver = ListAsResolver;
+
+    /// Multi-owner (COW) migration: a fork-shared frame must move to a fresh
+    /// shared frame carried by BOTH owners, preserving contents, freeing the
+    /// source, and keeping the copy COW so a later write still splits privately.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_migrate_frame_multi_owner() -> TestResult {
+        use super::migrate_frame;
+        use crate::frame::cow;
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        cow::__test_clear();
+        TEST_AS_LIST.lock().clear();
+
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let parent = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let p = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: identity-mapped fresh frame, sole owner.
+        unsafe { *(p.kernel_mut_ptr::<u32>()) = 0xC0FE_D00D };
+        let va = VirtAddr::new(0x0000_0080_00B0_0000);
+        if parent
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![p],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region parent failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { parent.materialize() }.is_err() {
+            return TestResult::Fail("materialize parent failed");
+        }
+        // SAFETY: fork's documented contract; paging is live.
+        let child = match unsafe { parent.clone_for_fork() } {
+            Ok(c) => Arc::new(c),
+            Err(_) => return TestResult::Fail("clone_for_fork failed"),
+        };
+        // SAFETY: child owns a fresh root; materialize maps its COW-shared page.
+        if unsafe { child.materialize() }.is_err() {
+            return TestResult::Fail("materialize child failed");
+        }
+        *TEST_AS_LIST.lock() = alloc::vec![parent.clone(), child.clone()];
+        register_address_space_resolver(&LIST_AS_RESOLVER);
+
+        let result = (|| {
+            if crate::rmap::owner_count(p) != 2 || cow::count(p) != 2 {
+                return TestResult::Fail("setup: fork-shared frame should have 2 owners/refs");
+            }
+            // Phys-driven migration walks BOTH owners and repoints them.
+            let new = match migrate_frame(p) {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = e;
+                    return TestResult::Fail("migrate_frame failed for a live COW-shared frame");
+                }
+            };
+            if new == p {
+                return TestResult::Fail("migrate must move to a different frame");
+            }
+            // SAFETY: new is the live frame; identity-mapped.
+            if unsafe { *(new.kernel_ptr::<u32>()) } != 0xC0FE_D00D {
+                return TestResult::Fail("migrate did not preserve the shared page contents");
+            }
+            // Both owners now carry `new`; the source is fully released.
+            if crate::rmap::owner_count(new) != 2 || cow::count(new) != 2 {
+                return TestResult::Fail("migrated frame should be shared by both owners");
+            }
+            if crate::rmap::owner_count(p) != 0 || cow::count(p) != 0 {
+                return TestResult::Fail("source frame should be fully released after migration");
+            }
+            if parent.regions_snapshot()[0].phys[0] != new
+                || child.regions_snapshot()[0].phys[0] != new
+            {
+                return TestResult::Fail("both owners' Region.phys must point at the new frame");
+            }
+            // The copy is still COW: a child write must split to a private frame,
+            // leaving the parent as the lone owner of `new`.
+            // SAFETY: `va` names the child's present COW mapping of `new`.
+            if unsafe { child.cow_split_on_write(va) }.is_err() {
+                return TestResult::Fail("post-migrate cow_split_on_write failed");
+            }
+            // SAFETY: pairs with the split to rewrite the leaf PTE.
+            if unsafe { child.remap_page(va) }.is_err() {
+                return TestResult::Fail("post-migrate remap_page failed");
+            }
+            let c_priv = child.regions_snapshot()[0].phys[0];
+            if c_priv == new {
+                return TestResult::Fail("post-migrate write should split to a private frame");
+            }
+            if crate::rmap::owner_count(new) != 1 || cow::count(new) > 1 {
+                return TestResult::Fail("after the split, only the parent should own `new`");
+            }
+            TestResult::Pass
+        })();
+
+        TEST_AS_LIST.lock().clear();
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        cow::__test_clear();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_migrate_frame_multi_owner);
 
     #[cfg(target_arch = "x86_64")]
     fn smoke_compact_block_evacuates_movable() -> TestResult {
