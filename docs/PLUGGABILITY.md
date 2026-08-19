@@ -141,6 +141,7 @@ The `0x0200..` block in `CapKind`:
 | `CongestionControl` (0x0207) | install per-socket TCP cc | `net::tcp` |
 | `IdleGovernor` (0x0208) | install idle governor | `power` |
 | `EventSink` (0x0209) | install tracing sink | `tracing` |
+| `OomPolicy` (0x020A) | install OOM victim-selection policy | `bpf-oom` |
 
 Each landing wave defines the `CapType` marker struct in its own crate
 and impls `CapType { const KIND = CapKind::Foo }` against the reserved

@@ -61,6 +61,7 @@ programs (§8.5).
 | `narf-bpf-jit` | x86_64 and aarch64 emitters | `isa`, `verifier` |
 | `narf-bpf` | kernel runtime, `kfunc!`/`struct_ops!`, attach adapters | the above + kernel crates |
 | `narf-bpf-leds` | atomic LED-command kfunc + worker-registration seam | `narf-bpf`, `narf-drivers-leds`, `narf-init` |
+| `narf-bpf-oom` | struct_ops OOM victim-ranking policy + candidate source | `narf-bpf-structops`, `narf-memory`, `narf-scheduler`, `narf-userspace` |
 
 The first three are dependency-free of the kernel and host-testable via
 `cargo xtask host-test`. `narf-bpf` must **not** depend on `narf-userspace` —
@@ -594,7 +595,12 @@ before the RX caller may recycle the DMA buffer or the test-run syscall returns.
 Capabilities: `Jit` (0x0053), `BpfProgLoad`/`BpfAttach`/`BpfMap`/`BpfArena`/
 `BpfStructOps` (0x0300..). struct_ops reuses the existing pluggable-policy
 caps — `SchedPolicy` (0x0203), `IoScheduler` (0x0206), `CongestionControl`
-(0x0207), `IdleGovernor` (0x0208) — so it needs no new cap plumbing.
+(0x0207), `IdleGovernor` (0x0208) — so it needs no new cap plumbing. The one
+exception is `OomPolicy` (0x020A), reserved for `narf-bpf-oom`: `memory`'s
+`OomKiller` seam predates the pluggable-cap convention and is uncapped
+(installed once at boot, from inside the kernel), so there was no existing
+authority to reuse. It is a *kill* authority, not an allocation one, and is
+deliberately not derivable from `MemAlloc` or `Pager`.
 
 ## 7. Stage assignment
 
