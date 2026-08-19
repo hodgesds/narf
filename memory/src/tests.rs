@@ -991,7 +991,9 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         return TestResult::Fail("aarch64 scatter map did not batch publication barriers");
     }
     if __range_l3_walks_for_test() != walks_before_map + 1 {
+        // SAFETY: cleanup of a root never installed in TTBR0.
         let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 scatter map repeated an upper-level walk per page");
     }
@@ -1018,7 +1020,9 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     }
     .is_err()
     {
+        // SAFETY: cleanup of a root never installed in TTBR0.
         let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 scatter permission rewrite failed");
     }
@@ -1026,12 +1030,16 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     if barriers_after_rewrite.0 != barriers_before_rewrite.0 + 1
         || barriers_after_rewrite.1 != barriers_before_rewrite.1 + 1
     {
+        // SAFETY: cleanup of a root never installed in TTBR0.
         let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 rewrite did not batch break-before-make barriers");
     }
     if __range_l3_walks_for_test() != walks_before_rewrite + 2 {
+        // SAFETY: cleanup of a root never installed in TTBR0.
         let _ = unsafe { unmap_4kb_range(root, base, 3) };
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 rewrite did not batch both upper-level walks");
     }
@@ -1041,7 +1049,9 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         let read_only = unsafe { crate::aarch64::paging::flags_at(root, va) }
             .is_some_and(|flags| flags.bits() & (0b11 << 6) == PtFlags::AP_RO_EL0.bits());
         if !read_only {
+            // SAFETY: cleanup of a root never installed in TTBR0.
             let _ = unsafe { unmap_4kb_range(root, base, 3) };
+            // SAFETY: no CPU has ever installed this isolated root.
             unsafe { free_user_ttbr0_tree(root) };
             return TestResult::Fail("aarch64 rewrite left a writable leaf");
         }
@@ -1051,6 +1061,7 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     // never active.
     let barriers_before_unmap = __batch_barrier_counts_for_test();
     let walks_before_unmap = __range_l3_walks_for_test();
+    // SAFETY: range unmap of the isolated root; no CPU ever installed it.
     if unsafe { unmap_4kb_range(root, base, 3) } != Ok(2) {
         // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
@@ -1063,9 +1074,11 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
         return TestResult::Fail("aarch64 range unmap did not batch TLBI barriers");
     }
     if __range_l3_walks_for_test() != walks_before_unmap + 1 {
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 range unmap repeated an upper-level walk per page");
     }
+    // SAFETY: idempotent re-unmap of the same isolated root.
     if unsafe { unmap_4kb_range(root, base, 3) } != Ok(0) {
         // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
@@ -1083,14 +1096,18 @@ fn smoke_aarch64_paging_scatter_and_range_unmap() -> TestResult {
     }
     .is_err()
     {
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 boundary scatter map failed");
     }
     if __range_l3_walks_for_test() != walks_before_boundary + 2 {
+        // SAFETY: cleanup of a root never installed in TTBR0.
         let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
+        // SAFETY: no CPU has ever installed this isolated root.
         unsafe { free_user_ttbr0_tree(root) };
         return TestResult::Fail("aarch64 scatter map reused L3 across a boundary");
     }
+    // SAFETY: final cleanup unmap of the isolated boundary root.
     let _ = unsafe { unmap_4kb_range(root, boundary_base, 2) };
     // SAFETY: no CPU has ever installed this isolated root.
     unsafe { free_user_ttbr0_tree(root) };
