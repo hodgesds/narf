@@ -6343,6 +6343,87 @@ fn smoke_memory_rmap_swap_roundtrip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_rmap_swap_roundtrip);
 
+/// `relocate_page` (the compaction primitive) must move a private page to a
+/// fresh frame, preserving its contents, and update both `Region.phys` and the
+/// reverse map to the new frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_relocate_page_moves_frame() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    crate::rmap::__reset_for_test();
+    // SAFETY: paging + frame allocator live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let p = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    // Stamp a sentinel so the post-relocate copy is observable.
+    // SAFETY: identity-mapped fresh frame, sole owner.
+    unsafe { *(p.kernel_mut_ptr::<u32>()) = 0xBEEF_1234 };
+    let va = VirtAddr::new(0x0000_0080_0080_0000);
+    if aspace
+        .map_region(Region {
+            base: va,
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![p],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        if crate::rmap::owner_count(p) != 1 {
+            return TestResult::Fail("setup: page should have one rmap owner");
+        }
+        // SAFETY: aspace owns the live root + private resident page.
+        let new_p = match unsafe { aspace.relocate_page(va) } {
+            Ok(x) => x,
+            Err(_) => return TestResult::Fail("relocate_page failed"),
+        };
+        if new_p == p {
+            return TestResult::Fail("relocate must move to a different frame");
+        }
+        // SAFETY: new_p is the live frame; identity-mapped.
+        if unsafe { *(new_p.kernel_ptr::<u32>()) } != 0xBEEF_1234 {
+            return TestResult::Fail("relocate did not preserve the page contents");
+        }
+        if aspace.regions_snapshot()[0].phys[0] != new_p {
+            return TestResult::Fail("relocate did not update Region.phys");
+        }
+        if crate::rmap::owner_count(p) != 0 {
+            return TestResult::Fail("relocate did not drop the old frame's rmap");
+        }
+        if crate::rmap::owner_count(new_p) != 1 {
+            return TestResult::Fail("relocate did not record the new frame's rmap");
+        }
+        let mut ok = false;
+        crate::rmap::for_each_owner(new_p, |o| {
+            if o.root == aspace.root && o.va == va {
+                ok = true;
+            }
+        });
+        if !ok {
+            return TestResult::Fail("relocated rmap owner does not match (root, va)");
+        }
+        TestResult::Pass
+    })();
+
+    let _ = aspace.unmap_region(va);
+    crate::rmap::__reset_for_test();
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_relocate_page_moves_frame);
+
 /// `demand_alloc_page` on an already-backed slot is a spurious
 /// fault (TLB shootdown race). Returns AlignmentMismatch so the
 /// trap handler retries cleanly without double-allocating.
