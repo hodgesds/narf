@@ -3958,6 +3958,9 @@ fn boot_userspace_init() {
     // anonymous pages once clean caches + shrinkers no longer cover the
     // watermark deficit (before resorting to the OOM killer).
     narf_userspace::anon_reclaim::install();
+    // Install the root→AddressSpace resolver so physical-frame migration
+    // (compaction) can map a frame's rmap owners back to their address spaces.
+    narf_userspace::migrate::install();
     // `trace_comm=<prefix>[,<prefix>...]` retargets the syscall-trace feature's
     // comm filter without a rebuild (default `systemd-executo`). No-op unless
     // the kernel was built with `--features syscall-trace`.
