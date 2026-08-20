@@ -34,7 +34,7 @@ use super::extent::{
     empty_iblock_leaf, find_physical_for_logical, insert_into_leaf, lookup_in_node, ExtentHeader,
     ExtentIndex, ExtentLeaf, InsertOutcome, LookupOutcome, EXT4_EXTENT_MAGIC,
 };
-use super::htree::{hash_version, name_hash, DxRoot};
+use super::htree::{hash_version, name_hash, DxRoot, DX_ROOT_ENTRIES_OFF, DX_ROOT_HEAD_OFF};
 use super::inode::{Ext4Inode, EXT4_EXTENTS_FL, EXT4_INDEX_FL};
 use super::journal::{
     block_type as jbt, build_one_txn_image, encode_commit, encode_descriptor, encode_superblock,
@@ -392,7 +392,8 @@ kernel_test_in!("drivers/fs/ext4", smoke_ext4_extent_insert_triggers_split);
 
 fn smoke_ext4_htree_root_decode_same_format() -> TestResult {
     // 4 KiB block. Synthesise: "." (12 bytes) + ".." (12 bytes) +
-    // dx_root_info (8 bytes) + dx_head (4 bytes) + 3 dx_entries.
+    // dx_root_info (8 bytes) + dx_head (limit/count, overlapping entry[0]'s
+    // hash slot) + 3 dx_entries.
     let mut block = vec![0u8; 4096];
     // "." dirent: inode=2, rec_len=12, name_len=1, file_type=2, name=".\0\0\0"
     block[0..4].copy_from_slice(&2u32.to_le_bytes());
@@ -412,16 +413,19 @@ fn smoke_ext4_htree_root_decode_same_format() -> TestResult {
     block[29] = 8;
     block[30] = 0;
     block[31] = 0;
-    // dx_head @ 32: limit=508, count=3
-    block[32..34].copy_from_slice(&508u16.to_le_bytes());
-    block[34..36].copy_from_slice(&3u16.to_le_bytes());
-    // dx_entries @ 40 (3 of them, 8 bytes each).
-    block[40..44].copy_from_slice(&0u32.to_le_bytes());
-    block[44..48].copy_from_slice(&1u32.to_le_bytes());
-    block[48..52].copy_from_slice(&0x4000_0000u32.to_le_bytes());
-    block[52..56].copy_from_slice(&2u32.to_le_bytes());
-    block[56..60].copy_from_slice(&0x8000_0000u32.to_le_bytes());
-    block[60..64].copy_from_slice(&3u32.to_le_bytes());
+    // dx_head overlaps entry[0]'s hash slot (the real ext4 dx_countlimit union):
+    // limit=508, count=3 live at DX_ROOT_HEAD_OFF, and the entries array begins
+    // at the SAME offset (DX_ROOT_ENTRIES_OFF), so entry 0's block is at +4.
+    block[DX_ROOT_HEAD_OFF..DX_ROOT_HEAD_OFF + 2].copy_from_slice(&508u16.to_le_bytes());
+    block[DX_ROOT_HEAD_OFF + 2..DX_ROOT_HEAD_OFF + 4].copy_from_slice(&3u16.to_le_bytes());
+    // 3 entries: block 0 → 1, (0x4000_0000) → 2, (0x8000_0000) → 3.
+    block[DX_ROOT_ENTRIES_OFF + 4..DX_ROOT_ENTRIES_OFF + 8].copy_from_slice(&1u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 8..DX_ROOT_ENTRIES_OFF + 12]
+        .copy_from_slice(&0x4000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 12..DX_ROOT_ENTRIES_OFF + 16].copy_from_slice(&2u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 16..DX_ROOT_ENTRIES_OFF + 20]
+        .copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    block[DX_ROOT_ENTRIES_OFF + 20..DX_ROOT_ENTRIES_OFF + 24].copy_from_slice(&3u32.to_le_bytes());
 
     let root = match DxRoot::parse(&block) {
         Some(r) => r,
