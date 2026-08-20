@@ -1365,10 +1365,44 @@ pub fn alloc_pages_on_ctx(
         return Err(FrameAllocError::Exhausted);
     }
     let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
+    // Direct compaction: a higher-order allocation that ran out of contiguous
+    // blocks may succeed after migrating movable pages together. Compact this
+    // node once and retry before giving up.
+    let r = retry_after_direct_compaction(r, node, order, ctx.migrate_type());
     #[cfg(feature = "cgroup")]
     if r.is_err() {
         crate::cgroup_charge::uncharge(charge_bytes);
     }
+    r
+}
+
+/// If a higher-order allocation failed, run synchronous direct compaction on
+/// `node` and retry the allocation once. x86_64 only — migration needs the rmap
+/// and accessed-bit machinery that aarch64 lacks; other arches pass the result
+/// through unchanged.
+#[cfg(target_arch = "x86_64")]
+fn retry_after_direct_compaction(
+    r: Result<PhysFrame, FrameAllocError>,
+    node: usize,
+    order: u8,
+    mt: buddy::MigrateType,
+) -> Result<PhysFrame, FrameAllocError> {
+    if r.is_err()
+        && order > 0
+        && crate::migrate::direct_compact(node.min(MAX_NUMA_NODES - 1), order as usize) > 0
+    {
+        return alloc_pages_on_inner(node, order, mt);
+    }
+    r
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn retry_after_direct_compaction(
+    r: Result<PhysFrame, FrameAllocError>,
+    _node: usize,
+    _order: u8,
+    _mt: buddy::MigrateType,
+) -> Result<PhysFrame, FrameAllocError> {
     r
 }
 
