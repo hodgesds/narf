@@ -400,10 +400,11 @@ fn smoke_io_dma_buffer_accessors() -> TestResult {
         }
         Err(_) => return TestResult::Fail("64 KiB contiguous alloc rejected"),
     }
-    // Above MAX_DMA_ORDER (256 KiB) still rejects with NoMemory.
-    match alloc_coherent(1 << 20, DomainId::DRIVER_0) {
+    // Above MAX_DMA_ORDER (order 10 = 4 MiB) rejects with NoMemory: 8 MiB rounds
+    // up to order 11, which the order check refuses regardless of free memory.
+    match alloc_coherent(8 << 20, DomainId::DRIVER_0) {
         Err(IoError::NoMemory) => {}
-        _ => return TestResult::Fail("1 MiB alloc (over MAX_DMA_ORDER) didn't reject"),
+        _ => return TestResult::Fail("8 MiB alloc (over MAX_DMA_ORDER) didn't reject"),
     }
     match alloc_coherent(0, DomainId::DRIVER_0) {
         Err(IoError::NoMemory) => {}
