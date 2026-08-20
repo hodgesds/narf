@@ -51,7 +51,7 @@
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use narf_kernel_test::kernel_test_in;
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
@@ -1013,6 +1013,9 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         }
         class.grown.fetch_add(n_blocks, Ordering::Relaxed);
         class.in_use.fetch_add(1, Ordering::Relaxed);
+        // First growth of any class arms the slab shrinker so reclaim can later
+        // return these frames under pressure (allocation-free, once).
+        ensure_slab_shrinker_registered();
         // Last block is the one we return.
         // SAFETY: identity-mapped frame.
         Ok(unsafe {
@@ -1245,6 +1248,279 @@ pub fn magazine_stats() -> MagazineStats {
     MagazineStats {
         mag_hit_count: hits,
         mag_miss_count: misses,
+    }
+}
+
+// ── Slab-page reclaim ──────────────────────────────────────────────
+//
+// Size classes grow by carving a fresh frame into `PAGE_SIZE / block_size`
+// equal blocks; historically those frames were never returned to the buddy, so
+// a class that ballooned during a spike of small allocations and then freed
+// everything kept all its frames. Slab reclaim returns FULLY-FREE frames to the
+// buddy under memory pressure.
+//
+// Soundness rests on one invariant: a frame is reclaimed only when ALL of its
+// blocks are on the CENTRAL free list. A block lives in exactly one place —
+// allocated, on a per-CPU magazine, or on the central list — so "all blocks
+// central-resident" proves none is in use and none is cached in a magazine that
+// would dangle once the frame is freed. Blocks stranded in magazines simply keep
+// their frame un-reclaimable (bounded by MAG_SIZE * MAX_CPUS per class).
+//
+// The scan runs under the class's central lock and allocation-free (it is
+// reachable from the allocation-failure reclaim path), so it groups blocks by
+// frame with an in-place merge sort of the free list rather than a heap map.
+
+/// Registered-once guard for the slab shrinker.
+static SLAB_SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Register the slab shrinker with the reclaimer, once. Called from the grow
+/// slow path — allocation-free, since `register_shrinker` only writes a fixed
+/// array, so it cannot re-enter the slab.
+fn ensure_slab_shrinker_registered() {
+    if !SLAB_SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        crate::reclaim::register_shrinker(crate::reclaim::Shrinker {
+            name: "slab",
+            count: slab_reclaimable_count,
+            scan: slab_shrink,
+        });
+    }
+}
+
+/// Shrinker `count`: an upper bound on reclaimable slab objects — total free
+/// blocks across all classes (`grown - in_use`). Only blocks whose whole frame
+/// is central-resident are actually reclaimable, so this over-estimates; the
+/// reclaimer tolerates a shrinker returning less than its proportional share.
+fn slab_reclaimable_count() -> usize {
+    let mut n = 0usize;
+    for c in CLASSES.iter() {
+        let grown = c.grown.load(Ordering::Relaxed);
+        let in_use = c.in_use.load(Ordering::Relaxed);
+        n = n.saturating_add(grown.saturating_sub(in_use));
+    }
+    n
+}
+
+/// Shrinker `scan`: return fully-free frames to the buddy, freeing about `nr`
+/// objects. Returns the number of objects (blocks) reclaimed.
+fn slab_shrink(nr: usize) -> usize {
+    if nr == 0 {
+        return 0;
+    }
+    let mut freed = 0usize;
+    for c in 0..N_CLASSES {
+        if freed >= nr {
+            break;
+        }
+        // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks.
+        freed = freed.saturating_add(unsafe { reclaim_class_frames(c) });
+    }
+    freed
+}
+
+/// Reclaim every fully-free frame of class `c`, returning the object count
+/// freed. Holds the class central lock for the whole operation.
+///
+/// # Safety
+/// `c < N_CLASSES`. The central free list holds only this class's blocks.
+unsafe fn reclaim_class_frames(c: usize) -> usize {
+    let class = &CLASSES[c];
+    let block_size = class_size(c);
+    let n_blocks = PAGE_SIZE_USIZE / block_size;
+    if n_blocks == 0 {
+        return 0;
+    }
+    let mut g = class.head.lock();
+    let taken = g.take();
+    // Validate every free block's canary before trusting its links.
+    // SAFETY: every node on the central list we just took is a valid free block
+    // of class `c`; we only read canaries and `next` links.
+    unsafe {
+        let mut cur = taken;
+        while let Some(b) = cur {
+            canary_check_free(b, c);
+            cur = b.as_ref().next;
+        }
+    }
+    // SAFETY: the nodes are this class's free blocks; the sort only relinks them.
+    let sorted = unsafe { sort_free_list_by_addr(taken) };
+
+    let mut kept_head: Option<NonNull<FreeBlock>> = None;
+    let mut kept_tail: Option<NonNull<FreeBlock>> = None;
+    let mut freed_objects = 0usize;
+
+    let mut cur = sorted;
+    while let Some(run_start) = cur {
+        let frame_base = (run_start.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+        // A frame's blocks are contiguous in the sorted list: measure the run.
+        let mut run_len = 0usize;
+        let mut scan = cur;
+        // SAFETY: sorted nodes are valid free blocks; we only read `next`.
+        let run_end = unsafe {
+            while let Some(b) = scan {
+                if ((b.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1)) != frame_base {
+                    break;
+                }
+                run_len += 1;
+                scan = b.as_ref().next;
+            }
+            scan // first block of the next frame (or None)
+        };
+
+        if run_len == n_blocks {
+            // Every block of this frame is free → return it to the buddy.
+            // SAFETY: `frame_base` is the page-aligned kernel VA of a frame this
+            // slab owns; invert the direct map to recover its phys.
+            let phys = crate::PhysAddr::from_kernel_ptr(frame_base as *const u8);
+            #[cfg(feature = "kasan")]
+            // SAFETY: clear the slab poison so the buddy hands out clean shadow.
+            unsafe {
+                crate::kasan::unpoison(frame_base as u64, PAGE_SIZE_USIZE);
+            }
+            crate::frame::free_frame(PhysFrame::new(phys));
+            class.grown.fetch_sub(n_blocks, Ordering::Relaxed);
+            freed_objects += n_blocks;
+        } else {
+            // Keep this run: append its blocks to the rebuilt list, in order.
+            // SAFETY: the run nodes are valid free blocks we own; we re-null and
+            // re-link their `next` pointers onto the rebuilt kept list.
+            unsafe {
+                let mut k = cur;
+                while k != run_end {
+                    let node = k.expect("run node within bounds");
+                    let nxt = node.as_ref().next;
+                    (*node.as_ptr()).next = None;
+                    match kept_tail {
+                        None => kept_head = Some(node),
+                        Some(t) => (*t.as_ptr()).next = Some(node),
+                    }
+                    kept_tail = Some(node);
+                    k = nxt;
+                }
+            }
+        }
+        cur = run_end;
+    }
+    *g = kept_head;
+    freed_objects
+}
+
+/// Detach up to `n` nodes from the front of `head`; return `(front, rest)`.
+///
+/// # Safety
+/// `head` is a valid singly-linked list of free blocks owned by the caller.
+unsafe fn split_run(
+    head: Option<NonNull<FreeBlock>>,
+    n: usize,
+) -> (Option<NonNull<FreeBlock>>, Option<NonNull<FreeBlock>>) {
+    if head.is_none() || n == 0 {
+        return (None, head);
+    }
+    // SAFETY: per the fn contract `head` is a valid owned list; we walk and
+    // re-null the `next` link of a node we own.
+    unsafe {
+        let mut cur = head.expect("checked some");
+        for _ in 1..n {
+            match cur.as_ref().next {
+                Some(nx) => cur = nx,
+                None => return (head, None),
+            }
+        }
+        let rest = cur.as_ref().next;
+        (*cur.as_ptr()).next = None;
+        (head, rest)
+    }
+}
+
+/// Merge two address-sorted runs into one ascending run.
+///
+/// # Safety
+/// Both arguments are valid, address-sorted singly-linked runs.
+unsafe fn merge_runs(
+    mut a: Option<NonNull<FreeBlock>>,
+    mut b: Option<NonNull<FreeBlock>>,
+) -> Option<NonNull<FreeBlock>> {
+    let mut head: Option<NonNull<FreeBlock>> = None;
+    let mut tail: Option<NonNull<FreeBlock>> = None;
+    // SAFETY: per the fn contract both runs are valid owned lists; we read `next`
+    // links and re-link nodes we own onto the merged run.
+    unsafe {
+        loop {
+            let pick = match (a, b) {
+                (Some(x), Some(y)) => {
+                    if (x.as_ptr() as usize) <= (y.as_ptr() as usize) {
+                        a = x.as_ref().next;
+                        x
+                    } else {
+                        b = y.as_ref().next;
+                        y
+                    }
+                }
+                (Some(x), None) => {
+                    a = x.as_ref().next;
+                    x
+                }
+                (None, Some(y)) => {
+                    b = y.as_ref().next;
+                    y
+                }
+                (None, None) => break,
+            };
+            (*pick.as_ptr()).next = None;
+            match tail {
+                None => head = Some(pick),
+                Some(t) => (*t.as_ptr()).next = Some(pick),
+            }
+            tail = Some(pick);
+        }
+    }
+    head
+}
+
+/// In-place bottom-up merge sort of the free list by block address (ascending).
+/// Iterative — no recursion — so a long list can't overflow the kernel stack.
+///
+/// # Safety
+/// `head` is a valid singly-linked list of free blocks owned by the caller.
+unsafe fn sort_free_list_by_addr(head: Option<NonNull<FreeBlock>>) -> Option<NonNull<FreeBlock>> {
+    // SAFETY: per the fn contract `head` is a valid owned list; `split_run` /
+    // `merge_runs` preserve that invariant, and we only read `next` links.
+    unsafe {
+        let mut len = 0usize;
+        let mut cur = head;
+        while let Some(b) = cur {
+            len += 1;
+            cur = b.as_ref().next;
+        }
+        if len < 2 {
+            return head;
+        }
+        let mut head = head;
+        let mut width = 1usize;
+        while width < len {
+            let mut result_head: Option<NonNull<FreeBlock>> = None;
+            let mut result_tail: Option<NonNull<FreeBlock>> = None;
+            let mut cur = head;
+            while cur.is_some() {
+                let (left, rest1) = split_run(cur, width);
+                let (right, rest2) = split_run(rest1, width);
+                cur = rest2;
+                let merged = merge_runs(left, right);
+                match result_tail {
+                    None => result_head = merged,
+                    Some(t) => (*t.as_ptr()).next = merged,
+                }
+                // Advance the tail to the end of the just-merged run.
+                if let Some(mut t) = merged {
+                    while let Some(nx) = t.as_ref().next {
+                        t = nx;
+                    }
+                    result_tail = Some(t);
+                }
+            }
+            head = result_head;
+            width *= 2;
+        }
+        head
     }
 }
 
@@ -1911,3 +2187,116 @@ kernel_test_in!(
     "memory",
     smoke_slab_owner_written_canary_value_is_not_double_free
 );
+
+/// The reclaim free-list sort must order blocks by address and preserve every
+/// node — the grouping the slab shrinker relies on to find fully-free frames.
+fn smoke_slab_sort_free_list_by_addr() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    // A private frame gives us K well-separated FreeBlock slots to scramble.
+    let frame = match crate::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let base = frame.start_address().kernel_mut_ptr::<u8>();
+    const K: usize = 8;
+    const STRIDE: usize = 64;
+    // Link the slots in a scrambled order.
+    let order = [3usize, 0, 5, 1, 7, 2, 6, 4];
+    let result = (|| {
+        // SAFETY: `base..base+K*STRIDE` is within the owned frame.
+        unsafe {
+            for w in 0..K {
+                let node = base.add(order[w] * STRIDE) as *mut FreeBlock;
+                let next = if w + 1 < K {
+                    NonNull::new(base.add(order[w + 1] * STRIDE) as *mut FreeBlock)
+                } else {
+                    None
+                };
+                (*node).next = next;
+            }
+            let head = NonNull::new(base.add(order[0] * STRIDE) as *mut FreeBlock);
+            let sorted = sort_free_list_by_addr(head);
+            // Verify strictly ascending and all K nodes present.
+            let mut cur = sorted;
+            let mut prev = 0usize;
+            let mut count = 0usize;
+            while let Some(b) = cur {
+                let a = b.as_ptr() as usize;
+                if count > 0 && a <= prev {
+                    return TestResult::Fail("sort did not order by address");
+                }
+                prev = a;
+                count += 1;
+                cur = b.as_ref().next;
+            }
+            if count != K {
+                return TestResult::Fail("sort lost or duplicated a node");
+            }
+            TestResult::Pass
+        }
+    })();
+    crate::frame::free_frame(frame);
+    result
+}
+kernel_test_in!("memory", smoke_slab_sort_free_list_by_addr);
+
+/// The slab shrinker must return fully-free frames to the buddy: grow a class,
+/// free every block, then assert the shrinker reclaims whole frames (a multiple
+/// of the class's blocks-per-frame) and the allocator still works afterwards.
+fn smoke_slab_shrinker_reclaims_free_frames() -> narf_kernel_test::TestResult {
+    use core::alloc::Layout;
+    use narf_kernel_test::TestResult;
+    // Class 6 (1024 B → 4 blocks/frame) is large enough to force central-list
+    // residency yet less trafficked than the 16 B / page-size classes.
+    let c = 6usize;
+    let block_size = class_size(c);
+    let n_blocks = PAGE_SIZE_USIZE / block_size;
+    let layout = match Layout::from_size_align(block_size, 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad layout"),
+    };
+    const M: usize = 128;
+    let mut ptrs: [Option<NonNull<u8>>; M] = [None; M];
+    for slot in ptrs.iter_mut() {
+        match alloc(layout) {
+            Ok(p) => *slot = Some(p),
+            Err(_) => {
+                // Free what we got and bail rather than leak.
+                for q in ptrs.iter().flatten() {
+                    // SAFETY: allocated just above with `layout`.
+                    unsafe { dealloc(*q, layout) };
+                }
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    // Free everything so the class's blocks spill onto the central free list.
+    for p in ptrs.iter().flatten() {
+        // SAFETY: allocated above with `layout`.
+        unsafe { dealloc(*p, layout) };
+    }
+
+    // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks.
+    let freed = unsafe { reclaim_class_frames(c) };
+
+    // Freeing 128 blocks (32 frames) spills far more than one frame's worth onto
+    // the central list, so at least one whole frame must be reclaimable. Reclaim
+    // only ever returns whole frames, so the count is a positive multiple of the
+    // class's blocks-per-frame — concurrency-independent invariants.
+    if freed < n_blocks {
+        return TestResult::Fail("shrinker reclaimed less than one full frame");
+    }
+    if freed % n_blocks != 0 {
+        return TestResult::Fail("reclaim freed a partial frame (not a block multiple)");
+    }
+    // The allocator must still hand out and take back a block cleanly.
+    match alloc(layout) {
+        Ok(p) => {
+            // SAFETY: just allocated with `layout`.
+            unsafe { dealloc(p, layout) };
+        }
+        Err(_) => return TestResult::Fail("alloc failed after reclaim"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_shrinker_reclaims_free_frames);
