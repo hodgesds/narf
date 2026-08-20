@@ -617,7 +617,7 @@ pub fn kobject_add_uevent_attr(kobj: &Arc<Kobject>, body: String) {
         move || body.clone(),
         move |data: &[u8]| {
             if let Some(k) = weak.upgrade() {
-                kobject_emit_uevent(&k, uevent_action_from_write(data));
+                kobject_emit_uevent_from_write(&k, data);
             }
             Ok(())
         },
@@ -640,7 +640,52 @@ pub(crate) fn uevent_action_from_write(data: &[u8]) -> UeventAction {
     }
 }
 
+/// Extract the synthetic-event UUID from a `uevent`-attr write, if present.
+/// `sd_device_trigger_with_uuid()` writes `"<action> <uuid>"` and the kernel
+/// echoes the UUID back as a `SYNTH_UUID=` property on the resulting netlink
+/// event; udevd propagates it to the processed event, and a waiter matches its
+/// triggered event to that completion. Dropping it makes systemd-logind's seat
+/// setup block forever (`"seat0: waiting for N events being processed by
+/// udevd"`) — it never marks the DRM card ready, so it never applies the
+/// `uaccess` ACL and the session user (the greeter) is denied `/dev/dri/card0`.
+/// A bare 8-4-4-4-12 UUID token after the verb is the SYNTH_UUID; `KEY=VALUE`
+/// tails are extra env, not a UUID. Linux ref: `kobject_synth_uevent`.
+pub(crate) fn uevent_synth_uuid_from_write(data: &[u8]) -> Option<String> {
+    let s = core::str::from_utf8(data).ok()?.trim();
+    let mut it = s.split_whitespace();
+    let _verb = it.next()?;
+    let tok = it.next()?;
+    let is_uuid = tok.len() == 36
+        && tok.as_bytes().iter().enumerate().all(|(i, &b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    is_uuid.then(|| tok.to_string())
+}
+
+/// Emit a uevent parsed from a `uevent`-attr write (`udevadm trigger`,
+/// `echo change > uevent`, or `sd_device_trigger_with_uuid`), carrying
+/// `SYNTH_UUID` when the writer supplied one.
+pub(crate) fn kobject_emit_uevent_from_write(kobj: &Kobject, data: &[u8]) {
+    kobject_emit_uevent_synth(
+        kobj,
+        uevent_action_from_write(data),
+        uevent_synth_uuid_from_write(data).as_deref(),
+    );
+}
+
 pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
+    kobject_emit_uevent_synth(kobj, action, None);
+}
+
+/// Like [`kobject_emit_uevent`] but folds a synthetic-event `SYNTH_UUID` into
+/// the broadcast when the triggering write carried one (see
+/// [`uevent_synth_uuid_from_write`]).
+pub(crate) fn kobject_emit_uevent_synth(
+    kobj: &Kobject,
+    action: UeventAction,
+    synth_uuid: Option<&str>,
+) {
     // DEVPATH is relative to the sysfs mount: udev/udevd read `/sys$DEVPATH`,
     // so it must NOT carry the `/sys` prefix (else they look up
     // `/sys/sys/...` and the device is never found). `kobj.path()` returns
@@ -678,6 +723,11 @@ pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
                 }
             }
         }
+    }
+    // Echo the synthetic-event UUID back so a waiter (systemd-logind) can match
+    // its `sd_device_trigger_with_uuid()` to the udev completion event.
+    if let Some(uuid) = synth_uuid {
+        extras.push((String::from("SYNTH_UUID"), String::from(uuid)));
     }
     crate::uevent::emit_with_extras(action, devpath, subsystem, extras);
 }
@@ -1059,7 +1109,7 @@ pub fn populate_input_class() {
             || String::from("DRIVER=narf-input\n"),
             move |data: &[u8]| {
                 if let Some(k) = weak.upgrade() {
-                    kobject_emit_uevent(&k, uevent_action_from_write(data));
+                    kobject_emit_uevent_from_write(&k, data);
                 }
                 Ok(())
             },
@@ -1098,7 +1148,7 @@ pub fn populate_input_class() {
                 move || pu.clone(),
                 move |data: &[u8]| {
                     if let Some(k) = weak.upgrade() {
-                        kobject_emit_uevent(&k, uevent_action_from_write(data));
+                        kobject_emit_uevent_from_write(&k, data);
                     }
                     Ok(())
                 },
@@ -1136,7 +1186,7 @@ pub fn populate_input_class() {
             move || uevent.clone(),
             move |data: &[u8]| {
                 if let Some(k) = weak.upgrade() {
-                    kobject_emit_uevent(&k, uevent_action_from_write(data));
+                    kobject_emit_uevent_from_write(&k, data);
                 }
                 Ok(())
             },
@@ -1752,7 +1802,7 @@ fn add_writable_uevent(kobj: &Arc<Kobject>, text: String) {
         move || text.clone(),
         move |data: &[u8]| {
             if let Some(k) = weak.upgrade() {
-                kobject_emit_uevent(&k, uevent_action_from_write(data));
+                kobject_emit_uevent_from_write(&k, data);
             }
             Ok(())
         },
@@ -1960,7 +2010,7 @@ pub fn populate_rtc_class() {
         move || uevent.clone(),
         move |data: &[u8]| {
             if let Some(k) = weak.upgrade() {
-                kobject_emit_uevent(&k, uevent_action_from_write(data));
+                kobject_emit_uevent_from_write(&k, data);
             }
             Ok(())
         },
