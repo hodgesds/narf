@@ -201,6 +201,19 @@ impl FileOps for PidExtFile {
             }
         })
     }
+    fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
+        // These procfs pseudo-files hold a single small value, not sized
+        // content. Linux ignores an `ftruncate(2)` on them (the write path
+        // that matters is the value write). systemd/pam's audit loginuid
+        // setter opens `/proc/self/loginuid` O_RDWR then `ftruncate(fd, 0)`
+        // before writing the new uid; the default `FileOps::truncate`
+        // returns `Unsupported` (→ EPERM), which aborted that write and made
+        // `pam_loginuid` (session required) fail → the whole systemd-user PAM
+        // session failed with EXIT_PAM. Accept truncate as a no-op success to
+        // match Linux and let the loginuid write proceed. Only writable fields
+        // are ever opened O_RDWR, so a no-op here cannot lose read-only data.
+        Box::pin(async move { Ok(()) })
+    }
     fn stat(&self) -> Stat {
         // Magic symlinks [[proc-magic-links]] must report S_IFLNK so that
         // sys_readlink and the VFS walker treat them correctly. Linux reports
@@ -1564,6 +1577,41 @@ fn smoke_loginuid_write_round_trips() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_loginuid_write_round_trips
+);
+
+/// Smoke: /proc/<pid>/loginuid accepts `ftruncate(fd, 0)` as a no-op success,
+/// then still round-trips a subsequent write. systemd/pam's audit loginuid
+/// setter opens the file O_RDWR and `ftruncate(fd, 0)` BEFORE writing the new
+/// uid; the default `FileOps::truncate` returns `Unsupported` (→ EPERM), which
+/// aborted that write and failed `pam_loginuid` (session required) — the whole
+/// systemd-user PAM session then died with EXIT_PAM. Linux ignores the
+/// truncate on this single-value procfs file. Regression guard for that gate.
+fn smoke_loginuid_ftruncate_is_noop_then_writes() -> TestResult {
+    use super::poll_once;
+    const PID: u64 = 0x000f_109a_1d02;
+    let f = PidExtFile::new(PID, PidExtField::Loginuid);
+    // ftruncate(0) must succeed (no-op), NOT return Unsupported/EPERM.
+    match poll_once(f.truncate(0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("loginuid ftruncate must succeed as a no-op"),
+    }
+    // The value write after the truncate must still land and round-trip —
+    // exactly the O_RDWR + ftruncate + write sequence pam_loginuid performs.
+    match poll_once(f.write(0, b"957\n")) {
+        Some(Ok(n)) if n > 0 => {}
+        _ => return TestResult::Fail("loginuid write after ftruncate must succeed"),
+    }
+    let mut buf = [0u8; 16];
+    match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) if core::str::from_utf8(&buf[..n]).unwrap_or("").trim() == "957" => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("loginuid did not round-trip the post-truncate write"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_loginuid_ftruncate_is_noop_then_writes
 );
 
 /// Smoke: /proc/<pid>/setgroups accepts "deny" (systemd/newuidmap write
