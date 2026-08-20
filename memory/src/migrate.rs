@@ -370,6 +370,202 @@ pub fn direct_compact(node: usize, order: usize) -> usize {
     migrated
 }
 
+/// Migrate the single-owner private frame `src` into the caller-reserved `dst`
+/// frame (no allocation) — the per-page step of the compaction dual-scanner,
+/// whose free-scanner supplies `dst`. Only single-owner pages are moved; a
+/// COW-shared frame is left in place ([`MigrateError::MultiOwner`]) and the
+/// scanner skips it. `dst` is consumed only on `Ok`; on any error the caller
+/// still owns `dst` and must release its reservation.
+#[cfg(target_arch = "x86_64")]
+pub fn migrate_frame_to(src: PhysAddr, dst: PhysAddr) -> Result<(), MigrateError> {
+    match crate::rmap::owner_count(src) {
+        0 => return Err(MigrateError::NotMapped),
+        1 => {}
+        _ => return Err(MigrateError::MultiOwner),
+    }
+    let mut owner = None;
+    crate::rmap::for_each_owner(src, |o| owner = Some(o));
+    let owner = owner.ok_or(MigrateError::NotMapped)?;
+    let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
+    // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_to` re-validates
+    // the page under the region lock and only moves it if it still maps `src`.
+    match unsafe { aspace.relocate_frame_to(owner.va, src, dst) } {
+        Ok(()) => Ok(()),
+        Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
+        Err(_) => Err(MigrateError::Failed),
+    }
+}
+
+/// Number of NUMA nodes the compaction cursors are sized for.
+#[cfg(target_arch = "x86_64")]
+const COMPACT_NODES: usize = crate::frame::MAX_NUMA_NODES;
+
+/// Frames either scanner may examine per background dual-scanner call, bounding
+/// its latency; the persistent cursors resume the sweep on the next call.
+#[cfg(target_arch = "x86_64")]
+const DUALSCAN_MAX_SCAN: usize = 8192;
+
+/// Persistent per-node dual-scanner cursors (frame numbers). `u64::MAX` means
+/// "no pass in flight — (re)start from the node bounds". The migrate scanner
+/// climbs from the low end, the free scanner descends from the high end; a pass
+/// completes when they meet, resetting both to the sentinel.
+#[cfg(target_arch = "x86_64")]
+static COMPACT_MIGRATE_CURSOR: [core::sync::atomic::AtomicU64; COMPACT_NODES] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; COMPACT_NODES];
+#[cfg(target_arch = "x86_64")]
+static COMPACT_FREE_CURSOR: [core::sync::atomic::AtomicU64; COMPACT_NODES] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; COMPACT_NODES];
+/// Per-node "compaction in progress" guard so concurrent callers on one node
+/// don't share cursors or double-migrate; a busy node yields 0 for the round.
+#[cfg(target_arch = "x86_64")]
+static COMPACT_IN_PROGRESS: [core::sync::atomic::AtomicBool; COMPACT_NODES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; COMPACT_NODES];
+
+/// One bounded pass of Linux-style dual-scanner compaction on `node`.
+///
+/// A migrate scanner sweeps UP from the node's low frame collecting single-owner
+/// movable pages; a free scanner sweeps DOWN from the high frame reserving free
+/// frames; each movable source is migrated into a reserved destination
+/// ([`migrate_frame_to`]). Because every destination is above every source and
+/// the scanners never cross, no page is migrated twice within a pass. The
+/// cursors persist across calls (resuming mid-sweep) and reset only once the
+/// scanners meet, so a page is not re-migrated across the calls of a single pass
+/// either — unlike [`compact_scan`], whose arbitrary destinations can re-migrate
+/// a page. Returns the number of pages migrated.
+///
+/// `budget` bounds migrations per call so a background caller (kswapd/kcompactd)
+/// consolidates gently. COW/multi-owner and unmovable frames are skipped.
+#[cfg(target_arch = "x86_64")]
+pub fn compact_node_dualscan(node: usize, budget: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    if node >= COMPACT_NODES || budget == 0 {
+        return 0;
+    }
+    let Some((lo, hi)) = crate::frame::node_frame_bounds(node) else {
+        return 0;
+    };
+    // Serialize per node: a busy node simply yields 0 this round.
+    if COMPACT_IN_PROGRESS[node].swap(true, Ordering::Acquire) {
+        return 0;
+    }
+    // Restores the in-progress flag on every exit path.
+    struct Guard(usize);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            COMPACT_IN_PROGRESS[self.0].store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+    let _guard = Guard(node);
+
+    // Load cursors; (re)start a pass if unset, crossed, or out of current bounds.
+    let mut migrate_cur = COMPACT_MIGRATE_CURSOR[node].load(Ordering::Relaxed);
+    let mut free_cur = COMPACT_FREE_CURSOR[node].load(Ordering::Relaxed);
+    if migrate_cur == u64::MAX
+        || free_cur == u64::MAX
+        || migrate_cur >= free_cur
+        || migrate_cur < lo
+        || free_cur > hi
+    {
+        migrate_cur = lo;
+        free_cur = hi;
+    }
+
+    let (migrated, migrate_cur, free_cur) =
+        compact_span(node, migrate_cur, free_cur, budget, DUALSCAN_MAX_SCAN);
+
+    // Persist cursors: reset to the sentinel once the pass completed (scanners
+    // met), else save progress for the next call.
+    if migrate_cur >= free_cur {
+        COMPACT_MIGRATE_CURSOR[node].store(u64::MAX, Ordering::Relaxed);
+        COMPACT_FREE_CURSOR[node].store(u64::MAX, Ordering::Relaxed);
+    } else {
+        COMPACT_MIGRATE_CURSOR[node].store(migrate_cur, Ordering::Relaxed);
+        COMPACT_FREE_CURSOR[node].store(free_cur, Ordering::Relaxed);
+    }
+    migrated
+}
+
+/// Stateless core of the dual-scanner: sweep the frame span `[migrate_cur,
+/// free_cur)` once, migrating single-owner movable sources (climbing from
+/// `migrate_cur`) into reserved free destinations (descending from `free_cur`),
+/// up to `budget` migrations. `max_scan` bounds the total frames either scanner
+/// examines this call, so a single pass over a large, sparsely-movable node
+/// stays bounded in latency (the persistent cursors resume it next call).
+/// Returns `(migrated, migrate_cur, free_cur)` — the final cursor positions let
+/// the caller persist progress or detect a completed pass (`migrate_cur >=
+/// free_cur`). All allocator side effects (frame reserve / migrate / free) stay
+/// within the span.
+#[cfg(target_arch = "x86_64")]
+fn compact_span(
+    node: usize,
+    mut migrate_cur: u64,
+    mut free_cur: u64,
+    budget: usize,
+    max_scan: usize,
+) -> (usize, u64, u64) {
+    let mut migrated = 0usize;
+    let mut scanned = 0usize;
+    'sweep: while migrated < budget && migrate_cur < free_cur {
+        // Advance the migrate scanner to the next single-owner movable source.
+        loop {
+            if migrate_cur >= free_cur || scanned >= max_scan {
+                break 'sweep;
+            }
+            scanned += 1;
+            let phys = PhysAddr::new(migrate_cur << 12);
+            if crate::frame::node_for_phys(phys.raw()) == node
+                && crate::rmap::owner_count(phys) == 1
+            {
+                break;
+            }
+            migrate_cur += 1;
+        }
+        let src = PhysAddr::new(migrate_cur << 12);
+
+        // Advance the free scanner DOWN to the next reservable free frame on this
+        // node, strictly above the migrate cursor.
+        let mut dst: Option<PhysAddr> = None;
+        while free_cur > migrate_cur {
+            if scanned >= max_scan {
+                break;
+            }
+            scanned += 1;
+            let cand = PhysAddr::new(free_cur << 12);
+            let claimed = crate::frame::node_for_phys(cand.raw()) == node
+                && crate::frame::reserve_frame_range(cand, 1);
+            free_cur -= 1;
+            if claimed {
+                dst = Some(cand);
+                break;
+            }
+        }
+        let Some(dst) = dst else {
+            break; // scanners met (or scan budget spent) without a destination
+        };
+
+        // Migrate the source into the reserved destination; release the
+        // reservation if the source raced / turned COW / failed.
+        match migrate_frame_to(src, dst) {
+            Ok(()) => migrated += 1,
+            Err(_) => crate::frame::free_movable_range(dst, 1),
+        }
+        migrate_cur += 1;
+    }
+    (migrated, migrate_cur, free_cur)
+}
+
+/// Test-only: reset the dual-scanner cursors so a test starts from a clean pass.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __reset_dualscan_for_test() {
+    use core::sync::atomic::Ordering;
+    for node in 0..COMPACT_NODES {
+        COMPACT_MIGRATE_CURSOR[node].store(u64::MAX, Ordering::Relaxed);
+        COMPACT_FREE_CURSOR[node].store(u64::MAX, Ordering::Relaxed);
+        COMPACT_IN_PROGRESS[node].store(false, Ordering::Relaxed);
+    }
+}
+
 /// Test-only: clear the installed resolver so a test's mock never leaks.
 #[doc(hidden)]
 pub fn __reset_resolver_for_test() {
@@ -836,4 +1032,99 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_direct_compaction_consolidates_block);
+
+    /// Dual-scanner sweep: a movable page at the low end of a span migrates UP
+    /// into a free frame the free-scanner reserves at the high end — proving
+    /// destinations land above sources (the non-thrashing invariant), contents
+    /// are preserved, and the source frame is released.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_compact_dualscan_moves_page_upward() -> TestResult {
+        use super::compact_span;
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        super::__reset_dualscan_for_test();
+
+        // A contiguous order-4 block (16 frames) is our controlled sweep span.
+        let blk = match crate::frame::alloc_pages_on(0, 4) {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("could not allocate an order-4 block"),
+        };
+        let base = blk.raw();
+        let node = crate::frame::node_for_phys(base);
+        let lo_frame = base >> 12;
+        let hi_frame = lo_frame + 15;
+        // Free every frame but the first, so the free-scanner has high targets.
+        for i in 1..16u64 {
+            crate::frame::free_movable_range(PhysAddr::new(base + i * 4096), 1);
+        }
+
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => {
+                crate::frame::free_movable_range(blk, 1);
+                return TestResult::Skip("new_for_user failed");
+            }
+        };
+        // SAFETY: `base` is a live frame we hold; identity-mapped.
+        unsafe { *(blk.kernel_mut_ptr::<u32>()) = 0xDA15_CA20u32 };
+        let va = VirtAddr::new(0x0000_0080_00D0_0000);
+        if aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![blk],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { aspace.materialize() }.is_err() {
+            return TestResult::Fail("materialize failed");
+        }
+        *TEST_AS.lock() = Some(aspace.clone());
+        register_address_space_resolver(&SINGLE_AS_RESOLVER);
+
+        let result = (|| {
+            if crate::rmap::owner_count(blk) != 1 {
+                return TestResult::Fail("setup: source page should have one owner");
+            }
+            // Sweep the span; only the one movable source should migrate.
+            let (migrated, _mc, _fc) = compact_span(node, lo_frame, hi_frame, 8, 64);
+            if migrated != 1 {
+                return TestResult::Fail("dual-scanner should migrate exactly one page");
+            }
+            let moved = aspace.regions_snapshot()[0].phys[0];
+            // Destination must be ABOVE the source and within the span.
+            if moved.raw() <= base || (moved.raw() >> 12) > hi_frame {
+                return TestResult::Fail("destination must be above the source, within the span");
+            }
+            if crate::rmap::owner_count(blk) != 0 {
+                return TestResult::Fail("source frame should be released after migration");
+            }
+            if crate::rmap::owner_count(moved) != 1 {
+                return TestResult::Fail("destination frame should carry the single owner");
+            }
+            // SAFETY: `moved` is the live destination frame; identity-mapped.
+            if unsafe { *(moved.kernel_ptr::<u32>()) } != 0xDA15_CA20u32 {
+                return TestResult::Fail("migration did not preserve the page contents");
+            }
+            TestResult::Pass
+        })();
+
+        // The migrated destination is owned by `aspace` (freed on drop); the
+        // source and the other freed frames returned to the buddy. Nothing else
+        // to reclaim.
+        *TEST_AS.lock() = None;
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        super::__reset_dualscan_for_test();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_compact_dualscan_moves_page_upward);
 }
