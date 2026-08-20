@@ -137,18 +137,26 @@ fn uevent_wake_hook() {
 #[cfg(feature = "syscall-trace")]
 pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
     use core::fmt::Write as _;
-    if buf.len() < 16 || !crate::syscall::syscall_trace_target_task() {
+    if buf.len() < 16 {
         return;
     }
+    // Only look at buffers whose FIRST byte is a D-Bus endianness marker.
     let le = match buf[0] {
         b'l' => true,
         b'B' => false,
         _ => return,
     };
-    let ty = buf[1];
-    // version byte (buf[3]) is 1 for every D-Bus message; screens out
-    // non-D-Bus streams that happen to start with 'l'/'B'.
-    if ty == 0 || ty > 4 || buf[3] != 1 {
+    if buf[3] != 1 {
+        return;
+    }
+    let tid = crate::handlers::current_task_id();
+    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
+    // Fire for explicit trace targets, AND for the dbus-broker ROUTER (its
+    // routed CALL/RETURN/ERROR — SIGNALs are suppressed per-message below to
+    // avoid the boot-time signal flood a full trace_comm=dbus-broker emits).
+    let is_target = crate::syscall::syscall_trace_target_task();
+    let is_broker = comm.starts_with("dbus-broker");
+    if !is_target && !is_broker {
         return;
     }
     let rd32 = |o: usize| -> u32 {
@@ -159,47 +167,75 @@ pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
             u32::from_be_bytes(b)
         }
     };
-    let serial = rd32(8);
-    let fields_len = rd32(12) as usize;
-    let tyname = match ty {
-        1 => "CALL",
-        2 => "RETURN",
-        3 => "ERROR",
-        4 => "SIGNAL",
-        _ => "?",
-    };
-    let tid = crate::handlers::current_task_id();
-    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
-    let _ = write!(
-        narf_console::Writer,
-        "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
-    );
-    let end = core::cmp::min(buf.len(), 16 + fields_len);
-    let mut run: usize = 0;
-    let mut start = 16;
-    for i in 16..end {
-        let b = buf[i];
-        if b.is_ascii_graphic() && b != b' ' {
-            if run == 0 {
-                start = i;
+    // A single recvmsg on a busy connection (dbus-broker's, notably) carries
+    // SEVERAL framed messages; decoding only the first hid routed calls that
+    // arrived batched behind a signal. Walk every message in the buffer.
+    let mut off = 0usize;
+    let mut guard = 0u32;
+    while off + 16 <= buf.len() && guard < 64 {
+        guard += 1;
+        // A mid-buffer byte that is not a fresh header means we lost frame
+        // sync (e.g. an unaligned body) — stop rather than emit garbage.
+        if (buf[off] != b'l' && buf[off] != b'B') || buf[off + 3] != 1 {
+            break;
+        }
+        let ty = buf[off + 1];
+        if ty == 0 || ty > 4 {
+            break;
+        }
+        let body_len = rd32(off + 4) as usize;
+        let serial = rd32(off + 8);
+        let fields_len = rd32(off + 12) as usize;
+        // Framed length = 16-byte fixed header + fields, padded to 8, + body.
+        let after_fields = off + 16 + fields_len;
+        let body_start = (after_fields + 7) & !7;
+        let msg_end = body_start.saturating_add(body_len);
+        let tyname = match ty {
+            1 => "CALL",
+            2 => "RETURN",
+            3 => "ERROR",
+            4 => "SIGNAL",
+            _ => "?",
+        };
+        // Broker firehose suppression: skip SIGNAL unless an explicit target.
+        if is_target || ty != 4 {
+            let _ = write!(
+                narf_console::Writer,
+                "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
+            );
+            let end = core::cmp::min(buf.len(), off + 16 + fields_len);
+            let mut run: usize = 0;
+            let mut start = off + 16;
+            for i in (off + 16)..end {
+                let b = buf[i];
+                if b.is_ascii_graphic() && b != b' ' {
+                    if run == 0 {
+                        start = i;
+                    }
+                    run += 1;
+                } else {
+                    if run >= 3 {
+                        for &c in &buf[start..start + run] {
+                            let _ = write!(narf_console::Writer, "{}", c as char);
+                        }
+                        let _ = write!(narf_console::Writer, " ");
+                    }
+                    run = 0;
+                }
             }
-            run += 1;
-        } else {
             if run >= 3 {
                 for &c in &buf[start..start + run] {
                     let _ = write!(narf_console::Writer, "{}", c as char);
                 }
-                let _ = write!(narf_console::Writer, " ");
             }
-            run = 0;
+            let _ = writeln!(narf_console::Writer, "]");
         }
-    }
-    if run >= 3 {
-        for &c in &buf[start..start + run] {
-            let _ = write!(narf_console::Writer, "{}", c as char);
+        // No forward progress (malformed length) → stop to avoid a spin.
+        if msg_end <= off {
+            break;
         }
+        off = msg_end;
     }
-    let _ = writeln!(narf_console::Writer, "]");
 }
 
 pub const SOCK_STREAM: u32 = 1;
