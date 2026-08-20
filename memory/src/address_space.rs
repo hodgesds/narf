@@ -5509,7 +5509,34 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn relocate_page(&self, vaddr: VirtAddr) -> Result<PhysAddr, AddressSpaceError> {
         // SAFETY: forwarded to the caller's live-root / direct-map contract.
-        unsafe { self.relocate_page_inner(vaddr, None) }
+        unsafe { self.relocate_page_inner(vaddr, None, None) }
+    }
+
+    /// Relocate the private page at `vaddr` to the caller-provided `dst` frame
+    /// (instead of a freshly-allocated one), only if it still maps
+    /// `expected_src`. The compaction dual-scanner uses this to move a movable
+    /// source into a specific free frame its free-scanner reserved, so migrated
+    /// pages always land at the high end of the zone. On any failure `dst` is
+    /// left untouched (the caller owns its reservation and releases it); on
+    /// success `dst` becomes the page's live backing and must NOT be freed by
+    /// the caller.
+    ///
+    /// # Safety
+    /// Same prerequisites as [`Self::relocate_page`]; additionally `dst` must be
+    /// a live, caller-owned frame (e.g. reserved out of the buddy) distinct from
+    /// `expected_src`.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn relocate_frame_to(
+        &self,
+        vaddr: VirtAddr,
+        expected_src: PhysAddr,
+        dst: PhysAddr,
+    ) -> Result<(), AddressSpaceError> {
+        // SAFETY: forwarded to the caller's live-root / direct-map contract.
+        unsafe {
+            self.relocate_page_inner(vaddr, Some(expected_src), Some(dst))
+                .map(|_| ())
+        }
     }
 
     /// Like [`Self::relocate_page`] but relocates ONLY if the page still maps
@@ -5527,7 +5554,7 @@ impl AddressSpace {
         expected_src: PhysAddr,
     ) -> Result<PhysAddr, AddressSpaceError> {
         // SAFETY: forwarded to the caller's live-root / direct-map contract.
-        unsafe { self.relocate_page_inner(vaddr, Some(expected_src)) }
+        unsafe { self.relocate_page_inner(vaddr, Some(expected_src), None) }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5535,6 +5562,7 @@ impl AddressSpace {
         &self,
         vaddr: VirtAddr,
         expected: Option<PhysAddr>,
+        dst: Option<PhysAddr>,
     ) -> Result<PhysAddr, AddressSpaceError> {
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
@@ -5578,15 +5606,26 @@ impl AddressSpace {
             .containing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
         let perms = region.perms;
-        // SAFETY: page_va maps old_phys on old_phys's own node keeps the copy
-        // local; alloc on that node.
-        let node = unsafe { crate::frame::narf_phys_node(old_phys.raw()) };
-        let new_frame = crate::frame::alloc_user_frame_on_strict(node)
-            .map_err(|_| AddressSpaceError::OutOfRange)?;
-        let new_phys = new_frame.start_address();
-        // SAFETY: live root; page_va maps old_phys; new_phys is a fresh frame.
+        // Destination: the caller-provided frame (dual-scanner), else a fresh
+        // frame allocated on `old_phys`'s own node to keep the copy local.
+        let (new_frame, new_phys) = match dst {
+            Some(d) => (None, d),
+            None => {
+                // SAFETY: page_va maps old_phys; sample its node for a local alloc.
+                let node = unsafe { crate::frame::narf_phys_node(old_phys.raw()) };
+                let frame = crate::frame::alloc_user_frame_on_strict(node)
+                    .map_err(|_| AddressSpaceError::OutOfRange)?;
+                let phys = frame.start_address();
+                (Some(frame), phys)
+            }
+        };
+        // SAFETY: live root; page_va maps old_phys; new_phys is a live frame.
         if unsafe { self.relocate_leaf(page_va, perms, old_phys, new_phys) }.is_err() {
-            crate::frame::free_frame(new_frame);
+            // Free only a frame WE allocated; a caller-provided `dst` is left for
+            // the caller to release.
+            if let Some(frame) = new_frame {
+                crate::frame::free_frame(frame);
+            }
             return Err(AddressSpaceError::NotImplemented);
         }
         region.phys[page_idx] = new_phys;

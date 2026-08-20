@@ -2602,6 +2602,54 @@ pub fn hotplug_node_for_phys(addr: u64) -> Option<usize> {
         .map(|range| range.node)
 }
 
+/// Inclusive `[lo, hi]` frame-number span containing all of `node`'s managed
+/// frames, or `None` if the node has none. This is the physical range the
+/// compaction dual-scanner sweeps between.
+///
+/// The span is an OUTER bound, not an exact membership test: where firmware /
+/// hotplug ranges interleave nodes it may include holes or foreign-node frames.
+/// Callers step frame-by-frame and re-check [`node_for_phys`] (and free /
+/// movable state), so an over-approximate span only costs a few skipped frames.
+pub fn node_frame_bounds(node: usize) -> Option<(u64, u64)> {
+    // Snapshot the range registries first: `phys_to_node` locks `HOTPLUG_RANGES`,
+    // so we must not hold it (or `BOOT_MEMORY_RANGES`) across the sample.
+    let boot = BOOT_MEMORY_RANGES.lock().clone();
+    let hotplug = HOTPLUG_RANGES.lock().clone();
+
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    let mut seen = false;
+    let mut consider = |start: u64, len: u64| {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        // SRAT- and hotplug-derived ranges are node-homogeneous; sample the node
+        // at the range start rather than per frame.
+        if phys_to_node(start) != node {
+            return;
+        }
+        let first = (start + PAGE_SIZE - 1) >> 12; // first fully-contained frame
+        let last = (end >> 12).saturating_sub(1); // last fully-contained frame
+        if last < first {
+            return;
+        }
+        lo = lo.min(first);
+        hi = hi.max(last);
+        seen = true;
+    };
+
+    for (start, len) in &boot {
+        consider(*start, *len);
+    }
+    for range in &hotplug {
+        if range.online {
+            consider(range.start, range.len);
+        }
+    }
+    seen.then_some((lo, hi))
+}
+
 /// Snapshot Linux-style logical memory blocks from authoritative boot RAM and
 /// currently-online hotplug ranges. A block is listed once even when adjacent
 /// firmware ranges overlap it.
