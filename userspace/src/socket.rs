@@ -259,6 +259,16 @@ pub const SHUT_RDWR: u32 = 2;
 /// size the read of a pending notification.
 pub const SIOCINQ: u32 = 0x541B;
 
+/// `ioctl(fd, SIOCOUTQ, &int)` — bytes still queued in the socket's SEND
+/// buffer (unsent). Shares its value with `TIOCOUTQ` (0x5411). NARF AF_UNIX
+/// delivers synchronously — a send writes straight into the peer's rx ring
+/// or returns EAGAIN, so there is no local send queue — hence this is always
+/// 0. dbus-broker's `socket_dispatch_write` issues SIOCOUTQ after every write
+/// and treats a failure (ENOTTY) as a FATAL error (the broker exit(1)s,
+/// dbus.service restarts, and the whole system bus splits), so it MUST be
+/// recognised even though the answer is trivially 0.
+pub const SIOCOUTQ: u32 = 0x5411;
+
 // ── Socket-option levels and names ──────────────────────────────
 // Numbers match Linux `<linux/socket.h>` / `<netinet/tcp.h>` /
 // `<linux/in.h>`. Used by both handlers.rs and the dispatcher.
@@ -2137,19 +2147,28 @@ impl FileOps for SocketFile {
     }
 
     /// `ioctl(fd, SIOCINQ, &int)` — number of bytes immediately readable
-    /// (see `inq_bytes` for the per-state count). Only `SIOCINQ` (==
-    /// `FIONREAD`, 0x541B) is recognised; anything else is an unknown request
-    /// → `ENOTTY` (Linux `sock_ioctl` default). An empty queue reports 0 with
-    /// success (never ENOENT), which is what systemd PID 1 expects when it
-    /// sizes a read of its `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket.
+    /// (see `inq_bytes` for the per-state count) — and `SIOCOUTQ` (0x5411),
+    /// the send-queue byte count, always 0 under NARF's synchronous delivery.
+    /// Anything else is an unknown request → `ENOTTY` (Linux `sock_ioctl`
+    /// default). An empty queue reports 0 with success (never ENOENT), which
+    /// is what systemd PID 1 expects when it sizes a read of its
+    /// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket; SIOCOUTQ must likewise
+    /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        if cmd != SIOCINQ {
-            return Err(FsError::Unsupported);
-        }
-        let bytes = (self.inq_bytes() as i32).to_le_bytes();
+        // SIOCINQ = bytes immediately readable; SIOCOUTQ = bytes still queued
+        // in the send buffer (always 0 here — synchronous delivery, no local
+        // send queue). Any other request is unknown → ENOTTY (Linux
+        // `sock_ioctl` default). SIOCOUTQ MUST be answered: dbus-broker treats
+        // an ENOTTY from it as fatal and tears the whole system bus down.
+        let value: i32 = match cmd {
+            SIOCINQ => self.inq_bytes() as i32,
+            SIOCOUTQ => 0,
+            _ => return Err(FsError::Unsupported),
+        };
+        let bytes = value.to_le_bytes();
         // SAFETY: `copy_to_user` validates `arg` as a user address through
         // the SMAP window; the length is the fixed 4-byte little-endian
-        // `int` the SIOCINQ contract writes back.
+        // `int` the SIOCINQ/SIOCOUTQ contract writes back.
         if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
             return Err(FsError::InvalidData);
         }
@@ -6093,6 +6112,22 @@ kernel_test_in!(
     "userspace/socket",
     smoke_socket_ioctl_unknown_is_unsupported
 );
+
+/// `SIOCOUTQ` (0x5411) MUST be recognised and succeed. dbus-broker issues it
+/// after every socket write; an ENOTTY there is FATAL — the broker exit(1)s,
+/// dbus.service restarts, the system bus splits, and the desktop never comes
+/// up. NARF AF_UNIX delivers synchronously (no local send queue) so it reports
+/// 0. A real `&mut i32` backs the `copy_to_user` the ioctl performs.
+fn smoke_socket_ioctl_siocoutq_is_zero() -> TestResult {
+    let sock = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let mut out: i32 = -1;
+    match sock.ioctl(SIOCOUTQ, &mut out as *mut i32 as usize) {
+        Ok(0) if out == 0 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("SIOCOUTQ did not write 0 to the user int"),
+        Err(_) => TestResult::Fail("SIOCOUTQ was not recognised (dbus-broker needs it to succeed)"),
+    }
+}
+kernel_test_in!("userspace/socket", smoke_socket_ioctl_siocoutq_is_zero);
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
     let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
