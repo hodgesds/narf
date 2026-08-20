@@ -283,6 +283,23 @@ pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError
 /// per-block mechanism is [`compact_block`].
 #[cfg(target_arch = "x86_64")]
 pub fn compact_scan(order: usize, max_blocks: usize) -> usize {
+    compact_scan_filtered(order, max_blocks, None)
+}
+
+/// Node-targeted compaction: like [`compact_scan`] but only considers order-
+/// `order` blocks whose base lies on `node`. Direct compaction uses this so a
+/// higher-order allocation that failed on a node compacts that node's own
+/// movable memory rather than a remote node's (which would not help the local
+/// allocation).
+#[cfg(target_arch = "x86_64")]
+pub fn compact_scan_node(node: usize, order: usize, max_blocks: usize) -> usize {
+    compact_scan_filtered(order, max_blocks, Some(node))
+}
+
+/// Shared candidate-collect + compact loop for [`compact_scan`] /
+/// [`compact_scan_node`]. `node_filter` restricts candidates to one node.
+#[cfg(target_arch = "x86_64")]
+fn compact_scan_filtered(order: usize, max_blocks: usize, node_filter: Option<usize>) -> usize {
     if order == 0 || max_blocks == 0 {
         return 0;
     }
@@ -291,8 +308,16 @@ pub fn compact_scan(order: usize, max_blocks: usize) -> usize {
     // Distinct order-`order` block bases covering the tracked (movable) frames.
     let mut candidates: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     crate::rmap::for_each_tracked_frame(|phys| {
+        if candidates.len() >= max_blocks {
+            return;
+        }
+        if let Some(node) = node_filter {
+            if crate::frame::node_for_phys(phys.raw()) != node {
+                return;
+            }
+        }
         let base = phys.raw() & block_mask;
-        if candidates.len() < max_blocks && !candidates.contains(&base) {
+        if !candidates.contains(&base) {
             candidates.push(base);
         }
     });
@@ -302,6 +327,46 @@ pub fn compact_scan(order: usize, max_blocks: usize) -> usize {
             migrated = migrated.saturating_add(n);
         }
     }
+    migrated
+}
+
+/// Upper bound on blocks compacted per direct-compaction attempt — a failed
+/// allocation pays a bounded latency to consolidate memory before giving up.
+#[cfg(target_arch = "x86_64")]
+const DIRECT_COMPACT_MAX_BLOCKS: usize = 16;
+
+/// Count of direct-compaction attempts (a higher-order allocation failed and
+/// triggered synchronous compaction) and of pages those attempts migrated.
+static DIRECT_COMPACT_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DIRECT_COMPACT_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Number of direct-compaction attempts so far.
+pub fn direct_compact_events() -> u64 {
+    DIRECT_COMPACT_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of pages migrated by direct compaction so far.
+pub fn direct_compact_pages() -> u64 {
+    DIRECT_COMPACT_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Synchronous "direct" compaction for a higher-order allocation that just
+/// failed on `node`: compact up to [`DIRECT_COMPACT_MAX_BLOCKS`] of that node's
+/// movable blocks and return the pages migrated. The frame allocator calls this
+/// once before giving a higher-order (`order > 0`) allocation up, then retries
+/// the allocation if this migrated anything. A no-op for `order == 0` (order-0
+/// allocations never need contiguity, so they never compact — which also keeps
+/// the migration path, whose destination frames are order-0 allocations, from
+/// recursing into compaction).
+#[cfg(target_arch = "x86_64")]
+pub fn direct_compact(node: usize, order: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    if order == 0 {
+        return 0;
+    }
+    DIRECT_COMPACT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let migrated = compact_scan_node(node, order, DIRECT_COMPACT_MAX_BLOCKS);
+    DIRECT_COMPACT_PAGES.fetch_add(migrated as u64, Ordering::Relaxed);
     migrated
 }
 
@@ -673,4 +738,102 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_compact_scan_guards_and_runs);
+
+    /// Direct compaction: a higher-order block holding one movable page and one
+    /// free frame must be consolidated — `direct_compact` migrates the page out
+    /// (freeing the whole block), counts the attempt + migrated page, and no-ops
+    /// for order 0.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_direct_compaction_consolidates_block() -> TestResult {
+        use super::{direct_compact, direct_compact_events, direct_compact_pages};
+        use crate::{Region, RegionPerms, VirtAddr};
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+
+        // An order-1 block gives us two contiguous frames we control: map the
+        // first as a movable user page, free the second so it is reservable.
+        let blk = match crate::frame::alloc_pages_on(0, 1) {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("could not allocate an order-1 block"),
+        };
+        let f0 = blk;
+        let f1 = PhysAddr::new(blk.raw() + 4096);
+        let node = crate::frame::node_for_phys(blk.raw());
+        // Free the buddy so compaction can reserve it (keeping the destination
+        // for f0's migration outside the block).
+        crate::frame::free_movable_range(f1, 1);
+
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => {
+                crate::frame::free_movable_range(f0, 1);
+                return TestResult::Skip("new_for_user failed");
+            }
+        };
+        // SAFETY: f0 is a live frame we hold; identity-mapped.
+        unsafe { *(f0.kernel_mut_ptr::<u32>()) = 0xD1E5_0007 };
+        let va = VirtAddr::new(0x0000_0080_00C0_0000);
+        if aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![f0],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { aspace.materialize() }.is_err() {
+            return TestResult::Fail("materialize failed");
+        }
+        *TEST_AS.lock() = Some(aspace.clone());
+        register_address_space_resolver(&SINGLE_AS_RESOLVER);
+
+        let result = (|| {
+            if crate::rmap::owner_count(f0) != 1 {
+                return TestResult::Fail("setup: the movable page should have one owner");
+            }
+            let ev0 = direct_compact_events();
+            let pg0 = direct_compact_pages();
+            // Order 0 never compacts and never counts as an attempt.
+            if direct_compact(node, 0) != 0 || direct_compact_events() != ev0 {
+                return TestResult::Fail("direct_compact must no-op (uncounted) for order 0");
+            }
+            // Order 1: migrate the movable page out, consolidating the block.
+            if direct_compact(node, 1) != 1 {
+                return TestResult::Fail("direct_compact should migrate the one movable page");
+            }
+            if direct_compact_events() != ev0 + 1 || direct_compact_pages() != pg0 + 1 {
+                return TestResult::Fail(
+                    "direct_compact did not count the attempt + migrated page",
+                );
+            }
+            let moved = aspace.regions_snapshot()[0].phys[0];
+            if moved == f0 {
+                return TestResult::Fail("direct_compact did not move the page off its frame");
+            }
+            if crate::rmap::owner_count(f0) != 0 {
+                return TestResult::Fail("direct_compact left an rmap entry on the freed frame");
+            }
+            // SAFETY: `moved` is the live destination frame; identity-mapped.
+            if unsafe { *(moved.kernel_ptr::<u32>()) } != 0xD1E5_0007 {
+                return TestResult::Fail("direct_compact did not preserve the page contents");
+            }
+            TestResult::Pass
+        })();
+
+        // Compaction released the whole order-1 block back to the buddy; the
+        // migrated destination is owned by `aspace` and freed on drop. Nothing
+        // else to reclaim here.
+        *TEST_AS.lock() = None;
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_direct_compaction_consolidates_block);
 }
