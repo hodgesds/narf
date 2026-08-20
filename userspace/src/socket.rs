@@ -388,9 +388,27 @@ struct UnixPathKey {
 }
 
 impl UnixPathKey {
+    /// Bind/listen identity: name the LITERAL path (do not follow a final
+    /// symlink) — `bind(2)` on an AF_UNIX path names the path itself.
     fn for_current_path(path: &str) -> Self {
+        Self::compute(path, false)
+    }
+
+    /// Connect identity: FOLLOW a final symlink so a symlinked socket alias
+    /// (e.g. systemd's io.systemd.DropIn -> io.systemd.Multiplexer) resolves
+    /// to the target listener's identity. See `unix_socket_path_key`.
+    fn for_connect_path(path: &str) -> Self {
+        Self::compute(path, true)
+    }
+
+    fn compute(path: &str, follow_final: bool) -> Self {
         let (filesystem, parent_ino, fallback_parent_path, name) =
-            crate::handlers::unix_socket_path_key(path).unwrap_or((0, 0, None, String::from(path)));
+            crate::handlers::unix_socket_path_key(path, follow_final).unwrap_or((
+                0,
+                0,
+                None,
+                String::from(path),
+            ));
         Self {
             filesystem,
             parent_ino,
@@ -3949,7 +3967,7 @@ impl SocketFile {
                     UnixAddr::Path(p) => LISTENERS
                         .lock()
                         .as_ref()
-                        .and_then(|m| m.get(&UnixPathKey::for_current_path(p)).cloned()),
+                        .and_then(|m| m.get(&UnixPathKey::for_connect_path(p)).cloned()),
                     UnixAddr::Abstract(n) => ABSTRACT_STREAM
                         .lock()
                         .as_ref()
@@ -4690,7 +4708,7 @@ impl SocketFile {
                 };
                 let mut state = self.state.lock();
                 if let UnixAddr::Path(p) = &uaddr {
-                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_current_path(p));
+                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_connect_path(p));
                 } else {
                     *self.connected_unix_path.lock() = None;
                 }
@@ -4752,10 +4770,15 @@ impl SocketFile {
                 drop(state);
                 let dest_sock = match &dest_addr {
                     UnixAddr::Path(p) => {
+                        // A datagram destination follows a final symlink, same
+                        // as a stream connect: /dev/log is a symlink to
+                        // /run/systemd/journal/dev-log, so keying the sendto by
+                        // the /dev/log symlink inode found no bound receiver and
+                        // dropped every syslog/pam_syslog message (ECONNREFUSED).
                         let key = if explicit_dest {
-                            UnixPathKey::for_current_path(p)
+                            UnixPathKey::for_connect_path(p)
                         } else {
-                            connected_path.unwrap_or_else(|| UnixPathKey::for_current_path(p))
+                            connected_path.unwrap_or_else(|| UnixPathKey::for_connect_path(p))
                         };
                         UNIX_DGRAM_BOUND
                             .lock()

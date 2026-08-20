@@ -2478,6 +2478,49 @@ pub(crate) fn resolve_parent_dir_async(
 /// the stable backing filesystem.
 pub(crate) fn unix_socket_path_key(
     path: &str,
+    follow_final: bool,
+) -> Option<(
+    usize,
+    u64,
+    Option<alloc::string::String>,
+    alloc::string::String,
+)> {
+    unix_socket_path_key_depth(path, follow_final, 0)
+}
+
+/// If `path_ref`'s final component is a symlink, return its target string
+/// verbatim (absolute or relative) so the caller can re-resolve it in the
+/// GLOBAL namespace. Resolves the node NOFOLLOW (tmpfs sync path + async
+/// fallback), then reads the link target. `None` if the final component is
+/// not a symlink or does not resolve.
+fn resolve_final_symlink_target(path_ref: &str) -> Option<alloc::string::String> {
+    current_resolve_absolute(path_ref, |fs, rel| {
+        let file = if rel.is_empty() {
+            fs.root_file()
+        } else {
+            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    .and_then(|result| result.ok())
+            })
+        };
+        file.and_then(|file| {
+            if file.stat().mode.file_type != narf_filesystem::FileType::Symlink {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; 4096];
+            let n = poll_blocking(file.read(0, &mut buf)).and_then(|r| r.ok())?;
+            core::str::from_utf8(&buf[..n])
+                .ok()
+                .map(alloc::string::String::from)
+        })
+    })
+    .flatten()
+}
+
+fn unix_socket_path_key_depth(
+    path: &str,
+    follow_final: bool,
+    depth: usize,
 ) -> Option<(
     usize,
     u64,
@@ -2489,6 +2532,30 @@ pub(crate) fn unix_socket_path_key(
     }
     let abs = resolve_cwd_path(current_task_id(), path);
     let path_ref = abs.trim_end_matches('/');
+    // CONNECT (follow_final) follows a FINAL symlink at the GLOBAL namespace
+    // level so a symlinked socket alias keys by the TARGET listener's identity.
+    // systemd socket units publish aliases this way (systemd-userdbd.socket
+    // `Symlinks=` makes io.systemd.DropIn / io.systemd.NameServiceSwitch
+    // symlinks to io.systemd.Multiplexer, with an ABSOLUTE target). Following
+    // here (not inside resolve_async) is required because resolve_async
+    // restarts an absolute symlink target from the CURRENT fs root — wrong when
+    // the socket dir is its own mount (/run tmpfs) → /run/run/... NotFound.
+    // resolve_cwd_path re-roots the target across mounts + chroot, then we
+    // recurse. Keying a connect by the symlink's own inode found no listener
+    // and returned ECONNREFUSED, wedging nss_systemd's userdb group lookup and
+    // failing user@<uid>'s PAM session (EXIT_PAM). bind() must NOT follow (it
+    // names the literal path), so this is gated per-caller.
+    if follow_final && depth < 40 {
+        if let Some(target) = resolve_final_symlink_target(path_ref) {
+            let target_abs = if target.starts_with('/') {
+                target
+            } else {
+                let parent = path_ref.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                alloc::format!("{parent}/{target}")
+            };
+            return unix_socket_path_key_depth(&target_abs, true, depth + 1);
+        }
+    }
     // Linux pathname AF_UNIX sockets are named by their dentry/inode.  This
     // also covers a `mount --bind <socket-file> <target-file>`: the target is
     // a file-rooted mount (`rel` is empty) whose `root_file()` is the original
@@ -2502,7 +2569,8 @@ pub(crate) fn unix_socket_path_key(
             // expose the synchronous DirOps path; block-backed filesystems
             // need the async resolver.  Use each according to the backing's
             // capability so this identity path never makes an in-memory
-            // S_IFSOCK node disappear.
+            // S_IFSOCK node disappear. (A final symlink was already followed by
+            // the follow_final preamble above; here `rel` is the real node.)
             narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
                 poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
                     .and_then(|result| result.ok())
