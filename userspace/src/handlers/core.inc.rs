@@ -2815,7 +2815,18 @@ fn readlink_impl(
     // every ext2-backed symlink; the async walker returns the real node.
     // NoFollow so we obtain the symlink itself and can read its target,
     // rather than following it to (a copy of) the target's contents.
-    let root_rel = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
+    // Resolve through the caller's PRIVATE mount namespace, not the global
+    // registry: a systemd service sandbox unshare(NEWNS)s, binds the API
+    // filesystems (sysfs at /sys especially) into its `/run/systemd/mount-
+    // rootfs` staging root, and pivot_roots into it. In the GLOBAL registry
+    // that staging path is just the tmpfs skeleton, so a global readlink of
+    // `/sys/dev/char/226:0` from inside logind's namespace hits tmpfs and
+    // EINVALs — which fails sd-device's `sd_device_new_from_devnum`, then
+    // `session_device_verify()` → `TakeDevice` over D-Bus → kwin "Failed to
+    // open /dev/dri/card0 device (Invalid argument)". The open/stat path
+    // already resolves namespace-aware (current_resolve_absolute); readlink
+    // must match or a pivoted service cannot readlink its own /sys symlinks.
+    let root_rel = current_resolve_absolute(&path, |fs, rel| {
         (fs.root(), alloc::string::String::from(rel))
     });
     let file = match root_rel {

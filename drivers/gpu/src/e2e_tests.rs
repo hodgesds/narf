@@ -1748,3 +1748,79 @@ kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_add_carries_devnum_naming_the_udev_db_file
 );
+
+// ── Smoke NN: /sys/dev/char/226:0 resolves as a SYMLINK under NoFollow ────
+//
+// The seat handover hinges on this. logind's `sd_device_new_from_devnum('c',
+// 226:0)` resolves the card node by `readlinkat(<fd for /sys/dev/char>,
+// "226:0")` — the final component read with *no* symlink-follow. readlink(2)
+// is driven by `resolve_async_nofollow`, which must hand back the symlink node
+// itself. If it instead returns None/Err (or a non-symlink), readlink answers
+// EINVAL; `session_device_verify()` then returns -EINVAL, `TakeDevice` over
+// D-Bus answers `org.freedesktop.DBus.Error.InvalidArgs`, and kwin logs
+// "Failed to open /dev/dri/card0 device (Invalid argument)" and exits — no
+// compositor ever reaches the GPU. libdrm only ever *follows* 226:N as an
+// intermediate component, so this NoFollow-final path was never covered.
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_sys_dev_char_symlink_resolves_nofollow() -> TestResult {
+    use crate::drm_registry;
+    use narf_filesystem::{sysfs, FsInstance};
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+
+    drm_registry::register_drm_card(alloc::sync::Arc::new(FakeDrmCard {
+        name_str: "card0".into(),
+        driver_str: "fake",
+        vid: 0x1002,
+        did: 0x1636,
+    }));
+    crate::drm_sysfs_bridge::populate_drm_class();
+
+    // (1) The symlink must actually live on the /sys/dev/char kobject.
+    let dev_char = sysfs::sysfs_root()
+        .get_child("dev")
+        .and_then(|d| d.get_child("char"));
+    let dev_char = match dev_char {
+        Some(c) => c,
+        None => return TestResult::Fail("/sys/dev/char missing"),
+    };
+    match dev_char.get_symlink("226:0") {
+        Some(t) if t.ends_with("card0") => {}
+        Some(_) => return TestResult::Fail("/sys/dev/char/226:0 target is not card0"),
+        None => return TestResult::Fail("/sys/dev/char/226:0 is not a symlink on the kobject"),
+    }
+
+    // (2) The async NoFollow resolver (what readlink(2) drives) must return the
+    //     symlink node — not None/Err, and typed Symlink.
+    let sysfs_root = sysfs::SysFs::new().root();
+    let node = match poll_once(narf_filesystem::resolve_async_nofollow(
+        sysfs_root,
+        "dev/char/226:0",
+    )) {
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return TestResult::Fail("resolve_async_nofollow(dev/char/226:0) errored"),
+        None => return TestResult::Fail("resolve_async_nofollow did not complete"),
+    };
+    if node.stat().mode.file_type != narf_filesystem::FileType::Symlink {
+        return TestResult::Fail("resolved /sys/dev/char/226:0 is not a Symlink");
+    }
+    let mut buf = alloc::vec![0u8; 256];
+    let n = match poll_once(node.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("reading the symlink target failed"),
+    };
+    match core::str::from_utf8(&buf[..n]) {
+        Ok(t) if t.ends_with("card0") => {}
+        _ => return TestResult::Fail("symlink target does not end with card0"),
+    }
+
+    drm_registry::__reset_for_test();
+    sysfs::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_sys_dev_char_symlink_resolves_nofollow
+);
