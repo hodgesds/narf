@@ -246,7 +246,16 @@ pub fn dispatch_virtgpu_render(
         }
         DRM_IOCTL_VIRTGPU_GET_CAPS => {
             let mut req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
-            if req.cap_set_id != 1 || req.size == 0 || req.addr == 0 {
+            // Forward WHATEVER capset id the client asks for to the host
+            // renderer rather than hardcoding a set. Mesa only queries capset
+            // ids the device ENUMERATED as available (VIRTIO_GPU_CMD_GET_CAPSET_INFO),
+            // and modern Mesa prefers the DRM native-context capset (id 6) over
+            // VIRGL2 (2)/VIRGL (1) when the host advertises it — hardcoding 1/2
+            // rejected the id-6 probe the device had itself advertised, so
+            // Mesa's GL init (and kwin) failed. virgl_capset returns Err (-> the
+            // client falls back, or fails cleanly) when the host has no such
+            // capset, so passing the id through is safe.
+            if req.size == 0 || req.addr == 0 {
                 return Err(FsError::Unsupported);
             }
             let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
