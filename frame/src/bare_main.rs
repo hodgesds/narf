@@ -64,10 +64,19 @@ const KSWAPD_PAGES_PER_CPU: usize = 64;
 /// Volatile writable trees a distro PID 1 requires even when its block-backed
 /// root filesystem is mounted read-only. Keep `/var/tmp` separate from `/tmp`:
 /// systemd's `PrivateTmp` prepares and mounts both trees independently.
-const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 3] = [
+///
+/// `/home` is included because a logged-in user's session writes there (KDE
+/// builds its `~/.cache/ksycoca6` plugin registry, `~/.config`, `~/.local`).
+/// On a read-only root those writes fail with EROFS, `kbuildsycoca6` can't
+/// build the registry, and Plasma reports "package does not exist" for every
+/// applet — no panel. Unlike the root-owned runtime trees, `/home` is mounted
+/// world-writable (1777) so a non-root user can create their own home dir; see
+/// the mount loop.
+const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 4] = [
     ("/mnt/tmp", "/tmp"),
     ("/mnt/var/tmp", "/var/tmp"),
     ("/mnt/run", "/run"),
+    ("/mnt/home", "/home"),
 ];
 
 #[cfg(feature = "kernel-test")]
@@ -77,10 +86,11 @@ fn smoke_distro_runtime_mount_plan_covers_private_tmp() -> narf_kernel_test::Tes
             ("/mnt/tmp", "/tmp"),
             ("/mnt/var/tmp", "/var/tmp"),
             ("/mnt/run", "/run"),
+            ("/mnt/home", "/home"),
         ]
     {
         return narf_kernel_test::TestResult::Fail(
-            "distro runtime mount plan must provide separate /tmp, /var/tmp, and /run trees",
+            "distro runtime mount plan must provide separate /tmp, /var/tmp, /run, and /home trees",
         );
     }
     narf_kernel_test::TestResult::Pass
@@ -3351,15 +3361,33 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             // separate prerequisite for systemd PrivateTmp.
                             for (mount_path, guest_path) in DISTRO_WRITABLE_RUNTIME_MOUNTS {
                                 if !mounts.iter().any(|m| m == mount_path) {
-                                    let fs = narf_filesystem::MemFs::new("tmpfs");
-                                    let _ =
-                                        narf_filesystem::registry().mount(&auth, mount_path, fs);
-                                    let _ = writeln!(
-                                        console::Writer,
-                                        "  mnt-dev-bind: writable {} mounted at {}",
-                                        guest_path,
-                                        mount_path,
-                                    );
+                                    // /home is written by a NON-root logged-in user, so it must be
+                                    // world-writable (1777) — the default MemFs tmpfs is 0755 root,
+                                    // where the user could not create their own $HOME. The other
+                                    // trees stay root-owned; the distro's systemd remounts /tmp,/run
+                                    // with proper perms over ours anyway.
+                                    let mounted = if mount_path == "/mnt/home" {
+                                        match narf_filesystem::TmpFs::from_options("mode=1777", 0, 0)
+                                        {
+                                            Ok(fs) => narf_filesystem::registry()
+                                                .mount(&auth, mount_path, fs)
+                                                .is_ok(),
+                                            Err(_) => false,
+                                        }
+                                    } else {
+                                        let fs = narf_filesystem::MemFs::new("tmpfs");
+                                        narf_filesystem::registry()
+                                            .mount(&auth, mount_path, fs)
+                                            .is_ok()
+                                    };
+                                    if mounted {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  mnt-dev-bind: writable {} mounted at {}",
+                                            guest_path,
+                                            mount_path,
+                                        );
+                                    }
                                 }
                             }
                             // Bind /sys and /proc into the chroot too — libudev/
