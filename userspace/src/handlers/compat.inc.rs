@@ -7651,6 +7651,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));
     table.install_raw(Syscall::Mount, "mount", RawFnHandler(sys_mount));
     table.install_raw(Syscall::Umount2, "umount2", RawFnHandler(sys_umount2));
+    table.install_raw(Syscall::Quotactl, "quotactl", RawFnHandler(sys_quotactl));
     table.install_raw(Syscall::Statfs, "statfs", RawFnHandler(sys_statfs));
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
@@ -9772,6 +9773,8 @@ mod handler_sys_splice;
 mod handler_sys_stat;
 #[path = "sys_stat_linux.rs"]
 mod handler_sys_stat_linux;
+#[path = "sys_quotactl.rs"]
+mod handler_sys_quotactl;
 #[path = "sys_statfs.rs"]
 mod handler_sys_statfs;
 #[path = "sys_statx.rs"]
@@ -10140,6 +10143,7 @@ pub(crate) use {
     handler_sys_socketpair::sys_socketpair,
     handler_sys_splice::sys_splice,
     handler_sys_stat::{stat_absolute, sys_stat},
+    handler_sys_quotactl::sys_quotactl,
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,

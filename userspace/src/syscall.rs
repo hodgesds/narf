@@ -1776,6 +1776,11 @@ pub enum Syscall {
     /// Linux `sysinfo` (x86_64=99, aarch64=179).
     Sysinfo,
 
+    /// `quotactl(cmd, special, id, addr)` — disk-quota control. `cmd` packs a
+    /// subcommand and quota type (`(subcmd << 8) | type`). Linux `quotactl`
+    /// (x86_64=179, aarch64=60). Backed for tmpfs mounted `usrquota`/`grpquota`.
+    Quotactl,
+
     /// `splice(fd_in, off_in*, fd_out, off_out*, len, flags)` — move
     /// data between two fds (one a pipe) without a userspace copy.
     /// Linux `splice` (x86_64=275, aarch64=76).
@@ -2418,6 +2423,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getresgid, 120),
     (Syscall::Ppoll, 271),
     (Syscall::Sysinfo, 99),
+    (Syscall::Quotactl, 179),
     (Syscall::Splice, 275),
     (Syscall::Membarrier, 324),
     (Syscall::ClockGetres, 229),
@@ -2898,6 +2904,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setresgid, 149),
     (Syscall::Getresgid, 150),
     (Syscall::Sysinfo, 179),
+    (Syscall::Quotactl, 60),
     (Syscall::Splice, 76),
     (Syscall::Membarrier, 283),
     (Syscall::ClockGetres, 114),
