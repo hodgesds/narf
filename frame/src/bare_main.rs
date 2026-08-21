@@ -4052,10 +4052,10 @@ fn run_async_demo() -> ! {
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     use narf_userspace::{
-        bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
-        install_all_address_spaces_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, install_user_task_hooks, load_user_process_with,
-        load_user_process_with_root, sigaction_init, signal_init, SyscallTable,
+        bootstrap_init, cwd_init, install_address_space_lookup, install_all_address_spaces_lookup,
+        install_core_syscalls, install_global, install_task_id_lookup, install_user_task_hooks,
+        load_user_process_with, load_user_process_with_root, sigaction_init, signal_init,
+        SyscallTable,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
@@ -4069,7 +4069,6 @@ fn boot_userspace_init() {
 
     // Per-task subsystem stores. Idempotent — fine to call once.
     bootstrap_init();
-    brk_init();
     cwd_init();
     sigaction_init();
     signal_init();

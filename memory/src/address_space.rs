@@ -631,6 +631,15 @@ pub struct AddressSpace {
     /// Initial value 0x4080_0000_0000 matches the prior global —
     /// well above the ELF + brk regions and below the user stack.
     mmap_cursor: core::sync::atomic::AtomicU64,
+    /// Program break (top of the `brk(2)` heap), owned by the ADDRESS SPACE —
+    /// not per-task. The heap is AS state: every `CLONE_VM` thread shares it and
+    /// a real fork inherits it (see `clone_for_fork`). Keying it per-task let a
+    /// worker thread with no entry answer `brk(0)` with the arena base, which
+    /// glibc latched into its process-global `__curbrk`; the main thread's next
+    /// `sbrk` then computed a mid-heap break and `sys_brk` unmapped live heap
+    /// (kwin's deterministic heap-UAF SIGSEGV). `0` = unset; first use seeds it
+    /// to the brk arena base.
+    brk_top: core::sync::atomic::AtomicU64,
     /// Set once this AS is shared by a `CLONE_VM` clone (a thread) —
     /// from then on it can be RESIDENT ON MULTIPLE CPUS at once, so PTE
     /// mutations must broadcast cross-CPU TLB shootdowns. While false
@@ -704,6 +713,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            brk_top: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         }
@@ -903,6 +913,19 @@ impl AddressSpace {
         }
     }
 
+    /// Current program break (top of the `brk(2)` heap) for this address space,
+    /// or `0` if `brk` has not been called yet (caller seeds the arena base).
+    /// AS-scoped so `CLONE_VM` threads share it; see the `brk_top` field.
+    pub fn brk_top(&self) -> u64 {
+        self.brk_top.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish the program break for this address space.
+    pub fn set_brk_top(&self, top: u64) {
+        self.brk_top
+            .store(top, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Allocate a fresh user-mode PML4 (x86_64) or TTBR0 page-table
     /// root (aarch64) inheriting every kernel-half entry from the
     /// currently-active root. The returned `AddressSpace` can be
@@ -923,6 +946,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            brk_top: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
@@ -947,6 +971,7 @@ impl AddressSpace {
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
+            brk_top: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         })
@@ -5104,6 +5129,13 @@ impl AddressSpace {
         child
             .mmap_cursor
             .store(parent_cursor, core::sync::atomic::Ordering::Relaxed);
+        // A real fork inherits the parent's program break: the child clones the
+        // heap regions, so its break must start where the parent's is (a fresh
+        // `0` would let the first child brk mass-unmap the cloned heap on the
+        // shrink path). `CLONE_VM` threads need no copy — they share this AS.
+        child
+            .brk_top
+            .store(self.brk_top(), core::sync::atomic::Ordering::Relaxed);
 
         Ok(child)
     }

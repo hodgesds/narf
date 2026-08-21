@@ -751,7 +751,6 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
 
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
-    crate::brk_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -792,14 +791,12 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         _ => {
             *USER_AS_BRK.lock() = None;
             __test_clear_global();
-            crate::handlers::__test_brk_reset();
             return TestResult::Fail("Brk(0) did not return Ok");
         }
     };
     if initial == 0 {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        crate::handlers::__test_brk_reset();
         return TestResult::Fail("Brk(0) returned zero base");
     }
 
@@ -818,14 +815,12 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         _ => {
             *USER_AS_BRK.lock() = None;
             __test_clear_global();
-            crate::handlers::__test_brk_reset();
             return TestResult::Fail("Brk(grow) did not return Ok");
         }
     };
     if grown != target {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        crate::handlers::__test_brk_reset();
         return TestResult::Fail("Brk(grow) returned wrong value");
     }
 
@@ -839,7 +834,6 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_none() {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        crate::handlers::__test_brk_reset();
         return TestResult::Fail("Brk-grown page not mapped in AS");
     }
 
@@ -854,20 +848,17 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         _ => {
             *USER_AS_BRK.lock() = None;
             __test_clear_global();
-            crate::handlers::__test_brk_reset();
             return TestResult::Fail("Brk(0) post-grow not Ok");
         }
     };
     if after != target {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        crate::handlers::__test_brk_reset();
         return TestResult::Fail("Brk did not persist new break");
     }
 
     *USER_AS_BRK.lock() = None;
     __test_clear_global();
-    crate::handlers::__test_brk_reset();
     TestResult::Pass
 }
 // Gate out of `user-mode-e2e` runs: e2e ordering is sensitive to

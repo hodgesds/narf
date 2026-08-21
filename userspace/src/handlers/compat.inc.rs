@@ -691,24 +691,11 @@ const _: () = assert!(BRK_DEFAULT_BASE < BRK_ARENA_TOP);
 // never alias (the bug this base was moved to fix).
 const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BASE);
 
-static BRK_TABLE: TaskMapTable<u64> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
-
-/// Initialise the per-task brk registry. Boot calls this once before
-/// any user task can issue `Syscall::Brk`.
-pub fn brk_init() {
-    task_map_init(&BRK_TABLE);
-}
-
-/// fork(2) inheritance: copy `parent`'s brk top to `child`.
-pub fn brk_fork(parent: u64, child: u64) {
-    task_map_fork(&BRK_TABLE, parent, child);
-}
-
-/// Reset the registry — test hook.
-#[doc(hidden)]
-pub fn __test_brk_reset() {
-    task_map_init(&BRK_TABLE);
-}
+// The program break is ADDRESS-SPACE state (`AddressSpace::brk_top`), not a
+// per-task registry: CLONE_VM threads share it and a real fork inherits it in
+// `clone_for_fork`. It used to live in a per-task `BRK_TABLE`, which let a fresh
+// worker thread answer `brk(0)` with the arena base and poison glibc's
+// process-global `__curbrk` — see `sys_brk::brk_core`.
 
 // ── execve — re-image the current task ─────────────────────────────
 //
@@ -3999,9 +3986,12 @@ pub fn proc_task_info(
     if !live {
         return None;
     }
-    // brk top — pull from the per-task BRK_TABLE, which (like fd/cwd/comm) is
-    // keyed by TaskId, so use `tid`, not the outer ProcessId `pid`.
-    let brk_top = task_map_get(&BRK_TABLE, tid).unwrap_or(0);
+    // brk top — the break is ADDRESS-SPACE state now (not per-task), so read it
+    // off the task's AS. This also gives every CLONE_VM thread the same `[heap]`
+    // range in its /proc/<tid>/maps (per-task keying showed threads no heap).
+    let brk_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+        .map(|as_arc| as_arc.brk_top())
+        .unwrap_or(0);
     // Stack top — the exclusive high end of the user-stack region.
     // Stage-1 just reports the standard fixed top.
     let stack_top = crate::process::DEFAULT_USER_STACK_TOP;

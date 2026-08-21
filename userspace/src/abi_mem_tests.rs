@@ -22,10 +22,10 @@ use crate::abi_test_support::*;
 // ════════════════════════════════════════════════════════════════════
 
 // ── Brk (12) ─────────────────────────────────────────────────────────
-// No AS + (possibly) uninitialised BRK_TABLE: every path here returns a
-// NARF-Ok status with a non-negative value (current break or 0). We pin
-// the status + sign rather than an exact address (the break base depends
-// on whether BRK_TABLE was initialised by an earlier boot test).
+// The break lives on the AddressSpace (`AddressSpace::brk_top`), seeded to the
+// arena base on first use. Every path here returns a NARF-Ok status with a
+// non-negative value (current break or 0); we pin the status + sign rather than
+// an exact address (the break depends on the test's AS state).
 
 fn smoke_abi_mem_brk_query_pos() -> TestResult {
     with_setup(|| {

@@ -198,7 +198,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "linux-compat")]
     root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
-    brk_fork(parent_pid, child_tid.raw());
+    // brk is inherited by `clone_for_fork` (it's address-space state), not copied
+    // per-task.
     sigaction_fork(parent_pid, child_tid.raw());
     signal_mask_fork(parent_pid, child_tid.raw());
     // POSIX: inherit the parent's process group, session, and controlling

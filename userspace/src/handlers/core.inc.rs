@@ -628,7 +628,6 @@ pub fn bootstrap_init() {
 pub fn init_per_task_state() {
     bootstrap_init();
     cwd_init();
-    brk_init();
     sigaction_init();
     signal_init();
     uidgid_init();
@@ -5822,11 +5821,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
     }
 
-    if !share_vm {
-        // brk maps onto AS state; only meaningful for a non-VM clone
-        // (a true fork).
-        brk_fork(parent_pid, child_tid.raw());
-    }
+    // The program break is ADDRESS-SPACE state: a real fork inherits it in
+    // `clone_for_fork`, and CLONE_VM threads share it because they share the AS.
+    // No per-task copy is needed or wanted (per-task keying let a fresh thread
+    // answer brk(0) with the arena base and poison glibc's __curbrk).
     // Signal-handler table: CLONE_SIGHAND (mandatory for CLONE_THREAD)
     // SHARES the parent's live sighand — a handler installed by any
     // thread is visible to the whole group (Linux sighand_struct
@@ -6006,7 +6004,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
 // the parent.
 //
 // Inheritance: AS (copied), fd table (copied via `fd::fork`), cwd
-// (copied via `cwd_fork`), brk (copied via `brk_fork`), sigaction
+// (copied via `cwd_fork`), brk (inherited on the AS by `clone_for_fork`), sigaction
 // handlers (copied via `sigaction_fork`), trap-frame state (copied
 // via `TrapContext::save_user_state`, with rax mutated to 0 in
 // the child).
@@ -7104,7 +7102,6 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    task_map_remove(&BRK_TABLE, tid);
 
     // Memory policy.
     if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
