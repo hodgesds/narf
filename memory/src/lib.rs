@@ -190,10 +190,10 @@ pub use pager::{
     ZpoolPager,
 };
 pub use swap::{
-    backend_name as swap_backend_name, install_backend as install_swap_backend,
+    add_swap_area, backend_name as swap_backend_name, install_backend as install_swap_backend,
     set_swap_batch_pages, swap_batch_pages, swap_discard, swap_discard_batch, swap_stats,
-    SwapBackend, SwapError, SwapPte, SwapStats, ZramBackend, SWAP_BATCH_PAGES_DEFAULT,
-    SWAP_BATCH_PAGES_MAX,
+    SwapBackend, SwapError, SwapPte, SwapStats, ZramBackend, MAX_SWAP_AREAS,
+    SWAP_BATCH_PAGES_DEFAULT, SWAP_BATCH_PAGES_MAX,
 };
 #[cfg(target_arch = "x86_64")]
 pub use swap::{
