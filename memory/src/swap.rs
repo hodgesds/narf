@@ -574,15 +574,20 @@ impl SlotAllocator {
 
 // ── Global swap state ──────────────────────────────────────────────
 
-/// The kernel-wide swap device: one backend + one slot allocator.
-struct SwapDevice {
-    backend: Option<Arc<dyn SwapBackend>>,
+/// Maximum number of swap areas, bounded by the 5-bit `swap_type` PTE field
+/// (mirrors Linux's `MAX_SWAPFILES`-class budget).
+pub const MAX_SWAP_AREAS: usize = SwapPte::MAX_TYPE as usize + 1;
+
+/// One swap area: a backing store, its own slot allocator, a priority, and
+/// per-area counters. Higher `priority` is preferred by the swap-out allocator
+/// (Linux `swapon -p`); an area's index is the `swap_type` stamped into its
+/// pages' PTEs.
+struct SwapArea {
+    backend: Arc<dyn SwapBackend>,
     slots: SlotAllocator,
-    /// Swap area id this device answers for. v1 = 0 (single area).
-    /// Consumed by the x86_64 pageout path when stamping swap PTEs;
-    /// aarch64 paging is a stub, so it's read only under x86_64.
+    /// Read only by the x86_64 swap-out allocator; aarch64 paging is a stub.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    swap_type: u8,
+    priority: i32,
     /// Live paged-out page count, for `swap_stats`.
     resident: u64,
     /// Total pages ever paged out, for `swap_stats`.
@@ -591,12 +596,12 @@ struct SwapDevice {
     pages_in: u64,
 }
 
-impl SwapDevice {
-    const fn new() -> Self {
+impl SwapArea {
+    fn new(backend: Arc<dyn SwapBackend>, priority: i32) -> Self {
         Self {
-            backend: None,
+            backend,
             slots: SlotAllocator::new(),
-            swap_type: 0,
+            priority,
             resident: 0,
             pages_out: 0,
             pages_in: 0,
@@ -604,7 +609,85 @@ impl SwapDevice {
     }
 }
 
-static SWAP: IrqSafeSpinLock<SwapDevice> = IrqSafeSpinLock::new(SwapDevice::new());
+/// The kernel-wide swap configuration: up to [`MAX_SWAP_AREAS`] prioritized
+/// areas indexed by `swap_type`.
+struct SwapAreas {
+    areas: [Option<SwapArea>; MAX_SWAP_AREAS],
+}
+
+impl SwapAreas {
+    const fn new() -> Self {
+        Self {
+            areas: [const { None }; MAX_SWAP_AREAS],
+        }
+    }
+
+    /// True once any area has a backend.
+    fn any_installed(&self) -> bool {
+        self.areas.iter().any(|a| a.is_some())
+    }
+
+    /// Allocate a run of `n` slots from the highest-priority area that can
+    /// satisfy it (ties broken by lowest index — Linux fills equal-priority
+    /// areas low-index first). Returns `(swap_type, base_slot, backend)`.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    fn alloc_run_by_priority(
+        &mut self,
+        n: usize,
+    ) -> Result<(u8, u64, Arc<dyn SwapBackend>), SwapError> {
+        let mut tried = [false; MAX_SWAP_AREAS];
+        loop {
+            // Pick the highest-priority not-yet-tried installed area.
+            let mut best: Option<usize> = None;
+            for (i, slot) in self.areas.iter().enumerate() {
+                if tried[i] {
+                    continue;
+                }
+                let Some(area) = slot.as_ref() else { continue };
+                match best {
+                    None => best = Some(i),
+                    Some(b) => {
+                        // Lower index already wins ties, so only a strictly
+                        // higher priority replaces the incumbent.
+                        if area.priority > self.areas[b].as_ref().unwrap().priority {
+                            best = Some(i);
+                        }
+                    }
+                }
+            }
+            let Some(i) = best else {
+                // No installed area (or every one is full).
+                return Err(SwapError::NoSlots);
+            };
+            tried[i] = true;
+            let area = self.areas[i].as_mut().unwrap();
+            if let Ok(base) = area.slots.alloc_run(n) {
+                return Ok((i as u8, base, area.backend.clone()));
+            }
+        }
+    }
+
+    fn area_mut(&mut self, ty: u8) -> Option<&mut SwapArea> {
+        self.areas.get_mut(ty as usize).and_then(|a| a.as_mut())
+    }
+
+    fn backend_of(&self, ty: u8) -> Option<Arc<dyn SwapBackend>> {
+        self.areas
+            .get(ty as usize)
+            .and_then(|a| a.as_ref())
+            .map(|a| a.backend.clone())
+    }
+
+    /// Return a single slot to its area's free set.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    fn free_slot(&mut self, ty: u8, slot: u64) {
+        if let Some(area) = self.area_mut(ty) {
+            area.slots.free_slot(slot);
+        }
+    }
+}
+
+static SWAP: IrqSafeSpinLock<SwapAreas> = IrqSafeSpinLock::new(SwapAreas::new());
 
 /// Snapshot of swap counters for `/proc`-style diagnostics + tests.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -623,41 +706,67 @@ pub struct SwapStats {
     pub batch_pages: usize,
 }
 
-/// Install the swap backend. Idempotent-safe to call once at boot;
-/// replaces any prior backend (whose live slots become unrecoverable,
-/// so only swap at well-defined boundaries — boot / test setup).
+/// Install the primary swap area (`swap_type` 0) at priority 0, replacing any
+/// prior area 0 (whose live slots become unrecoverable, so only swap at
+/// well-defined boundaries — boot / test setup). Additional prioritized areas
+/// are added with [`add_swap_area`].
 pub fn install_backend<B: SwapBackend>(backend: B) {
-    let mut dev = SWAP.lock();
-    dev.backend = Some(Arc::new(backend));
+    let mut swap = SWAP.lock();
+    swap.areas[0] = Some(SwapArea::new(Arc::new(backend), 0));
 }
 
-/// Install the default compressed-RAM backend if none is set yet.
-/// Called from the pageout path so callers never hit a missing
+/// Register an additional prioritized swap area, returning its `swap_type` id,
+/// or `None` if all [`MAX_SWAP_AREAS`] slots are occupied. Higher `priority` is
+/// preferred by the swap-out allocator (Linux `swapon -p`), so a fast area fills
+/// before a slower one.
+pub fn add_swap_area<B: SwapBackend>(backend: B, priority: i32) -> Option<u8> {
+    let mut swap = SWAP.lock();
+    for i in 0..MAX_SWAP_AREAS {
+        if swap.areas[i].is_none() {
+            swap.areas[i] = Some(SwapArea::new(Arc::new(backend), priority));
+            return Some(i as u8);
+        }
+    }
+    None
+}
+
+/// Install the default compressed-RAM backend as the primary area if no area is
+/// set yet. Called from the pageout path so callers never hit a missing
 /// backend. Idempotent.
 pub fn install_default_if_unset() {
-    let mut dev = SWAP.lock();
-    if dev.backend.is_none() {
-        dev.backend = Some(Arc::new(ZramBackend::new()));
+    let mut swap = SWAP.lock();
+    if !swap.any_installed() {
+        swap.areas[0] = Some(SwapArea::new(Arc::new(ZramBackend::new()), 0));
     }
 }
 
-/// Name of the installed backend, or `None` if unset.
+/// Name of the lowest-indexed installed area's backend, or `None` if no area is
+/// installed.
 pub fn backend_name() -> Option<&'static str> {
-    SWAP.lock().backend.as_ref().map(|b| b.name())
+    SWAP.lock()
+        .areas
+        .iter()
+        .flatten()
+        .next()
+        .map(|a| a.backend.name())
 }
 
-/// Swap counter snapshot.
+/// Swap counter snapshot, aggregated across every installed area.
 pub fn swap_stats() -> SwapStats {
-    let dev = SWAP.lock();
-    let (hw, free) = dev.slots.stats();
-    SwapStats {
-        resident: dev.resident,
-        slots_high_water: hw,
-        slots_free: free,
-        pages_out: dev.pages_out,
-        pages_in: dev.pages_in,
+    let swap = SWAP.lock();
+    let mut stats = SwapStats {
         batch_pages: swap_batch_pages(),
+        ..SwapStats::default()
+    };
+    for area in swap.areas.iter().flatten() {
+        let (hw, free) = area.slots.stats();
+        stats.resident += area.resident;
+        stats.slots_high_water += hw;
+        stats.slots_free += free;
+        stats.pages_out += area.pages_out;
+        stats.pages_in += area.pages_in;
     }
+    stats
 }
 
 // ── cgroup swap accounting seam ────────────────────────────────────
@@ -925,40 +1034,34 @@ pub(crate) unsafe fn swap_out_batch_owned(
     }
     let n = resolved.len();
 
-    // ── 2. Allocate a contiguous slot run + build the slot list. ──
-    let (base, swap_type, slot_run) = {
-        let mut dev = SWAP.lock();
-        let base = dev.slots.alloc_run(n)?;
-        let ty = dev.swap_type;
+    // ── 2. Allocate a contiguous slot run from the highest-priority area
+    //       that can hold it, and carry its backend + type. ──
+    let (base, swap_type, backend, slot_run) = {
+        let mut swap = SWAP.lock();
+        let (ty, base, backend) = swap.alloc_run_by_priority(n)?;
         let run: Vec<SwapSlot> = (0..n as u64).map(|k| SwapSlot(base + k)).collect();
-        (base, ty, run)
+        (base, ty, backend, run)
     };
 
     // ── 3. cgroup swap charge for the whole run. ──
     if !swap_charge(n as u64) {
         // Return the slots we reserved and bail — frames stay resident.
-        let mut dev = SWAP.lock();
+        let mut swap = SWAP.lock();
         for k in 0..n as u64 {
-            dev.slots.free_slot(base + k);
+            swap.free_slot(swap_type, base + k);
         }
         return Err(SwapError::SwapLimit);
     }
 
-    // ── 4. One batched backend write. ──
+    // ── 4. One batched write to the chosen area's backend. ──
     let frames: Vec<PhysAddr> = resolved.iter().map(|(_, p)| *p).collect();
     {
-        let backend = SWAP
-            .lock()
-            .backend
-            .as_ref()
-            .expect("backend installed above")
-            .clone();
         if let Err(e) = backend.write_batch(&slot_run, &frames) {
             // Roll back: uncharge + return the slots. No PTE touched yet.
             swap_uncharge(n as u64);
-            let mut dev = SWAP.lock();
+            let mut swap = SWAP.lock();
             for k in 0..n as u64 {
-                dev.slots.free_slot(base + k);
+                swap.free_slot(swap_type, base + k);
             }
             return Err(e);
         }
@@ -981,18 +1084,12 @@ pub(crate) unsafe fn swap_out_batch_owned(
     // SAFETY: every commit names the one validated root, unique aligned VAs,
     // and the expected frames resolved immediately above.
     if unsafe { commit_swap_out_batch(root, &commits) }.is_err() {
-        let backend = SWAP
-            .lock()
-            .backend
-            .as_ref()
-            .expect("backend remains installed")
-            .clone();
         backend.discard_batch(&slot_run);
-        let mut dev = SWAP.lock();
+        let mut swap = SWAP.lock();
         for slot in &slot_run {
-            dev.slots.free_slot(slot.raw());
+            swap.free_slot(swap_type, slot.raw());
         }
-        drop(dev);
+        drop(swap);
         swap_uncharge(n as u64);
         return Err(SwapError::MapFailed);
     }
@@ -1017,9 +1114,11 @@ pub(crate) unsafe fn swap_out_batch_owned(
     let done = resolved.len();
 
     {
-        let mut dev = SWAP.lock();
-        dev.resident += done as u64;
-        dev.pages_out += done as u64;
+        let mut swap = SWAP.lock();
+        if let Some(area) = swap.area_mut(swap_type) {
+            area.resident += done as u64;
+            area.pages_out += done as u64;
+        }
     }
     Ok(done)
 }
@@ -1140,22 +1239,25 @@ pub(crate) fn swap_in_batch_owned(
     // Snapshot all expected swap entries under the same root mutation lock.
     // A later commit pass revalidates the raw values, so a competing fault can
     // win safely while backend I/O runs without any page-table lock held.
-    let expected: Vec<(u64, SwapSlot)> = {
+    let expected: Vec<(u64, SwapPte)> = {
         let _guard = crate::paging::pt_lock_for(root).lock();
         let mut entries = Vec::with_capacity(requests.len());
         for request in requests {
             let raw = read_leaf_pte(root, request.virt).ok_or(SwapError::SlotNotFound)?;
             let entry = SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?;
-            entries.push((raw, SwapSlot(entry.offset)));
+            entries.push((raw, entry));
         }
         entries
     };
-    let slots: Vec<SwapSlot> = expected.iter().map(|(_, slot)| *slot).collect();
 
-    // Duplicate slot aliases would let a malformed batch discard the same
-    // backing twice. Legitimate swap PTEs are one-slot-per-leaf.
-    for (index, slot) in slots.iter().enumerate() {
-        if slots[..index].contains(slot) {
+    // Duplicate (area, slot) aliases would let a malformed batch discard the
+    // same backing twice. Legitimate swap PTEs are one-slot-per-leaf; the SAME
+    // offset in two DIFFERENT areas is distinct backing, so key on the pair.
+    for (index, (_, entry)) in expected.iter().enumerate() {
+        if expected[..index]
+            .iter()
+            .any(|(_, prior)| prior.swap_type == entry.swap_type && prior.offset == entry.offset)
+        {
             return Err(SwapError::InvalidBatch);
         }
     }
@@ -1173,13 +1275,10 @@ pub(crate) fn swap_in_batch_owned(
         }
     }
     let phys: Vec<PhysAddr> = frames.iter().map(|frame| frame.start_address()).collect();
-    let backend = SWAP
-        .lock()
-        .backend
-        .as_ref()
-        .ok_or(SwapError::SlotNotFound)?
-        .clone();
-    if let Err(error) = backend.read_batch_into(&slots, &phys) {
+    // Read each page from ITS OWN area's backend — a consecutive fault run can
+    // span areas if the pages were paged out in separate batches. Grouped by
+    // swap_type so each backend still does one coalesced read.
+    if let Err(error) = read_pages_by_area(&expected, &phys) {
         for frame in frames {
             crate::frame::free_frame(frame);
         }
@@ -1208,17 +1307,78 @@ pub(crate) fn swap_in_batch_owned(
 
     publish(&phys);
 
-    backend.discard_batch(&slots);
-    {
-        let mut dev = SWAP.lock();
-        for slot in &slots {
-            dev.slots.free_slot(slot.raw());
-        }
-        dev.resident = dev.resident.saturating_sub(requests.len() as u64);
-        dev.pages_in += requests.len() as u64;
-    }
-    swap_uncharge(requests.len() as u64);
+    // Retire each page's backing in its own area: discard the backend copy (no
+    // lock held) then free the slot + residency under the lock.
+    let entries: Vec<SwapPte> = expected.iter().map(|(_, e)| *e).collect();
+    let retired = retire_slots_by_area(&entries, /* count_in */ true);
+    swap_uncharge(retired as u64);
     Ok(phys)
+}
+
+/// Read pages back from their areas, grouped by `swap_type` so each backend
+/// does one coalesced read. `phys[i]` receives `expected[i]`'s page.
+#[cfg(target_arch = "x86_64")]
+fn read_pages_by_area(expected: &[(u64, SwapPte)], phys: &[PhysAddr]) -> Result<(), SwapError> {
+    let mut handled = [false; MAX_SWAP_AREAS];
+    for (_, entry) in expected {
+        let ty = entry.swap_type;
+        if handled[ty as usize] {
+            continue;
+        }
+        handled[ty as usize] = true;
+        let mut gslots: Vec<SwapSlot> = Vec::new();
+        let mut gphys: Vec<PhysAddr> = Vec::new();
+        for (i, (_, e)) in expected.iter().enumerate() {
+            if e.swap_type == ty {
+                gslots.push(SwapSlot(e.offset));
+                gphys.push(phys[i]);
+            }
+        }
+        let backend = SWAP.lock().backend_of(ty).ok_or(SwapError::SlotNotFound)?;
+        backend.read_batch_into(&gslots, &gphys)?;
+    }
+    Ok(())
+}
+
+/// Discard the backing of every entry and return its slot to the owning area,
+/// grouped by `swap_type`. When `count_in` is set the pages count as fault-ins
+/// (`pages_in`); either way they leave `resident`. Cgroup uncharge is the
+/// caller's responsibility (it differs between fault-in and teardown).
+fn retire_slots_by_area(entries: &[SwapPte], count_in: bool) -> usize {
+    let mut handled = [false; MAX_SWAP_AREAS];
+    let mut retired = 0usize;
+    for entry in entries {
+        let ty = entry.swap_type;
+        if handled[ty as usize] {
+            continue;
+        }
+        handled[ty as usize] = true;
+        let mut gslots: Vec<SwapSlot> = entries
+            .iter()
+            .filter(|e| e.swap_type == ty)
+            .map(|e| SwapSlot(e.offset))
+            .collect();
+        gslots.sort_unstable_by_key(|slot| slot.raw());
+        gslots.dedup_by_key(|slot| slot.raw());
+        // Bind the backend out first so the registry lock is NOT held across the
+        // (potentially blocking) backend I/O.
+        let backend = SWAP.lock().backend_of(ty);
+        if let Some(backend) = backend {
+            backend.discard_batch(&gslots);
+        }
+        let mut swap = SWAP.lock();
+        if let Some(area) = swap.area_mut(ty) {
+            for slot in &gslots {
+                area.slots.free_slot(slot.raw());
+            }
+            area.resident = area.resident.saturating_sub(gslots.len() as u64);
+            if count_in {
+                area.pages_in += gslots.len() as u64;
+            }
+        }
+        retired += gslots.len();
+    }
+    retired
 }
 
 /// Fault a single swapped-out page back in.
@@ -1267,20 +1427,11 @@ pub fn swap_discard_batch(entries: &[SwapPte]) {
     if entries.is_empty() {
         return;
     }
-    let mut slots: Vec<SwapSlot> = entries.iter().map(|entry| SwapSlot(entry.offset)).collect();
-    slots.sort_unstable_by_key(|slot| slot.raw());
-    slots.dedup_by_key(|slot| slot.raw());
-    let backend = SWAP.lock().backend.as_ref().cloned();
-    if let Some(backend) = backend {
-        backend.discard_batch(&slots);
-    }
-    let mut dev = SWAP.lock();
-    for slot in &slots {
-        dev.slots.free_slot(slot.raw());
-    }
-    dev.resident = dev.resident.saturating_sub(slots.len() as u64);
-    drop(dev);
-    swap_uncharge(slots.len() as u64);
+    // Route each entry to its own area (a teardown can span areas), discarding
+    // the backend copy and freeing the slot. Teardown does not count as a
+    // fault-in.
+    let retired = retire_slots_by_area(entries, /* count_in */ false);
+    swap_uncharge(retired as u64);
 }
 
 // ── Leaf-PTE helpers (x86_64) ──────────────────────────────────────
@@ -1375,9 +1526,9 @@ pub(crate) unsafe fn take_swap_entries(
 // Prefixed `__` + `#[doc(hidden)]` to signal "internal / test-only".
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    let mut dev = SWAP.lock();
-    *dev = SwapDevice::new();
-    drop(dev);
+    let mut swap = SWAP.lock();
+    *swap = SwapAreas::new();
+    drop(swap);
     set_swap_batch_pages(SWAP_BATCH_PAGES_DEFAULT);
 }
 
@@ -1721,6 +1872,131 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/swap", smoke_swap_end_to_end_batch);
+
+    // ── 4b. Multiple prioritized swap areas ──────────────────────
+
+    /// Swap-out must pick the HIGHEST-priority area, stamp its `swap_type` into
+    /// the PTEs, and fault-in must route back to that same area's backend
+    /// (proved by contents surviving the round-trip when a second, distinct
+    /// lower-priority backend also exists).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_swap_multi_area_priority() -> TestResult {
+        use crate::paging::{map_4kb, PageTable, PtFlags};
+        use crate::reclaim::{PlannedReclaimRange, ReclaimBatchPlan, PSS_UNITS_PER_PAGE};
+        use crate::{alloc_frame, free_frame, VirtAddr};
+
+        __reset_for_test();
+        // Area 0 (priority 0) is the default; area 1 (priority 100) is preferred.
+        install_backend(ZramBackend::new());
+        let high = match add_swap_area(ZramBackend::new(), 100) {
+            Some(ty) => ty,
+            None => return TestResult::Fail("add_swap_area failed"),
+        };
+        if high != 1 {
+            return TestResult::Fail("second area should take swap_type 1");
+        }
+
+        let pml4 = match alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator not initialised"),
+        };
+        PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+
+        const N: usize = 3;
+        let base_va = 0x0000_0100_0000_0000u64;
+        let flags = PtFlags::WRITABLE | PtFlags::USER;
+        let mut victims = alloc_crate::vec::Vec::with_capacity(N);
+        let mut patterns = [0u8; N];
+        for (i, pat_slot) in patterns.iter_mut().enumerate() {
+            let frame = match alloc_frame() {
+                Ok(f) => f,
+                Err(_) => return TestResult::Fail("alloc_frame (page) failed"),
+            };
+            let phys = frame.start_address();
+            let va = VirtAddr::new(base_va + (i as u64) * 0x1000);
+            // SAFETY: isolated PML4 owned by this test.
+            if unsafe { map_4kb(pml4, va, phys, flags) }.is_err() {
+                free_frame(frame);
+                return TestResult::Fail("map_4kb failed");
+            }
+            let pat = 0x40u8 + i as u8;
+            *pat_slot = pat;
+            // SAFETY: fresh exclusive frame, 4 KiB writable.
+            unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), pat, ZPAGE_SIZE) };
+            victims.push(SwapVictim {
+                pml4_phys: pml4,
+                virt: va,
+            });
+        }
+
+        let plan = ReclaimBatchPlan {
+            ranges: alloc_crate::vec![PlannedReclaimRange {
+                address_space_root: pml4,
+                base: VirtAddr::new(base_va),
+                pages: N,
+                mapcount: 1,
+                estimated_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+                expected_free_pages: N,
+            }],
+            target_free_pages: N,
+            target_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+            selected_pss_units: N as u64 * PSS_UNITS_PER_PAGE,
+            expected_free_pages: N,
+            scanned_pages: N,
+        };
+        // SAFETY: isolated test page table solely owns every frame.
+        let report = unsafe { swap_out_plan(&plan) };
+        if report.error.is_some() || report.swapped_pages != N {
+            return TestResult::Fail("swap_out_plan did not complete");
+        }
+
+        // Every page must have gone to the HIGH-priority area (swap_type 1).
+        for v in &victims {
+            let raw = match read_leaf_pte(pml4, v.virt) {
+                Some(r) => r,
+                None => return TestResult::Fail("leaf PTE vanished after swap-out"),
+            };
+            match SwapPte::decode(raw) {
+                Some(entry) if entry.swap_type == high => {}
+                Some(_) => return TestResult::Fail("swap-out did not pick the high-priority area"),
+                None => return TestResult::Fail("leaf is not a swap entry"),
+            }
+        }
+
+        // Fault back in: contents must survive, proving fault-in routed to the
+        // SAME (high-priority) area's backend and not the empty default area.
+        let requests: Vec<SwapInRequest> = victims
+            .iter()
+            .map(|victim| SwapInRequest {
+                pml4_phys: pml4,
+                virt: victim.virt,
+                flags,
+            })
+            .collect();
+        let restored = match swap_in_batch(&requests) {
+            Ok(pages) if pages.len() == N => pages,
+            _ => return TestResult::Fail("swap_in_batch did not restore N pages"),
+        };
+        for (i, phys) in restored.iter().copied().enumerate() {
+            let p = phys.kernel_ptr::<u8>();
+            // SAFETY: freshly restored, exclusively-owned frame.
+            let ok = unsafe {
+                (0..ZPAGE_SIZE).all(|k| core::ptr::read_volatile(p.add(k)) == patterns[i])
+            };
+            if !ok {
+                return TestResult::Fail("faulted-in bytes wrong (mis-routed area)");
+            }
+            free_frame(crate::frame::PhysFrame::new(phys));
+        }
+        if swap_stats().resident != 0 {
+            return TestResult::Fail("resident not drained after swap-in");
+        }
+
+        __reset_for_test();
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/swap", smoke_swap_multi_area_priority);
 
     // ── 5. Batch knob clamps + round-trips ───────────────────────
 
