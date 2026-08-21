@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use narf_memory::AddressSpace;
 
 pub use narf_capabilities::{Cap, Grant};
-pub use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint};
+pub use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint, TmpFs};
 pub use narf_kernel_test::{kernel_test_in, TestResult};
 
 pub use crate::syscall::{
@@ -603,6 +603,39 @@ pub fn with_memfs(
         Err(_) => {
             teardown();
             return TestResult::Fail("memfs mount failed");
+        }
+    };
+    let outcome = crate::handlers::with_kernel_buffers(body);
+    let _ = registry().unmount(&handle, mount);
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+
+/// Mount a fresh [`TmpFs`] configured with `options` (e.g. `"usrquota,size=1M"`)
+/// at `mount`, run `body`, then unmount + teardown. Used by the `quotactl`
+/// ABI smoke, which needs a real tmpfs superblock (disk-quota capable).
+pub fn with_tmpfs(
+    mount: &'static str,
+    options: &str,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> TestResult {
+    setup();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = match TmpFs::from_options_with_total(options, 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("tmpfs construction failed");
+        }
+    };
+    let handle = match registry().mount(&auth, mount, fs) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("tmpfs mount failed");
         }
     };
     let outcome = crate::handlers::with_kernel_buffers(body);

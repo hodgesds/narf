@@ -34,8 +34,8 @@ use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, MemFs, RamFs,
-    RamFsOptions, TmpFs, TmpFsOptions,
+    bootstrap_mount_authority, registry, resolve, FileType, FsDqBlk, FsError, FsInstance, MemFs,
+    QuotaKind, RamFs, RamFsOptions, TmpFs, TmpFsOptions, QIF_BLIMITS,
 };
 
 // ── poll_once helper ──────────────────────────────────────────────────
@@ -692,6 +692,137 @@ fn smoke_tmpfs_linux_mount_options() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_linux_mount_options);
+
+/// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
+/// users are unaffected, and chown transfers the charge to the new owner.
+fn smoke_tmpfs_usrquota_blocks_and_transfer() -> TestResult {
+    const U: u32 = 1000;
+    // usrquota on; generous mount size so the per-user limit is what bites.
+    let fs = match TmpFs::from_options_with_total("usrquota,size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("usrquota tmpfs construction failed"),
+    };
+    // Give uid 1000 a 2-block hard limit.
+    let limit = FsDqBlk {
+        blocks_hard: 2,
+        valid: QIF_BLIMITS,
+        ..Default::default()
+    };
+    if fs.quota_set(QuotaKind::User, U, &limit).is_err() {
+        return TestResult::Fail("quota_set(user) failed");
+    }
+    let root = fs.root();
+    let file = match poll_once(root.create("u1000")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if poll_once(file.set_owners(U, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown to uid 1000 failed");
+    }
+    // Two pages = exactly the limit → OK.
+    if poll_once(file.write(0, &[b'x'; 8192])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("write within quota failed");
+    }
+    // A third page must exceed the hard limit → EDQUOT (QuotaExceeded).
+    if !matches!(
+        poll_once(file.write(8192, b"y")),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("over-quota write did not return QuotaExceeded");
+    }
+    // The user's usage is exactly the limit.
+    match fs.quota_get(QuotaKind::User, U) {
+        Ok(dq) if dq.blocks_used == 2 && dq.blocks_hard == 2 => {}
+        _ => return TestResult::Fail("quota_get did not report used==2"),
+    }
+    // A file owned by root (uid 0, no limit set) is unaffected.
+    let rootfile = match poll_once(root.create("root")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create root file failed"),
+    };
+    if poll_once(rootfile.write(0, &[b'z'; 8192 * 4])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("unlimited (root-owned) write hit a quota");
+    }
+    // chown the capped file back to root → uid 1000's usage drops to zero.
+    if poll_once(file.set_owners(0, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown back to root failed");
+    }
+    match fs.quota_get(QuotaKind::User, U) {
+        Ok(dq) if dq.blocks_used == 0 => {}
+        _ => return TestResult::Fail("chown did not transfer the charge off uid 1000"),
+    }
+    // And chowning a file ONTO an already-full user must fail with EDQUOT.
+    if poll_once(file.set_owners(U, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("re-chown onto uid 1000 (2 blocks == limit) should fit");
+    }
+    let file2 = match poll_once(root.create("u1000b")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create second file failed"),
+    };
+    if poll_once(file2.write(0, b"q")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("root-owned write failed");
+    }
+    if !matches!(
+        poll_once(file2.set_owners(U, 0)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("chown onto an over-limit user did not return EDQUOT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_usrquota_blocks_and_transfer);
+
+/// tmpfs quota soft vs hard limit: writes are allowed PAST the soft limit
+/// (within the default grace period) but blocked at the hard limit — the
+/// distinction that separates a soft warning from a hard cap. Deterministic
+/// (the default 7-day grace never expires during the test, so no wall-clock
+/// dependency).
+fn smoke_tmpfs_usrquota_soft_vs_hard() -> TestResult {
+    const U: u32 = 1001;
+    let fs = match TmpFs::from_options_with_total("usrquota,size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("usrquota tmpfs construction failed"),
+    };
+    // Soft limit 1 block, hard limit 3 blocks.
+    let limit = FsDqBlk {
+        blocks_soft: 1,
+        blocks_hard: 3,
+        valid: QIF_BLIMITS,
+        ..Default::default()
+    };
+    if fs.quota_set(QuotaKind::User, U, &limit).is_err() {
+        return TestResult::Fail("quota_set(soft+hard) failed");
+    }
+    let root = fs.root();
+    let file = match poll_once(root.create("soft")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if poll_once(file.set_owners(U, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown failed");
+    }
+    // Three pages: crosses the soft limit at page 2 but stays within grace and
+    // under the hard limit, so all succeed.
+    if poll_once(file.write(0, &[b'a'; 4096 * 3])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("writes up to the hard limit (past soft) should succeed");
+    }
+    // A fourth page exceeds the hard limit → EDQUOT.
+    if !matches!(
+        poll_once(file.write(4096 * 3, b"d")),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("write past the hard limit did not return EDQUOT");
+    }
+    // The soft-limit grace deadline is armed (over soft) — verify it is recorded.
+    // (`btime` is a wall-clock deadline; if the test clock is 0 it may read 0,
+    // so only assert usage here, which is clock-independent.)
+    match fs.quota_get(QuotaKind::User, U) {
+        Ok(dq) if dq.blocks_used == 3 => {}
+        _ => return TestResult::Fail("quota_get should report 3 blocks used"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_usrquota_soft_vs_hard);
 
 fn smoke_tmpfs_sparse_block_and_inode_limits() -> TestResult {
     let fs = match TmpFs::from_options_with_total("size=8K,nr_inodes=3", 1024, 0, 0) {

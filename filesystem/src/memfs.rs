@@ -32,7 +32,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, FsStat, Mode, Stat,
+    DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture, FsInstance, FsStat,
+    Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS, QIF_BTIME,
+    QIF_ILIMITS, QIF_INODES, QIF_ITIME, QIF_SPACE,
 };
 
 const PAGE_SIZE: u64 = 4096;
@@ -53,6 +55,10 @@ pub struct TmpFsOptions {
     pub root_gid: u32,
     pub noswap: bool,
     pub inode64: bool,
+    /// `usrquota` — enable per-user disk-quota accounting + enforcement.
+    pub usrquota: bool,
+    /// `grpquota` — enable per-group disk-quota accounting + enforcement.
+    pub grpquota: bool,
 }
 
 impl TmpFsOptions {
@@ -68,6 +74,8 @@ impl TmpFsOptions {
             // have Linux's noswap behavior even when the option is omitted.
             noswap: true,
             inode64: true,
+            usrquota: false,
+            grpquota: false,
         }
     }
 
@@ -186,6 +194,16 @@ fn apply_tmpfs_options(
             "noswap" if value.is_empty() => parsed.noswap = true,
             "inode64" if value.is_empty() => parsed.inode64 = true,
             "inode32" if value.is_empty() => parsed.inode64 = false,
+            // Disk-quota mount options. `quota` is Linux's alias for usrquota;
+            // the journalled-quota spellings enable the same in-memory tracking
+            // (there is no journal to name a quota file in). NARF's page-backed
+            // quota is enforced live, so the format/file names are accepted and
+            // ignored.
+            "quota" | "usrquota" if value.is_empty() => parsed.usrquota = true,
+            "grpquota" if value.is_empty() => parsed.grpquota = true,
+            "usrjquota" => parsed.usrquota = true,
+            "grpjquota" => parsed.grpquota = true,
+            "jqfmt" => {}
             // NARF advertises THP as disabled. Accepting another policy would
             // make the mount option lie about allocation behavior.
             "huge" if value == "never" => {}
@@ -206,12 +224,215 @@ enum MemFsKind {
     Ramfs,
 }
 
+/// Default quota grace period — 7 days, matching Linux `MAX_DQ_TIME`.
+const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Wall-clock seconds, for quota soft-limit grace deadlines.
+fn quota_now_secs() -> u64 {
+    narf_time::now_wall().secs.max(0) as u64
+}
+
+/// Per-id disk-quota accounting + limits. Block units are 4-KiB pages (the fs
+/// block); `*_hard`/`*_soft` of 0 means "unlimited" (Linux convention).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct Dquot {
+    blocks_used: u64,
+    blocks_hard: u64,
+    blocks_soft: u64,
+    inodes_used: u64,
+    inodes_hard: u64,
+    inodes_soft: u64,
+    /// Grace deadlines (wall-clock seconds); 0 = not over the soft limit.
+    btime: u64,
+    itime: u64,
+}
+
+/// Evaluate charging `add` blocks against `dq` WITHOUT mutating: returns the
+/// new used count + new grace deadline, or `QuotaExceeded` if it must be
+/// denied (over hard, or over soft with the grace period expired).
+fn eval_blocks(dq: &Dquot, add: u64, grace: u64, now: u64) -> Result<(u64, u64), FsError> {
+    let new = dq.blocks_used.saturating_add(add);
+    if dq.blocks_hard != 0 && new > dq.blocks_hard {
+        return Err(FsError::QuotaExceeded);
+    }
+    let mut btime = dq.btime;
+    if dq.blocks_soft != 0 && new > dq.blocks_soft {
+        if btime == 0 {
+            btime = now.saturating_add(grace); // just crossed — start the clock
+        } else if now >= btime {
+            return Err(FsError::QuotaExceeded); // grace expired
+        }
+    } else {
+        btime = 0; // back under the soft limit
+    }
+    Ok((new, btime))
+}
+
+/// Inode analogue of [`eval_blocks`].
+fn eval_inodes(dq: &Dquot, add: u64, grace: u64, now: u64) -> Result<(u64, u64), FsError> {
+    let new = dq.inodes_used.saturating_add(add);
+    if dq.inodes_hard != 0 && new > dq.inodes_hard {
+        return Err(FsError::QuotaExceeded);
+    }
+    let mut itime = dq.itime;
+    if dq.inodes_soft != 0 && new > dq.inodes_soft {
+        if itime == 0 {
+            itime = now.saturating_add(grace);
+        } else if now >= itime {
+            return Err(FsError::QuotaExceeded);
+        }
+    } else {
+        itime = 0;
+    }
+    Ok((new, itime))
+}
+
+/// One quota kind's (user or group) table + grace periods.
+#[derive(Debug)]
+struct QuotaTable {
+    on: bool,
+    grace_blocks: u64,
+    grace_inodes: u64,
+    ids: BTreeMap<u32, Dquot>,
+}
+
+impl QuotaTable {
+    fn new() -> Self {
+        Self {
+            on: false,
+            grace_blocks: DEFAULT_GRACE_SECS,
+            grace_inodes: DEFAULT_GRACE_SECS,
+            ids: BTreeMap::new(),
+        }
+    }
+
+    /// Evaluate charging (`blocks`,`inodes`) to `id` without mutating: returns
+    /// `(new_blocks, new_btime, new_inodes, new_itime)` or `QuotaExceeded`.
+    fn eval(
+        &self,
+        id: u32,
+        blocks: u64,
+        inodes: u64,
+        now: u64,
+    ) -> Result<(u64, u64, u64, u64), FsError> {
+        let dq = self.ids.get(&id).copied().unwrap_or_default();
+        let (bu, bt) = eval_blocks(&dq, blocks, self.grace_blocks, now)?;
+        let (iu, it) = eval_inodes(&dq, inodes, self.grace_inodes, now)?;
+        Ok((bu, bt, iu, it))
+    }
+
+    /// Apply an evaluated charge to `id`.
+    fn commit(&mut self, id: u32, bu: u64, bt: u64, iu: u64, it: u64) {
+        let dq = self.ids.entry(id).or_default();
+        dq.blocks_used = bu;
+        dq.btime = bt;
+        dq.inodes_used = iu;
+        dq.itime = it;
+    }
+
+    /// Uncharge (`blocks`,`inodes`) from `id`, clearing grace once back under
+    /// the soft limit.
+    fn uncharge(&mut self, id: u32, blocks: u64, inodes: u64) {
+        if let Some(dq) = self.ids.get_mut(&id) {
+            dq.blocks_used = dq.blocks_used.saturating_sub(blocks);
+            dq.inodes_used = dq.inodes_used.saturating_sub(inodes);
+            if dq.blocks_soft == 0 || dq.blocks_used <= dq.blocks_soft {
+                dq.btime = 0;
+            }
+            if dq.inodes_soft == 0 || dq.inodes_used <= dq.inodes_soft {
+                dq.itime = 0;
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SuperState {
     max_blocks: Option<u64>,
     used_blocks: u64,
     max_inodes: Option<u64>,
     used_inodes: u64,
+    usr: QuotaTable,
+    grp: QuotaTable,
+}
+
+impl SuperState {
+    /// Charge `blocks`/`inodes` to the file owner (`uid`,`gid`) against every
+    /// active quota, all-or-nothing: if any per-id limit would be exceeded,
+    /// nothing is mutated and `QuotaExceeded` is returned.
+    fn charge_owner(
+        &mut self,
+        uid: u32,
+        gid: u32,
+        blocks: u64,
+        inodes: u64,
+    ) -> Result<(), FsError> {
+        if blocks == 0 && inodes == 0 {
+            return Ok(());
+        }
+        let now = quota_now_secs();
+        // Evaluate USR + GRP first so a failure mutates nothing.
+        let usr_eval = self
+            .usr
+            .on
+            .then(|| self.usr.eval(uid, blocks, inodes, now))
+            .transpose()?;
+        let grp_eval = self
+            .grp
+            .on
+            .then(|| self.grp.eval(gid, blocks, inodes, now))
+            .transpose()?;
+        if let Some((bu, bt, iu, it)) = usr_eval {
+            self.usr.commit(uid, bu, bt, iu, it);
+        }
+        if let Some((bu, bt, iu, it)) = grp_eval {
+            self.grp.commit(gid, bu, bt, iu, it);
+        }
+        Ok(())
+    }
+
+    /// Uncharge `blocks`/`inodes` from (`uid`,`gid`) — the inverse of
+    /// [`Self::charge_owner`], clearing grace deadlines once back under soft.
+    fn uncharge_owner(&mut self, uid: u32, gid: u32, blocks: u64, inodes: u64) {
+        if self.usr.on {
+            self.usr.uncharge(uid, blocks, inodes);
+        }
+        if self.grp.on {
+            self.grp.uncharge(gid, blocks, inodes);
+        }
+    }
+
+    /// Move a file's (`blocks`,`inodes`) charge from its old owner to a new one
+    /// (chown), enforcing the NEW owner's quota all-or-nothing: on `QuotaExceeded`
+    /// nothing changes and the caller must keep the old owner.
+    fn transfer_owner(
+        &mut self,
+        old_uid: u32,
+        old_gid: u32,
+        new_uid: u32,
+        new_gid: u32,
+        blocks: u64,
+        inodes: u64,
+    ) -> Result<(), FsError> {
+        let now = quota_now_secs();
+        // Evaluate the new owner's incoming charge (each kind only if the id
+        // actually changes) before mutating anything.
+        let usr_eval = (self.usr.on && old_uid != new_uid)
+            .then(|| self.usr.eval(new_uid, blocks, inodes, now))
+            .transpose()?;
+        let grp_eval = (self.grp.on && old_gid != new_gid)
+            .then(|| self.grp.eval(new_gid, blocks, inodes, now))
+            .transpose()?;
+        if let Some((bu, bt, iu, it)) = usr_eval {
+            self.usr.uncharge(old_uid, blocks, inodes);
+            self.usr.commit(new_uid, bu, bt, iu, it);
+        }
+        if let Some((bu, bt, iu, it)) = grp_eval {
+            self.grp.uncharge(old_gid, blocks, inodes);
+            self.grp.commit(new_gid, bu, bt, iu, it);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -222,6 +443,20 @@ struct MemSuper {
 
 impl MemSuper {
     fn new(kind: MemFsKind, max_blocks: Option<u64>, max_inodes: Option<u64>) -> Arc<Self> {
+        Self::with_quota(kind, max_blocks, max_inodes, false, false)
+    }
+
+    fn with_quota(
+        kind: MemFsKind,
+        max_blocks: Option<u64>,
+        max_inodes: Option<u64>,
+        usrquota: bool,
+        grpquota: bool,
+    ) -> Arc<Self> {
+        let mut usr = QuotaTable::new();
+        usr.on = usrquota;
+        let mut grp = QuotaTable::new();
+        grp.on = grpquota;
         Arc::new(Self {
             kind,
             state: IrqSafeSpinLock::new(SuperState {
@@ -229,11 +464,16 @@ impl MemSuper {
                 used_blocks: 0,
                 max_inodes,
                 used_inodes: 0,
+                usr,
+                grp,
             }),
         })
     }
 
-    fn reserve_blocks(&self, blocks: u64) -> Result<(), FsError> {
+    /// Reserve `blocks` for the file owned by (`uid`,`gid`): enforces the
+    /// mount-wide limit (`NoSpace`/ENOSPC) and each active per-owner quota
+    /// (`QuotaExceeded`/EDQUOT), all-or-nothing.
+    fn reserve_blocks(&self, uid: u32, gid: u32, blocks: u64) -> Result<(), FsError> {
         let mut state = self.state.lock();
         let new = state
             .used_blocks
@@ -242,24 +482,29 @@ impl MemSuper {
         if state.max_blocks.is_some_and(|limit| new > limit) {
             return Err(FsError::NoSpace);
         }
+        state.charge_owner(uid, gid, blocks, 0)?;
         state.used_blocks = new;
         Ok(())
     }
 
-    fn release_blocks(&self, blocks: u64) {
+    fn release_blocks(&self, uid: u32, gid: u32, blocks: u64) {
         let mut state = self.state.lock();
         state.used_blocks = state.used_blocks.saturating_sub(blocks);
+        state.uncharge_owner(uid, gid, blocks, 0);
     }
 
-    fn reserve_inode(self: &Arc<Self>) -> Result<InodeLease, FsError> {
+    fn reserve_inode(self: &Arc<Self>, uid: u32, gid: u32) -> Result<InodeLease, FsError> {
         let mut state = self.state.lock();
         let new = state.used_inodes.checked_add(1).ok_or(FsError::NoSpace)?;
         if state.max_inodes.is_some_and(|limit| new > limit) {
             return Err(FsError::NoSpace);
         }
+        state.charge_owner(uid, gid, 0, 1)?;
         state.used_inodes = new;
         Ok(InodeLease {
             superblock: Arc::clone(self),
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
         })
     }
 
@@ -352,17 +597,204 @@ impl MemSuper {
         }
         Ok(())
     }
+
+    // ── quotactl backing (only meaningful on a tmpfs mount) ─────────
+
+    fn quota_table_mut(state: &mut SuperState, kind: QuotaKind) -> &mut QuotaTable {
+        match kind {
+            QuotaKind::User => &mut state.usr,
+            QuotaKind::Group => &mut state.grp,
+        }
+    }
+
+    fn quota_on(&self, kind: QuotaKind) -> Result<(), FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        Self::quota_table_mut(&mut self.state.lock(), kind).on = true;
+        Ok(())
+    }
+
+    fn quota_off(&self, kind: QuotaKind) -> Result<(), FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        Self::quota_table_mut(&mut self.state.lock(), kind).on = false;
+        Ok(())
+    }
+
+    fn quota_get(&self, kind: QuotaKind, id: u32) -> Result<FsDqBlk, FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        let mut state = self.state.lock();
+        let table = Self::quota_table_mut(&mut state, kind);
+        if !table.on {
+            return Err(FsError::Unsupported);
+        }
+        Ok(dq_to_fsdqblk(
+            &table.ids.get(&id).copied().unwrap_or_default(),
+        ))
+    }
+
+    fn quota_get_next(&self, kind: QuotaKind, id: u32) -> Result<(u32, FsDqBlk), FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        let mut state = self.state.lock();
+        let table = Self::quota_table_mut(&mut state, kind);
+        if !table.on {
+            return Err(FsError::Unsupported);
+        }
+        match table.ids.range(id..).next() {
+            Some((&nid, dq)) => Ok((nid, dq_to_fsdqblk(dq))),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    fn quota_set(&self, kind: QuotaKind, id: u32, blk: &FsDqBlk) -> Result<(), FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        let now = quota_now_secs();
+        let mut state = self.state.lock();
+        let table = Self::quota_table_mut(&mut state, kind);
+        if !table.on {
+            return Err(FsError::Unsupported);
+        }
+        let (grace_b, grace_i) = (table.grace_blocks, table.grace_inodes);
+        let dq = table.ids.entry(id).or_default();
+        if blk.valid & QIF_BLIMITS != 0 {
+            dq.blocks_hard = blk.blocks_hard;
+            dq.blocks_soft = blk.blocks_soft;
+        }
+        if blk.valid & QIF_ILIMITS != 0 {
+            dq.inodes_hard = blk.inodes_hard;
+            dq.inodes_soft = blk.inodes_soft;
+        }
+        if blk.valid & QIF_SPACE != 0 {
+            dq.blocks_used = blk.blocks_used;
+        }
+        if blk.valid & QIF_INODES != 0 {
+            dq.inodes_used = blk.inodes_used;
+        }
+        if blk.valid & QIF_BTIME != 0 {
+            dq.btime = blk.btime;
+        }
+        if blk.valid & QIF_ITIME != 0 {
+            dq.itime = blk.itime;
+        }
+        // Re-arm or clear the soft-limit grace clock against the new
+        // limits/usage, unless the caller set the deadline explicitly.
+        if blk.valid & QIF_BTIME == 0 {
+            dq.btime = if dq.blocks_soft != 0 && dq.blocks_used > dq.blocks_soft {
+                now.saturating_add(grace_b)
+            } else {
+                0
+            };
+        }
+        if blk.valid & QIF_ITIME == 0 {
+            dq.itime = if dq.inodes_soft != 0 && dq.inodes_used > dq.inodes_soft {
+                now.saturating_add(grace_i)
+            } else {
+                0
+            };
+        }
+        Ok(())
+    }
+
+    fn quota_get_info(&self, kind: QuotaKind) -> Result<FsDqInfo, FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        let mut state = self.state.lock();
+        let table = Self::quota_table_mut(&mut state, kind);
+        if !table.on {
+            return Err(FsError::Unsupported);
+        }
+        Ok(FsDqInfo {
+            bgrace: table.grace_blocks,
+            igrace: table.grace_inodes,
+            flags: 0,
+            valid: 0,
+        })
+    }
+
+    fn quota_set_info(&self, kind: QuotaKind, info: &FsDqInfo) -> Result<(), FsError> {
+        if self.kind != MemFsKind::Tmpfs {
+            return Err(FsError::Unsupported);
+        }
+        let mut state = self.state.lock();
+        let table = Self::quota_table_mut(&mut state, kind);
+        if !table.on {
+            return Err(FsError::Unsupported);
+        }
+        if info.valid & IIF_BGRACE != 0 {
+            table.grace_blocks = info.bgrace;
+        }
+        if info.valid & IIF_IGRACE != 0 {
+            table.grace_inodes = info.igrace;
+        }
+        // IIF_FLAGS carries per-type feature flags NARF has no use for yet;
+        // accept and ignore so `setquota -t` succeeds.
+        let _ = IIF_FLAGS;
+        Ok(())
+    }
+}
+
+/// Snapshot a [`Dquot`] into the VFS-facing [`FsDqBlk`] (usage + limits, all
+/// fields valid).
+fn dq_to_fsdqblk(dq: &Dquot) -> FsDqBlk {
+    FsDqBlk {
+        blocks_hard: dq.blocks_hard,
+        blocks_soft: dq.blocks_soft,
+        blocks_used: dq.blocks_used,
+        inodes_hard: dq.inodes_hard,
+        inodes_soft: dq.inodes_soft,
+        inodes_used: dq.inodes_used,
+        btime: dq.btime,
+        itime: dq.itime,
+        valid: QIF_ALL,
+    }
 }
 
 #[derive(Debug)]
 struct InodeLease {
     superblock: Arc<MemSuper>,
+    /// Owner the inode is currently charged to for quota; updated by
+    /// `set_owners` (chown transfers the inode + block charge to the new owner).
+    uid: AtomicU32,
+    gid: AtomicU32,
+}
+
+impl InodeLease {
+    /// Transfer this node's quota charge — its inode plus `blocks` data blocks —
+    /// from its current owner to (`new_uid`,`new_gid`) on chown, enforcing the
+    /// new owner's quota. On `QuotaExceeded` nothing changes. Updates the lease's
+    /// tracked owner so `Drop` later uncharges the right id.
+    fn rechown(&self, new_uid: u32, new_gid: u32, blocks: u64) -> Result<(), FsError> {
+        let old_uid = self.uid.load(Ordering::Relaxed);
+        let old_gid = self.gid.load(Ordering::Relaxed);
+        self.superblock
+            .state
+            .lock()
+            .transfer_owner(old_uid, old_gid, new_uid, new_gid, blocks, 1)?;
+        self.uid.store(new_uid, Ordering::Relaxed);
+        self.gid.store(new_gid, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl Drop for InodeLease {
     fn drop(&mut self) {
         let mut state = self.superblock.state.lock();
         state.used_inodes = state.used_inodes.saturating_sub(1);
+        state.uncharge_owner(
+            self.uid.load(Ordering::Relaxed),
+            self.gid.load(Ordering::Relaxed),
+            0,
+            1,
+        );
     }
 }
 
@@ -484,7 +916,7 @@ struct MemFile {
 impl MemFile {
     /// Mint a `MemFile` with default perms (0o666) and owner (0, 0).
     fn new(superblock: &Arc<MemSuper>, bytes: &[u8]) -> Result<Self, FsError> {
-        let inode_lease = superblock.reserve_inode()?;
+        let inode_lease = superblock.reserve_inode(0, 0)?;
         let file = MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::default()),
@@ -510,7 +942,7 @@ impl MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::default()),
             _inode_lease: superblock
-                .reserve_inode()
+                .reserve_inode(uid, gid)
                 .expect("unlimited memfs inode reservation"),
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(uid),
@@ -529,7 +961,7 @@ impl MemFile {
         Ok(MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::default()),
-            _inode_lease: superblock.reserve_inode()?,
+            _inode_lease: superblock.reserve_inode(0, 0)?,
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
@@ -566,17 +998,29 @@ impl MemFile {
         let mut data = self.data.lock();
         let missing = data.missing_pages(offset, buf.len())?;
         let count = missing.len() as u64;
-        self._inode_lease.superblock.reserve_blocks(count)?;
+        self._inode_lease.superblock.reserve_blocks(
+            self.uid.load(Ordering::Relaxed),
+            self.gid.load(Ordering::Relaxed),
+            count,
+        )?;
         let mut allocated = Vec::new();
         if allocated.try_reserve_exact(missing.len()).is_err() {
-            self._inode_lease.superblock.release_blocks(count);
+            self._inode_lease.superblock.release_blocks(
+                self.uid.load(Ordering::Relaxed),
+                self.gid.load(Ordering::Relaxed),
+                count,
+            );
             return Err(FsError::NoSpace);
         }
         for index in missing {
             match Self::alloc_zero_page() {
                 Ok(page) => allocated.push((index, page)),
                 Err(error) => {
-                    self._inode_lease.superblock.release_blocks(count);
+                    self._inode_lease.superblock.release_blocks(
+                        self.uid.load(Ordering::Relaxed),
+                        self.gid.load(Ordering::Relaxed),
+                        count,
+                    );
                     return Err(error);
                 }
             }
@@ -627,7 +1071,11 @@ impl MemFile {
             }
         }
         drop(data);
-        self._inode_lease.superblock.release_blocks(released);
+        self._inode_lease.superblock.release_blocks(
+            self.uid.load(Ordering::Relaxed),
+            self.gid.load(Ordering::Relaxed),
+            released,
+        );
         Ok(())
     }
 }
@@ -635,7 +1083,11 @@ impl MemFile {
 impl Drop for MemFile {
     fn drop(&mut self) {
         let blocks = self.data.lock().pages.len() as u64;
-        self._inode_lease.superblock.release_blocks(blocks);
+        self._inode_lease.superblock.release_blocks(
+            self.uid.load(Ordering::Relaxed),
+            self.gid.load(Ordering::Relaxed),
+            blocks,
+        );
     }
 }
 
@@ -731,8 +1183,16 @@ impl FileOps for MemFile {
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // Transfer this file's block + inode charge to the new owner,
+            // enforcing their quota (chown returns EDQUOT past a hard limit).
+            // Hold `data` so the page count is stable against a concurrent
+            // write; lock order is data -> super.
+            let data = self.data.lock();
+            self._inode_lease
+                .rechown(uid, gid, data.pages.len() as u64)?;
             self.uid.store(uid, Ordering::Relaxed);
             self.gid.store(gid, Ordering::Relaxed);
+            drop(data);
             self.perms.fetch_and(!0o6000, Ordering::Relaxed);
             Ok(())
         })
@@ -756,7 +1216,11 @@ impl FileOps for MemFile {
                         page[(len % PAGE_SIZE) as usize..].fill(0);
                     }
                 }
-                self._inode_lease.superblock.release_blocks(released);
+                self._inode_lease.superblock.release_blocks(
+                    self.uid.load(Ordering::Relaxed),
+                    self.gid.load(Ordering::Relaxed),
+                    released,
+                );
             }
             // Extending a tmpfs file creates a hole. No page/block is charged
             // until a write or fallocate materialises it.
@@ -967,6 +1431,8 @@ impl FileOps for MemSymlink {
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // A symlink holds no data blocks; transfer only its inode charge.
+            self._inode_lease.rechown(uid, gid, 0)?;
             self.uid.store(uid, Ordering::Relaxed);
             self.gid.store(gid, Ordering::Relaxed);
             Ok(())
@@ -1028,6 +1494,9 @@ impl FileOps for MemSpecial {
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // A special node holds no data blocks; transfer only its inode
+            // charge to the new owner (enforcing their inode quota).
+            self._inode_lease.rechown(uid, gid, 0)?;
             self.uid.store(uid, Ordering::Relaxed);
             self.gid.store(gid, Ordering::Relaxed);
             self.perms.fetch_and(!0o6000, Ordering::Relaxed);
@@ -1461,7 +1930,7 @@ impl DirOps for MemDir {
             if file_type == FileType::Fifo {
                 let fifo = Arc::new(MemFifo {
                     node: Arc::new(crate::fifo::FifoNode::new(alloc_ino(), DEFAULT_PERMS)),
-                    _inode_lease: self.superblock.reserve_inode()?,
+                    _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 });
                 g.insert(name.to_string(), Entry::Fifo(Arc::clone(&fifo)));
                 Ok(fifo as Arc<dyn FileOps>)
@@ -1470,7 +1939,7 @@ impl DirOps for MemDir {
                     ino: alloc_ino(),
                     file_type,
                     rdev,
-                    _inode_lease: self.superblock.reserve_inode()?,
+                    _inode_lease: self.superblock.reserve_inode(0, 0)?,
                     perms: AtomicU32::new(DEFAULT_PERMS as u32),
                     uid: AtomicU32::new(0),
                     gid: AtomicU32::new(0),
@@ -1490,7 +1959,7 @@ impl DirOps for MemDir {
             let d = Arc::new(MemDir {
                 ino: alloc_ino(),
                 superblock: Arc::clone(&self.superblock),
-                _inode_lease: self.superblock.reserve_inode()?,
+                _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
                 perms: AtomicU32::new(0o755),
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
@@ -1551,7 +2020,7 @@ impl DirOps for MemDir {
             let s = Arc::new(MemSymlink {
                 ino: alloc_ino(),
                 target: target.to_string(),
-                _inode_lease: self.superblock.reserve_inode()?,
+                _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
             });
@@ -1701,6 +2170,7 @@ impl fmt::Debug for MemFs {
 }
 
 impl MemFs {
+    #[allow(clippy::too_many_arguments)]
     fn configured(
         name: &'static str,
         kind: MemFsKind,
@@ -1710,11 +2180,28 @@ impl MemFs {
         root_uid: u32,
         root_gid: u32,
     ) -> Result<Self, FsError> {
-        let superblock = MemSuper::new(kind, max_blocks, max_inodes);
+        Self::configured_quota(
+            name, kind, max_blocks, max_inodes, root_mode, root_uid, root_gid, false, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn configured_quota(
+        name: &'static str,
+        kind: MemFsKind,
+        max_blocks: Option<u64>,
+        max_inodes: Option<u64>,
+        root_mode: u16,
+        root_uid: u32,
+        root_gid: u32,
+        usrquota: bool,
+        grpquota: bool,
+    ) -> Result<Self, FsError> {
+        let superblock = MemSuper::with_quota(kind, max_blocks, max_inodes, usrquota, grpquota);
         let root = Arc::new(MemDir {
             ino: alloc_ino(),
             superblock: Arc::clone(&superblock),
-            _inode_lease: superblock.reserve_inode()?,
+            _inode_lease: superblock.reserve_inode(0, 0)?,
             entries: IrqSafeSpinLock::new(BTreeMap::new()),
             perms: AtomicU32::new(root_mode as u32),
             uid: AtomicU32::new(root_uid),
@@ -1816,7 +2303,7 @@ impl TmpFs {
         gid: u32,
     ) -> Result<Self, FsError> {
         let parsed = TmpFsOptions::parse(options, total_pages, uid, gid)?;
-        let inner = MemFs::configured(
+        let inner = MemFs::configured_quota(
             "tmpfs",
             MemFsKind::Tmpfs,
             parsed.max_blocks,
@@ -1824,6 +2311,8 @@ impl TmpFs {
             parsed.root_mode,
             parsed.root_uid,
             parsed.root_gid,
+            parsed.usrquota,
+            parsed.grpquota,
         )?;
         Ok(Self { inner, total_pages })
     }
@@ -1846,6 +2335,32 @@ impl FsInstance for TmpFs {
         self.inner
             .superblock
             .reconfigure_tmpfs(options, self.total_pages)
+    }
+
+    fn quota_on(&self, kind: QuotaKind) -> Result<(), FsError> {
+        self.inner.superblock.quota_on(kind)
+    }
+    fn quota_off(&self, kind: QuotaKind) -> Result<(), FsError> {
+        self.inner.superblock.quota_off(kind)
+    }
+    fn quota_get(&self, kind: QuotaKind, id: u32) -> Result<FsDqBlk, FsError> {
+        self.inner.superblock.quota_get(kind, id)
+    }
+    fn quota_get_next(&self, kind: QuotaKind, id: u32) -> Result<(u32, FsDqBlk), FsError> {
+        self.inner.superblock.quota_get_next(kind, id)
+    }
+    fn quota_set(&self, kind: QuotaKind, id: u32, blk: &FsDqBlk) -> Result<(), FsError> {
+        self.inner.superblock.quota_set(kind, id, blk)
+    }
+    fn quota_get_info(&self, kind: QuotaKind) -> Result<FsDqInfo, FsError> {
+        self.inner.superblock.quota_get_info(kind)
+    }
+    fn quota_set_info(&self, kind: QuotaKind, info: &FsDqInfo) -> Result<(), FsError> {
+        self.inner.superblock.quota_set_info(kind, info)
+    }
+    fn quota_sync(&self) -> Result<(), FsError> {
+        // RAM-backed: quotas are always in sync. Succeed on a tmpfs mount.
+        Ok(())
     }
 }
 

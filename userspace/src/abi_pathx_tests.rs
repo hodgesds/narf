@@ -1671,6 +1671,149 @@ fn smoke_abi_pathx_statfs_ftype() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_ftype);
 
+// ── quotactl(cmd, special, id, addr) — Linux disk-quota control ─────
+//
+// cmd = (subcmd << 8) | type. `if_dqblk` limits are in 1 KiB quota blocks;
+// tmpfs blocks are 4 KiB, so a 2-page limit round-trips as bhardlimit = 8.
+
+const Q_GETQUOTA: u64 = 0x0080_0007;
+const Q_SETQUOTA: u64 = 0x0080_0008;
+const Q_GETINFO: u64 = 0x0080_0005;
+const Q_SETINFO: u64 = 0x0080_0006;
+const USRQUOTA: u64 = 0;
+
+fn quota_cmd(subcmd: u64, type_: u64) -> u64 {
+    (subcmd << 8) | type_
+}
+
+fn smoke_abi_quotactl_setquota_getquota_roundtrip() -> TestResult {
+    with_tmpfs("/q", "usrquota,size=1M", || {
+        let path = b"/q\0";
+        let uid = 4242u64;
+        const QIF_BLIMITS: u32 = 1;
+        // if_dqblk: bhardlimit=8 (→ 2 pages), bsoftlimit=4 (→ 1 page).
+        let mut dqblk = [0u8; 72];
+        dqblk[0..8].copy_from_slice(&8u64.to_le_bytes());
+        dqblk[8..16].copy_from_slice(&4u64.to_le_bytes());
+        dqblk[64..68].copy_from_slice(&QIF_BLIMITS.to_le_bytes());
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_SETQUOTA, USRQUOTA),
+                path.as_ptr() as u64,
+                uid,
+                dqblk.as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_SETQUOTA should return 0");
+        }
+        // Read it back.
+        let mut out = [0u8; 72];
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_GETQUOTA, USRQUOTA),
+                path.as_ptr() as u64,
+                uid,
+                out.as_mut_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_GETQUOTA should return 0");
+        }
+        let bhard = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        let bsoft = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        if bhard != 8 || bsoft != 4 {
+            return Err("Q_GETQUOTA did not round-trip the block limits");
+        }
+        // GETINFO / SETINFO round-trip the block grace period.
+        let mut info = [0u8; 32];
+        info[0..8].copy_from_slice(&86_400u64.to_le_bytes()); // bgrace = 1 day
+        const IIF_BGRACE: u32 = 1;
+        info[20..24].copy_from_slice(&IIF_BGRACE.to_le_bytes());
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_SETINFO, USRQUOTA),
+                path.as_ptr() as u64,
+                0,
+                info.as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_SETINFO should return 0");
+        }
+        let mut got = [0u8; 32];
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_GETINFO, USRQUOTA),
+                path.as_ptr() as u64,
+                0,
+                got.as_mut_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_GETINFO should return 0");
+        }
+        if u64::from_le_bytes(got[0..8].try_into().unwrap()) != 86_400 {
+            return Err("Q_GETINFO did not report the grace period set by Q_SETINFO");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_quotactl_setquota_getquota_roundtrip
+);
+
+fn smoke_abi_quotactl_rejects_bad_type_and_nonquota_fs() -> TestResult {
+    // A bad quota type is EINVAL regardless of the mount.
+    let bad_type = with_tmpfs("/q", "usrquota", || {
+        let path = b"/q\0";
+        let mut out = [0u8; 72];
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_GETQUOTA, 5), // type 5 is not USR/GRP
+                path.as_ptr() as u64,
+                0,
+                out.as_mut_ptr() as u64,
+            ),
+        ) != Some(-22)
+        {
+            return Err("bad quota type should return -EINVAL");
+        }
+        Ok(())
+    });
+    if !matches!(bad_type, TestResult::Pass) {
+        return bad_type;
+    }
+    // A non-tmpfs mount has no quota support: ESRCH.
+    with_memfs("/m", "m", &[("f", b"x")], || {
+        let path = b"/m\0";
+        let mut out = [0u8; 72];
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_GETQUOTA, USRQUOTA),
+                path.as_ptr() as u64,
+                0,
+                out.as_mut_ptr() as u64,
+            ),
+        ) != Some(-3)
+        {
+            return Err("quotactl on a non-quota fs should return -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_quotactl_rejects_bad_type_and_nonquota_fs
+);
+
 // ── symlink: Linux (const char *target, const char *linkpath), NUL-term ──
 //
 // The link location is resolved against cwd; the target stays verbatim.

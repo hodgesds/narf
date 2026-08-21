@@ -1509,6 +1509,102 @@ pub trait FsInstance: Send + Sync + 'static {
     fn reconfigure(&self, _options: &str) -> Result<(), FsError> {
         Err(FsError::Unsupported)
     }
+
+    // ── Disk quota (quotactl) ──────────────────────────────────────
+    // Filesystems that support per-id disk quotas (tmpfs with usrquota /
+    // grpquota) implement these; the rest inherit `Unsupported` (ESRV/ENOSYS
+    // shaped as `Unsupported` at the syscall boundary).
+
+    /// `Q_QUOTAON` — begin enforcing `kind` quotas.
+    fn quota_on(&self, _kind: QuotaKind) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_QUOTAOFF` — stop enforcing `kind` quotas.
+    fn quota_off(&self, _kind: QuotaKind) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_GETQUOTA` — read one id's usage + limits.
+    fn quota_get(&self, _kind: QuotaKind, _id: u32) -> Result<FsDqBlk, FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_GETNEXTQUOTA` — read the first id `>= id` that has an entry, with its
+    /// usage + limits.
+    fn quota_get_next(&self, _kind: QuotaKind, _id: u32) -> Result<(u32, FsDqBlk), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_SETQUOTA` — set one id's limits/usage (only the fields flagged in
+    /// `blk.valid`).
+    fn quota_set(&self, _kind: QuotaKind, _id: u32, _blk: &FsDqBlk) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_GETINFO` — read a quota type's grace periods + flags.
+    fn quota_get_info(&self, _kind: QuotaKind) -> Result<FsDqInfo, FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_SETINFO` — set a quota type's grace periods + flags.
+    fn quota_set_info(&self, _kind: QuotaKind, _info: &FsDqInfo) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `Q_SYNC` — flush in-core quotas (a no-op for RAM-backed tmpfs).
+    fn quota_sync(&self) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+}
+
+/// Which quota a `quotactl` request targets. tmpfs supports user + group
+/// (Linux `PRJQUOTA` is not implemented).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QuotaKind {
+    User,
+    Group,
+}
+
+/// `QIF_*` field-valid flags (Linux `<linux/quota.h>`) — which fields of an
+/// [`FsDqBlk`] a `Q_SETQUOTA` caller actually set, and which a `Q_GETQUOTA`
+/// reply fills.
+pub const QIF_BLIMITS: u32 = 1;
+pub const QIF_SPACE: u32 = 2;
+pub const QIF_ILIMITS: u32 = 4;
+pub const QIF_INODES: u32 = 8;
+pub const QIF_BTIME: u32 = 16;
+pub const QIF_ITIME: u32 = 32;
+pub const QIF_USAGE: u32 = QIF_SPACE | QIF_INODES;
+pub const QIF_TIMES: u32 = QIF_BTIME | QIF_ITIME;
+pub const QIF_ALL: u32 = QIF_BLIMITS | QIF_SPACE | QIF_ILIMITS | QIF_INODES | QIF_BTIME | QIF_ITIME;
+
+/// `IIF_*` field-valid flags for [`FsDqInfo`] on `Q_SETINFO`.
+pub const IIF_BGRACE: u32 = 1;
+pub const IIF_IGRACE: u32 = 2;
+pub const IIF_FLAGS: u32 = 4;
+pub const IIF_ALL: u32 = IIF_BGRACE | IIF_IGRACE | IIF_FLAGS;
+
+/// One id's disk-quota state, in the filesystem's natural units: block limits
+/// and usage are in **fs blocks** (4 KiB) and inode counts are absolute; the
+/// `quotactl` syscall converts to/from Linux's 1-KiB quota-block ABI. `btime`/
+/// `itime` are soft-limit grace deadlines in wall-clock seconds. `valid` is a
+/// `QIF_*` mask.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsDqBlk {
+    pub blocks_hard: u64,
+    pub blocks_soft: u64,
+    pub blocks_used: u64,
+    pub inodes_hard: u64,
+    pub inodes_soft: u64,
+    pub inodes_used: u64,
+    pub btime: u64,
+    pub itime: u64,
+    pub valid: u32,
+}
+
+/// A quota type's grace periods + flags (Linux `struct if_dqinfo`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsDqInfo {
+    /// Block-limit grace period, seconds.
+    pub bgrace: u64,
+    /// Inode-limit grace period, seconds.
+    pub igrace: u64,
+    pub flags: u32,
+    pub valid: u32,
 }
 
 // ── Path resolution ────────────────────────────────────────────────
