@@ -94,9 +94,14 @@ impl FileOps for DriCardFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let index = self.index;
         Box::pin(async move {
+            let now = narf_time::wall::monotonic_ns();
             if let Some(ms) = crate::drm_registry::mode_state(index) {
                 let mut card = ms.lock();
-                if let Some(ev) = card.events.pop_front() {
+                // Only surface a flip-complete event once its simulated-vblank
+                // time has arrived — this is the read side of the refresh-rate
+                // pacing (see `Card::queue_flip_event`). An event queued but not
+                // yet due stays put; the poller re-parks until `poll_deadline`.
+                if let Some(ev) = card.pop_deliverable_event(now) {
                     let n = ev.len().min(buf.len());
                     buf[..n].copy_from_slice(&ev[..n]);
                     return Ok(n);
@@ -106,13 +111,28 @@ impl FileOps for DriCardFile {
         })
     }
 
-    /// `POLL_IN` while flip-complete events are queued, so `select`/`poll`
-    /// on the DRM fd wakes the render loop.
+    /// `POLL_IN` once a flip-complete event's simulated vblank has arrived, so
+    /// `select`/`poll` on the DRM fd wakes the render loop AT the vblank — not
+    /// the instant the flip was issued. Combined with `poll_deadline`, this
+    /// parks the compositor between frames instead of spinning it.
     fn poll_readiness(&self) -> u32 {
+        let now = narf_time::wall::monotonic_ns();
         match crate::drm_registry::mode_state(self.index) {
-            Some(ms) if !ms.lock().events.is_empty() => POLL_IN,
+            Some(ms) if ms.lock().has_deliverable_event(now) => POLL_IN,
             _ => 0,
         }
+    }
+
+    /// Earliest not-yet-due flip event's simulated-vblank time. A poll/epoll set
+    /// containing this DRM fd clamps its park wake-up to this deadline (see
+    /// `poll.rs::poll_nearest_deadline`), so a compositor waiting for
+    /// flip-complete sleeps until the vblank and then wakes — the mechanism that
+    /// throttles its repaint loop to the mode's refresh rate. `None` when no
+    /// event is pending or the front event is already due (reported readable).
+    fn poll_deadline(&self) -> Option<u64> {
+        let now = narf_time::wall::monotonic_ns();
+        crate::drm_registry::mode_state(self.index)
+            .and_then(|ms| ms.lock().next_event_deadline_ns(now))
     }
 
     /// The DRM card fd is a PARKABLE readiness source: a poll/epoll set

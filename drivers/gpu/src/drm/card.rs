@@ -259,9 +259,48 @@ pub struct Card {
     /// Pending DRM events (`drm_event_vblank` for PAGE_FLIP completion),
     /// drained by `read(/dev/dri/cardN)`. A compositor render loop
     /// PAGE_FLIPs with DRM_MODE_PAGE_FLIP_EVENT, then poll/read()s these.
-    pub events: alloc::collections::VecDeque<Vec<u8>>,
+    ///
+    /// Each entry is `(deliver_at_ns, bytes)`: the monotonic-ns simulated-vblank
+    /// time at/after which the event becomes visible to poll/read, and the raw
+    /// 32-byte `drm_event_vblank`. Gating delivery on the vblank time is what
+    /// paces the compositor's repaint loop to the refresh rate (see
+    /// `queue_flip_event` / `DriCardFile::poll_deadline`) instead of letting it
+    /// spin at 100% CPU on instantly-completed flips. Queued in nondecreasing
+    /// `deliver_at_ns` order.
+    pub events: alloc::collections::VecDeque<(u64, Vec<u8>)>,
     /// Monotonic vblank sequence reported in flip-complete events.
     pub vblank_seq: u32,
+    /// Monotonic-ns time of the next simulated vblank at/after which a queued
+    /// flip event may be delivered. Advances one refresh interval per flip so
+    /// back-to-back PAGE_FLIPs land on successive vblanks — the Linux/VKMS
+    /// hrtimer-per-frame pacing, derived from the CRTC mode's refresh rate.
+    pub next_vblank_ns: u64,
+}
+
+/// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
+/// made deliverable this many ns BEFORE its true simulated vblank, so the
+/// compositor wakes a little early and has time to render + resubmit the next
+/// frame before the scanout — absorbing scheduler wake latency and per-frame
+/// overhead. Default 0 (deliver exactly at the vblank). Tunable at runtime via
+/// `/sys/class/drm/card<N>/vblank_offset_ns`.
+///
+/// It shifts only the delivery PHASE, never the frame RATE: `queue_flip_event`
+/// advances `next_vblank_ns` from the true vblank, and derives the (earlier)
+/// delivery time from it — so successive flips stay exactly one refresh
+/// interval apart regardless of the offset. It compensates for SCHEDULER
+/// overhead (a system property), hence one global knob mirrored onto every
+/// card node rather than per-card state.
+static VBLANK_OFFSET_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Current vblank slack offset (ns). See [`VBLANK_OFFSET_NS`].
+pub fn vblank_offset_ns() -> u64 {
+    VBLANK_OFFSET_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the vblank slack offset (ns). See [`VBLANK_OFFSET_NS`]. Called from the
+/// `/sys/class/drm/card<N>/vblank_offset_ns` store path.
+pub fn set_vblank_offset_ns(ns: u64) {
+    VBLANK_OFFSET_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
 }
 
 impl Card {
@@ -284,23 +323,62 @@ impl Card {
             dumb_backings: Vec::new(),
             events: alloc::collections::VecDeque::new(),
             vblank_seq: 0,
+            next_vblank_ns: 0,
         }
+    }
+
+    /// Refresh rate (Hz) of a CRTC's currently programmed mode, for vblank
+    /// pacing. Falls back to 60 Hz when the CRTC is unknown or has no mode set
+    /// (or a bogus 0 Hz mode), so pacing degrades to a sane default rather than
+    /// dividing by zero.
+    pub fn crtc_refresh_hz(&self, crtc_id: u32) -> u32 {
+        self.crtcs
+            .iter()
+            .find(|c| c.id == crtc_id)
+            .and_then(|c| c.mode.as_ref())
+            .map(|m| m.refresh_hz as u32)
+            .filter(|hz| *hz > 0)
+            .unwrap_or(60)
     }
 
     /// Queue a `drm_event_vblank` flip-complete event (32 bytes) carrying
     /// `user_data` + `crtc_id`, to be drained by `read(/dev/dri/cardN)`.
     /// Linux: `drivers/gpu/drm/drm_vblank.c::send_vblank_event`.
+    ///
+    /// The event is stamped with a simulated-vblank delivery time one refresh
+    /// interval past the previous flip (`next_vblank_ns`) — so a compositor that
+    /// PAGE_FLIPs, waits for completion, then repaints is throttled to the
+    /// mode's refresh rate (60 Hz → 16.67 ms, 120 Hz → 8.33 ms, 144 Hz →
+    /// 6.94 ms) instead of getting an instant completion and spinning its
+    /// repaint loop at 100% CPU. This mirrors how Linux paces a *virtual* vblank
+    /// (vkms arms an hrtimer at `drm_mode_vrefresh(mode)`); real hardware paces
+    /// on the physical vblank IRQ.
     pub fn queue_flip_event(&mut self, user_data: u64, crtc_id: u32) {
         const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+        let refresh_hz = self.crtc_refresh_hz(crtc_id);
+        let interval_ns = 1_000_000_000u64 / refresh_hz as u64;
+        let now = narf_time::wall::monotonic_ns();
+        // The frame completes at the next simulated vblank, never sooner than
+        // one interval after the previous flip. A long idle gap (next_vblank_ns
+        // in the past) collapses to `now`, so the first flip after idle is not
+        // delayed. `next_vblank_ns` advances from THIS true vblank so the rate
+        // is exactly the refresh rate regardless of the slack offset below.
+        let present_at = now.max(self.next_vblank_ns);
+        self.next_vblank_ns = present_at.saturating_add(interval_ns);
+        // Render-slack: make the event deliverable up to `vblank_offset_ns`
+        // before the true vblank so the compositor wakes early enough to render
+        // and resubmit before scanout. Shifts phase only, not rate.
+        let deliver_at = present_at.saturating_sub(vblank_offset_ns());
+
         self.vblank_seq = self.vblank_seq.wrapping_add(1);
-        // Real CLOCK_MONOTONIC vblank timestamp. weston (and any DRM client that
-        // sets DRM_CAP_TIMESTAMP_MONOTONIC, which weston does) reads tv_sec/tv_usec
-        // off the flip-complete event to pace its repaint loop and to stamp
-        // wl_surface frame callbacks. A hardcoded [0,0] made every flip look like
-        // it happened at t=0, so the compositor's frame clock never advanced.
-        let mono_ns = narf_time::wall::monotonic_ns();
-        let tv_sec = (mono_ns / 1_000_000_000) as u32;
-        let tv_usec = ((mono_ns % 1_000_000_000) / 1_000) as u32;
+        // CLOCK_MONOTONIC vblank timestamp = the TRUE vblank time (present_at),
+        // not the possibly-earlier delivery time — the client schedules its next
+        // repaint against the vblank it is rendering for. weston (and any DRM
+        // client that sets DRM_CAP_TIMESTAMP_MONOTONIC) reads tv_sec/tv_usec off
+        // the flip-complete event to pace its repaint loop and to stamp
+        // wl_surface frame callbacks.
+        let tv_sec = (present_at / 1_000_000_000) as u32;
+        let tv_usec = ((present_at % 1_000_000_000) / 1_000) as u32;
         let mut e = Vec::with_capacity(32);
         e.extend_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes()); // base.type
         e.extend_from_slice(&32u32.to_le_bytes()); // base.length
@@ -309,7 +387,39 @@ impl Card {
         e.extend_from_slice(&tv_usec.to_le_bytes()); // tv_usec
         e.extend_from_slice(&self.vblank_seq.to_le_bytes());
         e.extend_from_slice(&crtc_id.to_le_bytes());
-        self.events.push_back(e);
+        self.events.push_back((deliver_at, e));
+    }
+
+    /// Delivery time of the earliest queued flip event that is still in the
+    /// FUTURE, for `DriCardFile::poll_deadline` — a DRM-fd poll parks until this
+    /// simulated vblank and wakes to read the completion. Events are queued in
+    /// nondecreasing delivery order, so the front is the earliest. `None` when
+    /// the queue is empty or its front is already deliverable.
+    pub fn next_event_deadline_ns(&self, now: u64) -> Option<u64> {
+        self.events
+            .front()
+            .map(|(deliver_at, _)| *deliver_at)
+            .filter(|deliver_at| *deliver_at > now)
+    }
+
+    /// Whether the front flip event's simulated-vblank time has arrived, i.e.
+    /// poll should report POLL_IN and read should return it.
+    pub fn has_deliverable_event(&self, now: u64) -> bool {
+        self.events
+            .front()
+            .map(|(deliver_at, _)| *deliver_at <= now)
+            .unwrap_or(false)
+    }
+
+    /// Pop the front flip event iff its simulated-vblank time has arrived;
+    /// otherwise leave it queued (the reader sees "no event yet" and re-parks
+    /// until `next_event_deadline_ns`).
+    pub fn pop_deliverable_event(&mut self, now: u64) -> Option<Vec<u8>> {
+        if self.has_deliverable_event(now) {
+            self.events.pop_front().map(|(_, e)| e)
+        } else {
+            None
+        }
     }
 
     // ── Connector / CRTC getters ──────────────────────────────────────
