@@ -1718,12 +1718,58 @@ pub fn request_syscall_backpressure_yield() {
     BACKPRESSURE_YIELD.inner[cpu].store(true, Ordering::Release);
 }
 
+/// Divisor of a task's time slice at which it becomes eligible for an EARLY
+/// fair-share yield — but only when a sibling is actually waiting. At the
+/// default 10 ms slice this is ≈2.5 ms. A task with no sibling waiting still
+/// runs to its full slice; this only bounds how long a CPU hog holds the core
+/// while a runnable peer starves.
+#[cfg(target_arch = "x86_64")]
+const FAIR_QUANTUM_DIV: u64 = 4;
+
+/// Pure yield policy for [`maybe_resched_syscall_exit`], split out so it is
+/// unit-testable without a live executor. Yields (`true`) on an explicit
+/// back-pressure request, on full time-slice expiry, or once a fair quantum
+/// (`slice / FAIR_QUANTUM_DIV`) is spent AND a sibling task is
+/// runnable-and-waiting. `started == 0` (slice clock not yet stamped) never
+/// yields.
+///
+/// The `sibling_waiting` term is the cooperative-scheduler stand-in for "a
+/// lower-vtime task is runnable": a task sitting runnable in the queue while
+/// another has been running has, by construction, accrued less recent CPU, so
+/// ceding to it is the fair move. Without the early branch a syscall-dense
+/// spinner (a compositor looping `poll()` on an always-ready eventfd) holds the
+/// CPU for a full slice at a time and, on SMP=1, starves its own worker threads
+/// and the whole session — the busy-poll starvation the ReqGate cooperative
+/// yield (8c63bd43) fixed for the in-kernel spin, here for userspace.
+#[cfg(target_arch = "x86_64")]
+fn syscall_exit_yield_decision(
+    started: u64,
+    slice: u64,
+    elapsed: u64,
+    backpressure: bool,
+    sibling_waiting: bool,
+) -> bool {
+    if backpressure {
+        return true;
+    }
+    if started == 0 {
+        return false;
+    }
+    if elapsed >= slice {
+        return true;
+    }
+    elapsed >= slice / FAIR_QUANTUM_DIV && sibling_waiting
+}
+
 /// Linux `TIF_NEED_RESCHED`-at-syscall-exit analogue. The scheduler tick only
 /// preempts a task it interrupts at CPL=3 (`try_preempt_user`'s CPL gate), so a
 /// *syscall-dense* task — one whose user-mode gaps between syscalls are far
 /// shorter than the syscall bodies — is essentially never sliced and starves
 /// every sibling on its CPU until it voluntarily blocks. Linux re-checks the
-/// spent time slice on the way out of every syscall; this restores that.
+/// spent time slice on the way out of every syscall; this restores that, and
+/// additionally yields EARLY (after a fair quantum, see
+/// [`syscall_exit_yield_decision`]) when a sibling is already runnable so a
+/// full-slice CPU hog cannot starve a waiting peer for the whole 10 ms.
 ///
 /// Called at the tail of the `syscall`-instruction dispatch (a real user frame
 /// is returning to CPL=3). If this task's slice is spent it yields NOW — staying
@@ -1760,12 +1806,18 @@ pub unsafe fn maybe_resched_syscall_exit() {
         // never yielding and starving its CPU's siblings.
         let started = (*p).tsc_started.load(Ordering::Acquire);
         let slice = (*p).slice_cycles.load(Ordering::Acquire);
-        // `started == 0` → slice clock not stamped yet (never yield blindly).
-        // A back-pressure request (see `request_syscall_backpressure_yield`)
-        // yields regardless of the remaining slice.
-        if !backpressure
-            && (started == 0 || narf_time::now_cycles().saturating_sub(started) < slice)
-        {
+        let elapsed = narf_time::now_cycles().saturating_sub(started);
+        // Only consult the (slightly more expensive) run-queue scan once a fair
+        // quantum is spent and the full slice is NOT yet up — the two cheap
+        // cases (back-pressure, full-slice) are decided by the policy fn without
+        // it. A normal, uncontended syscall exit therefore pays only the two
+        // atomic loads + one TSC read above.
+        let sibling_waiting = !backpressure
+            && started != 0
+            && elapsed >= slice / FAIR_QUANTUM_DIV
+            && elapsed < slice
+            && crate::has_other_runnable_work(crate::current_task_id().raw());
+        if !syscall_exit_yield_decision(started, slice, elapsed, backpressure, sibling_waiting) {
             return;
         }
         // Re-arm the slot waker so the executor keeps us Ready and re-polls us
@@ -2750,6 +2802,44 @@ pub mod tests {
         task.set_slice_cycles(123_456);
         if task.slice_cycles.load(Ordering::Acquire) != 123_456 {
             return TestResult::Fail("set_slice_cycles didn't stick");
+        }
+        TestResult::Pass
+    }
+
+    /// Fair-share syscall-exit yield policy (`syscall_exit_yield_decision`):
+    /// back-pressure and full-slice always yield; an EARLY yield requires BOTH a
+    /// spent fair quantum AND a waiting sibling; an unstamped slice clock
+    /// (`started == 0`) never yields. Regression pin for the SMP=1
+    /// compositor-poll-spin starvation — a syscall-dense CPU hog must cede to a
+    /// runnable peer after a fair quantum instead of holding the full slice.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_syscall_exit_fair_yield_policy() -> TestResult {
+        use super::{syscall_exit_yield_decision as decide, FAIR_QUANTUM_DIV};
+        let slice = 40_000u64;
+        let q = slice / FAIR_QUANTUM_DIV; // fair-quantum threshold
+                                          // Back-pressure always yields, even with the clock unstamped.
+        if !decide(0, slice, 0, true, false) {
+            return TestResult::Fail("back-pressure must yield regardless");
+        }
+        // Unstamped slice clock never yields (absent back-pressure).
+        if decide(0, slice, slice * 2, false, true) {
+            return TestResult::Fail("started==0 must not yield");
+        }
+        // Full slice spent always yields, even with no sibling waiting.
+        if !decide(1, slice, slice, false, false) {
+            return TestResult::Fail("full slice must yield");
+        }
+        // Below the fair quantum: never yield, even with a sibling waiting.
+        if decide(1, slice, q - 1, false, true) {
+            return TestResult::Fail("below fair quantum must not yield");
+        }
+        // At the fair quantum but no sibling: keep running to the full slice.
+        if decide(1, slice, q, false, false) {
+            return TestResult::Fail("fair quantum without a sibling must not yield");
+        }
+        // At the fair quantum WITH a sibling waiting: yield early.
+        if !decide(1, slice, q, false, true) {
+            return TestResult::Fail("fair quantum + sibling must yield early");
         }
         TestResult::Pass
     }
@@ -4579,6 +4669,8 @@ pub mod tests {
         "scheduler/stackful",
         smoke_stackful_slice_cycles_setter_round_trips
     );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_syscall_exit_fair_yield_policy);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
