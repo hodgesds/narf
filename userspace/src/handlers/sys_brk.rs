@@ -148,6 +148,8 @@ mod tests {
     /// genuine shrink unmaps only regions at/above the new break.
     fn smoke_brk_break_is_address_space_scoped_and_inherited() -> TestResult {
         let base = BRK_DEFAULT_BASE;
+        // SAFETY: kernel tests run with paging live and the frame allocator
+        // initialised, satisfying new_for_user's contract.
         let aspace = match unsafe { AddressSpace::new_for_user() } {
             Ok(a) => a,
             Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -190,6 +192,8 @@ mod tests {
 
         // A real fork inherits the break (clone_for_fork), so the child's first
         // brk does not mass-unmap the cloned heap.
+        // SAFETY: paging is live in a kernel test; `aspace` is a freshly built
+        // user AS with no concurrent writers.
         let child = match unsafe { aspace.clone_for_fork() } {
             Ok(c) => c,
             Err(_) => return TestResult::Fail("clone_for_fork failed"),
