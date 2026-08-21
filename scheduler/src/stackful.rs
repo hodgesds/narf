@@ -997,6 +997,12 @@ impl KernelTask {
         }
     }
 
+    /// Resume the task on its dedicated AArch64 stack until it yields,
+    /// completes, or is preempted back into `exec_ctx`.
+    ///
+    /// # Safety
+    /// The task, its stack, and `exec_ctx` must remain live for the complete
+    /// switch round trip, and the same task must not be polled concurrently.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn poll_to_yield(
         &mut self,
@@ -1543,7 +1549,11 @@ pub unsafe fn try_preempt_aarch64(frame_addr: usize) -> bool {
     }
     task.preempted.store(true, Ordering::Release);
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: CURRENT_STACKFUL_TASK names the task whose in-flight
+    // poll_to_yield call exclusively owns this context save slot.
     let task_ctx = unsafe { &raw mut (*task_ptr).ctx };
+    // SAFETY: exec_ctx was published by the in-flight poll_to_yield call and
+    // stays live until this trap continuation switches back into the task.
     guard_switch_into("try_preempt_aarch64:exec_ctx", unsafe { &*exec_ctx });
     // SAFETY: task_ctx and the executor context remain live across this swap.
     unsafe { kernel_switch(task_ctx, exec_ctx) };
