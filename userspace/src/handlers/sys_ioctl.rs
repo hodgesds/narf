@@ -571,6 +571,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
         }
+        Err(narf_filesystem::FsError::Busy) => {
+            // EBUSY = 16. A device ioctl that reports the resource is held —
+            // e.g. DRM_IOCTL_SET_MASTER when another client already holds DRM
+            // master. Without this arm the direct ioctl path folds Busy into
+            // the blanket -EINVAL below, giving the wrong errno.
+            ctx.set_return(SyscallReturn::ok((-16i64) as u64));
+        }
         Err(_) => {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
         }

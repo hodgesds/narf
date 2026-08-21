@@ -60,6 +60,11 @@ pub(crate) fn render_rdev(index: u32) -> u64 {
 #[derive(Debug)]
 pub struct DriCardFile {
     index: u32,
+    /// Unique per-open identity, used for DRM master arbitration: this open
+    /// holds master iff the card's `current_master` equals this id. Assigned
+    /// from [`NEXT_OPEN_ID`] at open, so two compositors opening the same
+    /// `card<N>` get distinct ids and only one can be master at a time.
+    open_id: u64,
     metadata: Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm_registry::DrmNodeMetadata>>,
 }
 
@@ -69,16 +74,39 @@ pub struct DriCardFile {
 /// post-compositor kernel logs are visible again.
 static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Monotonically-increasing source of per-open DRM master ids. Starts at 1 so
+/// 0 is reserved as a "no such open" sentinel (render nodes pass 0 — they never
+/// participate in master arbitration).
+static NEXT_OPEN_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Sentinel `open_id` for opens that never hold DRM master (render nodes).
+pub(crate) const NO_MASTER_OPEN_ID: u64 = 0;
+
 impl DriCardFile {
     pub(crate) fn new(index: u32) -> Option<Self> {
         let metadata = crate::drm_registry::node_metadata(index, false)?;
+        let open_id = NEXT_OPEN_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        Some(DriCardFile { index, metadata })
+        // drm_master_open: the first opener of a master-free device becomes its
+        // master automatically (cards without mode_state have no master to hold).
+        if let Some(ms) = crate::drm_registry::mode_state(index) {
+            ms.lock().master_open(open_id);
+        }
+        Some(DriCardFile {
+            index,
+            open_id,
+            metadata,
+        })
     }
 }
 
 impl Drop for DriCardFile {
     fn drop(&mut self) {
+        // drm_master_release: if this fd held DRM master, drop it so the device
+        // is free for the next session's SET_MASTER (greeter→user handoff).
+        if let Some(ms) = crate::drm_registry::mode_state(self.index) {
+            ms.lock().master_release(self.open_id);
+        }
         // Last master node closed → release the framebuffer back to the
         // kernel console (no-op if a DRM client never took it over).
         if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
@@ -193,7 +221,7 @@ impl FileOps for DriCardFile {
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ false)
+        crate::drm_ioctl_bridge::dispatch_card(self.index, self.open_id, cmd, arg, /*render*/ false)
     }
 
     /// DRM dumb-buffer mmap: resolve a MAP_DUMB fake offset to the
@@ -385,7 +413,13 @@ impl FileOps for DriRenderFile {
                 result => return result,
             }
         }
-        crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ true)
+        crate::drm_ioctl_bridge::dispatch_card(
+            self.index,
+            NO_MASTER_OPEN_ID,
+            cmd,
+            arg,
+            /*render*/ true,
+        )
     }
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {

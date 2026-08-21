@@ -275,6 +275,19 @@ pub struct Card {
     /// back-to-back PAGE_FLIPs land on successive vblanks — the Linux/VKMS
     /// hrtimer-per-frame pacing, derived from the CRTC mode's refresh rate.
     pub next_vblank_ns: u64,
+    /// The open-file that currently holds DRM master, if any. `None` means the
+    /// device master is free — the next `SET_MASTER` (or first primary open, via
+    /// [`Card::master_open`]) claims it. Each `/dev/dri/cardN` open is tagged
+    /// with a unique `open_id` (see `drm_devfs_bridge::DriCardFile`); a primary
+    /// fd is master iff its id equals this.
+    ///
+    /// Linux analogue: `struct drm_device::master` (guarded by `master_mutex`).
+    /// Modeset ioctls (SETCRTC/PAGE_FLIP/ADDFB2/ATOMIC) require the caller be the
+    /// current master; a second client's `SET_MASTER` fails with `EBUSY` while
+    /// this is held. Replaces the old "every primary fd is implicitly master"
+    /// model, which let a greeter and a user-session compositor both drive the
+    /// same scanout with no handoff.
+    pub(crate) current_master: Option<u64>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -303,6 +316,16 @@ pub fn set_vblank_offset_ns(ns: u64) {
     VBLANK_OFFSET_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// `SET_MASTER` denied because another open already holds DRM master.
+/// The bridge maps this to `EBUSY`, matching `drm_setmaster_ioctl`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MasterBusy;
+
+/// `DROP_MASTER` denied because the caller was not the current master.
+/// The bridge maps this to `EINVAL`, matching `drm_dropmaster_ioctl`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NotCurrentMaster;
+
 impl Card {
     /// Construct a new card with the given driver identity.
     pub fn new(
@@ -324,6 +347,64 @@ impl Card {
             events: alloc::collections::VecDeque::new(),
             vblank_seq: 0,
             next_vblank_ns: 0,
+            current_master: None,
+        }
+    }
+
+    // ── DRM master arbitration ────────────────────────────────────────
+    //
+    // `open_id` uniquely identifies one open `/dev/dri/cardN` file. These
+    // mirror `drivers/gpu/drm/drm_auth.c`: exactly one open holds master at
+    // a time, the first opener auto-acquires it, and it is released on
+    // DROP_MASTER or fd close so the next session can take over.
+
+    /// `drm_master_open`: the first primary open of a master-free device
+    /// becomes its master automatically. No-op if a master already exists —
+    /// a later opener stays non-master until it runs `SET_MASTER`.
+    pub fn master_open(&mut self, open_id: u64) {
+        if self.current_master.is_none() {
+            self.current_master = Some(open_id);
+        }
+    }
+
+    /// Whether `open_id` is the current DRM master. Drives `DrmFileCtx`'s
+    /// `is_master` for the per-ioctl permission gate.
+    pub fn is_master(&self, open_id: u64) -> bool {
+        self.current_master == Some(open_id)
+    }
+
+    /// `DRM_IOCTL_SET_MASTER`. `Ok` if `open_id` already holds master or the
+    /// device master was free (it now holds it); `Err` (→ `EBUSY`) if another
+    /// open currently holds master. Mirrors `drm_setmaster_ioctl`.
+    pub fn set_master(&mut self, open_id: u64) -> Result<(), MasterBusy> {
+        match self.current_master {
+            Some(m) if m == open_id => Ok(()),
+            Some(_) => Err(MasterBusy),
+            None => {
+                self.current_master = Some(open_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// `DRM_IOCTL_DROP_MASTER`. `Ok` if `open_id` held master (now released);
+    /// `Err` (→ `EINVAL`) if it was not the current master. Mirrors
+    /// `drm_dropmaster_ioctl`, which returns `-EINVAL` for a non-master caller.
+    pub fn drop_master(&mut self, open_id: u64) -> Result<(), NotCurrentMaster> {
+        if self.current_master == Some(open_id) {
+            self.current_master = None;
+            Ok(())
+        } else {
+            Err(NotCurrentMaster)
+        }
+    }
+
+    /// `drm_master_release`: called when a card fd closes. Auto-drops master
+    /// if this open held it, freeing the device for the next `SET_MASTER`
+    /// (the greeter→user-session handoff path).
+    pub fn master_release(&mut self, open_id: u64) {
+        if self.current_master == Some(open_id) {
+            self.current_master = None;
         }
     }
 

@@ -409,25 +409,35 @@ fn map_err(e: DrmIoctlError) -> FsError {
 /// Top-level `FileOps::ioctl` body for DRM card + render nodes.
 ///
 /// `card_index` is the registry index of the card (`/dev/dri/card<N>`
-/// or `renderD<N+128>`); `cmd` is the encoded ioctl number; `arg` is
-/// the raw user pointer; `render` selects render-node vs primary-node
-/// `DrmFileCtx`.
+/// or `renderD<N+128>`); `open_id` uniquely identifies the calling open
+/// file (used for DRM master arbitration — ignored on the render path);
+/// `cmd` is the encoded ioctl number; `arg` is the raw user pointer;
+/// `render` selects render-node vs primary-node `DrmFileCtx`.
 ///
 /// Returns the syscall return value (0 on success for most ioctls, or
 /// an ioctl-specific positive value) or a translated `FsError`.
-pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<u64, FsError> {
+pub fn dispatch_card(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    render: bool,
+) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
     let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
 
-    // 2. Build the per-fd ctx. Primary-node opens are treated as
-    //    authenticated master so KMS ioctls reach the body. NARF
-    //    doesn't yet model DRM_AUTH / DRM_MASTER handoffs — Stage-5
-    //    compositor work will add a separate ioctl gate.
+    // 2. Build the per-fd ctx. Primary opens are always authenticated, but
+    //    `is_master` reflects whether THIS open currently holds the device's
+    //    DRM master (compared against `Card::current_master`). Only the master
+    //    passes the modeset gate — so a greeter and a user-session compositor
+    //    can't both drive the scanout; the master is handed off via
+    //    SET/DROP_MASTER (below) and auto-released on fd close.
     let ctx = if render {
         DrmFileCtx::render_client()
     } else {
-        DrmFileCtx::primary_master()
+        let is_master = mode_state.lock().is_master(open_id);
+        DrmFileCtx::primary(is_master)
     };
 
     // 3. Look up the per-cmd handler.
@@ -460,9 +470,31 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
         // succeeds silently instead of warning `failed to set gamma`.
         IoctlCmd::ModeSetGamma => Ok(0),
-        // SET_MASTER / DROP_MASTER — primary-node fds are already treated
-        // as authenticated master (single-client model); accept + no-op.
-        IoctlCmd::SetMaster | IoctlCmd::DropMaster => Ok(0),
+        // SET_MASTER — claim DRM master for this open. Succeeds if the device
+        // master is free (or already ours); EBUSY if another open holds it.
+        // Render nodes carry no display authority → EACCES. Mirrors
+        // drm_auth.c::drm_setmaster_ioctl.
+        IoctlCmd::SetMaster => {
+            if ctx.is_render_client() {
+                return Err(FsError::PermissionDenied);
+            }
+            match mode_state.lock().set_master(open_id) {
+                Ok(()) => Ok(0),
+                Err(_) => Err(FsError::Busy), // → EBUSY
+            }
+        }
+        // DROP_MASTER — release DRM master, freeing the device for the next
+        // session's SET_MASTER (the greeter→user handoff). EINVAL if the caller
+        // wasn't the current master. Mirrors drm_auth.c::drm_dropmaster_ioctl.
+        IoctlCmd::DropMaster => {
+            if ctx.is_render_client() {
+                return Err(FsError::PermissionDenied);
+            }
+            match mode_state.lock().drop_master(open_id) {
+                Ok(()) => Ok(0),
+                Err(_) => Err(FsError::InvalidData), // → EINVAL
+            }
+        }
         // GET_MAGIC / AUTH_MAGIC — the DRM magic-token dance a compositor
         // does to confirm it's authenticated on its GPU fd. A primary-node fd
         // IS the authenticated master here, so hand back a fixed non-zero
@@ -1112,8 +1144,15 @@ fn handle_obj_getproperties(
 fn handle_atomic(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
-    _ctx: &DrmFileCtx,
+    ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    // ATOMIC is a DRM_MASTER op (drm_ioctls[] marks DRM_MODE_ATOMIC
+    // DRM_MASTER). Only the master may commit; reject render nodes and
+    // non-master primary fds with EACCES. Previously ungated.
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+
     // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeAtomicUapi>()` bytes, bounds-checked by `copy_in`.
@@ -1418,9 +1457,11 @@ fn handle_setcrtc(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // Modeset is primary-node only — render nodes (Mesa/Vulkan) carry no
-    // DRM master and must be rejected with EACCES (DRM_MASTER in Linux).
-    if ctx.is_render_client() {
+    // SETCRTC is a DRM_MASTER op: only the open holding master may modeset.
+    // This rejects render nodes (never master) AND authenticated-but-non-master
+    // primary fds (e.g. a second compositor before it takes over) with EACCES,
+    // exactly as Linux's drm_ioctl_permit gates a DRM_MASTER ioctl.
+    if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
 
@@ -1509,8 +1550,9 @@ fn handle_page_flip(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // Page flip is a modeset op — primary-node only (see handle_setcrtc).
-    if ctx.is_render_client() {
+    // Page flip is a DRM_MASTER op — only the master may flip (see
+    // handle_setcrtc). Rejects render nodes and non-master primary fds.
+    if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
 

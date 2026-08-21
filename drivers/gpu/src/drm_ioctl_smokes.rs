@@ -36,7 +36,19 @@ use crate::drm::card::{
     Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
 };
 use crate::drm_devfs_bridge::BochsCard;
-use crate::drm_ioctl_bridge::dispatch_card;
+/// DRM master id every existing smoke drives the card as. `register_test_card`
+/// pre-establishes this open as the card's master, so the modeset gate is
+/// satisfied without threading an id through each call. Master *arbitration*
+/// itself is covered by the dedicated smokes at the end of this file, which
+/// call the real `dispatch_card` with explicit competing ids.
+const SMOKE_MASTER_ID: u64 = 1;
+
+/// Test shim over [`crate::drm_ioctl_bridge::dispatch_card`] that injects
+/// [`SMOKE_MASTER_ID`] as the calling open. Keeps the smoke call sites at the
+/// pre-master signature `(idx, cmd, arg, render)`.
+fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<u64, FsError> {
+    crate::drm_ioctl_bridge::dispatch_card(card_index, SMOKE_MASTER_ID, cmd, arg, render)
+}
 use crate::drm_uapi::{
     ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,
     DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC,
@@ -86,8 +98,21 @@ fn make_test_card() -> Card {
     card
 }
 
-/// Register a fresh test card with the registry. Returns its index.
+/// Register a fresh test card with the registry, with `SMOKE_MASTER_ID`
+/// pre-established as its DRM master (as if that open had already acquired
+/// it), so the modeset smokes reach the handler body. Returns its index.
 fn register_test_card() -> u32 {
+    let idx = register_test_card_unmastered();
+    if let Some(ms) = crate::drm_registry::mode_state(idx) {
+        ms.lock().master_open(SMOKE_MASTER_ID);
+    }
+    idx
+}
+
+/// Register a fresh test card with NO DRM master established — the device
+/// master is free. Used by the arbitration smokes, which drive SET/DROP_MASTER
+/// explicitly to observe the handoff.
+fn register_test_card_unmastered() -> u32 {
     let name = format!("card{}", crate::drm_registry::count());
     let card = Arc::new(BochsCard::new(name));
     crate::drm_registry::register_drm_card_with_state(card, make_test_card())
@@ -869,6 +894,9 @@ fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
             .addfb2(256, 256, 0x3432_5258 /* XR24 */, 256 * 4, handle)
             .unwrap();
         let _ = fb_id;
+        // Drive the card as the pre-established master (this smoke exercises the
+        // SETCRTC blit path, not master arbitration) so the modeset gate passes.
+        card.master_open(SMOKE_MASTER_ID);
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
             card,
@@ -910,6 +938,127 @@ fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
     }
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_setcrtc_with_fb_succeeds);
+
+// ── DRM master arbitration ─────────────────────────────────────────────
+
+/// Two competing opens contend for DRM master: SET_MASTER is exclusive
+/// (EBUSY while held), only the master may modeset (EACCES otherwise),
+/// DROP_MASTER by a non-master is EINVAL, and after the holder drops, the
+/// other open can take over — the greeter→user-session handoff. Every errno
+/// matches Linux `drm_auth.c`.
+#[allow(dead_code)]
+fn smoke_drm_master_arbitration() -> TestResult {
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    // Fresh card — device master is free.
+    let idx = register_test_card_unmastered();
+    let set_master = ioc(0, DRM_IOCTL_BASE, 0x1E, 0);
+    let drop_master = ioc(0, DRM_IOCTL_BASE, 0x1F, 0);
+    const A: u64 = 0x0A11;
+    const B: u64 = 0x0B22;
+
+    // A modeset attempt as `open_id`, returning the raw dispatch result.
+    let setcrtc = |open_id: u64| {
+        let mut crtc = DrmModeCrtcUapi {
+            crtc_id: 11,
+            ..Default::default()
+        };
+        crate::drm_ioctl_bridge::dispatch_card(
+            idx,
+            open_id,
+            DRM_IOCTL_MODE_SETCRTC,
+            &mut crtc as *mut _ as usize,
+            false,
+        )
+    };
+    let master_ioctl = |open_id: u64, cmd: u32| {
+        crate::drm_ioctl_bridge::dispatch_card(idx, open_id, cmd, 0, false)
+    };
+
+    // A claims the free master; a repeat is idempotent (already current → 0).
+    if master_ioctl(A, set_master) != Ok(0) {
+        return TestResult::Fail("A SET_MASTER on a free device should succeed");
+    }
+    if master_ioctl(A, set_master) != Ok(0) {
+        return TestResult::Fail("A repeat SET_MASTER (already master) should be Ok(0)");
+    }
+    // B cannot take master while A holds it → EBUSY.
+    match master_ioctl(B, set_master) {
+        Err(FsError::Busy) => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("B SET_MASTER while A holds it should be EBUSY");
+        }
+    }
+    // B (non-master) is barred from modeset → EACCES.
+    match setcrtc(B) {
+        Err(FsError::PermissionDenied) => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("non-master SETCRTC should be EACCES");
+        }
+    }
+    // A (master) may modeset — must not be gated (any non-EACCES result is fine;
+    // SETCRTC can succeed or fail downstream on a card with no live scanout).
+    if let Err(FsError::PermissionDenied) = setcrtc(A) {
+        return TestResult::Fail("master SETCRTC should not be EACCES");
+    }
+    // B dropping a master it does not hold → EINVAL.
+    match master_ioctl(B, drop_master) {
+        Err(FsError::InvalidData) => {}
+        other => {
+            let _ = other;
+            return TestResult::Fail("non-master DROP_MASTER should be EINVAL");
+        }
+    }
+    // A drops master → device master is free again.
+    if master_ioctl(A, drop_master) != Ok(0) {
+        return TestResult::Fail("A DROP_MASTER (current master) should succeed");
+    }
+    // Handoff: B now takes the freed master, and the roles swap.
+    if master_ioctl(B, set_master) != Ok(0) {
+        return TestResult::Fail("B SET_MASTER after A dropped should succeed");
+    }
+    if let Err(FsError::PermissionDenied) = setcrtc(B) {
+        return TestResult::Fail("B (new master) SETCRTC should not be EACCES");
+    }
+    match setcrtc(A) {
+        Err(FsError::PermissionDenied) => TestResult::Pass,
+        other => {
+            let _ = other;
+            TestResult::Fail("A (ex-master) SETCRTC should be EACCES after handoff")
+        }
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_arbitration);
+
+/// The first primary open of a master-free card auto-acquires DRM master
+/// (drm_master_open), and closing that fd auto-drops it (drm_master_release)
+/// so the next session can take over.
+#[allow(dead_code)]
+fn smoke_drm_master_autodrop_on_close() -> TestResult {
+    let idx = register_test_card_unmastered();
+    let master = || {
+        crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master)
+    };
+    if master().is_some() {
+        return TestResult::Fail("a freshly registered card should have no master");
+    }
+    {
+        let _f = match crate::drm_devfs_bridge::DriCardFile::new(idx) {
+            Some(f) => f,
+            None => return TestResult::Fail("opening the card node failed"),
+        };
+        // First primary open auto-acquires master.
+        if master().is_none() {
+            return TestResult::Fail("first primary open should auto-acquire master");
+        }
+    } // `_f` drops here → master_release
+    if master().is_some() {
+        return TestResult::Fail("closing the master fd should free the device master");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_autodrop_on_close);
 
 // Anchor the kernel-test framework imports so the kernel-test feature
 // doesn't trip a "use never used" warning on cfg-out builds.
