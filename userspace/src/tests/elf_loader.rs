@@ -1989,8 +1989,9 @@ kernel_test_in!("userspace", smoke_userspace_parse_minimal_elf64);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_rejects_short_elf() -> TestResult {
-    // ELF length below 64-byte header → handler must reject without
-    // touching the loader (defensive arg check).
+    // execve(2) takes (path, argv, envp) on the Linux ABI: arg0 is the pathname
+    // pointer. A non-null but unmapped/invalid pointer faults in copy_user_cstr
+    // → EFAULT, before argv is even looked at.
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -2012,8 +2013,8 @@ fn smoke_userspace_execve_rejects_short_elf() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
     };
-    if r != SyscallReturn::invalid_op() {
-        return TestResult::Fail("short-elf should be rejected with invalid_op");
+    if r != SyscallReturn::ok((-14i64) as u64) {
+        return TestResult::Fail("bad execve pathname pointer should return -EFAULT");
     }
     crate::syscall::__test_clear_global();
     TestResult::Pass
@@ -2032,6 +2033,9 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
     // input. (Reaching invalid_op — not -ENOENT — proves the path resolved
     // and the image actually loaded.)
     crate::syscall::__test_clear_global();
+    // The path pointer is a kernel test address; opt into accepting it so
+    // execve reaches the load+bail instead of the EFAULT user-pointer guard.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);

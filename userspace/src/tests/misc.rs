@@ -476,7 +476,8 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getcwd.raw(), &mut ctx);
-    let small_invalid = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::INVALID_OP);
+    // Linux getcwd returns ERANGE when the buffer is too small for the path.
+    let small_invalid = matches!(ctx.ret, Some(r) if (r.value as i64) == -34);
 
     // Nonexistent directory rejected. (Relative paths are now resolved
     // against the cwd; an absolute path with no backing dir fails the
@@ -509,7 +510,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         return TestResult::Fail("Getcwd buffer did not match `/foo\\0`");
     }
     if !small_invalid {
-        return TestResult::Fail("Getcwd with too-small buf did not surface InvalidOp");
+        return TestResult::Fail("Getcwd with too-small buf did not surface ERANGE");
     }
     if !rel_rejected {
         return TestResult::Fail("Chdir(relative) did not surface -1 sentinel");

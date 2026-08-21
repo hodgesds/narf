@@ -47,7 +47,13 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     match advice {
         MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+            // Linux madvise(2): EINVAL for a misaligned/out-of-range request,
+            // else ENOMEM when the range spans an unmapped gap.
+            Err(narf_memory::AddressSpaceError::AlignmentMismatch)
+            | Err(narf_memory::AddressSpaceError::OutOfRange) => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64))
+            }
+            Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
         },
         // These values are performance hints only. NARF has no readahead,
         // KSM, THP promotion, or active LRU aging policy to tune yet, so a

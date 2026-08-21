@@ -23,7 +23,8 @@ pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
         // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
         // range-validates the 16-byte write.
         if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Faulting timespec buffer → EFAULT.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     }

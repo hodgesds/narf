@@ -33,6 +33,8 @@ pub(crate) fn sys_pkey_mprotect(ctx: &mut dyn TrapContext) {
     };
     match mprotect_core(&as_ref, VirtAddr::new(a.arg0), a.arg1, a.arg2 as u32) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+        // e is the positive errno (ENOMEM for an unmapped range, EACCES for a
+        // W^X denial / missing JIT cap); negate for the Linux ABI.
+        Err(e) => ctx.set_return(SyscallReturn::ok((-e) as u64)),
     }
 }

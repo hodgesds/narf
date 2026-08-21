@@ -276,6 +276,70 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_fork_basic_wait4_reap);
 
+// ── mprotect(2) on an unmapped range → -ENOMEM (Linux parity) ────────
+//
+// Errno-correctness regression guard: mprotect over a range that spans an
+// unmapped hole must report -ENOMEM, not the blanket -EINVAL the old
+// invalid_op fold produced. glibc/malloc probe mprotect's errno, so the
+// distinction is load-bearing. This needs a LIVE address space (the abi_mem
+// harness installs none, so it can only exercise the no-AS arm); here a fresh
+// `AddressSpace::new_for_user()` has nothing mapped at the target, so
+// `mprotect_range` returns `Unmapped`, which `mprotect_core` maps to ENOMEM.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_mprotect_unmapped_enomem() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const TASK: u64 = 0xF0_02;
+    const ENOMEM: i64 = -12;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(TASK);
+
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(as_);
+    install_address_space_lookup(lookup_proc_parent_as);
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // mprotect(0x2000_0000, 0x1000, PROT_READ|PROT_WRITE) over an unmapped,
+    // page-aligned, user-half range.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0x2000_0000,
+            arg1: 0x1000,
+            arg2: 0b011, // PROT_READ | PROT_WRITE
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MProtect.raw(), &mut ctx);
+
+    let outcome = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == ENOMEM => TestResult::Pass,
+        Some(r) if r.status == SyscallReturn::OK => {
+            TestResult::Fail("mprotect over an unmapped range must return -ENOMEM")
+        }
+        _ => TestResult::Fail("mprotect over an unmapped range must return -ENOMEM (got non-Ok)"),
+    };
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    outcome
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_mprotect_unmapped_enomem);
+
 /// Regression guard (mmap-scalability rebase, PR #161 commit 289ba96a): the
 /// perms the REAL vDSO region is mapped with (`vdso::VDSO_CODE_PERMS`, used by
 /// `vdso::map_into`) MUST satisfy `cow_split_on_write`'s precondition — WRITE
@@ -1574,7 +1638,8 @@ fn smoke_process_execve_input_validation() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // (A) null ELF pointer
+    // (A) null path pointer → -EFAULT (Linux parity; previously invalid_op).
+    const EFAULT: i64 = -14;
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0,
@@ -1585,10 +1650,10 @@ fn smoke_process_execve_input_validation() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     match ctx.ret {
-        Some(r) if r == SyscallReturn::invalid_op() => {}
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == EFAULT => {}
         _ => {
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("execve with null ptr should return invalid_op");
+            return TestResult::Fail("execve with null ptr should return -EFAULT");
         }
     }
 

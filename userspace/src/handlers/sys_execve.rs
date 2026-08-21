@@ -13,7 +13,8 @@ pub(crate) fn sys_execve(ctx: &mut dyn TrapContext) {
     let envp_uptr = args.arg2;
 
     if path_uptr == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Linux: execve with a NULL pathname pointer faults → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
 
@@ -21,7 +22,8 @@ pub(crate) fn sys_execve(ctx: &mut dyn TrapContext) {
     let path_owned = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Faulting pathname buffer (or no NUL within 4096) → EFAULT.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };

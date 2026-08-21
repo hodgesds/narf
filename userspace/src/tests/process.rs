@@ -1178,7 +1178,7 @@ kernel_test_in!(
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
     // Defence-in-depth: with no AS lookup installed, fork must
-    // return InvalidOp rather than panic / spawn a bogus task.
+    // return -ENOMEM rather than panic / spawn a bogus task.
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
     *PARENT_AS.lock() = None;
@@ -1198,8 +1198,11 @@ fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("no return set"),
     };
-    if ret.status == SyscallReturn::OK {
-        return TestResult::Fail("fork without AS lookup should not succeed");
+    // fork now reports failure as a Linux errno (-ENOMEM), which is an OK
+    // status carrying a negative value — success would be a non-negative
+    // value (child pid in the parent, 0 in the child).
+    if (ret.value as i64) != -12 {
+        return TestResult::Fail("fork without AS lookup should return -ENOMEM");
     }
 
     crate::syscall::__test_clear_global();
@@ -1394,8 +1397,9 @@ fn smoke_userspace_execve_rejects_null_ptr() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
     };
-    if r != SyscallReturn::invalid_op() {
-        return TestResult::Fail("null-ptr should be rejected with invalid_op");
+    // Linux: execve with a NULL pathname pointer faults → EFAULT.
+    if r != SyscallReturn::ok((-14i64) as u64) {
+        return TestResult::Fail("null-ptr execve should return -EFAULT");
     }
     crate::syscall::__test_clear_global();
     TestResult::Pass
@@ -2064,6 +2068,10 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
     // user ctx a prior test left in the process-global CURRENT cell
     // (`__test_clear_global` only clears the syscall table).
     crate::user_task::clear_current();
+    // The path/argv/envp pointers are kernel test addresses; opt into accepting
+    // them so execve reaches the load+bail instead of the EFAULT user-pointer
+    // guard. See `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);

@@ -4582,12 +4582,20 @@ pub fn release_external_shared_frame(phys: u64) {
 /// PROT_NONE (`prot == 0`) is NOT coerced to READ — Linux installs an
 /// unreadable region that faults on access; `materialize` keys off
 /// `prot_only().0 == 0` to leave PTEs absent.
+/// Apply a protection change to `[base, base+len)`.
+///
+/// On failure returns the POSIX-positive errno the caller should negate for
+/// userspace (Linux parity, so glibc/malloc can branch on the exact code):
+///   - **ENOMEM (12)** — the request covers an empty or gapped range
+///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
+///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
+///     JIT-gated RW→RX flip the caller has no JIT capability for.
 fn mprotect_core(
     as_ref: &Arc<AddressSpace>,
     base: VirtAddr,
     len: u64,
     prot: u32,
-) -> Result<(), ()> {
+) -> Result<(), i64> {
     let mut perms = RegionPerms(0);
     if prot & 0b001 != 0 {
         perms = perms | RegionPerms::READ;
@@ -4635,25 +4643,29 @@ fn mprotect_core(
             perms.prot_only(),
         );
         match transition {
-            // Refusals, whatever the caller holds.
+            // W^X refusals, whatever the caller holds → EACCES.
             narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
-                Err(())
+                Err(13)
             }
             narf_memory::wx::WxTransition::NeedsCapJit => {
                 let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id())
                 else {
-                    return Err(());
+                    // No JIT capability for the RW→RX flip → EACCES.
+                    return Err(13);
                 };
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ())
+                // Underlying range error (empty/gapped) → ENOMEM.
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| 12)
             }
             narf_memory::wx::WxTransition::Allow => {
-                as_ref.mprotect_range(base, len, perms).map_err(|_| ())
+                // Empty/gapped range → ENOMEM.
+                as_ref.mprotect_range(base, len, perms).map_err(|_| 12)
             }
         }
     }
     #[cfg(not(feature = "linux-compat"))]
     {
-        as_ref.change_perms_range(base, len, perms).map_err(|_| ())
+        // Whole-region perm change failure (unmapped range) → ENOMEM.
+        as_ref.change_perms_range(base, len, perms).map_err(|_| 12)
     }
 }
 
@@ -5399,7 +5411,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         let dup = match unsafe { parent_as.clone_for_fork() } {
             Ok(a) => a,
             Err(_) => {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // COW dup allocation failed → ENOMEM.
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                 return;
             }
         };
@@ -5407,14 +5420,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // and the regions cloned above; materialize installs only those PTEs.
         // SAFETY: Valid memory or trusted environment
         if unsafe { dup.materialize() }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Child page-table materialization failed → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
         // SAFETY: `parent_as` is the live caller AddressSpace; rematerialize rewrites
         // its existing PTEs to match the WRITE-stripped (COW) region perms set by clone_for_fork.
         // SAFETY: Valid memory or trusted environment
         if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Parent COW re-materialization failed → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
         alloc::sync::Arc::new(dup)

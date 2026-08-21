@@ -200,7 +200,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     })
                     .is_err()
                 {
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // VMA registration failed for device MAP_SHARED → ENOMEM.
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
                 // SAFETY: `as_ref` is the calling task's AddressSpace (valid
@@ -211,7 +212,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // materialize() calls (SHARED → PTE-clear only, the
                     // device keeps its frames).
                     let _ = as_ref.unmap_region(VirtAddr::new(base));
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // PTE installation failed for device MAP_SHARED → ENOMEM.
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
                 crate::mapped_file::register_current(base, len, offset, ops);
@@ -251,7 +253,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     })
                     .is_err()
                 {
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // VMA registration failed for demand-paged device → ENOMEM.
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
                 // No `materialize` call: every slot is unbacked, so it would
@@ -325,7 +328,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         // it after the first attachment.
                         if !(v.destroy)(handle) {
                             let _ = as_ref.unmap_region(VirtAddr::new(base));
-                            ctx.set_return(SyscallReturn::invalid_op());
+                            // Segment teardown failed after mapping → ENOMEM.
+                            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                             return;
                         }
                         #[cfg(feature = "linux-compat")]
@@ -351,7 +355,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     // the now-unreferenced segment.
                     let _ = as_ref.unmap_region(VirtAddr::new(base));
                     (v.destroy)(handle);
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // PTE installation failed for anon MAP_SHARED → ENOMEM.
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
                 // Not mapped (frames lookup / page-count mismatch / map_region
@@ -387,7 +392,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         {
             Some(o) => o,
             None => {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // File-backed mapping with an fd not in the fd table → EBADF.
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
                 return;
             }
         };
@@ -399,7 +405,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             let frame = match narf_memory::alloc_frame() {
                 Ok(f) => f.start_address(),
                 Err(_) => {
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // Frame allocator exhausted → ENOMEM.
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
             };
@@ -472,7 +479,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         if let Some(phys) = shared_rollback_phys.as_deref() {
             crate::mapped_file::discard_unmapped_shared_file_pages(phys);
         }
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Generic VMA registration failed → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
     // Anonymous private mappings are entirely lazy (`phys[i] == 0`), so there
@@ -495,7 +503,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // dark for the process). unmap_region frees any file-read
         // frames via the region's own phys list.
         let _ = as_ref.unmap_region(VirtAddr::new(base));
-        ctx.set_return(SyscallReturn::invalid_op());
+        // File-path PTE installation failed, rolled back → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
 

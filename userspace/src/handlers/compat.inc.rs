@@ -811,14 +811,16 @@ fn do_execve_resolved(
     let argv_strs = match copy_user_strarr(argv_uptr, 1024) {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Faulting argv array pointer → EFAULT.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };
     let envp_strs = match copy_user_strarr(envp_uptr, 4096) {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Faulting envp array pointer → EFAULT.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };
@@ -931,7 +933,8 @@ fn do_execve_resolved(
     // a real binary, and argv[0] is whatever the caller passed.
     if let Some(bytes) = image_override {
         if bytes.len() < 64 {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Too small to be a valid ELF → ENOEXEC.
+            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
             return;
         }
         elf_buf = bytes;
@@ -963,7 +966,8 @@ fn do_execve_resolved(
                     None => (line, None),
                 };
                 if interp.is_empty() {
-                    ctx.set_return(SyscallReturn::invalid_op());
+                    // Shebang with an empty interpreter name → ENOEXEC.
+                    ctx.set_return(SyscallReturn::ok((-8i64) as u64));
                     return;
                 }
                 let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
@@ -978,8 +982,8 @@ fn do_execve_resolved(
                 continue;
             }
             if buf.len() < 64 {
-                // Too small for a valid ELF and not a shebang.
-                ctx.set_return(SyscallReturn::invalid_op());
+                // Too small for a valid ELF and not a shebang → ENOEXEC.
+                ctx.set_return(SyscallReturn::ok((-8i64) as u64));
                 return;
             }
             elf_buf = buf;
@@ -1019,7 +1023,8 @@ fn do_execve_resolved(
             return;
         }
         Err(_) => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Malformed ELF (bad magic, unsupported class, etc.) → ENOEXEC.
+            ctx.set_return(SyscallReturn::ok((-8i64) as u64));
             return;
         }
     };

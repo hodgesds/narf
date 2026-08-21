@@ -6,7 +6,8 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let out_ptr = args.arg0;
     let flags = args.arg1;
     if out_ptr == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // NULL fd-array pointer → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     // `fs/pipe.c::do_pipe2`: any flag outside O_CLOEXEC | O_NONBLOCK |
@@ -68,7 +69,8 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
     // it and SMAP-brackets the write of the 8-byte `buf`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Faulting fd-array buffer → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

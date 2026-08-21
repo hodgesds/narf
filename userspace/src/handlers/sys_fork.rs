@@ -5,7 +5,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let parent_as = match current_address_space() {
         Some(a) => a,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // No live address space (internal) → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
     };
@@ -25,13 +26,15 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let child_as = match unsafe { parent_as.clone_for_fork() } {
         Ok(a) => a,
         Err(_) => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // COW dup allocation failed → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
     };
     // SAFETY: child AS just constructed; no concurrent writers.
     if unsafe { child_as.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Child page-table materialization failed → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
     // Re-materialise the parent's PTEs. `clone_for_fork` stripped
@@ -48,7 +51,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // TLB coherent.
     // SAFETY: Valid memory or trusted environment
     if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Parent COW re-materialization failed → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
     let child_as = alloc::sync::Arc::new(child_as);

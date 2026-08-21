@@ -305,11 +305,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_dup_pos);
 
 fn smoke_abi_fdio_dup_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux dup(2) on a bad fd returns -EBADF; NARF
-        // reports InvalidOp.
-        match call_raw(Syscall::Dup.raw(), a0(6543)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("dup on bad fd was not InvalidOp"),
+        // LINUX ABI: dup(2) on a fd that is not open returns -EBADF (previously
+        // folded to a non-Ok InvalidOp status). Shells actively probe EBADF.
+        match call(Syscall::Dup.raw(), a0(6543)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("dup on bad fd must return -EBADF"),
         }
     })
 }
@@ -765,11 +765,11 @@ kernel_test_in!(
 
 fn smoke_abi_fdio_pipe_neg() -> TestResult {
     with_setup(|| {
-        // null out-pointer → InvalidOp.
-        // LINUX-GAP: Linux pipe(2) returns -EFAULT for a bad buffer.
-        match call_raw(Syscall::Pipe.raw(), a0(0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("pipe with null buffer was not InvalidOp"),
+        // LINUX ABI: pipe(2) with a NULL fd-array pointer → -EFAULT (previously
+        // folded to a non-Ok InvalidOp status).
+        match call(Syscall::Pipe.raw(), a0(0)) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("pipe with null buffer must return -EFAULT"),
         }
     })
 }
@@ -790,10 +790,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_pos);
 
 fn smoke_abi_fdio_pipe2_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux pipe2(2) returns -EFAULT for a bad buffer.
-        match call_raw(Syscall::Pipe2.raw(), a1(0, 0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("pipe2 with null buffer was not InvalidOp"),
+        // LINUX ABI: pipe2(2) with a NULL fd-array pointer → -EFAULT (previously
+        // folded to a non-Ok InvalidOp status).
+        match call(Syscall::Pipe2.raw(), a1(0, 0)) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("pipe2 with null buffer must return -EFAULT"),
         }
     })
 }

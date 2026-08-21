@@ -260,13 +260,13 @@ kernel_test_in!(
 
 fn smoke_abi_time_clock_gettime_neg() -> TestResult {
     with_setup(|| {
-        // NULL buffer → invalid_op (None).
-        // LINUX-GAP: Linux returns -EFAULT; NARF reports a non-Ok status.
-        let r = call_raw(Syscall::ClockGetTime.raw(), a1(CLOCK_MONOTONIC, 0));
-        if r.status == SyscallReturn::INVALID_OP {
+        // LINUX ABI: a NULL/faulting timespec pointer → -EFAULT (previously
+        // folded to a non-Ok InvalidOp status). Linux never checks alignment.
+        let r = call(Syscall::ClockGetTime.raw(), a1(CLOCK_MONOTONIC, 0));
+        if r == Some(EFAULT) {
             Ok(())
         } else {
-            Err("clock_gettime(_, NULL) should report invalid_op")
+            Err("clock_gettime(_, NULL) must return -EFAULT")
         }
     })
 }
