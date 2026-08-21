@@ -357,3 +357,49 @@ kernel_test_in!(
     "drivers/virtio/gpu_pci",
     smoke_virtio_gpu_pci_live_paint_pattern
 );
+
+/// Regression (kwin black-screen freeze): a `flush()` re-entered on the CPU
+/// already inside a `submit()` must SKIP, not deadlock. `submit()` ticks
+/// `sleep_pumps` while holding `req_gate`; the FB cursor pump paints via
+/// `fb.flush()` → `gpu_pci::flush()`, which would re-acquire the gate that CPU
+/// already holds and spin forever — wedging the compositor's first SETCRTC
+/// present on a black screen. See `gpu_pci::flush`.
+fn smoke_virtio_gpu_flush_reentrancy_skips_not_deadlocks() -> TestResult {
+    use crate::gpu_pci;
+    use core::sync::atomic::Ordering;
+
+    // Pure predicate: same CPU = re-entrant (skip); a free gate or another
+    // CPU's submit is not.
+    if !gpu_pci::flush_would_reenter(0, 0) {
+        return TestResult::Fail("same-CPU flush must be detected as re-entrant");
+    }
+    if gpu_pci::flush_would_reenter(usize::MAX, 0) {
+        return TestResult::Fail("no active submit must not read as re-entrant");
+    }
+    if gpu_pci::flush_would_reenter(1, 0) {
+        return TestResult::Fail("another CPU's submit must not read as re-entrant");
+    }
+
+    // Live: on a real device, mark THIS cpu as submitting AND hold the gate as
+    // the outer submit would, then call flush(). Pre-fix this re-acquires the
+    // held gate and spins forever (the test hangs → the deadlock is back);
+    // post-fix it returns Ok immediately.
+    let Some(c) = gpu_pci::probed_device() else {
+        return TestResult::Skip("no virtio-gpu-pci device on this run");
+    };
+    let prev = c
+        .req_gate_submit_cpu
+        .swap(narf_lib::percpu::current_cpu(), Ordering::Relaxed);
+    c.req_gate.store(true, Ordering::Release); // outer submit holds the gate
+    let r = c.flush(); // MUST NOT block on the gate this "cpu" already holds
+    c.req_gate.store(false, Ordering::Release);
+    c.req_gate_submit_cpu.store(prev, Ordering::Relaxed);
+    match r {
+        Ok(()) => TestResult::Pass,
+        Err(_) => TestResult::Fail("re-entrant flush should skip with Ok, not error"),
+    }
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_flush_reentrancy_skips_not_deadlocks
+);
