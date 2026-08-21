@@ -3402,6 +3402,63 @@ fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_pidfd_authoritative_exit_fallback);
 
+/// Regression (kwin black-screen freeze): a live `mint_for` must NOT inherit a
+/// prior occupant's `exited = true` row for a recycled pid. `forget_pid` clears
+/// the row on `release_pid`, but a pid can return to the pool via paths that
+/// skip it (thread-group teardown, an unreaped child) — the stale row then
+/// survives. Reusing it hands the new, LIVE process a pidfd born POLLIN, and Qt
+/// forkfd's `waitid(P_PIDFD, WEXITED)` (armed on POLLIN, no WNOHANG) blocks the
+/// caller's main thread forever on a live child. kwin sat in that wait on a
+/// live `plasma-keyboard` and never accepted a wayland client → black screen.
+/// A live mint must discard the stale row and start fresh, while pidfds already
+/// opened against the OLD process keep reporting that process's exit.
+fn smoke_pidfd_stale_exited_row_discarded_for_live_mint() -> TestResult {
+    use narf_filesystem::POLL_IN;
+    crate::pidfd::__test_reset();
+    const PID: u64 = 0x00BE_EF11;
+
+    // Prior occupant of this pid number: mint, then exit — leaving a stale
+    // `exited = true` row in the table (forget_pid deliberately NOT called,
+    // reproducing the missed-release case the recycle guard must survive).
+    let old = crate::pidfd::mint_for(PID, 0, true);
+    crate::pidfd::notify_exit(PID);
+    let old_file = crate::pidfd::PidFdFile::new(old.clone());
+    if narf_filesystem::FileOps::poll_readiness(&old_file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("setup: prior occupant's pidfd should read POLLIN after its exit");
+    }
+
+    // The pid is recycled to a NEW, live process. `mint_for(.., assume_alive)`
+    // must NOT return the stale row: a live process cannot have an exited
+    // pidfd state.
+    let fresh = crate::pidfd::mint_for(PID, 0, true);
+    if alloc::sync::Arc::ptr_eq(&old, &fresh) {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("live mint reused the stale exited row instead of minting fresh");
+    }
+    let fresh_file = crate::pidfd::PidFdFile::new(fresh);
+    if narf_filesystem::FileOps::poll_readiness(&fresh_file) & POLL_IN != 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail(
+            "recycled-pid live mint inherited exited=true → pidfd born readable (kwin-freeze bug)",
+        );
+    }
+
+    // The orphaned old row must STILL report the old process's exit — a pidfd
+    // opened against the prior occupant keeps its own truth.
+    if narf_filesystem::FileOps::poll_readiness(&old_file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("orphaned prior-occupant pidfd stopped reporting its exit");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_pidfd_stale_exited_row_discarded_for_live_mint
+);
+
 /// Smoke 33: multiple pidfds for the same pid share state. Once one
 /// observes the exit, every other observer agrees.
 fn smoke_wave61_pidfd_shared_state() -> TestResult {
