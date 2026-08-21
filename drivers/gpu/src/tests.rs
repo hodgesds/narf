@@ -4833,7 +4833,9 @@ fn smoke_drm_flip_event_format() -> TestResult {
     }
     card.queue_flip_event(0xCAFE_F00D_1234_5678, 7);
     let ev = match card.events.pop_front() {
-        Some(e) => e,
+        // events are now (deliver_at_ns, bytes) — the format assertions below
+        // only care about the bytes.
+        Some((_deliver_at, e)) => e,
         None => return TestResult::Fail("flip event not queued"),
     };
     if ev.len() != 32 {
@@ -4859,6 +4861,103 @@ fn smoke_drm_flip_event_format() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_format);
+
+/// Vblank pacing (regression: kwin's unthrottled-repaint 100% CPU spin). A
+/// compositor that PAGE_FLIPs, waits for completion, then repaints must be
+/// throttled to the mode's refresh rate. Back-to-back flips on one crtc queue
+/// completion events one refresh interval apart, so the SECOND flip's event is
+/// NOT immediately deliverable — `poll_deadline` reports the future vblank and
+/// the DRM-fd poll parks until then instead of spinning. The first flip after
+/// idle stays immediate (no added latency).
+fn smoke_drm_flip_event_vblank_paced() -> TestResult {
+    let mut card = make_test_card_for_ioctl();
+    let crtc_id = card.crtcs.first().map(|c| c.id).unwrap_or(0);
+    let hz = card.crtc_refresh_hz(crtc_id);
+    if hz == 0 {
+        return TestResult::Fail("crtc refresh hz resolved to 0");
+    }
+    let interval = 1_000_000_000u64 / hz as u64;
+
+    // First flip after idle: deliverable immediately (deliver_at collapses to
+    // ~now, not a full interval away).
+    card.queue_flip_event(0x1, crtc_id);
+    let first_at = match card.events.back() {
+        Some((d, _)) => *d,
+        None => return TestResult::Fail("first flip event not queued"),
+    };
+    // Second flip: paced exactly one refresh interval past the first.
+    card.queue_flip_event(0x2, crtc_id);
+    let second_at = match card.events.back() {
+        Some((d, _)) => *d,
+        None => return TestResult::Fail("second flip event not queued"),
+    };
+    if second_at < first_at.saturating_add(interval) {
+        return TestResult::Fail("second flip not paced by one refresh interval");
+    }
+    // Evaluated at the first flip's vblank: only the first is deliverable.
+    if !card.has_deliverable_event(first_at) {
+        return TestResult::Fail("first flip not deliverable at its own vblank");
+    }
+    if card.pop_deliverable_event(first_at).is_none() {
+        return TestResult::Fail("first flip did not pop at its vblank");
+    }
+    if card.has_deliverable_event(first_at) {
+        return TestResult::Fail("second flip deliverable too early — pacing broken");
+    }
+    // ...and poll_deadline points a parked poll at the second flip's vblank.
+    match card.next_event_deadline_ns(first_at) {
+        Some(d) if d == second_at && d > first_at => {}
+        _ => return TestResult::Fail("poll_deadline is not the paced second-flip vblank"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_vblank_paced);
+
+/// Vblank slack offset (`vblank_offset_ns`, the sysfs render-slack knob): a
+/// nonzero offset shifts flip-event DELIVERY earlier by exactly that many ns
+/// (measured against the true simulated vblank, reconstructed as
+/// `next_vblank_ns - interval`) WITHOUT changing the frame RATE — successive
+/// flips stay one refresh interval apart. Default 0 is exact-vblank delivery.
+fn smoke_drm_flip_event_slack_offset() -> TestResult {
+    use crate::drm::card::{set_vblank_offset_ns, vblank_offset_ns};
+    let saved = vblank_offset_ns();
+
+    // The knob round-trips.
+    set_vblank_offset_ns(1234);
+    if vblank_offset_ns() != 1234 {
+        set_vblank_offset_ns(saved);
+        return TestResult::Fail("vblank_offset_ns setter did not stick");
+    }
+
+    let off = 2_000_000u64; // 2 ms of render slack
+    set_vblank_offset_ns(off);
+    let mut card = make_test_card_for_ioctl();
+    let crtc_id = card.crtcs.first().map(|c| c.id).unwrap_or(0);
+    let hz = card.crtc_refresh_hz(crtc_id);
+    let interval = 1_000_000_000u64 / hz.max(1) as u64;
+
+    card.queue_flip_event(0x1, crtc_id);
+    let d1 = card.events.back().map(|(d, _)| *d).unwrap_or(0);
+    // True vblank of that flip = next_vblank_ns - interval (advance is from the
+    // true vblank, not the earlier delivery time).
+    let present_at = card.next_vblank_ns.saturating_sub(interval);
+    let shift = present_at.saturating_sub(d1);
+
+    card.queue_flip_event(0x2, crtc_id);
+    let d2 = card.events.back().map(|(d, _)| *d).unwrap_or(0);
+    let gap = d2.saturating_sub(d1);
+
+    set_vblank_offset_ns(saved); // restore the global before any assertion returns
+
+    if shift != off {
+        return TestResult::Fail("delivery not shifted earlier by exactly the offset");
+    }
+    if gap != interval {
+        return TestResult::Fail("slack offset changed the frame rate (gap != interval)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_slack_offset);
 
 /// The flip event as a COMPOSITOR sees it: through `poll`/`read` on the
 /// card node, not by reaching into `Card::events`.

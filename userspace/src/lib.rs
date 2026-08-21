@@ -137,9 +137,9 @@ pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     abi_file_op_bridge, active_user_as, address_space_lookup, bootstrap_init, bootstrap_live_count,
-    brk_init, clear_exit_landing, clear_mempolicy_for_fault, cwd_init, cwd_of,
-    default_signal_delivery, default_sync_signal_delivery, delegate_stack_admin_to_route_socket,
-    exit_landing, hostname_init, init_per_task_state, install_address_space_lookup,
+    clear_exit_landing, clear_mempolicy_for_fault, cwd_init, cwd_of, default_signal_delivery,
+    default_sync_signal_delivery, delegate_stack_admin_to_route_socket, exit_landing,
+    hostname_init, init_per_task_state, install_address_space_lookup,
     install_all_address_spaces_lookup, install_core_syscalls, install_signal_delivery_hook,
     install_sync_signal_hook, install_task_id_lookup, nice_init, pgid_init, prctl_init,
     publish_mempolicy_for_fault, release_external_shared_frame, restore_address_space_lookup,

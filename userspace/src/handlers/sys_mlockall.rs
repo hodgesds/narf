@@ -31,7 +31,8 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
                 as_ref.mlock_range(r.base, r.len)
             };
             if result.is_err() {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // A region could not be locked (backing/OOM) → ENOMEM.
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                 return;
             }
         }

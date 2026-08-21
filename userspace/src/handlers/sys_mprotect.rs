@@ -13,6 +13,8 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
     let base = VirtAddr::new(args.arg0);
     match mprotect_core(&as_ref, base, args.arg1, args.arg2 as u32) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(SyscallReturn::invalid_op()),
+        // e is the positive errno (ENOMEM for an unmapped range, EACCES for a
+        // W^X denial / missing JIT cap); negate for the Linux ABI.
+        Err(e) => ctx.set_return(SyscallReturn::ok((-e) as u64)),
     }
 }

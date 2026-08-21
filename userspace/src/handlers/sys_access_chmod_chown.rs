@@ -73,7 +73,15 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
 }
 
 fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
-    if let Some(file) = xattr_file(path) {
+    // Resolve through the caller's PRIVATE mount namespace, not the global
+    // registry (which `xattr_file` uses). A systemd service sandbox pivot_roots
+    // into `/run/systemd/mount-rootfs` with the API filesystems bound in; a
+    // global `access("/sys/.../card0/uevent", F_OK)` from inside that namespace
+    // hits the empty tmpfs staging skeleton and returns ENOENT. That is exactly
+    // the existence probe `sd_device_new_from_syspath` runs, so logind decided
+    // card0 did not exist (-ENODEV) and `TakeDevice` failed — kwin never got
+    // the GPU. NOFOLLOW matches the prior `xattr_file` resolution semantics.
+    if let Some(file) = resolve_file_absolute_ext(path, false) {
         match poll_blocking(file.access(mode)) {
             Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
             Some(Err(narf_filesystem::FsError::PermissionDenied)) => {

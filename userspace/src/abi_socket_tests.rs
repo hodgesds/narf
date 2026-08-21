@@ -167,6 +167,62 @@ fn smoke_abi_socket_connect_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_pos);
 
+/// A stream `connect(2)` to a SYMLINKED socket path must FOLLOW the final
+/// symlink to the real listener. systemd socket units publish alias entry
+/// points this way (systemd-userdbd.socket `Symlinks=` points io.systemd.DropIn
+/// at io.systemd.Multiplexer with an ABSOLUTE target). NARF used to key the
+/// connect by the symlink node's own inode, found no listener, and returned
+/// ECONNREFUSED — which wedged nss_systemd's userdb group lookup and failed the
+/// systemd-user PAM session. The target is absolute, the case a single-fs
+/// resolver mishandles across a mount boundary, so it is followed globally.
+fn smoke_abi_socket_connect_follows_symlink() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    with_memfs("/sk", "sk", &[], || {
+        // Server: bind + listen at the REAL path.
+        let srv = open_unix_stream()?;
+        let (raddr, ralen) = unix_sockaddr(b"/sk/real.sock");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(srv, raddr.as_ptr() as u64, ralen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("server bind at real path failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(srv, 16)).ok_or("listen status")? != 0 {
+            return Err("server listen failed");
+        }
+        // Alias: an ABSOLUTE-target symlink to the real socket (systemd's shape).
+        let target = b"/sk/real.sock\0";
+        let link = b"/sk/alias.sock\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+        )
+        .ok_or("symlinkat status")?
+            != 0
+        {
+            return Err("symlinkat alias -> real failed");
+        }
+        // Connecting via the SYMLINK must find the listener (return 0), NOT
+        // ECONNREFUSED (the pre-fix behaviour of keying by the symlink inode).
+        let cli = open_unix_stream()?;
+        let (aaddr, aalen) = unix_sockaddr(b"/sk/alias.sock");
+        match call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, aaddr.as_ptr() as u64, aalen),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("connect via a symlinked socket path did not return 0"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_follows_symlink
+);
+
 fn smoke_abi_socket_bound_client_connects() -> TestResult {
     with_setup(|| {
         let srv = open_unix_stream()?;
@@ -2644,6 +2700,7 @@ fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
             let source_key = crate::handlers::unix_socket_path_key(
                 core::str::from_utf8(&SOURCE_SOCKET[..SOURCE_SOCKET.len() - 1])
                     .map_err(|_| "source notify path was not UTF-8")?,
+                false,
             )
             .ok_or("manager notify socket has no VFS identity")?;
             let source_inode = crate::handlers::current_resolve_absolute(SOURCE_PATH, |fs, rel| {
@@ -2692,6 +2749,7 @@ fn smoke_abi_socket_notify_sendmsg_through_stacked_file_bind() -> TestResult {
             let target_key = crate::handlers::unix_socket_path_key(
                 core::str::from_utf8(&TARGET_SOCKET[..TARGET_SOCKET.len() - 1])
                     .map_err(|_| "target notify path was not UTF-8")?,
+                false,
             )
             .ok_or("private notify file bind has no VFS identity")?;
             let target_inode = crate::handlers::current_resolve_absolute(TARGET_PATH, |fs, rel| {

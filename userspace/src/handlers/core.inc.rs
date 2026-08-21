@@ -628,7 +628,6 @@ pub fn bootstrap_init() {
 pub fn init_per_task_state() {
     bootstrap_init();
     cwd_init();
-    brk_init();
     sigaction_init();
     signal_init();
     uidgid_init();
@@ -2478,6 +2477,49 @@ pub(crate) fn resolve_parent_dir_async(
 /// the stable backing filesystem.
 pub(crate) fn unix_socket_path_key(
     path: &str,
+    follow_final: bool,
+) -> Option<(
+    usize,
+    u64,
+    Option<alloc::string::String>,
+    alloc::string::String,
+)> {
+    unix_socket_path_key_depth(path, follow_final, 0)
+}
+
+/// If `path_ref`'s final component is a symlink, return its target string
+/// verbatim (absolute or relative) so the caller can re-resolve it in the
+/// GLOBAL namespace. Resolves the node NOFOLLOW (tmpfs sync path + async
+/// fallback), then reads the link target. `None` if the final component is
+/// not a symlink or does not resolve.
+fn resolve_final_symlink_target(path_ref: &str) -> Option<alloc::string::String> {
+    current_resolve_absolute(path_ref, |fs, rel| {
+        let file = if rel.is_empty() {
+            fs.root_file()
+        } else {
+            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    .and_then(|result| result.ok())
+            })
+        };
+        file.and_then(|file| {
+            if file.stat().mode.file_type != narf_filesystem::FileType::Symlink {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; 4096];
+            let n = poll_blocking(file.read(0, &mut buf)).and_then(|r| r.ok())?;
+            core::str::from_utf8(&buf[..n])
+                .ok()
+                .map(alloc::string::String::from)
+        })
+    })
+    .flatten()
+}
+
+fn unix_socket_path_key_depth(
+    path: &str,
+    follow_final: bool,
+    depth: usize,
 ) -> Option<(
     usize,
     u64,
@@ -2489,6 +2531,30 @@ pub(crate) fn unix_socket_path_key(
     }
     let abs = resolve_cwd_path(current_task_id(), path);
     let path_ref = abs.trim_end_matches('/');
+    // CONNECT (follow_final) follows a FINAL symlink at the GLOBAL namespace
+    // level so a symlinked socket alias keys by the TARGET listener's identity.
+    // systemd socket units publish aliases this way (systemd-userdbd.socket
+    // `Symlinks=` makes io.systemd.DropIn / io.systemd.NameServiceSwitch
+    // symlinks to io.systemd.Multiplexer, with an ABSOLUTE target). Following
+    // here (not inside resolve_async) is required because resolve_async
+    // restarts an absolute symlink target from the CURRENT fs root — wrong when
+    // the socket dir is its own mount (/run tmpfs) → /run/run/... NotFound.
+    // resolve_cwd_path re-roots the target across mounts + chroot, then we
+    // recurse. Keying a connect by the symlink's own inode found no listener
+    // and returned ECONNREFUSED, wedging nss_systemd's userdb group lookup and
+    // failing user@<uid>'s PAM session (EXIT_PAM). bind() must NOT follow (it
+    // names the literal path), so this is gated per-caller.
+    if follow_final && depth < 40 {
+        if let Some(target) = resolve_final_symlink_target(path_ref) {
+            let target_abs = if target.starts_with('/') {
+                target
+            } else {
+                let parent = path_ref.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                alloc::format!("{parent}/{target}")
+            };
+            return unix_socket_path_key_depth(&target_abs, true, depth + 1);
+        }
+    }
     // Linux pathname AF_UNIX sockets are named by their dentry/inode.  This
     // also covers a `mount --bind <socket-file> <target-file>`: the target is
     // a file-rooted mount (`rel` is empty) whose `root_file()` is the original
@@ -2502,7 +2568,8 @@ pub(crate) fn unix_socket_path_key(
             // expose the synchronous DirOps path; block-backed filesystems
             // need the async resolver.  Use each according to the backing's
             // capability so this identity path never makes an in-memory
-            // S_IFSOCK node disappear.
+            // S_IFSOCK node disappear. (A final symlink was already followed by
+            // the follow_final preamble above; here `rel` is the real node.)
             narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
                 poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
                     .and_then(|result| result.ok())
@@ -2747,7 +2814,18 @@ fn readlink_impl(
     // every ext2-backed symlink; the async walker returns the real node.
     // NoFollow so we obtain the symlink itself and can read its target,
     // rather than following it to (a copy of) the target's contents.
-    let root_rel = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
+    // Resolve through the caller's PRIVATE mount namespace, not the global
+    // registry: a systemd service sandbox unshare(NEWNS)s, binds the API
+    // filesystems (sysfs at /sys especially) into its `/run/systemd/mount-
+    // rootfs` staging root, and pivot_roots into it. In the GLOBAL registry
+    // that staging path is just the tmpfs skeleton, so a global readlink of
+    // `/sys/dev/char/226:0` from inside logind's namespace hits tmpfs and
+    // EINVALs — which fails sd-device's `sd_device_new_from_devnum`, then
+    // `session_device_verify()` → `TakeDevice` over D-Bus → kwin "Failed to
+    // open /dev/dri/card0 device (Invalid argument)". The open/stat path
+    // already resolves namespace-aware (current_resolve_absolute); readlink
+    // must match or a pivoted service cannot readlink its own /sys symlinks.
+    let root_rel = current_resolve_absolute(&path, |fs, rel| {
         (fs.root(), alloc::string::String::from(rel))
     });
     let file = match root_rel {
@@ -4504,12 +4582,20 @@ pub fn release_external_shared_frame(phys: u64) {
 /// PROT_NONE (`prot == 0`) is NOT coerced to READ — Linux installs an
 /// unreadable region that faults on access; `materialize` keys off
 /// `prot_only().0 == 0` to leave PTEs absent.
+/// Apply a protection change to `[base, base+len)`.
+///
+/// On failure returns the POSIX-positive errno the caller should negate for
+/// userspace (Linux parity, so glibc/malloc can branch on the exact code):
+///   - **ENOMEM (12)** — the request covers an empty or gapped range
+///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
+///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
+///     JIT-gated RW→RX flip the caller has no JIT capability for.
 fn mprotect_core(
     as_ref: &Arc<AddressSpace>,
     base: VirtAddr,
     len: u64,
     prot: u32,
-) -> Result<(), ()> {
+) -> Result<(), i64> {
     let mut perms = RegionPerms(0);
     if prot & 0b001 != 0 {
         perms = perms | RegionPerms::READ;
@@ -4557,25 +4643,29 @@ fn mprotect_core(
             perms.prot_only(),
         );
         match transition {
-            // Refusals, whatever the caller holds.
+            // W^X refusals, whatever the caller holds → EACCES.
             narf_memory::wx::WxTransition::DenyWX | narf_memory::wx::WxTransition::DenyXtoWX => {
-                Err(())
+                Err(13)
             }
             narf_memory::wx::WxTransition::NeedsCapJit => {
                 let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id())
                 else {
-                    return Err(());
+                    // No JIT capability for the RW→RX flip → EACCES.
+                    return Err(13);
                 };
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ())
+                // Underlying range error (empty/gapped) → ENOMEM.
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| 12)
             }
             narf_memory::wx::WxTransition::Allow => {
-                as_ref.mprotect_range(base, len, perms).map_err(|_| ())
+                // Empty/gapped range → ENOMEM.
+                as_ref.mprotect_range(base, len, perms).map_err(|_| 12)
             }
         }
     }
     #[cfg(not(feature = "linux-compat"))]
     {
-        as_ref.change_perms_range(base, len, perms).map_err(|_| ())
+        // Whole-region perm change failure (unmapped range) → ENOMEM.
+        as_ref.change_perms_range(base, len, perms).map_err(|_| 12)
     }
 }
 
@@ -5321,7 +5411,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         let dup = match unsafe { parent_as.clone_for_fork() } {
             Ok(a) => a,
             Err(_) => {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // COW dup allocation failed → ENOMEM.
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                 return;
             }
         };
@@ -5329,14 +5420,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // and the regions cloned above; materialize installs only those PTEs.
         // SAFETY: Valid memory or trusted environment
         if unsafe { dup.materialize() }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Child page-table materialization failed → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
         // SAFETY: `parent_as` is the live caller AddressSpace; rematerialize rewrites
         // its existing PTEs to match the WRITE-stripped (COW) region perms set by clone_for_fork.
         // SAFETY: Valid memory or trusted environment
         if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // Parent COW re-materialization failed → ENOMEM.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
         alloc::sync::Arc::new(dup)
@@ -5743,11 +5836,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
     }
 
-    if !share_vm {
-        // brk maps onto AS state; only meaningful for a non-VM clone
-        // (a true fork).
-        brk_fork(parent_pid, child_tid.raw());
-    }
+    // The program break is ADDRESS-SPACE state: a real fork inherits it in
+    // `clone_for_fork`, and CLONE_VM threads share it because they share the AS.
+    // No per-task copy is needed or wanted (per-task keying let a fresh thread
+    // answer brk(0) with the arena base and poison glibc's __curbrk).
     // Signal-handler table: CLONE_SIGHAND (mandatory for CLONE_THREAD)
     // SHARES the parent's live sighand — a handler installed by any
     // thread is visible to the whole group (Linux sighand_struct
@@ -5927,7 +6019,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
 // the parent.
 //
 // Inheritance: AS (copied), fd table (copied via `fd::fork`), cwd
-// (copied via `cwd_fork`), brk (copied via `brk_fork`), sigaction
+// (copied via `cwd_fork`), brk (inherited on the AS by `clone_for_fork`), sigaction
 // handlers (copied via `sigaction_fork`), trap-frame state (copied
 // via `TrapContext::save_user_state`, with rax mutated to 0 in
 // the child).
@@ -7025,7 +7117,6 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    task_map_remove(&BRK_TABLE, tid);
 
     // Memory policy.
     if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {

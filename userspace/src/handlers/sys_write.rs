@@ -27,6 +27,28 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
+    // DIAG (syscall-trace): dump stdout/stderr content for trace-target
+    // processes and the dbus-broker family. A daemon's byte-count alone does
+    // not explain WHY it fails; dbus-broker prints its fatal error to stderr
+    // right before exit(1), and that exit takes the whole session bus down.
+    #[cfg(feature = "syscall-trace")]
+    if fd == 1 || fd == 2 {
+        let comm = crate::handlers::proc_comm_of_task(task).unwrap_or_default();
+        if crate::syscall::syscall_trace_target_task() || comm.starts_with("dbus-broker") {
+            use core::fmt::Write as _;
+            let _ = write!(narf_console::Writer, "STDIO t={task} comm={comm} fd={fd}: ");
+            for &b in kbuf.iter().take(240) {
+                let c = if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                };
+                let _ = write!(narf_console::Writer, "{c}");
+            }
+            let _ = writeln!(narf_console::Writer);
+        }
+    }
+
     // Job control: a background process writing its controlling tty with
     // TOSTOP set is stopped (SIGTTOU) before the write happens.
     #[cfg(feature = "linux-compat")]

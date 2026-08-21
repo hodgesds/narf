@@ -276,6 +276,70 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_fork_basic_wait4_reap);
 
+// ── mprotect(2) on an unmapped range → -ENOMEM (Linux parity) ────────
+//
+// Errno-correctness regression guard: mprotect over a range that spans an
+// unmapped hole must report -ENOMEM, not the blanket -EINVAL the old
+// invalid_op fold produced. glibc/malloc probe mprotect's errno, so the
+// distinction is load-bearing. This needs a LIVE address space (the abi_mem
+// harness installs none, so it can only exercise the no-AS arm); here a fresh
+// `AddressSpace::new_for_user()` has nothing mapped at the target, so
+// `mprotect_range` returns `Unmapped`, which `mprotect_core` maps to ENOMEM.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_mprotect_unmapped_enomem() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const TASK: u64 = 0xF0_02;
+    const ENOMEM: i64 = -12;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(TASK);
+
+    // SAFETY: `new_for_user` only requires paging to be enabled; these smokes
+    // run after kernel boot has installed the page tables.
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(as_);
+    install_address_space_lookup(lookup_proc_parent_as);
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // mprotect(0x2000_0000, 0x1000, PROT_READ|PROT_WRITE) over an unmapped,
+    // page-aligned, user-half range.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 0x2000_0000,
+            arg1: 0x1000,
+            arg2: 0b011, // PROT_READ | PROT_WRITE
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MProtect.raw(), &mut ctx);
+
+    let outcome = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == ENOMEM => TestResult::Pass,
+        Some(r) if r.status == SyscallReturn::OK => {
+            TestResult::Fail("mprotect over an unmapped range must return -ENOMEM")
+        }
+        _ => TestResult::Fail("mprotect over an unmapped range must return -ENOMEM (got non-Ok)"),
+    };
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    outcome
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_mprotect_unmapped_enomem);
+
 /// Regression guard (mmap-scalability rebase, PR #161 commit 289ba96a): the
 /// perms the REAL vDSO region is mapped with (`vdso::VDSO_CODE_PERMS`, used by
 /// `vdso::map_into`) MUST satisfy `cow_split_on_write`'s precondition — WRITE
@@ -1574,7 +1638,8 @@ fn smoke_process_execve_input_validation() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // (A) null ELF pointer
+    // (A) null path pointer → -EFAULT (Linux parity; previously invalid_op).
+    const EFAULT: i64 = -14;
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0,
@@ -1585,10 +1650,10 @@ fn smoke_process_execve_input_validation() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     match ctx.ret {
-        Some(r) if r == SyscallReturn::invalid_op() => {}
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == EFAULT => {}
         _ => {
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("execve with null ptr should return invalid_op");
+            return TestResult::Fail("execve with null ptr should return -EFAULT");
         }
     }
 
@@ -3401,6 +3466,63 @@ fn smoke_pidfd_authoritative_exit_fallback() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_pidfd_authoritative_exit_fallback);
+
+/// Regression (kwin black-screen freeze): a live `mint_for` must NOT inherit a
+/// prior occupant's `exited = true` row for a recycled pid. `forget_pid` clears
+/// the row on `release_pid`, but a pid can return to the pool via paths that
+/// skip it (thread-group teardown, an unreaped child) — the stale row then
+/// survives. Reusing it hands the new, LIVE process a pidfd born POLLIN, and Qt
+/// forkfd's `waitid(P_PIDFD, WEXITED)` (armed on POLLIN, no WNOHANG) blocks the
+/// caller's main thread forever on a live child. kwin sat in that wait on a
+/// live `plasma-keyboard` and never accepted a wayland client → black screen.
+/// A live mint must discard the stale row and start fresh, while pidfds already
+/// opened against the OLD process keep reporting that process's exit.
+fn smoke_pidfd_stale_exited_row_discarded_for_live_mint() -> TestResult {
+    use narf_filesystem::POLL_IN;
+    crate::pidfd::__test_reset();
+    const PID: u64 = 0x00BE_EF11;
+
+    // Prior occupant of this pid number: mint, then exit — leaving a stale
+    // `exited = true` row in the table (forget_pid deliberately NOT called,
+    // reproducing the missed-release case the recycle guard must survive).
+    let old = crate::pidfd::mint_for(PID, 0, true);
+    crate::pidfd::notify_exit(PID);
+    let old_file = crate::pidfd::PidFdFile::new(old.clone());
+    if narf_filesystem::FileOps::poll_readiness(&old_file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("setup: prior occupant's pidfd should read POLLIN after its exit");
+    }
+
+    // The pid is recycled to a NEW, live process. `mint_for(.., assume_alive)`
+    // must NOT return the stale row: a live process cannot have an exited
+    // pidfd state.
+    let fresh = crate::pidfd::mint_for(PID, 0, true);
+    if alloc::sync::Arc::ptr_eq(&old, &fresh) {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("live mint reused the stale exited row instead of minting fresh");
+    }
+    let fresh_file = crate::pidfd::PidFdFile::new(fresh);
+    if narf_filesystem::FileOps::poll_readiness(&fresh_file) & POLL_IN != 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail(
+            "recycled-pid live mint inherited exited=true → pidfd born readable (kwin-freeze bug)",
+        );
+    }
+
+    // The orphaned old row must STILL report the old process's exit — a pidfd
+    // opened against the prior occupant keeps its own truth.
+    if narf_filesystem::FileOps::poll_readiness(&old_file) & POLL_IN == 0 {
+        crate::pidfd::__test_reset();
+        return TestResult::Fail("orphaned prior-occupant pidfd stopped reporting its exit");
+    }
+
+    crate::pidfd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_pidfd_stale_exited_row_discarded_for_live_mint
+);
 
 /// Smoke 33: multiple pidfds for the same pid share state. Once one
 /// observes the exit, every other observer agrees.

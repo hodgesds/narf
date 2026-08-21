@@ -1048,6 +1048,35 @@ kernel_test_in!(
     smoke_ext4_metadata_csum_writable_mkdir_survives_remount
 );
 
+/// `ExtentLeaf::parse`: an extent is uninitialized only when `ee_len > 32768`
+/// (real length `ee_len - 32768`); `ee_len == 32768` is a MAX-LENGTH
+/// INITIALIZED extent, not a hole. Masking bit 15 wrongly zeroed a 128 MiB
+/// initialized run — block 0 of a 32768-block extent read as a hole, so a
+/// large `.so` (libLLVM, whose first extent is exactly 32768 blocks) failed to
+/// load with "invalid ELF header". Regression guard for that ext4 read bug.
+fn smoke_ext4_extent_max_len_is_initialized() -> TestResult {
+    use super::extent::ExtentLeaf;
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // ee_block = 0
+    buf[4..6].copy_from_slice(&0x8000u16.to_le_bytes()); // ee_len = 32768
+    buf[6..8].copy_from_slice(&0u16.to_le_bytes()); // ee_start_hi
+    buf[8..12].copy_from_slice(&413696u32.to_le_bytes()); // ee_start_lo
+    match ExtentLeaf::parse(&buf) {
+        Some(l) if !l.is_uninitialized && l.len == 32768 && l.physical == 413696 => {}
+        Some(_) => {
+            return TestResult::Fail("ee_len==32768 must be an INITIALIZED len-32768 extent")
+        }
+        None => return TestResult::Fail("parse(ee_len=32768) returned None"),
+    }
+    // The genuinely uninitialized case: ee_len == 32769 → uninit, real len 1.
+    buf[4..6].copy_from_slice(&0x8001u16.to_le_bytes());
+    match ExtentLeaf::parse(&buf) {
+        Some(l) if l.is_uninitialized && l.len == 1 => TestResult::Pass,
+        _ => TestResult::Fail("ee_len>32768 must be uninitialized with len = ee_len - 32768"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_extent_max_len_is_initialized);
+
 /// Build a two-block, one-level HTREE root on top of the compact ext4
 /// fixture. Logical block zero is the checksummed index root and logical block
 /// one is a classic checksummed leaf containing the original entries.

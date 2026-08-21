@@ -12,7 +12,8 @@ pub(crate) fn sys_execveat(ctx: &mut dyn TrapContext) {
     // A NULL path POINTER is invalid (fexecve passes a valid pointer to an
     // empty string, never NULL). Empty-string handling is below.
     if a.arg1 == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // NULL path pointer faults → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     let path_str = copy_user_cstr(a.arg1, 4096).unwrap_or_default();

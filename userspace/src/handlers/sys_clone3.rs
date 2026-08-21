@@ -14,8 +14,14 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
             size
         ));
     }
-    if uargs == 0 || size < 8 {
-        ctx.set_return(SyscallReturn::invalid_op());
+    if uargs == 0 {
+        // NULL clone_args pointer → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        return;
+    }
+    if size < 8 {
+        // Undersized clone_args struct → EINVAL.
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
 
@@ -30,7 +36,8 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // (<= CLONE_ARGS_MIN) bytes into the `raw` prefix.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Faulting clone_args buffer → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     // SAFETY: `CloneArgs` is `#[repr(C)]` of u64s; any bit pattern
@@ -57,5 +64,6 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
 pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // aarch64 / other arches: depends on x86_64-only user_task
     // pipeline. Will land alongside the EL0 user-task bring-up.
-    ctx.set_return(SyscallReturn::invalid_op());
+    // Not implemented on this arch → ENOSYS (glibc's clone3→clone fallback keys on it).
+    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
 }

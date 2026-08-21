@@ -2680,10 +2680,11 @@ fn smoke_execve_image_read_survives_slow_backing_store() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -5 => TestResult::Fail(
             "execve EIO'd a healthy binary on a slow store (image-read poll budget overran)",
         ),
-        // InvalidOp: the read completed and the junk failed ELF validation —
-        // the read path survived the slow store. Pass.
-        Some(r) if r.status != SyscallReturn::OK => TestResult::Pass,
-        _ => TestResult::Fail("execve on /slowexec/prog returned an unexpected status"),
+        // Any non-EIO outcome means the read survived the slow store: the junk
+        // image fails ELF validation (ENOEXEC) or, on a valid image, execve
+        // reaches the no-user-ctx bail. Either way the poll budget didn't overrun.
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("execve on /slowexec/prog returned no status"),
     }
 }
 kernel_test_in!(

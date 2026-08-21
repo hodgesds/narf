@@ -137,18 +137,26 @@ fn uevent_wake_hook() {
 #[cfg(feature = "syscall-trace")]
 pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
     use core::fmt::Write as _;
-    if buf.len() < 16 || !crate::syscall::syscall_trace_target_task() {
+    if buf.len() < 16 {
         return;
     }
+    // Only look at buffers whose FIRST byte is a D-Bus endianness marker.
     let le = match buf[0] {
         b'l' => true,
         b'B' => false,
         _ => return,
     };
-    let ty = buf[1];
-    // version byte (buf[3]) is 1 for every D-Bus message; screens out
-    // non-D-Bus streams that happen to start with 'l'/'B'.
-    if ty == 0 || ty > 4 || buf[3] != 1 {
+    if buf[3] != 1 {
+        return;
+    }
+    let tid = crate::handlers::current_task_id();
+    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
+    // Fire for explicit trace targets, AND for the dbus-broker ROUTER (its
+    // routed CALL/RETURN/ERROR — SIGNALs are suppressed per-message below to
+    // avoid the boot-time signal flood a full trace_comm=dbus-broker emits).
+    let is_target = crate::syscall::syscall_trace_target_task();
+    let is_broker = comm.starts_with("dbus-broker");
+    if !is_target && !is_broker {
         return;
     }
     let rd32 = |o: usize| -> u32 {
@@ -159,47 +167,75 @@ pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
             u32::from_be_bytes(b)
         }
     };
-    let serial = rd32(8);
-    let fields_len = rd32(12) as usize;
-    let tyname = match ty {
-        1 => "CALL",
-        2 => "RETURN",
-        3 => "ERROR",
-        4 => "SIGNAL",
-        _ => "?",
-    };
-    let tid = crate::handlers::current_task_id();
-    let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
-    let _ = write!(
-        narf_console::Writer,
-        "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
-    );
-    let end = core::cmp::min(buf.len(), 16 + fields_len);
-    let mut run: usize = 0;
-    let mut start = 16;
-    for i in 16..end {
-        let b = buf[i];
-        if b.is_ascii_graphic() && b != b' ' {
-            if run == 0 {
-                start = i;
+    // A single recvmsg on a busy connection (dbus-broker's, notably) carries
+    // SEVERAL framed messages; decoding only the first hid routed calls that
+    // arrived batched behind a signal. Walk every message in the buffer.
+    let mut off = 0usize;
+    let mut guard = 0u32;
+    while off + 16 <= buf.len() && guard < 64 {
+        guard += 1;
+        // A mid-buffer byte that is not a fresh header means we lost frame
+        // sync (e.g. an unaligned body) — stop rather than emit garbage.
+        if (buf[off] != b'l' && buf[off] != b'B') || buf[off + 3] != 1 {
+            break;
+        }
+        let ty = buf[off + 1];
+        if ty == 0 || ty > 4 {
+            break;
+        }
+        let body_len = rd32(off + 4) as usize;
+        let serial = rd32(off + 8);
+        let fields_len = rd32(off + 12) as usize;
+        // Framed length = 16-byte fixed header + fields, padded to 8, + body.
+        let after_fields = off + 16 + fields_len;
+        let body_start = (after_fields + 7) & !7;
+        let msg_end = body_start.saturating_add(body_len);
+        let tyname = match ty {
+            1 => "CALL",
+            2 => "RETURN",
+            3 => "ERROR",
+            4 => "SIGNAL",
+            _ => "?",
+        };
+        // Broker firehose suppression: skip SIGNAL unless an explicit target.
+        if is_target || ty != 4 {
+            let _ = write!(
+                narf_console::Writer,
+                "DBUS t={tid} comm={comm} {dir} {tyname} serial={serial} hdr=[",
+            );
+            let end = core::cmp::min(buf.len(), off + 16 + fields_len);
+            let mut run: usize = 0;
+            let mut start = off + 16;
+            for i in (off + 16)..end {
+                let b = buf[i];
+                if b.is_ascii_graphic() && b != b' ' {
+                    if run == 0 {
+                        start = i;
+                    }
+                    run += 1;
+                } else {
+                    if run >= 3 {
+                        for &c in &buf[start..start + run] {
+                            let _ = write!(narf_console::Writer, "{}", c as char);
+                        }
+                        let _ = write!(narf_console::Writer, " ");
+                    }
+                    run = 0;
+                }
             }
-            run += 1;
-        } else {
             if run >= 3 {
                 for &c in &buf[start..start + run] {
                     let _ = write!(narf_console::Writer, "{}", c as char);
                 }
-                let _ = write!(narf_console::Writer, " ");
             }
-            run = 0;
+            let _ = writeln!(narf_console::Writer, "]");
         }
-    }
-    if run >= 3 {
-        for &c in &buf[start..start + run] {
-            let _ = write!(narf_console::Writer, "{}", c as char);
+        // No forward progress (malformed length) → stop to avoid a spin.
+        if msg_end <= off {
+            break;
         }
+        off = msg_end;
     }
-    let _ = writeln!(narf_console::Writer, "]");
 }
 
 pub const SOCK_STREAM: u32 = 1;
@@ -222,6 +258,16 @@ pub const SHUT_RDWR: u32 = 2;
 /// PID 1 issues this on its `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket to
 /// size the read of a pending notification.
 pub const SIOCINQ: u32 = 0x541B;
+
+/// `ioctl(fd, SIOCOUTQ, &int)` — bytes still queued in the socket's SEND
+/// buffer (unsent). Shares its value with `TIOCOUTQ` (0x5411). NARF AF_UNIX
+/// delivers synchronously — a send writes straight into the peer's rx ring
+/// or returns EAGAIN, so there is no local send queue — hence this is always
+/// 0. dbus-broker's `socket_dispatch_write` issues SIOCOUTQ after every write
+/// and treats a failure (ENOTTY) as a FATAL error (the broker exit(1)s,
+/// dbus.service restarts, and the whole system bus splits), so it MUST be
+/// recognised even though the answer is trivially 0.
+pub const SIOCOUTQ: u32 = 0x5411;
 
 // ── Socket-option levels and names ──────────────────────────────
 // Numbers match Linux `<linux/socket.h>` / `<netinet/tcp.h>` /
@@ -342,9 +388,27 @@ struct UnixPathKey {
 }
 
 impl UnixPathKey {
+    /// Bind/listen identity: name the LITERAL path (do not follow a final
+    /// symlink) — `bind(2)` on an AF_UNIX path names the path itself.
     fn for_current_path(path: &str) -> Self {
+        Self::compute(path, false)
+    }
+
+    /// Connect identity: FOLLOW a final symlink so a symlinked socket alias
+    /// (e.g. systemd's io.systemd.DropIn -> io.systemd.Multiplexer) resolves
+    /// to the target listener's identity. See `unix_socket_path_key`.
+    fn for_connect_path(path: &str) -> Self {
+        Self::compute(path, true)
+    }
+
+    fn compute(path: &str, follow_final: bool) -> Self {
         let (filesystem, parent_ino, fallback_parent_path, name) =
-            crate::handlers::unix_socket_path_key(path).unwrap_or((0, 0, None, String::from(path)));
+            crate::handlers::unix_socket_path_key(path, follow_final).unwrap_or((
+                0,
+                0,
+                None,
+                String::from(path),
+            ));
         Self {
             filesystem,
             parent_ino,
@@ -2101,19 +2165,28 @@ impl FileOps for SocketFile {
     }
 
     /// `ioctl(fd, SIOCINQ, &int)` — number of bytes immediately readable
-    /// (see `inq_bytes` for the per-state count). Only `SIOCINQ` (==
-    /// `FIONREAD`, 0x541B) is recognised; anything else is an unknown request
-    /// → `ENOTTY` (Linux `sock_ioctl` default). An empty queue reports 0 with
-    /// success (never ENOENT), which is what systemd PID 1 expects when it
-    /// sizes a read of its `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket.
+    /// (see `inq_bytes` for the per-state count) — and `SIOCOUTQ` (0x5411),
+    /// the send-queue byte count, always 0 under NARF's synchronous delivery.
+    /// Anything else is an unknown request → `ENOTTY` (Linux `sock_ioctl`
+    /// default). An empty queue reports 0 with success (never ENOENT), which
+    /// is what systemd PID 1 expects when it sizes a read of its
+    /// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket; SIOCOUTQ must likewise
+    /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        if cmd != SIOCINQ {
-            return Err(FsError::Unsupported);
-        }
-        let bytes = (self.inq_bytes() as i32).to_le_bytes();
+        // SIOCINQ = bytes immediately readable; SIOCOUTQ = bytes still queued
+        // in the send buffer (always 0 here — synchronous delivery, no local
+        // send queue). Any other request is unknown → ENOTTY (Linux
+        // `sock_ioctl` default). SIOCOUTQ MUST be answered: dbus-broker treats
+        // an ENOTTY from it as fatal and tears the whole system bus down.
+        let value: i32 = match cmd {
+            SIOCINQ => self.inq_bytes() as i32,
+            SIOCOUTQ => 0,
+            _ => return Err(FsError::Unsupported),
+        };
+        let bytes = value.to_le_bytes();
         // SAFETY: `copy_to_user` validates `arg` as a user address through
         // the SMAP window; the length is the fixed 4-byte little-endian
-        // `int` the SIOCINQ contract writes back.
+        // `int` the SIOCINQ/SIOCOUTQ contract writes back.
         if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
             return Err(FsError::InvalidData);
         }
@@ -3894,7 +3967,7 @@ impl SocketFile {
                     UnixAddr::Path(p) => LISTENERS
                         .lock()
                         .as_ref()
-                        .and_then(|m| m.get(&UnixPathKey::for_current_path(p)).cloned()),
+                        .and_then(|m| m.get(&UnixPathKey::for_connect_path(p)).cloned()),
                     UnixAddr::Abstract(n) => ABSTRACT_STREAM
                         .lock()
                         .as_ref()
@@ -4635,7 +4708,7 @@ impl SocketFile {
                 };
                 let mut state = self.state.lock();
                 if let UnixAddr::Path(p) = &uaddr {
-                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_current_path(p));
+                    *self.connected_unix_path.lock() = Some(UnixPathKey::for_connect_path(p));
                 } else {
                     *self.connected_unix_path.lock() = None;
                 }
@@ -4697,10 +4770,15 @@ impl SocketFile {
                 drop(state);
                 let dest_sock = match &dest_addr {
                     UnixAddr::Path(p) => {
+                        // A datagram destination follows a final symlink, same
+                        // as a stream connect: /dev/log is a symlink to
+                        // /run/systemd/journal/dev-log, so keying the sendto by
+                        // the /dev/log symlink inode found no bound receiver and
+                        // dropped every syslog/pam_syslog message (ECONNREFUSED).
                         let key = if explicit_dest {
-                            UnixPathKey::for_current_path(p)
+                            UnixPathKey::for_connect_path(p)
                         } else {
-                            connected_path.unwrap_or_else(|| UnixPathKey::for_current_path(p))
+                            connected_path.unwrap_or_else(|| UnixPathKey::for_connect_path(p))
                         };
                         UNIX_DGRAM_BOUND
                             .lock()
@@ -6057,6 +6135,22 @@ kernel_test_in!(
     "userspace/socket",
     smoke_socket_ioctl_unknown_is_unsupported
 );
+
+/// `SIOCOUTQ` (0x5411) MUST be recognised and succeed. dbus-broker issues it
+/// after every socket write; an ENOTTY there is FATAL — the broker exit(1)s,
+/// dbus.service restarts, the system bus splits, and the desktop never comes
+/// up. NARF AF_UNIX delivers synchronously (no local send queue) so it reports
+/// 0. A real `&mut i32` backs the `copy_to_user` the ioctl performs.
+fn smoke_socket_ioctl_siocoutq_is_zero() -> TestResult {
+    let sock = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let mut out: i32 = -1;
+    match sock.ioctl(SIOCOUTQ, &mut out as *mut i32 as usize) {
+        Ok(0) if out == 0 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("SIOCOUTQ did not write 0 to the user int"),
+        Err(_) => TestResult::Fail("SIOCOUTQ was not recognised (dbus-broker needs it to succeed)"),
+    }
+}
+kernel_test_in!("userspace/socket", smoke_socket_ioctl_siocoutq_is_zero);
 
 fn smoke_unregistered_netlink_kernel_send_is_refused() -> TestResult {
     let sock = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);

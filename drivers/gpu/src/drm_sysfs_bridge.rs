@@ -53,7 +53,7 @@ use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
     class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
-    kobject_add_uevent_attr, kobject_emit_uevent, Kobject,
+    kobject_add_uevent_attr, kobject_add_writable_attr, kobject_emit_uevent, Kobject,
 };
 use narf_filesystem::uevent::UeventAction;
 
@@ -162,6 +162,28 @@ fn populate_card_node(
     }
     // Writable uevent so a real udevd's `udevadm trigger` re-broadcasts the ADD.
     kobject_add_uevent_attr(&kobj, card_uevent(idx, &driver));
+
+    // Writable `vblank_offset_ns` (default 0): the render-slack tuning knob —
+    // how many ns BEFORE the true simulated vblank a flip-complete event is made
+    // deliverable, so a compositor wakes early enough to render + resubmit
+    // before scanout (absorbing scheduler wake latency). Global (compensates for
+    // a system property), mirrored on every card node. See
+    // `crate::drm::card::VBLANK_OFFSET_NS`.
+    kobject_add_writable_attr(
+        &kobj,
+        "vblank_offset_ns",
+        || format!("{}\n", crate::drm::card::vblank_offset_ns()),
+        |data: &[u8]| {
+            let s =
+                core::str::from_utf8(data).map_err(|_| narf_filesystem::FsError::InvalidData)?;
+            let ns: u64 = s
+                .trim()
+                .parse()
+                .map_err(|_| narf_filesystem::FsError::InvalidData)?;
+            crate::drm::card::set_vblank_offset_ns(ns);
+            Ok(())
+        },
+    );
 
     // `subsystem` → /sys/class/drm. From /sys/devices/platform/narf-drm/card<N>
     // the class dir is four levels up. elogind only marks a seat graphical when

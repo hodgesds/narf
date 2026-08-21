@@ -1066,14 +1066,15 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_stat_tty_fields_from_ctty);
 fn smoke_abi_proc_fork_neg() -> TestResult {
     with_setup(|| {
         // No user address space is installed in the harness, so sys_fork's
-        // `current_address_space()` lookup returns None and the handler
-        // reports a non-Ok NARF status (InvalidOp). The success path (spawn
-        // a child) is unreachable without a live AS + scheduler.
-        let r = call_raw(Syscall::Fork.raw(), a0(0));
-        if r.status == SyscallReturn::INVALID_OP {
+        // `current_address_space()` lookup returns None. LINUX ABI: fork(2)
+        // never returns EINVAL — an AS/COW-dup failure reads as -ENOMEM so
+        // callers back off rather than treating args as invalid. The success
+        // path (spawn a child) is unreachable without a live AS + scheduler.
+        let r = call(Syscall::Fork.raw(), a0(0));
+        if r == Some(ENOMEM) {
             Ok(())
         } else {
-            Err("fork without an address space did not report InvalidOp")
+            Err("fork without an address space must return -ENOMEM")
         }
     })
 }
@@ -1081,12 +1082,12 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_fork_neg);
 
 fn smoke_abi_proc_vfork_neg() -> TestResult {
     with_setup(|| {
-        // Vfork maps to sys_fork; same no-AS InvalidOp path.
-        let r = call_raw(Syscall::Vfork.raw(), a0(0));
-        if r.status == SyscallReturn::INVALID_OP {
+        // Vfork maps to sys_fork; same no-AS path → -ENOMEM (not EINVAL).
+        let r = call(Syscall::Vfork.raw(), a0(0));
+        if r == Some(ENOMEM) {
             Ok(())
         } else {
-            Err("vfork without an address space did not report InvalidOp")
+            Err("vfork without an address space must return -ENOMEM")
         }
     })
 }
@@ -1125,14 +1126,22 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_clone_pidfd_pointer);
 
 fn smoke_abi_proc_clone3_badarg() -> TestResult {
     with_setup(|| {
-        // clone3(NULL, ...) and clone3(ptr, size<8) are rejected with
-        // InvalidOp before any address-space work.
-        let r = call_raw(Syscall::Clone3.raw(), a1(0, 64));
-        if r.status == SyscallReturn::INVALID_OP {
-            Ok(())
-        } else {
-            Err("clone3(NULL,..) did not report InvalidOp")
+        // LINUX ABI: the two failure modes are now distinguished (were both
+        // folded to InvalidOp). clone3(NULL, size) faults on the clone_args
+        // pointer → -EFAULT; clone3(ptr, size<8) is an undersized struct →
+        // -EINVAL. glibc's clone3→clone fallback depends on these being right.
+        let null_ptr = call(Syscall::Clone3.raw(), a1(0, 64));
+        if null_ptr != Some(EFAULT) {
+            return Err("clone3(NULL, ..) must return -EFAULT");
         }
+        // A non-NULL but obviously-invalid (kernel-half) pointer with size<8
+        // is rejected on the size floor before the pointer is dereferenced.
+        let scratch = [0u8; 8];
+        let undersize = call(Syscall::Clone3.raw(), a1(scratch.as_ptr() as u64, 4));
+        if undersize != Some(EINVAL) {
+            return Err("clone3(ptr, size<8) must return -EINVAL");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_badarg);
@@ -1162,12 +1171,14 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_no_as);
 
 fn smoke_abi_proc_execve_neg() -> TestResult {
     with_setup(|| {
-        // execve(NULL, ...) is rejected with InvalidOp (path_uptr == 0).
-        let r = call_raw(Syscall::Execve.raw(), a2(0, 0, 0));
-        if r.status == SyscallReturn::INVALID_OP {
+        // LINUX ABI: execve(NULL, ...) faults on the pathname pointer → -EFAULT
+        // (was folded to -EINVAL by the blanket invalid_op path). glibc/callers
+        // distinguish a bad-address fault from a bad argument.
+        let r = call(Syscall::Execve.raw(), a2(0, 0, 0));
+        if r == Some(EFAULT) {
             Ok(())
         } else {
-            Err("execve(NULL,..) did not report InvalidOp")
+            Err("execve(NULL,..) must return -EFAULT")
         }
     })
 }
@@ -1212,13 +1223,13 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_execve_missing_path_enoent);
 
 fn smoke_abi_proc_execveat_neg() -> TestResult {
     with_setup(|| {
-        // execveat reshapes (dirfd, path, argv, envp, flags) → execve(path,
-        // argv, envp); a NULL path (arg1) forwards as execve(NULL) → InvalidOp.
-        let r = call_raw(Syscall::Execveat.raw(), a3(0, 0, 0, 0));
-        if r.status == SyscallReturn::INVALID_OP {
+        // execveat(dirfd, path, argv, envp, flags): a NULL path pointer (arg1)
+        // faults → -EFAULT (Linux parity; previously folded to -EINVAL).
+        let r = call(Syscall::Execveat.raw(), a3(0, 0, 0, 0));
+        if r == Some(EFAULT) {
             Ok(())
         } else {
-            Err("execveat with a NULL path did not report InvalidOp")
+            Err("execveat with a NULL path must return -EFAULT")
         }
     })
 }

@@ -26,13 +26,31 @@ impl<'a> ReqGate<'a> {
     /// Spin until the gate is ours. Interrupts keep their
     /// caller-supplied state — the whole point.
     pub(crate) fn acquire(flag: &'a AtomicBool) -> ReqGate<'a> {
-        while flag
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        loop {
+            // Short plain spin first: the gate covers only a submit sequence,
+            // so it is usually released within a few iterations.
+            for _ in 0..64 {
+                if flag
+                    .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return ReqGate(flag);
+                }
+                core::hint::spin_loop();
+            }
+            // Still contended: the holder is blocked on its (up to two-second)
+            // device round-trip and may be a descheduled stackful task homed
+            // on THIS CPU. A non-yielding spin starves it and DEADLOCKS at low
+            // core counts — at SMP=1 the GPU/snd/mem flush gate never releases.
+            // Yield to the executor so the holder runs, completes, and drops
+            // the gate; fall back to a plain spin when there is no stackful
+            // task to yield (early boot / IRQ context). Same shape as the
+            // virtio-blk gate (`blk_pci::ReqGate`, task #34) that this module
+            // generalises — the yield was the missing half of that fix.
+            if !narf_scheduler::cooperative_yield() {
+                core::hint::spin_loop();
+            }
         }
-        ReqGate(flag)
     }
 }
 

@@ -595,10 +595,11 @@ kernel_test_in!("syscall_abi", smoke_abi_path_getcwd_pos);
 
 fn smoke_abi_path_getcwd_neg() -> TestResult {
     with_setup(|| {
-        // NULL buf / zero len → handler returns InvalidOp (non-Ok).
+        // LINUX ABI: a NULL destination pointer faults → -EFAULT (previously
+        // folded to a non-Ok InvalidOp status).
         match call(Syscall::Getcwd.raw(), a1(0, 0)) {
-            None => Ok(()),
-            Some(_) => Err("getcwd(NULL, 0) must not report success"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("getcwd(NULL, 0) must return -EFAULT"),
         }
     })
 }
@@ -2206,3 +2207,40 @@ fn smoke_abi_path_statx_nofollow_reports_link() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_statx_nofollow_reports_link);
+
+// ── getcwd(2) — errno correctness (ERANGE / EFAULT) ───────────────────
+//
+// glibc's getcwd grows its buffer on -ERANGE and retries; folding a
+// too-small buffer to -EINVAL broke that loop. A NULL destination faults
+// → -EFAULT. Both were previously the blanket invalid_op/-EINVAL.
+fn smoke_abi_path_getcwd_errno() -> TestResult {
+    with_setup(|| {
+        // A 1-byte buffer cannot hold even "/" + NUL (needed >= 2), so the
+        // handler must report -ERANGE regardless of the exact cwd length.
+        let mut small = [0u8; 1];
+        let r = call(
+            Syscall::Getcwd.raw(),
+            a1(small.as_mut_ptr() as u64, small.len() as u64),
+        );
+        if r != Some(ERANGE) {
+            return Err("getcwd with an undersized buffer must return -ERANGE");
+        }
+        // A NULL destination pointer faults → -EFAULT.
+        let r = call(Syscall::Getcwd.raw(), a1(0, 256));
+        if r != Some(EFAULT) {
+            return Err("getcwd(NULL, len) must return -EFAULT");
+        }
+        // A generous buffer succeeds and returns the cwd string length (>= 1
+        // for the root "/"), proving the ERANGE arm is not swallowing valid
+        // calls.
+        let mut big = [0u8; 256];
+        match call(
+            Syscall::Getcwd.raw(),
+            a1(big.as_mut_ptr() as u64, big.len() as u64),
+        ) {
+            Some(n) if n >= 1 => Ok(()),
+            _ => Err("getcwd with a large buffer should return the path length"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_getcwd_errno);

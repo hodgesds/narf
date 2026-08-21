@@ -81,8 +81,9 @@ impl ExtentHeader {
 pub struct ExtentLeaf {
     /// First logical block this extent covers.
     pub logical: u32,
-    /// Length in blocks. Bit 15 set = "uninitialized extent" (caller
-    /// reads as zero); we mask it off into `is_uninitialized`.
+    /// Length in blocks. `ee_len > 32768` marks an "uninitialized extent"
+    /// (caller reads as zero) whose real length is `ee_len - 32768`; a value
+    /// of *exactly* 32768 is a max-length INITIALIZED extent. See `parse`.
     pub len: u16,
     /// Whether the extent is marked uninitialized.
     pub is_uninitialized: bool,
@@ -99,8 +100,14 @@ impl ExtentLeaf {
             return None;
         }
         let raw_len = u16::from_le_bytes([buf[4], buf[5]]);
-        let is_uninit = raw_len & 0x8000 != 0;
-        let len = if is_uninit { raw_len & 0x7FFF } else { raw_len };
+        // ext4 (fs/ext4/ext4_extents.h): EXT_INIT_MAX_LEN = 32768. An extent is
+        // uninitialized only when ee_len > 32768 (real length = ee_len - 32768);
+        // ee_len <= 32768 is INITIALIZED with that exact length. ee_len == 32768
+        // is therefore a max-length *initialized* extent — masking bit 15 here
+        // wrongly zeroed a 128 MiB initialized run (block 0 of a 32768-block
+        // extent read as a hole → "invalid ELF header" loading a large .so).
+        let is_uninit = raw_len > 0x8000;
+        let len = if is_uninit { raw_len - 0x8000 } else { raw_len };
         Some(Self {
             logical: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             len,

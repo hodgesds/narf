@@ -114,7 +114,26 @@ pub fn mint_for(pid: u64, tid: u64, assume_alive: bool) -> Arc<PidFdState> {
     }
     let map = g.as_mut().expect("table inited");
     if let Some(existing) = map.get(&pid) {
-        return existing.clone();
+        // Belt-and-suspenders on top of `forget_pid`: a row that has cached
+        // `exited = true` for a pid the caller is minting as ALIVE cannot be
+        // THIS process's — it is the previous occupant's state, left behind
+        // because the recycled pid returned to the pool via a path that
+        // skipped `forget_pid` (thread-group teardown, an unreaped child, a
+        // reap that never called `release_pid`). Handing that stale row to the
+        // new, live process makes its pidfd born POLLIN-readable, and Qt
+        // forkfd's `waitid(P_PIDFD, ., WEXITED)` — armed on POLLIN, NO WNOHANG
+        // — then blocks the caller's main thread forever on a live child. That
+        // is the kwin freeze: its thread sat in `waitid` on a live
+        // `plasma-keyboard`, never returned to the Wayland event loop, and
+        // every client's `connect()` to wayland-0 went unaccepted (black
+        // screen). Orphan the stale row (its existing `Arc` holders — pidfds
+        // opened against the OLD process — keep reporting that process's exit)
+        // and fall through to mint a fresh, un-signalled row.
+        if !(assume_alive && existing.exited.load(Ordering::Acquire)) {
+            return existing.clone();
+        }
+        // else: stale `exited=true` row for a recycled pid now assigned to a
+        // LIVE process — fall through to mint a fresh row.
     }
     let st = PidFdState::new(pid, tid, !assume_alive);
     map.insert(pid, st.clone());

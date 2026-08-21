@@ -679,6 +679,30 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         (*uctx_ptr).dbg_poll_scans.fetch_add(1, Ordering::Relaxed);
     }
     let ready = poll_scan(task, &mut fds);
+    // DIAG (syscall-trace): for a trace target, log the polled fd set + each
+    // fd's events/revents so a poll that churns (re-executes with ready==0
+    // forever, woken by the notify(0) herd) can be attributed to WHICH fd
+    // never becomes level-ready — the lost-wake fd. Throttled: first few, then
+    // sparse, so a busy re-execution loop does not itself flood the console.
+    #[cfg(feature = "syscall-trace")]
+    if ready == 0 && crate::syscall::syscall_trace_target_task() {
+        use core::fmt::Write as _;
+        static POLLDIAG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = POLLDIAG_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n % 8192 == 0 {
+            let _ = write!(narf_console::Writer, "POLLDIAG t={task} #{n} fds=[");
+            for pfd in fds.iter().take(16) {
+                let _ = write!(
+                    narf_console::Writer,
+                    "{}:ev{:#x}:re{:#x} ",
+                    pfd.fd,
+                    pfd.events,
+                    pfd.revents
+                );
+            }
+            let _ = writeln!(narf_console::Writer, "]");
+        }
+    }
     if ready > 0 {
         // A re-execution that found readiness: tear down any cell arm from the
         // prior park before returning.

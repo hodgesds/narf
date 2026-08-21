@@ -23,7 +23,7 @@
 //! enough that adding an MSI-X vector + waker isn't worth the
 //! complexity yet.
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
@@ -104,6 +104,19 @@ const FALLBACK_SCANOUT_W: u32 = 1280;
 const FALLBACK_SCANOUT_H: u32 = 800;
 const _: () = assert!((FALLBACK_SCANOUT_W * FALLBACK_SCANOUT_H * 4) as usize <= MAX_SCANOUT_BYTES);
 
+/// Whether a `flush()` on `cur_cpu` would re-enter a `submit()` that the same
+/// CPU is already driving (holding `req_gate` while ticking `sleep_pumps`).
+///
+/// The FB cursor sleep-pump paints through `fb.flush()` → `gpu_pci::flush()`;
+/// when that runs on the CPU spinning inside a submit, re-acquiring `req_gate`
+/// deadlocks on the gate that CPU itself holds. `submit()` publishes its CPU in
+/// `req_gate_submit_cpu` (else `usize::MAX`); a match here means skip the nested
+/// paint. A different CPU legitimately flushing concurrently is NOT re-entrant.
+#[inline]
+pub(crate) fn flush_would_reenter(submit_cpu: usize, cur_cpu: usize) -> bool {
+    submit_cpu == cur_cpu
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DisplayMode {
     pub width: u32,
@@ -151,6 +164,13 @@ pub struct VirtioGpuPci {
     /// the multi-command sequences (`init_scanout`, `flush`) WITHOUT
     /// masking interrupts while waiting — see [`crate::req_gate`].
     req_gate: AtomicBool,
+    /// CPU currently inside [`submit`]'s completion spin (which runs
+    /// `sleep_pumps` while holding `req_gate`), or `usize::MAX` when none.
+    /// The cursor sleep-pump paints through `fb.flush()` → [`flush`] → this
+    /// same gate; on that CPU the acquire would spin forever on a gate it
+    /// already holds. `flush` consults this to skip a re-entrant nested paint
+    /// instead of deadlocking. See [`flush`].
+    req_gate_submit_cpu: AtomicUsize,
     /// Context 1 is created lazily by the render-node bridge. A separate bit
     /// keeps context creation out of the 2D boot path and makes retries
     /// idempotent after an early userspace open races driver bring-up.
@@ -297,6 +317,7 @@ impl VirtioGpuPci {
             ready: AtomicBool::new(false),
             last_err: IrqSafeSpinLock::new(None),
             req_gate: AtomicBool::new(false),
+            req_gate_submit_cpu: AtomicUsize::new(usize::MAX),
             virgl_context_ready: AtomicBool::new(false),
         };
 
@@ -671,6 +692,23 @@ impl VirtioGpuPci {
     /// the same mutual exclusion while leaving interrupts enabled on
     /// the waiting CPU for the (up to two-second) device round-trips.
     pub fn flush(&self) -> Result<(), VirtioPciError> {
+        // Re-entrancy guard. A GPU submit holds `req_gate` while it drives
+        // `sleep_pumps` (to keep serial / cursor / FB alive across the up-to-
+        // 2 s device round-trip). One of those pumps is the FB cursor, which
+        // paints through `fb.flush()` → THIS `flush()`. On the CPU already
+        // spinning in `submit()`, re-acquiring `req_gate` here spins forever on
+        // a gate that CPU itself holds — the outer submit can never progress to
+        // release it. That is a hard deadlock: it wedged kwin's very first
+        // SETCRTC present inside `virtio.flush()` and left the compositor frozen
+        // on a black screen (it never returned to accept wayland clients). A
+        // nested cursor flush is best-effort, so skip it; the cursor repaints on
+        // the next pump tick once the gate is free.
+        if flush_would_reenter(
+            self.req_gate_submit_cpu.load(Ordering::Relaxed),
+            narf_lib::percpu::current_cpu(),
+        ) {
+            return Ok(());
+        }
         let _gate = ReqGate::acquire(&self.req_gate);
         // SAFETY: the device is only reachable after bring_up; the gate
         // excludes concurrent users of the request scratch.
@@ -729,7 +767,13 @@ impl VirtioGpuPci {
             self.notify.write16(off, 0);
         }
         // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
-        // while waiting for the device to publish a used-ring entry.
+        // while waiting for the device to publish a used-ring entry. Those
+        // pumps run WHILE `req_gate` is held; the cursor pump re-enters this
+        // device through `flush()`. Publish the CPU spinning here so that
+        // nested `flush()` skips instead of deadlocking on the held gate.
+        let prev_submit_cpu = self
+            .req_gate_submit_cpu
+            .swap(narf_lib::percpu::current_cpu(), Ordering::Relaxed);
         let mut q_err = false;
         let done = narf_scheduler::responsive_spin_until(
             || {
@@ -747,6 +791,8 @@ impl VirtioGpuPci {
             },
             narf_time::Deadline::after_ms(1_000),
         );
+        self.req_gate_submit_cpu
+            .store(prev_submit_cpu, Ordering::Relaxed);
         if q_err {
             return Err(VirtioPciError::NoQueues);
         }

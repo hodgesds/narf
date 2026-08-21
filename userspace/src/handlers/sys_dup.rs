@@ -27,6 +27,7 @@ pub(crate) fn sys_dup(ctx: &mut dyn TrapContext) {
             crate::mqueue::duplicate_fd_path(task, oldfd, new_fd);
             ctx.set_return(SyscallReturn::ok(new_fd as u64));
         }
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
+        // oldfd is not an open file descriptor → EBADF.
+        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
     }
 }

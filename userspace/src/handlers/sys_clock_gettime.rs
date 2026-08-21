@@ -5,8 +5,10 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
-    if buf == 0 || buf & 0x7 != 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+    // Linux never checks timespec alignment (copy_to_user handles unaligned
+    // stores); only a NULL/faulting pointer is an error → EFAULT.
+    if buf == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     let (sec, nsec) = match id {
@@ -42,7 +44,8 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // Faulting timespec buffer → EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

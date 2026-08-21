@@ -3429,7 +3429,7 @@ fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
     let task = crate::handlers::current_task_id();
     let mut line = alloc::string::String::new();
     match name {
-        "openat" | "newfstatat" | "statx" | "faccessat" | "faccessat2" => {
+        "openat" | "newfstatat" | "statx" | "faccessat" | "faccessat2" | "readlinkat" => {
             if let Some(p) = cstr(args.arg1) {
                 let _ = write!(line, "  PATH {name} dfd={:#x} path={:?}", args.arg0, p);
                 if p.starts_with('/') {

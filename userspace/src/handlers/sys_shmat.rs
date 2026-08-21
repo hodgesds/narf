@@ -64,13 +64,15 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         }
     });
     if mapped.is_err() {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        // Backing frames unavailable / could not be aliased → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
     // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
     // region was just registered, so materialize installs only its PTEs.
     if unsafe { as_ref.materialize() }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // PTE installation failed after the region was registered → ENOMEM.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
     // Record the attaching process as the segment's last-op pid (shm_lpid).

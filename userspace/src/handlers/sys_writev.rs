@@ -130,6 +130,10 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-122i64) as u64)); // -EDQUOT
                 return;
             }
+            // TODO(linux-gap): this `_` arm folds every remaining FsError to
+            // EINVAL — still needs a per-errno split (Io→EIO, ReadOnly→EROFS,
+            // sealed-memfd→EPERM, IsDir→EISDIR). Only the total==0 case is
+            // user-visible; a short write already committed keeps its byte count.
             Err(_) => {
                 if total == 0 {
                     ctx.set_return(SyscallReturn::invalid_op());

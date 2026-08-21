@@ -28,6 +28,15 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     };
     match as_ref.mlock_range(VirtAddr::new(args.arg0), args.arg1) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+        // Linux mlock(2): EINVAL for an out-of-range request, EAGAIN when the
+        // lock could not be satisfied (unimplemented backing here), and ENOMEM
+        // for the dominant case — the range spans an unmapped hole.
+        Err(narf_memory::AddressSpaceError::OutOfRange) => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64))
+        }
+        Err(narf_memory::AddressSpaceError::NotImplemented) => {
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64))
+        }
+        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
     }
 }

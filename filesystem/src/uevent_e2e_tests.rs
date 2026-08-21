@@ -40,7 +40,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 #[cfg(feature = "linux-compat")]
 use crate::sysfs::{
     class_device_register, class_register, kobject_add_writable_attr, kobject_emit_uevent,
-    uevent_action_from_write,
+    kobject_emit_uevent_from_write, uevent_action_from_write, uevent_synth_uuid_from_write,
 };
 use crate::uevent::{self, UeventAction, UeventReader};
 
@@ -1195,3 +1195,89 @@ kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_netlink_bytes_satisfy_libudev_validation
 );
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke — synthetic-event UUID round-trips as SYNTH_UUID
+//
+// `sd_device_trigger_with_uuid()` writes "<action> <uuid>" to a device's
+// `uevent` attr; the kernel echoes the UUID back as a SYNTH_UUID= property on
+// the resulting netlink event, and a waiter (systemd-logind's seat setup)
+// matches its triggered event to that completion. Without it logind blocks
+// forever ("seat0: waiting for N events being processed by udevd") and never
+// applies the uaccess ACL to /dev/dri/card0, so the greeter is denied the GPU.
+// Linux ref: `kobject_synth_uevent` (lib/kobject_uevent.c).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_synth_uuid_round_trip() -> TestResult {
+    reset();
+
+    // Parser: a bare 8-4-4-4-12 UUID after the verb is the SYNTH_UUID; the
+    // plain verb, or a KEY=VALUE tail, is not.
+    let uuid = "ce60d5b4-1ff7-45d8-a6da-f20f1a996ee6";
+    let write = alloc::format!("change {uuid}");
+    match uevent_synth_uuid_from_write(write.as_bytes()) {
+        Some(u) if u == uuid => {}
+        other => {
+            return TestResult::Fail(match other {
+                Some(_) => "parsed wrong SYNTH_UUID from 'change <uuid>'",
+                None => "failed to parse SYNTH_UUID from 'change <uuid>'",
+            })
+        }
+    }
+    if uevent_synth_uuid_from_write(b"change").is_some() {
+        return TestResult::Fail("a bare verb must not yield a SYNTH_UUID");
+    }
+    if uevent_synth_uuid_from_write(b"change KEY=value").is_some() {
+        return TestResult::Fail("a KEY=VALUE tail must not be treated as a SYNTH_UUID");
+    }
+    // Action still parses alongside the UUID.
+    if uevent_action_from_write(write.as_bytes()) != UeventAction::Change {
+        return TestResult::Fail("action parse regressed with a trailing UUID");
+    }
+
+    // Round trip: writing "change <uuid>" to a device's uevent attr must
+    // broadcast an event carrying SYNTH_UUID=<uuid>.
+    let class = class_register("drm");
+    let kobj = class_device_register(class, "card0");
+    let mut reader = UeventReader::new();
+    kobject_emit_uevent_from_write(&kobj, write.as_bytes());
+
+    let evs = reader.drain(10);
+    let ev = match evs
+        .iter()
+        .find(|e| e.action == UeventAction::Change && e.devpath.contains("card0"))
+    {
+        Some(e) => e,
+        None => return TestResult::Fail("no change event after synthetic uevent write"),
+    };
+    let synth = alloc::format!("SYNTH_UUID={uuid}");
+    if !ev.to_text().contains(&synth) {
+        return TestResult::Fail(
+            "broadcast event lacks SYNTH_UUID= (logind's wait never resolves)",
+        );
+    }
+    // The on-the-wire netlink bytes must carry it too (that is what udevd and
+    // the monitor actually parse).
+    let bytes = ev.to_netlink_bytes();
+    if bytes.windows(synth.len()).all(|w| w != synth.as_bytes()) {
+        return TestResult::Fail("netlink bytes lack SYNTH_UUID= record");
+    }
+
+    // A plain `udevadm trigger` write ("change") carries no SYNTH_UUID.
+    let mut reader2 = UeventReader::new();
+    kobject_emit_uevent_from_write(&kobj, b"change");
+    if let Some(ev) = reader2
+        .drain(10)
+        .iter()
+        .find(|e| e.action == UeventAction::Change && e.devpath.contains("card0"))
+    {
+        if ev.to_text().contains("SYNTH_UUID=") {
+            return TestResult::Fail("a plain 'change' write must not synthesize a SYNTH_UUID");
+        }
+    }
+
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("uevent_e2e", smoke_uevent_synth_uuid_round_trip);
