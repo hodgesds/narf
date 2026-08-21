@@ -30,10 +30,25 @@ those — it is the glue, not the signal source.
 ### 3.1 Core executor API
 
 ```rust
-pub fn spawn<F: Future<Output=()> + Send + 'static>(f: F, domain: DomainId) -> TaskId;
-pub fn spawn_with(f: impl Future<Output=()>, domain: DomainId, spec: TaskSpec) -> TaskId;
+pub fn spawn<F: Future<Output=()> + Send + 'static>(f: F) -> TaskId;
+pub fn spawn_with_spec(
+    f: impl Future<Output=()> + Send + 'static,
+    spec: TaskSpec,
+) -> TaskId;
+pub fn spawn_stackful_with_spec(
+    f: impl Future<Output=()> + Send + 'static,
+    spec: TaskSpec,
+    options: StackfulOptions,
+) -> TaskId;
+pub fn spawn_user(
+    id: TaskId,
+    f: impl Future<Output=()> + Send + 'static,
+    spec: TaskSpec,
+    address_space: Arc<AddressSpace>,
+) -> TaskId;
 pub fn yield_now() -> impl Future<Output=()>;
-pub fn donate_to(task: TaskId) -> impl Future<Output=()>; // direct context transfer
+pub fn donate_to(task: TaskId, cap: &Cap<Task, Invoke>)
+    -> Result<(), DonateError>;
 pub fn set_task_mems_allowed(task: u64, mask: u64);
 pub fn task_mems_allowed(task: u64) -> u64;
 pub fn clear_task_mems_allowed(task: u64);
@@ -52,8 +67,14 @@ pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 ```
 
-Executor internals: per-CPU queues + global stealing pool; each task
-carries `DomainId` so the executor switches domain before polling.
+Executor internals are per-CPU queues plus global stealing. The specified
+design requires every task to carry `DomainId` plus architecture-neutral
+`DomainSavedState`, with the executor switching domain before polling. The
+current `TaskSlot` carries an opaque architecture-neutral state and switches it
+at cooperative poll boundaries. Trap-entry neutralisation and
+first-instruction restore inside involuntary/direct context transfer remain
+mandatory gaps. The state remains executor-private and is intentionally absent
+from the policy interface.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
 allocation boundary and removes it when the task exits or detaches.
@@ -76,13 +97,142 @@ preemption path retains the task's live trap frame, FPU state, address space,
 TLS base, and dedicated kernel-stack continuation across requeue, so a
 syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
 Their CPL0 syscall continuations remain run-to-completion except at explicit
-park/yield points. NARF does not yet have a Linux-style per-task preempt-disable
-counter, so enabling arbitrary CPL0 timer preemption for user tasks would make
-lock-bearing kernel continuations migratable and could strand shared state.
+park/yield points. NARF now has a nestable CPU-local `preempt_disable()` guard,
+but syscall/driver critical regions have not completed the adoption audit;
+enabling arbitrary CPL0 timer preemption before that would still make an
+unannotated lock-bearing continuation migratable and could strand shared state.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Ordinary background task polls deliberately do not advance it: scheduler churn
 must not hide a foreground task that has stopped making useful progress.
+
+#### 3.1.1 Pluggable scheduling policy
+
+Scheduling policy may be implemented in a separate `no_std` crate using only
+the public interface below:
+
+```rust
+pub trait Scheduler: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+    fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>)
+        -> Option<TaskHandle>;
+    fn on_install(&self) { }
+    fn on_cpu_attach(&self, cpu: CpuId) { }
+    fn on_cpu_detach(&self, cpu: CpuId) { }
+    fn on_task_queue_event(&self, cpu: CpuId, event: TaskQueueEvent) { }
+    fn on_uninstall(&self) { }
+    fn on_cpu_state_change(&self, cpu: CpuId, change: CpuStateChange) { }
+}
+
+pub struct TaskMeta {
+    pub id: TaskId,
+    pub work_kind: WorkKind,
+    pub class: SchedClass,
+    pub priority: Priority,
+    pub deadline_cycles: Option<u64>,
+    pub budget: ResourceBudget,
+    pub account: BudgetAccount,
+    pub budget_state: BudgetView,
+    pub runnable: bool,
+    pub affinity: Affinity,
+    pub addr_space: bool,
+}
+
+pub enum WorkKind { UserThread, KernelThread, AsyncTask, SoftIrq, Idle }
+pub enum SchedClass { Idle, Batch, Default, Interactive, Realtime }
+pub enum TaskEnqueueReason { Admitted, Requeued, Migrated, PolicyReplacement }
+pub enum TaskDequeueReason { Selected, Migrated, PolicyReplacement }
+pub enum TaskQueueEvent {
+    Enqueued { task: TaskMeta, reason: TaskEnqueueReason },
+    Dequeued { task: TaskMeta, reason: TaskDequeueReason },
+}
+pub enum CpuState { Offline, Starting, Active, Idle, Draining }
+pub struct CpuStateChange {
+    pub previous: CpuState,
+    pub current: CpuState,
+    pub idle: Option<CpuIdleMeta>,
+}
+pub struct CpuIdleMeta {
+    pub queued: usize,
+    pub parked: usize,
+    pub throttled: usize,
+    pub borrowable: usize,
+    pub next_budget_replenishment: Option<u64>,
+}
+```
+
+`RunQueue` is a read-only, callback-scoped projection. It exposes queue length,
+the first opaque handle, and iteration over `(TaskHandle, TaskMeta)` snapshots;
+it never exposes `TaskSlot`, futures, saved domain state, stacks, queue locks,
+or context-switch entry points. A policy returns only an opaque handle. The
+executor validates that the handle is still queued and in the highest available
+eligibility tier, then performs removal itself. `None`, a stale handle, or an
+ineligible handle falls back to the first eligible core-owned slot. When no
+slot is dispatchable, the core may detach one slot only for cap/affinity
+maintenance and rechecks its budget before polling. A faulty policy therefore
+cannot detach, duplicate, lose, run throttled work, or strand a task.
+
+Each CPU has a local publication slot containing a generation-stamped reference
+to the active policy. Dispatch takes no global policy lock and performs no
+shared `Arc` reference-count write; it touches only the CPU-local policy slot
+and run queue. `pick_next` executes with both local locks held and therefore
+must not allocate, sleep, re-enter the scheduler, or acquire an IRQ-contended
+lock.
+
+`on_task_queue_event` is the task-control lifecycle boundary. `Enqueued` means
+the copied task is now in that CPU policy's selectable set; `Dequeued` means it
+has left that set for selection or migration. The callback is serialized with
+`pick_next` under the same CPU-local policy/run-queue lock order, so a policy
+never observes selection before enqueue. It is a bounded hot-path callback and
+must not allocate, sleep, re-enter the scheduler, or acquire an IRQ-contended
+lock. Runnable/wake changes remain visible in authoritative `RunQueue`
+snapshots rather than invoking arbitrary policy code from a waker or IRQ.
+
+Policy replacement is a first-class rolling operation ordered by an atomic
+generation ticket. `on_install` runs once before publication;
+`on_cpu_attach(cpu)` runs before that CPU can enter the new policy. Replacement
+of a CPU slot waits for its in-flight callback to return, publishes the new
+complete instance, then calls the old policy's `on_cpu_detach(cpu)` outside the
+slot lock. `on_uninstall` runs once when the last CPU/reference releases the old
+instance. A completed, non-concurrent `install_scheduler` call has processed
+every CPU slot. During the bounded rolling interval, different CPUs may use old
+and new policies, but one dispatch never mixes them. Task slots, runnable state,
+budget/debt, affinity, and switch/domain state stay core-owned, so policy
+replacement neither migrates nor reconstructs task execution state. Stateful
+policies receive `Dequeued(PolicyReplacement)` on the old instance and
+`Enqueued(PolicyReplacement)` on the new instance for every task queued during
+the CPU-local cutover. A task already executing left the old policy at
+selection; if it returns `Pending`, its later requeue enters whichever policy
+is then active. This makes task-control events balanced without stopping CPUs.
+Install/CPU lifecycle callbacks may allocate, but task queue callbacks may not;
+none may recursively install a policy.
+Concurrent installers are ordered by generation: the newest issued generation
+wins every CPU slot, and an older overlapping caller returns
+`SchedulerError::Superseded` if that newer ticket existed at its completion
+linearization point. Superseded instances still receive balanced detach and
+uninstall callbacks; callers may retry with a newly constructed policy.
+
+`on_cpu_state_change` is an edge-triggered observation delivered after relevant
+run-queue/lifecycle locks are released. `Idle` includes copied queue and budget
+state; other transitions carry `idle: None`. The callback may update bounded,
+nonblocking policy telemetry, but does not grant authority over hot-plug,
+stealing, clockevents, architecture halt, or power state.
+
+A separate crate is an API and build boundary, not a protection boundary. The
+core remains safe against a returned stale/invalid choice, but a policy that
+loops forever can deny service on the calling CPU. Policy implementations are
+therefore trusted for availability and require TCB-grade review until policy
+execution is moved behind a protected-domain/RPC boundary.
+
+Budget and accounting values in `TaskMeta` are immutable copies for policy
+ranking. Budget-cap liveness checks, elapsed-time charging, donation settlement,
+throttling, task removal, and accounting attribution remain executor-owned.
+In particular, `WorkKind` is descriptive policy input and never substitutes for
+a capability, process/cgroup identity, domain id, or IRQ-source identity.
+Hard IRQ/NMI execution is not a schedulable `WorkKind`; hard-IRQ entry/exit is
+charged to per-CPU counters and subtracted from task dispatch time, while
+deferred interrupt work uses `SoftIrq`. The same public guard exists for NMI;
+architecture NMI/FIQ entry wiring remains a gate.
 
 ### 3.2 CPU topology
 
@@ -115,10 +265,13 @@ pub struct CpuInfo { pub id: CpuId, pub node: NumaNodeId, pub smt_sibling_of: Op
 ```rust
 pub struct Affinity { pub allowed: CpuSet, pub preferred: Option<CpuId> }
 pub struct TaskSpec {
-    pub affinity:  Affinity,
-    pub budget:    Option<ResourceBudget>,    // see §3.4
-    pub smt_share: SmtSharePolicy,            // None | Allow | Require
-    pub priority:  Priority,                  // tentative
+    pub affinity: Affinity,
+    pub budget: ResourceBudget,
+    pub budget_cap: Option<Cap<CpuBudget, Spend>>,
+    pub work_kind: WorkKind,
+    pub class: SchedClass,
+    pub priority: Priority,
+    pub smt: SmtSharePolicy,
 }
 ```
 
@@ -147,40 +300,116 @@ pub struct TaskSpec {
 
 ```rust
 pub struct ResourceBudget {
-    pub share_ppm: u32,               // parts-per-million of a CPU
-    pub burst_ns:  u32,               // how long a task may exceed its share
-    pub deadline:  Option<Deadline>,  // absolute wake deadline for realtime-ish
+    pub share_ppm: u32,                  // parts-per-million of a CPU
+    pub burst_cycles: u64,               // contiguous-poll burst allowance
+    pub deadline_cycles: Option<u64>,    // absolute monotonic-cycle deadline
+    pub policy: OverrunPolicy,
+    pub period: Option<PeriodBudget>,
+}
+pub struct PeriodBudget {
+    pub runtime_cycles: u64,
+    pub period_cycles: u64,
+    pub max_borrow_cycles: u64,
+    pub exhaustion: ExhaustionPolicy,     // Strict | IdleBorrow
+}
+pub struct BudgetView {
+    pub eligibility: BudgetEligibility,   // Eligible | Borrowable | Throttled
+    pub remaining_cycles: u64,
+    pub replenish_at_cycles: Option<u64>,
+    pub borrowed_cycles: u64,
+    pub debt_cycles: u64,
 }
 pub type CpuBudgetCap = Cap<CpuBudget, Spend>;
+pub fn spawn_realtime<F>(f: F, spec: TaskSpec, authority: &CpuBudgetCap)
+    -> Result<TaskId, AdmissionError>;
+pub fn spawn_realtime_with_options<F>(f: F, spec: TaskSpec,
+    authority: &CpuBudgetCap, options: StackfulOptions)
+    -> Result<TaskId, AdmissionError>;
+pub fn realtime_bandwidth(cpu: CpuId) -> RealtimeBandwidth;
 ```
 
-- A task holding a `CpuBudgetCap` is charged for every ns it runs.
-  Running past the budget either blocks the task (default) or raises
-  a `tracing/` event and continues at degraded priority
-  (`OverrunPolicy::Degrade`).
-- Budget caps are **revocable** like any cap; revocation causes the
-  scheduler to stop picking that task until a replacement cap arrives.
-- Fair-share between domains is implemented by assigning each domain
-  a root budget cap from which per-task caps are derived.
+- `burst_cycles` and `OverrunPolicy` govern an individual dispatch that runs
+  too long (`Throttle`, `Demote`, `Kill`, or `Ignore`). `PeriodBudget` governs
+  aggregate runtime across dispatches and is authoritative when present.
+- The executor initialises a period on first dispatch, deducts actual elapsed
+  cycles after every poll/switch-back, and advances an expired replenishment
+  boundary without looping once per missed period. Unused runtime does not
+  accumulate.
+- `Strict` makes an exhausted task ineligible until replenishment, even if the
+  CPU would otherwise idle. `IdleBorrow` exposes a lower `Borrowable` tier:
+  bounded idle capacity may run only when no `Eligible` work exists and is
+  retained as debt against later replenishment.
+- Cooperative/non-preemptible overshoot is also debt. It is not silently
+  forgiven at the next boundary.
+- Before a stackful switch-in, the core publishes soft and hard budget
+  ends and arms the clockevent. At the soft end, an idle borrower resumes the
+  same continuation when no competitor exists, avoiding a switch to idle and
+  back. A competitor wake makes it preemptible at the next tick; the hard end
+  or period boundary always switches.
+- Policy receives `BudgetView` by value. It can rank eligible tasks but cannot
+  replenish runtime, modify debt, or make `Throttled` work runnable. Core-side
+  validation enforces `Eligible` before `Borrowable` regardless of policy.
+- Budget caps are **revocable** like any cap; revocation causes the executor
+  to reap the task at the next cap check.
+- Realtime admission reserves the ceiling-rounded `runtime/period` utilization
+  atomically against the selected CPU, the online system, and the
+  `CpuBudget` capability-object domain. A conservative hash collision may
+  reject admission but can never permit overcommit. Five percent of each CPU
+  remains outside RT reservations for IRQ and kernel progress.
+- Admitted RT tasks are pinned to their admission CPU; affinity mutation
+  returns `RealtimePinned`. Generic `spawn_with_spec` and `spawn_user` demote a
+  bare `Realtime` label to `Default`, so policy metadata cannot mint service.
 - Driver domains typically carry a `share_ppm` large enough that they
   never hit the cap; the mechanism is there to *limit* misbehaving
   tasks, not to micro-manage well-behaved ones.
+- `share_ppm` is descriptive unless a consistent `PeriodBudget` is attached;
+  `runtime_cycles/period_cycles` is the enforcement source of truth.
+- Stackless futures remain bounded only at cooperative poll returns. Stackful
+  kernel tasks are tick-preemptive on both architectures; x86_64 additionally
+  supports own-stack CPL3 preemption. NMI/FIQ entry accounting and aarch64 EL0
+  own-stack handoff remain incomplete.
 
 ### 3.5 CPU hot-plug
 
 ```rust
 pub fn cpu_online(id: CpuId) -> bool;
-pub fn cpu_bring_up(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> Result<(), HotPlugError>;
-pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Future<Output=()>;
+pub fn cpu_state(id: CpuId) -> CpuState;
+pub fn cpu_bring_up(id: CpuId, cap: &Cap<CpuLifecycle, Invoke>)
+    -> Result<(), HotPlugError>;
+pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Invoke>)
+    -> Result<(), HotPlugError>;
 ```
 
-- Bring-up: `arch/` sends the startup IPI / `PSCI CPU_ON`; the new CPU
-  joins the per-CPU run-queue set atomically.
-- Take-offline: mark the CPU non-schedulable; migrate queued tasks
-  with compatible affinity to other CPUs; drain; park the CPU via
-  `HLT` / `WFI` loop. Undoes cleanly with `cpu_bring_up`.
+- The implementation publishes `Draining` and waits for a target-CPU
+  between-polls acknowledgement before inspecting its queue. The target's
+  run loop cannot overwrite a lifecycle state with a late Active/Idle edge and
+  remains logically parked while Draining/Offline. A bounded acknowledgement
+  timeout or a pinned task returns `HotPlugError::Busy`; otherwise the core
+  migrates the queue without holding source and destination locks together
+  before publishing `Offline`.
+- Architecture startup (`INIT-SIPI-SIPI` / `PSCI CPU_ON`) and physical park are
+  integration gates. Logical queue drain completion is not proof firmware has
+  powered the CPU down.
 - Used by `power/` (when that lands) for suspend/resume and by
   stress testing in `verification/`.
+
+Frequency control is deliberately not part of `Scheduler`. Scheduling classes
+express ordering, deadlines, and latency intent; the core publishes CPU/load
+observations; a separately capability-gated `power/` governor owns DVFS and
+must enforce thermal and platform constraints. An external scheduler policy
+therefore cannot write P-states or architecture frequency registers.
+
+```rust
+pub fn cpu_demand(cpu: CpuId) -> CpuDemand;
+pub fn interrupt_account_enter(kind: InterruptKind) -> InterruptAccountGuard;
+pub fn preempt_disable() -> PreemptGuard;
+pub fn preempt_count() -> u32;
+```
+
+`CpuDemand` reads only one CPU-local queue and copied/atomic counters. It
+reports runnable work-kind counts, RT reservation, next deadline, state, and
+cumulative hard-IRQ/NMI cycles. It is a governor input, never a frequency
+control callback.
 
 ## 4. Invariants & safety properties
 
@@ -210,23 +439,28 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
   it sees either the old CPU or a new CPU; never a torn migration.
 - Resource-budget accounting is never racy: a task that exceeds its
   budget cannot cause a refund to another task.
+- A policy cannot override budget eligibility. Regular eligible work always
+  outranks idle-borrow work, and strict-throttled work cannot be polled before
+  replenishment.
+- Idle borrowing is bounded and accounted as debt. It may save a context
+  switch only while no competing eligible work exists.
 - A task-scoped PMU event is active only between its matching switch-in and
   switch-out hook calls. The hook must stop and fold the current CPU's counter
   before the executor or another task runs.
 - **PKRS / TCF save/restore is the scheduler's responsibility.** On
-  every preemption the executor calls
-  `memory::save_domain_state(&mut task.domain_saved)` before touching
+  every cooperative poll return the executor calls
+  `memory::save_domain_state()` before touching
   any executor-local state. On every resume it calls
-  `memory::restore_domain_state(&task.domain_saved)` **before** the
+  `memory::restore_domain_state(&task.domain_saved)` before the
   first instruction of the resumed task executes. No memory access in
   the new task's domain is allowed before the restore. Without this,
-  every preemption is a TOCTOU window on domain rights.
-- **Direct context transfer restores the callee's domain state before
-  its first instruction.** The `donate_to` path, with interrupts
-  disabled, saves the caller's `DomainSavedState`, restores the
-  callee's, and only then branches into the callee. A `WRMSR
-  IA32_PKRS` on x86_64 or the equivalent TCF write on aarch64 is part
-  of the transfer's critical section.
+  every preemption is a TOCTOU window on domain rights. Involuntary switch and
+  trap-prologue completion remains an explicit gate; this invariant must not
+  be inferred merely from cooperative poll coverage.
+- A future true direct-transfer primitive must restore the callee's domain
+  state before its first instruction. Today's `donate_to` only moves budget
+  credit and queue position; it does not branch directly to the donee and must
+  not be described as satisfying this future invariant.
 - **A task never polls across an await with a `ReadGuard` held
   (except sleepable-RCU guards).** The executor's `report_quiescent`
   hook relies on poll-boundary release; holding a non-sleepable guard
@@ -258,9 +492,10 @@ pub fn cpu_take_offline(id: CpuId, cap: &Cap<CpuLifecycle, Manage>) -> impl Futu
   PSCI), `frame/` (enter_domain), `memory/` (task storage + NUMA-local
   per-CPU storage), `interrupts/` (timer IRQ, reschedule IPI),
   `capabilities/` (Stage 3 donation check; affinity and budget caps),
-  `time/` (deadlines), `power/` (EnergyAware governor feedback).
+  `time/` (deadlines), `power/` (thermal/capacity feedback; never direct
+  frequency-register access from scheduling policy).
 - **Provides to:** every other subsystem (anything async); `power/`
-  (CPU hot-plug lifecycle for suspend/resume, load snapshot for DVFS);
+  (CPU lifecycle and read-only demand/state observations for DVFS decisions);
   `rcu/` (`report_quiescent` hook at each poll boundary).
 
 ## 7. Stage assignment
@@ -308,10 +543,10 @@ Interactive preempts Default …).
 
 ### 8.3 Driver-domain vs user-task fairness (resolved)
 
-**Decision:** **per-domain budget caps**. Each `DomainId`
-gets a budget pool (configurable at boot, manifest-overridable
-per driver). Tasks attribute CPU to their domain; a
-spendthrift domain is throttled, not its individual tasks.
+**Decision:** **per-domain budget caps**. This is the aggregation target, not
+yet an implemented root-pool mechanism. Each `DomainId` will get a budget pool
+(configurable at boot and manifest-overridable per driver). Tasks attribute CPU
+to their domain; a spendthrift domain is throttled, not its individual tasks.
 
 Default budgets:
 - `DOMAIN_FRAME / CAPS / MEMORY_MGR` — uncapped (TCB).
@@ -337,33 +572,36 @@ Scheduler policy:
 
 ### 8.5 Gang scheduling (resolved)
 
-**Decision (was open):** **no gang scheduling**. Direct
-context transfer (`donate_to`) handles the IPC-pair case
-adequately and avoids the complexity of multi-CPU
-coordinated dispatch. Producer-consumer pairs that benefit
-from cache-locality express it via affinity hints, not gang.
+**Decision (was open):** **no gang scheduling**. The current `donate_to`
+operation transfers bounded budget credit and moves an already queued donee
+to the head of its core-owned queue; it does not branch directly to the donee.
+This covers the present IPC-pair priority-inheritance case without multi-CPU
+coordinated dispatch. A future true direct-transfer fast path remains subject
+to the first-instruction domain-restore gate in §4. Producer-consumer pairs
+that benefit from cache locality express it via affinity hints, not gang.
 
 Revisit if profiling shows specific pairs that lose >10% to
 inter-CPU cache misses.
 
 ### 8.6 Realtime class shape (resolved)
 
-**Decision:** **fixed-priority with deadline annotations**,
-not full SCHED_DEADLINE. RT tasks declare:
+**Decision:** **fixed-priority with deadline annotations and core-owned
+period bandwidth**, not a claim of full Linux `SCHED_DEADLINE`. RT tasks use:
 
 ```rust
-pub struct RtSpec {
-    pub priority: u8,               // 0..=63 (RT range)
-    pub deadline_us: Option<u32>,   // soft hint; not enforced
-    pub period_us:   Option<u32>,   // for periodic tasks
-}
+TaskSpec::realtime_periodic(runtime_cycles, period_cycles, deadline_cycles)
 ```
 
-The deadline is a hint to `power/` for DVFS decisions and to
-the scheduler for tie-breaking among same-priority RT tasks.
-True deadline-bounded RT requires hardware support and a
-carefully designed energy model that we're not attempting in
-v1.
+The deadline orders equal-priority realtime tasks. Runtime/period is strictly
+enforced by the core. `spawn_realtime` requires a live
+`Cap<CpuBudget, Spend>`, ceiling-rounds utilization, and atomically reserves it
+against CPU, online-system, and capability-object-domain ceilings before the
+task becomes visible. The admitted task is CPU-pinned and retains an RAII
+reservation until its slot is destroyed. A label supplied through a generic
+spawn path is demoted to `Default`; only successful admission establishes RT
+service. This provides bounded fixed-priority periodic service, but does not
+yet promise Linux `SCHED_DEADLINE`-style deadline-miss guarantees or
+transactional RT migration.
 
 ### 8.7 CPU hot-plug PKS coherence (resolved)
 
@@ -386,15 +624,27 @@ coherent domain-rights state from the first instruction.
 ## 9. ABI versioning
 
 `scheduler/` exports through SDK at `@v0`:
-- `spawn`, `spawn_with_spec`, `spawn_user`.
+- `spawn`, `spawn_with_spec`, `spawn_stackful_with_spec`, `spawn_user`.
 - `run_until_empty`, `yield_now`.
+- `Scheduler`, `RunQueue`, `TaskHandle`, `TaskMeta`, `WorkKind`, `SchedClass`,
+  `TaskQueueEvent`, `TaskEnqueueReason`, `TaskDequeueReason`, `CpuState`,
+  `CpuStateChange`, `CpuIdleMeta`, `cpu_state`.
+- `ResourceBudget`, `PeriodBudget`, `BudgetView`, `BudgetEligibility`.
+- `spawn_realtime`, `spawn_realtime_with_options`, `AdmissionError`,
+  `RealtimeBandwidth`, `realtime_bandwidth`.
+- `CpuDemand`, `cpu_demand`, `InterruptKind`, `interrupt_account_enter`.
+- `PreemptGuard`, `preempt_disable`, `preempt_count`.
 - `Cap<Task, _>`, `Cap<CpuBudget, _>`.
 
 Task waking and IRQ integration follows
 `interrupts/spec` §8 (`wait_for_irq`'s waker contract).
 
-`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 0`.
+`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 2`.
 
-## 10. Open questions
+## 10. Open implementation gates
 
-(none — all v0.3 questions resolved in §8)
+- Trap-entry neutralisation and first-instruction domain restore for every
+  involuntary/direct-transfer boundary.
+- Aarch64 EL0 own-stack handoff and preemption.
+- Adoption audit for arbitrary CPL0 user-continuation preempt guards.
+- NMI/FIQ entry wiring and a bounded softirq execution policy.

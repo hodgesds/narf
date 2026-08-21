@@ -75,5 +75,8 @@ pub(crate) fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
         Err(narf_scheduler::SetAffinityError::NoOnlineCpu) => {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         }
+        Err(narf_scheduler::SetAffinityError::RealtimePinned) => {
+            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // EBUSY
+        }
     }
 }

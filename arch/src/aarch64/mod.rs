@@ -13,6 +13,7 @@ pub mod ete;
 pub mod gcs;
 pub mod gits;
 pub mod ident;
+pub mod kernel_ctx;
 pub mod lse;
 pub mod mmio;
 pub mod mpam;

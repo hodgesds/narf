@@ -31,6 +31,7 @@ pub mod compress;
 pub mod compressed_ramdisk;
 pub mod context;
 pub mod diag;
+pub mod domain_state;
 pub mod frame;
 pub mod heap;
 pub mod heap_backend;
@@ -84,6 +85,7 @@ pub use addr::{
     KERNEL_DIRECT_MAP_PML4_SLOTS,
 };
 pub use addr::{PhysAddr, VirtAddr};
+pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState};
 
 #[cfg(feature = "cgroup")]
 pub use cgroup_charge::{

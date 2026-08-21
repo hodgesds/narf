@@ -10,11 +10,12 @@
 //! lands, the state machine here is correct-by-construction but not
 //! load-bearing.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, NoopOp};
 
 use crate::affinity::CpuId;
+use crate::policy::{self, CpuState};
 
 /// Cap-type marker for the CPU hot-plug surface. `Cap<CpuLifecycle,
 /// narf_capabilities::Invoke>` is the authority required by
@@ -31,6 +32,16 @@ impl CapType for CpuLifecycle {
 /// Online-state bitmap. Bit `i` set = CPU `i` is currently online.
 /// Capped at 64 CPUs — same ceiling as `CpuSet`.
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(1); // CPU 0 always starts online
+static DRAIN_QUIESCED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Target-CPU acknowledgement that its executor is between polls and will not
+/// select more work until the lifecycle state returns to Active.
+pub(crate) fn acknowledge_drain(cpu: usize) {
+    if let Some(ack) = DRAIN_QUIESCED.get(cpu) {
+        ack.store(true, Ordering::Release);
+    }
+}
 
 /// Errors returned by the CPU lifecycle surface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -41,6 +52,8 @@ pub enum HotPlugError {
     OutOfRange,
     /// CPU is already in the requested state.
     NoChange,
+    /// A running or pinned task prevents a lossless queue drain.
+    Busy,
 }
 
 impl From<CapError> for HotPlugError {
@@ -85,6 +98,12 @@ pub fn cpu_bring_up(
     if prev & bit != 0 {
         Err(HotPlugError::NoChange)
     } else {
+        if let Some(ack) = DRAIN_QUIESCED.get(id as usize) {
+            ack.store(false, Ordering::Release);
+        }
+        policy::notify_cpu_state(cpu, CpuState::Starting, None);
+        policy::notify_cpu_state(cpu, CpuState::Active, None);
+        crate::resched_remote(id);
         Ok(())
     }
 }
@@ -106,16 +125,44 @@ pub fn cpu_take_offline(
         return Err(HotPlugError::OutOfRange);
     }
     let bit = 1u64 << id;
-    let prev = ONLINE_MASK.fetch_and(!bit, Ordering::AcqRel);
-    if prev & bit == 0 {
-        Err(HotPlugError::NoChange)
-    } else {
-        Ok(())
+    if ONLINE_MASK.load(Ordering::Acquire) & bit == 0 {
+        return Err(HotPlugError::NoChange);
     }
+    if id as usize == narf_lib::percpu::current_cpu() {
+        return Err(HotPlugError::Busy);
+    }
+    DRAIN_QUIESCED[id as usize].store(false, Ordering::Release);
+    policy::notify_cpu_state(cpu, CpuState::Draining, None);
+    crate::resched_remote(id);
+
+    // A logically-created CPU in a UP test has no executor to acknowledge.
+    // A physical online CPU must cross the between-polls barrier before its
+    // queue can be inspected or moved. Bound the wait so a non-preemptible or
+    // wedged target fails closed as Busy instead of hanging hotplug forever.
+    let physical = narf_lib::smp::is_online(id);
+    let deadline = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(100_000_000));
+    while physical && !DRAIN_QUIESCED[id as usize].load(Ordering::Acquire) {
+        if narf_time::now_cycles() >= deadline {
+            policy::notify_cpu_state(cpu, CpuState::Active, None);
+            return Err(HotPlugError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+    if crate::cpu_running_task(cpu) || !crate::drain_cpu_queue(cpu) {
+        policy::notify_cpu_state(cpu, CpuState::Active, None);
+        return Err(HotPlugError::Busy);
+    }
+    ONLINE_MASK.fetch_and(!bit, Ordering::AcqRel);
+    policy::notify_cpu_state(cpu, CpuState::Offline, None);
+    Ok(())
 }
 
 /// Test helper: reset online-mask to boot state (CPU 0 only).
 #[doc(hidden)]
 pub fn __test_reset_online_mask() {
     ONLINE_MASK.store(1, Ordering::Release);
+    for ack in &DRAIN_QUIESCED {
+        ack.store(false, Ordering::Release);
+    }
+    policy::__reset_cpu_states_for_test();
 }

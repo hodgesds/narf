@@ -519,14 +519,16 @@ impl<T> SlabCache<T> {
 pub fn kalloc(size: usize, align: usize, domain: DomainId) -> Option<NonNull<u8>>;
 pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 
-// Task-context PKRS state, owned by scheduler/ but defined here
-// because memory/ owns domain-rights semantics. See §4.
+// Task-context domain state. Its architecture representation is private so
+// scheduler policies cannot manufacture or directly switch rights state.
 pub struct DomainSavedState {
-    pub pkrs: u64,        // x86_64 IA32_PKRS snapshot
-    pub current_domain: DomainId,
-    pub mte_tcf: u8,      // aarch64 TCF mode snapshot (sync/async/off)
+    /* private architecture state */
 }
-pub fn save_domain_state(out: &mut DomainSavedState);
+impl DomainSavedState {
+    pub fn current_domain(&self) -> DomainId;
+    pub fn is_active(&self) -> bool;
+}
+pub fn save_domain_state() -> DomainSavedState;
 pub fn restore_domain_state(s: &DomainSavedState);
 ```
 

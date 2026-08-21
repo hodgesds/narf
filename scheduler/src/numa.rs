@@ -12,14 +12,21 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// No cgroup constraint: all node bits accepted by the memory layer.
 pub const ALL_NUMA_NODES: u64 = u64::MAX;
 
-static TASK_MEMS_ALLOWED: IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> = IrqSafeSpinLock::new(None);
+const NEW_MEMS_SHARD: IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> = IrqSafeSpinLock::new(None);
+static TASK_MEMS_ALLOWED: [IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>;
+    narf_lib::percpu::MAX_CPUS] = [NEW_MEMS_SHARD; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn shard(task: u64) -> usize {
+    task as usize % narf_lib::percpu::MAX_CPUS
+}
 
 /// Set the hard NUMA-node mask for `task`.
 ///
 /// An empty mask means unconstrained/inherit and is normalized to all nodes.
 pub fn set_task_mems_allowed(task: u64, mask: u64) {
     let allowed = if mask == 0 { ALL_NUMA_NODES } else { mask };
-    TASK_MEMS_ALLOWED
+    TASK_MEMS_ALLOWED[shard(task)]
         .lock()
         .get_or_insert_with(BTreeMap::new)
         .insert(task, allowed);
@@ -27,7 +34,7 @@ pub fn set_task_mems_allowed(task: u64, mask: u64) {
 
 /// Return the hard NUMA-node mask for `task`.
 pub fn task_mems_allowed(task: u64) -> u64 {
-    TASK_MEMS_ALLOWED
+    TASK_MEMS_ALLOWED[shard(task)]
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
@@ -36,7 +43,7 @@ pub fn task_mems_allowed(task: u64) -> u64 {
 
 /// Remove a task's stored NUMA constraint at detach/exit.
 pub fn clear_task_mems_allowed(task: u64) {
-    if let Some(m) = TASK_MEMS_ALLOWED.lock().as_mut() {
+    if let Some(m) = TASK_MEMS_ALLOWED[shard(task)].lock().as_mut() {
         m.remove(&task);
     }
 }

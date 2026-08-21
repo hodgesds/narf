@@ -88,9 +88,9 @@ pub trait StealStrategy: Send + Sync + 'static {
     /// (xAPIC fallback) user tasks stay BOOT-pinned and this floor is
     /// belt-and-suspenders. Either way, respect the affinity mask so
     /// pinned tasks are never stolen across their pins. Custom impls
-    /// may broaden the affinity rule (e.g. ignore affinity for a
-    /// throughput-only workload) or narrow it (e.g. only steal
-    /// SchedClass::Normal tasks).
+    /// may broaden the strategy preference (the dispatcher still enforces
+    /// hard affinity before execution) or narrow it (e.g. only steal
+    /// `SchedClass::Default` tasks).
     fn allow_steal(&self, thief: CpuId, task: &TaskMeta) -> bool {
         if task.addr_space && !crate::user_task_smp_enabled() {
             return false;
@@ -213,8 +213,13 @@ impl StealStrategy for RandomSteal {
 /// can `clone()` out of the slot O(1) and drop the slot lock before
 /// taking any `READY[victim]` lock — see the lock-discipline comment
 /// at the top of the module.
-pub(crate) static STEAL: IrqSafeSpinLock<Option<Arc<dyn StealStrategy>>> =
-    IrqSafeSpinLock::new(None);
+static STEAL: [IrqSafeSpinLock<Option<Arc<dyn StealStrategy>>>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn local_slot() -> &'static IrqSafeSpinLock<Option<Arc<dyn StealStrategy>>> {
+    &STEAL[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
 
 /// Install a steal strategy. Cap-gated on `Cap<Steal, Grant>`.
 /// Replaces the previous active strategy; the displaced `Arc` is
@@ -225,15 +230,17 @@ pub fn install_steal_strategy<S: StealStrategy>(
     s: S,
 ) -> Result<(), StealError> {
     cap.check_live()?;
-    let mut slot = STEAL.lock();
-    *slot = Some(Arc::from(Box::new(s) as Box<dyn StealStrategy>));
+    let replacement: Arc<dyn StealStrategy> = Arc::from(Box::new(s) as Box<dyn StealStrategy>);
+    for slot in &STEAL {
+        *slot.lock() = Some(replacement.clone());
+    }
     Ok(())
 }
 
 /// Snapshot the active steal strategy's name. Returns `None` if
 /// `init()` hasn't run yet.
 pub fn current_steal_strategy_name() -> Option<&'static str> {
-    let slot = STEAL.lock();
+    let slot = local_slot().lock();
     slot.as_ref().map(|s| s.name())
 }
 
@@ -241,9 +248,13 @@ pub fn current_steal_strategy_name() -> Option<&'static str> {
 /// installed. Idempotent — re-calling after an explicit
 /// `install_steal_strategy` is a no-op. Called from `crate::init`.
 pub(crate) fn install_default_if_unset() {
-    let mut slot = STEAL.lock();
-    if slot.is_none() {
-        *slot = Some(Arc::from(Box::new(NumaAwareSteal) as Box<dyn StealStrategy>));
+    let replacement: Arc<dyn StealStrategy> =
+        Arc::from(Box::new(NumaAwareSteal) as Box<dyn StealStrategy>);
+    for slot in &STEAL {
+        let mut slot = slot.lock();
+        if slot.is_none() {
+            *slot = Some(replacement.clone());
+        }
     }
 }
 
@@ -256,5 +267,5 @@ pub(crate) fn install_default_if_unset() {
 /// boot path); the caller treats that as "no steal".
 #[inline]
 pub(crate) fn snapshot() -> Option<Arc<dyn StealStrategy>> {
-    STEAL.lock().as_ref().cloned()
+    local_slot().lock().as_ref().cloned()
 }

@@ -1,21 +1,56 @@
 //! Task priority + scheduling class.
 //!
 //! Spec: `scheduler/specification/spec.md` §3.3 + §3.4.
-//! Stage-4 structural surface — the single-CPU executor does not yet
-//! act on priority, but the type discipline means task specs can
-//! carry their policy forward so the SMP dispatcher has a stable
-//! interface when it lands.
+//! The default `ClassScheduler` applies strict inter-class order and uses
+//! `Priority` within a class. Alternative policies receive these values as
+//! read-only metadata through the public policy interface.
 
-/// Scheduling class for a task. A `RealTime` task with a
-/// `ResourceBudget::deadline_cycles` receives strict earliest-deadline-
-/// first service from the Stage-4 dispatcher; `Normal` is work-preserving
-/// fair-share; `Idle` runs only when no other class has a runnable task.
+/// Linux-like scheduling-class order. Inter-class dispatch is strict:
+/// `Realtime` outranks `Interactive`, then `Default`, `Batch`, and `Idle`.
+/// Policy implementations may replace the ordering algorithm, but the core
+/// retains task ownership, eligibility checks, and context switching.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum SchedClass {
-    #[default]
-    Normal,
-    RealTime,
     Idle,
+    Batch,
+    #[default]
+    Default,
+    Interactive,
+    Realtime,
+}
+
+/// Kind of execution being accounted. This is descriptive scheduling
+/// metadata, not authority: the core assigns/validates attribution and charges
+/// hard-IRQ time outside the schedulable task model.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WorkKind {
+    UserThread,
+    KernelThread,
+    #[default]
+    AsyncTask,
+    SoftIrq,
+    Idle,
+}
+
+impl SchedClass {
+    /// Compatibility spelling retained for existing callers.
+    #[allow(non_upper_case_globals)]
+    pub const Normal: Self = Self::Default;
+    /// Compatibility spelling retained for existing callers.
+    #[allow(non_upper_case_globals)]
+    pub const RealTime: Self = Self::Realtime;
+
+    /// Strict inter-class ordering used by [`crate::ClassScheduler`].
+    #[inline]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Batch => 1,
+            Self::Default => 2,
+            Self::Interactive => 3,
+            Self::Realtime => 4,
+        }
+    }
 }
 
 /// Nice-style priority within a scheduling class. `0` is the default;

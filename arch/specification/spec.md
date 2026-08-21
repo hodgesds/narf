@@ -68,6 +68,16 @@ pub trait DomainPrimitive {
 
 pub enum DomainBackend { Pks, Mte }
 
+/// Architecture-owned continuation state used only by the executor core.
+/// Policy crates never receive this type or the switch entry point.
+#[cfg(target_arch = "aarch64")]
+pub struct aarch64::kernel_ctx::KernelContext { /* x19-x29, SP, PC, DAIF */ }
+#[cfg(target_arch = "aarch64")]
+pub unsafe extern "C" fn aarch64::kernel_ctx::kernel_switch(
+    out: *mut aarch64::kernel_ctx::KernelContext,
+    incoming: *const aarch64::kernel_ctx::KernelContext,
+);
+
 /// Current-CPU speculative-execution policy. Remote changes require an
 /// IPI/rendezvous that executes this function on the target CPU.
 pub enum speculation::Policy { Disabled, Protected }

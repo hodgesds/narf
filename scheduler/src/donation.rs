@@ -25,6 +25,7 @@
 //! before re-taking the queue lock.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -94,7 +95,7 @@ pub trait DonationPolicy: Send + Sync + 'static {
     /// back-of-queue") without re-plumbing the trait surface.
     fn enqueue_donee(
         &self,
-        queue: &mut RunQueue,
+        queue: &RunQueue<'_>,
         donor_meta: &TaskMeta,
         donee: TaskHandle,
     ) -> EnqueueDonee;
@@ -129,7 +130,7 @@ impl DonationPolicy for HeadQueueDonation {
 
     fn enqueue_donee(
         &self,
-        _queue: &mut RunQueue,
+        _queue: &RunQueue<'_>,
         _donor_meta: &TaskMeta,
         _donee: TaskHandle,
     ) -> EnqueueDonee {
@@ -155,7 +156,7 @@ impl DonationPolicy for BackQueueDonation {
 
     fn enqueue_donee(
         &self,
-        _queue: &mut RunQueue,
+        _queue: &RunQueue<'_>,
         _donor_meta: &TaskMeta,
         _donee: TaskHandle,
     ) -> EnqueueDonee {
@@ -177,8 +178,13 @@ pub const DEFAULT_CYCLE_CEILING: u64 = 1_000_000;
 /// `Box<dyn DonationPolicy>` slot. Init wires a `HeadQueueDonation`
 /// so behaviour out of the box matches the pre-Wave-E inline
 /// `push_front` + 1M-cycle cap byte-for-byte.
-pub(crate) static DONATION: IrqSafeSpinLock<Option<Box<dyn DonationPolicy>>> =
-    IrqSafeSpinLock::new(None);
+static DONATION: [IrqSafeSpinLock<Option<Arc<dyn DonationPolicy>>>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn local_slot() -> &'static IrqSafeSpinLock<Option<Arc<dyn DonationPolicy>>> {
+    &DONATION[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
 
 /// Install a donation policy. Cap-gated on `Cap<Donation, Grant>`.
 /// Replaces the previous active policy; the displaced `Box` is
@@ -188,15 +194,17 @@ pub fn install_donation_policy<D: DonationPolicy>(
     d: D,
 ) -> Result<(), DonationError> {
     cap.check_live()?;
-    let mut slot = DONATION.lock();
-    *slot = Some(Box::new(d));
+    let replacement: Arc<dyn DonationPolicy> = Arc::from(Box::new(d) as Box<dyn DonationPolicy>);
+    for slot in &DONATION {
+        *slot.lock() = Some(replacement.clone());
+    }
     Ok(())
 }
 
 /// Snapshot the active donation policy's name. Returns `None` if
 /// `init()` hasn't run yet.
 pub fn current_donation_policy_name() -> Option<&'static str> {
-    let slot = DONATION.lock();
+    let slot = local_slot().lock();
     slot.as_ref().map(|d| d.name())
 }
 
@@ -204,9 +212,13 @@ pub fn current_donation_policy_name() -> Option<&'static str> {
 /// yet installed. Idempotent — re-calling after an explicit
 /// `install_donation_policy` is a no-op. Called from `crate::init`.
 pub(crate) fn install_default_if_unset() {
-    let mut slot = DONATION.lock();
-    if slot.is_none() {
-        *slot = Some(Box::new(HeadQueueDonation));
+    let replacement: Arc<dyn DonationPolicy> =
+        Arc::from(Box::new(HeadQueueDonation) as Box<dyn DonationPolicy>);
+    for slot in &DONATION {
+        let mut slot = slot.lock();
+        if slot.is_none() {
+            *slot = Some(replacement.clone());
+        }
     }
 }
 
@@ -217,11 +229,11 @@ pub(crate) fn install_default_if_unset() {
 /// returning, so the caller is free to take the per-CPU queue lock
 /// without nesting.
 pub(crate) fn placement_and_ceiling(
-    queue: &mut RunQueue,
+    queue: &RunQueue<'_>,
     donor_meta: &TaskMeta,
     donee: TaskHandle,
 ) -> (EnqueueDonee, u64) {
-    let slot = DONATION.lock();
+    let slot = local_slot().lock();
     match slot.as_ref() {
         Some(p) => (
             p.enqueue_donee(queue, donor_meta, donee),
@@ -243,7 +255,7 @@ pub(crate) fn placement_and_ceiling(
 /// performed by the caller; this hook is informational. Falls back
 /// to a no-op when nothing is installed.
 pub(crate) fn notify_revoke(donor_meta: &TaskMeta, refund_cycles: u64) {
-    let slot = DONATION.lock();
+    let slot = local_slot().lock();
     if let Some(p) = slot.as_ref() {
         p.on_revoke(donor_meta, refund_cycles);
     }

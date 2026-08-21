@@ -511,6 +511,24 @@ argument = "User timer preemption remains inside the existing frame and schedule
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Procfs basic task snapshots now obtain only saturating allocation-free aggregate counters while holding the existing address-space region locks. The scan never transfers physical ownership or exposes frame addresses, counts a base page resident only when its authoritative physical slot is nonzero, and converts huge leaves to base-page equivalents without changing mappings. Detailed per-VMA NUMA data remains opt-in for maps/numa_maps; ordinary liveness and metadata reads cannot allocate kernel memory proportional to an untrusted task's region count."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler refactor remains inside the already enumerated executor TCB. A separately packaged policy receives only copied scheduling metadata and opaque task handles; TaskSlot, futures, stacks, trap frames, domain state, run-queue mutation, budget charging, and switch routines remain executor-private. Linking a policy crate is not a security sandbox, and the specification explicitly retains trusted-for-availability review until protected-domain policy execution exists."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Policy installation still requires a live Cap<SchedPolicy, Grant>. Every returned handle is revalidated by the core against current queue identity, runnable state, affinity, and core-computed budget eligibility before removal or execution; invalid, stale, throttled, and wrong-tier choices fall back to a core-owned candidate. WorkKind and scheduling class are descriptive and grant no capability, domain right, CPU-hotplug authority, clockevent access, or DVFS control."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L62"
+argument = "The policy, task-queue, and CPU-state hooks expose immutable scheduling metadata only: task identifiers, work/class/priority, runnable and affinity state, copied budget/accounting values, transition reasons, and aggregate idle counts. They expose no task memory, capability object, saved protection-key state, address-space root, stack, trap frame, future body, or mutable queue reference. Task enter/leave callbacks are serialized under CPU-local policy/run-queue locks and never execute from a waker or hard-IRQ path; CPU-state callbacks run after relevant core locks are released."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Core-owned period replenishment, eligibility tiers, bounded idle borrowing, and debt repayment cannot be overridden by policy. Borrowable work runs only when no eligible candidate exists, strict-throttled work stays ineligible until replenishment, and the tick forces a switch at the hard boundary. The existing architecture-neutral DomainSavedState preemption gap is recorded as an open gate and is not claimed closed by this refactor."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame boot edit only repeats the existing idempotent SysFs block-class projection after PCI probing has registered storage devices. It adds no TCB member, authority, domain transition, capability operation, mapping, or scheduler state; it exposes metadata already present in the block registry through the existing untrusted filesystem bridge."
 
@@ -525,3 +543,15 @@ argument = "The frame boot edit mounts a second instance of the existing untrust
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The new /var/tmp mount uses the same bootstrap mount authority and kernel-owned MemFs implementation already used for /tmp and /run, and is installed before userspace PID 1 starts. It grants no user pointer access or cross-domain memory access and does not alter capability checks or domain tags."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Realtime service is now granted only by the scheduler core after a live Cap<CpuBudget, Spend> check and an atomic, ceiling-rounded reservation against per-CPU, online-system, and capability-object-domain limits. Generic spawn paths demote an unauthorised Realtime label; admitted tasks are own-stack, preemptible, CPU-pinned, and retain an RAII reservation that releases on every slot-drop path. Policy cannot alter the reservation, replenish runtime, move the task, or make throttled work eligible. Five percent of each CPU remains outside RT reservation for interrupt and kernel progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "AArch64 stackful kernel tasks now save AAPCS64 callee state, SP, resume PC, and DAIF in task-owned context, validate every incoming stack/PC, and switch from the generic-timer tail only after GIC EOI and hard-IRQ accounting have ended. The live vector frame is required to lie inside the current task stack; current-task publication is cleared before switch-out and restored on resume, and involuntary returns remain non-quiescent for QSBR. The specification explicitly keeps trap-entry domain neutralisation, first-instruction domain restore, and AArch64 EL0 own-stack handoff open rather than claiming the cooperative DomainSavedState wrapper closes those invariants."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Scheduler hot paths use CPU-local run queues and policy/donation/steal publication, task-sharded affinity, pending-address-space, donor-debit, and NUMA registries, plus lock-free admission and interrupt counters; no single scheduler-wide lock serialises dispatch. Logical hot-unplug publishes Draining before new dispatch, refuses a running or pinned task, drains without holding source and destination queues together, and balances policy task-lifecycle callbacks. The power path receives only a copied per-CPU demand snapshot and gains no scheduler mutation, frequency-register, capability, domain-transition, or task-memory authority."

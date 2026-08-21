@@ -1454,7 +1454,13 @@ kernel_test_in!("scheduler", smoke_scheduler_affinity_any_and_pinned);
 
 fn smoke_scheduler_sched_class_variants_distinct() -> TestResult {
     use crate::priority::SchedClass;
-    let all = [SchedClass::Normal, SchedClass::RealTime, SchedClass::Idle];
+    let all = [
+        SchedClass::Idle,
+        SchedClass::Batch,
+        SchedClass::Default,
+        SchedClass::Interactive,
+        SchedClass::Realtime,
+    ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
             if i != j && a == b {
@@ -1462,8 +1468,13 @@ fn smoke_scheduler_sched_class_variants_distinct() -> TestResult {
             }
         }
     }
-    if SchedClass::default() != SchedClass::Normal {
-        return TestResult::Fail("SchedClass::default != Normal");
+    if SchedClass::default() != SchedClass::Default {
+        return TestResult::Fail("SchedClass::default != Default");
+    }
+    for pair in all.windows(2) {
+        if pair[0].rank() >= pair[1].rank() {
+            return TestResult::Fail("SchedClass rank is not strictly increasing");
+        }
     }
     TestResult::Pass
 }
@@ -1638,6 +1649,84 @@ fn smoke_scheduler_budget_account_charge_saturates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_budget_account_charge_saturates);
+
+fn smoke_scheduler_period_budget_strict_replenishes() -> TestResult {
+    use crate::{BudgetAccount, BudgetEligibility, ChargeOutcome, PeriodBudget, ResourceBudget};
+
+    let budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(100, 1_000));
+    let mut account = BudgetAccount::new();
+    let first = account.prepare(10_000, &budget);
+    if first.eligibility != BudgetEligibility::Eligible || first.remaining_cycles != 100 {
+        return TestResult::Fail("strict period did not initialise with full runtime");
+    }
+    if account.charge_period(100, &budget, false) != ChargeOutcome::Continue {
+        return TestResult::Fail("exact strict runtime charge should complete cleanly");
+    }
+    if account.view(10_100, &budget).eligibility != BudgetEligibility::Throttled {
+        return TestResult::Fail("strict budget remained eligible after exhaustion");
+    }
+    let replenished = account.prepare(11_000, &budget);
+    if replenished.eligibility != BudgetEligibility::Eligible || replenished.remaining_cycles != 100
+    {
+        return TestResult::Fail("strict budget did not replenish at its boundary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_period_budget_strict_replenishes
+);
+
+fn smoke_scheduler_period_budget_idle_borrow_repays_debt() -> TestResult {
+    use crate::{BudgetAccount, BudgetEligibility, ChargeOutcome, PeriodBudget, ResourceBudget};
+
+    let budget =
+        ResourceBudget::unthrottled().with_period(PeriodBudget::idle_borrow(100, 1_000, 50));
+    let mut account = BudgetAccount::new();
+    let _ = account.prepare(20_000, &budget);
+    if account.charge_period(125, &budget, true) != ChargeOutcome::Continue {
+        return TestResult::Fail("bounded idle borrow was rejected");
+    }
+    let borrowed = account.view(20_100, &budget);
+    if borrowed.eligibility != BudgetEligibility::Borrowable
+        || borrowed.borrowed_cycles != 25
+        || borrowed.debt_cycles != 25
+    {
+        return TestResult::Fail("idle-borrow accounting snapshot is wrong");
+    }
+    let replenished = account.prepare(21_000, &budget);
+    if replenished.remaining_cycles != 75 || replenished.debt_cycles != 0 {
+        return TestResult::Fail("next period did not repay idle-borrow debt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_period_budget_idle_borrow_repays_debt
+);
+
+fn smoke_scheduler_period_budget_overshoot_becomes_debt() -> TestResult {
+    use crate::{BudgetAccount, ChargeOutcome, PeriodBudget, ResourceBudget};
+
+    let budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(100, 1_000));
+    let mut account = BudgetAccount::new();
+    let _ = account.prepare(30_000, &budget);
+    if account.charge_period(140, &budget, false) != ChargeOutcome::PeriodExhausted {
+        return TestResult::Fail("strict overshoot did not exhaust the period");
+    }
+    if account.debt_cycles != 40 {
+        return TestResult::Fail("unpreemptible overshoot was not retained as debt");
+    }
+    let replenished = account.prepare(31_000, &budget);
+    if replenished.remaining_cycles != 60 {
+        return TestResult::Fail("overshoot debt was not deducted at replenishment");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_period_budget_overshoot_becomes_debt
+);
 
 // ── cpu_lifecycle ──────────────────────────────────────────────────
 
@@ -2178,6 +2267,7 @@ fn smoke_scheduler_overrun_policy_throttle_outcome() -> TestResult {
         burst_cycles: 100,
         deadline_cycles: None,
         policy: OverrunPolicy::Throttle,
+        period: None,
     };
     let mut a = BudgetAccount::new();
     if a.charge(200, &b) != ChargeOutcome::Throttle {
@@ -2194,6 +2284,7 @@ fn smoke_scheduler_overrun_policy_demote_outcome() -> TestResult {
         burst_cycles: 100,
         deadline_cycles: None,
         policy: OverrunPolicy::Demote,
+        period: None,
     };
     let mut a = BudgetAccount::new();
     if a.charge(200, &b) != ChargeOutcome::Demote {
@@ -2210,6 +2301,7 @@ fn smoke_scheduler_overrun_policy_kill_outcome() -> TestResult {
         burst_cycles: 100,
         deadline_cycles: None,
         policy: OverrunPolicy::Kill,
+        period: None,
     };
     let mut a = BudgetAccount::new();
     if a.charge(200, &b) != ChargeOutcome::Kill {
@@ -2226,6 +2318,7 @@ fn smoke_scheduler_overrun_policy_ignore_outcome() -> TestResult {
         burst_cycles: 100,
         deadline_cycles: None,
         policy: OverrunPolicy::Ignore,
+        period: None,
     };
     let mut a = BudgetAccount::new();
     if a.charge(200, &b) != ChargeOutcome::Continue {
@@ -2258,6 +2351,7 @@ fn smoke_scheduler_kill_policy_drops_slot() -> TestResult {
         burst_cycles: 0,
         deadline_cycles: None,
         policy: OverrunPolicy::Kill,
+        period: None,
     };
     spawn_with_spec(
         async {
@@ -2294,6 +2388,7 @@ fn smoke_scheduler_charge_outcome_variants_distinct() -> TestResult {
         ChargeOutcome::Throttle,
         ChargeOutcome::Demote,
         ChargeOutcome::Kill,
+        ChargeOutcome::PeriodExhausted,
     ];
     for (i, a) in all.iter().enumerate() {
         for (j, b) in all.iter().enumerate() {
@@ -2315,26 +2410,26 @@ kernel_test_in!(
 fn smoke_pluggable_scheduler_policy() -> TestResult {
     // Wave D: validate the `Scheduler` policy seam.
     //
-    // 1) Default install ("fifo") is wired by `init()` — confirmed
+    // 1) Default strict-class policy is wired by `init()` — confirmed
     //    via `current_scheduler_name`.
     // 2) Install `PriorityScheduler` under a `Cap<SchedPolicy, Grant>`
     //    minted from `Cap::bootstrap()`; spawn one HIGH and one LOW
     //    priority task and drive one round. With priority enabled,
     //    the HIGH-priority task polls first.
-    // 3) Reinstall `FifoScheduler` so subsequent smokes start clean.
+    // 3) Reinstall `ClassScheduler` so subsequent smokes start clean.
     use crate::{
-        current_scheduler_name, install_scheduler, spawn_with_spec, FifoScheduler, Priority,
+        current_scheduler_name, install_scheduler, spawn_with_spec, ClassScheduler, Priority,
         PriorityScheduler, SchedPolicy, TaskSpec,
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
     use narf_capabilities::{Cap, Grant};
 
-    // Default install — `init()` always plants Fifo. Re-run a fresh
+    // Default install — `init()` always plants ClassScheduler. Re-run a fresh
     // `init()` is gated, but the slot is already set from boot, so
     // the name is observable right here.
     let default_name = current_scheduler_name();
-    if default_name != Some("fifo") {
-        return TestResult::Fail("default scheduler is not 'fifo'");
+    if default_name != Some("class") {
+        return TestResult::Fail("default scheduler is not 'class'");
     }
 
     let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
@@ -2344,7 +2439,7 @@ fn smoke_pluggable_scheduler_policy() -> TestResult {
     if current_scheduler_name() != Some("priority") {
         // Restore default before bailing so we don't leak the
         // wrong-policy install into the next smoke.
-        let _ = install_scheduler(&cap, FifoScheduler);
+        let _ = install_scheduler(&cap, ClassScheduler);
         return TestResult::Fail("current_scheduler_name did not reflect Priority install");
     }
 
@@ -2390,12 +2485,12 @@ fn smoke_pluggable_scheduler_policy() -> TestResult {
     let order_ok = high > 0 && low > 0 && high < low;
 
     // Always reinstall the default before returning so subsequent
-    // smokes (and the rest of the kernel) see fifo.
-    if install_scheduler(&cap, FifoScheduler).is_err() {
-        return TestResult::Fail("re-install_scheduler(Fifo) failed");
+    // smokes (and the rest of the kernel) see strict class dispatch.
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("re-install_scheduler(Class) failed");
     }
-    if current_scheduler_name() != Some("fifo") {
-        return TestResult::Fail("scheduler did not revert to fifo");
+    if current_scheduler_name() != Some("class") {
+        return TestResult::Fail("scheduler did not revert to class");
     }
 
     if !order_ok {
@@ -2407,6 +2502,371 @@ fn smoke_pluggable_scheduler_policy() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_pluggable_scheduler_policy);
+
+fn smoke_scheduler_strict_class_order() -> TestResult {
+    use crate::{
+        install_scheduler, spawn_with_spec, ClassScheduler, SchedClass, SchedPolicy, TaskSpec,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant, Spend};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: [AtomicUsize; 5] = [const { AtomicUsize::new(usize::MAX) }; 5];
+
+    NEXT.store(0, Ordering::Relaxed);
+    for seen in &SEEN {
+        seen.store(usize::MAX, Ordering::Relaxed);
+    }
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    let budget_cap: Cap<crate::CpuBudget, Spend> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Class) failed");
+    }
+
+    // Enqueue lowest-to-highest so FIFO produces the exact opposite order.
+    let classes = [
+        SchedClass::Idle,
+        SchedClass::Batch,
+        SchedClass::Default,
+        SchedClass::Interactive,
+        SchedClass::Realtime,
+    ];
+    for (index, class) in classes.into_iter().enumerate() {
+        let mut spec = TaskSpec::unthrottled();
+        spec.class = class;
+        let task = async move {
+            SEEN[index].store(NEXT.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        };
+        if class == SchedClass::Realtime {
+            spec =
+                TaskSpec::realtime_periodic(1, 100, narf_time::now_cycles().saturating_add(10_000));
+            if crate::spawn_realtime(task, spec, &budget_cap).is_err() {
+                return TestResult::Fail("realtime class admission failed");
+            }
+        } else {
+            spawn_with_spec(task, spec);
+        }
+    }
+    crate::run_until_empty();
+
+    let expected = [4usize, 3, 2, 1, 0];
+    for (class_index, expected_order) in expected.into_iter().enumerate() {
+        if SEEN[class_index].load(Ordering::Relaxed) != expected_order {
+            return TestResult::Fail("strict scheduling-class order was not enforced");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_strict_class_order);
+
+fn smoke_scheduler_faulty_policy_cannot_strand_work() -> TestResult {
+    use crate::{
+        install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
+        TaskHandle,
+    };
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct DeclinesEverything;
+    impl Scheduler for DeclinesEverything {
+        fn name(&self) -> &'static str {
+            "declines-everything"
+        }
+
+        fn pick_next(&self, _cpu: CpuId, _queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+    }
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+    RAN.store(false, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, DeclinesEverything).is_err() {
+        return TestResult::Fail("install_scheduler(DeclinesEverything) failed");
+    }
+    spawn(async { RAN.store(true, Ordering::Relaxed) });
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if !RAN.load(Ordering::Relaxed) {
+        return TestResult::Fail("core fallback allowed policy to strand runnable work");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_faulty_policy_cannot_strand_work
+);
+
+fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
+    use crate::{
+        cpu_bring_up, cpu_take_offline, install_scheduler, spawn, ClassScheduler, CpuId,
+        CpuLifecycle, CpuState, CpuStateChange, RunQueue, SchedPolicy, Scheduler,
+        TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskQueueEvent,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant, Invoke};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static IDLE: AtomicUsize = AtomicUsize::new(0);
+    static BAD_IDLE_META: AtomicUsize = AtomicUsize::new(0);
+    static STARTING: AtomicUsize = AtomicUsize::new(0);
+    static DRAINING: AtomicUsize = AtomicUsize::new(0);
+    static OFFLINE: AtomicUsize = AtomicUsize::new(0);
+    static POLICY_INSTALL: AtomicUsize = AtomicUsize::new(0);
+    static CPU_ATTACH: AtomicUsize = AtomicUsize::new(0);
+    static CPU_DETACH: AtomicUsize = AtomicUsize::new(0);
+    static POLICY_UNINSTALL: AtomicUsize = AtomicUsize::new(0);
+    static TASK_ENQUEUE: AtomicUsize = AtomicUsize::new(0);
+    static TASK_DEQUEUE: AtomicUsize = AtomicUsize::new(0);
+    static BAD_TASK_REASON: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Copy, Clone, Debug)]
+    struct StateObserver;
+
+    impl Scheduler for StateObserver {
+        fn name(&self) -> &'static str {
+            "state-observer"
+        }
+
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            queue.front()
+        }
+
+        fn on_install(&self) {
+            POLICY_INSTALL.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_cpu_attach(&self, _cpu: CpuId) {
+            CPU_ATTACH.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_cpu_detach(&self, _cpu: CpuId) {
+            CPU_DETACH.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_uninstall(&self) {
+            POLICY_UNINSTALL.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_task_queue_event(&self, cpu: CpuId, event: TaskQueueEvent) {
+            if cpu != CpuId::BOOT {
+                return;
+            }
+            match event {
+                TaskQueueEvent::Enqueued { reason, .. } => {
+                    TASK_ENQUEUE.fetch_add(1, Ordering::Relaxed);
+                    if reason != TaskEnqueueReason::Admitted {
+                        BAD_TASK_REASON.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                TaskQueueEvent::Dequeued { reason, .. } => {
+                    TASK_DEQUEUE.fetch_add(1, Ordering::Relaxed);
+                    if reason != TaskDequeueReason::Selected {
+                        BAD_TASK_REASON.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        fn on_cpu_state_change(&self, cpu: CpuId, change: CpuStateChange) {
+            if cpu == CpuId(3) {
+                match change.current {
+                    CpuState::Starting => {
+                        STARTING.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CpuState::Draining => {
+                        DRAINING.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CpuState::Offline => {
+                        OFFLINE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if cpu != CpuId::BOOT {
+                return;
+            }
+            match change.current {
+                CpuState::Active => {
+                    ACTIVE.fetch_add(1, Ordering::Relaxed);
+                }
+                CpuState::Idle => {
+                    IDLE.fetch_add(1, Ordering::Relaxed);
+                    if change.idle.is_none() {
+                        BAD_IDLE_META.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    ACTIVE.store(0, Ordering::Relaxed);
+    IDLE.store(0, Ordering::Relaxed);
+    BAD_IDLE_META.store(0, Ordering::Relaxed);
+    STARTING.store(0, Ordering::Relaxed);
+    DRAINING.store(0, Ordering::Relaxed);
+    OFFLINE.store(0, Ordering::Relaxed);
+    POLICY_INSTALL.store(0, Ordering::Relaxed);
+    CPU_ATTACH.store(0, Ordering::Relaxed);
+    CPU_DETACH.store(0, Ordering::Relaxed);
+    POLICY_UNINSTALL.store(0, Ordering::Relaxed);
+    TASK_ENQUEUE.store(0, Ordering::Relaxed);
+    TASK_DEQUEUE.store(0, Ordering::Relaxed);
+    BAD_TASK_REASON.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::cpu_lifecycle::__test_reset_online_mask();
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, StateObserver).is_err() {
+        return TestResult::Fail("install_scheduler(StateObserver) failed");
+    }
+
+    // An empty executor enters Idle exactly once. Dispatching a task produces
+    // one Active edge, and completing the now-empty queue enters Idle again.
+    crate::run_until_empty();
+    spawn(async {});
+    crate::run_until_empty();
+
+    let lifecycle_cap: Cap<CpuLifecycle, Invoke> = Cap::bootstrap();
+    if cpu_bring_up(CpuId(3), &lifecycle_cap).is_err()
+        || cpu_take_offline(CpuId(3), &lifecycle_cap).is_err()
+    {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        crate::cpu_lifecycle::__test_reset_online_mask();
+        return TestResult::Fail("logical CPU lifecycle transition failed");
+    }
+
+    let active = ACTIVE.load(Ordering::Relaxed);
+    let idle = IDLE.load(Ordering::Relaxed);
+    let bad_idle_meta = BAD_IDLE_META.load(Ordering::Relaxed);
+    let lifecycle_edges = (
+        STARTING.load(Ordering::Relaxed),
+        DRAINING.load(Ordering::Relaxed),
+        OFFLINE.load(Ordering::Relaxed),
+    );
+
+    let _ = install_scheduler(&cap, ClassScheduler);
+    let policy_lifecycle = (
+        POLICY_INSTALL.load(Ordering::Relaxed),
+        CPU_ATTACH.load(Ordering::Relaxed),
+        CPU_DETACH.load(Ordering::Relaxed),
+        POLICY_UNINSTALL.load(Ordering::Relaxed),
+    );
+    crate::cpu_lifecycle::__test_reset_online_mask();
+
+    if active != 1 || idle != 2 {
+        return TestResult::Fail("CPU Active/Idle callbacks were not edge-triggered");
+    }
+    if bad_idle_meta != 0 {
+        return TestResult::Fail("Idle callback omitted CpuIdleMeta");
+    }
+    if TASK_ENQUEUE.load(Ordering::Relaxed) != 1
+        || TASK_DEQUEUE.load(Ordering::Relaxed) != 1
+        || BAD_TASK_REASON.load(Ordering::Relaxed) != 0
+    {
+        return TestResult::Fail("task queue enter/leave callbacks were not balanced");
+    }
+    if lifecycle_edges != (1, 1, 1) {
+        return TestResult::Fail("Starting/Draining/Offline callbacks were not edge-triggered");
+    }
+    if policy_lifecycle != (1, narf_lib::percpu::MAX_CPUS, narf_lib::percpu::MAX_CPUS, 1) {
+        return TestResult::Fail("policy install/attach/detach/uninstall lifecycle was unbalanced");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_policy_observes_cpu_state_edges);
+
+fn smoke_scheduler_policy_replacement_rebalances_queued_tasks() -> TestResult {
+    use crate::{
+        install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
+        TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskQueueEvent,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    static ADMITTED: AtomicUsize = AtomicUsize::new(0);
+    static ENTER_REPLACEMENT: AtomicUsize = AtomicUsize::new(0);
+    static LEAVE_REPLACEMENT: AtomicUsize = AtomicUsize::new(0);
+    static SELECTED: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Copy, Clone)]
+    struct Observer;
+
+    impl Scheduler for Observer {
+        fn name(&self) -> &'static str {
+            "task-queue-observer"
+        }
+
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            queue.front()
+        }
+
+        fn on_task_queue_event(&self, _cpu: CpuId, event: TaskQueueEvent) {
+            match event {
+                TaskQueueEvent::Enqueued {
+                    reason: TaskEnqueueReason::Admitted,
+                    ..
+                } => {
+                    ADMITTED.fetch_add(1, Ordering::Relaxed);
+                }
+                TaskQueueEvent::Enqueued {
+                    reason: TaskEnqueueReason::PolicyReplacement,
+                    ..
+                } => {
+                    ENTER_REPLACEMENT.fetch_add(1, Ordering::Relaxed);
+                }
+                TaskQueueEvent::Dequeued {
+                    reason: TaskDequeueReason::PolicyReplacement,
+                    ..
+                } => {
+                    LEAVE_REPLACEMENT.fetch_add(1, Ordering::Relaxed);
+                }
+                TaskQueueEvent::Dequeued {
+                    reason: TaskDequeueReason::Selected,
+                    ..
+                } => {
+                    SELECTED.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    ADMITTED.store(0, Ordering::Relaxed);
+    ENTER_REPLACEMENT.store(0, Ordering::Relaxed);
+    LEAVE_REPLACEMENT.store(0, Ordering::Relaxed);
+    SELECTED.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, Observer).is_err() {
+        return TestResult::Fail("initial observer install failed");
+    }
+    spawn(async {});
+    if install_scheduler(&cap, Observer).is_err() {
+        return TestResult::Fail("replacement observer install failed");
+    }
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if ADMITTED.load(Ordering::Relaxed) != 1
+        || ENTER_REPLACEMENT.load(Ordering::Relaxed) != 1
+        || LEAVE_REPLACEMENT.load(Ordering::Relaxed) != 1
+        || SELECTED.load(Ordering::Relaxed) != 1
+    {
+        return TestResult::Fail("queued task was not balanced across policy replacement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_policy_replacement_rebalances_queued_tasks
+);
 
 fn smoke_pluggable_donation_policy() -> TestResult {
     // Wave E: validate the `DonationPolicy` seam.
@@ -2595,3 +3055,36 @@ fn smoke_task_numa_allowed_mask_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_task_numa_allowed_mask_roundtrip);
+
+fn smoke_realtime_admission_is_bounded_and_released() -> TestResult {
+    use narf_capabilities::{Cap, Spend};
+
+    crate::__reset_queues_for_test();
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let before = crate::realtime_bandwidth(cpu).cpu_reserved_ppm;
+    let authority: Cap<crate::CpuBudget, Spend> = Cap::bootstrap();
+    let deadline = narf_time::now_cycles().saturating_add(10_000);
+    let first = crate::TaskSpec::realtime_periodic(100, 1_000, deadline);
+    if crate::spawn_realtime(async {}, first, &authority).is_err() {
+        return TestResult::Fail("valid realtime reservation was rejected");
+    }
+    if crate::realtime_bandwidth(cpu).cpu_reserved_ppm != before.saturating_add(100_000) {
+        return TestResult::Fail("realtime utilization was not reserved");
+    }
+    let excess = crate::TaskSpec::realtime_periodic(900, 1_000, deadline);
+    match crate::spawn_realtime(async {}, excess, &authority) {
+        Err(crate::AdmissionError::CpuBandwidthExceeded)
+        | Err(crate::AdmissionError::DomainBandwidthExceeded)
+        | Err(crate::AdmissionError::SystemBandwidthExceeded) => {}
+        _ => return TestResult::Fail("overcommitted realtime reservation was admitted"),
+    }
+    crate::run_until_empty();
+    if crate::realtime_bandwidth(cpu).cpu_reserved_ppm != before {
+        return TestResult::Fail("completed realtime task leaked its reservation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_realtime_admission_is_bounded_and_released
+);

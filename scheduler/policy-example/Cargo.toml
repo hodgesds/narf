@@ -1,0 +1,15 @@
+[package]
+name = "narf-scheduler-policy-example"
+description = "Out-of-tree-style scheduler policy compile proof for NARF"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+narf-scheduler = { path = ".." }
+
+[lints]
+workspace = true
