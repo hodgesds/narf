@@ -59,6 +59,8 @@ pub struct TrapFrame {
 /// INTID, then writes ICC_EOIR1_EL1 to release the priority.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
+    let hardirq_account =
+        narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
     // SAFETY: we are in the IRQ handler by the vector-table contract.
     let iar = unsafe { sysreg::read_icc_iar1_el1() };
     let intid = (iar & 0x00FF_FFFF) as u32;
@@ -125,6 +127,14 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
     // SAFETY: write the same IAR value we read to EOI.
     unsafe {
         narf_interrupts::aarch64::eoi_for(iar);
+    }
+    drop(hardirq_account);
+    if intid == narf_interrupts::aarch64::TIMER_PPI {
+        // SAFETY: this is the live vector frame, and EOI/accounting completed
+        // above before a switch can strand the trap continuation.
+        unsafe {
+            narf_scheduler::stackful::try_preempt_aarch64(frame as *const TrapFrame as usize);
+        }
     }
 }
 

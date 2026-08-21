@@ -25,7 +25,12 @@ Every pluggable subsystem in NARF follows one pattern:
    `0x0200..` range — see `capabilities/src/lib.rs`.
 
 3. **A static slot** holding the currently installed backend.
-   `IrqSafeSpinLock<Option<Box<dyn FooPolicy>>>` is the convention.
+   `IrqSafeSpinLock<Option<Box<dyn FooPolicy>>>` is the usual convention.
+   Scheduler policy, donation policy, and steal strategy are scalability
+   exceptions: they have one
+   generation-stamped `Arc` slot per CPU. Dispatch touches no global policy
+   lock and performs no shared reference-count write; the `Arc` exists to keep
+   a policy alive across rolling replacement, not to be cloned per dispatch.
 
    ```rust
    static FOO: IrqSafeSpinLock<Option<Box<dyn FooPolicy>>> =
@@ -113,7 +118,7 @@ the subsystem is callable. The order is:
 2. `memory::heap::init()` — installs `BumpBackend`, later promotes to
    `SlabBackend`.
 3. `memory::pager::init()` — installs `NoopPager`.
-4. `scheduler::init()` — installs `FifoScheduler`,
+4. `scheduler::init()` — installs `ClassScheduler`,
    `HeadQueueDonation`, `NumaAwareSteal`.
 5. Driver-framework boot — block `IoScheduler`, network `CongestionControl`
    installs land per-device / per-socket later.
@@ -122,8 +127,56 @@ the subsystem is callable. The order is:
 7. `tracing::init()` — installs `FlightRecorderSink`.
 
 A downstream's replacement happens any time after the relevant `init()`,
-and the install fn revokes its predecessor by dropping the displaced
-`Box`.
+and the install fn revokes its predecessor by dropping the displaced backend
+after releasing the install-slot lock.
+
+### Scheduler-specific boundary
+
+An external scheduler crate implements `narf_scheduler::Scheduler` and receives
+only a callback-scoped, read-only `RunQueue`. It can inspect opaque handles and
+copied `TaskMeta` (class, work kind, runnable state, affinity, budget, and
+accounting), including the core-computed `BudgetView` eligibility tier, then
+return a handle. The executor validates both identity and eligibility before it
+removes that slot; regular work outranks idle borrowing and throttled work is
+never polled merely because a policy selected it.
+Private `TaskSlot`, queue locks, future bodies, saved domain state, stacks, and
+switch routines never cross the interface. See
+`scheduler/policy-example` for a workspace compile proof with no private
+dependency.
+
+`on_task_queue_event` supplies the balanced task-control lifecycle needed by a
+stateful policy. It reports copied metadata when a task enters a CPU-local
+selectable set and when it leaves for selection or migration. Rolling policy
+replacement emits old-policy `Dequeued(PolicyReplacement)` and new-policy
+`Enqueued(PolicyReplacement)` events for queued tasks. An in-flight task has
+already left the old policy and enters the new policy only if it requeues. The
+callback runs under CPU-local hot-path locks, so it must be bounded and
+nonblocking; wake flags remain authoritative in the next `RunQueue` snapshot
+instead of invoking external code from IRQ/waker context.
+
+The optional `on_cpu_state_change` callback receives edge-triggered
+`Offline`, `Starting`, `Active`, `Idle`, and `Draining` observations after core
+locks are released. Idle events carry copied queue/budget counts and the next
+replenishment. This is telemetry, not mechanism authority: an external policy
+cannot hot-plug a CPU, arm a clockevent, halt a core, or program frequency.
+DVFS remains a separate capability-gated `power/` governor consuming
+scheduler-published `cpu_demand()` snapshots so thermal and platform limits
+stay authoritative. The demand snapshot takes only the named CPU's queue lock;
+it does not call policy code or expose a frequency-control hook.
+
+Separate-crate linkage is not an isolation boundary. The executor can reject a
+bad returned handle, but it cannot recover if policy code never returns. Such
+implementations remain trusted for availability until the callback is replaced
+by a protected-domain/RPC policy service.
+
+Scheduler replacement is a supported lifecycle: `on_install` runs once,
+`on_cpu_attach` precedes publication on each CPU, `on_cpu_detach` follows the
+last in-flight callback on a replaced CPU, and `on_uninstall` runs after the
+final reference disappears. An atomic generation orders concurrent rolling
+updates; an overlapping older installer returns `SchedulerError::Superseded`
+once a newer ticket exists. Tasks and all mechanism-owned state remain in the
+executor, so the new policy reconstructs only its private ranking indexes from
+read-only queue snapshots and balanced task queue events.
 
 ## Cap markers reserved
 

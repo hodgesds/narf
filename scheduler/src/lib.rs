@@ -31,8 +31,8 @@
 //! CPU FIFO ordering.
 //!
 //! Stage 5 lands the spec's post-Stage-4 features in three waves:
-//! direct time-slice donation (this commit), PKRS save/restore at
-//! yield points, and fair-share enforcement + NUMA-aware steal.
+//! budget-credit donation with head enqueue, domain-state save/restore at
+//! cooperative yield points, and fair-share enforcement + NUMA-aware steal.
 //!
 //! Donation fast path (spec §3.3): `donate_to(target, &Cap<Task,
 //! Invoke>)` deducts the donor's remaining burst quantum from its
@@ -41,19 +41,20 @@
 //! the donation cap before the donee polls refunds both sides
 //! atomically at the donee's next pop (`settle_donation`).
 //!
-//! PKRS save/restore at yield points (x86_64, Intel SDM Vol 3
-//! §4.6.2.4): `IA32_PKRS` (MSR `0x6E1`) is snapshotted into the
-//! task slot's `saved_pkrs` after the future returns
-//! `Poll::Pending`; restored before the next `Future::poll`. Two
-//! tasks polled back-to-back never see each other's protection-
-//! key rights view. aarch64 has no PKRS analogue; the field and
-//! the save/restore are gated behind `cfg(target_arch = "x86_64")`.
+//! Architecture-neutral domain state is saved around every poll. On x86_64
+//! this preserves PKRS (or the PCID fallback); on aarch64 it preserves the MTE
+//! tag-check mode. The representation and switching mechanics remain private
+//! to `narf_memory`, so scheduling policies cannot bypass this boundary.
 //!
-//! Fair-share enforcement + NUMA-aware steal (spec §3.4 / §3.2):
-//! `BudgetAccount::charge` returns a `ChargeOutcome` the executor
-//! acts on — `Throttle` clears the awake flag for one round,
+//! Burst-overrun handling + NUMA-aware steal (spec §3.4 / §3.2):
+//! `BudgetAccount::charge` compares each completed poll with the configured
+//! burst and returns a `ChargeOutcome` the executor acts on — `Throttle`
+//! clears the awake flag until an external wake,
 //! `Demote` reclassifies the slot as `SchedClass::Idle`, `Kill`
-//! drops the slot O(1). `try_steal_one` prefers same-NUMA-node
+//! drops the slot O(1). `PeriodBudget` adds core-owned replenishment, strict
+//! throttling, and bounded idle borrowing with debt repayment. `share_ppm`
+//! remains descriptive unless a consistent period contract is attached.
+//! `try_steal_one` prefers same-NUMA-node
 //! victims (`narf_acpi::cpu_node`) before crossing nodes; design
 //! follows Vyukov's CPPCON work-stealing notes
 //! (https://www.1024cores.net/).
@@ -64,6 +65,8 @@
 
 extern crate alloc;
 
+pub mod accounting;
+pub mod admission;
 pub mod affinity;
 pub mod budget;
 #[cfg(feature = "cgroup")]
@@ -78,8 +81,15 @@ pub mod steal;
 
 mod tests;
 
+pub use accounting::{
+    hardirq_cycles, interrupt_account_enter, nmi_cycles, InterruptAccountGuard, InterruptKind,
+};
+pub use admission::{realtime_bandwidth, AdmissionError, RealtimeBandwidth, RT_CPU_LIMIT_PPM};
 pub use affinity::{Affinity, CpuId, CpuSet};
-pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
+pub use budget::{
+    BudgetAccount, BudgetEligibility, BudgetView, ChargeOutcome, CpuBudget, ExhaustionPolicy,
+    OverrunPolicy, PeriodBudget, ResourceBudget,
+};
 #[cfg(feature = "cgroup")]
 pub use cgroup::{
     apply_affinity, apply_priority, cgroup_cycles_for, cgroup_set_affinity, cgroup_set_priority,
@@ -96,10 +106,12 @@ pub use donation::{
 };
 pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
 pub use policy::{
-    current_scheduler_name, install_scheduler, FifoScheduler, PriorityScheduler, RunQueue,
-    SchedPolicy, Scheduler, SchedulerError, TaskHandle, TaskMeta,
+    cpu_state, current_scheduler_name, install_scheduler, ClassScheduler, CpuIdleMeta, CpuState,
+    CpuStateChange, FifoScheduler, PriorityScheduler, RunQueue, SchedPolicy, Scheduler,
+    SchedulerError, TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent,
 };
-pub use priority::{Priority, SchedClass, SmtSharePolicy};
+pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
+pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
     current_steal_strategy_name, install_steal_strategy, NumaAwareSteal, RandomSteal, Steal,
     StealError, StealStrategy,
@@ -182,6 +194,75 @@ impl TaskId {
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// Read-only, per-CPU demand sample for the separately capability-gated power
+/// governor. This is observation only: scheduler policies cannot set
+/// frequencies and power governors cannot mutate a run queue.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuDemand {
+    pub state: CpuState,
+    pub runnable: usize,
+    pub realtime_runnable: usize,
+    pub softirq_runnable: usize,
+    pub kernel_threads_runnable: usize,
+    pub user_threads_runnable: usize,
+    pub next_deadline_cycles: Option<u64>,
+    pub realtime_reserved_ppm: u64,
+    pub hardirq_cycles: u64,
+    pub nmi_cycles: u64,
+}
+
+/// Snapshot scheduler demand without calling policy code or taking any
+/// cross-CPU/global scheduler lock.
+pub fn cpu_demand(cpu: CpuId) -> CpuDemand {
+    let index = cpu.0 as usize;
+    let mut sample = CpuDemand {
+        state: policy::cpu_state(cpu),
+        realtime_reserved_ppm: admission::realtime_bandwidth(cpu).cpu_reserved_ppm,
+        hardirq_cycles: accounting::hardirq_cycles(cpu),
+        nmi_cycles: accounting::nmi_cycles(cpu),
+        ..CpuDemand::default()
+    };
+    let Some(ready) = READY.get(index) else {
+        return sample;
+    };
+    let queue = ready.lock();
+    let Some(queue) = queue.as_ref() else {
+        return sample;
+    };
+    let now = narf_time::now_cycles();
+    for slot in queue {
+        if !slot.awake.flag.load(Ordering::Acquire) {
+            continue;
+        }
+        let view = slot.account.view(now, &slot.spec.budget);
+        if view.eligibility == BudgetEligibility::Throttled {
+            sample.next_deadline_cycles =
+                min_deadline(sample.next_deadline_cycles, view.replenish_at_cycles);
+            continue;
+        }
+        sample.runnable += 1;
+        sample.realtime_runnable += usize::from(slot.spec.class == SchedClass::Realtime);
+        sample.softirq_runnable += usize::from(slot.spec.work_kind == WorkKind::SoftIrq);
+        sample.kernel_threads_runnable +=
+            usize::from(slot.spec.work_kind == WorkKind::KernelThread);
+        sample.user_threads_runnable += usize::from(slot.spec.work_kind == WorkKind::UserThread);
+        sample.next_deadline_cycles = min_deadline(
+            sample.next_deadline_cycles,
+            min_deadline(slot.spec.budget.deadline_cycles, view.replenish_at_cycles),
+        );
+    }
+    sample
+}
+
+#[inline]
+fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 
@@ -309,6 +390,13 @@ fn current_task_slot() -> &'static AtomicU64 {
     &CURRENT_TASK[narf_lib::percpu::current_cpu()]
 }
 
+pub(crate) fn cpu_running_task(cpu: CpuId) -> bool {
+    CURRENT_TASK
+        .get(cpu.0 as usize)
+        .map(|task| task.load(Ordering::Acquire) != TaskId::NONE.raw())
+        .unwrap_or(false)
+}
+
 /// Address space of the currently-polling task on each CPU — published
 /// before `poll` so syscall handlers can resolve it without searching
 /// the run-queue (the slot has been popped and isn't visible to
@@ -333,6 +421,60 @@ fn active_user_as_slot() -> &'static narf_lib::sync::IrqSafeSpinLock<Option<Arc<
 #[inline]
 pub fn current_task_id() -> TaskId {
     TaskId(current_task_slot().load(Ordering::Acquire))
+}
+
+fn publish_budget_window(cpu: usize, started: u64, view: BudgetView, budget: &ResourceBudget) {
+    let Some(period) = budget.period else {
+        CURRENT_BUDGET_SOFT_END[cpu].store(0, Ordering::Release);
+        CURRENT_BUDGET_HARD_END[cpu].store(0, Ordering::Release);
+        CURRENT_BUDGET_BORROWING[cpu].store(false, Ordering::Release);
+        return;
+    };
+    let borrow_available = if period.exhaustion == ExhaustionPolicy::IdleBorrow {
+        period
+            .max_borrow_cycles
+            .saturating_sub(view.borrowed_cycles)
+    } else {
+        0
+    };
+    let soft_end = started.saturating_add(view.remaining_cycles);
+    let hard_end = soft_end
+        .saturating_add(borrow_available)
+        .min(view.replenish_at_cycles.unwrap_or(u64::MAX));
+    CURRENT_BUDGET_SOFT_END[cpu].store(soft_end, Ordering::Release);
+    CURRENT_BUDGET_HARD_END[cpu].store(hard_end, Ordering::Release);
+    arm_scheduler_deadline(soft_end.min(hard_end));
+    CURRENT_BUDGET_BORROWING[cpu].store(
+        view.eligibility == BudgetEligibility::Borrowable,
+        Ordering::Release,
+    );
+}
+
+fn clear_budget_window(cpu: usize) -> bool {
+    CURRENT_BUDGET_SOFT_END[cpu].store(0, Ordering::Release);
+    CURRENT_BUDGET_HARD_END[cpu].store(0, Ordering::Release);
+    CURRENT_BUDGET_BORROWING[cpu].swap(false, Ordering::AcqRel)
+}
+
+/// Timer-trap decision for a currently running stackful task. A strict budget
+/// forces a switch at its soft boundary. Idle-borrow work keeps the current
+/// continuation running—with no idle-thread round trip—until regular work
+/// appears or its bounded hard limit is reached.
+pub(crate) fn tick_preemption_required(current: u64, now: u64, slice_expired: bool) -> bool {
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let soft_end = CURRENT_BUDGET_SOFT_END[cpu].load(Ordering::Acquire);
+    let hard_end = CURRENT_BUDGET_HARD_END[cpu].load(Ordering::Acquire);
+    if hard_end != 0 && now >= hard_end {
+        return true;
+    }
+    if soft_end != 0 && now >= soft_end {
+        if has_other_runnable_work(current) {
+            return true;
+        }
+        CURRENT_BUDGET_BORROWING[cpu].store(true, Ordering::Release);
+        return false;
+    }
+    slice_expired && has_other_runnable_work(current)
 }
 
 /// Resolve the address space of the currently-polling task. This
@@ -370,6 +512,16 @@ pub(crate) struct WakeCell {
 static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
 
+/// Per-CPU periodic-budget boundaries for the currently polling slot. Zero
+/// means no period budget. The timer trap reads these without touching the
+/// private task slot or accounting object.
+static CURRENT_BUDGET_SOFT_END: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+static CURRENT_BUDGET_HARD_END: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+static CURRENT_BUDGET_BORROWING: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
 /// Installed at boot: sends a fixed reschedule IPI to `cpu`. A hook (not
 /// a direct call) keeps `narf-scheduler` free of an `narf-interrupts`
 /// dependency. `0` = not installed (single-CPU / pre-boot) → no IPI.
@@ -380,9 +532,10 @@ pub fn set_resched_ipi_hook(f: fn(u32)) {
     RESCHED_IPI_HOOK.store(f as usize, Ordering::Release);
 }
 
-/// Hook to arm a one-shot LAPIC TSC-deadline at the given TSC value (boot
-/// wires `apic::arm_tsc_deadline_if_earlier`). Used by the idle path as a
-/// LOST-WAKEUP BACKSTOP: an AP that HLTs with no wheel deadline otherwise
+/// Hook to arm a one-shot architecture clockevent at the given cycle value
+/// (x86 boot wires `apic::arm_tsc_deadline_if_earlier`). Used for periodic
+/// budget boundaries and by the idle path as a LOST-WAKEUP BACKSTOP: an AP
+/// that HLTs with no wheel deadline otherwise
 /// relies entirely on an external wake (cross-core IPI / device IRQ) plus
 /// the periodic tick. The stall watchdog caught a runnable task stranded
 /// on a HALTED AP — a wake that was neither observed nor IPI-delivered.
@@ -392,8 +545,8 @@ pub fn set_resched_ipi_hook(f: fn(u32)) {
 /// subtle wake-delivery race. `0` = not installed (single-CPU / pre-boot).
 static IDLE_BACKSTOP_HOOK: AtomicUsize = AtomicUsize::new(0);
 
-/// Wire the idle-halt fallback-deadline arm (boot installs the LAPIC
-/// TSC-deadline write).
+/// Wire the scheduler deadline arm (boot installs the LAPIC TSC-deadline
+/// write). The historical name is retained for API compatibility.
 pub fn set_idle_backstop_hook(f: fn(u64)) {
     IDLE_BACKSTOP_HOOK.store(f as usize, Ordering::Release);
 }
@@ -461,16 +614,21 @@ pub(crate) fn retarget_kernel_stack(top: u64) {
     f(top);
 }
 
-/// Arm the idle backstop ~`ms` milliseconds out, if a hook is installed.
-fn arm_idle_backstop_ms(ms: u64) {
+/// Arm the architecture clockevent no later than `deadline`.
+fn arm_scheduler_deadline(deadline: u64) {
     let p = IDLE_BACKSTOP_HOOK.load(Ordering::Acquire);
     if p == 0 {
         return;
     }
-    let deadline = narf_time::now_cycles().wrapping_add(narf_time::ns_to_cycles(ms * 1_000_000));
     // SAFETY: `p` was set by `set_idle_backstop_hook` from a `fn(u64)`.
     let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
     f(deadline);
+}
+
+/// Arm the idle backstop ~`ms` milliseconds out, if a hook is installed.
+fn arm_idle_backstop_ms(ms: u64) {
+    let deadline = narf_time::now_cycles().wrapping_add(narf_time::ns_to_cycles(ms * 1_000_000));
+    arm_scheduler_deadline(deadline);
 }
 
 /// Reschedule the owner of a just-woken task: if it lives on a DIFFERENT
@@ -570,13 +728,13 @@ pub(crate) struct TaskSlot {
     /// next pop either consumes the credit (cap live) or refunds
     /// the donor (cap revoked). `None` outside an active donation.
     donation: Option<DonationClaim>,
-    /// Saved IA32_PKRS (Intel SDM Vol 3 §4.6.2.4). Snapshotted
-    /// after a `Poll::Pending` so the next poll of this slot
-    /// restores the task's protection-key rights view. `None`
-    /// before the first yield. x86_64-only; aarch64 has no
-    /// protection-key analogue.
-    #[cfg(target_arch = "x86_64")]
-    saved_pkrs: Option<narf_arch::x86_64::pks::SavedPkrs>,
+    /// Architecture-neutral PKRS / PCID / MTE-TCF task state. `None` before
+    /// first dispatch means the task inherits the executor's neutral state;
+    /// every later dispatch restores the captured value before polling.
+    domain_saved: Option<narf_memory::DomainSavedState>,
+    /// Present only for tasks admitted through `spawn_realtime`. Its `Drop`
+    /// releases per-CPU, system, and authority-domain bandwidth atomically.
+    rt_reservation: Option<admission::RealtimeReservation>,
     /// RAII fork-bomb counter. `Some` for user tasks (decrements
     /// `LIVE_USER_TASKS` on the slot's final drop), `None` for kernel tasks.
     /// Held purely for its `Drop` side-effect — never read, hence the allow.
@@ -621,6 +779,24 @@ impl core::fmt::Debug for TaskSlot {
     }
 }
 
+/// Poll one task with domain state treated as task context rather than CPU
+/// context. Capture of the returned task state is the first operation after
+/// `poll`; the executor state is restored before accounting, queue mutation,
+/// or any other scheduler-owned data is touched.
+#[inline]
+fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
+    let executor_domain = narf_memory::save_domain_state();
+    let task_domain = slot.domain_saved.unwrap_or(executor_domain);
+    narf_memory::restore_domain_state(&task_domain);
+
+    let result = slot.task.as_mut().poll(ctx);
+
+    let returned_task_domain = narf_memory::save_domain_state();
+    narf_memory::restore_domain_state(&executor_domain);
+    slot.domain_saved = Some(returned_task_domain);
+    result
+}
+
 /// Per-task scheduling metadata — spec §3.3 + §3.4.
 ///
 /// A `TaskSpec` with `budget_cap = None` behaves like a Stage-2 task:
@@ -633,8 +809,11 @@ pub struct TaskSpec {
     pub affinity: Affinity,
     pub budget: ResourceBudget,
     pub budget_cap: Option<Cap<CpuBudget, Spend>>,
-    /// Scheduling class (Stage-4). Stage-3 executor ignores this;
-    /// SMP dispatch consumes it once the deadline class lands.
+    /// Kind of execution requested for this task. This is visible to policy,
+    /// but the core retains ownership of accounting and attribution and this
+    /// value grants no authority by itself.
+    pub work_kind: WorkKind,
+    /// Scheduling class used by the default strict-class dispatcher.
     pub class: SchedClass,
     /// Nice-style priority within `class`.
     pub priority: Priority,
@@ -643,6 +822,14 @@ pub struct TaskSpec {
 }
 
 impl TaskSpec {
+    /// Return this spec with descriptive work classification changed. The
+    /// value affects policy selection only; it does not change the task's
+    /// capability, domain, or accounting identity.
+    pub const fn with_work_kind(mut self, work_kind: WorkKind) -> Self {
+        self.work_kind = work_kind;
+        self
+    }
+
     /// Default: BSP-pinned, unthrottled, no cap gate. Pinning to
     /// the boot CPU is a load-bearing safety property today —
     /// most spawn-and-forget tasks (FB drain, USB-HID supervisor,
@@ -657,6 +844,7 @@ impl TaskSpec {
             affinity: Affinity::pinned(crate::affinity::CpuId::BOOT),
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
+            work_kind: WorkKind::AsyncTask,
             class: SchedClass::Normal,
             priority: Priority::NORMAL,
             smt: SmtSharePolicy::Avoid,
@@ -678,6 +866,7 @@ impl TaskSpec {
             affinity: Affinity::any(),
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
+            work_kind: WorkKind::KernelThread,
             class: SchedClass::Normal,
             priority: Priority::NORMAL,
             smt: SmtSharePolicy::Avoid,
@@ -712,6 +901,7 @@ impl TaskSpec {
             affinity,
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
+            work_kind: WorkKind::UserThread,
             class: SchedClass::Normal,
             priority: Priority::NORMAL,
             smt: SmtSharePolicy::Avoid,
@@ -725,6 +915,7 @@ impl TaskSpec {
             affinity: Affinity::pinned(crate::affinity::CpuId::BOOT),
             budget,
             budget_cap: Some(cap),
+            work_kind: WorkKind::AsyncTask,
             class: SchedClass::Normal,
             priority: Priority::NORMAL,
             smt: SmtSharePolicy::Avoid,
@@ -740,12 +931,38 @@ impl TaskSpec {
                 burst_cycles: u64::MAX,
                 deadline_cycles: Some(deadline_cycles),
                 policy: OverrunPolicy::Ignore,
+                period: None,
             },
             budget_cap: None,
+            work_kind: WorkKind::KernelThread,
             class: SchedClass::RealTime,
             priority: Priority::HIGH,
             smt: SmtSharePolicy::Avoid,
         }
+    }
+
+    /// Realtime task with a strict core-enforced runtime/period reservation.
+    /// The scheduling policy sees the deadline and budget snapshot, but only
+    /// the executor replenishes or throttles this contract.
+    pub const fn realtime_periodic(
+        runtime_cycles: u64,
+        period_cycles: u64,
+        deadline_cycles: u64,
+    ) -> Self {
+        let mut spec = Self::realtime(deadline_cycles);
+        let share = if period_cycles == 0 {
+            0
+        } else {
+            let raw = ((runtime_cycles as u128) * 1_000_000u128) / (period_cycles as u128);
+            if raw > 1_000_000 {
+                1_000_000
+            } else {
+                raw as u32
+            }
+        };
+        spec.budget.share_ppm = share;
+        spec.budget.period = Some(PeriodBudget::strict(runtime_cycles, period_cycles));
+        spec
     }
 }
 
@@ -786,10 +1003,11 @@ pub fn init() {
     for q in READY.iter() {
         *q.lock() = Some(VecDeque::new());
     }
-    // Wave D: wire the default `FifoScheduler` into the policy slot
+    // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
     // smoke installed an alternative impl ahead of init, leave it.
     policy::install_default_if_unset();
+    policy::notify_cpu_state(CpuId::BOOT, CpuState::Active, None);
     // Wave E: wire the default `HeadQueueDonation` so `donate_to`'s
     // policy-driven placement and cycle-ceiling lookups return the
     // pre-Wave-E hardcoded behaviour byte-for-byte. Idempotent for the
@@ -822,17 +1040,37 @@ pub fn __reset_queues_for_test() {
 /// Keeping the mask independently makes `sched_getaffinity(2)` exact during
 /// that interval and lets a concurrent setter publish an update that the slot
 /// consumes at the next cooperative poll boundary.
-static TASK_AFFINITY: IrqSafeSpinLock<alloc::vec::Vec<(TaskId, Affinity)>> =
-    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+#[derive(Copy, Clone)]
+struct TaskAffinityEntry {
+    id: TaskId,
+    affinity: Affinity,
+    realtime_pinned: bool,
+}
 
-fn register_task_affinity(id: TaskId, affinity: Affinity) {
-    let mut entries = TASK_AFFINITY.lock();
-    entries.retain(|(task, _)| *task != id);
-    entries.push((id, affinity));
+const NEW_TASK_AFFINITY_SHARD: IrqSafeSpinLock<alloc::vec::Vec<TaskAffinityEntry>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+static TASK_AFFINITY: [IrqSafeSpinLock<alloc::vec::Vec<TaskAffinityEntry>>;
+    narf_lib::percpu::MAX_CPUS] = [NEW_TASK_AFFINITY_SHARD; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn task_affinity_shard(id: TaskId) -> usize {
+    id.raw() as usize % narf_lib::percpu::MAX_CPUS
+}
+
+fn register_task_affinity(id: TaskId, affinity: Affinity, realtime_pinned: bool) {
+    let mut entries = TASK_AFFINITY[task_affinity_shard(id)].lock();
+    entries.retain(|entry| entry.id != id);
+    entries.push(TaskAffinityEntry {
+        id,
+        affinity,
+        realtime_pinned,
+    });
 }
 
 fn unregister_task_affinity(id: TaskId) {
-    TASK_AFFINITY.lock().retain(|(task, _)| *task != id);
+    TASK_AFFINITY[task_affinity_shard(id)]
+        .lock()
+        .retain(|entry| entry.id != id);
 }
 
 /// Snapshot the online CPU set used by Linux affinity syscalls and cgroups.
@@ -842,11 +1080,11 @@ pub fn online_cpu_set() -> CpuSet {
 
 /// Return a live task's hard affinity mask.
 pub fn task_affinity(id: TaskId) -> Option<CpuSet> {
-    TASK_AFFINITY
+    TASK_AFFINITY[task_affinity_shard(id)]
         .lock()
         .iter()
-        .find(|(task, _)| *task == id)
-        .map(|(_, affinity)| affinity.allowed)
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.affinity.allowed)
 }
 
 /// Failure from [`set_task_affinity`].
@@ -856,6 +1094,8 @@ pub enum SetAffinityError {
     TaskNotFound,
     /// The supplied set has no online CPU.
     NoOnlineCpu,
+    /// Admitted realtime reservations remain pinned to their admission CPU.
+    RealtimePinned,
 }
 
 /// Change a task's hard affinity and migrate a queued slot when necessary.
@@ -875,35 +1115,50 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
         preferred: lowest_allowed_cpu(allowed),
     };
     {
-        let mut entries = TASK_AFFINITY.lock();
-        let Some((_, current)) = entries.iter_mut().find(|(task, _)| *task == id) else {
+        let mut entries = TASK_AFFINITY[task_affinity_shard(id)].lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
             return Err(SetAffinityError::TaskNotFound);
         };
-        *current = affinity;
+        if entry.realtime_pinned && entry.affinity != affinity {
+            return Err(SetAffinityError::RealtimePinned);
+        }
+        entry.affinity = affinity;
     }
 
     // If the task is parked, update and (when its old queue is no longer
     // allowed) move it before it can dispatch again. At most one READY lock is
     // held at a time; enqueue_on acquires the destination only after removal.
     for (cpu, ready) in READY.iter().enumerate() {
-        let moved = {
+        let cpu_id = CpuId(cpu as u32);
+        let found = policy::with_scheduler(cpu_id, |scheduler| {
             let mut queue = ready.lock();
-            let Some(queue) = queue.as_mut() else {
-                continue;
-            };
-            let Some(pos) = queue.iter().position(|slot| slot.id == id) else {
-                continue;
-            };
+            let queue = queue.as_mut()?;
+            let pos = queue.iter().position(|slot| slot.id == id)?;
             if allowed.contains(CpuId(cpu as u32)) {
                 queue[pos].spec.affinity = affinity;
-                return Ok(());
+                return Some(None);
             }
             let mut slot = queue.remove(pos).expect("affinity slot disappeared");
             slot.spec.affinity = affinity;
-            slot
+            if let Some(scheduler) = scheduler {
+                scheduler.on_task_queue_event(
+                    cpu_id,
+                    policy::TaskQueueEvent::Dequeued {
+                        task: policy::TaskMeta::from_slot(&slot),
+                        reason: policy::TaskDequeueReason::Migrated,
+                    },
+                );
+            }
+            Some(Some(slot))
+        });
+        let Some(moved) = found else {
+            continue;
+        };
+        let Some(moved) = moved else {
+            return Ok(());
         };
         let target = target_cpu_for_affinity(affinity, cpu);
-        enqueue_on(target, moved);
+        enqueue_on(target, moved, policy::TaskEnqueueReason::Migrated);
         return Ok(());
     }
 
@@ -913,11 +1168,11 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
 }
 
 fn registered_affinity(id: TaskId) -> Option<Affinity> {
-    TASK_AFFINITY
+    TASK_AFFINITY[task_affinity_shard(id)]
         .lock()
         .iter()
-        .find(|(task, _)| *task == id)
-        .map(|(_, affinity)| *affinity)
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.affinity)
 }
 
 fn refresh_slot_affinity(slot: &mut TaskSlot) {
@@ -995,7 +1250,73 @@ fn normalize_spawn_affinity(affinity: Affinity) -> Affinity {
 fn enqueue_after_poll(cpu: usize, mut slot: TaskSlot) {
     refresh_slot_affinity(&mut slot);
     let target = requeue_cpu_for_affinity(slot.spec.affinity, cpu);
-    enqueue_on(target, slot);
+    enqueue_on(target, slot, policy::TaskEnqueueReason::Requeued);
+}
+
+fn offline_migration_target(slot: &TaskSlot, source: usize) -> Option<usize> {
+    if slot.rt_reservation.is_some() {
+        return None;
+    }
+    let preferred = slot.spec.affinity.preferred.map(|cpu| cpu.0 as usize);
+    preferred
+        .filter(|cpu| {
+            *cpu != source
+                && *cpu < narf_lib::percpu::MAX_CPUS
+                && narf_lib::smp::is_online(*cpu as u32)
+                && cpu_lifecycle::cpu_online(CpuId(*cpu as u32))
+                && slot.spec.affinity.allowed.contains(CpuId(*cpu as u32))
+        })
+        .or_else(|| {
+            (0..narf_lib::percpu::MAX_CPUS).find(|cpu| {
+                *cpu != source
+                    && narf_lib::smp::is_online(*cpu as u32)
+                    && cpu_lifecycle::cpu_online(CpuId(*cpu as u32))
+                    && slot.spec.affinity.allowed.contains(CpuId(*cpu as u32))
+            })
+        })
+}
+
+/// Drain one quiesced CPU without holding its queue lock while taking a
+/// destination lock. Returns false if any queued task is pinned there.
+pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
+    let source = cpu.0 as usize;
+    let Some(ready) = READY.get(source) else {
+        return false;
+    };
+    let mut moved: alloc::vec::Vec<(usize, TaskSlot)> = alloc::vec::Vec::new();
+    let drained = policy::with_scheduler(cpu, |scheduler| {
+        let mut queue = ready.lock();
+        let Some(queue) = queue.as_mut() else {
+            return false;
+        };
+        let mut destinations = alloc::vec::Vec::with_capacity(queue.len());
+        for slot in queue.iter() {
+            let Some(target) = offline_migration_target(slot, source) else {
+                return false;
+            };
+            destinations.push(target);
+        }
+        for (slot, target) in queue.drain(..).zip(destinations) {
+            if let Some(scheduler) = scheduler {
+                scheduler.on_task_queue_event(
+                    cpu,
+                    policy::TaskQueueEvent::Dequeued {
+                        task: policy::TaskMeta::from_slot(&slot),
+                        reason: policy::TaskDequeueReason::Migrated,
+                    },
+                );
+            }
+            moved.push((target, slot));
+        }
+        true
+    });
+    if !drained {
+        return false;
+    }
+    for (target, slot) in moved {
+        enqueue_on(target, slot, policy::TaskEnqueueReason::Migrated);
+    }
+    true
 }
 
 /// Pick the CPU index a task with `spec` should land on. Honours
@@ -1115,18 +1436,25 @@ fn user_ap_affinity() -> Affinity {
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
-fn enqueue_on(cpu: usize, slot: TaskSlot) {
+fn enqueue_on(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) {
     // Record the slot's home CPU so a cross-core waker knows where to
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
     let awake = slot.awake.flag.load(Ordering::Acquire);
-    {
+    let meta = policy::TaskMeta::from_slot(&slot);
+    policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
         let mut q = READY[cpu].lock();
         q.as_mut()
             .expect("scheduler: spawn before init")
             .push_back(slot);
-    }
+        if let Some(scheduler) = scheduler {
+            scheduler.on_task_queue_event(
+                CpuId(cpu as u32),
+                policy::TaskQueueEvent::Enqueued { task: meta, reason },
+            );
+        }
+    });
     // A spawn IS a wake: a freshly-enqueued runnable slot on a REMOTE CPU
     // needs the same reschedule kick a cross-core `Waker::wake` sends, or
     // an idle-halted target only notices it at its next timer tick (~10 ms
@@ -1142,6 +1470,78 @@ fn enqueue_on(cpu: usize, slot: TaskSlot) {
     if awake {
         resched_remote(cpu as u32);
     }
+}
+
+#[inline]
+fn slot_is_dispatchable(slot: &TaskSlot, now: u64) -> bool {
+    if !slot.awake.flag.load(Ordering::Acquire) {
+        return false;
+    }
+    slot.account.view(now, &slot.spec.budget).eligibility != BudgetEligibility::Throttled
+}
+
+fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
+    let q = READY[cpu].lock();
+    q.as_ref().and_then(|ready| {
+        ready
+            .iter()
+            .filter(|slot| slot.awake.flag.load(Ordering::Acquire))
+            .filter_map(|slot| {
+                let view = slot.account.view(now, &slot.spec.budget);
+                (view.eligibility == BudgetEligibility::Throttled)
+                    .then_some(view.replenish_at_cycles)
+                    .flatten()
+            })
+            .min()
+    })
+}
+
+fn notify_cpu_idle(cpu: usize) {
+    let now = narf_time::now_cycles();
+    let state = {
+        let q = READY[cpu].lock();
+        let Some(ready) = q.as_ref() else {
+            return;
+        };
+        let mut parked = 0usize;
+        let mut throttled = 0usize;
+        let mut borrowable = 0usize;
+        let mut next_budget_replenishment = None;
+        for slot in ready {
+            if !slot.awake.flag.load(Ordering::Acquire) {
+                parked += 1;
+                continue;
+            }
+            let view = slot.account.view(now, &slot.spec.budget);
+            match view.eligibility {
+                BudgetEligibility::Eligible => {}
+                BudgetEligibility::Borrowable => borrowable += 1,
+                BudgetEligibility::Throttled => {
+                    throttled += 1;
+                    if let Some(deadline) = view.replenish_at_cycles {
+                        next_budget_replenishment = Some(
+                            next_budget_replenishment
+                                .map(|current: u64| current.min(deadline))
+                                .unwrap_or(deadline),
+                        );
+                    }
+                }
+            }
+        }
+        CpuIdleMeta {
+            queued: ready.len(),
+            parked,
+            throttled,
+            borrowable,
+            next_budget_replenishment,
+        }
+    };
+    policy::notify_cpu_executor_state(CpuId(cpu as u32), CpuState::Idle, Some(state));
+}
+
+#[inline]
+fn notify_cpu_active(cpu: usize) {
+    policy::notify_cpu_executor_state(CpuId(cpu as u32), CpuState::Active, None);
 }
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
@@ -1161,6 +1561,16 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let mut spec = spec;
+    assert!(
+        spec.budget.is_valid(),
+        "scheduler: invalid periodic resource budget"
+    );
+    // A class label is policy metadata, not authority. The infallible legacy
+    // spawn surface cannot prove admission, so an RT request through it is
+    // safely demoted. `spawn_realtime*` is the sole admission path.
+    if spec.class == SchedClass::Realtime {
+        spec.class = SchedClass::Default;
+    }
     spec.affinity = normalize_spawn_affinity(spec.affinity);
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
@@ -1176,14 +1586,73 @@ where
         addr_space: None,
         account: BudgetAccount::new(),
         donation: None,
-        #[cfg(target_arch = "x86_64")]
-        saved_pkrs: None,
+        domain_saved: None,
+        rt_reservation: None,
         nproc_guard: None,
     };
     let cpu = target_cpu(&spec);
-    register_task_affinity(id, spec.affinity);
-    enqueue_on(cpu, slot);
+    register_task_affinity(id, spec.affinity, false);
+    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
+}
+
+/// Admit and spawn a preemptible realtime kernel thread.
+///
+/// Realtime service requires all three of: a live CPU-budget authority, a
+/// strict `PeriodBudget` with an absolute deadline, and available per-CPU,
+/// system, and authority-domain bandwidth. The resulting task is pinned to
+/// the CPU on which its reservation was admitted.
+pub fn spawn_realtime<F>(
+    f: F,
+    spec: TaskSpec,
+    authority: &Cap<CpuBudget, Spend>,
+) -> Result<TaskId, AdmissionError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_realtime_with_options(f, spec, authority, StackfulOptions::default())
+}
+
+/// [`spawn_realtime`] with explicit own-stack/preemption options.
+pub fn spawn_realtime_with_options<F>(
+    f: F,
+    mut spec: TaskSpec,
+    authority: &Cap<CpuBudget, Spend>,
+    opts: StackfulOptions,
+) -> Result<TaskId, AdmissionError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if spec.class != SchedClass::Realtime || !spec.budget.is_valid() || opts.no_preempt {
+        return Err(AdmissionError::InvalidContract);
+    }
+    spec.affinity = normalize_spawn_affinity(spec.affinity);
+    let cpu = target_cpu(&spec);
+    let reservation = admission::reserve(authority, CpuId(cpu as u32), &spec.budget)?;
+    spec.affinity = Affinity::pinned(reservation.cpu());
+    spec.budget_cap = Some(*authority);
+    spec.work_kind = WorkKind::KernelThread;
+    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let slot = TaskSlot {
+        task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
+        awake: Arc::new(WakeCell {
+            pops: AtomicU64::new(0),
+            not_awake_requeues: AtomicU64::new(0),
+            flag: AtomicBool::new(true),
+            cpu: AtomicU32::new(cpu as u32),
+        }),
+        id,
+        spec,
+        addr_space: None,
+        account: BudgetAccount::new(),
+        donation: None,
+        domain_saved: None,
+        rt_reservation: Some(reservation),
+        nproc_guard: None,
+    };
+    register_task_affinity(id, spec.affinity, true);
+    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
+    Ok(id)
 }
 
 /// Spawn a task that runs on its own dedicated kernel stack
@@ -1210,7 +1679,10 @@ pub fn spawn_stackful<F>(f: F) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    spawn(stackful::StackfulAdapter::new(f))
+    spawn_with_spec(
+        stackful::StackfulAdapter::new(f),
+        TaskSpec::unthrottled().with_work_kind(WorkKind::KernelThread),
+    )
 }
 
 /// Options for tuning a stackful task's preemption behaviour.
@@ -1252,9 +1724,24 @@ pub fn spawn_stackful_with_options<F>(f: F, opts: StackfulOptions) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    spawn_stackful_with_spec(
+        f,
+        TaskSpec::unthrottled().with_work_kind(WorkKind::KernelThread),
+        opts,
+    )
+}
+
+/// Spawn a preemptible stackful task with explicit scheduling metadata and
+/// preemption options. This is the public bridge used by realtime/kernel
+/// thread front-ends: policy can inspect the spec, while stack switching and
+/// domain restoration remain private to the executor.
+pub fn spawn_stackful_with_spec<F>(f: F, spec: TaskSpec, opts: StackfulOptions) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let mut adapter = stackful::StackfulAdapter::with_options(f, opts);
     adapter.apply_options();
-    spawn(adapter)
+    spawn_with_spec(adapter, spec)
 }
 
 /// Spawn a stackful task HARD-pinned to `cpu` (otherwise default
@@ -1271,6 +1758,7 @@ where
 {
     let spec = TaskSpec {
         affinity: Affinity::pinned(crate::affinity::CpuId(cpu)),
+        work_kind: WorkKind::KernelThread,
         ..TaskSpec::unthrottled()
     };
     spawn_with_spec(stackful::StackfulAdapter::new(f), spec)
@@ -1333,6 +1821,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let mut spec = spec;
+    assert!(
+        spec.budget.is_valid(),
+        "scheduler: invalid periodic resource budget"
+    );
+    spec.work_kind = WorkKind::UserThread;
+    if spec.class == SchedClass::Realtime {
+        spec.class = SchedClass::Default;
+    }
     spec.affinity = normalize_spawn_affinity(spec.affinity);
     // Run user tasks on their OWN kernel stack via the stackful
     // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
@@ -1372,13 +1868,13 @@ where
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),
         donation: None,
-        #[cfg(target_arch = "x86_64")]
-        saved_pkrs: None,
+        domain_saved: None,
+        rt_reservation: None,
         nproc_guard: Some(NprocGuard::new()),
     };
     let cpu = target_cpu(&spec);
-    register_task_affinity(id, spec.affinity);
-    enqueue_on(cpu, slot);
+    register_task_affinity(id, spec.affinity, false);
+    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
 }
 
@@ -1485,7 +1981,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             let _ = g.take();
             *g = Some(new_arc.clone());
         }
-        let mut p = PENDING_SLOT_AS.lock();
+        let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
             .iter()
             .find(|(k, _)| *k == id.raw())
@@ -1514,15 +2010,19 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
 /// of BTreeMap to avoid an alloc-only dependency on `alloc::collections`
 /// for one-or-two-entry workloads. Wave-49+ may swap this to a
 /// `BTreeMap` if the post-fork burst pattern needs it.
-static PENDING_SLOT_AS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, Arc<AddressSpace>)>> =
-    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+type PendingAddressSpaces = alloc::vec::Vec<(u64, Arc<AddressSpace>)>;
+type PendingAddressSpaceShard = IrqSafeSpinLock<PendingAddressSpaces>;
+const NEW_PENDING_SLOT_AS_SHARD: PendingAddressSpaceShard =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
+static PENDING_SLOT_AS: [PendingAddressSpaceShard; narf_lib::percpu::MAX_CPUS] =
+    [NEW_PENDING_SLOT_AS_SHARD; narf_lib::percpu::MAX_CPUS];
 
 /// Drain `PENDING_SLOT_AS` for the given task id, returning the
 /// pending AS if any. Called by `poll_one_round` after popping a
 /// slot — the caller assigns the override into `slot.addr_space`
 /// so the activate + ACTIVE_USER_AS publication see the new AS.
 fn take_pending_slot_as(id: TaskId) -> Option<Arc<AddressSpace>> {
-    let mut p = PENDING_SLOT_AS.lock();
+    let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
     let pos = p.iter().position(|(k, _)| *k == id.raw())?;
     let (_, v) = p.swap_remove(pos);
     Some(v)
@@ -1552,11 +2052,18 @@ pub enum DonateError {
 /// 16 slots covers the realistic in-flight donation graph; an
 /// overflow panics so the misuse surfaces at the call site.
 const MAX_PENDING_DONATIONS: usize = 16;
-static PENDING_DONOR_DEBITS: IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONATIONS]> =
+const NEW_PENDING_DONOR_SHARD: IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONATIONS]> =
     IrqSafeSpinLock::new([(TaskId::NONE, 0); MAX_PENDING_DONATIONS]);
+static PENDING_DONOR_DEBITS: [IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONATIONS]>;
+    narf_lib::percpu::MAX_CPUS] = [NEW_PENDING_DONOR_SHARD; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn donor_shard(donor: TaskId) -> usize {
+    donor.raw() as usize % narf_lib::percpu::MAX_CPUS
+}
 
 fn stage_donor_debit(donor: TaskId, cycles: u64) {
-    let mut t = PENDING_DONOR_DEBITS.lock();
+    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
     for slot in t.iter_mut() {
         if slot.0 == TaskId::NONE {
             *slot = (donor, cycles);
@@ -1570,7 +2077,7 @@ fn drain_donor_debit(donor: TaskId) -> u64 {
     if donor == TaskId::NONE {
         return 0;
     }
-    let mut t = PENDING_DONOR_DEBITS.lock();
+    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
     let mut total = 0u64;
     for slot in t.iter_mut() {
         if slot.0 == donor {
@@ -1582,7 +2089,7 @@ fn drain_donor_debit(donor: TaskId) -> u64 {
 }
 
 fn cancel_donor_debit(donor: TaskId, cycles: u64) {
-    let mut t = PENDING_DONOR_DEBITS.lock();
+    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
     for slot in t.iter_mut() {
         if slot.0 == donor {
             let new = slot.1.saturating_sub(cycles);
@@ -1614,7 +2121,9 @@ fn refund_donor(donor: TaskId, cycles: u64) {
 
 #[doc(hidden)]
 pub fn __reset_donations_for_test() {
-    *PENDING_DONOR_DEBITS.lock() = [(TaskId::NONE, 0); MAX_PENDING_DONATIONS];
+    for shard in &PENDING_DONOR_DEBITS {
+        *shard.lock() = [(TaskId::NONE, 0); MAX_PENDING_DONATIONS];
+    }
 }
 
 /// Direct time-slice donation fast path (spec §3.3).
@@ -1666,8 +2175,14 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                     (
                         crate::policy::TaskMeta {
                             id: d.id,
+                            work_kind: d.spec.work_kind,
                             priority: d.spec.priority,
                             class: d.spec.class,
+                            deadline_cycles: d.spec.budget.deadline_cycles,
+                            budget: d.spec.budget,
+                            account: d.account,
+                            budget_state: d.account.view(narf_time::now_cycles(), &d.spec.budget),
+                            runnable: d.awake.flag.load(Ordering::Acquire),
                             affinity: d.spec.affinity,
                             addr_space: d.addr_space.is_some(),
                         },
@@ -1677,8 +2192,17 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                     (
                         crate::policy::TaskMeta {
                             id: donor_id,
+                            work_kind: crate::priority::WorkKind::AsyncTask,
                             priority: crate::priority::Priority::NORMAL,
                             class: crate::priority::SchedClass::Normal,
+                            deadline_cycles: None,
+                            budget: crate::budget::ResourceBudget::unthrottled(),
+                            account: crate::budget::BudgetAccount::new(),
+                            budget_state: crate::budget::BudgetAccount::new().view(
+                                narf_time::now_cycles(),
+                                &crate::budget::ResourceBudget::unthrottled(),
+                            ),
+                            runnable: false,
                             affinity: crate::affinity::Affinity::any(),
                             addr_space: false,
                         },
@@ -1689,8 +2213,17 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 (
                     crate::policy::TaskMeta {
                         id: TaskId::NONE,
+                        work_kind: crate::priority::WorkKind::AsyncTask,
                         priority: crate::priority::Priority::NORMAL,
                         class: crate::priority::SchedClass::Normal,
+                        deadline_cycles: None,
+                        budget: crate::budget::ResourceBudget::unthrottled(),
+                        account: crate::budget::BudgetAccount::new(),
+                        budget_state: crate::budget::BudgetAccount::new().view(
+                            narf_time::now_cycles(),
+                            &crate::budget::ResourceBudget::unthrottled(),
+                        ),
+                        runnable: false,
                         affinity: crate::affinity::Affinity::any(),
                         addr_space: false,
                     },
@@ -1703,14 +2236,10 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             // and drops the lock before returning so the queue lock
             // we still hold here is never nested under it.
             let donee_handle = crate::policy::TaskHandle::from_id(target);
-            let mut rq = crate::policy::RunQueue::projected(ready);
-            let (placement, ceiling) =
-                crate::donation::placement_and_ceiling(&mut rq, &donor_meta, donee_handle);
-            // `rq` is a borrow of `ready`; drop it before mutating
-            // `ready` further so the borrow checker sees the lifetime
-            // ended (no `take_picked` was called — the projection is
-            // read-only for this path).
-            drop(rq);
+            let (placement, ceiling) = {
+                let rq = crate::policy::RunQueue::projected(ready);
+                crate::donation::placement_and_ceiling(&rq, &donor_meta, donee_handle)
+            };
 
             // Refuse short-circuit: no budget changes, no enqueue
             // mutation; donee stays where it is.
@@ -1939,12 +2468,16 @@ pub fn poll_one_round() -> usize {
     let mut ready_this_round = 0usize;
 
     for _ in 0..round_len {
-        let mut slot = {
+        // Policy publication is CPU-local on the hot path. The callback sees
+        // a read-only queue projection; the core validates and detaches the
+        // returned opaque handle while retaining queue ownership.
+        let cpu_id = CpuId(cpu as u32);
+        let Some((_handle, mut slot)) = policy::with_scheduler(cpu_id, |scheduler| {
             let mut q = READY[cpu].lock();
-            match q.as_mut().and_then(|d| d.pop_front()) {
-                Some(t) => t,
-                None => break,
-            }
+            q.as_mut()
+                .and_then(|d| policy::pick_next_slot(scheduler, cpu_id, d))
+        }) else {
+            break;
         };
         refresh_slot_affinity(&mut slot);
         if !slot.spec.affinity.allowed.contains(CpuId(cpu as u32)) {
@@ -1969,6 +2502,15 @@ pub fn poll_one_round() -> usize {
                 continue;
             }
         }
+        if slot
+            .account
+            .view(narf_time::now_cycles(), &slot.spec.budget)
+            .eligibility
+            == BudgetEligibility::Throttled
+        {
+            enqueue_after_poll(cpu, slot);
+            continue;
+        }
         if !slot.awake.flag.swap(false, Ordering::Acquire) {
             enqueue_after_poll(cpu, slot);
             continue;
@@ -1979,6 +2521,9 @@ pub fn poll_one_round() -> usize {
         let waker = make_waker(slot.awake.clone());
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
+        let interrupt_start = accounting::interrupt_cycles(cpu);
+        let budget_dispatch = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
+        publish_budget_window(cpu, start.as_cycles(), budget_dispatch, &slot.spec.budget);
         // Save + restore identity around the inner poll. We're
         // running INSIDE another task's poll (the user-mode
         // syscall handler that called sleep_pumps); a blunt
@@ -1993,37 +2538,29 @@ pub fn poll_one_round() -> usize {
         current_task_slot().store(slot.id.raw(), Ordering::Release);
         // No `*active_user_as_slot().lock() = ...` here because kernel
         // tasks have `addr_space.is_none()` (we filtered above).
-        // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
-        // re-establish the task's protection-key rights view
-        // before re-entering its future. No-op when CR4.PKS is
-        // off (pre-SPR Intel, AMD) or the slot has never yielded
-        // before (saved_pkrs is None).
-        #[cfg(target_arch = "x86_64")]
-        if let Some(saved) = slot.saved_pkrs {
-            if narf_arch::x86_64::pks::is_active() {
-                // SAFETY: CR4.PKS is on (is_active() returned true);
-                // WRMSR IA32_PKRS is well-defined.
-                // SAFETY: Valid memory or trusted environment
-                unsafe { narf_arch::x86_64::pks::restore(saved) };
-            }
-        }
-        let poll_result = slot.task.as_mut().poll(&mut ctx);
+        let poll_result = poll_with_domain(&mut slot, &mut ctx);
+        let borrowed = clear_budget_window(cpu)
+            || budget_dispatch.eligibility == BudgetEligibility::Borrowable;
         current_task_slot().store(outer_task, Ordering::Release);
         *active_user_as_slot().lock() = outer_as;
-        let elapsed = Instant::now().cycles_since(start);
-        let outcome = slot.account.charge(elapsed, &slot.spec.budget);
+        let interrupt_elapsed = accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
+        let elapsed = Instant::now()
+            .cycles_since(start)
+            .saturating_sub(interrupt_elapsed);
+        let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
+        let period_outcome = slot
+            .account
+            .charge_period(elapsed, &slot.spec.budget, borrowed);
+        let outcome = if burst_outcome == crate::budget::ChargeOutcome::Continue {
+            period_outcome
+        } else {
+            burst_outcome
+        };
         // Apply any donor-side debit that `donate_to` staged
         // while this task was off-queue (currently polling).
         let pending = drain_donor_debit(slot.id);
         if pending > 0 {
             slot.account.add_debit(pending);
-        }
-        // Stage-5 PKRS save: snapshot IA32_PKRS into the slot
-        // so the next poll restores the same rights view.
-        #[cfg(target_arch = "x86_64")]
-        if narf_arch::x86_64::pks::is_active() {
-            // SAFETY: see above.
-            slot.saved_pkrs = Some(unsafe { narf_arch::x86_64::pks::save() });
         }
         // Announce a QSBR quiescent state — UNLESS the task returned Pending
         // because it was involuntarily preempted (a preemption is an
@@ -2047,7 +2584,7 @@ pub fn poll_one_round() -> usize {
                     ChargeOutcome::Throttle => {
                         slot.awake.flag.store(false, Ordering::Release);
                     }
-                    ChargeOutcome::Continue => {}
+                    ChargeOutcome::Continue | ChargeOutcome::PeriodExhausted => {}
                 }
                 enqueue_after_poll(cpu, slot);
             }
@@ -2164,6 +2701,13 @@ pub fn run_until_empty() {
     let mut halt_poll_cycles: u64 = 0;
 
     loop {
+        // Logical hot-unplug publishes Draining before inspecting/migrating
+        // the queue. Stop dispatching new slots so the control CPU observes a
+        // stable quiescent queue; an already-running slot makes the operation
+        // return Busy and restores Active.
+        if policy::cpu_state(CpuId(cpu as u32)) == CpuState::Draining {
+            return;
+        }
         // Per-round drain of IRQ-deferred wakers. Must run every
         // round (not gated on ready_this_round == 0), because a
         // perpetually self-waking task (supervisor with
@@ -2181,22 +2725,16 @@ pub fn run_until_empty() {
         };
 
         for _ in 0..round_len {
-            // Wave D: the pluggable `Scheduler` policy decides which
-            // slot to dispatch next. Default is `FifoScheduler` — its
-            // `pick_next` is pop_front, so this branch behaves
-            // byte-for-byte like the pre-Wave-D inline pop. The
-            // policy is consulted under the per-CPU queue lock; impls
-            // must not allocate or re-enter the scheduler (see the
-            // trait-level hot-path constraint comment in
-            // `policy.rs`).
+            // The pluggable policy sees only a read-only candidate view and
+            // returns an opaque handle. Policy publication is CPU-local on
+            // this hot path; the core validates and removes the selected slot.
             let cpu_id = crate::affinity::CpuId(cpu as u32);
-            let mut slot = {
+            let Some((_handle, mut slot)) = policy::with_scheduler(cpu_id, |scheduler| {
                 let mut q = READY[cpu].lock();
                 let dq = q.as_mut().unwrap();
-                match policy::pick_next_slot(cpu_id, dq) {
-                    Some((_h, slot)) => slot,
-                    None => break,
-                }
+                policy::pick_next_slot(scheduler, cpu_id, dq)
+            }) else {
+                break;
             };
 
             // Wave-49fu: apply any deferred AS update that
@@ -2237,6 +2775,16 @@ pub fn run_until_empty() {
                 }
             }
 
+            if slot
+                .account
+                .view(narf_time::now_cycles(), &slot.spec.budget)
+                .eligibility
+                == BudgetEligibility::Throttled
+            {
+                enqueue_after_poll(cpu, slot);
+                continue;
+            }
+
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
             slot.awake.pops.fetch_add(1, Ordering::Relaxed);
@@ -2247,6 +2795,10 @@ pub fn run_until_empty() {
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
+            // This is the first point at which idle has become execution:
+            // merely receiving an IRQ or running maintenance does not make a
+            // CPU active from a scheduling-policy perspective.
+            notify_cpu_active(cpu);
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
@@ -2323,6 +2875,9 @@ pub fn run_until_empty() {
             let waker = make_waker(slot.awake.clone());
             let mut ctx = Context::from_waker(&waker);
             let start = Instant::now();
+            let interrupt_start = accounting::interrupt_cycles(cpu);
+            let budget_dispatch = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
+            publish_budget_window(cpu, start.as_cycles(), budget_dispatch, &slot.spec.budget);
             // Publish this slot's id + AS as the currently-polling
             // task so syscall handlers + introspection can identify
             // the caller and resolve its mappings. Cleared after the
@@ -2335,19 +2890,9 @@ pub fn run_until_empty() {
             // the queue and thus invisible to that scan.
             current_task_slot().store(slot.id.raw(), Ordering::Release);
             *active_user_as_slot().lock() = slot.addr_space.clone();
-            // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
-            // re-establish the task's protection-key rights view
-            // before re-entering its future.
-            #[cfg(target_arch = "x86_64")]
-            if let Some(saved) = slot.saved_pkrs {
-                if narf_arch::x86_64::pks::is_active() {
-                    // SAFETY: CR4.PKS is on (is_active() returned
-                    // true); WRMSR IA32_PKRS is well-defined.
-                    // SAFETY: Valid memory or trusted environment
-                    unsafe { narf_arch::x86_64::pks::restore(saved) };
-                }
-            }
-            let poll_result = slot.task.as_mut().poll(&mut ctx);
+            let poll_result = poll_with_domain(&mut slot, &mut ctx);
+            let borrowed = clear_budget_window(cpu)
+                || budget_dispatch.eligibility == BudgetEligibility::Borrowable;
             current_task_slot().store(0, Ordering::Release);
             *active_user_as_slot().lock() = None;
             // Restore kernel per-AS register — see save comment
@@ -2396,26 +2941,26 @@ pub fn run_until_empty() {
                 }
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
-            let elapsed = Instant::now().cycles_since(start);
-            let outcome = slot.account.charge(elapsed, &slot.spec.budget);
+            let interrupt_elapsed =
+                accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
+            let elapsed = Instant::now()
+                .cycles_since(start)
+                .saturating_sub(interrupt_elapsed);
+            let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
+            let period_outcome = slot
+                .account
+                .charge_period(elapsed, &slot.spec.budget, borrowed);
+            let outcome = if burst_outcome == crate::budget::ChargeOutcome::Continue {
+                period_outcome
+            } else {
+                burst_outcome
+            };
 
             // Apply any donor-side debit that `donate_to` staged
             // while this task was off-queue (currently polling).
             let pending = drain_donor_debit(slot.id);
             if pending > 0 {
                 slot.account.add_debit(pending);
-            }
-
-            // Stage-5 PKRS save: snapshot IA32_PKRS into the slot
-            // so the next poll restores the same rights view
-            // (Intel SDM Vol 3 §4.6.2.4). Done on both Ready and
-            // Pending; the Ready case drops the slot immediately
-            // after so the save is redundant but keeps the
-            // invariant uniform.
-            #[cfg(target_arch = "x86_64")]
-            if narf_arch::x86_64::pks::is_active() {
-                // SAFETY: CR4.PKS is on; RDMSR(IA32_PKRS) is well-defined.
-                slot.saved_pkrs = Some(unsafe { narf_arch::x86_64::pks::save() });
             }
 
             // Announce a QSBR quiescent state: the task has yielded
@@ -2450,7 +2995,7 @@ pub fn run_until_empty() {
                         ChargeOutcome::Demote => {
                             // Hot cutover: mutate the slot's class
                             // to Idle so it only polls when no
-                            // Normal/RealTime peer is runnable.
+                            // Default/Interactive/Realtime peer is runnable.
                             slot.spec.class = SchedClass::Idle;
                         }
                         ChargeOutcome::Throttle => {
@@ -2461,7 +3006,7 @@ pub fn run_until_empty() {
                             enqueue_after_poll(cpu, slot);
                             continue;
                         }
-                        ChargeOutcome::Continue => {}
+                        ChargeOutcome::Continue | ChargeOutcome::PeriodExhausted => {}
                     }
                     // A self-wake during the poll (`yield_now`, the
                     // SleepUntil busy-poll fallback) leaves `slot.awake`
@@ -2485,15 +3030,26 @@ pub fn run_until_empty() {
         // nothing to do — return so the caller decides whether to
         // park (worker APs via `run_forever`) or proceed (BSP-side
         // test callers).
-        let local_empty = {
+        let now = narf_time::now_cycles();
+        let (local_empty, local_dispatchable) = {
             let q = READY[cpu].lock();
-            q.as_ref().map(|d| d.is_empty()).unwrap_or(true)
+            q.as_ref()
+                .map(|d| {
+                    (
+                        d.is_empty(),
+                        d.iter().any(|slot| slot_is_dispatchable(slot, now)),
+                    )
+                })
+                .unwrap_or((true, false))
         };
-        if local_empty {
-            if !try_steal_one(cpu) {
+        if !local_dispatchable {
+            if try_steal_one(cpu) {
+                continue;
+            }
+            if local_empty {
+                notify_cpu_idle(cpu);
                 return;
             }
-            continue;
         }
 
         // Drain any wakers that IRQ handlers stashed for deferred
@@ -2564,14 +3120,15 @@ pub fn run_until_empty() {
         if cpu < narf_lib::percpu::MAX_CPUS {
             EXEC_ROUNDS[cpu].fetch_add(1, Ordering::Relaxed);
         }
+        let runnable_now = narf_time::now_cycles();
         let any_runnable = {
             let q = READY[cpu].lock();
             q.as_ref()
-                .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
+                .map(|d| d.iter().any(|s| slot_is_dispatchable(s, runnable_now)))
                 .unwrap_or(false)
         };
         if any_runnable {
-            let now = narf_time::now_cycles();
+            let now = runnable_now;
             // Drain due timer-wheel wakers EVERY round while a task is
             // runnable — the idle-path `fire_due` below only runs when nothing
             // is runnable, and the timer ISR can't fire the wheel itself (the
@@ -2599,6 +3156,7 @@ pub fn run_until_empty() {
             continue;
         }
         last_pump_cycles = narf_time::now_cycles();
+        notify_cpu_idle(cpu);
 
         {
             // All tasks parked this round. Tick the sleep pumps so the work
@@ -2708,9 +3266,10 @@ pub fn run_until_empty() {
                                 break;
                             }
                             let any = {
+                                let now = narf_time::now_cycles();
                                 let q = READY[cpu].lock();
                                 q.as_ref()
-                                    .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
+                                    .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
                                     .unwrap_or(false)
                             };
                             if any {
@@ -2739,7 +3298,18 @@ pub fn run_until_empty() {
                     halt_poll_cycles /= 2;
                 }
             }
-            let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            let now = narf_time::now_cycles();
+            let wheel_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            let budget_deadline = next_budget_replenishment(cpu, now);
+            let next_deadline = match (wheel_deadline, budget_deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(deadline) = budget_deadline {
+                arm_scheduler_deadline(deadline);
+            }
             // We are between task polls and hold no RCU read guard. This halt
             // can be indefinite when the queue contains only parked slots, so
             // remove this CPU from the active QSBR census before publishing
@@ -2791,9 +3361,10 @@ pub fn run_until_empty() {
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             let woke_late = {
+                let now = narf_time::now_cycles();
                 let q = READY[cpu].lock();
                 q.as_ref()
-                    .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
+                    .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
                     .unwrap_or(false)
             };
             if woke_late {
@@ -2881,12 +3452,13 @@ pub fn has_other_runnable_work(current: u64) -> bool {
     }
     // Another awake task is queued and ready to run.
     let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::now_cycles();
     match READY[cpu].try_lock() {
         Some(q) => q
             .as_ref()
             .map(|d| {
                 d.iter()
-                    .any(|s| s.id.raw() != current && s.awake.flag.load(Ordering::Acquire))
+                    .any(|s| s.id.raw() != current && slot_is_dispatchable(s, now))
             })
             .unwrap_or(false),
         None => true,
@@ -2924,10 +3496,8 @@ pub fn runnable_task_count() -> usize {
         }
         if let Some(g) = ready.try_lock() {
             if let Some(d) = g.as_ref() {
-                n += d
-                    .iter()
-                    .filter(|s| s.awake.flag.load(Ordering::Acquire))
-                    .count();
+                let now = narf_time::now_cycles();
+                n += d.iter().filter(|s| slot_is_dispatchable(s, now)).count();
             }
         }
     }
@@ -3149,7 +3719,8 @@ fn try_steal_one(cpu: usize) -> bool {
 /// STEAL slot lock is no longer held.
 fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealStrategy) -> bool {
     let thief = crate::affinity::CpuId(cpu as u32);
-    let stolen = {
+    let victim_id = crate::affinity::CpuId(victim as u32);
+    let stolen = policy::with_scheduler(victim_id, |scheduler| {
         // Non-blocking: a contended victim queue is skipped, never spun
         // on. Spinning here holds IRQs masked (IrqSafeSpinLock), which on
         // x86_64 stalls inbound TLB-shootdown IPIs — the sender then spins
@@ -3158,38 +3729,40 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         // the slot stays for the lock holder or another thief.
         let mut g = match READY[victim].try_lock() {
             Some(g) => g,
-            None => return false,
+            None => return None,
         };
         let q = match g.as_mut() {
             Some(q) => q,
-            None => return false,
+            None => return None,
         };
         // Linear scan for the first slot the strategy permits. The
         // default impl respects `affinity.allowed`; custom impls may
         // refuse on class/priority/id.
+        let now = narf_time::now_cycles();
         let pos = q.iter().position(|s| {
-            let meta = crate::policy::TaskMeta {
-                id: s.id,
-                priority: s.spec.priority,
-                class: s.spec.class,
-                affinity: s.spec.affinity,
-                // Marks an address-space-bearing (user) task. The default
-                // strategy's `allow_steal` refuses to steal one UNLESS
-                // `user_task_smp_enabled()` — see `steal.rs`. This was
-                // once an unconditional "never migrate" floor and the
-                // comment outlived the exception, which matters when
-                // reasoning about strands: a user task whose home CPU
-                // stops iterating its executor loop is only rescuable by
-                // another CPU if that flag is on.
-                addr_space: s.addr_space.is_some(),
-            };
+            if !slot_is_dispatchable(s, now) {
+                return false;
+            }
+            let meta = crate::policy::TaskMeta::from_slot(s);
             strategy.allow_steal(thief, &meta)
         });
         match pos {
-            Some(p) => q.remove(p),
+            Some(p) => {
+                let slot = q.remove(p);
+                if let (Some(scheduler), Some(slot)) = (scheduler, slot.as_ref()) {
+                    scheduler.on_task_queue_event(
+                        victim_id,
+                        policy::TaskQueueEvent::Dequeued {
+                            task: policy::TaskMeta::from_slot(slot),
+                            reason: policy::TaskDequeueReason::Migrated,
+                        },
+                    );
+                }
+                slot
+            }
             None => None,
         }
-    };
+    });
     if let Some(slot) = stolen {
         // ── BUG FIX (intermittent permanent SMP wedge) ──
         // Re-home the stolen slot to the THIEF before it lands on the
@@ -3205,13 +3778,10 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         // task strands with awake=true → the connection it serves stalls
         // (the intermittent 200-conn livelock; worse under affinity
         // restriction, which forces more cross-core placement/stealing).
-        // `enqueue_on` already does this store for the normal enqueue path;
-        // the steal path bypassed it.
-        slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-        let mut g = READY[cpu].lock();
-        g.as_mut()
-            .expect("scheduler: steal before init")
-            .push_back(slot);
+        // Route the steal through `enqueue_on` as well so re-homing, policy
+        // lifecycle notification, and the remote reschedule handshake remain
+        // one ordered operation.
+        enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
         return true;
     }
     false
@@ -3227,6 +3797,58 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
 /// Without this, an AP that polled one task and then halted would
 /// leave its `last_quiescent` stuck below the current epoch and
 /// stall every subsequent grace period kernel-wide.
+fn park_for_cpu_lifecycle(cpu: usize) -> bool {
+    let cpu_id = CpuId(cpu as u32);
+    let state = policy::cpu_state(cpu_id);
+    if matches!(state, CpuState::Active | CpuState::Idle) {
+        return false;
+    }
+    if state == CpuState::Draining {
+        cpu_lifecycle::acknowledge_drain(cpu);
+    }
+    narf_rcu::report_idle();
+    narf_memory::tlb_shootdown::mark_idle(cpu as u32);
+
+    let interrupts_were_enabled = narf_arch::interrupts_enabled();
+    if interrupts_were_enabled {
+        // SAFETY: between polls with no scheduler lock held. The matching
+        // enable below restores the executor's normal IRQ state.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    CPU_HALTED[cpu].store(true, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    let state_after_publish = policy::cpu_state(cpu_id);
+    if state_after_publish == CpuState::Draining {
+        cpu_lifecycle::acknowledge_drain(cpu);
+    }
+    if matches!(state_after_publish, CpuState::Active | CpuState::Idle) {
+        CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+        narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+        if interrupts_were_enabled {
+            // SAFETY: restores the state masked above.
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        return false;
+    }
+
+    if interrupts_were_enabled {
+        // SAFETY: IRQs were disabled above. This is the architecture's atomic
+        // enable/halt/disable sequence, so a bring-up IPI cannot be lost in
+        // the final state-check-to-halt window.
+        unsafe { narf_arch::idle_halt_then_disable() };
+    } else {
+        core::hint::spin_loop();
+    }
+    CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+    narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+    if interrupts_were_enabled {
+        // SAFETY: restores the state masked above.
+        unsafe { narf_arch::enable_interrupts() };
+    }
+    true
+}
+
 pub fn run_forever() -> ! {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -3234,8 +3856,18 @@ pub fn run_forever() -> ! {
     } else {
         0
     };
+    // APs enter the scheduler here after architecture bring-up. Publish
+    // execution availability even if the first queue is empty; the first
+    // run_until_empty pass then emits the matching Idle edge before halt.
+    policy::notify_cpu_state(CpuId(cpu as u32), CpuState::Active, None);
     loop {
+        if park_for_cpu_lifecycle(cpu) {
+            continue;
+        }
         run_until_empty();
+        if park_for_cpu_lifecycle(cpu) {
+            continue;
+        }
         // RCU maintenance before idling: open the next grace-period epoch
         // if this CPU still holds deferred reclamations, so peers' reports
         // can release them while we halt.

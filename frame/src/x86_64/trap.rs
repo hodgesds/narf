@@ -1229,11 +1229,17 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // The preempt/signal tail below stays on the task stack so a
         // `kernel_switch` continuation is never stranded on the shared
         // IRQ stack (Linux reschedules on the thread stack).
-        // SAFETY: kernel GS is live (common_trap swapgs'd on user entry);
-        // gs:[24]/gs:[32] are set up per-CPU by percpu::init_bsp/init_ap.
+        let hardirq_account =
+            narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
+        // SAFETY: kernel GS is live (common_trap swapgs'd on user entry), and
+        // gs:[24]/gs:[32] name this CPU's initialized hardirq-stack bounds.
         unsafe {
             run_irq_dispatch_on_stack(frame as *mut TrapFrame);
         }
+        // End accounting before the reschedule tail: try_preempt may switch to
+        // the executor and not resume this trap continuation for an arbitrary
+        // interval, which must not be billed as hard-IRQ residency.
+        drop(hardirq_account);
         #[cfg(feature = "stall-watchdog")]
         if is_tick {
             stall_wd::stage(2);

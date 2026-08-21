@@ -2076,6 +2076,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-scheduler-policy-example"
+version = "0.0.0"
+dependencies = [
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-scmi"
 version = "0.0.0"
 dependencies = [

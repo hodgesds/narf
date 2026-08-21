@@ -1,13 +1,11 @@
 //! Stackful kernel tasks.
 //!
-//! Spec: `scheduler/specification/preemption.md` Phase 1b.
+//! Spec: `scheduler/specification/preemption.md`.
 //!
 //! Wraps a `Pin<Box<dyn Future>>` with a dedicated kernel stack
 //! plus a saved `KernelContext`, so the future's `poll()` runs on
-//! the task's own stack instead of the executor's. The point is
-//! NOT (yet) preemption — phase 1b is the foundation. Phase 2
-//! adds the timer-driven preemption that's the actual fix for
-//! the cooperative-async busy-loop wedge.
+//! the task's own stack instead of the executor's. Timer traps can switch the
+//! live continuation back to the executor on x86_64 and aarch64.
 //!
 //! With this in place, the executor can `kernel_switch` into a
 //! task; the task polls its future to either `Ready` (done) or
@@ -18,7 +16,7 @@
 //!
 //! 1. `KernelTask::new(future, stack_bytes)` — allocate a stack
 //!    and seed `KernelContext::fresh` with the trampoline entry
-//!    + a pointer to the task itself in r15.
+//!    + a pointer to the task itself in r15 (x86_64) or x19 (aarch64).
 //! 2. Executor calls `KernelTask::poll_to_yield(&mut self, exec_ctx)`:
 //!    - Records `exec_ctx` so the task knows where to switch back.
 //!    - Calls `kernel_switch(exec_ctx, &task.ctx)`.
@@ -51,23 +49,15 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+#[cfg(target_arch = "aarch64")]
+use narf_arch::aarch64::kernel_ctx::{kernel_switch, KernelContext};
 #[cfg(target_arch = "x86_64")]
 use narf_arch::x86_64::kernel_ctx::{kernel_switch, KernelContext};
-
-#[cfg(not(target_arch = "x86_64"))]
-#[derive(Default, Copy, Clone, Debug)]
-pub struct KernelContext;
-
-#[cfg(not(target_arch = "x86_64"))]
-impl KernelContext {
-    pub fn fresh(_stack_top: u64, _entry: u64, _arg: u64) -> Self {
-        Self
-    }
-}
 
 /// Trap frame layout matching `narf_frame::x86_64::trap::TrapFrame`.
 /// Re-declared here because scheduler can't depend on frame (frame
@@ -199,6 +189,53 @@ struct PerCpuBool {
 static PREEMPTED_RETURN: PerCpuBool = PerCpuBool {
     inner: [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
 };
+
+/// Nestable CPU-local preemption depth. Interrupt masking remains the
+/// architecture's protection for IRQ-safe spin locks; this counter covers
+/// longer task-context critical sections that must remain interruptible but
+/// must not be involuntarily switched to another task.
+static PREEMPT_DEPTH: [AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// RAII token returned by [`preempt_disable`]. It is deliberately `!Send`:
+/// dropping it on another CPU would decrement the wrong CPU-local depth.
+#[must_use = "dropping the guard immediately re-enables preemption"]
+#[derive(Debug)]
+pub struct PreemptGuard {
+    cpu: usize,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl Drop for PreemptGuard {
+    fn drop(&mut self) {
+        let previous = PREEMPT_DEPTH[self.cpu].fetch_sub(1, Ordering::Release);
+        assert!(previous != 0, "scheduler preempt-disable underflow");
+    }
+}
+
+/// Disable involuntary task switching on this CPU until the returned guard is
+/// dropped. Calls nest; timer/IRQ delivery itself remains enabled.
+#[inline]
+pub fn preempt_disable() -> PreemptGuard {
+    let cpu = this_cpu();
+    let previous = PREEMPT_DEPTH[cpu].fetch_add(1, Ordering::Acquire);
+    assert!(previous != u32::MAX, "scheduler preempt-disable overflow");
+    PreemptGuard {
+        cpu,
+        _not_send: PhantomData,
+    }
+}
+
+/// Current CPU's nesting depth, exposed for assertions and diagnostics.
+#[inline]
+pub fn preempt_count() -> u32 {
+    PREEMPT_DEPTH[this_cpu()].load(Ordering::Acquire)
+}
+
+#[inline]
+fn preempt_enabled() -> bool {
+    preempt_count() == 0
+}
 
 /// Read-and-clear this CPU's "last poll_to_yield returned via preemption" flag.
 /// Returns `true` iff the most recent stackful poll on this CPU yielded because
@@ -394,16 +431,13 @@ pub fn current_stackful_stack_top() -> u64 {
 /// slot is freshly written by `kernel_switch`'s save half on every
 /// `poll_to_yield` entry before the task runs, so no task relies on
 /// its contents persisting across the task's own suspension.
-#[cfg(target_arch = "x86_64")]
 struct PerCpuExecCtx {
     inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
 }
-#[cfg(target_arch = "x86_64")]
 // SAFETY: each CPU accesses only `inner[its-own-cpu]`, non-re-entrantly
 // (no nested stackful polls), so there is never concurrent or aliasing
 // access to a single slot despite the shared-static `&`.
 unsafe impl Sync for PerCpuExecCtx {}
-#[cfg(target_arch = "x86_64")]
 static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
     inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
 };
@@ -473,6 +507,22 @@ fn guard_switch_into(label: &str, ctx: &KernelContext) {
             ctx.rbx,
             ctx.r12,
             ctx.r15,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn guard_switch_into(label: &str, ctx: &KernelContext) {
+    if ctx.pc < 0x1000 || ctx.sp < 0x1000 || ctx.sp & 0xF != 0 {
+        panic!(
+            "CTXGUARD {label} cpu={}: refusing kernel_switch into corrupt context — \
+             pc={:#018x} sp={:#018x} x29={:#018x} x19={:#018x}",
+            this_cpu(),
+            ctx.pc,
+            ctx.sp,
+            ctx.x29,
+            ctx.x19,
         );
     }
 }
@@ -704,7 +754,7 @@ impl KernelTask {
         // moves it to rdi for the Rust-side call.
         let task_ptr_as_u64 = &*me as *const KernelTask as u64;
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             me.ctx =
                 KernelContext::fresh(stack_top, trampoline_entry as usize as u64, task_ptr_as_u64);
@@ -947,6 +997,50 @@ impl KernelTask {
         }
     }
 
+    /// Resume the task on its dedicated AArch64 stack until it yields,
+    /// completes, or is preempted back into `exec_ctx`.
+    ///
+    /// # Safety
+    /// The task, its stack, and `exec_ctx` must remain live for the complete
+    /// switch round trip, and the same task must not be polled concurrently.
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn poll_to_yield(
+        &mut self,
+        exec_ctx: &mut KernelContext,
+        waker: &Waker,
+    ) -> Poll<()> {
+        if self.completed.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        *self.current_waker.lock() = Some(waker.clone());
+        self.exec_ctx.store(exec_ctx as *mut _, Ordering::Release);
+        self.tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+        let cpu = this_cpu();
+        let saved_current = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        // SAFETY: this CPU exclusively owns the persistent executor slot for
+        // this call; the POD copy preserves a nested pump's outer continuation.
+        let previous = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
+        guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
+        // SAFETY: both contexts and the task-owned stack remain live.
+        unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        self.check_stack_canary();
+        // SAFETY: same exclusive per-CPU slot as above.
+        unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
+        CURRENT_STACKFUL_TASK.inner[cpu].store(saved_current, Ordering::Release);
+        self.exec_ctx
+            .store(core::ptr::null_mut(), Ordering::Release);
+        PREEMPTED_RETURN.inner[cpu].store(
+            self.preempted.swap(false, Ordering::AcqRel),
+            Ordering::Release,
+        );
+        if self.completed.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     /// Mark this task as non-preemptible. The trap-handler hook
     /// will skip it regardless of slice expiry. Use for drivers
     /// that hold hardware locks across an `.await`-free region.
@@ -1050,11 +1144,23 @@ unsafe extern "C" fn trampoline_entry() -> ! {
     );
 }
 
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn trampoline_entry() -> ! {
+    use core::arch::naked_asm;
+    naked_asm!(
+        "mov x0, x19",
+        "bl {body}",
+        "brk #0",
+        body = sym task_body_rust,
+    );
+}
+
 /// The body of every stackful kernel task. Polls the future,
 /// yields back to the executor when it returns Pending, marks
 /// `completed = true` when it returns Ready then yields one
 /// last time (so the executor can drop the task).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     // SAFETY: `task` was set by `KernelTask::new` from a `Box::leak`-
     // equivalent (we own the box via `Box<KernelTask>`; the executor
@@ -1229,6 +1335,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if !cpl_zero(frame.cs) {
         return false; // trapped from user mode; not our path
     }
+    if !preempt_enabled() {
+        return false;
+    }
     let cpu = this_cpu();
     let task_ptr = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if task_ptr.is_null() {
@@ -1251,8 +1360,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: Same live-`KernelTask` invariant as above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
     let now = narf_time::now_cycles();
-    if now.saturating_sub(started) < slice {
-        return false; // task hasn't used its slice yet
+    let slice_expired = now.saturating_sub(started) >= slice;
+    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+        return false;
     }
     // SAFETY: Same live-`KernelTask` invariant as above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
@@ -1390,6 +1500,74 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     true
 }
 
+/// AArch64 generic-timer equivalent of [`try_preempt`]. The vector prologue
+/// has already preserved the complete EL1/EL0 return frame on the task's own
+/// stack; this function switches the live trap continuation back to the
+/// executor and later resumes it unchanged.
+///
+/// # Safety
+/// `frame_addr` must name the live vector frame on the current stack, and the
+/// GIC interrupt must have been EOI'd before this call.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn try_preempt_aarch64(frame_addr: usize) -> bool {
+    if !preempt_enabled() {
+        return false;
+    }
+    let cpu = this_cpu();
+    let task_ptr = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if task_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: CURRENT names the task whose in-flight poll keeps its Box live.
+    let task = unsafe { &*task_ptr };
+    if task.no_preempt.load(Ordering::Acquire) {
+        return false;
+    }
+    let now = narf_time::now_cycles();
+    let started = task.tsc_started.load(Ordering::Acquire);
+    let slice_expired = now.saturating_sub(started) >= task.slice_cycles.load(Ordering::Acquire);
+    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+        return false;
+    }
+    let exec_ctx = task.exec_ctx.load(Ordering::Acquire);
+    if exec_ctx.is_null() {
+        return false;
+    }
+    let stack_base = task.stack.as_ptr() as usize;
+    let stack_top = stack_base + task.stack.len();
+    if frame_addr < stack_base || frame_addr >= stack_top {
+        panic!(
+            "CTXGUARD try_preempt_aarch64 cpu={cpu}: vector frame {frame_addr:#018x} \
+             outside task stack [{stack_base:#018x},{stack_top:#018x})"
+        );
+    }
+    {
+        let waker = task.current_waker.lock();
+        if let Some(waker) = waker.as_ref() {
+            waker.wake_by_ref();
+        }
+    }
+    task.preempted.store(true, Ordering::Release);
+    CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: CURRENT_STACKFUL_TASK names the task whose in-flight
+    // poll_to_yield call exclusively owns this context save slot.
+    let task_ctx = unsafe { &raw mut (*task_ptr).ctx };
+    // SAFETY: exec_ctx was published by the in-flight poll_to_yield call and
+    // stays live until this trap continuation switches back into the task.
+    guard_switch_into("try_preempt_aarch64:exec_ctx", unsafe { &*exec_ctx });
+    // SAFETY: task_ctx and the executor context remain live across this swap.
+    unsafe { kernel_switch(task_ctx, exec_ctx) };
+    let resumed_cpu = this_cpu();
+    CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(task_ptr, Ordering::Release);
+    // SAFETY: the task is still owned by the in-flight poll_to_yield.
+    unsafe {
+        (*task_ptr)
+            .tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+    }
+    true
+}
+
 /// Per-task-own-stack CPL=3 timer preemption — the clean replacement for the
 /// longjmp-based `handlers::timer_preempt_user_task`. The user task ran on its
 /// OWN kernel stack (`TSS.rsp0`), so the timer trap's frame is already sitting
@@ -1416,6 +1594,9 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     if (frame.cs & 3) != 3 {
         return false; // kernel-mode trap → that's `try_preempt`'s job
     }
+    if !preempt_enabled() {
+        return false;
+    }
     let cpu = this_cpu();
     let task_ptr = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if task_ptr.is_null() {
@@ -1431,8 +1612,10 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
     // SAFETY: live `task_ptr` as established above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
-    if narf_time::now_cycles().saturating_sub(started) < slice {
-        return false; // slice not yet used
+    let now = narf_time::now_cycles();
+    let slice_expired = now.saturating_sub(started) >= slice;
+    if !crate::tick_preemption_required(crate::current_task_id().raw(), now, slice_expired) {
+        return false;
     }
     // SAFETY: live `task_ptr` as established above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
@@ -2040,7 +2223,7 @@ impl Future for StackfulAdapter {
         // get re-polled next round. NO unconditional re-arm
         // here — only re-arm if the inner future asks for it,
         // otherwise busy-looping pumps would starve everyone else.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             // SAFETY: `StackfulAdapter` has no structurally-pinned fields we
             // move out of here — `inner` stays behind its `Box` and we only
@@ -2064,14 +2247,6 @@ impl Future for StackfulAdapter {
             // SAFETY: Valid memory or trusted environment
             unsafe { this.inner.poll_to_yield(exec_ctx, cx.waker()) }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = cx;
-            // aarch64 has no kernel_ctx primitive yet — fall
-            // back to immediate completion. Phase 2 + arm64
-            // port follows the same shape.
-            Poll::Ready(())
-        }
     }
 }
 
@@ -2082,6 +2257,31 @@ pub mod tests {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_preempt_disable_nests_and_unwinds() -> TestResult {
+        let before = preempt_count();
+        {
+            let outer = preempt_disable();
+            if preempt_count() != before + 1 {
+                return TestResult::Fail("outer preempt depth not published");
+            }
+            {
+                let inner = preempt_disable();
+                if preempt_count() != before + 2 {
+                    return TestResult::Fail("nested preempt depth not published");
+                }
+                drop(inner);
+            }
+            if preempt_count() != before + 1 {
+                return TestResult::Fail("nested preempt depth did not unwind");
+            }
+            drop(outer);
+        }
+        if preempt_count() != before {
+            return TestResult::Fail("preempt depth leaked after guard drop");
+        }
+        TestResult::Pass
+    }
 
     /// A future that increments a counter and returns Ready
     /// immediately. Used to verify the stackful path completes
@@ -2100,7 +2300,6 @@ pub mod tests {
     /// Drive a trivial future to completion via the stackful
     /// path. Verifies kernel_switch round-trips the executor ↔
     /// task transitions correctly.
-    #[cfg(target_arch = "x86_64")]
     fn smoke_stackful_trivial_future_completes() -> TestResult {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         COUNTER.store(0, Ordering::Release);
@@ -2138,7 +2337,6 @@ pub mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn smoke_stackful_multi_yield_then_complete() -> TestResult {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         COUNTER.store(0, Ordering::Release);
@@ -4583,6 +4781,10 @@ pub mod tests {
         TestResult::Pass
     }
 
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_preempt_disable_nests_and_unwinds
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -4599,7 +4801,6 @@ pub mod tests {
         smoke_exit_current_stackful_poisons_ctx_and_completes
     );
 
-    #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_trivial_future_completes
@@ -4608,7 +4809,6 @@ pub mod tests {
         "scheduler/stackful",
         smoke_stack_canary_detects_bottom_scribble
     );
-    #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_multi_yield_then_complete
