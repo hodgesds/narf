@@ -298,6 +298,38 @@ pub fn set_current_user_fpu(area: *mut u8) {
     }
 }
 
+/// Publish an owner-defined context pointer on the CURRENT stackful task.
+/// The scheduler stores but never dereferences it; [`current_user_context`]
+/// returns it only while that same task is current on the calling CPU.
+///
+/// # Safety
+/// `context` must remain valid until the current [`KernelTask`] is destroyed,
+/// or until the caller replaces it with another pointer having that lifetime.
+/// The task's pinned future is the intended owner.
+pub unsafe fn set_current_user_context(context: *mut ()) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: `p` names the in-flight task on this CPU. The caller owns
+        // the pointee-lifetime obligation documented above.
+        unsafe { (*p).user_context.store(context, Ordering::Release) };
+    }
+}
+
+/// Owner-defined context for the CURRENT stackful task, or null when no task
+/// is current or that task has not published a context.
+#[inline]
+pub fn current_user_context() -> *mut () {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `p` names the current task and remains alive through this run;
+    // adapter reclamation is additionally RCU-deferred for stale observers.
+    unsafe { (*p).user_context.load(Ordering::Acquire) }
+}
+
 /// Publish the current AArch64 task's TPIDR_EL0 value so a direct
 /// `kernel_switch` resume can restore TLS without re-polling its future.
 #[cfg(target_arch = "aarch64")]
@@ -674,6 +706,15 @@ pub struct KernelTask {
     /// per-CPU slot would go stale (last task to poll) or dangle after a task
     /// exits and its `Box` is freed, fxrstor-ing freed memory.
     user_fpu: AtomicPtr<u8>,
+    /// Opaque owner-defined context for the current stackful task. Userspace
+    /// publishes its refcounted `Task` here so syscall paths can recover their
+    /// task-local state without consulting a process-wide registry lock.
+    ///
+    /// The scheduler never dereferences this pointer. It is valid whenever
+    /// this `KernelTask` is current because the pinned future owns the backing
+    /// reference; adapter teardown clears current-task publication before RCU
+    /// defers destruction of both the future and this field.
+    user_context: AtomicPtr<()>,
     /// Per-task user address-space CR3, published by the userspace
     /// `UserTaskFuture::poll` (and the inline execve path) once the AS is
     /// activated. In the own-stack model a preempted/parked task resumes via
@@ -784,6 +825,7 @@ impl KernelTask {
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
+            user_context: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
             user_tls_valid: AtomicBool::new(false),
@@ -4882,6 +4924,44 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Owner context follows `CURRENT_STACKFUL_TASK`, not the CPU that first
+    /// polled a task. This is the property syscall task-local lookup relies on
+    /// across work stealing and direct `kernel_switch` resume.
+    fn smoke_current_user_context_is_task_local() -> TestResult {
+        let cpu = this_cpu();
+        let saved = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        let first = KernelTask::new(core::future::pending());
+        let second = KernelTask::new(core::future::pending());
+        let first_ptr = &*first as *const KernelTask as *mut KernelTask;
+        let second_ptr = &*second as *const KernelTask as *mut KernelTask;
+        let mut first_context = 1u8;
+        let mut second_context = 2u8;
+
+        CURRENT_STACKFUL_TASK.inner[cpu].store(first_ptr, Ordering::Release);
+        // SAFETY: both stack markers outlive the publication and are cleared
+        // before this function returns.
+        unsafe { set_current_user_context((&mut first_context as *mut u8).cast()) };
+        CURRENT_STACKFUL_TASK.inner[cpu].store(second_ptr, Ordering::Release);
+        // SAFETY: as above for the second live task-local marker.
+        unsafe { set_current_user_context((&mut second_context as *mut u8).cast()) };
+
+        CURRENT_STACKFUL_TASK.inner[cpu].store(first_ptr, Ordering::Release);
+        let first_seen = current_user_context();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(second_ptr, Ordering::Release);
+        let second_seen = current_user_context();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+        let null_seen = current_user_context();
+        CURRENT_STACKFUL_TASK.inner[cpu].store(saved, Ordering::Release);
+
+        if first_seen != (&mut first_context as *mut u8).cast()
+            || second_seen != (&mut second_context as *mut u8).cast()
+            || !null_seen.is_null()
+        {
+            return TestResult::Fail("current user context did not follow its stackful task");
+        }
+        TestResult::Pass
+    }
+
     /// Dropping a `KernelTask` must clear every per-CPU
     /// `CURRENT_STACKFUL_TASK` slot that still points at it. This is the
     /// backstop against a slot stranded by a work-steal migration
@@ -5162,6 +5242,10 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_current_task_cleared_after_poll);
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_current_user_context_is_task_local
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",

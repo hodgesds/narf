@@ -546,6 +546,39 @@ pub fn install_current(ctx: *mut UserTaskCtx) {
     current_slot().store(ctx, Ordering::Release);
 }
 
+/// Publish the refcounted task object in the scheduler's own stack context.
+/// Unlike the per-CPU `CURRENT` compatibility slot, this follows direct
+/// kernel-switch resume and CPU migration with the `KernelTask` itself.
+fn publish_current_task(task: &alloc::sync::Arc<crate::task::Task>) {
+    let ptr = alloc::sync::Arc::as_ptr(task) as *mut crate::task::Task;
+    // SAFETY: `UserTaskFuture` owns `task` for the entire lifetime of the
+    // enclosing stackful KernelTask, exactly the lifetime required by the
+    // scheduler's opaque-context slot.
+    unsafe { narf_scheduler::stackful::set_current_user_context(ptr.cast()) };
+}
+
+#[inline]
+fn current_task_owner_ptr() -> *const crate::task::Task {
+    narf_scheduler::stackful::current_user_context().cast()
+}
+
+/// Clone the CURRENT stackful user task's owner without consulting the global
+/// task registry. The future-held Arc proves the raw pointer remains live while
+/// the scheduler publishes this task as current.
+pub(crate) fn current_task_owner() -> Option<alloc::sync::Arc<crate::task::Task>> {
+    let ptr = current_task_owner_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` came from Arc::as_ptr in `publish_current_task`, and the
+    // current KernelTask's pinned future still owns a strong reference. Pair
+    // increment_strong_count with from_raw to produce one ordinary clone.
+    unsafe {
+        alloc::sync::Arc::increment_strong_count(ptr);
+        Some(alloc::sync::Arc::from_raw(ptr))
+    }
+}
+
 pub fn clear_current() {
     current_slot().store(core::ptr::null_mut(), Ordering::Release);
 }
@@ -616,18 +649,19 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // RESUMED task runs would then operate on the WRONG task's `UserTaskCtx` —
     // a redis worker's futex wrote its wait-state into netserve's ctx, wedging
     // netserve's accept() into an infinite futex wait (net-smoke echo hang).
-    // The executor's `current_task_id()` (the slot it is polling) is ALWAYS
-    // correct, so resolve the ctx by id through the refcounted task registry.
-    // The returned raw pointer targets the `Arc<Task>`-owned `UserTaskCtx`,
-    // which stays valid until the LAST `Arc` drops — the registry holds one
-    // ref until reap, and the in-flight task's own future holds another, so
-    // a self-lookup can never dangle. Fall back to the `CURRENT` cell when
-    // the registry has no entry (the in-kernel test harness never registers).
+    // The scheduler's CURRENT KernelTask publication is always correct and
+    // already follows direct resume plus migration. The polling future stores
+    // its Arc<Task> pointer in that task-local context once, so recover the ctx
+    // without bouncing the global TASKS B-tree lock on every syscall. Fall
+    // back to the legacy per-CPU cell for the longjmp model and kernel tests.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
-        let id = crate::handlers::current_task_id();
-        if let Some(t) = crate::task::task_get(id) {
-            return Some(&t.uctx as *const UserTaskCtx as *mut UserTaskCtx);
+        let task = current_task_owner_ptr();
+        if !task.is_null() {
+            // SAFETY: the CURRENT KernelTask's pinned UserTaskFuture owns the
+            // Arc<Task> that published this pointer; it cannot be dropped
+            // while its syscall continuation is executing.
+            return Some(unsafe { &(*task).uctx as *const UserTaskCtx as *mut UserTaskCtx });
         }
     }
     // Longjmp model (and the fallback): the in-flight polling routine publishes
@@ -1087,7 +1121,7 @@ pub fn own_stack_park() {
 /// (exited-but-unreaped) tasks still resolve; poking their park state
 /// is harmless and matches Linux's find-task-by-vpid semantics.
 pub fn with_user_task_ctx<R>(task_id: u64, f: impl FnOnce(&UserTaskCtx) -> R) -> Option<R> {
-    let t = crate::task::task_get(task_id)?;
+    let t = crate::task::task_get_local(task_id)?;
     Some(f(&t.uctx))
 }
 
@@ -2235,6 +2269,7 @@ impl core::future::Future for UserTaskFuture {
         // transition so a trap that lands mid-setup still finds
         // valid slots.
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
+        publish_current_task(&this.task);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
@@ -2819,6 +2854,7 @@ impl core::future::Future for UserTaskFuture {
 
         // Publish per-task pointers the trap path consults.
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
+        publish_current_task(&this.task);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Program an explicit per-task TPIDR_EL0 after activating the task AS.

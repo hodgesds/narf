@@ -591,3 +591,11 @@ argument = "The frame boot edit removes all distro-specific writable tmpfs and h
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Writable runtime and home mounts are now requested by PID 1 through the existing Linux mount syscall boundary instead of being created with bootstrap mount authority. Removing the kernel policy does not widen user-memory access or bypass filesystem capability checks; typed mount construction and user-copy validation remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler change adds one opaque pointer field to the existing private KernelTask context and two mechanism-only accessors. It adds no trusted subsystem, policy callback, scheduling choice, capability, domain transition, address-space authority, or externally dereferenceable task state; scheduler code stores and returns the scalar pointer but never interprets its pointee."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Userspace publishes Arc::as_ptr(Task) only while the enclosing pinned UserTaskFuture retains that Arc through the full KernelTask lifetime. CURRENT_STACKFUL_TASK selects the pointer from the actually executing continuation across direct resume and migration, is cleared before switch-out/exit, and KernelTask reclamation remains RCU-deferred; acquire/release publication prevents a syscall from observing an uninitialized context, while cross-task lookups retain the refcounted registry path."
