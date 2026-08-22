@@ -139,6 +139,27 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         crate::socket::SocketOpResult::Err(e) => {
+            // SO_PEERGROUPS on ERANGE: Linux writes the required byte length
+            // into *optlen so the caller can grow its buffer and retry
+            // (net/core/sock.c: `put_user(len, optlen)` then `-ERANGE`).
+            // dbus-broker relies on this — `sockopt_get_peergroups` probes with
+            // an 8-slot buffer and, for a user in >7 supplementary groups, reads
+            // the returned optlen to size the retry. Without the writeback the
+            // retry reuses the same too-small size, ERANGEs again, and the
+            // broker rejects the peer with a fatal error, taking the session bus
+            // down (the greeter user has ≤7 groups, so only real logins hit it).
+            // The errno itself (ERANGE = 34) is already correct; only the
+            // optlen out-parameter was missing.
+            if level == crate::socket::SOL_SOCKET
+                && name == crate::socket::SO_PEERGROUPS
+                && matches!(e, crate::socket::SockError::Range)
+            {
+                // `needed` mirrors the socket handler's own `groups.len() * 4`
+                // gate; group-id namespace translation is 1:1, so this size is
+                // sufficient for the (translated) success reply on retry.
+                let needed = sock.peer_groups().len().saturating_mul(4);
+                write_user_u32(len_ptr, needed as u32);
+            }
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         _ => ctx.set_return(fail),

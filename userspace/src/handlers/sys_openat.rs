@@ -16,7 +16,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     };
@@ -48,12 +48,8 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         if path_str == "." {
             let task = current_task_id();
             let mount = fd::with_table(task, |t| {
-                t.get(dirfd as u32).and_then(|entry| {
-                    entry
-                        .ops
-                        .mount_object_id()
-                        .map(|_| entry.ops.clone())
-                })
+                t.get(dirfd as u32)
+                    .and_then(|entry| entry.ops.mount_object_id().map(|_| entry.ops.clone()))
             })
             .flatten();
             if let Some(ops) = mount {
@@ -73,7 +69,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
                     })
                 });
                 ctx.set_return(SyscallReturn::ok(
-                    reopened.map(|fd| fd as u64).unwrap_or((-1i64) as u64),
+                    reopened.map(|fd| fd as u64).unwrap_or((-24i64) as u64),
                 ));
                 return;
             }
@@ -125,7 +121,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
                 })
             });
             ctx.set_return(SyscallReturn::ok(
-                new_fd.map(|nf| nf as u64).unwrap_or((-1i64) as u64),
+                new_fd.map(|nf| nf as u64).unwrap_or((-24i64) as u64),
             ));
             return;
         }

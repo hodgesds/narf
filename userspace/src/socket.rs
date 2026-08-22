@@ -151,11 +151,13 @@ pub(crate) fn dbg_dbus_peek(dir: &str, buf: &[u8]) {
     }
     let tid = crate::handlers::current_task_id();
     let comm = crate::handlers::proc_comm_of_task(tid).unwrap_or_default();
-    // Fire for explicit trace targets, AND for the dbus-broker ROUTER (its
-    // routed CALL/RETURN/ERROR — SIGNALs are suppressed per-message below to
-    // avoid the boot-time signal flood a full trace_comm=dbus-broker emits).
+    // Fire for explicit trace targets.  Keep the historical broker-router
+    // view only when no explicit selector is installed, or when the selector
+    // itself includes dbus-broker.  Otherwise a narrow late-boot trace still
+    // turns into a system-bus firehose before the selected process starts.
     let is_target = crate::syscall::syscall_trace_target_task();
-    let is_broker = comm.starts_with("dbus-broker");
+    let is_broker =
+        comm.starts_with("dbus-broker") && crate::syscall::unix_latency_line_wanted(&comm);
     if !is_target && !is_broker {
         return;
     }

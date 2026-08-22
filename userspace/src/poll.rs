@@ -312,7 +312,7 @@ pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
     // Re-resolving on every park wake instead turned such a close into an
     // instant POLLNVAL, and an event loop that reads that as a spurious wake
     // re-polls at once and spins.
-    let entry_files = crate::task::task_get(task_id).and_then(|t| {
+    let entry_files = crate::task::task_get_local(task_id).and_then(|t| {
         let held = t.poll_files.lock();
         (held.len() == fds.len()).then(|| held.clone())
     });
@@ -430,7 +430,7 @@ fn record_poll_wait(uc: &crate::user_task::UserTaskCtx, fds: &[PollFd]) {
 pub(crate) fn clear_poll_wait_record(task_id: u64, uc: &crate::user_task::UserTaskCtx) {
     use core::sync::atomic::Ordering;
     uc.poll_wait_nfds.store(0, Ordering::Release);
-    if let Some(t) = crate::task::task_get(task_id) {
+    if let Some(t) = crate::task::task_get_local(task_id) {
         let mut held = t.poll_files.lock();
         if !held.is_empty() {
             // Drop the Arcs OUTSIDE the lock: releasing the last reference to
@@ -448,7 +448,7 @@ pub(crate) fn clear_poll_wait_record(task_id: u64, uc: &crate::user_task::UserTa
 /// held — the park re-executes this syscall on every wake, and re-resolving
 /// then is precisely the bug this prevents.
 pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
-    let Some(t) = crate::task::task_get(task_id) else {
+    let Some(t) = crate::task::task_get_local(task_id) else {
         return;
     };
     {

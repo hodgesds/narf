@@ -558,13 +558,13 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn flush(&self) -> impl Future<Output = ()> {
-        core::future::pending()
+        core::future::ready(())
     }
     fn discard(&self, _range: LbaRange) -> impl Future<Output = ()> {
-        core::future::pending()
+        core::future::ready(())
     }
     fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> {
-        core::future::pending()
+        core::future::ready(CancelResult::NotFound)
     }
 }
 

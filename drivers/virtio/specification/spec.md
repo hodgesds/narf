@@ -48,6 +48,10 @@ blk/net/console/rng.
   render-node bridge owns per-open resource lifetime and validates all
   user-provided command sizes before it calls this surface. A 2D-only host
   remains supported with the feature clear.
+- Virtio block request futures register the caller's waker in their in-flight
+  request slot and completion wakes it after removing the request from the
+  used ring. Unsupported/no-op flush, discard, and cancel paths resolve
+  immediately rather than returning a permanently pending future.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.

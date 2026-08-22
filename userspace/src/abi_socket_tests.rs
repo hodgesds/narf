@@ -1553,6 +1553,84 @@ fn smoke_abi_socket_getsockopt_peergroups() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_getsockopt_peergroups);
 
+// A user in more supplementary groups than the caller's initial probe buffer
+// holds. Linux answers with ERANGE and writes the REQUIRED byte length into
+// *optlen so the caller can grow its buffer and retry. dbus-broker's
+// sockopt_get_peergroups does exactly this (8-slot probe, realloc on ERANGE
+// using the returned optlen); without the writeback its retry reused the same
+// too-small size, ERANGEd again, and the broker rejected the peer with a fatal
+// error — taking down the session bus and hanging every real login (the greeter
+// user has ≤7 groups, so it never tripped this).
+fn smoke_abi_socket_getsockopt_peergroups_erange_sets_optlen() -> TestResult {
+    with_setup(|| {
+        const SO_PEERGROUPS: u64 = 59;
+        let groups = [11u32, 22, 33, 44, 55, 66, 77, 88]; // 8 groups → 32 bytes
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(groups.len() as u64, groups.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups setup failed");
+        }
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd = i32::from_ne_bytes(sv[0..4].try_into().unwrap()) as u64;
+
+        // Probe with room for a single gid — must ERANGE and report the size.
+        let mut small = [0u8; 4];
+        let mut optlen = (small.len() as u32).to_ne_bytes();
+        let probe = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERGROUPS,
+            arg3: small.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::SocketGetSockOpt.raw(), probe) != Some(-34) {
+            return Err("too-small SO_PEERGROUPS did not return ERANGE");
+        }
+        if u32::from_ne_bytes(optlen) != 32 {
+            return Err("SO_PEERGROUPS ERANGE did not set *optlen to the required size");
+        }
+
+        // Grow to the reported size and retry — must now succeed with all gids.
+        let mut big = [0u8; 32];
+        let mut optlen2 = (big.len() as u32).to_ne_bytes();
+        let retry = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERGROUPS,
+            arg3: big.as_mut_ptr() as u64,
+            arg4: optlen2.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::SocketGetSockOpt.raw(), retry) != Some(0) {
+            return Err("SO_PEERGROUPS retry with grown buffer failed");
+        }
+        if u32::from_ne_bytes(optlen2) != 32 {
+            return Err("SO_PEERGROUPS retry returned wrong length");
+        }
+        for (i, want) in groups.iter().enumerate() {
+            let got = u32::from_ne_bytes(big[i * 4..i * 4 + 4].try_into().unwrap());
+            if got != *want {
+                return Err("SO_PEERGROUPS retry returned wrong gids");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getsockopt_peergroups_erange_sets_optlen
+);
+
 fn smoke_abi_socket_getsockopt_peerpidfd_unavailable() -> TestResult {
     with_setup(|| {
         const SO_PEERPIDFD: u64 = 77;

@@ -63,6 +63,8 @@ pub fn all_address_spaces() -> Vec<Arc<AddressSpace>>;
 pub fn set_user_perf_switch_hook(hook: fn(task: u64, running: bool));
 pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
 pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());
+pub unsafe fn set_current_user_context(context: *mut ());
+pub fn current_user_context() -> *mut ();
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 ```
@@ -82,6 +84,12 @@ The memory-controller charge provider resolves the executor-private `TaskId`
 through `install_memory_pid_resolver` before charging: cgroup membership is
 keyed by the outer userspace ProcessId, never by a numerically coincident task
 id. Kernel tasks and unmapped bootstrap tasks remain unattributed.
+An own-stack task may publish one opaque owner-defined context pointer in its
+private `KernelTask`. The scheduler never dereferences it and returns it only
+while that same task is current on the calling CPU. The publishing future must
+retain the pointee until task destruction. This lets userspace recover its
+current refcounted task state across direct resume and migration without a
+process-wide identity-registry lock; cross-task lookup remains userspace-owned.
 The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch

@@ -17,7 +17,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use narf_filesystem::FileOps;
+use narf_filesystem::{FileOps, MmapLifetime};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
@@ -36,6 +36,10 @@ struct MappingOwner {
     /// therefore adjusted wherever `base` moves (`punch`).
     file_offset: u64,
     ops: Arc<dyn FileOps>,
+    /// Optional per-object backing owner. The open file alone is insufficient
+    /// for multiplexed devices such as DRM, where GEM_CLOSE removes one buffer
+    /// while the fd and other resources remain live.
+    lifetime: Option<Arc<dyn MmapLifetime>>,
     /// Ordinary file MAP_SHARED mappings use private physical frames as a
     /// fallback when the filesystem cannot expose cache pages directly. Keep
     /// their frame list so fsync/msync can copy dirty bytes back to FileOps.
@@ -70,7 +74,17 @@ fn current_pid() -> u64 {
 }
 
 pub(crate) fn register_current(base: u64, len: u64, offset: u64, ops: Arc<dyn FileOps>) {
-    register(current_pid(), base, len, offset, ops, None);
+    register(current_pid(), base, len, offset, ops, None, None);
+}
+
+pub(crate) fn register_current_with_lifetime(
+    base: u64,
+    len: u64,
+    offset: u64,
+    ops: Arc<dyn FileOps>,
+    lifetime: Option<Arc<dyn MmapLifetime>>,
+) {
+    register(current_pid(), base, len, offset, ops, lifetime, None);
 }
 
 /// Resolve a fault on a demand-paged `MAP_SHARED` mapping to the frame its
@@ -121,6 +135,7 @@ pub(crate) fn register_file_current(
         len,
         offset,
         ops,
+        None,
         Some(FileWriteback { offset, phys }),
     );
 }
@@ -229,6 +244,7 @@ fn register(
     len: u64,
     file_offset: u64,
     ops: Arc<dyn FileOps>,
+    lifetime: Option<Arc<dyn MmapLifetime>>,
     writeback: Option<FileWriteback>,
 ) {
     MAPPING_OWNERS.lock().push(MappingOwner {
@@ -237,6 +253,7 @@ fn register(
         len,
         file_offset,
         ops,
+        lifetime,
         writeback,
     });
 }
@@ -284,6 +301,7 @@ fn punch(pid: u64, base: u64, len: u64) {
                     // into the surviving half of a punched mapping.
                     file_offset: mapping.file_offset.saturating_add(end - original_base),
                     ops: Arc::clone(&mapping.ops),
+                    lifetime: mapping.lifetime.clone(),
                     writeback: mapping.writeback.clone(),
                 };
                 if let Some(wb) = suffix.writeback.as_mut() {
@@ -329,6 +347,7 @@ pub(crate) fn fork_process(parent_pid: u64, child_pid: u64) {
             len: mapping.len,
             file_offset: mapping.file_offset,
             ops: Arc::clone(&mapping.ops),
+            lifetime: mapping.lifetime.clone(),
             writeback: mapping.writeback.clone(),
         })
         .collect();
@@ -465,8 +484,17 @@ mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
+    static LIFETIME_DROPS: AtomicUsize = AtomicUsize::new(0);
 
     struct TestOwner;
+
+    struct TestLifetime;
+
+    impl Drop for TestLifetime {
+        fn drop(&mut self) {
+            LIFETIME_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     impl Drop for TestOwner {
         fn drop(&mut self) {
@@ -499,11 +527,25 @@ mod tests {
         process_exit(PARENT, PARENT);
         process_exit(CHILD, CHILD);
         DROPS.store(0, Ordering::Relaxed);
+        LIFETIME_DROPS.store(0, Ordering::Relaxed);
 
         let owner: Arc<dyn FileOps> = Arc::new(TestOwner);
-        register(PARENT, 0x1000, 0x3000, 0, Arc::clone(&owner), None);
+        let lifetime: Arc<dyn MmapLifetime> = Arc::new(TestLifetime);
+        register(
+            PARENT,
+            0x1000,
+            0x3000,
+            0,
+            Arc::clone(&owner),
+            Some(Arc::clone(&lifetime)),
+            None,
+        );
         drop(owner);
-        if DROPS.load(Ordering::Relaxed) != 0 || owner_count(PARENT) != 1 {
+        drop(lifetime);
+        if DROPS.load(Ordering::Relaxed) != 0
+            || LIFETIME_DROPS.load(Ordering::Relaxed) != 0
+            || owner_count(PARENT) != 1
+        {
             return TestResult::Fail("mapping did not retain its file owner");
         }
 
@@ -518,12 +560,15 @@ mod tests {
             return TestResult::Fail("MAP_FIXED punch did not split the mapping owner");
         }
         process_exit(PARENT, PARENT);
-        if DROPS.load(Ordering::Relaxed) != 0 || owner_count(CHILD) != 1 {
+        if DROPS.load(Ordering::Relaxed) != 0
+            || LIFETIME_DROPS.load(Ordering::Relaxed) != 0
+            || owner_count(CHILD) != 1
+        {
             return TestResult::Fail("parent exit released an inherited mapping owner");
         }
         process_exit(CHILD, CHILD);
-        if DROPS.load(Ordering::Relaxed) != 1 {
-            return TestResult::Fail("last mapping did not release its file owner");
+        if DROPS.load(Ordering::Relaxed) != 1 || LIFETIME_DROPS.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("last mapping did not release all backing owners");
         }
         TestResult::Pass
     }

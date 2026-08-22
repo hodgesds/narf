@@ -179,6 +179,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
+            // Acquire any per-object owner BEFORE resolving raw frames. A
+            // concurrent handle close may remove the lookup-table entry after
+            // this point, but it cannot recycle the backing while this Arc is
+            // held and then transferred into the mapping-owner table.
+            let mmap_lifetime = ops.mmap_lifetime(offset, len as usize);
             // On Err (unsupported, or any device error) we fall through to the
             // regular file-backed path below, unchanged from before.
             if let Ok(frames) = ops.mmap_frames(offset, len as usize) {
@@ -216,7 +221,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                     return;
                 }
-                crate::mapped_file::register_current(base, len, offset, ops);
+                crate::mapped_file::register_current_with_lifetime(
+                    base,
+                    len,
+                    offset,
+                    ops,
+                    mmap_lifetime,
+                );
                 #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
@@ -374,7 +385,20 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
         // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
         // each page on first access.
-        alloc::vec![narf_memory::PhysAddr::new(0); pages]
+        //
+        // Allocate the per-page slot vector FALLIBLY. A userspace mmap of an
+        // absurd length — e.g. baloo's LMDB opens with a ~256 GiB map size, so
+        // `pages` is ~64M and this vector is ~512 MiB — must never panic the
+        // kernel: the infallible `vec![_; n]` calls `handle_alloc_error` on OOM,
+        // which is a kernel panic. `try_reserve_exact` + `resize` returns
+        // -ENOMEM to the process instead (a normal mmap failure).
+        let mut v = alloc::vec::Vec::new();
+        if v.try_reserve_exact(pages).is_err() {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+            return;
+        }
+        v.resize(pages, narf_memory::PhysAddr::new(0));
+        v
     } else {
         // File-backed MAP_PRIVATE: stream the file's [offset, offset+len)
         // bytes straight into per-page private frames (zero past EOF),
@@ -400,7 +424,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         if shared_file_fallback {
             shared_file_ops = Some(Arc::clone(&ops));
         }
-        let mut frames = alloc::vec::Vec::with_capacity(pages);
+        // Fallible per-page frame list — see the anonymous branch: never panic
+        // the kernel on an oversized userspace mmap; return -ENOMEM. (The frame
+        // loop below is already fallible; only this capacity reservation could
+        // panic on a huge `pages`.)
+        let mut frames = alloc::vec::Vec::new();
+        if frames.try_reserve_exact(pages).is_err() {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+            return;
+        }
         for i in 0..pages {
             let frame = match narf_memory::alloc_frame() {
                 Ok(f) => f.start_address(),
@@ -456,9 +488,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Anonymous mmap previously cloned its potentially huge all-zero vector
     // solely to keep `phys_list` available for an error arm that can never use
     // it, adding another O(pages) copy before returning the lazy VMA.
-    let shared_rollback_phys = shared_file_ops
-        .as_ref()
-        .map(|_| phys_list.clone());
+    let shared_rollback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
@@ -704,10 +734,7 @@ mod tests {
         *USER_AS.lock() = None;
         TestResult::Pass
     }
-    kernel_test_in!(
-        "userspace",
-        smoke_sys_mmap_does_not_revisit_unrelated_vmas
-    );
+    kernel_test_in!("userspace", smoke_sys_mmap_does_not_revisit_unrelated_vmas);
 
     /// Anonymous shared mappings have no userspace-visible shmem handle. The
     /// backing entry must therefore be name-removed after the first VMA has
@@ -1010,7 +1037,9 @@ mod tests {
         };
         sys_mmap(&mut call);
         match call.ret {
-            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => Some(ret.value),
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => {
+                Some(ret.value)
+            }
             _ => None,
         }
     }

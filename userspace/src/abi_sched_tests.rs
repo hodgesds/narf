@@ -492,6 +492,23 @@ fn smoke_abi_sched_setscheduler_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setscheduler_pos);
 
+fn smoke_abi_sched_setscheduler_reset_on_fork_pos() -> TestResult {
+    with_setup(|| {
+        const SCHED_RESET_ON_FORK: u64 = 0x4000_0000;
+        match call(
+            Syscall::SchedSetScheduler.raw(),
+            a3(0, SCHED_OTHER | SCHED_RESET_ON_FORK, 0, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("sched_setscheduler must accept SCHED_RESET_ON_FORK"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setscheduler_reset_on_fork_pos
+);
+
 fn smoke_abi_sched_setscheduler_bad_policy_neg() -> TestResult {
     with_setup(|| {
         // Policy 42 is unknown ⇒ EINVAL.

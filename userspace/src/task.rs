@@ -137,6 +137,17 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }
 
+/// Resolve `tid`, using the stackful task's cached owner when it names the
+/// caller. Cross-task lookups retain the authoritative registry path.
+pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {
+    if tid == crate::handlers::current_task_id() {
+        if let Some(task) = crate::user_task::current_task_owner() {
+            return Some(task);
+        }
+    }
+    task_get(tid)
+}
+
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────
 //
 // "This process burns 41 s of user CPU before it starts serving" is where
@@ -732,13 +743,13 @@ pub fn current_task() -> Option<Arc<Task>> {
     if tid == 0 {
         return None;
     }
-    task_get(tid)
+    task_get_local(tid)
 }
 
 /// Flip a task to ZOMBIE at the top of its exit path. Idempotent;
 /// returns `false` if the task was unknown (kernel-test contexts).
 pub fn mark_zombie(tid: u64) -> bool {
-    match task_get(tid) {
+    match task_get_local(tid) {
         Some(t) => {
             t.state.store(TASK_ZOMBIE, Ordering::Release);
             true

@@ -161,15 +161,26 @@ impl DrmFileCtx {
         }
     }
 
-    /// File context for a primary-node open by an authenticated master
-    /// (e.g. a Wayland compositor).
-    pub const fn primary_master() -> Self {
+    /// File context for a primary-node open. Always authenticated (a
+    /// primary fd has run the magic dance), but `is_master` reflects whether
+    /// this open currently holds the device's DRM master (see
+    /// [`crate::drm::card::Card::current_master`]) — only the master may run
+    /// modeset ioctls. The bridge computes `is_master` per call by comparing
+    /// the open's id against the card's current master.
+    pub const fn primary(is_master: bool) -> Self {
         DrmFileCtx {
             minor: MinorType::Primary,
             authenticated: true,
-            is_master: true,
+            is_master,
             is_root: false,
         }
+    }
+
+    /// File context for a primary-node open that holds DRM master. Convenience
+    /// for tests and callers that have already established mastership;
+    /// equivalent to `primary(true)`.
+    pub const fn primary_master() -> Self {
+        Self::primary(true)
     }
 
     /// Returns `true` when this file is a render client per

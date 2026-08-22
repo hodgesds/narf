@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -63,7 +64,7 @@ pub(crate) struct VirtGpuResource {
 /// All mutable state is behind a lock because ioctl and mmap can arrive from
 /// different threads sharing the same fd.
 pub struct VirtGpuRenderState {
-    resources: narf_lib::sync::IrqSafeSpinLock<Vec<VirtGpuResource>>,
+    resources: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<VirtGpuResource>>>,
     next_handle: AtomicU32,
 }
 
@@ -81,15 +82,37 @@ impl VirtGpuRenderState {
         }
     }
 
-    fn find(&self, handle: u32) -> Option<(u32, u64, usize)> {
+    fn find(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
         self.resources
             .lock()
             .iter()
             .find(|r| r.handle == handle)
-            .map(|r| (r.resource_id, r.buffer.phys_addr().raw(), r.buffer.len()))
+            .cloned()
     }
 
-    pub(crate) fn drain_resources(&self) -> Vec<VirtGpuResource> {
+    pub(crate) fn insert(&self, handle: u32, resource_id: u32, buffer: DmaBuffer) {
+        self.resources.lock().push(Arc::new(VirtGpuResource {
+            handle,
+            resource_id,
+            buffer,
+        }));
+    }
+
+    pub(crate) fn take(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
+        let mut resources = self.resources.lock();
+        let pos = resources.iter().position(|r| r.handle == handle)?;
+        Some(resources.swap_remove(pos))
+    }
+
+    pub(crate) fn mapping_resource(&self, offset: u64, len: usize) -> Option<Arc<VirtGpuResource>> {
+        if offset & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
+            return None;
+        }
+        let resource = self.find((offset >> 12) as u32)?;
+        (len <= resource.buffer.len()).then_some(resource)
+    }
+
+    pub(crate) fn drain_resources(&self) -> Vec<Arc<VirtGpuResource>> {
         core::mem::take(&mut *self.resources.lock())
     }
 }
@@ -190,11 +213,7 @@ pub fn dispatch_virtgpu_render(
             )
             .map_err(|_| FsError::InvalidData)?;
             let handle = state.next_handle.fetch_add(1, Ordering::Relaxed);
-            state.resources.lock().push(VirtGpuResource {
-                handle,
-                resource_id,
-                buffer,
-            });
+            state.insert(handle, resource_id, buffer);
             req.bo_handle = handle;
             req.res_handle = resource_id;
             req.size = bytes as u32;
@@ -203,25 +222,24 @@ pub fn dispatch_virtgpu_render(
         }
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
             let mut req: DrmVirtGpuResourceInfoUapi = read_uapi(arg)?;
-            let (resource_id, _phys, len) =
-                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
-            req.res_handle = resource_id;
-            req.size = len as u32;
+            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            req.res_handle = resource.resource_id;
+            req.size = resource.buffer.len() as u32;
             req.blob_mem = 0;
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_MAP => {
             let mut req: DrmVirtGpuMapUapi = read_uapi(arg)?;
-            state.find(req.handle).ok_or(FsError::InvalidData)?;
+            let _resource = state.find(req.handle).ok_or(FsError::InvalidData)?;
             req.offset = (req.handle as u64) << 12;
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => {
             let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
-            let (resource_id, _phys, bytes) =
-                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let bytes = resource.buffer.len();
             let end =
                 (req.offset as usize).saturating_add(req.layer_stride.max(req.stride) as usize);
             if end > bytes || req.w == 0 || req.h == 0 || req.d == 0 {
@@ -229,7 +247,7 @@ pub fn dispatch_virtgpu_render(
             }
             let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
             dev.transfer_to_host_virgl(narf_drivers_virtio::gpu_pci::cmd::Transfer3D {
-                resource_id,
+                resource_id: resource.resource_id,
                 x: req.x,
                 y: req.y,
                 z: req.z,
@@ -290,16 +308,17 @@ pub fn dispatch_virtgpu_render(
             // Validate every referenced handle before touching the command
             // pointer. This makes the resource ownership check independent of
             // virgl command parsing (which belongs to the host renderer).
+            let mut _referenced: [Option<Arc<VirtGpuResource>>; 256] = [const { None }; 256];
             if req.num_bo_handles != 0 {
                 // SAFETY: the count is capped at 256 above, multiplication by
                 // four cannot overflow, and copy_in validates the entire
                 // userspace handle-array range before returning owned bytes.
                 let bytes =
                     unsafe { copy_in(req.bo_handles as usize, req.num_bo_handles as usize * 4)? };
-                for chunk in bytes.chunks_exact(4) {
+                for (index, chunk) in bytes.chunks_exact(4).enumerate() {
                     let handle =
                         u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
-                    state.find(handle).ok_or(FsError::PermissionDenied)?;
+                    _referenced[index] = Some(state.find(handle).ok_or(FsError::PermissionDenied)?);
                 }
             }
             // SAFETY: the command size is non-zero and bounded to the
@@ -311,7 +330,32 @@ pub fn dispatch_virtgpu_render(
                 .map_err(|_| FsError::InvalidData)?;
             Ok(0)
         }
+        DRM_IOCTL_GEM_CLOSE => {
+            // `struct drm_gem_close { u32 handle; u32 pad; }`. Remove the
+            // per-open handle before touching the host, so no new operation
+            // can acquire the resource while teardown is in progress.
+            // SAFETY: `arg` is the ioctl's userspace struct pointer; copy_in
+            // validates the complete fixed-size range and SMAP-brackets it.
+            let bytes = unsafe { copy_in(arg, 8)? };
+            let handle =
+                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
+            let resource = state.take(handle).ok_or(FsError::InvalidData)?;
+            release_virtgpu_resource(resource);
+            Ok(0)
+        }
         _ => Err(FsError::Unsupported),
+    }
+}
+
+/// Quiesce one host resource before releasing its DMA pages. If host teardown
+/// fails, intentionally retain this Arc: freeing the backing would let a live
+/// host resource DMA into recycled kernel or userspace memory.
+pub(crate) fn release_virtgpu_resource(resource: Arc<VirtGpuResource>) {
+    let released = narf_drivers_virtio::gpu_pci::probed_device()
+        .map(|dev| dev.destroy_virgl_resource(resource.resource_id).is_ok())
+        .unwrap_or(false);
+    if !released {
+        core::mem::forget(resource);
     }
 }
 
@@ -325,10 +369,11 @@ pub fn dispatch_virtgpu_mmap(
         return Err(FsError::InvalidData);
     }
     let handle = (offset >> 12) as u32;
-    let (_resource_id, phys, bytes) = state.find(handle).ok_or(FsError::InvalidData)?;
-    if len > bytes {
+    let resource = state.find(handle).ok_or(FsError::InvalidData)?;
+    if len > resource.buffer.len() {
         return Err(FsError::InvalidData);
     }
+    let phys = resource.buffer.phys_addr().raw();
     Ok((0..len / 4096)
         .map(|page| phys + page as u64 * 4096)
         .collect())
@@ -409,25 +454,35 @@ fn map_err(e: DrmIoctlError) -> FsError {
 /// Top-level `FileOps::ioctl` body for DRM card + render nodes.
 ///
 /// `card_index` is the registry index of the card (`/dev/dri/card<N>`
-/// or `renderD<N+128>`); `cmd` is the encoded ioctl number; `arg` is
-/// the raw user pointer; `render` selects render-node vs primary-node
-/// `DrmFileCtx`.
+/// or `renderD<N+128>`); `open_id` uniquely identifies the calling open
+/// file (used for DRM master arbitration — ignored on the render path);
+/// `cmd` is the encoded ioctl number; `arg` is the raw user pointer;
+/// `render` selects render-node vs primary-node `DrmFileCtx`.
 ///
 /// Returns the syscall return value (0 on success for most ioctls, or
 /// an ioctl-specific positive value) or a translated `FsError`.
-pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<u64, FsError> {
+pub fn dispatch_card(
+    card_index: u32,
+    open_id: u64,
+    cmd: u32,
+    arg: usize,
+    render: bool,
+) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
     let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
 
-    // 2. Build the per-fd ctx. Primary-node opens are treated as
-    //    authenticated master so KMS ioctls reach the body. NARF
-    //    doesn't yet model DRM_AUTH / DRM_MASTER handoffs — Stage-5
-    //    compositor work will add a separate ioctl gate.
+    // 2. Build the per-fd ctx. Primary opens are always authenticated, but
+    //    `is_master` reflects whether THIS open currently holds the device's
+    //    DRM master (compared against `Card::current_master`). Only the master
+    //    passes the modeset gate — so a greeter and a user-session compositor
+    //    can't both drive the scanout; the master is handed off via
+    //    SET/DROP_MASTER (below) and auto-released on fd close.
     let ctx = if render {
         DrmFileCtx::render_client()
     } else {
-        DrmFileCtx::primary_master()
+        let is_master = mode_state.lock().is_master(open_id);
+        DrmFileCtx::primary(is_master)
     };
 
     // 3. Look up the per-cmd handler.
@@ -460,9 +515,31 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
         // succeeds silently instead of warning `failed to set gamma`.
         IoctlCmd::ModeSetGamma => Ok(0),
-        // SET_MASTER / DROP_MASTER — primary-node fds are already treated
-        // as authenticated master (single-client model); accept + no-op.
-        IoctlCmd::SetMaster | IoctlCmd::DropMaster => Ok(0),
+        // SET_MASTER — claim DRM master for this open. Succeeds if the device
+        // master is free (or already ours); EBUSY if another open holds it.
+        // Render nodes carry no display authority → EACCES. Mirrors
+        // drm_auth.c::drm_setmaster_ioctl.
+        IoctlCmd::SetMaster => {
+            if ctx.is_render_client() {
+                return Err(FsError::PermissionDenied);
+            }
+            match mode_state.lock().set_master(open_id) {
+                Ok(()) => Ok(0),
+                Err(_) => Err(FsError::Busy), // → EBUSY
+            }
+        }
+        // DROP_MASTER — release DRM master, freeing the device for the next
+        // session's SET_MASTER (the greeter→user handoff). EINVAL if the caller
+        // wasn't the current master. Mirrors drm_auth.c::drm_dropmaster_ioctl.
+        IoctlCmd::DropMaster => {
+            if ctx.is_render_client() {
+                return Err(FsError::PermissionDenied);
+            }
+            match mode_state.lock().drop_master(open_id) {
+                Ok(()) => Ok(0),
+                Err(_) => Err(FsError::InvalidData), // → EINVAL
+            }
+        }
         // GET_MAGIC / AUTH_MAGIC — the DRM magic-token dance a compositor
         // does to confirm it's authenticated on its GPU fd. A primary-node fd
         // IS the authenticated master here, so hand back a fixed non-zero
@@ -1112,8 +1189,15 @@ fn handle_obj_getproperties(
 fn handle_atomic(
     mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
-    _ctx: &DrmFileCtx,
+    ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    // ATOMIC is a DRM_MASTER op (drm_ioctls[] marks DRM_MODE_ATOMIC
+    // DRM_MASTER). Only the master may commit; reject render nodes and
+    // non-master primary fds with EACCES. Previously ungated.
+    if !ctx.is_master {
+        return Err(FsError::PermissionDenied);
+    }
+
     // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeAtomicUapi>()` bytes, bounds-checked by `copy_in`.
@@ -1149,7 +1233,8 @@ fn handle_atomic(
         let _ = writeln!(
             narf_console::Writer,
             "  drm: ATOMIC #{n} objs={} flags={:#x} — committed as EMPTY state, no pixels presented",
-            req.count_objs, req.flags
+            req.count_objs,
+            req.flags
         );
     }
 
@@ -1418,9 +1503,11 @@ fn handle_setcrtc(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // Modeset is primary-node only — render nodes (Mesa/Vulkan) carry no
-    // DRM master and must be rejected with EACCES (DRM_MASTER in Linux).
-    if ctx.is_render_client() {
+    // SETCRTC is a DRM_MASTER op: only the open holding master may modeset.
+    // This rejects render nodes (never master) AND authenticated-but-non-master
+    // primary fds (e.g. a second compositor before it takes over) with EACCES,
+    // exactly as Linux's drm_ioctl_permit gates a DRM_MASTER ioctl.
+    if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
 
@@ -1509,8 +1596,9 @@ fn handle_page_flip(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // Page flip is a modeset op — primary-node only (see handle_setcrtc).
-    if ctx.is_render_client() {
+    // Page flip is a DRM_MASTER op — only the master may flip (see
+    // handle_setcrtc). Rejects render nodes and non-master primary fds.
+    if !ctx.is_master {
         return Err(FsError::PermissionDenied);
     }
 

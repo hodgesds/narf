@@ -8171,6 +8171,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             RawFnHandler(crate::mount_api::sys_open_tree),
         );
         table.install_raw(
+            Syscall::OpenTreeAttr,
+            "open_tree_attr",
+            RawFnHandler(crate::mount_api::sys_open_tree_attr),
+        );
+        table.install_raw(
             Syscall::Fspick,
             "fspick",
             RawFnHandler(crate::mount_api::sys_fspick),

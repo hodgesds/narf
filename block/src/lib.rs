@@ -78,9 +78,12 @@ pub trait BlockDevice: Send + Sync {
     fn supports(&self, feat: BlockFeature) -> bool;
 
     /// Submit a block I/O request. Returns a future that resolves to
-    /// the completion.
+    /// the completion. If it returns `Poll::Pending`, completion or device
+    /// removal must wake the last supplied waker after publishing the result.
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send;
     /// Ensure all previously-submitted writes are persistent on the media.
+    /// Unsupported/no-op implementations resolve immediately; they must not
+    /// return a permanently-pending future.
     fn flush(&self) -> impl Future<Output = ()> + Send;
     /// Advise the device that a range of blocks is no longer needed.
     fn discard(&self, range: LbaRange) -> impl Future<Output = ()> + Send;

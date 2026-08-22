@@ -61,37 +61,6 @@ static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 )))]
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
-/// Volatile writable trees a distro PID 1 requires even when its block-backed
-/// root filesystem is mounted read-only. Keep `/var/tmp` separate from `/tmp`:
-/// systemd's `PrivateTmp` prepares and mounts both trees independently.
-const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 3] = [
-    ("/mnt/tmp", "/tmp"),
-    ("/mnt/var/tmp", "/var/tmp"),
-    ("/mnt/run", "/run"),
-];
-
-#[cfg(feature = "kernel-test")]
-fn smoke_distro_runtime_mount_plan_covers_private_tmp() -> narf_kernel_test::TestResult {
-    if DISTRO_WRITABLE_RUNTIME_MOUNTS
-        != [
-            ("/mnt/tmp", "/tmp"),
-            ("/mnt/var/tmp", "/var/tmp"),
-            ("/mnt/run", "/run"),
-        ]
-    {
-        return narf_kernel_test::TestResult::Fail(
-            "distro runtime mount plan must provide separate /tmp, /var/tmp, and /run trees",
-        );
-    }
-    narf_kernel_test::TestResult::Pass
-}
-
-#[cfg(feature = "kernel-test")]
-narf_kernel_test::kernel_test_in!(
-    "frame/boot",
-    smoke_distro_runtime_mount_plan_covers_private_tmp
-);
-
 /// Per-NUMA-node reclaimer signal, one flag per node (one `kswapd<node>`
 /// each): set by `kswapd_wake` so a wake that races the kthread's park is
 /// never lost.
@@ -3345,23 +3314,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 console::Writer,
                                 "  mnt-dev-bind: /dev bound at /mnt/dev (distro device access)"
                             );
-                            // A read-only distro root still needs writable
-                            // runtime trees. /tmp carries sockets and locks,
-                            // /run carries daemon state, and /var/tmp is a
-                            // separate prerequisite for systemd PrivateTmp.
-                            for (mount_path, guest_path) in DISTRO_WRITABLE_RUNTIME_MOUNTS {
-                                if !mounts.iter().any(|m| m == mount_path) {
-                                    let fs = narf_filesystem::MemFs::new("tmpfs");
-                                    let _ =
-                                        narf_filesystem::registry().mount(&auth, mount_path, fs);
-                                    let _ = writeln!(
-                                        console::Writer,
-                                        "  mnt-dev-bind: writable {} mounted at {}",
-                                        guest_path,
-                                        mount_path,
-                                    );
-                                }
-                            }
                             // Bind /sys and /proc into the chroot too — libudev/
                             // libinput enumerate devices via /sys/class/*, and
                             // most Linux software pokes /proc. Best-effort.

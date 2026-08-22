@@ -56,6 +56,16 @@ pub enum CancelResult { Cancelled, Completed, NotFound }
 pub enum BlockFeature { Flush, Discard, WriteZeroes, Fua, Zoned, AtomicWrites }
 ```
 
+Every operation future follows the executor wake contract. Before returning
+`Poll::Pending`, it registers the supplied waker with the request/completion or
+queue-capacity state that can make progress. Completion, device removal,
+cancellation, and released queue capacity publish their state before waking
+the waiter. Registration uses the same lock or a register-then-recheck pattern
+as readiness inspection, preventing a lost wake during the transition to
+sleep. Unsupported or synchronous no-op operations resolve immediately; an
+implementation must not represent them with a future that remains pending
+forever.
+
 ### 3.2 Request / completion
 
 ```rust
