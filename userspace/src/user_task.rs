@@ -1228,6 +1228,8 @@ pub fn __test_clear_hooks() {
     YIELD_HOOK.store(core::ptr::null_mut(), Ordering::Release);
     EXIT_HOOK.store(core::ptr::null_mut(), Ordering::Release);
     clear_current();
+    #[cfg(feature = "kernel-test")]
+    narf_scheduler::stackful::__reset_user_own_stack_for_test();
 }
 
 /// Test-only reset of the execve hook (a test that installs its own

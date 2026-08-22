@@ -60,6 +60,10 @@ build orchestration (`build/`), release sign-off (`process/`).
 - A `#[kernel_test]` macro registers a function that runs **inside** the
   booted kernel. The harness boots QEMU, runs the test, examines the
   exit code and log.
+- `user-mode-e2e` enables filesystem-independent, instruction-embedded user
+  tests, including the AArch64 two-task EL0 timer-preemption and TLS/FP-state
+  isolation smoke. `firmware-allow-unsigned` independently mirrors the
+  firmware crate's bring-up policy for tests that need unsigned blobs.
 - Three outcome channels: success (QEMU exit 0x10), failure (0x11),
   timeout (harness kill).
 - Runs on `x86_64` and `aarch64` targets on every PR.

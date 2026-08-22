@@ -239,6 +239,17 @@ pub fn user_own_stack_enabled() -> bool {
     USE_OWN_STACK.load(Ordering::Acquire)
 }
 
+/// Restore the own-stack latch to its kernel-test initial state.
+///
+/// Production boot enables this mode once and never turns it off. Verification
+/// needs an explicit reset because distributed tests may exercise the legacy
+/// longjmp path after a smoke that installed the production own-stack hooks.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __reset_user_own_stack_for_test() {
+    USE_OWN_STACK.store(false, Ordering::Release);
+}
+
 // Hooks for saving/restoring the CURRENT user task's FPU (x87/SSE) across a
 // `kernel_switch` out/in. The FPU area lives in userspace (`UserTaskFuture`),
 // so the scheduler drives it through these hooks rather than reaching across
@@ -3099,6 +3110,9 @@ pub mod tests {
                     // EL0 is allowed to write TPIDR_EL0 without entering the
                     // kernel. Model that direct write, then exercise the
                     // production switch-out capture.
+                    // SAFETY: this kernel smoke executes at EL1; TPIDR_EL0 is
+                    // an architecturally writable per-task register, and TLS
+                    // is the deliberately modelled test value.
                     unsafe { narf_arch::aarch64::set_user_tls_base(TLS) };
                     user_fpu_save();
                     cx.waker().wake_by_ref();
@@ -3129,6 +3143,9 @@ pub mod tests {
         let first = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         // SAFETY: simulate a different task's TLS state on this CPU.
         unsafe { narf_arch::aarch64::set_user_tls_base(CLOBBER) };
+        // SAFETY: `task`, its dedicated stack, and `exec_ctx` remain live and
+        // exclusively borrowed after the first completed switch round trip;
+        // no concurrent poll of this task exists in the smoke.
         let second = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         // SAFETY: leave a benign kernel-test value behind.
         unsafe { narf_arch::aarch64::set_user_tls_base(0) };

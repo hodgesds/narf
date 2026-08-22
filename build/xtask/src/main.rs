@@ -6170,6 +6170,44 @@ fn ensure_feature(features: &mut String, feature: &str) {
     features.push_str(feature);
 }
 
+/// Remove features whose contract is to select the in-kernel test runner.
+/// `xtask test` reuses the caller's feature list for its second, production
+/// boot-smoke phase, where retaining any of these would transitively re-enable
+/// `kernel-test` and make the kernel run tests instead of real init.
+fn without_kernel_test_features(features: &str) -> String {
+    features
+        .split(',')
+        .map(str::trim)
+        .filter(|feature| {
+            !feature.is_empty()
+                && !matches!(
+                    *feature,
+                    "kernel-test" | "user-mode-e2e" | "user-mode-testbin" | "narf-libc-validate"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod kernel_test_feature_tests {
+    use super::without_kernel_test_features;
+
+    #[test]
+    fn boot_smoke_drops_direct_and_transitive_kernel_test_features() {
+        assert_eq!(
+            without_kernel_test_features(
+                "mte,user-mode-e2e,kernel-test,user-mode-testbin,narf-libc-validate,boot-init"
+            ),
+            "mte,boot-init"
+        );
+        assert_eq!(
+            without_kernel_test_features("mte, boot-init"),
+            "mte,boot-init"
+        );
+    }
+}
+
 /// Recursively walk `fw_dir` collecting every regular file. Returns a
 /// pair of entry lists:
 ///
@@ -8173,12 +8211,7 @@ fn main() -> Result<()> {
                 // regressions that smokes miss because they exercise modules
                 // in isolation, not the full init flow. Strip the
                 // kernel-test feature explicitly so the real init runs.
-                args.features = args
-                    .features
-                    .split(',')
-                    .filter(|f| !f.is_empty() && *f != "kernel-test")
-                    .collect::<Vec<_>>()
-                    .join(",");
+                args.features = without_kernel_test_features(&args.features);
                 boot_smoke_cmd(&args)?;
                 // Verify NARF's on-disk btrfs writes are still Linux-consistent.
                 verify_btrfs_write_interop()
