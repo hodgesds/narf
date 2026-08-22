@@ -640,39 +640,136 @@ pub fn user_fpu_restore_current() {
     }
 }
 
-pub fn current_user_task() -> Option<*mut UserTaskCtx> {
-    // Own-stack model: a task RESUMES from a park via `kernel_switch`, NOT a
-    // re-poll, so `UserTaskFuture::poll`'s `install_current` does NOT re-run —
-    // the per-CPU `CURRENT` cell keeps pointing at whichever task was last
-    // FRESHLY polled, even after the executor switched to a different task. A
-    // syscall handler (e.g. `sys_futex`) reading `current_user_task()` while a
-    // RESUMED task runs would then operate on the WRONG task's `UserTaskCtx` —
-    // a redis worker's futex wrote its wait-state into netserve's ctx, wedging
-    // netserve's accept() into an infinite futex wait (net-smoke echo hang).
-    // The scheduler's CURRENT KernelTask publication is always correct and
-    // already follows direct resume plus migration. The polling future stores
-    // its Arc<Task> pointer in that task-local context once, so recover the ctx
-    // without bouncing the global TASKS B-tree lock on every syscall. Fall
-    // back to the legacy per-CPU cell for the longjmp model and kernel tests.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if narf_scheduler::stackful::user_own_stack_enabled() {
-        let task = current_task_owner_ptr();
-        if !task.is_null() {
-            // SAFETY: the CURRENT KernelTask's pinned UserTaskFuture owns the
-            // Arc<Task> that published this pointer; it cannot be dropped
-            // while its syscall continuation is executing.
-            return Some(unsafe { &(*task).uctx as *const UserTaskCtx as *mut UserTaskCtx });
-        }
+/// Which pointer `current_user_task` should resolve the current `UserTaskCtx`
+/// from. Split out from the pointer dereferences so the own-stack-vs-legacy
+/// precedence is unit-testable without toggling the global own-stack latch or
+/// per-CPU scheduler state (both shared across the concurrent kernel-test run).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CurrentTaskSource {
+    /// No current user task on this CPU.
+    None,
+    /// Deref the scheduler-published owner `Task` (own-stack model).
+    OwnerContext,
+    /// Read the legacy per-CPU `CURRENT` cell (longjmp model / kernel tests).
+    LegacyCell,
+}
+
+/// Own-stack model: the scheduler-published owner context is the ONLY sound
+/// source. It is lifetime-coupled to the live `KernelTask` (its pinned
+/// `UserTaskFuture` owns the `Arc<Task>`) and follows direct kernel_switch
+/// resume + CPU migration. When no owner is published yet — e.g. a freshly
+/// polled task between `task_body_rust` arming CURRENT and its poll reaching
+/// `publish_current_task` — the answer is None: such a task has not opened a
+/// kernel span, so there is nothing to account against. The legacy per-CPU
+/// `CURRENT` cell must NOT be consulted here, because own-stack execution never
+/// runs its clear site (the longjmp poll tail), so the cell dangles at a prior
+/// exited task's freed `uctx` and a timer-preempt accounting hook would store
+/// through it. The legacy cell is authoritative only in the longjmp model,
+/// where the poll publishes it before entering user mode and clears it on the
+/// way back out.
+#[inline]
+fn current_user_task_source(
+    own_stack: bool,
+    owner_null: bool,
+    legacy_cell_null: bool,
+) -> CurrentTaskSource {
+    if own_stack {
+        return if owner_null {
+            CurrentTaskSource::None
+        } else {
+            CurrentTaskSource::OwnerContext
+        };
     }
-    // Longjmp model (and the fallback): the in-flight polling routine publishes
-    // its ctx in this CPU's `CURRENT` cell right before entering user mode and
-    // clears it on the way back out.
-    let p = current_slot().load(Ordering::Acquire);
-    if p.is_null() {
-        None
+    if legacy_cell_null {
+        CurrentTaskSource::None
     } else {
-        Some(p)
+        CurrentTaskSource::LegacyCell
     }
+}
+
+pub fn current_user_task() -> Option<*mut UserTaskCtx> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let (own_stack, owner) = {
+        let own_stack = narf_scheduler::stackful::user_own_stack_enabled();
+        // Only resolve the owner when the own-stack model is active; the legacy
+        // model never publishes it.
+        let owner = if own_stack {
+            current_task_owner_ptr()
+        } else {
+            core::ptr::null()
+        };
+        (own_stack, owner)
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let (own_stack, owner) = (false, core::ptr::null::<crate::task::Task>());
+
+    let legacy = current_slot().load(Ordering::Acquire);
+    match current_user_task_source(own_stack, owner.is_null(), legacy.is_null()) {
+        CurrentTaskSource::None => None,
+        CurrentTaskSource::OwnerContext => {
+            // SAFETY: the CURRENT KernelTask's pinned UserTaskFuture owns the
+            // Arc<Task> that published this pointer; it cannot be dropped while
+            // its syscall continuation is executing.
+            Some(unsafe { &(*owner).uctx as *const UserTaskCtx as *mut UserTaskCtx })
+        }
+        CurrentTaskSource::LegacyCell => Some(legacy),
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+mod current_user_task_source_tests {
+    use super::{current_user_task_source, CurrentTaskSource};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// C1 regression. In the own-stack model `current_user_task` must resolve
+    /// the current `UserTaskCtx` ONLY from the scheduler-published owner
+    /// context, never from the legacy per-CPU `CURRENT` cell. That cell is not
+    /// cleared on the own-stack park/exit path (its clear site is the longjmp
+    /// poll tail, which own-stack execution never reaches), so it dangles at a
+    /// prior exited task's freed `uctx`. A timer-preempt accounting hook that
+    /// fell back to it stored through freed memory — the KASAN store-to-poisoned
+    /// panic in `close_kernel_span`. The pre-fix code fell through to the cell
+    /// whenever no owner was published; this asserts the precedence stays split.
+    fn smoke_own_stack_never_reads_stale_legacy_cell() -> TestResult {
+        use CurrentTaskSource::{LegacyCell, None, OwnerContext};
+
+        // Own-stack, owner published → use the owner context.
+        if current_user_task_source(true, false, false) != OwnerContext {
+            return TestResult::Fail("own-stack with a published owner must use the owner context");
+        }
+        // Own-stack, NO owner published, legacy cell NON-null (a prior task's
+        // possibly-freed uctx) → None. This is the exact C1 window; the pre-fix
+        // code returned the stale cell here.
+        if current_user_task_source(true, true, false) != None {
+            return TestResult::Fail(
+                "own-stack without a published owner must be None, not the stale legacy cell",
+            );
+        }
+        // Own-stack, nothing anywhere → None.
+        if current_user_task_source(true, true, true) != None {
+            return TestResult::Fail("own-stack with no context must be None");
+        }
+        // Own-stack must resolve the owner even when the legacy cell is null.
+        if current_user_task_source(true, false, true) != OwnerContext {
+            return TestResult::Fail("own-stack must use the owner even with a null legacy cell");
+        }
+        // Longjmp model: fall back to the legacy per-CPU cell.
+        if current_user_task_source(false, true, false) != LegacyCell {
+            return TestResult::Fail("longjmp model must use the legacy cell");
+        }
+        if current_user_task_source(false, true, true) != None {
+            return TestResult::Fail("longjmp model with an empty cell must be None");
+        }
+        // Longjmp model ignores the owner pointer.
+        if current_user_task_source(false, false, false) != LegacyCell {
+            return TestResult::Fail("longjmp model must ignore the owner pointer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/process",
+        smoke_own_stack_never_reads_stale_legacy_cell
+    );
 }
 
 // ── Per-task-own-stack syscall park ─────────────────────────────────
