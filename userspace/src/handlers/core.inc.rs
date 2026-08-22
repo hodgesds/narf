@@ -4915,8 +4915,8 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 //   - CLONE_FS       cwd table shared (skip cwd_fork).
 //   - CLONE_FILES    fd table shared (skip fd::fork).
 //   - CLONE_SIGHAND  sigaction table shared (skip sigaction_fork).
-//   - CLONE_SETTLS   args.tls programmed into IA32_FS_BASE on first
-//                    dispatch (per-thread TLS thread-pointer).
+//   - CLONE_SETTLS   args.tls programmed into the architecture's user TLS
+//                    register on first dispatch (IA32_FS_BASE / TPIDR_EL0).
 //   - CLONE_PARENT_SETTID writes the child TID into *args.parent_tid.
 //   - CLONE_CHILD_CLEARTID stashes args.child_tid in a per-task slot;
 //                    on thread exit, the kernel writes 0 there and
@@ -4934,9 +4934,8 @@ const CLONE_VM: u64 = 0x0000_0100;
 /// child on a caller-provided stack while sharing the parent's address space;
 /// the parent MUST NOT resume — and thus must not mutate/free that shared AS
 /// (e.g. munmap the child's stack) — until the child releases the mm. Linux
-/// keeps the parent in TASK_KILLABLE across this window. Consumed only by the
-/// x86_64 `do_clone3`; other arches stub clone until the EL0 user-task pipeline.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+/// keeps the parent in TASK_KILLABLE across this window.
+#[cfg(feature = "linux-compat")]
 const CLONE_VFORK: u64 = 0x0000_4000;
 /// `CLONE_PIDFD`: mint a pidfd on the child, installed in the PARENT's fd
 /// table (the child does not inherit it — Linux allocates it after
@@ -4947,14 +4946,14 @@ const CLONE_PIDFD: u64 = 0x0000_1000;
 /// `CLONE_CLEAR_SIGHAND` (clone3-only): the child starts with every signal
 /// disposition SIG_DFL instead of a copy of the parent's table. glibc's
 /// `posix_spawn`/`pidfd_spawn` passes it unconditionally (2.38+).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(feature = "linux-compat")]
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// `CLONE_INTO_CGROUP` (clone3-only): `clone_args.cgroup` is an O_PATH
 /// directory fd on cgroupfs; the child starts life in that cgroup instead
 /// of inheriting the parent's. glibc `posix_spawn` with
 /// `POSIX_SPAWN_SETCGROUP` (systemd's per-service spawn) sets it.
 /// Consumed only under the `cgroup` feature (accepted-and-inherit otherwise).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(feature = "linux-compat")]
 #[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
@@ -5191,11 +5190,14 @@ pub fn __test_reset_clear_child_tid() {
 /// the AS Arc is dropped — for CLONE_THREAD children, the AS Arc is
 /// shared with the parent so it stays mapped. The writes use the
 /// kernel-side identity map via `paging::translate` to avoid
-/// requiring an `activate()` (the user task's AS was the active CR3
-/// at the moment of longjmp and the trap-exit path restored the
-/// kernel CR3 before reaching us; we don't want to bounce CR3 again
+/// requiring an `activate()` (the user task's AS was active at longjmp and the
+/// trap-exit path restored the kernel address-space context before reaching us;
+/// we don't want to switch user roots again
 /// just for one qword write).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // The clear_child_tid table is keyed by TaskId (= tid_raw),
     // NOT by visible pid. For CLONE_THREAD children, pid_raw is
@@ -5230,14 +5232,21 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
             // (non-zero, checked above); `translate` walks it read-only to
             // resolve the page-aligned user `page` to its current phys frame.
             // SAFETY: Valid memory or trusted environment
-            if let Some(phys) = unsafe {
+            #[cfg(target_arch = "x86_64")]
+            let translated = unsafe {
                 narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
-            } {
-                // SAFETY: identity-mapped low RAM; the AS Arc keeps the backing
-                // frame alive across this write.
+            };
+            #[cfg(target_arch = "aarch64")]
+            let translated = unsafe {
+                narf_memory::aarch64::paging::translate(root, narf_memory::VirtAddr::new(page))
+            };
+            if let Some(phys) = translated {
+                // SAFETY: the AS Arc keeps the backing frame alive. Use the
+                // kernel direct-map accessor so this remains valid through
+                // TTBR0 changes on aarch64 and for high RAM on x86_64.
                 // SAFETY: Valid memory or trusted environment
                 unsafe {
-                    *((phys.as_u64() + off) as *mut u32) = 0;
+                    *narf_memory::PhysAddr::new(phys.as_u64() + off).kernel_mut_ptr::<u32>() = 0;
                 }
             }
         }
@@ -5266,10 +5275,12 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     }
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(all(
+    feature = "linux-compat",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 fn fire_clear_child_tid_on_exit(_pid_raw: u64, _tid_raw: u64) {
-    // aarch64 / other arches: clone3 path is x86_64-gated below;
-    // the table never gets populated, so this is a no-op.
+    // Other arches do not yet have a user-task clone path.
 }
 
 /// Register the clear_child_tid observer (THREAD-scoped: fires per
@@ -5321,18 +5332,27 @@ const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
 // cannot resume and mutate the shared address space (e.g. munmap the child's
 // stack) out from under a still-running CLONE_VM child — the race that SIGSEGV'd
 // every glibc `posix_spawn` service child under systemd.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 static VFORK_WAIT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn vfork_wait_register(child_pid: u64, parent_task: u64) {
     let mut g = VFORK_WAIT.lock();
     g.get_or_insert_with(BTreeMap::new)
         .insert(child_pid, parent_task);
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn vfork_is_pending(child_pid: u64) -> bool {
     VFORK_WAIT
         .lock()
@@ -5343,7 +5363,10 @@ pub(crate) fn vfork_is_pending(child_pid: u64) -> bool {
 /// Called from the child's `execve` and exit paths: if this child had a vfork
 /// parent parked on it, drop the entry and wake the parent. `child_pid` is the
 /// child's visible pid. Idempotent (only the first exec/exit releases).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn vfork_child_release(child_pid: u64) {
     let parent = {
         let mut g = VFORK_WAIT.lock();
@@ -5354,14 +5377,144 @@ pub(crate) fn vfork_child_release(child_pid: u64) {
     }
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn current_user_tls_base() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    let value = {
+        // SAFETY: IA32_FS_BASE is architectural and readable at CPL0.
+        unsafe { narf_arch::x86_64::msr::rdmsr(narf_arch::x86_64::IA32_FS_BASE) }
+    };
+    #[cfg(target_arch = "aarch64")]
+    let value = {
+        let value: u64;
+        // SAFETY: TPIDR_EL0 is the live EL0 thread pointer and is readable
+        // from EL1 without changing architectural state.
+        unsafe {
+            core::arch::asm!(
+                "mrs {value}, TPIDR_EL0",
+                value = out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    };
+    (value != 0).then_some(value)
+}
+
+/// Validate the Linux-visible clone contract before allocating or publishing
+/// any child state. The returned value is a positive errno number.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
+    const EINVAL: u64 = 22;
+    const CLONE_DETACHED: u64 = 0x0040_0000;
+    const CLONE_PARENT: u64 = 0x0000_8000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_NEWUSER: u64 = 0x1000_0000;
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+
+    if !legacy && ca.exit_signal > 64 {
+        return Err(EINVAL);
+    }
+    if ca.set_tid_size > 32
+        || (ca.set_tid == 0 && ca.set_tid_size != 0)
+        || (ca.set_tid != 0 && ca.set_tid_size == 0)
+    {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_INTO_CGROUP != 0 && ca.cgroup > i32::MAX as u64 {
+        return Err(EINVAL);
+    }
+    if !legacy {
+        // clone3 reserves the low signal bits (the signal lives in
+        // exit_signal) and currently defines only bits 0..=33.
+        const CLONE3_KNOWN_FLAG_BITS: u64 = (1u64 << 34) - 1;
+        if ca.flags & (0x7f | CLONE_DETACHED) != 0
+            || ca.flags & !CLONE3_KNOWN_FLAG_BITS != 0
+        {
+            return Err(EINVAL);
+        }
+        if (ca.stack == 0) != (ca.stack_size == 0) {
+            return Err(EINVAL);
+        }
+    }
+    if ca.stack.checked_add(ca.stack_size).is_none() {
+        return Err(EINVAL);
+    }
+    if !legacy
+        && ca.stack != 0
+        && ca.stack + ca.stack_size > crate::handlers::USER_VA_LIMIT
+    {
+        // Linux clone3 reports a failed access_ok(stack, stack_size) as
+        // EINVAL, not EFAULT.
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_THREAD != 0 && ca.flags & CLONE_SIGHAND == 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_SIGHAND != 0 && ca.flags & CLONE_VM == 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_FS != 0 && ca.flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_THREAD != 0 && ca.flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_SIGHAND != 0 && ca.flags & CLONE_CLEAR_SIGHAND != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & (CLONE_THREAD | CLONE_PARENT) != 0 && ca.exit_signal != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_PIDFD != 0
+        && ca.flags & CLONE_PARENT_SETTID != 0
+        && ca.pidfd == ca.parent_tid
+    {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_PIDFD != 0 && ca.flags & CLONE_DETACHED != 0 {
+        return Err(EINVAL);
+    }
+    if ca.set_tid != 0 {
+        // NARF has no ambient root/CAP_CHECKPOINT_RESTORE analogue on this
+        // syscall surface. Refuse requested PID injection instead of silently
+        // ignoring it and creating a child with a different identity.
+        return Err(1); // -EPERM
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     use crate::process::DEFAULT_USER_STACK_BYTES;
     let flags = ca.flags;
+    if let Err(errno) = validate_clone_args(&ca, legacy) {
+        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+        return;
+    }
+    if (flags & CLONE_PIDFD != 0
+        && validate_user_range(ca.pidfd, core::mem::size_of::<i32>()).is_err())
+        || (flags & CLONE_PARENT_SETTID != 0
+            && validate_user_range(ca.parent_tid, core::mem::size_of::<i32>()).is_err())
+    {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        return;
+    }
     let parent_as = match current_address_space() {
         Some(a) => a,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // A Linux process cannot clone without an mm/task context. Treat
+            // failure to resolve that context like task-state allocation.
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
     };
@@ -5383,15 +5536,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     let _share_files = (flags & CLONE_FILES) != 0;
     let share_sighand = (flags & CLONE_SIGHAND) != 0;
     let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
-
-    // CLONE_THREAD requires CLONE_VM + CLONE_SIGHAND in Linux.
-    // We enforce CLONE_VM (without a shared AS the child can't
-    // observe the parent's memory); CLONE_SIGHAND shares the live
-    // sigaction table below.
-    if share_thread && !share_vm {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
 
     // No-VM (fork-shaped) path: redirect to sys_fork's machinery.
     // The clone_args fields not consumed by fork are accepted-and-
@@ -5437,7 +5581,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
 
     // Stack: for `clone3(2)`, `ca.stack` points at the LOW end
     // of the user-provided stack region and `ca.stack_size` is
-    // the byte length; the child's initial RSP is the top
+    // the byte length; the child's initial SP is the top
     // (`stack + stack_size`). For the legacy `clone(2)` syscall
     // (sys_clone synthesises a CloneArgs), `ca.stack` is ALREADY
     // the top and `ca.stack_size` is 0 — `stack + 0` recovers
@@ -5447,28 +5591,20 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // its own stack — reusing the parent's would collide. A fork-shaped
     // clone (no CLONE_VM) instead COW-copies the whole AS, so `stack == 0`
     // is valid and means "resume the child on the (COW) parent stack at
-    // the parent's RSP" — exactly what glibc's fork() passes
+    // the parent's SP" — exactly what glibc's fork() passes
     // (`clone(SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID, stack=0)`).
-    if share_vm && ca.stack == 0 {
-        #[cfg(feature = "syscall-trace")]
-        narf_console::write_str(&alloc::format!(
-            "[CLONE3_FAIL share_vm stack==0 flags={:#x}]\n",
-            flags
-        ));
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
     let rsp = if ca.stack != 0 {
-        ca.stack.saturating_add(ca.stack_size)
+        // Overflow was rejected by validate_clone_args.
+        ca.stack + ca.stack_size
     } else {
-        // Fork: inherit the parent's user RSP (child runs on its COW copy).
+        // Fork: inherit the parent's user SP (child runs on its COW copy).
         ctx.user_rsp()
     };
 
-    // Entry: clone3 doesn't carry an explicit entry RIP in
+    // Entry: clone3 doesn't carry an explicit entry PC in
     // clone_args. The child resumes at the parent's saved trap-
-    // frame RIP (the instruction after the clone3 syscall) with
-    // a rewritten RAX = 0 — same shape as fork(). User code
+    // frame PC (the instruction after the clone3 syscall) with
+    // a rewritten return value of 0 — same shape as fork(). User code
     // dispatches "am I the child? if so, call my start_routine"
     // off the zero return value (relibc's pthread_create does
     // exactly this).
@@ -5484,13 +5620,28 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             // initialized UserState.
             // SAFETY: Valid memory or trusted environment
             let mut snap = unsafe { s.assume_init() };
-            snap.rax = 0;
-            // Plant the user-supplied RSP. The parent's trap-frame
-            // RSP stays in the parent's snapshot (its set_return
-            // path writes its own rax = child_tid later); the
+            #[cfg(target_arch = "x86_64")]
+            {
+                snap.rax = 0;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                snap.x[0] = 0;
+                snap.x[1] = 0;
+            }
+            // Plant the user-supplied SP. The parent's trap-frame
+            // SP stays in the parent's snapshot (its set_return
+            // path writes its own return register later); the
             // child's snapshot gets the freshly-allocated thread
             // stack.
-            snap.rsp = rsp;
+            #[cfg(target_arch = "x86_64")]
+            {
+                snap.rsp = rsp;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                snap.sp = rsp;
+            }
             Some(snap)
         } else {
             None
@@ -5582,32 +5733,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         address_space: child_as.clone(),
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
-        fs_base: if (flags & CLONE_SETTLS) != 0 && ca.tls != 0 {
+        fs_base: if (flags & CLONE_SETTLS) != 0 {
             Some(ca.tls)
         } else {
-            // Inherit parent's FS_BASE — read the live MSR.
-            let lo: u32;
-            let hi: u32;
-            const IA32_FS_BASE: u32 = 0xC000_0100;
-            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax. The MSR is
-            // architectural and always readable at CPL0 (kernel); operands name the
-            // ABI registers and the instruction has no memory side effects.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                core::arch::asm!(
-                    "rdmsr",
-                    in("ecx") IA32_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                    options(nostack, preserves_flags),
-                );
-            }
-            let v = (lo as u64) | ((hi as u64) << 32);
-            if v == 0 {
-                None
-            } else {
-                Some(v)
-            }
+            // Inherit the live architecture TLS register (FS_BASE or
+            // TPIDR_EL0); the user-task poller restores it before EL0 entry.
+            current_user_tls_base()
         },
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
@@ -5953,6 +6084,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // → `wake_signal`; SIGKILL (pending bit 9) still breaks the wait.
     if flags & CLONE_VFORK != 0 {
         if let Some(uctx) = crate::user_task::current_user_task() {
+            #[cfg(target_arch = "x86_64")]
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // SAFETY: the in-flight parent task's poller-pinned UserTaskCtx;
                 // single-CPU cooperative execution — no concurrent &mut.
@@ -5964,7 +6096,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                 }
-                while vfork_is_pending(child_visible_pid) {
+                loop {
+                    // Arm the park before testing the wait-table predicate.
+                    // vfork_child_release removes the row before clearing this
+                    // deadline, closing the final check-to-sleep race.
+                    uc.sleep_deadline_ns
+                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                    if !vfork_is_pending(child_visible_pid) {
+                        break;
+                    }
                     if (signal_pending_bits(parent_pid) & (1 << 9)) != 0 {
                         // SIGKILL pending: abandon the wait; drop the stale entry
                         // so a later reuse of this pid can't wake a dead parent.
@@ -5974,9 +6114,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
                             .map(|m| m.remove(&child_visible_pid));
                         break;
                     }
-                    uc.sleep_deadline_ns
-                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
                     crate::user_task::own_stack_park();
+                }
+                uc.sleep_deadline_ns
+                    .store(0, core::sync::atomic::Ordering::Release);
+            }
+            #[cfg(target_arch = "aarch64")]
+            if let Some(hook) = crate::user_task::yield_hook() {
+                // aarch64 uses the polling-future path: keep the parent's
+                // saved syscall return parked until vfork_child_release calls
+                // wake_signal and clears this infinite deadline.
+                // SAFETY: uctx is the live poller-owned context and hook
+                // longjmps back through its installed JmpBuf.
+                let uc = unsafe { &*uctx };
+                uc.sleep_deadline_ns
+                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                if vfork_is_pending(child_visible_pid) {
+                    unsafe {
+                        ctx.save_user_state(uc.state.get() as *mut u8);
+                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                        hook(uctx);
+                    }
                 }
                 uc.sleep_deadline_ns
                     .store(0, core::sync::atomic::Ordering::Release);
@@ -6479,7 +6637,10 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     // in do_clone3's vfork park — otherwise the parent waits forever. `task` is
     // the visible pid here (every caller passes a pid). Idempotent with the
     // execve release. No-op when the pid isn't a vfork child.
-    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "linux-compat",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     vfork_child_release(task);
     let mut g = PENDING_TERMINATION.lock();
     if let Some(m) = g.as_mut() {

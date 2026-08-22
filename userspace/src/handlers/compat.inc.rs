@@ -1032,7 +1032,10 @@ fn do_execve_resolved(
     // CLONE_VFORK release: this child is now replacing its image, so it no
     // longer needs the shared address space — wake a parent suspended in
     // do_clone3's vfork park. (Load succeeded above, so the exec is committed.)
-    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "linux-compat",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     vfork_child_release(task_to_pid_raw(task).unwrap_or(task));
 
     // POSIX execve: reset caught signal handlers to SIG_DFL — their code
@@ -3609,7 +3612,6 @@ static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[cfg(target_arch = "x86_64")]
 fn proc_identity_fork(parent_task: u64, child_task: u64) {
     let inherited_comm = {
         let g = PROC_COMM.lock();

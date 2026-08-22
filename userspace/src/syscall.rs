@@ -1137,34 +1137,16 @@ pub enum Syscall {
     /// scheduler's `TaskId.raw()` for the running task.
     Gettid,
 
-    /// Linux clone(2) — minimal viable thread spawn. NARF doesn't
-    /// implement the full `flags / ptid / ctid / tls` surface;
-    /// instead it takes a four-argument shape that creates one new
-    /// task sharing the caller's address space:
-    ///
-    /// - `arg0 = entry_pc`  : user vaddr the new task starts at
-    /// - `arg1 = stack_top` : user RSP the new task starts on
-    ///   (caller-allocated; kernel does NOT
-    ///   validate that the page is mapped)
-    /// - `arg2 = arg`       : opaque u64 passed in RDI to `entry_pc`
-    /// - `arg3 = fs_base`   : if non-zero, value the kernel writes
-    ///   into the new task's `IA32_FS_BASE` so
-    ///   it can find its own TLS block. Zero
-    ///   means "inherit parent's fs_base"
-    ///   (suitable for child code that does
-    ///   not touch TLS).
-    ///
-    /// Returns the new task's tid on success (non-zero), or
-    /// `SyscallReturn::invalid_op` if the parent's address space
-    /// could not be resolved (no AS lookup installed → not a real
-    /// userspace boot).
-    ///
-    /// Future work (tracked in MEMORY): clone3-shaped flags,
-    /// per-thread TLS allocation from PT_TLS template, futex /
-    /// thread-group bookkeeping. For now, two threads can exist in
-    /// one address space, gettid distinguishes them, and the
-    /// scheduler's per-task UserState/JmpBuf/FS_BASE machinery
-    /// already supports them.
+    /// Linux clone(2), implemented on x86_64 and aarch64. Arguments use each
+    /// architecture's Linux register ABI: `flags`, child stack top,
+    /// `parent_tid`, then x86_64 `child_tid, tls` or arm64 `tls, child_tid`.
+    /// The low flag byte is the exit signal. The child resumes after the
+    /// syscall with a zero result; the parent receives the child PID/TID.
+    /// `CLONE_VM`, thread-group, shared files/fs/sighand, TLS, pidfd,
+    /// parent/child TID, clear-child-TID, namespaces, and vfork lifecycle feed
+    /// the same implementation as `clone3`. Invalid flag dependencies return
+    /// `EINVAL`; task exhaustion returns `EAGAIN`; address-space construction
+    /// failures return `ENOMEM`.
     Clone,
 
     /// Linux fork(2) — duplicate-process counterpart to `Clone`.
@@ -1202,7 +1184,7 @@ pub enum Syscall {
     /// Single user argument: a pointer to `struct clone_args`
     /// (see `man 2 clone3`). The kernel reads `flags`, `stack`,
     /// `stack_size`, `tls`, `parent_tid`, `child_tid`, and
-    /// `exit_signal` from it; everything else is treated as zero.
+    /// `exit_signal`, `set_tid`, and `cgroup` from it.
     ///
     /// Honoured `CLONE_*` flags (Wave-65):
     ///   - `CLONE_VM`              child shares parent's AS via Arc.
@@ -1216,13 +1198,16 @@ pub enum Syscall {
     ///     `*parent_tid`.
     ///   - `CLONE_CHILD_CLEARTID`  on thread exit, zero `*child_tid`
     ///     and FUTEX_WAKE one waiter there.
-    ///   - `CLONE_SETTLS`          program child's `IA32_FS_BASE` to
-    ///     `args.tls` on first dispatch.
+    ///   - `CLONE_SETTLS`          program the child's user TLS register
+    ///     (`IA32_FS_BASE` / `TPIDR_EL0`) on dispatch.
     ///
-    /// Unsupported flags (CLONE_NEWPID, CLONE_NEWNS, etc.) are
-    /// silently accepted today; container support lands in Wave-67.
-    /// Returns the child's TID (which equals its PID when
-    /// CLONE_THREAD is unset, or shares the parent's PID when set).
+    /// The accepted wire struct is 64..=4096 bytes. Unknown trailing bytes
+    /// must be zero (`E2BIG` otherwise); invalid sizes/flag combinations,
+    /// stack pairs, signals, and field versions return `EINVAL`; bad user
+    /// pointers return `EFAULT`. Requested PID injection through `set_tid`
+    /// returns `EPERM` because this interface conveys no corresponding NARF
+    /// capability. Returns the child's TID (equal to its PID unless
+    /// `CLONE_THREAD` joins the parent's process).
     Clone3,
 
     /// Linux set_tid_address(2). Sets the calling task's

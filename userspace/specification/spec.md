@@ -218,6 +218,18 @@ a bounded queue — so a readiness edge is never dropped and then recovered only
 by a coarse fallback tick.
 Legacy `clone(2)` honors `CLONE_PIDFD` by installing a pidfd in the parent and
 writing its descriptor through the overloaded `parent_tid` pointer argument.
+Both legacy `clone(2)` and `clone3(2)` create resumable user tasks on x86_64
+and aarch64 through the same architecture-neutral process/lifecycle path; the
+architecture boundary is limited to Linux's register ordering, saved return
+register/stack fields, and the user TLS register (`IA32_FS_BASE` or
+`TPIDR_EL0`). The child resumes after the syscall with zero while the parent
+receives its PID/TID. `clone3` enforces Linux's 64-byte v0 minimum, one-page
+maximum, zero-only unknown tail, paired stack fields, valid exit signal, and
+flag dependency rules before allocating or publishing a child. These failures
+surface as Linux `EINVAL`, `EFAULT`, or `E2BIG`; task exhaustion is `EAGAIN`
+and address-space construction failure is `ENOMEM`. Requested `set_tid` PID
+injection is refused with `EPERM` because no checkpoint/restore capability is
+present on this syscall interface.
 Private futex wait queues are keyed by `(address-space identity, user address)`;
 `CLONE_VM` threads share wakes, while unrelated processes that map the same
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.

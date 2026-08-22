@@ -1113,36 +1113,26 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_fork_is_unwired);
 
 // ── clone(2) — no live address space ──
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone_neg() -> TestResult {
     with_setup(|| {
         // clone routes through do_clone3, whose first step is the
-        // `current_address_space()` lookup — None in the harness → InvalidOp.
+        // `current_address_space()` lookup — None in the harness → ENOMEM.
         let r = call_raw(Syscall::Clone.raw(), a0(0));
-        if r.status == SyscallReturn::INVALID_OP {
-            Ok(())
+        if r.status == SyscallReturn::OK && r.value as i64 == -12 {
+            // Legacy clone truncates flags to 32 bits. A clone3-only upper
+            // flag must be ignored and reach the same no-mm ENOMEM path.
+            let upper = call(Syscall::Clone.raw(), a0(0x1_0000_0000));
+            if upper == Some(-12) {
+                Ok(())
+            } else {
+                Err("legacy clone did not truncate flags to 32 bits")
+            }
         } else {
-            Err("clone without an address space did not report InvalidOp")
+            Err("clone without an address space did not return -ENOMEM")
         }
     })
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone_neg);
-
-#[cfg(target_arch = "aarch64")]
-fn smoke_abi_proc_clone_is_enosys() -> TestResult {
-    with_setup(|| {
-        // The wire number is part of the aarch64 ABI, but the EL0 child-task
-        // construction path has not landed on this architecture yet.
-        if call(Syscall::Clone.raw(), a0(0)) == Some(-38) {
-            Ok(())
-        } else {
-            Err("aarch64 clone stub did not return -ENOSYS")
-        }
-    })
-}
-#[cfg(target_arch = "aarch64")]
-kernel_test_in!("syscall_abi", smoke_abi_proc_clone_is_enosys);
 
 fn smoke_abi_proc_legacy_clone_pidfd_pointer() -> TestResult {
     const CLONE_PIDFD: u64 = 0x1000;
@@ -1159,7 +1149,6 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_clone_pidfd_pointer);
 
 // ── clone3(2) — struct validation + no live address space ──
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone3_badarg() -> TestResult {
     with_setup(|| {
         // LINUX ABI: the two failure modes are now distinguished (were both
@@ -1173,32 +1162,155 @@ fn smoke_abi_proc_clone3_badarg() -> TestResult {
         // A non-NULL but obviously-invalid (kernel-half) pointer with size<8
         // is rejected on the size floor before the pointer is dereferenced.
         let scratch = [0u8; 8];
-        let undersize = call(Syscall::Clone3.raw(), a1(scratch.as_ptr() as u64, 4));
+        let undersize = call(Syscall::Clone3.raw(), a1(scratch.as_ptr() as u64, 63));
         if undersize != Some(EINVAL) {
             return Err("clone3(ptr, size<8) must return -EINVAL");
         }
         Ok(())
     })
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_badarg);
 
-#[cfg(target_arch = "aarch64")]
-fn smoke_abi_proc_clone3_is_enosys() -> TestResult {
+fn smoke_abi_proc_clone3_errno_matrix() -> TestResult {
     with_setup(|| {
-        // An unavailable syscall reports ENOSYS before interpreting its
-        // arguments, which is what libc uses to fall back to clone(2).
-        if call(Syscall::Clone3.raw(), a1(0, 64)) == Some(-38) {
-            Ok(())
-        } else {
-            Err("aarch64 clone3 stub did not return -ENOSYS")
+        const E2BIG: i64 = -7;
+        const ENOMEM: i64 = -12;
+
+        // Size validation precedes pointer access, matching Linux.
+        if call(Syscall::Clone3.raw(), a1(0, 4097)) != Some(E2BIG) {
+            return Err("clone3 oversized struct must return -E2BIG before EFAULT");
         }
+
+        // An unknown non-zero extension field is E2BIG; a zero extension is
+        // forward-compatible and reaches the later no-address-space ENOMEM.
+        let mut extended = [0u8; 89];
+        extended[88] = 1;
+        if call(
+            Syscall::Clone3.raw(),
+            a1(extended.as_ptr() as u64, extended.len() as u64),
+        ) != Some(E2BIG)
+        {
+            return Err("clone3 non-zero unknown tail must return -E2BIG");
+        }
+        extended[88] = 0;
+        if call(
+            Syscall::Clone3.raw(),
+            a1(extended.as_ptr() as u64, extended.len() as u64),
+        ) != Some(ENOMEM)
+        {
+            return Err("clone3 zero unknown tail was not accepted");
+        }
+
+        // clone3 requires stack and stack_size as a pair.
+        let mut bad_stack = [0u8; 64];
+        bad_stack[40..48].copy_from_slice(&0x1000u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(bad_stack.as_ptr() as u64, bad_stack.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 stack without stack_size must return -EINVAL");
+        }
+
+        // CLONE_THREAD requires CLONE_SIGHAND, which in turn requires CLONE_VM.
+        let mut bad_flags = [0u8; 64];
+        bad_flags[..8].copy_from_slice(&0x1_0000u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(bad_flags.as_ptr() as u64, bad_flags.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 CLONE_THREAD without SIGHAND must return -EINVAL");
+        }
+        bad_flags[..8].copy_from_slice(&0x800u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(bad_flags.as_ptr() as u64, bad_flags.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 CLONE_SIGHAND without VM must return -EINVAL");
+        }
+
+        // The dedicated exit_signal field accepts 0..=64 only.
+        let mut bad_signal = [0u8; 64];
+        bad_signal[32..40].copy_from_slice(&65u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(bad_signal.as_ptr() as u64, bad_signal.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 invalid exit_signal must return -EINVAL");
+        }
+
+        // clone3 reserves the obsolete CLONE_DETACHED bit for future reuse.
+        let mut detached = [0u8; 64];
+        detached[..8].copy_from_slice(&0x0040_0000u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(detached.as_ptr() as u64, detached.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 CLONE_DETACHED must return -EINVAL");
+        }
+
+        // Linux copies the set_tid pid_t array before capability checks:
+        // a bad array is EFAULT, while a readable request is denied by NARF's
+        // explicit checkpoint/restore capability policy with EPERM.
+        let mut set_tid_args = [0u8; 80];
+        set_tid_args[64..72].copy_from_slice(&u64::MAX.to_ne_bytes());
+        set_tid_args[72..80].copy_from_slice(&1u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(set_tid_args.as_ptr() as u64, set_tid_args.len() as u64),
+        ) != Some(-14)
+        {
+            return Err("clone3 unreadable set_tid array must return -EFAULT");
+        }
+        let requested_pid = 123i32;
+        set_tid_args[64..72]
+            .copy_from_slice(&(core::ptr::addr_of!(requested_pid) as u64).to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(set_tid_args.as_ptr() as u64, set_tid_args.len() as u64),
+        ) != Some(-1)
+        {
+            return Err("clone3 set_tid request must return -EPERM");
+        }
+
+        // Output pointers are mandatory when their corresponding flags are
+        // set; NULL is EFAULT, not an accepted request that silently omits the
+        // write.
+        let mut null_pidfd = [0u8; 64];
+        null_pidfd[..8].copy_from_slice(&0x1000u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(null_pidfd.as_ptr() as u64, null_pidfd.len() as u64),
+        ) != Some(-14)
+        {
+            return Err("clone3 CLONE_PIDFD with NULL pidfd must return -EFAULT");
+        }
+
+        // clone3's stack range is checked like Linux access_ok(), but its
+        // prescribed errno for a non-user range is EINVAL.
+        let mut bad_stack_range = [0u8; 64];
+        bad_stack_range[40..48].copy_from_slice(&((1u64 << 47) - 8).to_ne_bytes());
+        bad_stack_range[48..56].copy_from_slice(&16u64.to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(
+                bad_stack_range.as_ptr() as u64,
+                bad_stack_range.len() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3 non-user stack range must return -EINVAL");
+        }
+
+        Ok(())
     })
 }
-#[cfg(target_arch = "aarch64")]
-kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_is_enosys);
+kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_errno_matrix);
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone3_no_as() -> TestResult {
     with_setup(|| {
         // A well-formed clone_args (size >= 8, non-NULL) passes the prefix
@@ -1209,14 +1321,13 @@ fn smoke_abi_proc_clone3_no_as() -> TestResult {
             a1(ca.as_mut_ptr() as u64, ca.len() as u64),
         );
         let _ = &mut ca;
-        if r.status == SyscallReturn::INVALID_OP {
+        if r.status == SyscallReturn::OK && r.value as i64 == -12 {
             Ok(())
         } else {
-            Err("clone3 without an address space did not report InvalidOp")
+            Err("clone3 without an address space did not return -ENOMEM")
         }
     })
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_no_as);
 
 // ── execve(2) / execveat(2) — NULL path rejection ──
