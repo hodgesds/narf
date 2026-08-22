@@ -219,6 +219,14 @@ For `build_new` vs. `baseline`:
   investigated within one release cycle. Without this check, a 0.5%
   regression every PR drifts into a 20% release-over-release
   regression undetected, because each individual delta is below noise.
+- The xtask benchmark runner accepts the previous green-main record through
+  `--baseline` and the release record through `--release-baseline`. It refuses
+  cross-runner, cross-architecture, accelerator, unit, direction, iteration,
+  warmup, or work-declaration mismatches instead of treating unlike sample
+  vectors as comparable. A comparison is publishable only when both records
+  passed the §8.2 precondition gate and both source trees were clean. Schema 1
+  records predate clean-tree provenance and are therefore accepted only as
+  advisory baselines.
 
 ### 8.8 Performance result record
 
@@ -249,6 +257,15 @@ Each perf run emits a machine-readable record (JSON) including:
 ```
 
 Records are archived for at least two release cycles.
+
+The current xtask JSON format is schema 2. It retains every raw sample and the
+benchmark's declared delta, and records main/release comparisons separately
+with both commit IDs, corrected significance decisions, direction-aware
+improvement/regression labels, and a `publishable` bit. The reader accepts
+schema 1 records as baselines so rotation does not invalidate the immediately
+preceding archive, but treats their missing source-tree provenance
+conservatively. Schema 2 records include a `dirty` bit and dirty candidates or
+baselines cannot produce a publishable comparison.
 
 ## 9. Stress / soak tests
 

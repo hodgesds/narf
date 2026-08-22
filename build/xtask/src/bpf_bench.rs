@@ -16,6 +16,8 @@
 //! comparison is labelled advisory, because a number collected on a laptop with
 //! a `powersave` governor and SMT on is a development measurement and must never
 //! be quoted as a release one.
+//! Records also capture whether the source tree is dirty. An uncommitted build
+//! cannot produce a publishable comparison under the identity of `HEAD`.
 //!
 //! The flag exists because refusing outright would mean no measurement can be
 //! taken until a perf runner exists, which is how "we never measured it" becomes
@@ -28,6 +30,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde_json::Value;
 use wait_timeout::ChildExt;
 
 use crate::bench_stats::{
@@ -59,6 +62,14 @@ pub struct BpfBenchArgs {
     /// Where to write the §8.8 JSON records.
     #[arg(long, default_value = "target/bench/bpf-bench.json")]
     pub json: String,
+
+    /// Previous green main record to compare against under §8.6.
+    #[arg(long)]
+    pub baseline: Option<String>,
+
+    /// Most recent release record for §8.7's slow-cooking regression check.
+    #[arg(long)]
+    pub release_baseline: Option<String>,
 
     /// Seconds to wait for the boot + suite + clean exit.
     #[arg(long, default_value_t = 300)]
@@ -558,6 +569,203 @@ struct Row {
     summary: Summary,
 }
 
+/// The subset of a §8.8 record needed for a cross-build comparison.
+#[derive(Clone, Debug)]
+struct ArchivedRecord {
+    commit: String,
+    dirty: bool,
+    runner: String,
+    accel: String,
+    noise_control: String,
+    guest_arch: String,
+    benchmarks: BTreeMap<String, ArchivedSeries>,
+}
+
+#[derive(Clone, Debug)]
+struct ArchivedSeries {
+    unit: String,
+    lower_is_better: bool,
+    iters: u64,
+    warmup: u64,
+    work: u64,
+    samples: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct BaselineComparison {
+    kind: &'static str,
+    benchmark: String,
+    baseline_commit: String,
+    comparison: Comparison,
+    decision: BaselineDecision,
+    publishable: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReportComparisons<'a> {
+    pairs: &'a [Comparison],
+    baselines: &'a [BaselineComparison],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReportProvenance<'a> {
+    accel: &'a str,
+    noise_verified: bool,
+    source_dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaselineDecision {
+    Inconclusive,
+    NotSignificant,
+    Improvement,
+    RegressionWithinDelta,
+    RegressionBeyondDelta,
+}
+
+impl BaselineDecision {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Inconclusive => "inconclusive (tests disagree)",
+            Self::NotSignificant => "no difference established",
+            Self::Improvement => "significant improvement",
+            Self::RegressionWithinDelta => "significant regression, within delta (tracked)",
+            Self::RegressionBeyondDelta => "significant regression, beyond delta",
+        }
+    }
+
+    fn record_value(self) -> &'static str {
+        match self {
+            Self::Inconclusive => "inconclusive",
+            Self::NotSignificant => "not-significant",
+            Self::Improvement => "improvement",
+            Self::RegressionWithinDelta => "regression-within-delta",
+            Self::RegressionBeyondDelta => "regression-beyond-delta",
+        }
+    }
+}
+
+fn required_string<'a>(value: &'a Value, key: &str, path: &Path) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{}: missing string field `{key}`", path.display()))
+}
+
+fn required_u64(value: &Value, key: &str, path: &Path) -> Result<u64> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("{}: missing integer field `{key}`", path.display()))
+}
+
+fn load_archived_record(path: &Path) -> Result<ArchivedRecord> {
+    let bytes = std::fs::read(path).with_context(|| format!("read baseline {}", path.display()))?;
+    parse_archived_record(&bytes, path)
+}
+
+fn parse_archived_record(bytes: &[u8], path: &Path) -> Result<ArchivedRecord> {
+    let root: Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("parse baseline {}", path.display()))?;
+    let schema = required_u64(&root, "schema", path)?;
+    if !matches!(schema, 1 | 2) {
+        bail!(
+            "{}: unsupported benchmark-record schema {schema} (expected 1 or 2)",
+            path.display()
+        );
+    }
+
+    let guest = root
+        .get("guest")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("{}: missing object field `guest`", path.display()))?;
+    let guest_arch = guest
+        .get("arch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{}: missing string field `guest.arch`", path.display()))?;
+    let entries = root
+        .get("benchmarks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("{}: missing array field `benchmarks`", path.display()))?;
+    let mut benchmarks = BTreeMap::new();
+    for entry in entries {
+        let name = required_string(entry, "benchmark", path)?.to_string();
+        let sample_values = entry
+            .get("samples")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("{}: `{name}` has no sample array", path.display()))?;
+        let samples: Vec<f64> = sample_values
+            .iter()
+            .map(|sample| {
+                sample.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                    anyhow!("{}: `{name}` contains a non-finite sample", path.display())
+                })
+            })
+            .collect::<Result<_>>()?;
+        let declared_n = required_u64(entry, "n", path)? as usize;
+        if declared_n != samples.len() {
+            bail!(
+                "{}: `{name}` declares n={declared_n} but contains {} samples",
+                path.display(),
+                samples.len()
+            );
+        }
+        if samples.len() < 30 {
+            bail!(
+                "{}: `{name}` has {} samples; §8.3 requires at least 30",
+                path.display(),
+                samples.len()
+            );
+        }
+        let archived = ArchivedSeries {
+            unit: required_string(entry, "unit", path)?.to_string(),
+            lower_is_better: entry
+                .get("lower_is_better")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("{}: `{name}` has no boolean direction", path.display()))?,
+            iters: required_u64(entry, "iters", path)?,
+            warmup: required_u64(entry, "warmup", path)?,
+            work: required_u64(entry, "work_per_sample", path)?,
+            samples,
+        };
+        if benchmarks.insert(name.clone(), archived).is_some() {
+            bail!("{}: duplicate benchmark `{name}`", path.display());
+        }
+    }
+    if benchmarks.is_empty() {
+        bail!("{}: baseline contains no benchmarks", path.display());
+    }
+
+    let noise_control = required_string(&root, "noise_control", path)?.to_string();
+    if !matches!(noise_control.as_str(), "verified" | "unverified") {
+        bail!(
+            "{}: unknown noise_control value `{noise_control}`",
+            path.display()
+        );
+    }
+
+    // Schema 1 predates source-state provenance. Treat it conservatively as
+    // dirty: it remains usable for development comparisons, but cannot make a
+    // result publishable merely because both machines passed the noise gate.
+    let dirty = if schema == 1 {
+        true
+    } else {
+        root.get("dirty")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("{}: missing boolean field `dirty`", path.display()))?
+    };
+
+    Ok(ArchivedRecord {
+        commit: required_string(&root, "commit", path)?.to_string(),
+        dirty,
+        runner: required_string(&root, "runner", path)?.to_string(),
+        accel: required_string(&root, "accel", path)?.to_string(),
+        noise_control,
+        guest_arch: guest_arch.to_string(),
+        benchmarks,
+    })
+}
+
 fn report(
     args: &BpfBenchArgs,
     harvest: &Harvest,
@@ -584,6 +792,11 @@ fn report(
             "the suite emitted no records (skipped: {})",
             harvest.skips.len()
         );
+    }
+
+    let source_dirty = source_tree_dirty(root)?;
+    if source_dirty {
+        println!("  [advisory] source tree has uncommitted changes; the record is not publishable");
     }
 
     let mut rows: Vec<Row> = Vec::new();
@@ -708,7 +921,76 @@ fn report(
         }
     }
 
-    write_json(args, harvest, &rows, &comparisons, accel, verified, root)?;
+    let mut baseline_comparisons = Vec::new();
+    for (kind, configured) in [
+        ("main", args.baseline.as_deref()),
+        ("release", args.release_baseline.as_deref()),
+    ] {
+        let Some(configured) = configured else {
+            continue;
+        };
+        let configured_path = Path::new(configured);
+        let path = if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            root.join(configured_path)
+        };
+        let archived = load_archived_record(&path)?;
+        let compared = compare_archived(
+            args,
+            &rows,
+            &archived,
+            kind,
+            &env.arch,
+            accel,
+            verified && !source_dirty,
+        )?;
+        println!();
+        println!(
+            "── §8.6 {kind} baseline {} (BH-corrected, q=0.05) ──",
+            archived.commit
+        );
+        for item in &compared {
+            let c = &item.comparison;
+            println!("  {}", item.benchmark);
+            println!(
+                "      delta {:+.2}% [{:+.2}%, {:+.2}%]   welch p={}{}   mwu p={}   delta={}%",
+                c.delta_pct,
+                c.delta_ci.0,
+                c.delta_ci.1,
+                fmt_p(c.welch_p),
+                if c.welch_logged { " (log)" } else { "" },
+                fmt_p(c.mwu_p),
+                c.delta_threshold,
+            );
+            println!(
+                "      → {}{}",
+                item.decision.label(),
+                if item.publishable {
+                    ""
+                } else {
+                    "  [advisory: runner unverified or source tree dirty]"
+                }
+            );
+        }
+        baseline_comparisons.extend(compared);
+    }
+
+    write_json(
+        args,
+        harvest,
+        &rows,
+        ReportComparisons {
+            pairs: &comparisons,
+            baselines: &baseline_comparisons,
+        },
+        ReportProvenance {
+            accel,
+            noise_verified: verified,
+            source_dirty,
+        },
+        root,
+    )?;
     Ok(())
 }
 
@@ -805,6 +1087,137 @@ fn compare_pairs(args: &BpfBenchArgs, rows: &[Row]) -> Vec<Comparison> {
     out
 }
 
+fn baseline_decision(comparison: &Comparison, lower_is_better: bool) -> BaselineDecision {
+    if comparison.welch_significant != comparison.mwu_significant {
+        return BaselineDecision::Inconclusive;
+    }
+    if !comparison.welch_significant {
+        return BaselineDecision::NotSignificant;
+    }
+
+    let regressed = if lower_is_better {
+        comparison.delta_pct > 0.0
+    } else {
+        comparison.delta_pct < 0.0
+    };
+    if !regressed {
+        return BaselineDecision::Improvement;
+    }
+
+    let beyond_delta = if lower_is_better {
+        comparison.delta_ci.0 > comparison.delta_threshold
+    } else {
+        comparison.delta_ci.1 < -comparison.delta_threshold
+    };
+    if beyond_delta {
+        BaselineDecision::RegressionBeyondDelta
+    } else {
+        BaselineDecision::RegressionWithinDelta
+    }
+}
+
+/// Compare the current suite with an archived main or release record.
+///
+/// §8.6 requires the same runner. The declaration checks are equally strict:
+/// changing the timer unit, inner-iteration count, or work per sample while
+/// retaining a benchmark name makes the two raw vectors different metrics.
+fn compare_archived(
+    args: &BpfBenchArgs,
+    rows: &[Row],
+    archived: &ArchivedRecord,
+    kind: &'static str,
+    current_arch: &str,
+    accel: &str,
+    current_publishable: bool,
+) -> Result<Vec<BaselineComparison>> {
+    let runner = hostname();
+    if archived.runner != runner {
+        bail!(
+            "{kind} baseline runner is `{}`, current runner is `{runner}`; §8.6 requires the same runner",
+            archived.runner
+        );
+    }
+    if archived.accel != accel {
+        bail!(
+            "{kind} baseline accelerator is `{}`, current accelerator is `{accel}`",
+            archived.accel
+        );
+    }
+    if archived.guest_arch != current_arch {
+        bail!(
+            "{kind} baseline guest arch is `{}`, current guest arch is `{current_arch}`",
+            archived.guest_arch
+        );
+    }
+
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(base) = archived.benchmarks.get(&row.series.name) else {
+            continue;
+        };
+        if base.unit != row.series.unit
+            || base.lower_is_better != row.series.lower_is_better
+            || base.iters != row.series.iters
+            || base.warmup != row.series.warmup
+            || base.work != row.series.work
+        {
+            bail!(
+                "{kind} baseline declaration for `{}` is incompatible with the current benchmark",
+                row.series.name
+            );
+        }
+        let (welch_p, welch_logged) = welch_t_test(&base.samples, &row.series.samples);
+        let mwu_p = mann_whitney_u(&base.samples, &row.series.samples);
+        let (delta_pct, delta_ci) = delta_pct_ci(
+            &base.samples,
+            &row.series.samples,
+            args.resamples,
+            hash_name(&row.series.name) ^ hash_name(kind),
+        );
+        out.push(BaselineComparison {
+            kind,
+            benchmark: row.series.name.clone(),
+            baseline_commit: archived.commit.clone(),
+            comparison: Comparison {
+                baseline: format!("{}@{}", row.series.name, archived.commit),
+                candidate: row.series.name.clone(),
+                delta_pct,
+                delta_ci,
+                welch_p,
+                welch_logged,
+                mwu_p,
+                delta_threshold: row.series.delta_pct,
+                welch_significant: false,
+                mwu_significant: false,
+            },
+            decision: BaselineDecision::NotSignificant,
+            publishable: current_publishable
+                && archived.noise_control == "verified"
+                && !archived.dirty,
+        });
+    }
+
+    if out.is_empty() {
+        bail!("{kind} baseline has no benchmark names in common with the current suite");
+    }
+    let welch: Vec<f64> = out.iter().map(|c| c.comparison.welch_p).collect();
+    let mwu: Vec<f64> = out.iter().map(|c| c.comparison.mwu_p).collect();
+    let welch_rej = benjamini_hochberg(&welch, 0.05);
+    let mwu_rej = benjamini_hochberg(&mwu, 0.05);
+    for (i, item) in out.iter_mut().enumerate() {
+        item.comparison.welch_significant = welch_rej[i];
+        item.comparison.mwu_significant = mwu_rej[i];
+        let lower_is_better = rows
+            .iter()
+            .find(|row| row.series.name == item.benchmark)
+            .expect("comparison came from current rows")
+            .series
+            .lower_is_better;
+        item.decision = baseline_decision(&item.comparison, lower_is_better);
+    }
+    Ok(out)
+}
+
 /// Deterministic per-benchmark bootstrap seed. Derived from the name so a
 /// re-run of the same suite reproduces the same intervals from the same
 /// samples, which is what makes an archived §8.8 record checkable.
@@ -817,13 +1230,27 @@ fn hash_name(name: &str) -> u64 {
     h
 }
 
+fn source_tree_dirty(root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(root)
+        .output()
+        .context("inspect source-tree state for benchmark provenance")?;
+    if !output.status.success() {
+        bail!(
+            "git status failed while recording benchmark provenance: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(!output.stdout.is_empty())
+}
+
 fn write_json(
     args: &BpfBenchArgs,
     harvest: &Harvest,
     rows: &[Row],
-    comparisons: &[Comparison],
-    accel: &str,
-    verified: bool,
+    comparisons: ReportComparisons<'_>,
+    provenance: ReportProvenance<'_>,
     root: &Path,
 ) -> Result<()> {
     let path = root.join(&args.json);
@@ -845,14 +1272,19 @@ fn write_json(
     // is not worth adding one. §8.8's field names are reproduced exactly so an
     // archived record from this harness is comparable with one from any other.
     writeln!(f, "{{")?;
-    writeln!(f, "  \"schema\": 1,")?;
+    writeln!(f, "  \"schema\": 2,")?;
     writeln!(f, "  \"commit\": \"{commit}\",")?;
+    writeln!(f, "  \"dirty\": {},", provenance.source_dirty)?;
     writeln!(f, "  \"runner\": \"{}\",", hostname())?;
-    writeln!(f, "  \"accel\": \"{accel}\",")?;
+    writeln!(f, "  \"accel\": \"{}\",", provenance.accel)?;
     writeln!(
         f,
         "  \"noise_control\": \"{}\",",
-        if verified { "verified" } else { "unverified" }
+        if provenance.noise_verified {
+            "verified"
+        } else {
+            "unverified"
+        }
     )?;
     writeln!(f, "  \"guest\": {{ \"arch\": \"{}\", \"cpus\": {}, \"tsc_mult\": {}, \"tsc_shift\": {}, \"irq_masked\": {} }},",
         env.arch, env.cpus, env.tsc_mult, env.tsc_shift, env.irq_masked)?;
@@ -872,6 +1304,11 @@ fn write_json(
         writeln!(f, "      \"iters\": {},", r.series.iters)?;
         writeln!(f, "      \"warmup\": {},", r.series.warmup)?;
         writeln!(f, "      \"work_per_sample\": {},", r.series.work)?;
+        writeln!(
+            f,
+            "      \"delta_threshold_pct\": {:.2},",
+            r.series.delta_pct
+        )?;
         writeln!(f, "      \"median\": {:.2},", s.median)?;
         writeln!(
             f,
@@ -896,7 +1333,7 @@ fn write_json(
     }
     writeln!(f, "  ],")?;
     writeln!(f, "  \"comparisons\": [")?;
-    for (i, c) in comparisons.iter().enumerate() {
+    for (i, c) in comparisons.pairs.iter().enumerate() {
         writeln!(f, "    {{")?;
         writeln!(f, "      \"baseline\": \"{}\",", c.baseline)?;
         writeln!(f, "      \"candidate\": \"{}\",", c.candidate)?;
@@ -933,7 +1370,60 @@ fn write_json(
         writeln!(
             f,
             "    }}{}",
-            if i + 1 == comparisons.len() { "" } else { "," }
+            if i + 1 == comparisons.pairs.len() {
+                ""
+            } else {
+                ","
+            }
+        )?;
+    }
+    writeln!(f, "  ],")?;
+    writeln!(f, "  \"baseline_comparisons\": [")?;
+    for (i, item) in comparisons.baselines.iter().enumerate() {
+        let c = &item.comparison;
+        writeln!(f, "    {{")?;
+        writeln!(f, "      \"kind\": \"{}\",", item.kind)?;
+        writeln!(f, "      \"benchmark\": \"{}\",", item.benchmark)?;
+        writeln!(
+            f,
+            "      \"baseline_commit\": \"{}\",",
+            item.baseline_commit
+        )?;
+        writeln!(f, "      \"candidate_commit\": \"{commit}\",")?;
+        writeln!(f, "      \"delta_pct\": {:.4},", c.delta_pct)?;
+        writeln!(
+            f,
+            "      \"delta_ci95\": [{:.4}, {:.4}],",
+            c.delta_ci.0, c.delta_ci.1
+        )?;
+        writeln!(f, "      \"welch_p\": {:.6e},", c.welch_p)?;
+        writeln!(f, "      \"welch_log_transformed\": {},", c.welch_logged)?;
+        writeln!(f, "      \"mwu_p\": {:.6e},", c.mwu_p)?;
+        writeln!(
+            f,
+            "      \"delta_threshold_pct\": {:.2},",
+            c.delta_threshold
+        )?;
+        writeln!(f, "      \"bh_q\": 0.05,")?;
+        writeln!(
+            f,
+            "      \"welch_significant\": {}, \"mwu_significant\": {},",
+            c.welch_significant, c.mwu_significant
+        )?;
+        writeln!(f, "      \"publishable\": {},", item.publishable)?;
+        writeln!(
+            f,
+            "      \"decision\": \"{}\"",
+            item.decision.record_value()
+        )?;
+        writeln!(
+            f,
+            "    }}{}",
+            if i + 1 == comparisons.baselines.len() {
+                ""
+            } else {
+                ","
+            }
         )?;
     }
     writeln!(f, "  ]")?;
@@ -945,4 +1435,149 @@ fn write_json(
 
 fn hostname() -> String {
     read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comparison(delta_pct: f64, delta_ci: (f64, f64), welch: bool, mwu: bool) -> Comparison {
+        Comparison {
+            baseline: "base".into(),
+            candidate: "candidate".into(),
+            delta_pct,
+            delta_ci,
+            welch_p: 0.001,
+            welch_logged: false,
+            mwu_p: 0.001,
+            delta_threshold: 3.0,
+            welch_significant: welch,
+            mwu_significant: mwu,
+        }
+    }
+
+    #[test]
+    fn baseline_direction_distinguishes_improvements_from_regressions() {
+        assert_eq!(
+            baseline_decision(&comparison(5.0, (4.0, 6.0), true, true), true),
+            BaselineDecision::RegressionBeyondDelta
+        );
+        assert_eq!(
+            baseline_decision(&comparison(-5.0, (-6.0, -4.0), true, true), true),
+            BaselineDecision::Improvement
+        );
+        assert_eq!(
+            baseline_decision(&comparison(-5.0, (-6.0, -4.0), true, true), false),
+            BaselineDecision::RegressionBeyondDelta
+        );
+        assert_eq!(
+            baseline_decision(&comparison(5.0, (4.0, 6.0), true, true), false),
+            BaselineDecision::Improvement
+        );
+    }
+
+    #[test]
+    fn baseline_disagreement_remains_inconclusive() {
+        assert_eq!(
+            baseline_decision(&comparison(20.0, (19.0, 21.0), true, false), true),
+            BaselineDecision::Inconclusive
+        );
+    }
+
+    #[test]
+    fn archived_schema_one_record_remains_readable() {
+        let samples = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "schema": 1,
+                "commit": "abc123",
+                "runner": "runner-1",
+                "accel": "kvm",
+                "noise_control": "verified",
+                "guest": {{ "arch": "x86_64" }},
+                "benchmarks": [{{
+                    "benchmark": "bpf.test",
+                    "unit": "cycles",
+                    "lower_is_better": true,
+                    "n": 30,
+                    "iters": 8,
+                    "warmup": 3,
+                    "work_per_sample": 8,
+                    "samples": [{samples}]
+                }}]
+            }}"#
+        );
+        let record = parse_archived_record(json.as_bytes(), Path::new("record.json"))
+            .expect("valid archived record");
+        assert_eq!(record.commit, "abc123");
+        assert!(record.dirty, "schema 1 has no clean-tree provenance");
+        assert_eq!(record.benchmarks["bpf.test"].samples.len(), 30);
+    }
+
+    #[test]
+    fn archived_schema_two_preserves_clean_tree_provenance() {
+        let samples = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "schema": 2,
+                "commit": "abc123",
+                "dirty": false,
+                "runner": "runner-1",
+                "accel": "kvm",
+                "noise_control": "verified",
+                "guest": {{ "arch": "x86_64" }},
+                "benchmarks": [{{
+                    "benchmark": "bpf.test",
+                    "unit": "cycles",
+                    "lower_is_better": true,
+                    "n": 30,
+                    "iters": 8,
+                    "warmup": 3,
+                    "work_per_sample": 8,
+                    "samples": [{samples}]
+                }}]
+            }}"#
+        );
+        let record = parse_archived_record(json.as_bytes(), Path::new("record.json"))
+            .expect("valid archived record");
+        assert!(!record.dirty);
+    }
+
+    #[test]
+    fn archived_record_rejects_declared_sample_count_mismatch() {
+        let samples = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "schema": 2,
+                "commit": "abc123",
+                "dirty": false,
+                "runner": "runner-1",
+                "accel": "kvm",
+                "noise_control": "unverified",
+                "guest": {{ "arch": "x86_64" }},
+                "benchmarks": [{{
+                    "benchmark": "bpf.test",
+                    "unit": "cycles",
+                    "lower_is_better": true,
+                    "n": 31,
+                    "iters": 8,
+                    "warmup": 3,
+                    "work_per_sample": 8,
+                    "samples": [{samples}]
+                }}]
+            }}"#
+        );
+        let error = parse_archived_record(json.as_bytes(), Path::new("record.json"))
+            .expect_err("mismatched n must fail");
+        assert!(error.to_string().contains("declares n=31"));
+    }
 }

@@ -56,6 +56,14 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 - `cargo xtask host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
   and device integration coverage remains under `xtask test`.
+- `cargo xtask bpf-bench --arch=x86_64 --baseline <record.json>` — collect the
+  BPF suite and compare each compatible metric with a previous green-main
+  §8.8 record. `--release-baseline <record.json>` adds the cumulative
+  slow-cooking check. Both comparisons require the same runner, accelerator,
+  guest architecture, unit, direction, inner-iteration count, warmup, and work
+  declaration; a record from an unverified runner or dirty source tree remains
+  explicitly advisory. Records carry the source-tree dirty bit so an
+  uncommitted candidate cannot be mistaken for the named commit.
 - `cargo xtask image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a

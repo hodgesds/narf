@@ -886,6 +886,21 @@ and the perf event layer, all of which are closed.
     arise (§9, the sizing fixpoint). The lever if this ever bites is an await
     point in the load path, which costs nothing when verification is fast.
 
+    **The worklist membership cost is fixed without adding a complexity
+    limit.** A generated dispatch CFG can leave thousands of distinct taken
+    arms pending while the LIFO verifier follows the fallthrough chain. The
+    worklist previously used `Vec::contains` before each enqueue, making that
+    valid shape quadratic even though every block itself converged once. The
+    verifier now retains the same LIFO order and state transitions but tracks
+    queued membership in a block-indexed bitmap. A permanent 2,048-arm / 6,147
+    instruction benchmark pins the shape. In an N=100 development comparison,
+    its median fell from 27,694,008 to 26,483,616 cycles: -4.37%, 95% bootstrap
+    CI [-4.48%, -4.29%], with Welch and Mann-Whitney both significant after
+    Benjamini-Hochberg correction. The ordinary `branchy194` case moved +0.28%,
+    inside its 3% delta. As with item 7, the laptop failed the §8.2 governor,
+    boost, SMT, ASLR, thermal-telemetry, and idle-host gates, so these are
+    explicitly advisory development measurements, not publishable numbers.
+
     **Amendment — the reasoning above did not cover every shape, and one of
     them was a genuine divergence.** The paragraph beginning "The existing
     `fixpoint_round_budget` does not bound this" rested on the measured cost
