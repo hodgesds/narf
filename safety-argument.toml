@@ -591,3 +591,11 @@ argument = "The scheduler edit adds only clippy-required safety documentation to
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The own-stack reset is compiled only under the kernel-test feature and is invoked only by the existing userspace test-hook cleanup. It restores the verification initial state between distributed smokes; production builds retain the one-way own-stack enablement contract, and no policy crate gains access to stacks, trap frames, saved domain state, or context-switch mechanics."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame boot edit replaces the existing CachyOS-specific home tmpfs mount with an OverlayFs assembled from the already-mounted read-only home and a user-owned TmpFs upper. Both filesystems remain outside the enumerated TCB; the frame retains the same bootstrap mount authority and adds no trusted subsystem, capability, domain transition, scheduler state, or physical-frame ownership path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The overlay lower is obtained through VfsRegistry::clone_tree_at before the new mount is stacked, and the upper is a fresh kernel-owned TmpFs. The boot path passes only typed FsInstance and DirOps handles to the existing OverlayFs implementation; it does not dereference user memory, expose backing addresses, alter domain tags, or bypass filesystem capability checks."

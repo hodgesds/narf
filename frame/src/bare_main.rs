@@ -71,13 +71,13 @@ const KSWAPD_PAGES_PER_CPU: usize = 64;
 /// build the registry, and Plasma reports "package does not exist" for every
 /// applet — no panel.
 ///
-/// STOPGAP: this mounts a writable tmpfs at the specific home dir `/home/narf`
-/// (owned by that user), rather than over all of `/home` — mounting over
-/// `/home` would hide the existing `/home/narf`, and a session whose `$HOME`
-/// does not exist fails to start `startplasma-wayland` at all. The correct,
-/// user-agnostic fix is a whole-root overlay (ext4 read-only lower + tmpfs
-/// upper) in the `mnt-mount-ext2` step, which preserves the real home and skel;
-/// that replaces this entry.
+/// Unlike the other entries, `/home/narf` is mounted as an overlay: the
+/// installed home is the read-only lower and a user-owned tmpfs is the upper.
+/// A plain tmpfs here would hide the installed Plasma defaults and force every
+/// login to rebuild the complete KDE service cache.
+///
+/// STOPGAP: the path and uid/gid are specific to this CachyOS image. A
+/// user-agnostic writable-root overlay should eventually replace this entry.
 const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 4] = [
     ("/mnt/tmp", "/tmp"),
     ("/mnt/var/tmp", "/var/tmp"),
@@ -3367,19 +3367,32 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             // separate prerequisite for systemd PrivateTmp.
                             for (mount_path, guest_path) in DISTRO_WRITABLE_RUNTIME_MOUNTS {
                                 if !mounts.iter().any(|m| m == mount_path) {
-                                    // The user's home is written by the NON-root logged-in user, so
-                                    // its tmpfs must be owned by that user (uid/gid 1000 = narf) —
-                                    // the default MemFs tmpfs is 0755 root, unwritable by the user.
-                                    // STOPGAP hardcode of narf/1000; the proper fix is a root overlay
-                                    // (see DISTRO_WRITABLE_RUNTIME_MOUNTS doc). The other trees stay
-                                    // root-owned; systemd remounts /tmp,/run over ours anyway.
+                                    // The user's home needs both its installed Plasma defaults and
+                                    // a writable layer. Snapshot the still-visible disk directory as
+                                    // the lower BEFORE stacking the overlay at the same mountpoint.
+                                    // STOPGAP hardcode of narf/1000; see the mount-plan doc above.
+                                    // The other trees stay root-owned; systemd remounts /tmp,/run
+                                    // over ours anyway.
                                     let mounted = if mount_path == "/mnt/home/narf" {
-                                        // Owned by narf (uid/gid 1000) so the user can write its home.
-                                        match narf_filesystem::TmpFs::from_options("", 1000, 1000) {
-                                            Ok(fs) => narf_filesystem::registry()
-                                                .mount(&auth, mount_path, fs)
-                                                .is_ok(),
-                                            Err(_) => false,
+                                        let lower = narf_filesystem::registry()
+                                            .clone_tree_at(mount_path);
+                                        match (
+                                            lower,
+                                            narf_filesystem::TmpFs::from_options("", 1000, 1000),
+                                        ) {
+                                            (Some(lower), Ok(upper)) => {
+                                                let fs = narf_filesystem::OverlayFs::new(
+                                                    "cachyos-home-overlay",
+                                                    narf_filesystem::FsInstance::root(&upper),
+                                                    alloc::vec![narf_filesystem::FsInstance::root(
+                                                        lower.as_ref(),
+                                                    )],
+                                                );
+                                                narf_filesystem::registry()
+                                                    .mount(&auth, mount_path, fs)
+                                                    .is_ok()
+                                            }
+                                            _ => false,
                                         }
                                     } else {
                                         let fs = narf_filesystem::MemFs::new("tmpfs");
