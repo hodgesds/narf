@@ -9,10 +9,34 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
     let fd = a.arg0 as u32;
     let iov_ptr = a.arg1;
     let nr = a.arg2 as usize;
+    let flags = a.arg3;
+    /// `SPLICE_F_NONBLOCK` — do not block on pipe I/O.
+    const SPLICE_F_NONBLOCK: u64 = 0x2;
     const IOV_MAX: usize = 1024;
     if nr > IOV_MAX {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
+    }
+    let task_id = current_task_id();
+    // Full-pipe check BEFORE gathering anything: a blocking vmsplice into a
+    // full pipe must wait for room (`fs/splice.c::vmsplice_to_pipe` →
+    // wait_for_space), and parking here — before a single byte is written —
+    // keeps the re-executed syscall idempotent (nothing has been consumed).
+    // `SPLICE_F_NONBLOCK` short-circuits to -EAGAIN instead.
+    let pipe_full = fd::with_table(task_id, |t| {
+        t.get(fd).map(|e| {
+            e.ops.poll_readiness() & narf_filesystem::POLL_OUT == 0 && e.ops.write_should_block()
+        })
+    });
+    if let Some(Some(true)) = pipe_full {
+        if flags & SPLICE_F_NONBLOCK != 0 {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            return;
+        }
+        if park_reexecute_on_io(ctx) {
+            return;
+        }
+        // Kernel-test context (no executor): fall through to a best-effort copy.
     }
     // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
     let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, nr.saturating_mul(16)) } {
@@ -22,7 +46,7 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let task = current_task_id();
+    let task = task_id;
     let mut total: usize = 0;
     for i in 0..nr {
         let o = i * 16;

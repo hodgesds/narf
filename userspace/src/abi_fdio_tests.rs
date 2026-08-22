@@ -1823,6 +1823,62 @@ fn smoke_abi_fdio_vmsplice_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_neg);
 
+/// A nonblocking `vmsplice(SPLICE_F_NONBLOCK)` into a full pipe returns
+/// -EAGAIN before gathering anything (`fs/splice.c::vmsplice_to_pipe` →
+/// wait_for_space, short-circuited by O_NONBLOCK). Without the full-pipe
+/// pre-check the write returned a 0-byte success, which stalls forward
+/// progress instead of signalling back-pressure.
+fn smoke_abi_fdio_vmsplice_full_pipe_eagain() -> TestResult {
+    const SPLICE_F_NONBLOCK: u64 = 0x2;
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        // Fill the pipe to capacity (64 KiB) with 4 KiB chunks.
+        let chunk = [0x5Au8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr as u64, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("filling the pipe did not take a full 4 KiB chunk");
+            }
+        }
+        // A further nonblocking vmsplice must report back-pressure, not 0.
+        let payload = *b"ab";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, SPLICE_F_NONBLOCK),
+        ) != Some(EAGAIN)
+        {
+            return Err("vmsplice into a full pipe was not -EAGAIN");
+        }
+        // Drain the pipe so the fixture tears down cleanly, and confirm the
+        // refused vmsplice queued nothing (still exactly 64 KiB).
+        let mut sink = [0u8; 4096];
+        let mut drained = 0usize;
+        loop {
+            match call(
+                Syscall::Read.raw(),
+                a2(rd as u64, sink.as_mut_ptr() as u64, 4096),
+            ) {
+                Some(n) if n > 0 => drained += n as usize,
+                _ => break,
+            }
+            if drained >= 65536 {
+                break;
+            }
+        }
+        if drained != 65536 {
+            return Err("refused vmsplice altered the pipe contents");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_full_pipe_eagain);
+
 // ── F_SETLKW: EINTR + harness-degrade + exit-sweep release ──
 //
 // The blocking half of the record-lock TODO(wave-69): a conflicting

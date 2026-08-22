@@ -3088,7 +3088,11 @@ fn copy_fd_to_fd(
     };
 
     let mut total = 0usize;
-    const CHUNK: usize = 4096;
+    // Transfer granularity for splice/sendfile/copy_file_range. Sized to a
+    // whole default pipe buffer (64 KiB) so a full-pipe splice completes in a
+    // single read+write pair — one heap Vec and two `fd::with_table` lock
+    // acquisitions — instead of 16 four-KiB round trips.
+    const CHUNK: usize = 65536;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> =

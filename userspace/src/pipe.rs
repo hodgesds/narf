@@ -212,9 +212,12 @@ impl FileOps for PipeRead {
                 };
             }
             let n = core::cmp::min(buf.len(), avail);
-            for slot in buf.iter_mut().take(n) {
-                // VecDeque::pop_front cannot fail: avail > 0 above.
-                *slot = q.pop_front().unwrap();
+            // Bulk drain: `VecDeque::drain` copies the front `n` bytes in as
+            // few `memcpy`s as the ring's two contiguous slices allow, instead
+            // of `n` individual `pop_front`s — the byte-at-a-time loop dominated
+            // large pipe/splice transfers.
+            for (slot, byte) in buf.iter_mut().zip(q.drain(..n)) {
+                *slot = byte;
             }
             let became_writable = avail == PIPE_BUF_BYTES && n != 0;
             drop(q);
@@ -357,9 +360,10 @@ impl FileOps for PipeWrite {
                 return Ok(0);
             }
             let n = core::cmp::min(buf.len(), room);
-            for &b in buf.iter().take(n) {
-                q.push_back(b);
-            }
+            // Bulk enqueue: `extend` appends the whole prefix in one pass
+            // (amortised memcpy into the ring), replacing `n` individual
+            // `push_back`s that dominated large pipe/vmsplice writes.
+            q.extend(buf[..n].iter().copied());
             drop(q);
             if n != 0 {
                 if was_empty {
