@@ -49,9 +49,12 @@ and render nodes. It is deliberately small but wire-compatible with Mesa's
 virtgpu userspace ABI:
 
 - Render-node inbound: `GETPARAM`, `CONTEXT_INIT`, `RESOURCE_CREATE`,
-  `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, and bounded `EXECBUFFER`.
-  Handles are per-open, context creation is lazy, and opaque command streams
-  are passed to a host only after size and ownership validation.
+  `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, bounded `EXECBUFFER`, and
+  `GEM_CLOSE`. Handles are per-open, context creation is lazy, and opaque
+  command streams are passed to a host only after size and ownership
+  validation. `GEM_CLOSE` removes the handle, detaches and unreferences the
+  host resource, then releases its DMA pages; failed host teardown retains the
+  backing rather than permitting DMA into recycled memory.
 - Primary-node inbound: the existing framebuffer / modeset ioctls; an
   accelerated buffer may be presented only after it is also registered as a
   KMS framebuffer.

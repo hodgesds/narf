@@ -1037,9 +1037,7 @@ kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_master_arbitration);
 #[allow(dead_code)]
 fn smoke_drm_master_autodrop_on_close() -> TestResult {
     let idx = register_test_card_unmastered();
-    let master = || {
-        crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master)
-    };
+    let master = || crate::drm_registry::mode_state(idx).and_then(|ms| ms.lock().current_master);
     if master().is_some() {
         return TestResult::Fail("a freshly registered card should have no master");
     }

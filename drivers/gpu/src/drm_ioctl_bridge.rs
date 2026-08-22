@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -63,7 +64,7 @@ pub(crate) struct VirtGpuResource {
 /// All mutable state is behind a lock because ioctl and mmap can arrive from
 /// different threads sharing the same fd.
 pub struct VirtGpuRenderState {
-    resources: narf_lib::sync::IrqSafeSpinLock<Vec<VirtGpuResource>>,
+    resources: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<VirtGpuResource>>>,
     next_handle: AtomicU32,
 }
 
@@ -81,15 +82,37 @@ impl VirtGpuRenderState {
         }
     }
 
-    fn find(&self, handle: u32) -> Option<(u32, u64, usize)> {
+    fn find(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
         self.resources
             .lock()
             .iter()
             .find(|r| r.handle == handle)
-            .map(|r| (r.resource_id, r.buffer.phys_addr().raw(), r.buffer.len()))
+            .cloned()
     }
 
-    pub(crate) fn drain_resources(&self) -> Vec<VirtGpuResource> {
+    pub(crate) fn insert(&self, handle: u32, resource_id: u32, buffer: DmaBuffer) {
+        self.resources.lock().push(Arc::new(VirtGpuResource {
+            handle,
+            resource_id,
+            buffer,
+        }));
+    }
+
+    pub(crate) fn take(&self, handle: u32) -> Option<Arc<VirtGpuResource>> {
+        let mut resources = self.resources.lock();
+        let pos = resources.iter().position(|r| r.handle == handle)?;
+        Some(resources.swap_remove(pos))
+    }
+
+    pub(crate) fn mapping_resource(&self, offset: u64, len: usize) -> Option<Arc<VirtGpuResource>> {
+        if offset & 0xfff != 0 || len == 0 || len & 0xfff != 0 {
+            return None;
+        }
+        let resource = self.find((offset >> 12) as u32)?;
+        (len <= resource.buffer.len()).then_some(resource)
+    }
+
+    pub(crate) fn drain_resources(&self) -> Vec<Arc<VirtGpuResource>> {
         core::mem::take(&mut *self.resources.lock())
     }
 }
@@ -190,11 +213,7 @@ pub fn dispatch_virtgpu_render(
             )
             .map_err(|_| FsError::InvalidData)?;
             let handle = state.next_handle.fetch_add(1, Ordering::Relaxed);
-            state.resources.lock().push(VirtGpuResource {
-                handle,
-                resource_id,
-                buffer,
-            });
+            state.insert(handle, resource_id, buffer);
             req.bo_handle = handle;
             req.res_handle = resource_id;
             req.size = bytes as u32;
@@ -203,25 +222,24 @@ pub fn dispatch_virtgpu_render(
         }
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
             let mut req: DrmVirtGpuResourceInfoUapi = read_uapi(arg)?;
-            let (resource_id, _phys, len) =
-                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
-            req.res_handle = resource_id;
-            req.size = len as u32;
+            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            req.res_handle = resource.resource_id;
+            req.size = resource.buffer.len() as u32;
             req.blob_mem = 0;
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_MAP => {
             let mut req: DrmVirtGpuMapUapi = read_uapi(arg)?;
-            state.find(req.handle).ok_or(FsError::InvalidData)?;
+            let _resource = state.find(req.handle).ok_or(FsError::InvalidData)?;
             req.offset = (req.handle as u64) << 12;
             write_uapi(arg, req)?;
             Ok(0)
         }
         DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => {
             let req: DrmVirtGpuTransferToHostUapi = read_uapi(arg)?;
-            let (resource_id, _phys, bytes) =
-                state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let resource = state.find(req.bo_handle).ok_or(FsError::InvalidData)?;
+            let bytes = resource.buffer.len();
             let end =
                 (req.offset as usize).saturating_add(req.layer_stride.max(req.stride) as usize);
             if end > bytes || req.w == 0 || req.h == 0 || req.d == 0 {
@@ -229,7 +247,7 @@ pub fn dispatch_virtgpu_render(
             }
             let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(FsError::Unsupported)?;
             dev.transfer_to_host_virgl(narf_drivers_virtio::gpu_pci::cmd::Transfer3D {
-                resource_id,
+                resource_id: resource.resource_id,
                 x: req.x,
                 y: req.y,
                 z: req.z,
@@ -290,16 +308,17 @@ pub fn dispatch_virtgpu_render(
             // Validate every referenced handle before touching the command
             // pointer. This makes the resource ownership check independent of
             // virgl command parsing (which belongs to the host renderer).
+            let mut _referenced: [Option<Arc<VirtGpuResource>>; 256] = [const { None }; 256];
             if req.num_bo_handles != 0 {
                 // SAFETY: the count is capped at 256 above, multiplication by
                 // four cannot overflow, and copy_in validates the entire
                 // userspace handle-array range before returning owned bytes.
                 let bytes =
                     unsafe { copy_in(req.bo_handles as usize, req.num_bo_handles as usize * 4)? };
-                for chunk in bytes.chunks_exact(4) {
+                for (index, chunk) in bytes.chunks_exact(4).enumerate() {
                     let handle =
                         u32::from_le_bytes(chunk.try_into().map_err(|_| FsError::InvalidData)?);
-                    state.find(handle).ok_or(FsError::PermissionDenied)?;
+                    _referenced[index] = Some(state.find(handle).ok_or(FsError::PermissionDenied)?);
                 }
             }
             // SAFETY: the command size is non-zero and bounded to the
@@ -311,7 +330,32 @@ pub fn dispatch_virtgpu_render(
                 .map_err(|_| FsError::InvalidData)?;
             Ok(0)
         }
+        DRM_IOCTL_GEM_CLOSE => {
+            // `struct drm_gem_close { u32 handle; u32 pad; }`. Remove the
+            // per-open handle before touching the host, so no new operation
+            // can acquire the resource while teardown is in progress.
+            // SAFETY: `arg` is the ioctl's userspace struct pointer; copy_in
+            // validates the complete fixed-size range and SMAP-brackets it.
+            let bytes = unsafe { copy_in(arg, 8)? };
+            let handle =
+                u32::from_le_bytes(bytes[0..4].try_into().map_err(|_| FsError::InvalidData)?);
+            let resource = state.take(handle).ok_or(FsError::InvalidData)?;
+            release_virtgpu_resource(resource);
+            Ok(0)
+        }
         _ => Err(FsError::Unsupported),
+    }
+}
+
+/// Quiesce one host resource before releasing its DMA pages. If host teardown
+/// fails, intentionally retain this Arc: freeing the backing would let a live
+/// host resource DMA into recycled kernel or userspace memory.
+pub(crate) fn release_virtgpu_resource(resource: Arc<VirtGpuResource>) {
+    let released = narf_drivers_virtio::gpu_pci::probed_device()
+        .map(|dev| dev.destroy_virgl_resource(resource.resource_id).is_ok())
+        .unwrap_or(false);
+    if !released {
+        core::mem::forget(resource);
     }
 }
 
@@ -325,10 +369,11 @@ pub fn dispatch_virtgpu_mmap(
         return Err(FsError::InvalidData);
     }
     let handle = (offset >> 12) as u32;
-    let (_resource_id, phys, bytes) = state.find(handle).ok_or(FsError::InvalidData)?;
-    if len > bytes {
+    let resource = state.find(handle).ok_or(FsError::InvalidData)?;
+    if len > resource.buffer.len() {
         return Err(FsError::InvalidData);
     }
+    let phys = resource.buffer.phys_addr().raw();
     Ok((0..len / 4096)
         .map(|page| phys + page as u64 * 4096)
         .collect())
@@ -1188,7 +1233,8 @@ fn handle_atomic(
         let _ = writeln!(
             narf_console::Writer,
             "  drm: ATOMIC #{n} objs={} flags={:#x} — committed as EMPTY state, no pixels presented",
-            req.count_objs, req.flags
+            req.count_objs,
+            req.flags
         );
     }
 

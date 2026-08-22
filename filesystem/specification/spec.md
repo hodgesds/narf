@@ -88,6 +88,8 @@ pub trait FileOps {
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
     fn acknowledge_poll_readiness(&self, readiness: u32);
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
+    fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
 }
 
@@ -453,6 +455,13 @@ ordered under one lock or an equivalent register-then-recheck protocol, so a
 wake racing with the transition to sleep cannot be lost. Futures do not
 self-wake merely to obtain another poll; synchronous Linux-compat callers park
 their stackful task and resume only when this wake contract fires.
+
+For a shared device mapping, `mmap_frames` supplies borrowed physical pages
+and `mmap_lifetime` may supply a narrower per-object owner. The compatibility
+VMA registry clones that owner across fork and VMA splits and drops it after
+the last unmap. Multiplexed devices must return the specific backing owner;
+retaining only the open file is insufficient when an object handle can close
+while the file remains live.
 
 `backing_identity` identifies the backing filesystem object rather than a
 mount attachment. Bind-mount adapters preserve their source value so a VFS

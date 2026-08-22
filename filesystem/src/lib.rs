@@ -471,6 +471,13 @@ pub enum FsError {
     WouldBlock,
 }
 
+/// Type-erased owner retained for the lifetime of a shared device mapping.
+/// Implementations use this for backing whose lifetime is narrower than the
+/// open file itself (for example, one GEM resource on a long-lived DRM fd).
+pub trait MmapLifetime: Send + Sync {}
+
+impl<T: Send + Sync> MmapLifetime for T {}
+
 impl From<CapError> for FsError {
     /// Cap-side errors collapse to `PermissionDenied` at the FS layer.
     /// Spec §4: a revoked mount cap should refuse further access via
@@ -887,6 +894,20 @@ pub trait FileOps: Send + Sync {
     /// override this.
     fn mmap_frames(&self, _offset: u64, _len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Optional backing owner paired with [`FileOps::mmap_frames`]. The
+    /// syscall layer retains this object across VMA splits and fork, and drops
+    /// it only after the last mapping disappears. A device whose frames are
+    /// owned by the file itself may keep the default `None`; per-object
+    /// backings must return their specific owner so handle close cannot recycle
+    /// still-mapped pages.
+    fn mmap_lifetime(
+        &self,
+        _offset: u64,
+        _len: usize,
+    ) -> Option<alloc::sync::Arc<dyn MmapLifetime>> {
+        None
     }
 
     /// `mmap(2)` **demand** backing: return the physical frame that backs the

@@ -559,6 +559,12 @@ fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
 compatibility code so address-space regions do not gain a filesystem
 dependency.
 
+When `FileOps::mmap_lifetime` returns a per-object owner, the same registry
+retains it beside the file reference and clones it across fork and VMA splits.
+This permits a multiplexed device such as DRM to remove a closed GEM handle
+and quiesce its host resource immediately while deferring DMA-page reuse until
+the final mapping disappears.
+
 Generic filesystem mappings that cannot expose page-cache frames retain one
 canonical fallback page per open-file description and file offset, plus an
 exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that

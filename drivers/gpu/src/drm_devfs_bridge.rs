@@ -29,7 +29,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN,
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, MmapLifetime, Mode, Stat, POLL_IN,
 };
 
 /// `st_rdev` for `/dev/dri/card<N>` — `DRM_MAJOR`(226):minor(`index`).
@@ -221,7 +221,13 @@ impl FileOps for DriCardFile {
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
-        crate::drm_ioctl_bridge::dispatch_card(self.index, self.open_id, cmd, arg, /*render*/ false)
+        crate::drm_ioctl_bridge::dispatch_card(
+            self.index,
+            self.open_id,
+            cmd,
+            arg,
+            /*render*/ false,
+        )
     }
 
     /// DRM dumb-buffer mmap: resolve a MAP_DUMB fake offset to the
@@ -348,12 +354,7 @@ impl Drop for DriRenderFile {
         // the backing instead: a bounded process-exit leak is preferable to a
         // host DMA use-after-free into another process's pages.
         for resource in self.virtgpu.drain_resources() {
-            let released = narf_drivers_virtio::gpu_pci::probed_device()
-                .map(|dev| dev.destroy_virgl_resource(resource.resource_id).is_ok())
-                .unwrap_or(false);
-            if !released {
-                core::mem::forget(resource);
-            }
+            crate::drm_ioctl_bridge::release_virtgpu_resource(resource);
         }
     }
 }
@@ -427,6 +428,15 @@ impl FileOps for DriRenderFile {
             return crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len);
         }
         Err(FsError::Unsupported)
+    }
+
+    fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        if crate::drm_registry::driver_name(self.index) != Some("virtio_gpu") {
+            return None;
+        }
+        self.virtgpu
+            .mapping_resource(offset, len)
+            .map(|resource| resource as Arc<dyn MmapLifetime>)
     }
 }
 

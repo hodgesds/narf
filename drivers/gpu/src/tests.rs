@@ -38,6 +38,46 @@ fn smoke_drivers_gpu_mode_and_family() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_drivers_gpu_mode_and_family);
 
+/// A render-node GEM handle owns its coherent DMA backing only while it is in
+/// that open file's resource table (or while an in-flight operation holds an
+/// Arc). Removing the handle must drop the final owner and return the pages;
+/// otherwise a long-lived compositor leaks one buffer per GEM_CLOSE.
+fn smoke_virtgpu_render_resource_close_reclaims_dma() -> TestResult {
+    let before = narf_memory::frame_stats().free;
+    let buffer = match narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0) {
+        Ok(buffer) => buffer,
+        Err(_) => return TestResult::Skip("no frame available for virtgpu resource lifecycle"),
+    };
+    if narf_memory::frame_stats().free >= before {
+        return TestResult::Fail("coherent resource allocation did not consume a frame");
+    }
+
+    let state = crate::drm_ioctl_bridge::VirtGpuRenderState::new();
+    state.insert(7, 77, buffer);
+    let mapping = match state.mapping_resource(7 << 12, 4096) {
+        Some(mapping) => mapping,
+        None => return TestResult::Fail("mmap did not retain its GEM resource"),
+    };
+    if state.take(8).is_some() {
+        return TestResult::Fail("unknown GEM handle removed a render resource");
+    }
+    if state.take(7).is_none() {
+        return TestResult::Fail("GEM_CLOSE did not remove its render resource");
+    }
+    if narf_memory::frame_stats().free >= before {
+        return TestResult::Fail("GEM_CLOSE recycled a still-mapped DMA frame");
+    }
+    drop(mapping);
+    if narf_memory::frame_stats().free != before {
+        return TestResult::Fail("last mapping did not release the closed resource's DMA frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_virtgpu_render_resource_close_reclaims_dma
+);
+
 // libudev derives a DRM device's node path from DEVNAME and its devnum
 // from MAJOR:MINOR. With either missing, udev_device_get_devnode() returns
 // NULL and weston's find_primary_gpu reports "no drm device found" even
@@ -827,7 +867,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
 fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_offsets::{
-        offsets_of, register_family_offsets, registered_count, FamilyOffsets, __reset_for_test,
+        FamilyOffsets, __reset_for_test, offsets_of, register_family_offsets, registered_count,
     };
     __reset_for_test();
     if registered_count() != 0 {
