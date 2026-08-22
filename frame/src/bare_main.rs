@@ -61,53 +61,6 @@ static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 )))]
 const KSWAPD_PAGES_PER_CPU: usize = 64;
 
-/// Volatile writable trees a distro PID 1 requires even when its block-backed
-/// root filesystem is mounted read-only. Keep `/var/tmp` separate from `/tmp`:
-/// systemd's `PrivateTmp` prepares and mounts both trees independently.
-///
-/// The user's home is included because a logged-in session writes there (KDE
-/// builds its `~/.cache/ksycoca6` plugin registry, `~/.config`, `~/.local`).
-/// On a read-only root those writes fail with EROFS, `kbuildsycoca6` can't
-/// build the registry, and Plasma reports "package does not exist" for every
-/// applet — no panel.
-///
-/// Unlike the other entries, `/home/narf` is mounted as an overlay: the
-/// installed home is the read-only lower and a user-owned tmpfs is the upper.
-/// A plain tmpfs here would hide the installed Plasma defaults and force every
-/// login to rebuild the complete KDE service cache.
-///
-/// STOPGAP: the path and uid/gid are specific to this CachyOS image. A
-/// user-agnostic writable-root overlay should eventually replace this entry.
-const DISTRO_WRITABLE_RUNTIME_MOUNTS: [(&str, &str); 4] = [
-    ("/mnt/tmp", "/tmp"),
-    ("/mnt/var/tmp", "/var/tmp"),
-    ("/mnt/run", "/run"),
-    ("/mnt/home/narf", "/home/narf"),
-];
-
-#[cfg(feature = "kernel-test")]
-fn smoke_distro_runtime_mount_plan_covers_private_tmp() -> narf_kernel_test::TestResult {
-    if DISTRO_WRITABLE_RUNTIME_MOUNTS
-        != [
-            ("/mnt/tmp", "/tmp"),
-            ("/mnt/var/tmp", "/var/tmp"),
-            ("/mnt/run", "/run"),
-            ("/mnt/home/narf", "/home/narf"),
-        ]
-    {
-        return narf_kernel_test::TestResult::Fail(
-            "distro runtime mount plan must provide separate /tmp, /var/tmp, /run, and /home/narf trees",
-        );
-    }
-    narf_kernel_test::TestResult::Pass
-}
-
-#[cfg(feature = "kernel-test")]
-narf_kernel_test::kernel_test_in!(
-    "frame/boot",
-    smoke_distro_runtime_mount_plan_covers_private_tmp
-);
-
 /// Per-NUMA-node reclaimer signal, one flag per node (one `kswapd<node>`
 /// each): set by `kswapd_wake` so a wake that races the kthread's park is
 /// never lost.
@@ -3361,55 +3314,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 console::Writer,
                                 "  mnt-dev-bind: /dev bound at /mnt/dev (distro device access)"
                             );
-                            // A read-only distro root still needs writable
-                            // runtime trees. /tmp carries sockets and locks,
-                            // /run carries daemon state, and /var/tmp is a
-                            // separate prerequisite for systemd PrivateTmp.
-                            for (mount_path, guest_path) in DISTRO_WRITABLE_RUNTIME_MOUNTS {
-                                if !mounts.iter().any(|m| m == mount_path) {
-                                    // The user's home needs both its installed Plasma defaults and
-                                    // a writable layer. Snapshot the still-visible disk directory as
-                                    // the lower BEFORE stacking the overlay at the same mountpoint.
-                                    // STOPGAP hardcode of narf/1000; see the mount-plan doc above.
-                                    // The other trees stay root-owned; systemd remounts /tmp,/run
-                                    // over ours anyway.
-                                    let mounted = if mount_path == "/mnt/home/narf" {
-                                        let lower = narf_filesystem::registry()
-                                            .clone_tree_at(mount_path);
-                                        match (
-                                            lower,
-                                            narf_filesystem::TmpFs::from_options("", 1000, 1000),
-                                        ) {
-                                            (Some(lower), Ok(upper)) => {
-                                                let fs = narf_filesystem::OverlayFs::new(
-                                                    "cachyos-home-overlay",
-                                                    narf_filesystem::FsInstance::root(&upper),
-                                                    alloc::vec![narf_filesystem::FsInstance::root(
-                                                        lower.as_ref(),
-                                                    )],
-                                                );
-                                                narf_filesystem::registry()
-                                                    .mount(&auth, mount_path, fs)
-                                                    .is_ok()
-                                            }
-                                            _ => false,
-                                        }
-                                    } else {
-                                        let fs = narf_filesystem::MemFs::new("tmpfs");
-                                        narf_filesystem::registry()
-                                            .mount(&auth, mount_path, fs)
-                                            .is_ok()
-                                    };
-                                    if mounted {
-                                        let _ = writeln!(
-                                            console::Writer,
-                                            "  mnt-dev-bind: writable {} mounted at {}",
-                                            guest_path,
-                                            mount_path,
-                                        );
-                                    }
-                                }
-                            }
                             // Bind /sys and /proc into the chroot too — libudev/
                             // libinput enumerate devices via /sys/class/*, and
                             // most Linux software pokes /proc. Best-effort.

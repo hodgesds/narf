@@ -553,14 +553,6 @@ ref = "security-model/specification/spec.md#L42"
 argument = "The late SysFs projection reads block names, capacities, and immutable partition-identification metadata from the existing registry and creates only kernel-owned virtual kobjects. It does not dereference user memory, grant capabilities, access another domain's data, or modify block I/O, mount selection, or frame ownership."
 
 [[invariants_preserved]]
-ref = "security-model/specification/spec.md#L39"
-argument = "The frame boot edit mounts a second instance of the existing untrusted MemFs at the Linux /var/tmp runtime path beside the existing /tmp and /run mounts. It adds no TCB member, authority, domain transition, capability operation, scheduler state, or physical-frame ownership path."
-
-[[invariants_preserved]]
-ref = "security-model/specification/spec.md#L42"
-argument = "The new /var/tmp mount uses the same bootstrap mount authority and kernel-owned MemFs implementation already used for /tmp and /run, and is installed before userspace PID 1 starts. It grants no user pointer access or cross-domain memory access and does not alter capability checks or domain tags."
-
-[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Realtime service is now granted only by the scheduler core after a live Cap<CpuBudget, Spend> check and an atomic, ceiling-rounded reservation against per-CPU, online-system, and capability-object-domain limits. Generic spawn paths demote an unauthorised Realtime label; admitted tasks are own-stack, preemptible, CPU-pinned, and retain an RAII reservation that releases on every slot-drop path. Policy cannot alter the reservation, replenish runtime, move the task, or make throttled work eligible. Five percent of each CPU remains outside RT reservation for interrupt and kernel progress."
 
@@ -594,8 +586,8 @@ argument = "The own-stack reset is compiled only under the kernel-test feature a
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The frame boot edit replaces the existing CachyOS-specific home tmpfs mount with an OverlayFs assembled from the already-mounted read-only home and a user-owned TmpFs upper. Both filesystems remain outside the enumerated TCB; the frame retains the same bootstrap mount authority and adds no trusted subsystem, capability, domain transition, scheduler state, or physical-frame ownership path."
+argument = "The frame boot edit removes all distro-specific writable tmpfs and home-overlay creation from the pre-PID1 path. The remaining bootstrap operation only makes the existing device, proc, and sys filesystems reachable inside the selected root; no new TCB member, authority, domain transition, capability operation, scheduler state, or physical-frame ownership path is added."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "The overlay lower is obtained through VfsRegistry::clone_tree_at before the new mount is stacked, and the upper is a fresh kernel-owned TmpFs. The boot path passes only typed FsInstance and DirOps handles to the existing OverlayFs implementation; it does not dereference user memory, expose backing addresses, alter domain tags, or bypass filesystem capability checks."
+argument = "Writable runtime and home mounts are now requested by PID 1 through the existing Linux mount syscall boundary instead of being created with bootstrap mount authority. Removing the kernel policy does not widen user-memory access or bypass filesystem capability checks; typed mount construction and user-copy validation remain unchanged."

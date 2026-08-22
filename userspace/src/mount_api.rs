@@ -217,7 +217,11 @@ pub fn build_fs_with_options(
 
 fn context_options(context: &FsContext) -> String {
     let mut rendered = String::new();
-    for (key, value) in &context.options {
+    for (key, value) in context
+        .options
+        .iter()
+        .filter(|(key, _)| key.as_str() != "source")
+    {
         if !rendered.is_empty() {
             rendered.push(',');
         }
@@ -230,7 +234,8 @@ fn context_options(context: &FsContext) -> String {
     rendered
 }
 
-/// Separate VFS mount attributes from filesystem-specific remount options.
+/// Separate generic VFS parameters and mount attributes from
+/// filesystem-specific remount options.
 /// The registry does not yet persist per-mount RO/NOSWAP state, but Linux
 /// accepts these flags for tmpfs credentials mounts and systemd requires the
 /// reconfigure step to succeed before it attaches the detached mount.
@@ -238,7 +243,9 @@ fn filesystem_reconfigure_options(context: &FsContext) -> String {
     context
         .options
         .iter()
-        .filter(|(key, _)| key.as_str() != "ro" && key.as_str() != "noswap")
+        .filter(|(key, _)| {
+            key.as_str() != "source" && key.as_str() != "ro" && key.as_str() != "noswap"
+        })
         .fold(String::new(), |mut rendered, (key, value)| {
             if !rendered.is_empty() {
                 rendered.push(',');

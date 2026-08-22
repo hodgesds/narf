@@ -1378,6 +1378,54 @@ fn smoke_abi_fsx2_fsconfig_set_string_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_set_string_pos);
 
+// mount(8)'s new-mount-API path supplies `source=tmpfs` as a generic VFS
+// parameter before the filesystem-specific tmpfs options. Linux consumes
+// `source` in vfs_parse_fs_param_source(); it must not reach the TmpFs option
+// parser, where it would turn FSCONFIG_CMD_CREATE into EINVAL. These are the
+// effective options from CachyOS's stock tmp.mount.
+fn smoke_abi_fsx2_fsconfig_tmpfs_generic_source_pos() -> TestResult {
+    with_setup(|| {
+        let fsname = b"tmpfs\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        for (key, value) in [
+            (b"source\0".as_slice(), b"tmpfs\0".as_slice()),
+            (b"mode\0".as_slice(), b"1777\0".as_slice()),
+            (b"size\0".as_slice(), b"50%\0".as_slice()),
+            (b"nr_inodes\0".as_slice(), b"1m\0".as_slice()),
+        ] {
+            if call(
+                Syscall::Fsconfig.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: FSCONFIG_SET_STRING,
+                    arg2: key.as_ptr() as u64,
+                    arg3: value.as_ptr() as u64,
+                    ..Default::default()
+                },
+            ) != Some(0)
+            {
+                return Err("fsconfig(SET_STRING) rejected a tmp.mount parameter");
+            }
+        }
+        let create = SyscallArgs {
+            arg0: fd,
+            arg1: FSCONFIG_CMD_CREATE,
+            ..Default::default()
+        };
+        match call(Syscall::Fsconfig.raw(), create) {
+            Some(0) => Ok(()),
+            _ => Err("generic source leaked into the tmpfs option parser"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_fsconfig_tmpfs_generic_source_pos
+);
+
 fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
     with_setup(|| {
         let fsname = b"tmpfs\0";
