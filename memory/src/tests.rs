@@ -9086,6 +9086,79 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
 
+/// MADV_DONTNEED over a MULTI-PAGE range with an interior unfaulted hole must
+/// release every resident private frame and zero its per-page slot, while
+/// leaving the hole's already-zero slot untouched. This exercises the batched
+/// per-region range unmap (one root lock + one upper-level walk for the whole
+/// intersection) rather than the single-page helper, so a regression in the
+/// range teardown that dropped or double-counted a page would surface here.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // Three real resident frames with an unfaulted hole (phys 0) at index 1.
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..3 {
+        match crate::alloc_frame() {
+            Ok(f) => frames.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame drained");
+            }
+        }
+    }
+    let v = VirtAddr::new(0x0000_0080_0005_0000);
+    if a
+        .map_region(Region {
+            base: v,
+            len: 0x4000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]],
+        })
+        .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let _ = unsafe { a.materialize() };
+
+    if a.madvise_dontneed(v, 0x4000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("madvise_dontneed over the range returned err");
+    }
+
+    let ok = {
+        let g = a.regions_snapshot();
+        g.iter()
+            .find(|r| r.base.as_u64() == v.as_u64())
+            .map(|r| r.phys.len() == 4 && r.phys.iter().all(|p| p.raw() == 0))
+            .unwrap_or(false)
+    };
+    core::mem::forget(a);
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("range madvise left a resident slot or resized the region")
+    }
+}
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole
+);
+
 /// MADV_DONTNEED reports an unmapped hole without releasing either mapped
 /// island, and rounds a one-byte request over its containing page.
 #[cfg(all(

@@ -4459,12 +4459,28 @@ impl AddressSpace {
                 let end_v = hi.min(re);
                 let start_i = ((start_v - rb) >> 12) as usize;
                 let end_i = ((end_v - rb) >> 12) as usize;
-                #[cfg(target_arch = "aarch64")]
+                // Clear the whole page-aligned intersection under ONE root lock
+                // and a single upper-level walk, rather than re-locking the root
+                // and walking PML4→PT for every resident page. This is the
+                // intersection with one live private, unlocked, non-shared VMA;
+                // the region lock keeps its ownership stable while the helper
+                // clears the run. Missing leaves (unfaulted holes) are benign.
+                // LOCAL invalidation only — the single cross-CPU broadcast below
+                // runs before any freed backing can be reused.
                 if self.root.as_u64() != 0 && start_i < end_i {
-                    // SAFETY: this is the page-aligned intersection with one
-                    // live private, unlocked VMA. The region lock keeps its
-                    // ownership stable while the helper clears and
-                    // broadcasts the complete run under one root lock.
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: identity-mapped; the run lies in a bookkept region
+                    // of this AS.
+                    let _ = unsafe {
+                        crate::x86_64::paging::unmap_4kb_local_range(
+                            self.root,
+                            VirtAddr::new(start_v),
+                            (end_i - start_i) as u64,
+                        )
+                    };
+                    #[cfg(target_arch = "aarch64")]
+                    // SAFETY: as above; the helper clears the complete run under
+                    // one root lock.
                     let _ = unsafe {
                         crate::aarch64::paging::unmap_4kb_range(
                             self.root,
@@ -4477,17 +4493,6 @@ impl AddressSpace {
                     let p = r.phys[i];
                     if p.raw() == 0 {
                         continue;
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    let v = rb + ((i as u64) << 12);
-                    if self.root.as_u64() != 0 {
-                        #[cfg(target_arch = "x86_64")]
-                        // SAFETY: identity-mapped; `v` lies in a bookkept
-                        // region of this AS. LOCAL invalidation only —
-                        // one batched cross-CPU flush below.
-                        let _ = unsafe {
-                            crate::x86_64::paging::unmap_4kb_local(self.root, VirtAddr::new(v))
-                        };
                     }
                     to_release.push(crate::frame::PhysFrame::new(p));
                     r.phys[i] = PhysAddr::new(0);
