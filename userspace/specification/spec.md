@@ -230,6 +230,13 @@ surface as Linux `EINVAL`, `EFAULT`, or `E2BIG`; task exhaustion is `EAGAIN`
 and address-space construction failure is `ENOMEM`. Requested `set_tid` PID
 injection is refused with `EPERM` because no checkpoint/restore capability is
 present on this syscall interface.
+On both architectures, each user task enters and resumes EL0/CPL3 with a
+dedicated scheduler-owned kernel stack. Timer preemption retains the complete
+trap continuation, FP/SIMD image, address space, and TLS value; a TLS value of
+zero is restored explicitly rather than treated as an unpublished sentinel.
+On aarch64, switch-out reads live `TPIDR_EL0` because EL0 may update it without
+a syscall, fork/clone inherit that live value and FPSIMD image, and exec clears
+both in line with Linux arm64 `copy_thread`/`flush_thread` semantics.
 Private futex wait queues are keyed by `(address-space identity, user address)`;
 `CLONE_VM` threads share wakes, while unrelated processes that map the same
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.

@@ -1102,10 +1102,11 @@ fn do_execve_resolved(
     // argv/envp copies. Under a process-churning desktop boot (~1 exec/s,
     // ~15 MiB/exec) that exhausted 8 GiB in ~5 minutes: the
     // "memory allocation of N bytes failed" kernel-heap OOM panic.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
+        #[cfg(target_arch = "x86_64")]
         let fs_base = new_proc.fs_base;
         // The scheduler slot (PENDING_SLOT_AS entry from Step 5) holds the
         // persistent reference that keeps the new AS alive while the task
@@ -1124,6 +1125,7 @@ fn do_execve_resolved(
         let _ = new_as.activate();
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
+        #[cfg(target_arch = "x86_64")]
         {
             let cr3: u64;
             // SAFETY: Reading the current CPU's CR3 register has no side-effects.
@@ -1133,9 +1135,24 @@ fn do_execve_resolved(
             }
             narf_scheduler::stackful::set_current_user_cr3(cr3);
         }
+        #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
-            // SAFETY: canonical user vaddr from the new image's TLS staging.
-            unsafe { narf_scheduler::set_user_fs_base(fb) };
+                // SAFETY: canonical user vaddr from the new image's TLS staging.
+                unsafe { narf_scheduler::set_user_fs_base(fb) };
+                narf_scheduler::stackful::set_current_user_fs_base(fb);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Linux arm64 flush_thread clears TLS and FPSIMD during exec.
+            // NARF does not stage an AArch64 TLS image here, so the new image
+            // begins with an explicit zero thread pointer and clean Q/FP state.
+            // SAFETY: TPIDR_EL0 is writable at EL1; `reset_fp` is aligned and
+            // FPEN is enabled on every booted CPU.
+            unsafe { narf_scheduler::set_user_tls_base(0) };
+            narf_scheduler::stackful::set_current_user_tls_base(0);
+            let reset_fp = narf_arch::aarch64::UserFpState::zeroed();
+            // SAFETY: `reset_fp` is live and aligned; FPEN is enabled at EL1.
+            unsafe { narf_arch::aarch64::restore_user_fp_state(reset_fp.as_ptr()) };
         }
         // The new AS is active and referenced by the slot; the pre-exec AS
         // (if Step 5 displaced one) is dead to this task. Release both local
@@ -1144,8 +1161,8 @@ fn do_execve_resolved(
         drop(new_as);
         drop(prev_slot_as);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
-        // SAFETY: new AS active; entry/rsp mapped by the loader; resets RSP to
-        // this task's own kernel-stack top and iretq's into the new image.
+        // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
+        // exception stack to this task's top and enters the new image.
         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
     }
 
@@ -3243,8 +3260,8 @@ pub(crate) fn store_sigqueue_info(
 
 /// Total queued rt_sigqueueinfo payloads pending for `task` across every
 /// signum — the sender-side back-pressure probe (see `sys_rt_sigqueueinfo`).
-/// Only consulted on the x86_64 own-stack resched path.
-#[cfg(target_arch = "x86_64")]
+/// Only consulted on supported own-stack reschedule paths.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn sigqueue_depth(task: u64) -> usize {
     let g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     g.as_ref()
@@ -3260,7 +3277,7 @@ pub(crate) fn sigqueue_depth(task: u64) -> usize {
 /// can consume it and the run never terminates). Linux gets the equivalent
 /// pacing from preemptive multi-CPU scheduling; this is the cooperative
 /// analogue, and it only triggers on genuinely backlogged floods.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) const SIGQUEUE_BACKPRESSURE_DEPTH: usize = 4;
 
 /// Pop and return the OLDEST queued `(si_code, si_value, si_pid)` for

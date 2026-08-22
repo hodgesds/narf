@@ -71,10 +71,10 @@ Executor internals are per-CPU queues plus global stealing. The specified
 design requires every task to carry `DomainId` plus architecture-neutral
 `DomainSavedState`, with the executor switching domain before polling. The
 current `TaskSlot` carries an opaque architecture-neutral state and switches it
-at cooperative poll boundaries. Trap-entry neutralisation and
-first-instruction restore inside involuntary/direct context transfer remain
-mandatory gaps. The state remains executor-private and is intentionally absent
-from the policy interface.
+at cooperative poll boundaries. Common trap entry neutralises domain rights,
+while the private direct-context-transfer path saves and restores the
+architecture state required by an involuntary switch. The state remains
+executor-private and is intentionally absent from the policy interface.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
 allocation boundary and removes it when the task exits or detaches.
@@ -86,7 +86,7 @@ The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch
 back, including preemption and migration.
-On x86_64, every own-stack switch-out folds the elapsed on-CPU slice through
+On x86_64 and aarch64, every own-stack switch-out folds the elapsed on-CPU slice through
 the slice-account hook. A CPL0 timer preemption additionally calls `pause`
 before switching and calls `resume` only when `pause` reported an open syscall
 span, preventing off-CPU residency from being charged as kernel CPU time. The
@@ -365,9 +365,8 @@ pub fn realtime_bandwidth(cpu: CpuId) -> RealtimeBandwidth;
 - `share_ppm` is descriptive unless a consistent `PeriodBudget` is attached;
   `runtime_cycles/period_cycles` is the enforcement source of truth.
 - Stackless futures remain bounded only at cooperative poll returns. Stackful
-  kernel tasks are tick-preemptive on both architectures; x86_64 additionally
-  supports own-stack CPL3 preemption. NMI/FIQ entry accounting and aarch64 EL0
-  own-stack handoff remain incomplete.
+  kernel tasks and own-stack user tasks are tick-preemptive on both
+  architectures. NMI/FIQ entry accounting remains incomplete.
 
 ### 3.5 CPU hot-plug
 
@@ -647,6 +646,5 @@ Task waking and IRQ integration follows
 
 - MTE allocation-tag ownership on aarch64 (switch/vector state preservation is
   complete; enforcement is structural until the allocator is tag-aware).
-- Aarch64 EL0 own-stack handoff and preemption.
-- Adoption audit for arbitrary CPL0 user-continuation preempt guards.
+- Adoption audit for arbitrary kernel-mode user-continuation preempt guards.
 - NMI/FIQ entry wiring and a bounded softirq execution policy.

@@ -275,16 +275,30 @@ fn user_perf_switch(task: u64, running: bool) {
     }
 }
 
-/// Publish the CURRENT stackful task's user-FPU (FXSAVE) area. Called by the
+/// Publish the CURRENT stackful task's user FP/SIMD save area. Called by the
 /// userspace `UserTaskFuture::poll` on first entry; stored per-task so a
 /// kernel_switch resume + a task exit never read a stale/freed area.
-#[cfg(target_arch = "x86_64")]
 pub fn set_current_user_fpu(area: *mut u8) {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if !p.is_null() {
         // SAFETY: in-flight task on this CPU.
         unsafe { (*p).user_fpu.store(area, Ordering::Release) };
+    }
+}
+
+/// Publish the current AArch64 task's TPIDR_EL0 value so a direct
+/// `kernel_switch` resume can restore TLS without re-polling its future.
+#[cfg(target_arch = "aarch64")]
+pub fn set_current_user_tls_base(tls_base: u64) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: `p` names the in-flight task on this CPU.
+        unsafe {
+            (*p).user_fs_base.store(tls_base, Ordering::Relaxed);
+            (*p).user_tls_valid.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -312,12 +326,14 @@ pub fn set_current_user_fs_base(fs_base: u64) {
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if !p.is_null() {
         // SAFETY: in-flight task on this CPU.
-        unsafe { (*p).user_fs_base.store(fs_base, Ordering::Release) };
+        unsafe {
+            (*p).user_fs_base.store(fs_base, Ordering::Relaxed);
+            (*p).user_tls_valid.store(true, Ordering::Release);
+        }
     }
 }
 
 /// Read the CURRENT task's user-FPU area, or null if none.
-#[cfg(target_arch = "x86_64")]
 #[inline]
 fn current_user_fpu() -> *mut u8 {
     let cpu = this_cpu();
@@ -342,7 +358,37 @@ fn user_fpu_save() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn user_fpu_save() {
+    let cpu = this_cpu();
+    let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !task.is_null() {
+        // SAFETY: CURRENT names the in-flight task on this CPU.
+        let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
+        if area.is_null() {
+            return;
+        }
+        let tls_base: u64;
+        // EL0 may write TPIDR_EL0 directly, without a syscall. Snapshot its
+        // live value at the same switch-out boundary as FP/SIMD state so a
+        // later migration cannot restore a stale creation-time value.
+        // SAFETY: TPIDR_EL0 is readable at EL1; `area` is the live, aligned
+        // UserFpState owned by this current task and FPEN is enabled.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tls_base}, tpidr_el0",
+                tls_base = out(reg) tls_base,
+                options(nomem, nostack, preserves_flags),
+            );
+            (*task).user_fs_base.store(tls_base, Ordering::Relaxed);
+            (*task).user_tls_valid.store(true, Ordering::Release);
+            narf_arch::aarch64::save_user_fp_state(area);
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn user_fpu_save() {}
 
 #[cfg(target_arch = "x86_64")]
@@ -357,12 +403,22 @@ fn user_fpu_restore() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn user_fpu_restore() {
+    let area = current_user_fpu();
+    if !area.is_null() {
+        // SAFETY: same live task-owned UserFpState invariant as save.
+        unsafe { narf_arch::aarch64::restore_user_fp_state(area) };
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn user_fpu_restore() {}
 
 /// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
-/// CPU, or 0 if none. The per-task-own-stack user entry resets RSP to this
-/// before `iretq`-to-user so the kernel stack is empty while the user runs.
+/// CPU, or 0 if none. The own-stack user entry resets RSP/SP_EL1 to this before
+/// returning to userspace so the kernel exception stack is empty while it runs.
 pub fn current_stackful_stack_top() -> u64 {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -420,16 +476,13 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
 /// switch, so the box must never again be a write target once
 /// `completed` is published. Nothing ever switches into this scratch —
 /// the continuation it captures is dead by construction.
-#[cfg(target_arch = "x86_64")]
 struct PerCpuScratchCtx {
     inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
 }
-#[cfg(target_arch = "x86_64")]
 // SAFETY: each CPU writes only `inner[its-own-cpu]`, and only from
 // `exit_current_stackful` (one exiting task at a time per CPU); the slot
 // is write-only dead storage, never read or switched into.
 unsafe impl Sync for PerCpuScratchCtx {}
-#[cfg(target_arch = "x86_64")]
 static EXIT_SCRATCH_CTX: PerCpuScratchCtx = PerCpuScratchCtx {
     inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
 };
@@ -479,6 +532,20 @@ fn guard_switch_into(label: &str, ctx: &KernelContext) {
             ctx.r15,
         );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn poison_context(ctx: *mut KernelContext) {
+    // SAFETY: caller owns the live context save slot.
+    unsafe { (&raw mut (*ctx).rip).write(0) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn poison_context(ctx: *mut KernelContext) {
+    // SAFETY: caller owns the live context save slot.
+    unsafe { (&raw mut (*ctx).pc).write(0) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -569,8 +636,9 @@ pub struct KernelTask {
     /// this task. Use for drivers that hold hardware locks across
     /// an `.await`-free critical section.
     no_preempt: AtomicBool,
-    /// Separate CPL3 policy. User tasks can be time-sliced while their CPL0
-    /// syscall continuations remain run-to-completion (`no_preempt = true`).
+    /// Separate userspace policy. User tasks can be time-sliced at CPL3/EL0
+    /// while kernel-mode syscall continuations remain run-to-completion
+    /// (`no_preempt = true`).
     user_preempt: AtomicBool,
     /// Set true by the trap-handler hook when it rewrites the
     /// frame.rip to preempt_yield_stub. Read by
@@ -588,7 +656,7 @@ pub struct KernelTask {
     /// can read without panicking on a poisoned lock, and the
     /// kernel-stack body can swap in a fresh waker per entry.
     current_waker: narf_lib::sync::IrqSafeSpinLock<Option<Waker>>,
-    /// Per-task user-FPU (FXSAVE) area pointer, published by the userspace
+    /// Per-task user FP/SIMD area pointer, published by the userspace
     /// `UserTaskFuture::poll` on first entry. Lives HERE (not in a per-CPU slot)
     /// because in the own-stack model a task resumes via `kernel_switch` (not a
     /// re-poll), so the save/restore must read the CURRENT task's area — a
@@ -615,9 +683,14 @@ pub struct KernelTask {
     /// freshly-polled task's value — and the thread's first `fs:[0]` TCB read
     /// faults at NULL (looping forever if it caught SIGSEGV with a handler that
     /// itself reads TLS — the SMP `chroot_run` runaway-SIGSEGV hang).
-    /// `poll_to_yield` reloads this before each switch into the task. 0 = no TLS
-    /// / not yet published.
+    /// `poll_to_yield` reloads this before each switch into the task. Zero is a
+    /// valid TLS base, so `user_tls_valid` records whether it was published.
     user_fs_base: AtomicU64,
+    /// Set after `user_fs_base` has been published at least once. This must be
+    /// distinct from the value: both AArch64 TPIDR_EL0 and x86 FS_BASE may
+    /// legitimately be zero, and skipping that restore leaks another task's
+    /// thread pointer across a direct context-switch resume.
+    user_tls_valid: AtomicBool,
 }
 
 // SAFETY: A `KernelTask` runs on one CPU at a time (the executor switches
@@ -702,6 +775,7 @@ impl KernelTask {
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
+            user_tls_valid: AtomicBool::new(false),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -725,7 +799,7 @@ impl KernelTask {
             me.ctx =
                 KernelContext::fresh(stack_top, trampoline_entry as usize as u64, task_ptr_as_u64);
         }
-        let _ = (stack_top, task_ptr_as_u64); // silence warnings on aarch64 stub
+        let _ = (stack_top, task_ptr_as_u64);
 
         me
     }
@@ -881,10 +955,11 @@ impl KernelTask {
             // rationale as CR3 above. A multithreaded task resumes via
             // kernel_switch, NOT a re-poll, so without this it runs on whatever
             // FS_BASE the last freshly-polled task installed and its first user
-            // TLS access (`fs:[0]`) faults. Skipped on the first poll / a TLS-less
-            // task (fs_base==0): the poll itself sets and publishes FS_BASE.
-            let fs_base = self.user_fs_base.load(Ordering::Acquire);
-            if fs_base != 0 {
+            // TLS access (`fs:[0]`) faults. Skipped only until the task publishes
+            // a value; zero itself is valid and must overwrite another task's
+            // FS_BASE.
+            if self.user_tls_valid.load(Ordering::Acquire) {
+                let fs_base = self.user_fs_base.load(Ordering::Relaxed);
                 // SAFETY: `fs_base` is a canonical user vaddr published from this
                 // task's poll-time `set_user_fs_base` (stage_tls / arch_prctl).
                 unsafe {
@@ -984,13 +1059,23 @@ impl KernelTask {
             .store(narf_time::now_cycles(), Ordering::Release);
         let cpu = this_cpu();
         let saved_current = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        if self.user_tls_valid.load(Ordering::Acquire) {
+            let tls_base = self.user_fs_base.load(Ordering::Relaxed);
+            // SAFETY: value was published after programming TPIDR_EL0 for this
+            // task and points into its active address space. The scheduler has
+            // already activated that address space before polling the adapter.
+            unsafe { narf_arch::aarch64::set_user_tls_base(tls_base) };
+        }
         // SAFETY: this CPU exclusively owns the persistent executor slot for
         // this call; the POD copy preserves a nested pump's outer continuation.
         let previous = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
+        let perf_task = crate::current_task_id().raw();
+        user_perf_switch(perf_task, true);
         // SAFETY: both contexts and the task-owned stack remain live.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         self.check_stack_canary();
+        user_perf_switch(perf_task, false);
         // SAFETY: same exclusive per-CPU slot as above.
         unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
         CURRENT_STACKFUL_TASK.inner[cpu].store(saved_current, Ordering::Release);
@@ -1461,6 +1546,22 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     true
 }
 
+/// Whether an AArch64 exception level is eligible for tick preemption.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn aarch64_preempt_mode_allowed(
+    spsr: u64,
+    own_stack: bool,
+    user_preempt: bool,
+    no_preempt: bool,
+) -> bool {
+    if (spsr & 0xF) == 0 {
+        own_stack && user_preempt
+    } else {
+        !no_preempt
+    }
+}
+
 /// AArch64 generic-timer equivalent of [`try_preempt`]. The vector prologue
 /// has already preserved the complete EL1/EL0 return frame on the task's own
 /// stack; this function switches the live trap continuation back to the
@@ -1481,7 +1582,13 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     }
     // SAFETY: CURRENT names the task whose in-flight poll keeps its Box live.
     let task = unsafe { &*task_ptr };
-    if task.no_preempt.load(Ordering::Acquire) {
+    let from_user = (frame.spsr & 0xF) == 0;
+    if !aarch64_preempt_mode_allowed(
+        frame.spsr,
+        USE_OWN_STACK.load(Ordering::Acquire),
+        task.user_preempt.load(Ordering::Acquire),
+        task.no_preempt.load(Ordering::Acquire),
+    ) {
         return false;
     }
     let now = narf_time::now_cycles();
@@ -1510,6 +1617,15 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
         }
     }
     task.preempted.store(true, Ordering::Release);
+    let kernel_span_paused = if from_user {
+        false
+    } else {
+        pause_user_kernel_span()
+    };
+    fold_current_slice(task_ptr);
+    if from_user {
+        user_fpu_save();
+    }
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: CURRENT_STACKFUL_TASK names the task whose in-flight
     // poll_to_yield call exclusively owns this context save slot.
@@ -1526,6 +1642,12 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
         (*task_ptr)
             .tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
+    }
+    if kernel_span_paused {
+        resume_user_kernel_span();
+    }
+    if from_user {
+        user_fpu_restore();
     }
     true
 }
@@ -1684,7 +1806,6 @@ pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn()) {
     KERNEL_SPAN_RESUME_HOOK.store(resume as usize, Ordering::Release);
 }
 
-#[cfg(target_arch = "x86_64")]
 fn pause_user_kernel_span() -> bool {
     let hook = KERNEL_SPAN_PAUSE_HOOK.load(Ordering::Acquire);
     if hook == 0 {
@@ -1696,7 +1817,6 @@ fn pause_user_kernel_span() -> bool {
     pause()
 }
 
-#[cfg(target_arch = "x86_64")]
 fn resume_user_kernel_span() {
     let hook = KERNEL_SPAN_RESUME_HOOK.load(Ordering::Acquire);
     if hook == 0 {
@@ -1708,7 +1828,6 @@ fn resume_user_kernel_span() {
     resume();
 }
 
-#[cfg(target_arch = "x86_64")]
 fn fold_current_slice(p: *mut KernelTask) {
     let h = SLICE_ACCOUNT_HOOK.load(Ordering::Acquire);
     if h == 0 {
@@ -1728,7 +1847,7 @@ fn fold_current_slice(p: *mut KernelTask) {
 /// Elapsed ns of the CURRENT (un-folded) slice — lets getrusage/times/
 /// the exit-time rusage snapshot include the in-flight slice a running
 /// task hasn't yielded out of yet. 0 when no stackful task is current.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn current_slice_elapsed_ns() -> u64 {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -1743,16 +1862,16 @@ pub fn current_slice_elapsed_ns() -> u64 {
     narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started))
 }
 
-/// Non-x86_64: no own-stack model, no in-flight slice.
-#[cfg(not(target_arch = "x86_64"))]
+/// Unsupported architectures have no own-stack model or in-flight slice.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn current_slice_elapsed_ns() -> u64 {
     0
 }
 
 /// # Safety
-/// Called at CPL=0 from a syscall handler running on the current task's own
-/// kernel stack, with a stackful task current on this CPU.
-#[cfg(target_arch = "x86_64")]
+/// Called from a syscall handler running in kernel mode on the current task's
+/// own kernel stack, with a stackful task current on this CPU.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn yield_current_stackful() {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -1802,7 +1921,7 @@ pub unsafe fn yield_current_stackful() {
 /// on re-poll the caller retries. Uses the same re-arm-then-`yield_current_stackful`
 /// switch-out as `maybe_resched_syscall_exit` / the own-stack park paths — the
 /// well-tested cooperative path, NOT `no_preempt`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn cooperative_yield() -> bool {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -1836,11 +1955,9 @@ pub fn cooperative_yield() -> bool {
 /// A rare mis-attribution (the requesting task is preempted before its own
 /// syscall tail runs, so ANOTHER task's tail consumes the flag) costs one
 /// spurious-but-harmless yield.
-#[cfg(target_arch = "x86_64")]
 struct PerCpuBackpressure {
     inner: [core::sync::atomic::AtomicBool; narf_lib::percpu::MAX_CPUS],
 }
-#[cfg(target_arch = "x86_64")]
 static BACKPRESSURE_YIELD: PerCpuBackpressure = PerCpuBackpressure {
     inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
 };
@@ -1848,7 +1965,7 @@ static BACKPRESSURE_YIELD: PerCpuBackpressure = PerCpuBackpressure {
 /// Request a cooperative yield at the current task's next syscall exit
 /// (see [`BACKPRESSURE_YIELD`]). Callable from any syscall handler body;
 /// no-op when own-stack scheduling isn't live.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn request_syscall_backpressure_yield() {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
         return;
@@ -1868,7 +1985,6 @@ pub fn request_syscall_backpressure_yield() {
 /// default 10 ms slice this is ≈2.5 ms. A task with no sibling waiting still
 /// runs to its full slice; this only bounds how long a CPU hog holds the core
 /// while a runnable peer starves.
-#[cfg(target_arch = "x86_64")]
 const FAIR_QUANTUM_DIV: u64 = 4;
 
 /// Pure yield policy for [`maybe_resched_syscall_exit`], split out so it is
@@ -1886,7 +2002,6 @@ const FAIR_QUANTUM_DIV: u64 = 4;
 /// CPU for a full slice at a time and, on SMP=1, starves its own worker threads
 /// and the whole session — the busy-poll starvation the ReqGate cooperative
 /// yield (8c63bd43) fixed for the in-kernel spin, here for userspace.
-#[cfg(target_arch = "x86_64")]
 fn syscall_exit_yield_decision(
     started: u64,
     slice: u64,
@@ -1929,7 +2044,7 @@ fn syscall_exit_yield_decision(
 /// own kernel stack, with a real user frame about to return to CPL=3 and no
 /// kernel locks held — the yield switches to the executor via the same
 /// `kernel_switch` the own-stack park paths use.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn maybe_resched_syscall_exit() {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
         return;
@@ -1986,7 +2101,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
 /// IRQ / wait-child) so firing it sets the task's `awake` flag and the executor
 /// re-polls — the per-task-own-stack analog of the longjmp poll's `cx.waker()`.
 /// `None` if no stackful task is current (e.g. kernel-test context).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn current_stackful_waker() -> Option<Waker> {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -1997,10 +2112,10 @@ pub fn current_stackful_waker() -> Option<Waker> {
     unsafe { (*p).current_waker.lock().as_ref().cloned() }
 }
 
-/// Non-x86_64: NARF has no stackful executor yet, so there is never a
+/// Unsupported architectures have no stackful executor, so there is never a
 /// current stackful task — the own-stack durable-wake arming callers make
 /// (`poll`/`epoll`) simply see `None` and fall through to the legacy park.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn current_stackful_waker() -> Option<Waker> {
     None
 }
@@ -2010,8 +2125,8 @@ pub fn current_stackful_waker() -> Option<Waker> {
 /// per-task-own-stack replacement for the longjmp-based task exit.
 ///
 /// # Safety
-/// Called at CPL=0 from the exit path on the current task's own kernel stack.
-#[cfg(target_arch = "x86_64")]
+/// Called in kernel mode from the exit path on the current task's own stack.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn exit_current_stackful() -> ! {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -2024,7 +2139,7 @@ pub unsafe fn exit_current_stackful() -> ! {
             // to switch into a completed task; the zeroed `rip` makes any
             // path that slips past it trip `guard_switch_into` with
             // attribution instead of resuming a consumed continuation.
-            (&raw mut (*p).ctx.rip).write(0);
+            poison_context(&raw mut (*p).ctx);
             (*p).completed.store(true, Ordering::Release);
             let exec_ctx = (*p).exec_ctx.load(Ordering::Acquire);
             CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
@@ -2054,13 +2169,14 @@ pub unsafe fn exit_current_stackful() -> ! {
     panic!("exit_current_stackful cpu={cpu}: no CURRENT stackful task at exit — lost executor continuation");
 }
 
-/// Fallback stub for exit_current_stackful on non-x86_64 architectures.
+/// Fallback stub for architectures without the stackful executor.
 ///
 /// # Safety
-/// This function is not supported on non-x86_64 architectures and will panic.
-#[cfg(not(target_arch = "x86_64"))]
+/// This function is not supported on architectures without stackful switching
+/// and will panic.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub unsafe fn exit_current_stackful() -> ! {
-    unreachable!("own-stack is not supported on non-x86_64 architectures");
+    unreachable!("own-stack is not supported on this architecture");
 }
 
 // The earlier preempt_yield_stub + preempt_yield_stub_body +
@@ -2241,6 +2357,26 @@ pub mod tests {
         }
         if preempt_count() != before {
             return TestResult::Fail("preempt depth leaked after guard drop");
+        }
+        TestResult::Pass
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn smoke_aarch64_preempt_mode_policy_separates_el0_el1() -> TestResult {
+        // EL0 requires both own-stack lifetime and explicit user eligibility;
+        // the CPL0-style no_preempt flag intentionally does not suppress it.
+        if aarch64_preempt_mode_allowed(0, false, true, false)
+            || aarch64_preempt_mode_allowed(0, true, false, false)
+            || !aarch64_preempt_mode_allowed(0, true, true, true)
+        {
+            return TestResult::Fail("EL0 preemption eligibility mismatch");
+        }
+        // EL1h is controlled only by no_preempt, preserving run-to-completion
+        // syscalls for user tasks while allowing explicitly preemptible kthreads.
+        if !aarch64_preempt_mode_allowed(5, false, false, false)
+            || aarch64_preempt_mode_allowed(5, true, true, true)
+        {
+            return TestResult::Fail("EL1 preemption eligibility mismatch");
         }
         TestResult::Pass
     }
@@ -2936,6 +3072,72 @@ pub mod tests {
         }
         if OBSERVED.load(Ordering::Acquire) != FS {
             return TestResult::Fail("FS_BASE not reloaded on kernel_switch resume");
+        }
+        TestResult::Pass
+    }
+
+    /// AArch64 equivalent of the FS_BASE resume gate: TPIDR_EL0 belongs to the
+    /// task, not the CPU, and must be restored before a saved continuation is
+    /// switched back in on a CPU whose prior task left another TLS pointer.
+    #[cfg(target_arch = "aarch64")]
+    fn smoke_zero_user_tls_base_reloaded_on_kernel_switch_resume() -> TestResult {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        const TLS: u64 = 0;
+        const CLOBBER: u64 = 0x0000_0007_6543_2000;
+        static PHASE: AtomicU32 = AtomicU32::new(0);
+        static OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+        struct TlsResume {
+            fp: Box<narf_arch::aarch64::UserFpState>,
+        }
+        impl Future for TlsResume {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                if PHASE.fetch_add(1, Ordering::AcqRel) == 0 {
+                    set_current_user_fpu(this.fp.as_mut_ptr());
+                    // EL0 is allowed to write TPIDR_EL0 without entering the
+                    // kernel. Model that direct write, then exercise the
+                    // production switch-out capture.
+                    unsafe { narf_arch::aarch64::set_user_tls_base(TLS) };
+                    user_fpu_save();
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                let value: u64;
+                // SAFETY: TPIDR_EL0 is readable at EL1 without side effects.
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {value}, tpidr_el0",
+                        value = out(reg) value,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                OBSERVED.store(value, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        PHASE.store(0, Ordering::Release);
+        OBSERVED.store(u64::MAX, Ordering::Release);
+        let mut task = KernelTask::new(TlsResume {
+            fp: Box::new(narf_arch::aarch64::UserFpState::zeroed()),
+        });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: ordinary exclusive stackful task round trips.
+        let first = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: simulate a different task's TLS state on this CPU.
+        unsafe { narf_arch::aarch64::set_user_tls_base(CLOBBER) };
+        let second = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: leave a benign kernel-test value behind.
+        unsafe { narf_arch::aarch64::set_user_tls_base(0) };
+
+        if first != Poll::Pending || second != Poll::Ready(()) {
+            return TestResult::Fail("AArch64 zero-TLS resume task did not round trip");
+        }
+        if OBSERVED.load(Ordering::Acquire) != TLS {
+            return TestResult::Fail("zero TPIDR_EL0 not restored before kernel_switch resume");
         }
         TestResult::Pass
     }
@@ -4840,6 +5042,11 @@ pub mod tests {
         "scheduler/stackful",
         smoke_preempt_disable_nests_and_unwinds
     );
+    #[cfg(target_arch = "aarch64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_aarch64_preempt_mode_policy_separates_el0_el1
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -5047,5 +5254,10 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_user_fs_base_reloaded_on_kernel_switch_resume
+    );
+    #[cfg(target_arch = "aarch64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_zero_user_tls_base_reloaded_on_kernel_switch_resume
     );
 }

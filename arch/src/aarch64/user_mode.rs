@@ -18,7 +18,7 @@
 //!   so a trap can unwind back to the executor's setjmp without
 //!   running destructors on the trap path.
 
-use core::arch::naked_asm;
+use core::arch::{asm, naked_asm};
 
 /// Snapshot of an EL0 task's CPU state at trap time. Field order
 /// is load-bearing — `enter_user_mode_resume`'s naked asm reads
@@ -51,6 +51,117 @@ pub struct UserState {
 /// async exceptions unmasked. Mirrors the value used by
 /// `frame::aarch64::user::USER_SPSR`.
 pub const USER_SPSR: u64 = 0;
+
+/// Complete architectural FP/SIMD state for one EL0 task.
+///
+/// The 32 128-bit vector registers occupy the first 512 bytes, followed by
+/// FPCR and FPSR.  AArch64 kernel code is built without FP/SIMD use, so the
+/// scheduler only needs to save this state when an EL0 continuation is about
+/// to be switched out and restore it immediately before that continuation is
+/// switched back in.
+#[repr(C, align(16))]
+#[derive(Debug)]
+pub struct UserFpState {
+    bytes: [u8; 528],
+}
+
+impl UserFpState {
+    pub const fn zeroed() -> Self {
+        Self { bytes: [0; 528] }
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+}
+
+impl Default for UserFpState {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+/// Save Q0-Q31, FPCR, and FPSR into `state`.
+///
+/// # Safety
+/// `state` must point to a writable, 16-byte-aligned [`UserFpState`]. FP/SIMD
+/// access must be enabled at EL1 (NARF enables CPACR_EL1.FPEN on every CPU).
+#[inline]
+pub unsafe fn save_user_fp_state(state: *mut u8) {
+    // SAFETY: the caller provides a live UserFpState; offsets match its fixed
+    // layout and the boot path enables FP/SIMD access at EL1.
+    unsafe {
+        asm!(
+            "stp q0,  q1,  [{state}, #0]",
+            "stp q2,  q3,  [{state}, #32]",
+            "stp q4,  q5,  [{state}, #64]",
+            "stp q6,  q7,  [{state}, #96]",
+            "stp q8,  q9,  [{state}, #128]",
+            "stp q10, q11, [{state}, #160]",
+            "stp q12, q13, [{state}, #192]",
+            "stp q14, q15, [{state}, #224]",
+            "stp q16, q17, [{state}, #256]",
+            "stp q18, q19, [{state}, #288]",
+            "stp q20, q21, [{state}, #320]",
+            "stp q22, q23, [{state}, #352]",
+            "stp q24, q25, [{state}, #384]",
+            "stp q26, q27, [{state}, #416]",
+            "stp q28, q29, [{state}, #448]",
+            "stp q30, q31, [{state}, #480]",
+            "mrs {fpcr}, fpcr",
+            "mrs {fpsr}, fpsr",
+            "str {fpcr}, [{state}, #512]",
+            "str {fpsr}, [{state}, #520]",
+            state = in(reg) state,
+            fpcr = out(reg) _,
+            fpsr = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+/// Restore Q0-Q31, FPCR, and FPSR from `state`.
+///
+/// # Safety
+/// `state` must point to a readable, 16-byte-aligned [`UserFpState`].
+#[inline]
+pub unsafe fn restore_user_fp_state(state: *const u8) {
+    // SAFETY: the caller provides a live UserFpState; see save_user_fp_state.
+    unsafe {
+        asm!(
+            "ldr {fpcr}, [{state}, #512]",
+            "ldr {fpsr}, [{state}, #520]",
+            "msr fpcr, {fpcr}",
+            "msr fpsr, {fpsr}",
+            "ldp q0,  q1,  [{state}, #0]",
+            "ldp q2,  q3,  [{state}, #32]",
+            "ldp q4,  q5,  [{state}, #64]",
+            "ldp q6,  q7,  [{state}, #96]",
+            "ldp q8,  q9,  [{state}, #128]",
+            "ldp q10, q11, [{state}, #160]",
+            "ldp q12, q13, [{state}, #192]",
+            "ldp q14, q15, [{state}, #224]",
+            "ldp q16, q17, [{state}, #256]",
+            "ldp q18, q19, [{state}, #288]",
+            "ldp q20, q21, [{state}, #320]",
+            "ldp q22, q23, [{state}, #352]",
+            "ldp q24, q25, [{state}, #384]",
+            "ldp q26, q27, [{state}, #416]",
+            "ldp q28, q29, [{state}, #448]",
+            "ldp q30, q31, [{state}, #480]",
+            state = in(reg) state,
+            fpcr = out(reg) _,
+            fpsr = out(reg) _,
+            options(nostack),
+        );
+    }
+}
 
 /// Transfer into EL0 at (`pc`, `sp`). Sets SPSR_EL1 = 0 (EL0t),
 /// loads ELR_EL1 = `pc`, SP_EL0 = `sp`, then `eret`. Never
@@ -111,6 +222,156 @@ pub unsafe extern "C" fn enter_user_mode(pc: u64, sp: u64) -> ! {
     );
 }
 
+/// Enter EL0 like [`enter_user_mode`], delivering `arg` in x0.
+///
+/// # Safety
+/// The active TTBR0 must map `pc` executable and `sp` writable for EL0, and
+/// SP_EL1 must already name a valid exception stack. This function never
+/// returns and abandons the caller's control flow at ERET.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_with_arg(pc: u64, sp: u64, arg: u64) -> ! {
+    naked_asm!(
+        "msr sp_el0, x1",
+        "msr elr_el1, x0",
+        "msr spsr_el1, xzr",
+        "mov x3, x2",
+        "mov x1, xzr",
+        "mov x2, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x9, xzr",
+        "mov x10, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "mov x0, x3",
+        "mov x3, xzr",
+        "eret",
+    );
+}
+
+/// Enter EL0 after resetting SP_EL1 to the empty task kernel-stack top.
+/// This abandons the caller's frames and therefore never returns.
+///
+/// # Safety
+/// The active TTBR0 must map `pc` executable and `user_sp` writable for EL0.
+/// `kernel_stack_top` must be the aligned top of the current task's live,
+/// exclusively-owned kernel stack and remain valid for every later exception.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_at_top(pc: u64, user_sp: u64, kernel_stack_top: u64) -> ! {
+    naked_asm!(
+        "msr sp_el0, x1",
+        "msr elr_el1, x0",
+        "msr spsr_el1, xzr",
+        "mov sp, x2",
+        "mov x0, xzr",
+        "mov x1, xzr",
+        "mov x2, xzr",
+        "mov x3, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x9, xzr",
+        "mov x10, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "eret",
+    );
+}
+
+/// [`enter_user_mode_at_top`] with the initial x0 argument supplied.
+///
+/// # Safety
+/// The mapping and task-stack requirements of [`enter_user_mode_at_top`] apply.
+/// `arg` is exposed unchanged to EL0 in x0. This function never returns.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_with_arg_at_top(
+    pc: u64,
+    user_sp: u64,
+    arg: u64,
+    kernel_stack_top: u64,
+) -> ! {
+    naked_asm!(
+        "msr sp_el0, x1",
+        "msr elr_el1, x0",
+        "msr spsr_el1, xzr",
+        "mov sp, x3",
+        "mov x3, x2",
+        "mov x1, xzr",
+        "mov x2, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x9, xzr",
+        "mov x10, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "mov x0, x3",
+        "mov x3, xzr",
+        "eret",
+    );
+}
+
 /// Resume EL0 at the state captured in `*state`. Restores every
 /// GPR + ELR + SPSR + SP_EL0 from the snapshot, then `eret`.
 /// Never returns.
@@ -159,6 +420,45 @@ pub unsafe extern "C" fn enter_user_mode_resume(state: *const UserState) -> ! {
         "ldp  x29, x30, [x0, #232]",
         // Finally x0.
         "ldr  x0, [x0, #0]",
+        "eret",
+    );
+}
+
+/// Resume a saved EL0 state after resetting SP_EL1 to the empty task stack.
+///
+/// # Safety
+/// `state` must be a live snapshot captured from this task's prior EL0
+/// continuation under the active TTBR0. `kernel_stack_top` must be the aligned
+/// top of this task's live, exclusively-owned exception stack.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_resume_at_top(
+    state: *const UserState,
+    kernel_stack_top: u64,
+) -> ! {
+    naked_asm!(
+        "mov sp, x1",
+        "ldr x9, [x0, #256]",
+        "msr sp_el0, x9",
+        "ldr x9, [x0, #248]",
+        "msr elr_el1, x9",
+        "ldr x9, [x0, #264]",
+        "msr spsr_el1, x9",
+        "ldp x1, x2, [x0, #8]",
+        "ldp x3, x4, [x0, #24]",
+        "ldp x5, x6, [x0, #40]",
+        "ldp x7, x8, [x0, #56]",
+        "ldp x9, x10, [x0, #72]",
+        "ldp x11, x12, [x0, #88]",
+        "ldp x13, x14, [x0, #104]",
+        "ldp x15, x16, [x0, #120]",
+        "ldp x17, x18, [x0, #136]",
+        "ldp x19, x20, [x0, #152]",
+        "ldp x21, x22, [x0, #168]",
+        "ldp x23, x24, [x0, #184]",
+        "ldp x25, x26, [x0, #200]",
+        "ldp x27, x28, [x0, #216]",
+        "ldp x29, x30, [x0, #232]",
+        "ldr x0, [x0]",
         "eret",
     );
 }
@@ -366,3 +666,47 @@ kernel_test_in!(
     "aarch64",
     smoke_aarch64_setjmp_longjmp_preserves_callee_saved
 );
+
+fn smoke_aarch64_user_fp_state_round_trip() -> TestResult {
+    let mut original = UserFpState::zeroed();
+    let mut saved = UserFpState::zeroed();
+    let mut q0 = 0u128;
+    let mut q31 = 0u128;
+    // Preserve the test runner's architectural FP/SIMD state, install two
+    // sentinels, save them through the production primitive, clobber the live
+    // registers, and restore. The kernel itself is soft-float, so no compiler
+    // generated vector instruction can intervene.
+    // SAFETY: all buffers have the required alignment and lifetime; the boot
+    // path enables FP/SIMD access at EL1, and original is restored before exit.
+    unsafe {
+        save_user_fp_state(original.as_mut_ptr());
+        asm!(
+            "movi v0.16b, #0x5a",
+            "movi v31.16b, #0xa5",
+            options(nomem, nostack),
+        );
+        save_user_fp_state(saved.as_mut_ptr());
+        asm!(
+            "movi v0.16b, #0",
+            "movi v31.16b, #0",
+            options(nomem, nostack),
+        );
+        restore_user_fp_state(saved.as_ptr());
+        asm!(
+            "str q0, [{q0}]",
+            "str q31, [{q31}]",
+            q0 = in(reg) &mut q0,
+            q31 = in(reg) &mut q31,
+            options(nostack),
+        );
+        restore_user_fp_state(original.as_ptr());
+    }
+    if q0 != u128::from_le_bytes([0x5a; 16]) {
+        return TestResult::Fail("Q0 did not survive user FP state round trip");
+    }
+    if q31 != u128::from_le_bytes([0xa5; 16]) {
+        return TestResult::Fail("Q31 did not survive user FP state round trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aarch64", smoke_aarch64_user_fp_state_round_trip);

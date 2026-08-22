@@ -97,6 +97,29 @@ pub unsafe extern "C" fn aarch64::kernel_ctx::kernel_switch(
     incoming: *const aarch64::kernel_ctx::KernelContext,
 );
 
+/// AArch64 EL0 FP/SIMD image: Q0-Q31 followed by FPCR and FPSR.
+#[cfg(target_arch = "aarch64")]
+pub struct aarch64::UserFpState { /* 528 bytes, 16-byte aligned */ }
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::save_user_fp_state(state: *mut u8);
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::restore_user_fp_state(state: *const u8);
+
+/// EL0 entry/resume variants that first abandon the current EL1 frames and
+/// reset SP_EL1 to the supplied per-task kernel-stack top.
+#[cfg(target_arch = "aarch64")]
+pub unsafe extern "C" fn aarch64::enter_user_mode_at_top(
+    pc: u64, user_sp: u64, kernel_stack_top: u64,
+) -> !;
+#[cfg(target_arch = "aarch64")]
+pub unsafe extern "C" fn aarch64::enter_user_mode_with_arg_at_top(
+    pc: u64, user_sp: u64, arg: u64, kernel_stack_top: u64,
+) -> !;
+#[cfg(target_arch = "aarch64")]
+pub unsafe extern "C" fn aarch64::enter_user_mode_resume_at_top(
+    state: *const aarch64::UserState, kernel_stack_top: u64,
+) -> !;
+
 /// Current-CPU speculative-execution policy. Remote changes require an
 /// IPI/rendezvous that executes this function on the target CPU.
 pub enum speculation::Policy { Disabled, Protected }

@@ -623,7 +623,7 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // ref until reap, and the in-flight task's own future holds another, so
     // a self-lookup can never dangle. Fall back to the `CURRENT` cell when
     // the registry has no entry (the in-kernel test harness never registers).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
         let id = crate::handlers::current_task_id();
         if let Some(t) = crate::task::task_get(id) {
@@ -689,7 +689,7 @@ pub(crate) fn refresh_io_wait_generation_after_registration(uc: &UserTaskCtx, ob
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn park_should_block(
     uc: &UserTaskCtx,
     waker: &core::task::Waker,
@@ -1012,7 +1012,7 @@ pub fn __test_park_should_block(
 /// Own-stack blocking-syscall park: register the slot-waker + `kernel_switch`
 /// out, looping until the park condition clears. Returns to the caller (a
 /// syscall handler that rewound RIP) so the sysret tail re-executes the syscall.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn own_stack_park() {
     let mut sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle> = None;
     loop {
@@ -2556,6 +2556,9 @@ pub struct UserTaskFuture {
     /// Refcounted task object — see the x86_64 sibling's field doc.
     task: alloc::sync::Arc<crate::task::Task>,
     jmp: UnsafeCell<JmpBuf>,
+    /// Complete EL0 FP/SIMD register file. Boxed so the pointer published to
+    /// the scheduler remains stable across task migration and adapter moves.
+    fp: alloc::boxed::Box<narf_scheduler::UserFpState>,
     state: TaskState,
 }
 
@@ -2586,6 +2589,7 @@ impl UserTaskFuture {
             process,
             task,
             jmp: UnsafeCell::new(JmpBuf::default()),
+            fp: alloc::boxed::Box::new(narf_scheduler::UserFpState::zeroed()),
             state: TaskState::Initial,
         }
     }
@@ -2606,10 +2610,18 @@ impl UserTaskFuture {
         unsafe {
             *task.uctx.state.get() = state;
         }
+        let mut fp = alloc::boxed::Box::new(narf_scheduler::UserFpState::zeroed());
+        // `resume_with` is called while handling clone/fork on the parent's
+        // syscall continuation. Kernel code is soft-float, so the architectural
+        // Q/FPCR/FPSR state is still the parent's and must seed the child (in
+        // particular AAPCS64's callee-saved v8-v15 state).
+        // SAFETY: `fp` is live and 16-byte aligned; FPEN is enabled at EL1.
+        unsafe { narf_arch::aarch64::save_user_fp_state(fp.as_mut_ptr()) };
         Self {
             process,
             task,
             jmp: UnsafeCell::new(JmpBuf::default()),
+            fp,
             state: TaskState::Running,
         }
     }
@@ -2807,16 +2819,54 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
-        // Program the per-task TLS thread pointer if the binary
-        // staged a TLS block. AArch64 stores it in TPIDR_EL0;
-        // pairing the write with the AS activation keeps the
-        // "outgoing user task's MSRs" mental model intact.
-        if let Some(tls_base) = this.process.fs_base {
-            // SAFETY: writing TPIDR_EL0 at EL1 is unconditional
-            // and has no side effects on EL1 state.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_scheduler::set_user_tls_base(tls_base);
+        // Program an explicit per-task TPIDR_EL0 after activating the task AS.
+        // Fresh images start at zero until their runtime writes TPIDR_EL0;
+        // clone/fork supplies Some(live_parent_tls), including Some(0). Never
+        // inherit whichever user thread happened to run previously on this CPU.
+        let tls_base = this.process.fs_base.unwrap_or(0);
+        // SAFETY: TPIDR_EL0 is writable at EL1 without affecting EL1 TLS.
+        unsafe {
+            narf_scheduler::set_user_tls_base(tls_base);
+        }
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            narf_scheduler::stackful::set_current_user_tls_base(tls_base);
+        }
+
+        // Own-stack AArch64 execution mirrors x86_64: reset SP_EL1 to the
+        // task stack top before ERET, then preserve the live vector frame via
+        // kernel_switch on preemption/park. This branch never re-enters the
+        // polling future; exit_current_stackful completes the adapter directly.
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            narf_scheduler::stackful::set_current_user_fpu(this.fp.as_mut_ptr());
+            // SAFETY: `fp` is a live, aligned UserFpState and FPEN is enabled.
+            unsafe { narf_arch::aarch64::restore_user_fp_state(this.fp.as_ptr()) };
+            let top = narf_scheduler::stackful::current_stackful_stack_top();
+            match this.state {
+                TaskState::Initial => {
+                    this.state = TaskState::Running;
+                    let pc = this.process.entry.0.as_u64();
+                    let sp = this.process.stack_top.as_u64();
+                    if let Some(arg) = this.process.entry_arg {
+                        // SAFETY: active TTBR0 maps pc/sp; top is this task's
+                        // dedicated EL1 exception-stack top.
+                        unsafe { narf_scheduler::enter_user_mode_with_arg_at_top(pc, sp, arg, top) }
+                    } else {
+                        // SAFETY: same mapping and stack ownership invariant.
+                        unsafe { narf_scheduler::enter_user_mode_at_top(pc, sp, top) }
+                    }
+                }
+                TaskState::Running => {
+                    narf_lib::perf::ctx_switch();
+                    // SAFETY: state came from a prior EL0 trap/fork snapshot;
+                    // top is the current stackful task's empty exception stack.
+                    unsafe {
+                        narf_scheduler::enter_user_mode_resume_at_top(
+                            this.task.uctx.state.get(),
+                            top,
+                        )
+                    }
+                }
+                TaskState::Exited => unreachable!("guarded above"),
             }
         }
 
@@ -2913,10 +2963,27 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
 }
 
 #[cfg(target_arch = "aarch64")]
+unsafe fn user_task_execve_hook(_uctx: *mut UserTaskCtx) -> ! {
+    let p = jmp_slot().load(Ordering::Acquire);
+    if p.is_null() {
+        narf_scheduler::halt_forever();
+    }
+    // SAFETY: legacy-only fallback; CURRENT_JMP names this poll's live buffer.
+    unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_EXECVE as u64) }
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
+    install_execve_hook(user_task_execve_hook);
+    narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
+    narf_scheduler::stackful::set_user_kernel_preempt_hooks(
+        crate::handlers::pause_current_kernel_span,
+        crate::handlers::resume_current_kernel_span,
+    );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    narf_scheduler::stackful::enable_user_own_stack();
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -43,8 +43,9 @@ pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch
 pub use cpuid::Features;
 pub use mte::Mte;
 pub use user_mode::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf, UserState,
-    USER_SPSR,
+    enter_user_mode, enter_user_mode_at_top, enter_user_mode_resume, enter_user_mode_resume_at_top,
+    enter_user_mode_with_arg, enter_user_mode_with_arg_at_top, longjmp, restore_user_fp_state,
+    save_user_fp_state, set_user_tls_base, setjmp, JmpBuf, UserFpState, UserState, USER_SPSR,
 };
 
 /// Exit QEMU via ARM semihosting `SYS_EXIT`. Falls back to `halt_forever`

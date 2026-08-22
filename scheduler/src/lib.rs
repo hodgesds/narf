@@ -137,8 +137,9 @@ pub use narf_arch::x86_64::{
 
 #[cfg(target_arch = "aarch64")]
 pub use narf_arch::aarch64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf, UserState,
-    USER_SPSR,
+    enter_user_mode, enter_user_mode_at_top, enter_user_mode_resume, enter_user_mode_resume_at_top,
+    enter_user_mode_with_arg, enter_user_mode_with_arg_at_top, longjmp, set_user_tls_base, setjmp,
+    JmpBuf, UserFpState, UserState, USER_SPSR,
 };
 
 // `halt_forever` is the right "I should never reach here" sink for
@@ -1842,9 +1843,9 @@ where
     // state, so a syscall-free loop yields its CPU. Arbitrary CPL0 preemption
     // stays disabled until NARF has Linux-style preempt-disable accounting;
     // otherwise a suspended syscall can strand a lock needed by every sibling
-    // in its CLONE_VM address space. x86_64 only — aarch64's stackful adapter
-    // is a stub that completes immediately.
-    #[cfg(target_arch = "x86_64")]
+    // in its shared address space. Both supported architectures use the same
+    // executor-private continuation model.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_options(
         f,
         crate::StackfulOptions {
@@ -1853,7 +1854,7 @@ where
             ..Default::default()
         },
     ));
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let task: BoxedTask = Box::pin(f);
     let slot = TaskSlot {
         task,
@@ -4083,14 +4084,14 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
 /// [`stackful::cooperative_yield`]). Returns `true` if a yield happened,
 /// `false` when there is nothing to yield to (no stackful task, or an arch
 /// without the own-stack model) — the caller should then plain-spin.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 pub fn cooperative_yield() -> bool {
     stackful::cooperative_yield()
 }
 
-/// Non-x86_64 stub: no own-stack cooperative scheduler, so the caller spins.
-#[cfg(not(target_arch = "x86_64"))]
+/// Unsupported-architecture stub: no own-stack scheduler, so the caller spins.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
 pub fn cooperative_yield() -> bool {
     false

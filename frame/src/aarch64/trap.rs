@@ -166,6 +166,12 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         if let Some(hook) = narf_userspace::signal_delivery_hook() {
             hook(&mut ctx, num);
         }
+        // Linux's exit-to-user reschedule check: timer preemption is gated to
+        // EL0 for user tasks, so a syscall-dense thread must still yield once
+        // its slice is spent. This helper is a no-op outside own-stack mode.
+        // SAFETY: the live SVC frame is returning to EL0 and handler dispatch
+        // has completed; own-stack park uses the same kernel_switch boundary.
+        unsafe { narf_scheduler::stackful::maybe_resched_syscall_exit() };
         return;
     }
 

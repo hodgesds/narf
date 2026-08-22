@@ -5237,6 +5237,8 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
                 narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
             };
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: same live recorded root and read-only translation walk as
+            // the x86_64 branch above.
             let translated = unsafe {
                 narf_memory::aarch64::paging::translate(root, narf_memory::VirtAddr::new(page))
             };
@@ -5401,7 +5403,10 @@ fn current_user_tls_base() -> Option<u64> {
         }
         value
     };
-    (value != 0).then_some(value)
+    #[cfg(target_arch = "x86_64")]
+    return (value != 0).then_some(value);
+    #[cfg(target_arch = "aarch64")]
+    Some(value)
 }
 
 /// Validate the Linux-visible clone contract before allocating or publishing
@@ -6084,7 +6089,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // → `wake_signal`; SIGKILL (pending bit 9) still breaks the wait.
     if flags & CLONE_VFORK != 0 {
         if let Some(uctx) = crate::user_task::current_user_task() {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // SAFETY: the in-flight parent task's poller-pinned UserTaskCtx;
                 // single-CPU cooperative execution — no concurrent &mut.
@@ -6120,7 +6125,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
                     .store(0, core::sync::atomic::Ordering::Release);
             }
             #[cfg(target_arch = "aarch64")]
-            if let Some(hook) = crate::user_task::yield_hook() {
+            if !narf_scheduler::stackful::user_own_stack_enabled() {
+                if let Some(hook) = crate::user_task::yield_hook() {
                 // aarch64 uses the polling-future path: keep the parent's
                 // saved syscall return parked until vfork_child_release calls
                 // wake_signal and clears this infinite deadline.
@@ -6130,6 +6136,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
                 uc.sleep_deadline_ns
                     .store(u64::MAX, core::sync::atomic::Ordering::Release);
                 if vfork_is_pending(child_visible_pid) {
+                    // SAFETY: `uc` and the legacy JmpBuf remain live for this
+                    // poll; the hook diverges back to that saved continuation.
                     unsafe {
                         ctx.save_user_state(uc.state.get() as *mut u8);
                         *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -6138,6 +6146,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
                 }
                 uc.sleep_deadline_ns
                     .store(0, core::sync::atomic::Ordering::Release);
+                }
             }
         }
     }
@@ -6798,7 +6807,7 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
 /// park), registers the slot-waker so `on_child_exit` re-polls us, and
 /// `kernel_switch`es out via `yield_current_stackful` until a child is reapable.
 /// The own-stack analog of `UserTaskFuture::poll`'s wait_child arm.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
     let parent = current_task_id();
     let uctx = match crate::user_task::current_user_task() {
@@ -6920,7 +6929,7 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
 /// `kernel_switch`es out. Returns when the condition clears; the caller then
 /// `return`s and the sysret tail either re-executes the syscall (rewound RIP)
 /// or returns the baked/reaped result.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
     let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
@@ -6937,9 +6946,9 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
-    unreachable!("own-stack is not supported on non-x86_64 architectures");
+    unreachable!("own-stack is not supported on this architecture");
 }
 
 /// Park the current task on net-I/O readiness (with the ~1ms timer-wheel
