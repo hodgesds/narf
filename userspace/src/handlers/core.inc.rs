@@ -316,11 +316,27 @@ fn raw_waker() -> RawWaker {
     RawWaker::new(core::ptr::null(), &VTAB)
 }
 
+/// Hand off after a synchronously-polled future reports `Pending`.
+///
+/// A syscall runs on a stackful task, so repeatedly polling a contended async
+/// mutex can monopolize the CPU on which its lock holder is homed. Use the
+/// scheduler's own-stack yield path so the holder can run. Sleep pumps remain
+/// necessary even when a yield succeeds: cursor/FB/serial pumps are not all
+/// ordinary scheduler tasks. Architectures without an own-stack yield path
+/// retain the old spin fallback, but still service those pumps.
+#[inline]
+fn pending_poll_wait() {
+    sleep_pumps::run();
+    if !narf_scheduler::cooperative_yield() {
+        core::hint::spin_loop();
+    }
+}
+
 /// Spin-pump a Future to completion inside a syscall. Caller must
 /// guarantee the future makes progress without external wakeups (the
 /// kernel's block-device drivers — NVMe in particular — are
 /// internally polled, so async FS futures complete after at most a
-/// handful of re-polls). Bounded to 65 536 iterations as a hard
+/// handful of re-polls). Bounded to four million iterations as a hard
 /// safety cap; returns `None` on overrun (caller surfaces EIO).
 pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
@@ -329,18 +345,14 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
     let mut ctx = Context::from_waker(&waker);
     // SAFETY: we own `fut` by value; pin to the stack temporary.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    // Busy-poll budget. This must be generous enough to cover a future that is
-    // legitimately *waiting* — not stuck — for a long time. The worst case is
-    // contended block I/O: two execve loads on different CPUs serialise on the
-    // ext2 volume's scratch DMA buffer, so the loser busy-spins here while the
-    // winner streams a whole ~1 MiB binary block-by-block. A small budget made
-    // the loser time out → read returns None → execve EINVALs (the "concurrent
-    // pipe stages fail" bug). The bound still exists only as a backstop against
-    // a genuinely wedged future.
+    // Poll budget. This must be generous enough to cover a future that is
+    // legitimately waiting on contended filesystem work. Responsiveness does
+    // not depend on reaching the cap: every Pending poll yields the stackful
+    // task when possible and services the registered sleep pumps.
     for _ in 0..4_000_000u64 {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
-            Poll::Pending => continue,
+            Poll::Pending => pending_poll_wait(),
         }
     }
     None
@@ -349,12 +361,11 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
 /// Poll a block-I/O future to completion, keeping the SAME future alive for the
 /// entire wait. Unlike `poll_blocking`'s small budget, this uses a huge backstop
 /// so a merely-contended read (KDE launching dozens of procs at once, all
-/// streaming binaries off ext2) completes rather than timing out. Crucially it
-/// NEVER drops the future mid-flight: a dropped read leaves its in-flight
-/// virtio-blk request DMA'ing into a scratch buffer that has been returned to
-/// the pool and reused → corruption. Only a genuinely-wedged device reaches the
-/// ceiling (returns None); callers that must not truncate treat that as a hard
-/// stop, not EOF.
+/// streaming binaries off ext2) completes rather than timing out. The huge
+/// ceiling is a last-resort wedge detector: reaching it drops the future, and
+/// an in-flight virtio-blk request could still be DMA'ing into a scratch buffer
+/// returned to the pool. Callers that must not truncate therefore treat an
+/// overrun as a hard stop, not EOF; normal contention must never approach it.
 pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     // SAFETY: same no-op waker as poll_blocking; the block-completion IRQ / pump
@@ -366,7 +377,7 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
     for _ in 0..2_000_000_000u64 {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
-            Poll::Pending => continue,
+            Poll::Pending => pending_poll_wait(),
         }
     }
     None

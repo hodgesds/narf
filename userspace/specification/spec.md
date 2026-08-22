@@ -598,6 +598,12 @@ prefix. Packet reads and their verifier/runtime contract are owned by
   The kernel-side shadow lives in `DomainId::USERSPACE_K` regardless
   of which user PKU key the user side uses.
 - relibc never performs a syscall the kernel hasn't explicitly wired up.
+- Synchronous syscall bridges for async filesystem operations never pure-spin
+  for their full completion budget. Every Pending result services the sleep
+  pumps, then cooperatively yields an x86_64 stackful task so a descheduled lock
+  holder homed on that CPU can run. Architectures without the own-stack yield
+  path retain a spin fallback after pumping, so cursor, framebuffer, serial,
+  and other pump-driven work remains responsive during long I/O waits.
 
 ### 4.1 Stable user-space ABI promise
 
