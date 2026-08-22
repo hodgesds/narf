@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "376409e8b766be629e598557ea11b309d2ba7ddd3f02f2dad99e620f0f5d5ec2"
+prompt_hash = "31f2268bffec442b347c24e5edc1e220634de3250af6506c7eb3c4b240b76a50"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -542,7 +542,7 @@ argument = "The policy, task-queue, and CPU-state hooks expose immutable schedul
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Core-owned period replenishment, eligibility tiers, bounded idle borrowing, and debt repayment cannot be overridden by policy. Borrowable work runs only when no eligible candidate exists, strict-throttled work stays ineligible until replenishment, and the tick forces a switch at the hard boundary. The existing architecture-neutral DomainSavedState preemption gap is recorded as an open gate and is not claimed closed by this refactor."
+argument = "Core-owned period replenishment, eligibility tiers, bounded idle borrowing, and debt repayment cannot be overridden by policy. Borrowable work runs only when no eligible candidate exists, strict-throttled work stays ineligible until replenishment, and the tick forces a switch at the hard boundary. Domain state remains mechanism-owned below policy and is preserved by the architecture-private switch boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -566,8 +566,20 @@ argument = "Realtime service is now granted only by the scheduler core after a l
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "AArch64 stackful kernel tasks now save AAPCS64 callee state, SP, resume PC, and DAIF in task-owned context, validate every incoming stack/PC, and switch from the generic-timer tail only after GIC EOI and hard-IRQ accounting have ended. The live vector frame is required to lie inside the current task stack; current-task publication is cleared before switch-out and restored on resume, and involuntary returns remain non-quiescent for QSBR. The specification explicitly keeps trap-entry domain neutralisation, first-instruction domain restore, and AArch64 EL0 own-stack handoff open rather than claiming the cooperative DomainSavedState wrapper closes those invariants."
+argument = "AArch64 stackful tasks save AAPCS64 callee state, SP, resume PC, DAIF, and architecture-private domain state in task-owned context, validate every incoming stack/PC, and switch from the generic-timer tail only after GIC EOI and hard-IRQ accounting have ended. The live vector frame is required to lie inside the current task stack; current-task publication is cleared before switch-out and restored on resume, and involuntary returns remain non-quiescent for QSBR. Common vector entry neutralises domain state before Rust and the switch primitive restores it before the resumed continuation."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Scheduler hot paths use CPU-local run queues and policy/donation/steal publication, task-sharded affinity, pending-address-space, donor-debit, and NUMA registries, plus lock-free admission and interrupt counters; no single scheduler-wide lock serialises dispatch. Logical hot-unplug publishes Draining before new dispatch, refuses a running or pinned task, drains without holding source and destination queues together, and balances policy task-lifecycle callbacks. The power path receives only a copied per-CPU demand snapshot and gains no scheduler mutation, frequency-register, capability, domain-transition, or task-memory authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "AArch64 EL0 preemption stays within the existing arch, frame, userspace-kernel, and scheduler executor boundaries. It adds no trusted subsystem, capability kind, domain identifier, scheduling-policy authority, or externally callable switch primitive; stacks, trap frames, saved registers, and context switching remain hidden from policy crates."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The generic-timer path reaches the private scheduler switch only after common vector entry has saved the interrupted SCTLR/GCR state and entered neutral Frame state, and after GIC EOI plus hard-IRQ accounting complete. The live vector frame must reside on the published task's dedicated kernel stack. kernel_switch preserves the architecture-private domain snapshot, and the unchanged vector epilogue restores the interrupted rights immediately before ERET; no policy callback receives any of this state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Every AArch64 user switch-out saves Q0-Q31, FPCR, FPSR, and the live TPIDR_EL0 into task-owned stable storage before current-task publication is cleared. Dispatch activates the slot's retained address space and restores its TLS and FP/SIMD image before resuming the saved continuation; zero TLS has explicit validity and cannot leak a prior task's value. Fork/clone seed the child from live parent TLS and FP/SIMD state, while exec clears both as Linux arm64 does. Involuntary returns remain non-quiescent for QSBR, and syscall continuations remain non-preemptible except at explicit safe exit/park boundaries."

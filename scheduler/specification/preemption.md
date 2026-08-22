@@ -1,8 +1,8 @@
 # Preemptive Scheduling — Implementation Contract
 
-> Status: **implemented for stackful kernel tasks on x86_64 and aarch64, and
-> for own-stack CPL3 user continuations on x86_64.** Aarch64 EL0 own-stack
-> handoff and audited arbitrary-CPL0 user preemption remain incomplete.
+> Status: **implemented for stackful kernel tasks and own-stack user
+> continuations on x86_64 and aarch64.** Audited arbitrary-kernel-mode user
+> continuation preemption remains incomplete.
 
 ## 1. Purpose
 
@@ -20,10 +20,9 @@ frames, saved domain rights, executor contexts, or switch functions.
 | Work | Spawn path | Timer-preemptible today |
 |---|---|---|
 | Stackless async task | `spawn`, `spawn_with_spec` | No; cooperative poll boundary only |
-| Stackful kernel thread | `spawn_stackful*` | x86_64 CPL0, unless `no_preempt` |
-| Own-stack user thread | `spawn_user` | x86_64 CPL3 |
-| User thread in syscall | `spawn_user` | No arbitrary CPL0 preemption yet |
-| aarch64 stackful kernel task | same API | Yes, generic-timer IRQ |
+| Stackful kernel thread | `spawn_stackful*` | x86_64 CPL0 / aarch64 EL1, unless `no_preempt` |
+| Own-stack user thread | `spawn_user` | x86_64 CPL3 / aarch64 EL0 |
+| User thread in syscall | `spawn_user` | No arbitrary CPL0/EL1 preemption yet |
 | Hard IRQ/NMI | interrupt entry | Not schedulable work |
 | Deferred IRQ work | task with `WorkKind::SoftIrq` | According to its execution mode |
 
@@ -31,7 +30,7 @@ frames, saved domain rights, executor contexts, or switch functions.
 that need both policy metadata and preemption options. The `StackfulAdapter`
 and `KernelTask` bodies remain private.
 
-## 3. x86_64 switch path
+## 3. Own-stack switch path
 
 Each `KernelTask` owns a stable kernel stack and `KernelContext`. The executor
 polls its `StackfulAdapter`, which publishes the task in a per-CPU
@@ -41,20 +40,21 @@ On a scheduler-timer trap:
 
 1. The trap prologue has already saved the interrupted register frame on the
    current task's own kernel stack and entered the Frame domain.
-2. `try_preempt` (CPL0) or `try_preempt_user` (CPL3) validates that the frame
-   lies inside the current task's stack.
+2. The architecture preemption hook validates that the frame lies inside the
+   current task's stack and that the interrupted exception level is eligible.
 3. The hook checks the time slice and the core-published periodic-budget
    boundaries.
 4. If a switch is required, it re-arms the task waker, records an involuntary
-   return for RCU, saves user FPU state when applicable, clears the per-CPU
-   current pointer, and calls `kernel_switch(&mut task.ctx, executor_ctx)`
-   directly from the trap handler with interrupts disabled.
+   return for RCU, saves user FPU/SIMD state when applicable, clears the
+   per-CPU current pointer, and calls
+   `kernel_switch(&mut task.ctx, executor_ctx)` directly from the trap handler
+   with interrupts disabled.
 5. The executor accounts the elapsed on-CPU interval and dispatches another
    eligible slot.
 6. A later `kernel_switch` resumes inside the suspended trap handler. The task
-   republishes itself, restores FPU/address-space/TLS state as applicable, and
-   returns through the untouched common-trap frame to the interrupted
-   instruction.
+   republishes itself, restores FPU/SIMD, address-space, and TLS state as
+   applicable, and returns through the untouched common-trap frame to the
+   interrupted instruction.
 
 The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 
@@ -135,8 +135,9 @@ rolling generation-ordered cutover.
 - Run-queue locks are released before entering a task.
 - A policy callback receives no mutable queue or execution state.
 - A preemption return is not an RCU quiescent state.
-- User FPU, address-space, TLS, trap continuation, and task stack remain paired
-  across preemption and migration.
+- User FPU/SIMD, address-space, TLS, trap continuation, and task stack remain
+  paired across preemption and migration. AArch64 captures live `TPIDR_EL0` at
+  switch-out because EL0 may write it directly.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
 - Realtime class metadata is demoted on generic spawn paths. Only
@@ -160,9 +161,7 @@ code receives none of this state.
 
 ## 7. Remaining gates
 
-- Wire aarch64 EL0 tasks to per-task kernel stacks before enabling EL0 timer
-  preemption there.
-- Audit CPL0 user/syscall critical regions and adopt the nestable
+- Audit kernel-mode user/syscall critical regions and adopt the nestable
   `preempt_disable()` guard before changing their conservative opt-out.
 - Wire the public NMI accounting guard into each architecture's NMI/FIQ entry;
   hard-IRQ entry/exit is live on both architectures.
@@ -181,5 +180,6 @@ Required gates for changes to this mechanism:
   declines work, plus edge-triggered CPU Active/Idle notifications;
 - external-crate compile proof in `scheduler/policy-example`;
 - x86_64 and aarch64 scheduler subsystem QEMU suites;
-- x86_64 busy-loop preemption and own-stack trap-frame/FPU/RCU smokes;
+- x86_64 and aarch64 busy-loop preemption and own-stack
+  trap-frame/FPU-or-SIMD/TLS/RCU smokes;
 - TCB safety argument and two-maintainer review including security review.

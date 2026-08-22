@@ -62,7 +62,7 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     }
     raise_signal_pending(target, sig);
     // Back-pressure — see sys_rt_sigqueueinfo.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();
     }

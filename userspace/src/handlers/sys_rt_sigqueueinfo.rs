@@ -59,7 +59,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
                                        // Producer/consumer back-pressure: the target is falling behind —
                                        // yield this sender at syscall exit so the consumer(s) drain (see
                                        // SIGQUEUE_BACKPRESSURE_DEPTH).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();
     }

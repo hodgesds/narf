@@ -64,7 +64,7 @@ pub(crate) fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
             {
                 // The stackful continuation itself remains live until the
                 // syscall-exit boundary; request a cooperative switch there.
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 narf_scheduler::stackful::request_syscall_backpressure_yield();
             }
             ctx.set_return(SyscallReturn::ok(0));

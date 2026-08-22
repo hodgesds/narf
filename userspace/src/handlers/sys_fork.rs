@@ -162,7 +162,23 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
                     Some(v)
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
+            {
+                let value: u64;
+                // Linux arm64 copy_thread reads the live TPIDR_EL0 because it
+                // may differ from any saved creation-time value. Zero remains
+                // an explicit inherited TLS value.
+                // SAFETY: TPIDR_EL0 is readable at EL1 without side effects.
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {value}, tpidr_el0",
+                        value = out(reg) value,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                Some(value)
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             None
         },
         entry_arg: None,
