@@ -38,47 +38,41 @@ pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
     };
 
     let mut written = 0usize;
-    // iter()-only DirOps — the procfs trees (/proc root, /proc/<pid>,
-    // fd/, task/, ns/) — keep the Unsupported default for
-    // enumerate_async. Bridge them through the sync iterator, or ps/
-    // top/ls see an EMPTY /proc (opens worked, listing didn't: the
-    // alpine-probe "no process info in /proc" failure). Snapshot the
-    // remainder ONCE per getdents call: iter() rebuilds (and, for
-    // ProcRoot, Box::leaks names on) every invocation, so a per-entry
-    // re-iter would cost O(entries²) and multiply that leak by the
-    // directory size on every ps/top refresh.
-    let mut iter_snapshot: Option<
-        alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>,
-    > = None;
-    let mut snapshot_pos = 0usize;
-    loop {
-        let batch: Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> =
-            if let Some(snap) = iter_snapshot.as_ref() {
-                let e = snap.get(snapshot_pos).cloned();
-                snapshot_pos += 1;
-                Some(e.into_iter().collect())
-            } else {
-                match poll_blocking(dir.enumerate_async(cursor, 1)) {
-                    Some(Ok(v)) => Some(v),
-                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                        let snap: alloc::vec::Vec<_> = dir
-                            .iter()
-                            .skip(cursor)
-                            .map(|e| (alloc::string::String::from(e.name), e.file_type))
-                            .collect();
-                        let first = snap.first().cloned();
-                        iter_snapshot = Some(snap);
-                        snapshot_pos = 1;
-                        Some(first.into_iter().collect())
-                    }
-                    _ => None,
-                }
-            };
-        let mut entries = match batch {
-            Some(v) if !v.is_empty() => v,
-            _ => break,
+    // The whole directory tail (everything at or after `cursor`) is
+    // snapshotted ONCE per getdents call, then served entry-by-entry from
+    // the snapshot. Two backend flavours feed it:
+    //
+    //   * enumerate_async: the in-memory and on-disk filesystems. A single
+    //     `enumerate_async(cursor, usize::MAX)` returns the remaining tail
+    //     in one traversal, so the listing is O(entries) for the directory.
+    //     Requesting one entry per call instead (`enumerate_async(cursor,
+    //     1)`) makes each call re-skip `cursor` positions from the start of
+    //     the backing container (a BTreeMap for tmpfs), turning a full
+    //     read-dir into O(entries²) — the mass-rmdir/getdents pathology.
+    //
+    //   * iter(): the procfs trees (/proc root, /proc/<pid>, fd/, task/,
+    //     ns/) keep the Unsupported default for enumerate_async. Bridge
+    //     them through the sync iterator, or ps/top/ls see an EMPTY /proc
+    //     (opens worked, listing didn't). iter() rebuilds (and, for
+    //     ProcRoot, Box::leaks names on) every invocation, so a per-entry
+    //     re-iter would cost O(entries²) and multiply that leak by the
+    //     directory size on every ps/top refresh.
+    //
+    // Either way the tail is captured once and indexed by `snapshot_pos`.
+    let snapshot: alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)> =
+        match poll_blocking(dir.enumerate_async(cursor, usize::MAX)) {
+            Some(Ok(v)) => v,
+            Some(Err(narf_filesystem::FsError::Unsupported)) => dir
+                .iter()
+                .skip(cursor)
+                .map(|e| (alloc::string::String::from(e.name), e.file_type))
+                .collect(),
+            _ => alloc::vec::Vec::new(),
         };
-        let (name, ftype) = entries.pop().unwrap();
+    let mut snapshot_pos = 0usize;
+    while let Some(entry) = snapshot.get(snapshot_pos).cloned() {
+        snapshot_pos += 1;
+        let (name, ftype) = entry;
         let name_bytes = name.as_bytes();
         // 19-byte fixed header + name + NUL, padded up to 8 bytes.
         let raw_len = 19 + name_bytes.len() + 1;
