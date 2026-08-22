@@ -69,13 +69,11 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // `enter_user_mode_resume` and lands at the parent's
     // post-syscall RIP. On aarch64 save_user_state populates the
     // analogous UserState (PC = ELR_EL1, SP = SP_EL0, x[0..=30] +
-    // SPSR), but `UserTaskFuture::resume_with` on aarch64 is
-    // currently a no-op pending the EL0 polling pipeline — the
-    // saved state is captured for forward-compat but not yet
-    // restored. Test contexts whose synthetic TrapContext can't
-    // save user state (the trait default returns false) fall back
-    // to `UserTaskFuture::new` against the parent's load-time
-    // (entry, stack_top).
+    // SPSR); `UserTaskFuture::resume_with` restores it through the
+    // aarch64 EL0 polling path. Test contexts whose synthetic
+    // TrapContext can't save user state (the trait default returns
+    // false) fall back to `UserTaskFuture::new` against the parent's
+    // load-time (entry, stack_top).
     let child_state: Option<crate::user_task::UserState> = {
         use core::mem::MaybeUninit;
         let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();

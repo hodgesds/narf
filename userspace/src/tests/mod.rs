@@ -3,9 +3,7 @@
 pub(crate) use alloc::sync::Arc;
 
 pub(crate) use narf_kernel_test::{kernel_test_in, TestResult};
-#[cfg(target_arch = "x86_64")]
 pub(crate) use narf_lib::sync::IrqSafeSpinLock;
-#[cfg(target_arch = "x86_64")]
 pub(crate) use narf_memory::AddressSpace;
 
 pub(crate) use crate::syscall::{
@@ -16,10 +14,8 @@ pub(crate) use crate::{install_address_space_lookup, install_core_syscalls, inst
 
 /// Static so the AS-lookup `fn` pointer can resolve it without a
 /// closure capture.
-#[cfg(target_arch = "x86_64")]
 static PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
 
-#[cfg(target_arch = "x86_64")]
 fn lookup_parent_as() -> Option<Arc<AddressSpace>> {
     PARENT_AS.lock().clone()
 }

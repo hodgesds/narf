@@ -3,7 +3,6 @@
 #![allow(unused_imports)]
 use super::*;
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_shares_address_space() -> TestResult {
     // Direct exercise of `sys_clone` (Syscall::Clone = 56) without
     // entering ring 3. Wires the address-space lookup to a fixed
@@ -34,7 +33,8 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     install_global(t);
 
     // Linux clone(2) ABI: arg0 = flags, arg1 = child stack top,
-    // arg2 = parent_tid ptr, arg3 = child_tid ptr, arg4 = tls.
+    // arg2 = parent_tid ptr. x86_64 puts child_tid/tls in arg3/arg4;
+    // arm64's CONFIG_CLONE_BACKWARDS ABI puts tls/child_tid there.
     // CLONE_VM|CLONE_SIGHAND|CLONE_THREAD = a thread that shares the
     // parent address space.
     const CLONE_VM_SIGHAND_THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
@@ -76,7 +76,6 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 
 // systemd creates its generator and service sandboxes with
@@ -238,7 +237,10 @@ kernel_test_in!(
 // parent's `while vfork_is_pending` park loop terminates. `vfork_child_release`
 // also fires `wake_signal`, which is a no-op here (no live task ctx for the
 // synthetic parent id) — this exercises the entry lifecycle in isolation.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
     let child = 0xF001u64; // arbitrary synthetic child pid (unused by any task)
     crate::handlers::vfork_wait_register(child, 0xF002);
@@ -256,17 +258,21 @@ fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 kernel_test_in!(
     "userspace",
     smoke_userspace_vfork_wait_release_clears_pending
 );
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
-    // Defence-in-depth on the handler — entry==0 or stack==0 is
-    // invalid input and must surface InvalidOp without spawning
-    // a task. Does NOT require an AS lookup to be installed.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_clone_rejects_invalid_flag_dependencies() -> TestResult {
+    // Linux clone(2) has no entry-point argument and permits stack == 0 for
+    // fork-shaped calls. Exercise two genuinely invalid flag combinations
+    // instead. Validation precedes address-space lookup, so both must return
+    // EINVAL without spawning a child even in this synthetic context.
 
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
@@ -274,11 +280,14 @@ fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    for (entry, stack) in [(0u64, 0x1000u64), (0x1000u64, 0u64), (0u64, 0u64)] {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    for flags in [CLONE_SIGHAND, CLONE_VM | CLONE_THREAD] {
         let mut ctx = StubCtx {
             args: SyscallArgs {
-                arg0: entry,
-                arg1: stack,
+                arg0: flags,
+                arg1: 0,
                 arg2: 0,
                 arg3: 0,
                 arg4: 0,
@@ -291,18 +300,18 @@ fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
             Some(r) => r,
             None => return TestResult::Fail("no return set"),
         };
-        if r.status == SyscallReturn::OK {
-            return TestResult::Fail("zero entry/stack should not succeed");
+        if r.status != SyscallReturn::OK || r.value as i64 != -22 {
+            return TestResult::Fail("invalid clone flag dependency did not return EINVAL");
         }
     }
 
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "userspace",
-    smoke_userspace_clone_rejects_zero_entry_or_stack
+    smoke_userspace_clone_rejects_invalid_flag_dependencies
 );
 
 // ── ELF loader / syscall handler / signal / fd / scheduler-time tests ──
@@ -1536,12 +1545,13 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_distinct_tids_same_as);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_userspace_clone_rejects_without_address_space() -> TestResult {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_userspace_clone_returns_enomem_without_address_space() -> TestResult {
     // Symmetric to smoke_userspace_fork_rejects_without_address_space:
     // a clone issued with no AS lookup wired (or one that returns None)
-    // must surface a non-OK return rather than panic / spawn a child
-    // against a phantom AS.
+    // must return the Linux ENOMEM errno rather than panic or spawn a child
+    // against a phantom AS. Linux errno values travel in an OK transport
+    // response; userspace observes the signed value in the return register.
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
     *PARENT_AS.lock() = None;
@@ -1553,7 +1563,7 @@ fn smoke_userspace_clone_rejects_without_address_space() -> TestResult {
 
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 0x8000_0000_1000,
+            arg0: 0,
             arg1: 0x7fff_fff0_0000,
             arg2: 0,
             arg3: 0,
@@ -1568,16 +1578,16 @@ fn smoke_userspace_clone_rejects_without_address_space() -> TestResult {
         None => return TestResult::Fail("no return"),
     };
     crate::syscall::__test_clear_global();
-    if ret.status == SyscallReturn::OK {
-        TestResult::Fail("clone without AS lookup should not succeed")
-    } else {
+    if ret.status == SyscallReturn::OK && ret.value as i64 == -12 {
         TestResult::Pass
+    } else {
+        TestResult::Fail("clone without AS lookup did not return ENOMEM")
     }
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "userspace",
-    smoke_userspace_clone_rejects_without_address_space
+    smoke_userspace_clone_returns_enomem_without_address_space
 );
 
 #[cfg(target_arch = "x86_64")]
