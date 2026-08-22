@@ -9116,14 +9116,13 @@ fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult 
         }
     }
     let v = VirtAddr::new(0x0000_0080_0005_0000);
-    if a
-        .map_region(Region {
-            base: v,
-            len: 0x4000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: v,
+        len: 0x4000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]],
+    })
+    .is_err()
     {
         core::mem::forget(a);
         return TestResult::Fail("map_region failed");
@@ -9158,6 +9157,58 @@ kernel_test_in!(
     "memory",
     smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole
 );
+
+/// A supervisor-mode write (signal-frame placement) must be refused on a
+/// present-but-read-only user page rather than faulting the kernel. This is the
+/// guard behind deliver_signal's pre-flight: a stress-ng `bad-altstack` points
+/// `sigaltstack` at a `PROT_READ` page, and without the writability gate the
+/// CPL=0 frame write took an unrecoverable #PF and panicked the whole kernel
+/// instead of terminating just the offending task (Linux `force_sigsegv`).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_user_page_writable_gates_readonly() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let ro = VirtAddr::new(0x0000_0080_0090_0000);
+    let rw = VirtAddr::new(0x0000_0080_0091_0000);
+    if a.map_region(Region {
+        base: ro,
+        len: 0x1000,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![PhysAddr::new(0x3000_0000)],
+    })
+    .is_err()
+        || a.map_region(Region {
+            base: rw,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0x3000_1000)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+
+    // Read-only page (a PROT_READ sigaltstack) must be refused.
+    // SAFETY: identity map is live in the kernel-test environment; the method
+    // only reads region metadata for a non-COW mapping.
+    if unsafe { a.user_page_writable_or_resolve(ro) } {
+        return TestResult::Fail("read-only page accepted for a supervisor write");
+    }
+    // Writable page is accepted.
+    // SAFETY: as above.
+    if !unsafe { a.user_page_writable_or_resolve(rw) } {
+        return TestResult::Fail("writable page refused");
+    }
+    // Unmapped hole is refused.
+    // SAFETY: as above.
+    if unsafe { a.user_page_writable_or_resolve(VirtAddr::new(0x0000_0080_00a0_0000)) } {
+        return TestResult::Fail("unmapped page accepted");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_user_page_writable_gates_readonly);
 
 /// MADV_DONTNEED reports an unmapped hole without releasing either mapped
 /// island, and rounds a one-byte request over its containing page.

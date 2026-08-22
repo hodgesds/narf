@@ -53,6 +53,16 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
         if !backed {
             return false;
         }
+        // Presence is not writability. `AlignmentMismatch` above only proves
+        // the page is mapped — it may be read-only (an `mprotect(PROT_READ)`
+        // region, or a deliberately-bad `sigaltstack`). A CPL=0 frame write to
+        // such a page faults un-recoverably and panics the kernel. Confirm the
+        // page is (or can be made, via COW) writable; refuse otherwise so the
+        // caller applies the signal's default action instead.
+        // SAFETY: same identity-map / active-AS contract as the calls above.
+        if !unsafe { as_arc.user_page_writable_or_resolve(v) } {
+            return false;
+        }
         p = p.wrapping_add(0x1000);
     }
     true

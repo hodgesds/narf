@@ -6232,6 +6232,44 @@ impl AddressSpace {
         Err(AddressSpaceError::NotImplemented)
     }
 
+    /// Ensure a *present* user page at `vaddr` can accept a supervisor-mode
+    /// write (signal-frame placement, `copy_to_user`), resolving a COW copy in
+    /// place. Returns `false` for a genuinely read-only mapping — e.g. an
+    /// `mprotect(PROT_READ)` region or a bad `sigaltstack` — so the caller can
+    /// force the signal's default action instead of taking an unrecoverable
+    /// CPL=0 write fault that panics the kernel. Presence is the caller's job
+    /// (back demand / guard pages via `demand_alloc_page` / `try_grow_stack`
+    /// first); this checks writability, which presence alone does not imply.
+    ///
+    /// # Safety
+    /// Same identity-map / active-frame contract as [`Self::cow_split_on_write`]
+    /// and [`Self::remap_page`]: the low-4-GiB identity map must be live and the
+    /// frame allocator + COW refcount table initialised.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub unsafe fn user_page_writable_or_resolve(&self, vaddr: VirtAddr) -> bool {
+        let Some(region) = self.lookup(vaddr) else {
+            // Unmapped: nothing to write to.
+            return false;
+        };
+        if !region.perms.contains(RegionPerms::WRITE) {
+            // Genuinely read-only mapping — not writable, not recoverable.
+            return false;
+        }
+        if region.perms.contains(RegionPerms::COW) {
+            // Writable-but-COW: resolve the private copy and rewrite the leaf so
+            // the upcoming supervisor write lands on a private, writable page.
+            // SAFETY: forwarded to the callees' documented contract.
+            if unsafe { self.cow_split_on_write(vaddr) }.is_err() {
+                return false;
+            }
+            // SAFETY: cow_split_on_write just touched this region's page.
+            if unsafe { self.remap_page(vaddr) }.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Find the region covering `vaddr`, if any. Returns a copy
     /// since the region table lives behind an interior lock.
     pub fn lookup(&self, vaddr: VirtAddr) -> Option<Region> {
