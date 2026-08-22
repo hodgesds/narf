@@ -148,11 +148,15 @@ rolling generation-ordered cutover.
 - Budget-cap revocation is checked by the core; maintenance pops keep
   revocation observable even if every task is parked or throttled.
 
-The load-bearing involuntary domain-state requirement remains open: `TaskSlot`
-now carries an architecture-neutral `DomainSavedState` and cooperative polls
-use it, but trap entry must still neutralize rights before Rust and the switch
-primitive must restore state before the resumed task's first instruction.
-Policy code never receives this state.
+The load-bearing involuntary domain-state requirement is closed on x86_64 and
+aarch64. Common trap/vector entry captures rights in the architecture-owned
+trap frame and enters neutral Frame state before Rust. Fast x86_64 `SYSCALL`
+does the same. `kernel_switch` owns the stackful boundary: with interrupts
+masked, it captures live PKRS/CR3 or SCTLR/GCR before its first outgoing-context
+store, and restores the incoming snapshot after its final context load. A task
+preempted inside a trap resumes the neutral trap continuation first; the trap
+epilogue restores the interrupted rights immediately before IRET/ERET. Policy
+code receives none of this state.
 
 ## 7. Remaining gates
 
@@ -164,10 +168,8 @@ Policy code never receives this state.
   hard-IRQ entry/exit is live on both architectures.
 - Reconcile direct time-slice donation with periodic runtime transfer. Current
   period eligibility remains authoritative and donation cannot bypass it.
-- Complete trap-prologue domain neutralisation and restore domain state inside
-  the architecture switch primitive before the resumed continuation's first
-  instruction. Cooperative poll boundaries already use opaque
-  `DomainSavedState`, but that alone does not close involuntary-switch safety.
+- Add a real MTE-tag-aware allocator on aarch64; switch/vector mechanics
+  preserve SCTLR/GCR today, while enforcement remains structural.
 
 ## 8. Validation
 

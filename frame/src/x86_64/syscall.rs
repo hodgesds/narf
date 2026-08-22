@@ -127,6 +127,14 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov gs:[0], rsp",
         "mov rsp, gs:[8]",
 
+        // Reserve an architecture-private domain snapshot above UserState.
+        // The user register file is preserved below before any scratch
+        // register is reused. Offsets from the final UserState pointer are
+        // +152 state, +160 kind (0 inactive, 1 PKRS, 2 CR3/PCID).
+        "sub rsp, 16",
+        "mov qword ptr [rsp], 0",
+        "mov qword ptr [rsp + 8], 0",
+
         // Build a full `UserState` snapshot on the kernel stack.
         // Layout (low addr → high addr) from
         // `narf_arch::x86_64::user_mode::UserState`:
@@ -166,6 +174,33 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "push r13",                            // r13
         "push r14",                            // r14
         "push r15",                            // r15
+
+        // User GPRs are now safe in UserState. Capture the live task-domain
+        // state and enter neutral FRAME before the first Rust instruction.
+        "mov rax, cr4",
+        "bt rax, 24",
+        "jc 7f",
+        "bt rax, 17",
+        "jnc 9f",
+        "mov rax, qword ptr [rip + NARF_X86_FRAME_PML4]",
+        "test rax, rax",
+        "jz 9f",
+        "mov rcx, cr3",
+        "mov [rsp + 152], rcx",
+        "mov qword ptr [rsp + 160], 2",
+        "or rax, 1",
+        "bts rax, 63",
+        "mov cr3, rax",
+        "jmp 9f",
+        "7:",
+        "mov ecx, 0x6e1",
+        "rdmsr",
+        "mov [rsp + 152], rax",
+        "mov qword ptr [rsp + 160], 1",
+        "xor eax, eax",
+        "xor edx, edx",
+        "wrmsr",
+        "9:",
 
         // Re-enable interrupts for the body of the syscall. SYSCALL
         // entry cleared IF via IA32_FMASK (SFMASK_BITS); now that the
@@ -219,6 +254,29 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "jz 2f",                               // status == OK: keep rax = value
         "mov rax, -22",                        // status != OK: rax = -EINVAL
         "2:",
+        // Preserve the folded result before the domain restore reuses RAX/RDX.
+        "mov [rsp + 112], rax",
+
+        // Restore the entry rights before resuming the task. FRAME remains
+        // accessible in every admitted domain, so the UserState loads below
+        // remain valid after this point.
+        "mov rcx, [rsp + 160]",
+        "cmp rcx, 1",
+        "je 7f",
+        "cmp rcx, 2",
+        "je 8f",
+        "jmp 9f",
+        "7:",
+        "mov rax, [rsp + 152]",
+        "xor edx, edx",
+        "mov ecx, 0x6e1",
+        "wrmsr",
+        "jmp 9f",
+        "8:",
+        "mov rax, [rsp + 152]",
+        "bts rax, 63",
+        "mov cr3, rax",
+        "9:",
 
         // Restore the six user-side arg registers from the
         // UserState slots. SysV says the C dispatcher freely
@@ -250,6 +308,7 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov r13, [rsp + 16]",   // r13
         "mov r14, [rsp + 8]",    // r14
         "mov r15, [rsp + 0]",    // r15
+        "mov rax, [rsp + 112]",  // syscall result
 
         // Reload user RIP, RFLAGS from saved slots for sysretq.
         "mov rcx, [rsp + 120]",                // user RIP
@@ -384,6 +443,26 @@ unsafe extern "C" fn sigreturn_iret_exit_x86_64(
 ) -> ! {
     naked_asm!(
         "cli",
+        // `state + 152/160` is the private syscall-entry domain snapshot.
+        // Restore it here because this non-returning path bypasses the normal
+        // syscall tail. All admitted domains retain FRAME stack access.
+        "mov rcx, [rdi + 160]",
+        "cmp rcx, 1",
+        "je 7f",
+        "cmp rcx, 2",
+        "je 8f",
+        "jmp 9f",
+        "7:",
+        "mov rax, [rdi + 152]",
+        "xor edx, edx",
+        "mov ecx, 0x6e1",
+        "wrmsr",
+        "jmp 9f",
+        "8:",
+        "mov rax, [rdi + 152]",
+        "bts rax, 63",
+        "mov cr3, rax",
+        "9:",
         // Build the iretq frame below the UserState snapshot (rdi). This
         // region is dead caller-frame stack; this function never returns.
         "mov rax, [rdi + 136]", // user RSP

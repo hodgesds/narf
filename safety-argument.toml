@@ -240,6 +240,22 @@ ref = "security-model/specification/spec.md#L39"
 argument = "The scheduler edit adds accounting callbacks at existing x86_64 stackful switch boundaries inside the already enumerated executor TCB. It does not add a trusted subsystem, change task selection, alter a task's saved domain state, or move any capability or address-space ownership."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Trap-frame and kernel-continuation layouts move to the existing architecture TCB boundary and are consumed by frame and the executor without duplicate structs or pointer casts. The change adds no trusted subsystem or policy authority; scheduling policy crates still receive neither trap frames, hardware rights, stacks, nor the switch entry point."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Every common x86_64 trap, fast syscall, and aarch64 vector captures live PKRS/CR3 or SCTLR/GCR state and enters neutral Frame execution before any Rust runs. The architecture switch primitive masks interrupts, neutralises rights before its first outgoing-context store, reads the complete incoming context while neutral, and restores rights only after its final incoming-context load. Trap-preempted tasks resume the neutral handler continuation before the assembly epilogue restores the interrupted rights."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L67"
+argument = "Hardware domain state remains opaque task context. Cooperative stackless tasks retain memory::DomainSavedState; stackful tasks retain only architecture-private raw fields, and the new kernel smoke proves that a task yielding under BPF confinement neither leaks its rights to the executor nor loses them on resume. No scheduler policy callback observes the snapshot."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "On PKS systems each dedicated atomic-BPF stack leaf is tagged DomainId::BPF and is used only while FRAME+BPF rights are active. The confinement guard is !Send and holds the scheduler's nestable preemption guard so a CPU-local rights snapshot cannot migrate before restore. Sleepable BPF constructs and drops both guards around each individual poll, returning Pending only after neutral scheduler rights have been restored; its heap stack remains explicitly documented as FRAME-owned pending a domain-aware allocator."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Timer-preemption accounting reads only the current task's scalar timestamps while its continuation is pinned on the current CPU. The pause callback completes before CURRENT_STACKFUL_TASK is cleared, the resume callback runs only after the same continuation is current again, and both use IRQ-safe per-task accounting locks. Normal syscall entry creates the task's BTreeMap row before publishing the active span, so the timer-IRQ close path only updates an existing node and cannot allocate; no user pointer, capability, domain right, or cross-task memory is exposed or modified."
 

@@ -53,8 +53,10 @@ pub unsafe fn exit_domain();
 pub fn panic(msg: &PanicInfo) -> !;
 ```
 
-Trap entry is written in arch-asm, fans out to a `dispatch_trap(frame)`
-Rust function that forwards to `interrupts/` or handles synchronous faults.
+Trap entry is written in arch assembly and materialises the architecture-owned
+`narf_arch::{x86_64,aarch64}::trap_frame::TrapFrame`. `frame` re-exports the
+selected type and fans out to a Rust dispatcher. The scheduler consumes that
+shared type directly; it does not define or cast a mirror layout.
 
 ## 4. Invariants & safety properties
 
@@ -77,7 +79,8 @@ Rust function that forwards to `interrupts/` or handles synchronous faults.
   1. `swapgs` (x86_64) / set `TPIDR_EL1` (aarch64 if needed).
   2. Save GP regs + PKRS (`rdmsr IA32_PKRS`) / TCF (aarch64 `MRS`) into
      the trap frame.
-  3. Switch PKRS/TCF to the Frame's own domain (domain 0).
+  3. Enter neutral Frame execution state: PKRS all-allow, the Frame PCID root,
+     or MTE tag checks suspended while retaining `SCTLR_EL1.ATA`.
   4. Call `dispatch_trap(frame)`.
   5. On return: restore PKRS/TCF from the trap frame, restore GP regs,
      `iretq` / `eret`.
@@ -105,8 +108,9 @@ Rust function that forwards to `interrupts/` or handles synchronous faults.
   - IST5..7 — reserved.
   Each IST slot has its own 16 KiB stack per CPU, allocated by
   `memory/` at AP bring-up time.
-- Trap frame carries saved `IA32_PKRS` in a dedicated 64-bit field
-  between the general-purpose regs and the error-code field.
+- The trap-frame prefix carries a saved state plus a discriminator: inactive,
+  `IA32_PKRS`, or CR3/PCID. Fast `SYSCALL` entry uses the same ordering before
+  Rust and restores the snapshot on both SYSRET and IRET exits.
 
 ### aarch64
 - EL1 vector table aligned to 2 KiB; four groups of four vectors.
@@ -115,8 +119,8 @@ Rust function that forwards to `interrupts/` or handles synchronous faults.
 - **Stack alignment:** SP must be 16-byte aligned at EL1 vector entry;
   the vector prologue enforces this before any push.
 - **MTE is suspended on vector entry.** The prologue clears
-  `SCTLR_EL1.TCF` (TCF=0, ATA=0) before any trap code runs; the saved
-  TCF from the `DomainSavedState` is restored on `eret`. This prevents
+  `SCTLR_EL1.TCF/TCF0` while retaining `ATA`, then saves both SCTLR and GCR;
+  the exact state is restored on `eret`. This prevents
   the trap handler itself from faulting on tag mismatches while
   running in Frame context.
 
@@ -194,17 +198,20 @@ This is the existing v0.2 boundary; v1.0 just locks it.
 
 ### 8.4 Trap frame layout
 
-The trap frame is part of the kernel-side ABI between
-`frame/`'s asm prologue and `dispatch_trap` in Rust. Layout
-is fixed at v1.0 and any change is a major bump:
+The trap frame is part of the kernel-side ABI between `frame/` assembly,
+`arch/`'s shared Rust representation, and the executor's preemption hook.
+Architecture modules own the exact `#[repr(C)]` layouts and compile-time offset
+assertions. `frame` and `scheduler` may not redeclare or cast mirror structs.
+The schematic common portion is:
 
 ```rust
 #[repr(C)]
 pub struct TrapFrame {
-    // GPRs (arch-specific layout — 16 on x86_64, 31 on aarch64)
+    // saved domain state is the first field, so entry can neutralise rights
+    // before exposing any Rust reference to the remainder
+    pub domain:    ArchDomainTrapState,
+    // GPRs (arch-specific layout — 15 on x86_64, 31 on aarch64)
     pub gpr:       [u64; ARCH_GPR_COUNT],
-    // saved domain state (x86_64: PKRS; aarch64: TCF + GCR)
-    pub domain:    DomainSavedState,
     // architectural fields
     pub vector:    u64,            // IDT vector / exception class
     pub err_code:  u64,            // page-fault error / FAR_EL1 /...
@@ -213,7 +220,6 @@ pub struct TrapFrame {
     pub rflags_:   u64,            // saved RFLAGS / 0 (aarch64)
     pub rsp:       u64,            // saved RSP / SP_EL0
     pub ss_or_zero:u64,            // saved SS / 0
-    pub timestamp: u64,            // RDTSC / CNTPCT_EL0 at entry
 }
 ```
 

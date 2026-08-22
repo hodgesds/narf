@@ -823,6 +823,78 @@ fn smoke_bpf_yield_does_not_refill_fuel() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_yield_does_not_refill_fuel);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_bpf_sleepable_confinement_is_per_poll() -> TestResult {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context as TaskContext, Poll, Waker};
+
+    use narf_arch::x86_64::{pcid, pks, Pks};
+    use narf_arch::DomainPrimitive;
+    use narf_lib::id::DomainId;
+
+    if !pks::is_active() && !pcid::is_active() {
+        return TestResult::Skip("no x86 hardware-domain backend is active");
+    }
+
+    fn is_bpf_confined() -> bool {
+        if pks::is_active() {
+            // SAFETY: this smoke runs at CPL0 after the PKS backend is live.
+            let bpf = unsafe { pks::get_rights(DomainId::BPF.raw()) };
+            // SAFETY: same precondition.
+            let caps = unsafe { pks::get_rights(DomainId::CAPS.raw()) };
+            bpf == pks::DomainRights::ALLOW_ALL && caps.no_access
+        } else {
+            // PCID(domain) = domain + 1.
+            // SAFETY: this smoke runs at CPL0 after the PCID backend is live.
+            (unsafe { narf_arch::x86_64::cr::read_cr3() } & 0xfff) == DomainId::BPF.raw() as u64 + 1
+        }
+    }
+
+    struct TwoPolls {
+        first: bool,
+    }
+
+    impl Future for TwoPolls {
+        type Output = bool;
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<bool> {
+            if !is_bpf_confined() {
+                return Poll::Ready(false);
+            }
+            if self.first {
+                self.first = false;
+                Poll::Pending
+            } else {
+                Poll::Ready(true)
+            }
+        }
+    }
+
+    // SAFETY: an active x86 backend was established above.
+    let neutral = unsafe { Pks::save() };
+    let mut wrapped = core::pin::pin!(crate::domain::run_sleepable(TwoPolls { first: true }));
+    let mut cx = TaskContext::from_waker(Waker::noop());
+
+    if wrapped.as_mut().poll(&mut cx) != Poll::Pending {
+        return TestResult::Fail("sleepable BPF did not suspend on its first poll");
+    }
+    // SAFETY: active backend; returning Pending must have dropped confinement.
+    if unsafe { Pks::save() } != neutral {
+        return TestResult::Fail("sleepable BPF leaked domain rights while parked");
+    }
+    if wrapped.as_mut().poll(&mut cx) != Poll::Ready(true) {
+        return TestResult::Fail("sleepable BPF was not confined on resume");
+    }
+    // SAFETY: active backend; completion must also restore the caller's state.
+    if unsafe { Pks::save() } != neutral {
+        return TestResult::Fail("sleepable BPF leaked domain rights after completion");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bpf", smoke_bpf_sleepable_confinement_is_per_poll);
+
 // ── attach ──────────────────────────────────────────────────────────
 
 fn smoke_bpf_probe_attach_fires() -> TestResult {

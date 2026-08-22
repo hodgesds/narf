@@ -1230,6 +1230,11 @@ impl BpfProg {
         if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
             return None;
         }
+        // This public differential-test entry point is still an execution
+        // boundary. Keep it under the same hardware fence as the normal
+        // atomic dispatcher so external callers cannot bypass confinement by
+        // forcing the interpreter.
+        let _confined = crate::domain::enter();
         self.run_atomic_interpreted_inner(ctx, ctx_len, None, None)
     }
 
@@ -1519,7 +1524,7 @@ impl BpfProg {
         .with_arenas(self.arenas())
         .with_map_indices(&self.map_indices);
         let stats_start = crate::stats::run_start();
-        let outcome = vm.run().await;
+        let outcome = crate::domain::run_sleepable(vm.run()).await;
         self.record(outcome, stats_start);
         Some(outcome)
     }

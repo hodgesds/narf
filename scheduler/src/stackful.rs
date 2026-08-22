@@ -56,42 +56,12 @@ use core::task::{Context, Poll, Waker};
 
 #[cfg(target_arch = "aarch64")]
 use narf_arch::aarch64::kernel_ctx::{kernel_switch, KernelContext};
+#[cfg(target_arch = "aarch64")]
+use narf_arch::aarch64::trap_frame::TrapFrame as Aarch64TrapFrame;
 #[cfg(target_arch = "x86_64")]
 use narf_arch::x86_64::kernel_ctx::{kernel_switch, KernelContext};
-
-/// Trap frame layout matching `narf_frame::x86_64::trap::TrapFrame`.
-/// Re-declared here because scheduler can't depend on frame (frame
-/// depends on scheduler). A const-assert pins layout equality at
-/// the `frame` end; drift on either side fails the build.
-///
-/// Order follows `frame::x86_64::trap_entry.S`'s reverse-push +
-/// CPU-pushed tail.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct TrapFrame {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rbp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
-    pub rax: u64,
-    pub vector: u64,
-    pub error_code: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
+#[cfg(target_arch = "x86_64")]
+use narf_arch::x86_64::trap_frame::TrapFrame;
 
 /// Default time slice for preemptive tasks. 10 ms ≈ 33 M cycles on
 /// a 3.3 GHz Zen2. Matches Linux's `CONFIG_HZ_100`-ish granularity
@@ -527,9 +497,12 @@ fn guard_switch_into(label: &str, ctx: &KernelContext) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 const fn zeroed_trap_frame() -> TrapFrame {
     TrapFrame {
+        domain_state: 0,
+        domain_kind: 0,
         r15: 0,
         r14: 0,
         r13: 0,
@@ -599,12 +572,6 @@ pub struct KernelTask {
     /// Separate CPL3 policy. User tasks can be time-sliced while their CPL0
     /// syscall continuations remain run-to-completion (`no_preempt = true`).
     user_preempt: AtomicBool,
-    /// Saved trap frame when the task was preempted. The
-    /// preempt_resume_stub uses this to IRET back to the exact
-    /// instruction the LAPIC timer interrupted. UnsafeCell because
-    /// the trap-handler hook needs raw write access from inside
-    /// an IRQ context (no Mutex).
-    saved_trap_frame: UnsafeCell<TrapFrame>,
     /// Set true by the trap-handler hook when it rewrites the
     /// frame.rip to preempt_yield_stub. Read by
     /// `kernel_switch` resume path to choose `kernel_switch`-restore
@@ -730,7 +697,6 @@ impl KernelTask {
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
             no_preempt: AtomicBool::new(false),
             user_preempt: AtomicBool::new(false),
-            saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
@@ -1410,13 +1376,8 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     }
 
     // Mark for debug visibility (consumed by the smoke tests).
-    // SAFETY: Same live-`KernelTask` invariant as above. `saved_trap_frame` is
-    // an UnsafeCell owned by this task and only written here while the task is
-    // the CPU's CURRENT_STACKFUL_TASK, so there is no concurrent access; the
-    // volatile write copies the caller-owned `*frame` into it.
-    // SAFETY: Valid memory or trusted environment
+    // SAFETY: Same live-`KernelTask` invariant as above.
     unsafe {
-        core::ptr::write_volatile((*task_ptr).saved_trap_frame.get(), *frame);
         (*task_ptr).preempted.store(true, Ordering::Release);
     }
 
@@ -1506,10 +1467,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
 /// executor and later resumes it unchanged.
 ///
 /// # Safety
-/// `frame_addr` must name the live vector frame on the current stack, and the
+/// `frame` must be the live vector frame on the current stack, and the
 /// GIC interrupt must have been EOI'd before this call.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn try_preempt_aarch64(frame_addr: usize) -> bool {
+pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     if !preempt_enabled() {
         return false;
     }
@@ -1533,6 +1494,7 @@ pub unsafe fn try_preempt_aarch64(frame_addr: usize) -> bool {
     if exec_ctx.is_null() {
         return false;
     }
+    let frame_addr = frame as *const Aarch64TrapFrame as usize;
     let stack_base = task.stack.as_ptr() as usize;
     let stack_top = stack_base + task.stack.len();
     if frame_addr < stack_base || frame_addr >= stack_top {
@@ -2313,6 +2275,99 @@ pub mod tests {
         }
         if COUNTER.load(Ordering::Acquire) != 1 {
             return TestResult::Fail("counter not bumped");
+        }
+        TestResult::Pass
+    }
+
+    /// A cooperative stack switch must carry hardware-domain state with the
+    /// task while restoring the executor's prior neutral state. This exercises
+    /// the same architecture primitive used by involuntary preemption after a
+    /// trap prologue has neutralised rights.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_switch_preserves_domain_state() -> TestResult {
+        use core::sync::atomic::AtomicBool;
+        use narf_arch::x86_64::{pcid, pks, Pks};
+        use narf_arch::DomainPrimitive;
+        use narf_lib::id::DomainId;
+
+        static RESUMED_CONFINED: AtomicBool = AtomicBool::new(false);
+
+        if !pks::is_active() && !pcid::is_active() {
+            return TestResult::Skip("no x86 hardware-domain backend is active");
+        }
+
+        struct DomainYield {
+            phase: u8,
+            saved: Option<pks::SavedPkrs>,
+        }
+
+        impl Future for DomainYield {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                if self.phase == 0 {
+                    // SAFETY: the kernel test runs at CPL0; FRAME remains
+                    // accessible and the saved value is restored below.
+                    self.saved = Some(unsafe {
+                        Pks::enter_domain(DomainId::FRAME.raw(), DomainId::BPF.raw())
+                    });
+                    self.phase = 1;
+                    return Poll::Pending;
+                }
+
+                let resumed_confined = if pks::is_active() {
+                    // SAFETY: PKS is live by the branch condition.
+                    let bpf = unsafe { pks::get_rights(DomainId::BPF.raw()) };
+                    // SAFETY: same precondition.
+                    let caps = unsafe { pks::get_rights(DomainId::CAPS.raw()) };
+                    bpf == pks::DomainRights::ALLOW_ALL && caps.no_access
+                } else {
+                    // PCID(domain) = domain + 1.
+                    // SAFETY: CPL0 kernel test.
+                    (unsafe { narf_arch::x86_64::cr::read_cr3() } & 0xfff)
+                        == DomainId::BPF.raw() as u64 + 1
+                };
+                RESUMED_CONFINED.store(resumed_confined, Ordering::Release);
+
+                if let Some(saved) = self.saved.take() {
+                    // SAFETY: balances the first poll's enter on the resumed
+                    // task continuation.
+                    unsafe { Pks::exit_domain(saved) };
+                }
+                Poll::Ready(())
+            }
+        }
+
+        // SAFETY: active backend established above.
+        let executor_before = unsafe { Pks::save() };
+        RESUMED_CONFINED.store(false, Ordering::Release);
+        let mut task = KernelTask::new(DomainYield {
+            phase: 0,
+            saved: None,
+        });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+
+        // SAFETY: single test-owned task/context, no concurrent poll.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Pending {
+            return TestResult::Fail("domain task did not yield");
+        }
+        // SAFETY: active backend; the executor must have recovered its entry
+        // state rather than inheriting BPF confinement.
+        if unsafe { Pks::save() } != executor_before {
+            return TestResult::Fail("executor inherited task domain state");
+        }
+
+        // SAFETY: same live task/context as the first switch round-trip.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+            return TestResult::Fail("domain task did not complete after resume");
+        }
+        if !RESUMED_CONFINED.load(Ordering::Acquire) {
+            return TestResult::Fail("task domain state was not restored on resume");
+        }
+        // SAFETY: active backend.
+        if unsafe { Pks::save() } != executor_before {
+            return TestResult::Fail("task domain state leaked after completion");
         }
         TestResult::Pass
     }
@@ -4804,6 +4859,11 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_trivial_future_completes
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_switch_preserves_domain_state
     );
     kernel_test_in!(
         "scheduler/stackful",

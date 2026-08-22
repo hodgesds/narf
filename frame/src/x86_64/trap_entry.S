@@ -157,6 +157,39 @@ common_trap:
     push r14
     push r15
 
+    /* Reserve the architecture-owned domain prefix. No Rust may execute
+     * until the live task rights have been captured and FRAME is active.
+     * kind: 0 = inactive, 1 = PKRS, 2 = CR3/PCID. */
+    sub rsp, 16
+    mov qword ptr [rsp], 0
+    mov qword ptr [rsp + 8], 0
+
+    mov rax, cr4
+    bt rax, 24                         /* CR4.PKS */
+    jc .Ldomain_enter_pks
+    bt rax, 17                         /* CR4.PCIDE */
+    jnc .Ldomain_enter_done
+    mov rax, qword ptr [rip + NARF_X86_FRAME_PML4]
+    test rax, rax                      /* PCID enforcer not initialised yet */
+    jz .Ldomain_enter_done
+    mov rcx, cr3
+    mov qword ptr [rsp], rcx
+    mov qword ptr [rsp + 8], 2
+    or rax, 1                          /* FRAME uses PCID 1 */
+    bts rax, 63                        /* preserve tagged translations */
+    mov cr3, rax
+    jmp .Ldomain_enter_done
+
+.Ldomain_enter_pks:
+    mov ecx, 0x6e1                     /* IA32_PKRS */
+    rdmsr
+    mov qword ptr [rsp], rax
+    mov qword ptr [rsp + 8], 1
+    xor eax, eax                       /* neutral FRAME: all domains allowed */
+    xor edx, edx
+    wrmsr
+.Ldomain_enter_done:
+
     /* RDI = pointer to the trap frame (the current RSP). */
     mov rdi, rsp
 
@@ -168,6 +201,27 @@ common_trap:
      *   - call exit_kernel internally → never returns here.
      */
     call rust_trap_handler
+
+    /* Restore the exact state captured on entry. Nested traps naturally save
+     * and restore the neutral state established by their outer trap. */
+    mov rcx, qword ptr [rsp + 8]
+    cmp rcx, 1
+    je .Ldomain_exit_pks
+    cmp rcx, 2
+    je .Ldomain_exit_pcid
+    jmp .Ldomain_exit_done
+.Ldomain_exit_pks:
+    mov rax, qword ptr [rsp]
+    xor edx, edx
+    mov ecx, 0x6e1                     /* IA32_PKRS */
+    wrmsr
+    jmp .Ldomain_exit_done
+.Ldomain_exit_pcid:
+    mov rax, qword ptr [rsp]
+    bts rax, 63
+    mov cr3, rax
+.Ldomain_exit_done:
+    add rsp, 16
 
     /* Restore general-purpose registers in reverse push order. */
     pop r15

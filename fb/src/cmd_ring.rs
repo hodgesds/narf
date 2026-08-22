@@ -189,13 +189,7 @@ pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>, writer: &FbWrit
     let mut errors = 0u32;
     // Loop ends when `try_recv` returns `Empty` or `Closed`.
     while let Ok(cmd) = consumer.try_recv() {
-        let rect = Rect::new(cmd.x, cmd.y, cmd.w, cmd.h);
-        let res: Result<(), FbWriteError> = match cmd.tag {
-            TAG_FILL => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
-            TAG_FLUSH => writer.flush(rect),
-            TAG_BLIT => writer.blit_from_shmem(rect, cmd.buffer, cmd.src_offset, cmd.src_stride),
-            _ => Err(FbWriteError::OutOfBounds),
-        };
+        let res = execute(cmd, writer);
         if res.is_err() {
             errors += 1;
         } else {
@@ -203,6 +197,22 @@ pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>, writer: &FbWrit
         }
     }
     (executed, errors)
+}
+
+/// Execute one command after its consumer-side ring lock has been released.
+///
+/// The registry uses this split form because a virtio-gpu flush drives the
+/// sleep pumps while waiting for the device. Holding an IRQ-safe ring lock
+/// across that round trip would make the nested FB pump deadlock on the same
+/// lock and would keep interrupts masked for up to the device timeout.
+pub(crate) fn execute(cmd: DrawCmd, writer: &FbWriter) -> Result<(), FbWriteError> {
+    let rect = Rect::new(cmd.x, cmd.y, cmd.w, cmd.h);
+    match cmd.tag {
+        TAG_FILL => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
+        TAG_FLUSH => writer.flush(rect),
+        TAG_BLIT => writer.blit_from_shmem(rect, cmd.buffer, cmd.src_offset, cmd.src_stride),
+        _ => Err(FbWriteError::OutOfBounds),
+    }
 }
 
 /// Helper for tests + producers that want to enqueue without

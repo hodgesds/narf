@@ -66,7 +66,11 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Bootstrap PML4 physical address (PML4_MASK bits only). Set by
 /// `init`. Used as the fallback when a domain has no registered PML4.
-static BOOTSTRAP_PML4: AtomicU64 = AtomicU64::new(0);
+// Read by the trap-entry assembly to enter the neutral FRAME address space
+// before any Rust executes. This is a linker-private architecture ABI, not a
+// supported Rust interface.
+#[unsafe(no_mangle)]
+pub(crate) static NARF_X86_FRAME_PML4: AtomicU64 = AtomicU64::new(0);
 
 /// Per-domain PML4 registry. Zero = "no per-domain PML4; fall back to
 /// bootstrap." Populated lazily by `set_domain_pml4` once `memory/`
@@ -182,7 +186,7 @@ pub unsafe fn enable_pcide() {
 pub unsafe fn init() {
     // SAFETY: caller ordering above.
     let cr3 = unsafe { cr::read_cr3() };
-    BOOTSTRAP_PML4.store(cr3 & PML4_MASK, Ordering::Relaxed);
+    NARF_X86_FRAME_PML4.store(cr3 & PML4_MASK, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Release);
 }
 
@@ -222,7 +226,7 @@ fn cr3_for_domain(domain: u8) -> u64 {
         if registered != 0 {
             registered
         } else {
-            BOOTSTRAP_PML4.load(Ordering::Relaxed)
+            NARF_X86_FRAME_PML4.load(Ordering::Relaxed)
         }
     };
     let pcid = (domain as u64 + 1) & PCID_MASK;

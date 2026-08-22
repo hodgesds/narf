@@ -35,6 +35,7 @@ pub mod ssbs;
 pub mod sve;
 pub mod sysreg;
 pub mod timer;
+pub mod trap_frame;
 pub mod trbe;
 pub mod user_mode;
 

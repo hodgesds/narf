@@ -721,41 +721,9 @@ mod perf_dump {
     }
 }
 
-/// The on-stack layout that `common_trap` builds before calling here.
-///
-/// Order follows the asm's reverse pushes + CPU-pushed frame at the end.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TrapFrame {
-    // General-purpose registers, in the order `common_trap` pushes them.
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rbp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
-    pub rax: u64,
-
-    // Pushed by `common_trap` before the GP saves.
-    pub vector: u64,
-    pub error_code: u64,
-
-    // Pushed by the CPU on exception. In long mode these are always
-    // 64-bit and the SS/RSP pair is always present.
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
+/// The architecture-owned layout that `common_trap` builds before calling
+/// Rust. Re-exported so existing frame consumers keep a stable path.
+pub use narf_arch::x86_64::trap_frame::TrapFrame;
 
 /// Zero one saved general-purpose register in a live trap frame.
 ///
@@ -975,28 +943,6 @@ mod kcore {
         }
     }
 }
-
-impl core::fmt::Debug for TrapFrame {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "TrapFrame {{ vec={}, err={:#x}, rip={:#018x}, cs={:#x}, rflags={:#x} }}",
-            self.vector, self.error_code, self.rip, self.cs, self.rflags
-        )
-    }
-}
-
-// Layout assertion: `narf_scheduler::stackful::TrapFrame` is a
-// re-declaration of this struct (scheduler can't depend on frame,
-// so the two are kept in sync by this assertion). Drift on
-// either side fails the build.
-const _: () = {
-    assert!(
-        core::mem::size_of::<TrapFrame>()
-            == core::mem::size_of::<narf_scheduler::stackful::TrapFrame>(),
-        "TrapFrame size must match scheduler::stackful::TrapFrame",
-    );
-};
 
 fn vector_name(v: u64) -> &'static str {
     match v {
@@ -1266,9 +1212,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             unsafe {
                 #[cfg(feature = "stall-watchdog")]
                 stall_wd::stage(3);
-                let sched_frame_ptr =
-                    frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
-                narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
+                narf_scheduler::stackful::try_preempt(frame);
                 #[cfg(feature = "stall-watchdog")]
                 stall_wd::stage(4);
             }
@@ -1332,9 +1276,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // SAFETY: TrapFrame layout matches narf-scheduler's mirror
                 // (asserted in stackful.rs); `frame` is the live trap frame.
                 unsafe {
-                    let sched_frame_ptr =
-                        frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
-                    narf_scheduler::stackful::try_preempt_user(&mut *sched_frame_ptr);
+                    narf_scheduler::stackful::try_preempt_user(frame);
                 }
             } else {
                 let mut ctx = X86TrapContext::from_int80(frame);
@@ -2490,6 +2432,8 @@ impl SmokeStack {
 /// sentinel so the arch's sigcontext write is easy to verify.
 fn smoke_signal_trap_frame(rip: u64, rsp: u64) -> TrapFrame {
     TrapFrame {
+        domain_state: 0,
+        domain_kind: 0,
         r15: 0xF1F1_F1F1_F1F1_F1F1,
         r14: 0xE2E2_E2E2_E2E2_E2E2,
         r13: 0xD3D3_D3D3_D3D3_D3D3,

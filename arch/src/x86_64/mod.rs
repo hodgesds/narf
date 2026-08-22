@@ -66,6 +66,7 @@ pub mod sse;
 pub mod svm;
 pub mod tme;
 pub mod topology;
+pub mod trap_frame;
 pub mod tsc;
 pub mod uintr;
 pub mod user_mode;
