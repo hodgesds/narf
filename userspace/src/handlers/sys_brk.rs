@@ -4,12 +4,14 @@ use super::*;
 /// `brk(2)` core, driven off the ADDRESS SPACE's break (not per-task).
 ///
 /// The break is AS state: `CLONE_VM` threads share it (they share the
-/// `AddressSpace`) and a real fork inherits it (`clone_for_fork`). Keying it
-/// per-task let a fresh worker thread — with no entry — answer `brk(0)` with the
-/// arena base, which glibc latched into its process-global `__curbrk`; the main
-/// thread's next `sbrk` then computed a mid-heap break and the shrink path below
-/// `unmap_region`'d live heap out from under malloc (a deterministic heap
-/// use-after-unmap SIGSEGV, observed in kwin_wayland). See `AddressSpace::brk_top`.
+/// `AddressSpace`) and a real fork inherits it (`clone_for_fork`). See
+/// `AddressSpace::brk_top`.
+///
+/// The heap is a SINGLE growable VMA rooted at `BRK_DEFAULT_BASE`. A grow
+/// extends that VMA in place (`brk_extend_region`) and materializes only the
+/// appended pages (`materialize_range`); a shrink tail-punches the freed range
+/// (`punch_fixed`). Repeated small grows therefore stay O(log VMA + pages-added)
+/// instead of accumulating one VMA per grow and rescanning every earlier VMA.
 ///
 /// Returns the resulting break (Linux `brk` reports the break value, never an
 /// errno; glibc's wrapper detects failure by comparing against the request).
@@ -34,40 +36,28 @@ fn brk_core(as_ref: &AddressSpace, new_break: u64) -> u64 {
         return cur;
     }
 
-    // Shrink path: walk the per-grow-call brk regions (each base ≥
-    // BRK_DEFAULT_BASE) and unmap any whose base falls entirely within
-    // [new_break_aligned, cur). Each unmap_region walks PTEs + frees the
-    // underlying frames. A grow region whose base sits BELOW new_break but
-    // extends past it is left intact — partial unmapping would need a region-
-    // split primitive; documented limitation, over-keep bounded by the grow
-    // chunk size.
+    let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
+    let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
+
+    // Shrink path: the heap is one VMA growing up from `BRK_DEFAULT_BASE`, so a
+    // shrink is a tail punch of `[new_aligned, cur_aligned)`. `punch_fixed`
+    // selects the intersecting VMA from the ordered index, tears down only that
+    // tail's PTEs, frees only its frames, truncates the heap VMA in place, and
+    // issues ONE batched cross-CPU flush — no whole-address-space snapshot. A
+    // shrink that lands inside the heap's last page (new_aligned == cur_aligned)
+    // frees nothing; the partial-page break is recorded below.
     if new_break < cur {
-        let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-        let mut bases_to_unmap: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for r in as_ref.regions_snapshot().iter() {
-            let rb = r.base.as_u64();
-            // Brk-grow regions live in `[BRK_DEFAULT_BASE, cur)` — bounded above
-            // by the OLD break. Without the `rb < cur` upper bound, any region
-            // above BRK_DEFAULT_BASE matches and gets unmapped, which on a fresh
-            // process (cur == BRK_DEFAULT_BASE) silently nukes the user stack the
-            // next time the caller does `brk(small_value)` (ld-musl's
-            // `__init_libc` does exactly that early in init).
-            if rb >= BRK_DEFAULT_BASE && rb < cur && rb >= new_aligned {
-                bases_to_unmap.push(rb);
-            }
-        }
-        for b in bases_to_unmap {
-            let _ = as_ref.unmap_region(VirtAddr::new(b));
+        if new_aligned < cur_aligned {
+            let _ = as_ref.punch_fixed(VirtAddr::new(new_aligned), cur_aligned - new_aligned);
         }
         as_ref.set_brk_top(new_break);
         return new_break;
     }
 
-    // Grow path: allocate frames + install a SINGLE Region for the whole new
-    // range. On any failure, roll the break back to `cur` (POSIX brk failure
-    // contract) WITHOUT leaking frames or leaving a half-registered region.
-    let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
-    let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
+    // Grow path: extend the single heap VMA in place with freshly zeroed frames,
+    // then materialize ONLY the appended range. On any failure roll the break
+    // back to `cur` (POSIX brk failure contract) without leaking frames or
+    // leaving the heap VMA grown past a range whose PTEs never installed.
     let pages = (new_aligned - cur_aligned) >> 12;
     if pages == 0 {
         // Within-page grow — just record the new break, no PTE work.
@@ -95,25 +85,26 @@ fn brk_core(as_ref: &AddressSpace, new_break: u64) -> u64 {
         }
         phys_list.push(phys);
     }
+    // `brk_extend_region` moves `phys_list` into the heap VMA on success; on
+    // failure it leaves it untouched so we free the frames and roll back.
     if as_ref
-        .map_region(Region {
-            base: VirtAddr::new(cur_aligned),
-            len: pages * 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: phys_list,
-        })
+        .brk_extend_region(VirtAddr::new(BRK_DEFAULT_BASE), cur_aligned, phys_list.clone())
         .is_err()
     {
+        for p in &phys_list {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(*p));
+        }
         return cur;
     }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the brk
-    // region was just registered via `map_region`, so materialize installs only
-    // its PTEs.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { as_ref.materialize() }.is_err() {
-        // Un-register the region we just mapped: rolling the break back while
-        // leaving the region installed wedges every future grow on Overlap.
-        let _ = as_ref.unmap_region(VirtAddr::new(cur_aligned));
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
+    // appended pages were just registered on the heap VMA, so materialize_range
+    // installs only their PTEs and skips every earlier VMA.
+    if unsafe { as_ref.materialize_range(VirtAddr::new(cur_aligned), pages * 0x1000) }.is_err() {
+        // Undo the extension: punch the just-appended tail (tears down any PTEs
+        // that installed, frees its frames, truncates the heap VMA back to
+        // `cur_aligned`), then report the unchanged break. Leaving the heap
+        // grown would wedge every future grow on a stale successor overlap.
+        let _ = as_ref.punch_fixed(VirtAddr::new(cur_aligned), pages * 0x1000);
         return cur;
     }
 
@@ -215,4 +206,144 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_brk_break_is_address_space_scoped_and_inherited);
+
+    /// Count heap VMAs (bases inside the brk arena) currently registered.
+    fn heap_vma_count(aspace: &AddressSpace) -> usize {
+        aspace
+            .regions_snapshot()
+            .iter()
+            .filter(|r| (BRK_DEFAULT_BASE..BRK_ARENA_TOP).contains(&r.base.as_u64()))
+            .count()
+    }
+
+    /// The heap is a SINGLE growable VMA: many small grows extend it in place
+    /// (one VMA, not N) and materialize only the appended pages; a shrink
+    /// tail-punches. This pins the O(1)-VMA growth, that grown pages are
+    /// readable + zeroed, exact partial-page break semantics, and that a grow
+    /// which fails to register leaves the break unchanged (POSIX rollback).
+    fn smoke_brk_single_growable_vma() -> TestResult {
+        let base = BRK_DEFAULT_BASE;
+        // SAFETY: kernel tests run with paging live and the frame allocator
+        // initialised, satisfying new_for_user's contract.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => a,
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+
+        // Seed the arena base.
+        if brk_core(&aspace, 0) != base {
+            return TestResult::Fail("initial brk(0) did not return the arena base");
+        }
+
+        // Many small grows, each one page. Each must advance the break and, as
+        // the whole point of the fix, keep exactly ONE heap VMA.
+        let grows = 64u64;
+        for i in 1..=grows {
+            let want = base + i * 0x1000;
+            if brk_core(&aspace, want) != want {
+                return TestResult::Fail("small grow did not return the new break");
+            }
+            if heap_vma_count(&aspace) != 1 {
+                return TestResult::Fail("small grows registered more than one heap VMA");
+            }
+        }
+        let top = base + grows * 0x1000;
+        if aspace.brk_top() != top {
+            return TestResult::Fail("break did not advance across small grows");
+        }
+
+        // Every grown page is mapped, and its backing frame is zeroed. The AS is
+        // not activated in a kernel test, so read the frame through the low-4-GiB
+        // identity map (same window brk_core zeroes through).
+        let region = match aspace.lookup(VirtAddr::new(base)) {
+            Some(r) => r,
+            None => return TestResult::Fail("heap VMA absent after grows"),
+        };
+        if region.len != grows * 0x1000 {
+            return TestResult::Fail("heap VMA len did not track the grows");
+        }
+        for (pg, phys) in region.phys.iter().enumerate() {
+            if phys.raw() == 0 {
+                return TestResult::Fail("grown heap page is unbacked");
+            }
+            // SAFETY: identity-mapped low 4 GiB; frame is page-aligned and was
+            // just allocated + zeroed for this heap.
+            let byte = unsafe { core::ptr::read_volatile(phys.raw() as *const u8) };
+            if byte != 0 {
+                let _ = pg;
+                return TestResult::Fail("grown heap page is not zeroed");
+            }
+        }
+
+        // `top` is page aligned, so a grow into it needs the containing page
+        // backed: growing to `top+0x40` adds exactly one page and lands the
+        // break mid-page.
+        let mid = top + 0x40;
+        if brk_core(&aspace, mid) != mid {
+            return TestResult::Fail("grow into a fresh page did not return the new break");
+        }
+        if aspace.brk_top() != mid
+            || heap_vma_count(&aspace) != 1
+            || aspace.lookup(VirtAddr::new(base)).map(|r| r.len) != Some((grows + 1) * 0x1000)
+        {
+            return TestResult::Fail("grow into a fresh page did not add exactly one page");
+        }
+
+        // Exact partial-page break: extending the break WITHIN the now-backed
+        // last page moves the break without adding a page or a VMA.
+        let within = top + 0x80;
+        if brk_core(&aspace, within) != within {
+            return TestResult::Fail("within-page grow did not return the new break");
+        }
+        if aspace.brk_top() != within
+            || heap_vma_count(&aspace) != 1
+            || aspace.lookup(VirtAddr::new(base)).map(|r| r.len) != Some((grows + 1) * 0x1000)
+        {
+            return TestResult::Fail("within-page grow changed the heap VMA");
+        }
+
+        // Partial-page shrink back within the last page frees no frame and keeps
+        // the VMA, but records the smaller break.
+        if brk_core(&aspace, mid) != mid {
+            return TestResult::Fail("within-page shrink did not return the new break");
+        }
+        if aspace.brk_top() != mid
+            || heap_vma_count(&aspace) != 1
+            || aspace.lookup(VirtAddr::new(base)).map(|r| r.len) != Some((grows + 1) * 0x1000)
+        {
+            return TestResult::Fail("within-page shrink changed the heap VMA");
+        }
+
+        // A failed grow leaves the break unchanged (POSIX rollback). Requesting
+        // past the arena ceiling is rejected and must report the OLD break.
+        let before = aspace.brk_top();
+        if brk_core(&aspace, BRK_ARENA_TOP + 0x1000) != before {
+            return TestResult::Fail("over-ceiling grow did not report the old break");
+        }
+        if aspace.brk_top() != before {
+            return TestResult::Fail("over-ceiling grow moved the break");
+        }
+
+        // A real shrink tail-punches: pages at/above the new break go, the VMA
+        // stays single and truncated, pages below remain mapped.
+        let shrink_to = base + 8 * 0x1000;
+        if brk_core(&aspace, shrink_to) != shrink_to {
+            return TestResult::Fail("shrink did not return the new break");
+        }
+        if heap_vma_count(&aspace) != 1 {
+            return TestResult::Fail("shrink split or dropped the single heap VMA");
+        }
+        if aspace.lookup(VirtAddr::new(base + 32 * 0x1000)).is_some() {
+            return TestResult::Fail("shrink kept a page above the new break");
+        }
+        if aspace.lookup(VirtAddr::new(base + 4 * 0x1000)).is_none() {
+            return TestResult::Fail("shrink unmapped a page below the new break");
+        }
+        match aspace.lookup(VirtAddr::new(base)) {
+            Some(r) if r.len == 8 * 0x1000 => {}
+            _ => return TestResult::Fail("heap VMA not truncated to the new break"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_single_growable_vma);
 }

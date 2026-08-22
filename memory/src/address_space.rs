@@ -926,6 +926,81 @@ impl AddressSpace {
             .store(top, core::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Extend the single growable `brk(2)` heap VMA at `heap_base` by appending
+    /// `frames` at `[grow_lo, grow_lo + frames.len() * 4096)`.
+    ///
+    /// The heap is one VMA that grows in place: a `brk` heap chunk of `n` frames
+    /// appends to the region's backing vector and bumps its `len`, rather than
+    /// registering a fresh VMA per grow. Callers materialize only the appended
+    /// range afterward (see `materialize_range`), so repeated small grows cost
+    /// O(log VMA + pages-added) instead of rescanning every earlier VMA.
+    ///
+    /// `frames` are moved into the region's backing on success. On any error the
+    /// caller still owns them (they were not appended) and must free them.
+    ///
+    /// `grow_lo` must be page-aligned and equal to the current end of the heap
+    /// VMA (`heap_base + len`) when a heap VMA exists, or `heap_base` for the
+    /// first grow. The appended tail must not overlap the successor VMA.
+    pub fn brk_extend_region(
+        &self,
+        heap_base: VirtAddr,
+        grow_lo: u64,
+        frames: Vec<PhysAddr>,
+    ) -> Result<(), AddressSpaceError> {
+        if grow_lo & 0xFFF != 0 || frames.is_empty() {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let add_len = (frames.len() as u64) * 0x1000;
+        let grow_hi = grow_lo
+            .checked_add(add_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+
+        let mut regions = self.regions.lock();
+        // The successor VMA (first base strictly above the growing region) must
+        // start at or after the new tail end, or the heap would overlap it.
+        if regions
+            .successor(grow_lo)
+            .is_some_and(|successor| successor.base.as_u64() < grow_hi)
+        {
+            return Err(AddressSpaceError::Overlap);
+        }
+
+        if let Some(heap) = regions.get_mut(heap_base.as_u64()) {
+            // Extend in place: the append site must be exactly the region's
+            // current end so the backing vector stays index==(va-base)/4096.
+            if heap.base.as_u64().saturating_add(heap.len) != grow_lo {
+                return Err(AddressSpaceError::Overlap);
+            }
+            heap.phys.extend_from_slice(&frames);
+            heap.len += add_len;
+        } else {
+            // First grow: the heap VMA does not exist yet. It must begin at the
+            // append site (there is no earlier heap prefix to be contiguous
+            // with). A predecessor VMA ending past `grow_lo` would overlap.
+            if grow_lo != heap_base.as_u64() {
+                return Err(AddressSpaceError::Overlap);
+            }
+            if regions
+                .predecessor(grow_lo)
+                .is_some_and(|p| p.base.as_u64().saturating_add(p.len) > grow_lo)
+            {
+                return Err(AddressSpaceError::Overlap);
+            }
+            assert!(regions
+                .insert(Region {
+                    base: heap_base,
+                    len: add_len,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: frames,
+                })
+                .is_none());
+        }
+        drop(regions);
+        self.bump_mmap_cursor_past(grow_lo, add_len);
+        Ok(())
+    }
+
     /// Allocate a fresh user-mode PML4 (x86_64) or TTBR0 page-table
     /// root (aarch64) inheriting every kernel-half entry from the
     /// currently-active root. The returned `AddressSpace` can be
