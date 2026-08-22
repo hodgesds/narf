@@ -115,6 +115,18 @@ fn smoke_ext4_csum_seed_validates_superblock() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_csum_seed_validates_superblock);
 
+fn smoke_ext2_scratch_waitqueue_wakes_and_handoffs() -> TestResult {
+    if super::volume::__test_scratch_waitqueue_wakes_and_handoffs() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ext2 scratch waitqueue lost a wake or cancellation handoff")
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_scratch_waitqueue_wakes_and_handoffs
+);
+
 fn smoke_ext4_csum_seed_metadata_writers_cover_checksum_fields() -> TestResult {
     let mut sb_bytes = vec![0u8; 1024];
     sb_bytes[56..58].copy_from_slice(&0xef53u16.to_le_bytes());

@@ -316,71 +316,111 @@ fn raw_waker() -> RawWaker {
     RawWaker::new(core::ptr::null(), &VTAB)
 }
 
-/// Hand off after a synchronously-polled future reports `Pending`.
+/// Sleep the current stackful syscall task after its future reports `Pending`.
 ///
-/// A syscall runs on a stackful task, so repeatedly polling a contended async
-/// mutex can monopolize the CPU on which its lock holder is homed. Use the
-/// scheduler's own-stack yield path so the holder can run. Sleep pumps remain
-/// necessary even when a yield succeeds: cursor/FB/serial pumps are not all
-/// ordinary scheduler tasks. Architectures without an own-stack yield path
-/// retain the old spin fallback, but still service those pumps.
+/// The future was polled with this task's executor waker, so its completion
+/// source is responsible for making the task runnable again. The executor's
+/// durable `awake` bit closes the classic register-waker -> sleep race: a wake
+/// between `poll()` and `yield_current_stackful()` remains set and causes an
+/// immediate re-poll. This is the same waitqueue shape Linux uses for
+/// synchronous filesystem I/O, rather than a busy-poll or repeated self-yield.
+///
+/// Returns `false` only outside a stackful user task (principally kernel-test
+/// contexts and architectures which have not enabled own-stack user tasks).
 #[inline]
-fn pending_poll_wait() {
+fn park_pending_future() -> bool {
     sleep_pumps::run();
-    if !narf_scheduler::cooperative_yield() {
-        core::hint::spin_loop();
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return false;
+    };
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return false;
     }
+
+    // SAFETY: this is the in-flight task's poller-pinned UserTaskCtx. The
+    // continuation stays on this task's private kernel stack while asleep.
+    let uc = unsafe { &*uctx };
+    crate::handlers::close_kernel_span(uc, current_task_id());
+    uc.parked_in_syscall
+        .store(true, core::sync::atomic::Ordering::Release);
+    // SAFETY: a current stackful task and its executor context were verified
+    // above; the future's waker is the only path which makes it runnable.
+    unsafe { narf_scheduler::stackful::yield_current_stackful() };
+
+    // A stackful resume continues here without re-entering UserTaskFuture::poll,
+    // so restore the publication another task may have replaced while we slept.
+    crate::user_task::install_current(uctx);
+    crate::handlers::open_kernel_span(uc);
+    true
 }
 
-/// Spin-pump a Future to completion inside a syscall. Caller must
-/// guarantee the future makes progress without external wakeups (the
-/// kernel's block-device drivers — NVMe in particular — are
-/// internally polled, so async FS futures complete after at most a
-/// handful of re-polls). Bounded to four million iterations as a hard
-/// safety cap; returns `None` on overrun (caller surfaces EIO).
+/// Drive a filesystem Future to completion inside a synchronous syscall.
+/// `Pending` parks a stackful user task until the future's registered waker
+/// fires. Outside that execution model, retain a bounded spin-pump solely for
+/// kernel tests and early fallback contexts.
 pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
-    // SAFETY: same waker as poll_once; never delivers wake events.
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut ctx = Context::from_waker(&waker);
+    let task_waker = narf_scheduler::stackful::current_stackful_waker();
+    // SAFETY: fallback only; the no-op raw waker obeys the RawWaker lifetime
+    // contract and never escapes this function.
+    let fallback_waker = unsafe { Waker::from_raw(raw_waker()) };
+    let waker = task_waker.as_ref().unwrap_or(&fallback_waker);
+    let mut ctx = Context::from_waker(waker);
     // SAFETY: we own `fut` by value; pin to the stack temporary.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    // Poll budget. This must be generous enough to cover a future that is
-    // legitimately waiting on contended filesystem work. Responsiveness does
-    // not depend on reaching the cap: every Pending poll yields the stackful
-    // task when possible and services the registered sleep pumps.
-    for _ in 0..4_000_000u64 {
+    let mut fallback_polls = 0u64;
+    loop {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
-            Poll::Pending => pending_poll_wait(),
+            Poll::Pending if task_waker.is_some() => {
+                if !park_pending_future() {
+                    return None;
+                }
+            }
+            Poll::Pending => {
+                sleep_pumps::run();
+                core::hint::spin_loop();
+                fallback_polls += 1;
+                if fallback_polls == 4_000_000 {
+                    return None;
+                }
+            }
         }
     }
-    None
 }
 
-/// Poll a block-I/O future to completion, keeping the SAME future alive for the
-/// entire wait. Unlike `poll_blocking`'s small budget, this uses a huge backstop
-/// so a merely-contended read (KDE launching dozens of procs at once, all
-/// streaming binaries off ext2) completes rather than timing out. The huge
-/// ceiling is a last-resort wedge detector: reaching it drops the future, and
-/// an in-flight virtio-blk request could still be DMA'ing into a scratch buffer
-/// returned to the pool. Callers that must not truncate therefore treat an
-/// overrun as a hard stop, not EOF; normal contention must never approach it.
+/// Drive block-backed filesystem I/O to completion while keeping the same
+/// future (and therefore its DMA ownership) alive for the whole sleep. The
+/// runtime path has no polling ceiling: completion or cancellation must wake
+/// it. Only the non-stackful test fallback retains a finite wedge detector.
 pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
-    // SAFETY: same no-op waker as poll_blocking; the block-completion IRQ / pump
-    // advances the future's readiness, which the re-poll observes.
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
-    let mut ctx = Context::from_waker(&waker);
+    let task_waker = narf_scheduler::stackful::current_stackful_waker();
+    // SAFETY: fallback only; see poll_blocking.
+    let fallback_waker = unsafe { Waker::from_raw(raw_waker()) };
+    let waker = task_waker.as_ref().unwrap_or(&fallback_waker);
+    let mut ctx = Context::from_waker(waker);
     // SAFETY: we own `fut` by value; pin to the stack temporary.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    for _ in 0..2_000_000_000u64 {
+    let mut fallback_polls = 0u64;
+    loop {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
-            Poll::Pending => pending_poll_wait(),
+            Poll::Pending if task_waker.is_some() => {
+                if !park_pending_future() {
+                    return None;
+                }
+            }
+            Poll::Pending => {
+                sleep_pumps::run();
+                core::hint::spin_loop();
+                fallback_polls += 1;
+                if fallback_polls == 2_000_000_000 {
+                    return None;
+                }
+            }
         }
     }
-    None
 }
 
 // ── Per-task AS lookup shim ────────────────────────────────────────
@@ -915,11 +955,6 @@ fn open_impl(
     // (O_NONBLOCK matters on its own for libinput's evdev nodes — see
     // `InputEventFile::nonblock_read_eagain`.)
     let open_status_flags = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
-    // user-runtime's `open` wrapper checks `r == !0u64` for failure
-    // (the asm wrapper observes only the value register, not the
-    // status word), so the kernel must mirror that sentinel rather
-    // than the generic `invalid_op` shape.
-    let fail = SyscallReturn::ok(!0u64);
     let task = current_task_id();
     // Linux open/openat reject an empty pathname with ENOENT. Do this before
     // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
@@ -989,7 +1024,7 @@ fn open_impl(
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
-                None => ctx.set_return(fail),
+                None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
             }
             return;
         }
@@ -1032,7 +1067,7 @@ fn open_impl(
                 });
                 match new_fd {
                     Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-                    None => ctx.set_return(fail),
+                    None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
                 }
             }
             // Directory resolves but its FS can't hold an anonymous inode,
@@ -1089,7 +1124,7 @@ fn open_impl(
                         crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                         ctx.set_return(SyscallReturn::ok(n as u64));
                     }
-                    None => ctx.set_return(fail),
+                    None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
                 }
                 return;
             }
@@ -1121,7 +1156,7 @@ fn open_impl(
         let mount_owned = match copy_user_path(mnt_ptr, mnt_len) {
             Some(s) => s,
             None => {
-                ctx.set_return(fail);
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                 return;
             }
         };
@@ -1165,7 +1200,7 @@ fn open_impl(
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
-                None => ctx.set_return(fail),
+                None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
             }
             return;
         }
@@ -1200,8 +1235,28 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-122i64) as u64));
                     return;
                 }
-                _ => {
-                    ctx.set_return(fail);
+                Some(Some(Err(error))) => {
+                    let errno = match error {
+                        narf_filesystem::FsError::NotFound => 2,          // ENOENT
+                        narf_filesystem::FsError::PermissionDenied => 13, // EACCES
+                        narf_filesystem::FsError::Io(_) => 5,             // EIO
+                        narf_filesystem::FsError::InvalidPath
+                        | narf_filesystem::FsError::InvalidData => 22, // EINVAL
+                        narf_filesystem::FsError::CrossDevice => 18,      // EXDEV
+                        narf_filesystem::FsError::Busy => 16,             // EBUSY
+                        narf_filesystem::FsError::ReadOnly => 30,         // EROFS
+                        narf_filesystem::FsError::Unsupported => 95,      // EOPNOTSUPP
+                        narf_filesystem::FsError::BrokenPipe => 32,       // EPIPE
+                        narf_filesystem::FsError::BadFd => 9,             // EBADF
+                        narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
+                        narf_filesystem::FsError::NoSpace => 28,
+                        narf_filesystem::FsError::QuotaExceeded => 122,
+                    };
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                None | Some(None) => {
+                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // -EIO
                     return;
                 }
             }
@@ -1256,7 +1311,7 @@ fn open_impl(
                 crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
-            None => ctx.set_return(fail),
+            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }
         return;
     }
@@ -1396,7 +1451,7 @@ fn open_impl(
     }) {
         Some(n) => n,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };
@@ -2197,15 +2252,14 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
     // "Operation not permitted" for every PATH-search candidate, and
     // every pipeline that touches an exec dies.
     let out_ptr = out_arg as *mut linux_compat::Stat;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     let raw = match copy_user_cstr(path_ptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     };
@@ -2218,9 +2272,8 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 #[cfg(feature = "linux-compat")]
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
     let out_ptr = out_arg as *mut linux_compat::Stat;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
@@ -2262,7 +2315,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -2411,11 +2464,11 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
 fn rename_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,     // -ENOENT
-        FsError::Busy => -17,        // -EEXIST
-        FsError::InvalidPath => -22, // -EINVAL
-        FsError::CrossDevice => -18, // -EXDEV
-        FsError::ReadOnly => -30,    // -EROFS
+        FsError::NotFound => -2,        // -ENOENT
+        FsError::Busy => -17,           // -EEXIST
+        FsError::InvalidPath => -22,    // -EINVAL
+        FsError::CrossDevice => -18,    // -EXDEV
+        FsError::ReadOnly => -30,       // -EROFS
         FsError::QuotaExceeded => -122, // -EDQUOT
         _ => -1,
     };
@@ -3038,22 +3091,23 @@ fn copy_fd_to_fd(
     const CHUNK: usize = 4096;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> = fd::with_table(task, |t| {
-            let entry = t.get_mut(in_fd)?;
-            let off = if use_off_ptr { in_off } else { entry.offset };
-            let mut kbuf = alloc::vec![0u8; want];
-            let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
-                Some(Ok(n)) => n,
-                Some(Err(error)) => return Some(Err(error)),
-                None => 0,
-            };
-            kbuf.truncate(n);
-            if !use_off_ptr {
-                entry.offset = off.saturating_add(n as u64);
-            }
-            Some(Ok(kbuf))
-        })
-        .flatten()?;
+        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> =
+            fd::with_table(task, |t| {
+                let entry = t.get_mut(in_fd)?;
+                let off = if use_off_ptr { in_off } else { entry.offset };
+                let mut kbuf = alloc::vec![0u8; want];
+                let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
+                    Some(Ok(n)) => n,
+                    Some(Err(error)) => return Some(Err(error)),
+                    None => 0,
+                };
+                kbuf.truncate(n);
+                if !use_off_ptr {
+                    entry.offset = off.saturating_add(n as u64);
+                }
+                Some(Ok(kbuf))
+            })
+            .flatten()?;
         let kbuf = match read_result {
             Ok(kbuf) => kbuf,
             // A short copy is reported normally; only an initial would-block
@@ -4659,8 +4713,7 @@ fn mprotect_core(
                 Err(13)
             }
             narf_memory::wx::WxTransition::NeedsCapJit => {
-                let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id())
-                else {
+                let Some(cap) = narf_memory::wx::jit_cap_default_policy(current_task_id()) else {
                     // No JIT capability for the RW→RX flip → EACCES.
                     return Err(13);
                 };
@@ -4999,7 +5052,10 @@ fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> 
         let _ = writeln!(
             narf_console::Writer,
             "CGATTACH pid={} full={} rel={:?} ok={}",
-            child_pid, full, rel, ok
+            child_pid,
+            full,
+            rel,
+            ok
         );
     }
     ok
@@ -5113,12 +5169,7 @@ pub fn clear_child_tid_init() {
 #[cfg(feature = "linux-compat")]
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
     let (as_root, futex_namespace) = current_address_space()
-        .map(|space| {
-            (
-                space.root,
-                futex_namespace_for_address_space(&space),
-            )
-        })
+        .map(|space| (space.root, futex_namespace_for_address_space(&space)))
         .unwrap_or((narf_memory::PhysAddr::new(0), 0));
     set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace);
 }
@@ -5450,9 +5501,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
         // clone3 reserves the low signal bits (the signal lives in
         // exit_signal) and currently defines only bits 0..=33.
         const CLONE3_KNOWN_FLAG_BITS: u64 = (1u64 << 34) - 1;
-        if ca.flags & (0x7f | CLONE_DETACHED) != 0
-            || ca.flags & !CLONE3_KNOWN_FLAG_BITS != 0
-        {
+        if ca.flags & (0x7f | CLONE_DETACHED) != 0 || ca.flags & !CLONE3_KNOWN_FLAG_BITS != 0 {
             return Err(EINVAL);
         }
         if (ca.stack == 0) != (ca.stack_size == 0) {
@@ -5462,10 +5511,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     if ca.stack.checked_add(ca.stack_size).is_none() {
         return Err(EINVAL);
     }
-    if !legacy
-        && ca.stack != 0
-        && ca.stack + ca.stack_size > crate::handlers::USER_VA_LIMIT
-    {
+    if !legacy && ca.stack != 0 && ca.stack + ca.stack_size > crate::handlers::USER_VA_LIMIT {
         // Linux clone3 reports a failed access_ok(stack, stack_size) as
         // EINVAL, not EFAULT.
         return Err(EINVAL);
@@ -7933,12 +7979,14 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     #[cfg(feature = "cgroup")]
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         use core::fmt::Write as _;
-        let comm =
-            proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
+        let comm = proc_comm_of_task(child_tid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
             narf_console::Writer,
             "PIDFD-EXIT child_pid={} child_tid={} comm={} pidfd_found={}",
-            child_pid, child_tid, comm, _pidfd_found
+            child_pid,
+            child_tid,
+            comm,
+            _pidfd_found
         );
     }
 

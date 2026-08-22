@@ -48,6 +48,14 @@ internal four-argument callers emit generic `epoll_pwait` number 22, whose
 zero-sigmask behavior shares the same handler; reverse lookup canonically
 returns `EpollPwait`.
 
+The Linux new-mount compatibility surface includes `open_tree_attr(2)` at
+wire number 467 on x86_64 and aarch64. It preserves Linux's error ordering:
+the exceptional null-attribute/nonzero-size pair is rejected before path
+lookup, while all other `mount_attr` validation follows successful tree
+acquisition. Attribute failure publishes no descriptor and retains no detached
+mount object. Extensible-record size, user-copy, trailing-byte, flag, atime,
+propagation, and idmapped-mount errors use Linux errno values.
+
 Linux `statx(2)` returns a stable `STATX_MNT_ID` whenever the resolved path
 has a covering NARF mount, even when the request mask names only basic fields.
 This is a deliberately useful Linux-permitted superset: service managers use
@@ -183,7 +191,11 @@ Connected unnamed AF_UNIX peers, including `socketpair(2)` endpoints, report a
 minimal `sockaddr_un` containing only `sa_family` from `getpeername(2)`;
 truncated output still reports the full address length.
 `open(2)`/`openat(2)` reject an empty pathname with `ENOENT` before cwd
-normalization; an empty path never aliases the current directory.
+normalization; an empty path never aliases the current directory. Linux path
+and descriptor failures return their specific errno rather than a bare `-1`:
+in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
+errors, while `newfstatat(2)` distinguishes `EFAULT`, `ENOENT`, `EBADF`,
+`ENOTDIR`, and invalid flag `EINVAL`.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and
 follow the final symlink unless `AT_SYMLINK_NOFOLLOW` selects the link inode.
@@ -198,6 +210,9 @@ security boundary.
 `clock_gettime(2)` accepts realtime/monotonic coarse clocks and process/thread
 CPU clocks. Coarse clocks currently use the precise source; CPU clocks use the
 calling task's accumulated user and kernel accounting.
+`sched_setscheduler(2)` accepts Linux's `SCHED_RESET_ON_FORK` modifier on every
+otherwise-supported policy; the cooperative scheduler retains compatibility
+state without assigning Linux real-time scheduling authority.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
@@ -598,12 +613,14 @@ prefix. Packet reads and their verifier/runtime contract are owned by
   The kernel-side shadow lives in `DomainId::USERSPACE_K` regardless
   of which user PKU key the user side uses.
 - relibc never performs a syscall the kernel hasn't explicitly wired up.
-- Synchronous syscall bridges for async filesystem operations never pure-spin
-  for their full completion budget. Every Pending result services the sleep
-  pumps, then cooperatively yields an x86_64 stackful task so a descheduled lock
-  holder homed on that CPU can run. Architectures without the own-stack yield
-  path retain a spin fallback after pumping, so cursor, framebuffer, serial,
-  and other pump-driven work remains responsive during long I/O waits.
+- Synchronous syscall bridges poll async filesystem operations with the current
+  stackful task's executor waker. `Pending` closes kernel-time accounting,
+  sleeps the task, and resumes only after filesystem/I/O completion wakes it;
+  the executor's durable runnable bit prevents a wake racing with sleep from
+  being lost. Resume republishes the task's `UserTaskCtx` before continuing the
+  syscall. Kernel-test contexts and architectures without own-stack user tasks
+  retain a bounded spin-pump fallback, but the x86_64 runtime path has no poll
+  count or repeated self-yield loop.
 
 ### 4.1 Stable user-space ABI promise
 

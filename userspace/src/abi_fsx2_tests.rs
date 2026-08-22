@@ -1991,21 +1991,21 @@ fn smoke_abi_fsx2_fspick_relpath_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fspick_relpath_neg);
 
-// ── mount_setattr: EINVAL on the size>64 upper bound ──────────────────
+// ── mount_setattr: E2BIG above Linux's one-page struct bound ──────────
 //
 // The first file pins size==0 (lower bound) → EINVAL and size==32 success.
-// Pin the size>64 upper-bound EINVAL branch.
+// Pin the size>PAGE_SIZE upper-bound E2BIG branch.
 
 fn smoke_abi_fsx2_mount_setattr_oversize_neg() -> TestResult {
     with_setup(|| {
         let args = SyscallArgs {
             arg0: 0,
-            arg4: 65, // > 64 → EINVAL
+            arg4: 4097,
             ..Default::default()
         };
         match call(Syscall::MountSetattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("mount_setattr with size>64 must return -EINVAL"),
+            Some(-7) => Ok(()),
+            _ => Err("mount_setattr with size>PAGE_SIZE must return -E2BIG"),
         }
     })
 }

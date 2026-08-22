@@ -3,7 +3,8 @@
 //! Covers the extended-attribute family (set/get/list/remove in the
 //! path/lpath/fd variants) and the mount / new-mount-API surface
 //! (mount, umount2, pivot_root, name_to_handle_at, open_by_handle_at,
-//! fsopen/fsconfig/fsmount/move_mount/open_tree/fspick/mount_setattr).
+//! fsopen/fsconfig/fsmount/move_mount/open_tree/open_tree_attr/fspick/
+//! mount_setattr).
 //!
 //! Shares the harness in [`crate::abi_test_support`]; every test drives
 //! `kernel_syscall_entry` through a synthetic `AbiCtx`. The xattr handlers
@@ -1443,6 +1444,120 @@ fn smoke_abi_fsx_open_tree_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_neg);
 
+// ── open_tree_attr ───────────────────────────────────────────────────
+
+fn smoke_abi_fsx_open_tree_attr_pos() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let path = b"/abi\0";
+        let attr = [0u8; 32];
+        let args = SyscallArgs {
+            arg0: (-100i64) as u64,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: attr.as_ptr() as u64,
+            arg4: attr.len() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::OpenTreeAttr.raw(), args) {
+            Some(fd) if fd >= 3 => Ok(()),
+            _ => Err("open_tree_attr with a v0 no-op mount_attr should return an fd"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_attr_pos);
+
+fn smoke_abi_fsx_open_tree_attr_errno_ordering() -> TestResult {
+    with_setup(|| {
+        // Linux rejects this pair before it tries to open filename.
+        let null_attr_with_size = SyscallArgs {
+            arg0: u32::MAX as u64,
+            arg1: 0,
+            arg3: 0,
+            arg4: 32,
+            ..Default::default()
+        };
+        if call(Syscall::OpenTreeAttr.raw(), null_attr_with_size) != Some(EINVAL) {
+            return Err("open_tree_attr(NULL, nonzero size) must return -EINVAL first");
+        }
+
+        // Every other attribute error is checked after opening the tree.
+        let relative = b"relative\0";
+        let attr = [0u8; 31];
+        let bad_dirfd_and_short_attr = SyscallArgs {
+            arg0: u32::MAX as u64,
+            arg1: relative.as_ptr() as u64,
+            arg3: attr.as_ptr() as u64,
+            arg4: attr.len() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::OpenTreeAttr.raw(), bad_dirfd_and_short_attr) {
+            Some(EBADF) => Ok(()),
+            _ => Err("open_tree_attr must report the open-tree error before attr EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_tree_attr_errno_ordering);
+
+fn smoke_abi_fsx_open_tree_attr_validation_and_cleanup() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const E2BIG: i64 = -7;
+        let path = b"/abi\0";
+        let mut extended = [0u8; 40];
+        extended[39] = 1;
+        let bad_extension = SyscallArgs {
+            arg0: (-100i64) as u64,
+            arg1: path.as_ptr() as u64,
+            arg3: extended.as_ptr() as u64,
+            arg4: extended.len() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::OpenTreeAttr.raw(), bad_extension) != Some(E2BIG) {
+            return Err("open_tree_attr with nonzero extension bytes must return -E2BIG");
+        }
+
+        // The failed call prepared fd 3 internally. It must be discarded so
+        // the next successful acquisition can reuse fd 3.
+        match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
+            Some(3) => Ok(()),
+            _ => Err("failed open_tree_attr must not leak its provisional fd"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_open_tree_attr_validation_and_cleanup
+);
+
+fn smoke_abi_fsx_open_tree_attr_fault_and_size_errno() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const E2BIG: i64 = -7;
+        let path = b"/abi\0";
+        let base = SyscallArgs {
+            arg0: (-100i64) as u64,
+            arg1: path.as_ptr() as u64,
+            arg3: 0x0000_0080_0000_0000,
+            arg4: 32,
+            ..Default::default()
+        };
+        if call(Syscall::OpenTreeAttr.raw(), base) != Some(EFAULT) {
+            return Err("open_tree_attr with an inaccessible attr must return -EFAULT");
+        }
+        let oversized = SyscallArgs {
+            arg3: 1,
+            arg4: 4097,
+            ..base
+        };
+        match call(Syscall::OpenTreeAttr.raw(), oversized) {
+            Some(E2BIG) => Ok(()),
+            _ => Err("open_tree_attr with attr size > PAGE_SIZE must return -E2BIG"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_open_tree_attr_fault_and_size_errno
+);
+
 // ── fspick ────────────────────────────────────────────────────────────
 //
 // fspick(dfd, path, flags) → an fs-context fd for an existing mount. Needs
@@ -1474,17 +1589,16 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_fspick_neg);
 // ── mount_setattr ─────────────────────────────────────────────────────
 //
 // mount_setattr(dfd, path, flags, attr, size). NARF doesn't enforce
-// per-mount attrs; a well-formed call (struct mount_attr size 1..=64)
-// just succeeds. size 0 or > 64 → EINVAL.
+// per-mount attrs; a valid v0 struct is accepted as a no-op.
 
 fn smoke_abi_fsx_mount_setattr_pos() -> TestResult {
     with_setup(|| {
-        // arg4 = size = 32 (sizeof struct mount_attr) → ok(0).
+        let attr = [0u8; 32];
         let args = SyscallArgs {
             arg0: 0,
             arg1: 0,
             arg2: 0,
-            arg3: 0,
+            arg3: attr.as_ptr() as u64,
             arg4: 32,
             ..Default::default()
         };

@@ -17,6 +17,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::task::{Context, Poll, Waker};
 
 use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
 use narf_capabilities::{Cap, Read, Write};
@@ -67,6 +68,11 @@ struct VolumeIo {
     /// pool, concurrent ops use distinct buffers — the block device, not a
     /// lock, serialises the actual requests.
     pool: Vec<Cap<DmaBuffer, Write>>,
+    /// Futures sleeping until a scratch buffer is returned. IDs make waiter
+    /// registration cancellation-safe: dropping an FS future removes only its
+    /// own entry instead of leaving a stale waker in the volume indefinitely.
+    scratch_waiters: BTreeMap<u64, Waker>,
+    next_scratch_waiter: u64,
     /// Logical block size of the underlying device.
     lbs: usize,
     /// Byte size of each pooled scratch buffer (a multiple of `lbs`, >= `lbs`).
@@ -91,41 +97,189 @@ struct ScratchGuard<'a> {
     cap: Cap<DmaBuffer, Write>,
 }
 
+fn return_scratch(io_lock: &IrqSafeSpinLock<VolumeIo>, cap: Cap<DmaBuffer, Write>) {
+    let wake = {
+        let mut io = io_lock.lock();
+        io.pool.push(cap);
+        io.scratch_waiters
+            .keys()
+            .next()
+            .copied()
+            .and_then(|id| io.scratch_waiters.remove(&id))
+    };
+    if let Some(waker) = wake {
+        waker.wake();
+    }
+}
+
 impl Drop for ScratchGuard<'_> {
     fn drop(&mut self) {
-        self.io.lock().pool.push(self.cap);
+        return_scratch(self.io, self.cap);
     }
 }
 
-/// A future that yields exactly once (Pending then Ready), so a caller can
-/// re-poll under the cooperative executor / `poll_blocking` busy-loop.
-#[derive(Default)]
-struct YieldOnce(bool);
+/// Future for one slot in the per-volume scratch-buffer waitqueue.
+struct AcquireScratch<'a> {
+    io: &'a IrqSafeSpinLock<VolumeIo>,
+    waiter_id: Option<u64>,
+}
 
-impl core::future::Future for YieldOnce {
-    type Output = ();
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<()> {
-        if self.0 {
-            core::task::Poll::Ready(())
+impl Drop for AcquireScratch<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.waiter_id.take() {
+            let wake = {
+                let mut io = self.io.lock();
+                let still_registered = io.scratch_waiters.remove(&id).is_some();
+                // If the entry was already taken, buffer return selected and
+                // woke us. Cancellation before our next poll must hand that
+                // now-free capacity to another waiter or it could sleep
+                // forever while a buffer sits idle.
+                if !still_registered && !io.pool.is_empty() {
+                    io.scratch_waiters
+                        .keys()
+                        .next()
+                        .copied()
+                        .and_then(|next| io.scratch_waiters.remove(&next))
+                } else {
+                    None
+                }
+            };
+            if let Some(waker) = wake {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl<'a> core::future::Future for AcquireScratch<'a> {
+    type Output = ScratchGuard<'a>;
+
+    fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut io = self.io.lock();
+        if let Some(cap) = io.pool.pop() {
+            if let Some(id) = self.waiter_id.take() {
+                io.scratch_waiters.remove(&id);
+            }
+            drop(io);
+            return Poll::Ready(ScratchGuard { io: self.io, cap });
+        }
+
+        if let Some(id) = self.waiter_id {
+            if let Some(waker) = io.scratch_waiters.get_mut(&id) {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+            } else {
+                io.scratch_waiters.insert(id, cx.waker().clone());
+            }
         } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            core::task::Poll::Pending
+            let id = loop {
+                let candidate = io.next_scratch_waiter.max(1);
+                io.next_scratch_waiter = candidate.wrapping_add(1).max(1);
+                if !io.scratch_waiters.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            io.scratch_waiters.insert(id, cx.waker().clone());
+            self.waiter_id = Some(id);
         }
+        Poll::Pending
     }
 }
 
-/// Borrow a scratch buffer from the pool, yielding until one is free.
+/// Borrow a scratch buffer from the pool, sleeping until one is free.
 async fn acquire_scratch(io: &IrqSafeSpinLock<VolumeIo>) -> ScratchGuard<'_> {
-    loop {
-        if let Some(cap) = io.lock().pool.pop() {
-            return ScratchGuard { io, cap };
-        }
-        YieldOnce::default().await;
+    AcquireScratch {
+        io,
+        waiter_id: None,
     }
+    .await
+}
+
+#[doc(hidden)]
+pub(super) fn __test_scratch_waitqueue_wakes_and_handoffs() -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{RawWaker, RawWakerVTable};
+
+    static FIRST_WAKES: AtomicUsize = AtomicUsize::new(0);
+    static SECOND_WAKES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VTABLE)
+    }
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: test wakers store a pointer to one of the two static counters.
+        let counter = unsafe { &*(data.cast::<AtomicUsize>()) };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: same representation and lifetime as `wake`.
+        unsafe { wake(data) };
+    }
+    unsafe fn drop_waker(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
+
+    FIRST_WAKES.store(0, Ordering::Relaxed);
+    SECOND_WAKES.store(0, Ordering::Relaxed);
+    let io = core::mem::ManuallyDrop::new(IrqSafeSpinLock::new(VolumeIo {
+        pool: Vec::new(),
+        scratch_waiters: BTreeMap::new(),
+        next_scratch_waiter: 1,
+        lbs: 512,
+        scratch_bytes: 512,
+    }));
+    let mut first = AcquireScratch {
+        io: &io,
+        waiter_id: None,
+    };
+    let mut second = AcquireScratch {
+        io: &io,
+        waiter_id: None,
+    };
+    // SAFETY: the data pointers name static AtomicUsize values and the vtable
+    // preserves those pointers without ownership or lifetime obligations.
+    let first_waker = unsafe {
+        Waker::from_raw(RawWaker::new(
+            (&FIRST_WAKES as *const AtomicUsize).cast(),
+            &VTABLE,
+        ))
+    };
+    // SAFETY: same as above.
+    let second_waker = unsafe {
+        Waker::from_raw(RawWaker::new(
+            (&SECOND_WAKES as *const AtomicUsize).cast(),
+            &VTABLE,
+        ))
+    };
+    let mut first_cx = Context::from_waker(&first_waker);
+    let mut second_cx = Context::from_waker(&second_waker);
+    if !matches!(Pin::new(&mut first).poll(&mut first_cx), Poll::Pending)
+        || !matches!(Pin::new(&mut second).poll(&mut second_cx), Poll::Pending)
+    {
+        return false;
+    }
+
+    // A returned buffer selects the oldest waiter. Cancelling that selected
+    // future before it polls again must hand the free capacity to the next.
+    return_scratch(&io, Cap::<DmaBuffer, Write>::bootstrap());
+    if FIRST_WAKES.load(Ordering::Relaxed) != 1 || SECOND_WAKES.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    drop(first);
+    if SECOND_WAKES.load(Ordering::Relaxed) != 1 {
+        return false;
+    }
+    let guard = match Pin::new(&mut second).poll(&mut second_cx) {
+        Poll::Ready(guard) => guard,
+        Poll::Pending => return false,
+    };
+    drop(guard);
+    drop(second);
+    // The bootstrap cap is a test stand-in, not a registered I/O object. Skip
+    // VolumeIo::drop so it is not passed to unregister().
+    true
 }
 
 /// One mounted ext2 volume.
@@ -367,6 +521,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
         let io = VolumeIo {
             pool,
+            scratch_waiters: BTreeMap::new(),
+            next_scratch_waiter: 1,
             lbs,
             scratch_bytes,
         };

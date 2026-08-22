@@ -386,7 +386,10 @@ root only; its descendants are already attached at the required paths.
 Nested `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the caller's
 current private table rather than rebuilding from the global registry.
 `clone_tree_at` exposes an arbitrary directory subtree as a detached
-filesystem root for Linux `open_tree(2)` and later `move_mount(2)`.
+filesystem root for Linux `open_tree(2)` / `open_tree_attr(2)` and later
+`move_mount(2)`. `open_tree_attr(2)` validates the extensible Linux
+`mount_attr` record and its trailing extension bytes before publishing the
+descriptor; an attribute failure leaves no visible or retained detached tree.
 An `OPEN_TREE_CLONE` detached object retains the visible descendant
 mounts beneath that root; attaching it rebases those mount paths beneath
 the new target.
@@ -440,6 +443,16 @@ pub trait FsInstance: Send + Sync {
 
 Filesystems run in their own PKS/MTE domain (Stage 4) and communicate
 with `filesystem/` core via Narf-Ring.
+
+Every future returned through `FileOps`, `DirOps`, or `FsInstance` obeys the
+standard wake contract: before returning `Poll::Pending`, it registers the
+current task waker with the event or resource that can make progress. Reply,
+I/O completion, disconnect, cancellation, and resource release publish their
+state before waking the waiter. Registration and readiness inspection are
+ordered under one lock or an equivalent register-then-recheck protocol, so a
+wake racing with the transition to sleep cannot be lost. Futures do not
+self-wake merely to obtain another poll; synchronous Linux-compat callers park
+their stackful task and resume only when this wake contract fires.
 
 `backing_identity` identifies the backing filesystem object rather than a
 mount attachment. Bind-mount adapters preserve their source value so a VFS
@@ -652,6 +665,9 @@ Wire structures in `filesystem::fuse` are `#[repr(C)]` shapes matching
 Linux UAPI field order and width. Malformed or short replies fail with
 `FsError::InvalidData`; a disconnected daemon fails pending requests
 without leaving callers parked indefinitely.
+FUSE reply slots retain the awaiting task's waker. Daemon reply and connection
+disconnect atomically publish a terminal reply, take that waker, and wake it;
+request cancellation removes the slot and its registration.
 
 ### 3.9 Linux synthetic filesystem projections
 

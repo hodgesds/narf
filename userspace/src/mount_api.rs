@@ -1,6 +1,6 @@
 //! Batch B — the Linux 5.2 "new mount API":
 //! `fsopen` / `fsconfig` / `fsmount` / `move_mount` / `open_tree` /
-//! `fspick` / `mount_setattr`.
+//! `open_tree_attr` / `fspick` / `mount_setattr`.
 //!
 //! These decompose `mount(2)` into fd-addressed steps. NARF layers them on
 //! the existing VFS registry, reusing the same fstype→backend dispatch
@@ -15,10 +15,10 @@
 //!   move_mount(mfd, "", AT_FDCWD, "/mnt/x")  → registry().mount_arc(...)
 //! ```
 //!
-//! `open_tree` / `fspick` grab an existing mount's fs via
-//! `registry().fs_arc_at`. `mount_setattr` is accepted (NARF doesn't model
-//! per-mount RO/NOSUID attributes at this layer, matching how `sys_mount`
-//! swallows the `MS_*` flags).
+//! `open_tree` / `open_tree_attr` / `fspick` grab an existing mount's fs via
+//! `registry().fs_arc_at`. Mount attributes are ABI-validated but accepted as
+//! no-ops (NARF doesn't model per-mount RO/NOSUID attributes at this layer,
+//! matching how `sys_mount` swallows the `MS_*` flags).
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -30,14 +30,17 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
 use crate::handlers::{
-    apply_chroot, copy_user_cstr, current_clone_mount_subtree, current_clone_tree_at,
-    current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task, parse_proc_self_fd,
+    apply_chroot, copy_from_user_vec, copy_user_cstr, current_clone_mount_subtree,
+    current_clone_tree_at, current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task,
+    parse_proc_self_fd,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
 // ── errno (negated-long convention) ─────────────────────────────────
 const ENOENT: i64 = 2;
+const E2BIG: i64 = 7;
 const EBADF: i64 = 9;
+const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const ENODEV: i64 = 19;
@@ -65,6 +68,20 @@ const FSOPEN_CLOEXEC: u64 = 0x0000_0001;
 const FSMOUNT_CLOEXEC: u64 = 0x0000_0001;
 const OPEN_TREE_CLOEXEC: u64 = 0o2000000; // O_CLOEXEC
 const OPEN_TREE_CLONE: u64 = 0x0000_0001;
+const OPEN_TREE_NAMESPACE: u64 = 0x0000_0002;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x0000_0100;
+const AT_NO_AUTOMOUNT: u64 = 0x0000_0800;
+const AT_EMPTY_PATH: u64 = 0x0000_1000;
+const AT_RECURSIVE: u64 = 0x0000_8000;
+
+const MOUNT_ATTR_SIZE_VER0: usize = 32;
+const MOUNT_ATTR__ATIME: u64 = 0x0000_0070;
+const MOUNT_ATTR_NOATIME: u64 = 0x0000_0010;
+const MOUNT_ATTR_STRICTATIME: u64 = 0x0000_0020;
+const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+const MOUNT_SETATTR_VALID_FLAGS: u64 = 0x0030_00ff;
+const MOUNT_SETATTR_PROPAGATION_FLAGS: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+const PAGE_SIZE: usize = 4096;
 
 /// A filesystem context under construction (fsopen / fspick).
 struct FsContext {
@@ -327,6 +344,143 @@ fn install_fd(file: Arc<dyn FileOps>, cloexec: bool) -> Option<u32> {
     })
 }
 
+fn validate_open_tree_flags(flags: u64) -> Result<(), i64> {
+    const ALLOWED: u64 = AT_EMPTY_PATH
+        | AT_NO_AUTOMOUNT
+        | AT_RECURSIVE
+        | AT_SYMLINK_NOFOLLOW
+        | OPEN_TREE_CLONE
+        | OPEN_TREE_CLOEXEC
+        | OPEN_TREE_NAMESPACE;
+    if flags & !ALLOWED != 0 {
+        return Err(EINVAL);
+    }
+    if flags & AT_RECURSIVE != 0 && flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE) == 0 {
+        return Err(EINVAL);
+    }
+    if flags & OPEN_TREE_CLONE != 0 && flags & OPEN_TREE_NAMESPACE != 0 {
+        return Err(EINVAL);
+    }
+    // NARF has task-private mount tables but no mount-namespace file object
+    // matching Linux's OPEN_TREE_NAMESPACE return contract yet.
+    if flags & OPEN_TREE_NAMESPACE != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// Copy and validate Linux's extensible `struct mount_attr`.
+///
+/// This mirrors `wants_mount_setattr()` / `copy_struct_from_user()` errno
+/// behavior: a short version is EINVAL, a version larger than one page is
+/// E2BIG, an inaccessible byte is EFAULT, and a non-zero unknown extension is
+/// E2BIG. Attribute values are validated even though NARF currently treats
+/// the supported per-mount settings as compatibility no-ops.
+fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<(), i64> {
+    if size > PAGE_SIZE {
+        return Err(E2BIG);
+    }
+    if size < MOUNT_ATTR_SIZE_VER0 {
+        return Err(EINVAL);
+    }
+    // SAFETY: copy_from_user_vec validates the complete caller-provided range
+    // and converts guarded-copy faults into errno without dereferencing it here.
+    let bytes = unsafe { copy_from_user_vec(ptr, size) }.map_err(|_| EFAULT)?;
+    if bytes[MOUNT_ATTR_SIZE_VER0..].iter().any(|&byte| byte != 0) {
+        return Err(E2BIG);
+    }
+
+    let field = |offset: usize| {
+        u64::from_ne_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("mount_attr field has fixed width"),
+        )
+    };
+    let attr_set = field(0);
+    let attr_clr = field(8);
+    let propagation = field(16);
+    let userns_fd = field(24);
+
+    if propagation & !MOUNT_SETATTR_PROPAGATION_FLAGS != 0
+        || (propagation & MOUNT_SETATTR_PROPAGATION_FLAGS).count_ones() > 1
+    {
+        return Err(EINVAL);
+    }
+    if (attr_set | attr_clr) & !MOUNT_SETATTR_VALID_FLAGS != 0 {
+        return Err(EINVAL);
+    }
+    if attr_clr & MOUNT_ATTR__ATIME != 0 {
+        if attr_clr & MOUNT_ATTR__ATIME != MOUNT_ATTR__ATIME
+            || !matches!(
+                attr_set & MOUNT_ATTR__ATIME,
+                0 | MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME
+            )
+        {
+            return Err(EINVAL);
+        }
+    } else if attr_set & MOUNT_ATTR__ATIME != 0 {
+        return Err(EINVAL);
+    }
+
+    if (attr_set | attr_clr) & MOUNT_ATTR_IDMAP != 0 {
+        if attr_clr & MOUNT_ATTR_IDMAP != 0 && !idmap_replace {
+            return Err(EINVAL);
+        }
+        if userns_fd > i32::MAX as u64 {
+            return Err(EINVAL);
+        }
+        // NARF does not expose Linux user-namespace fds, so a numerically
+        // valid descriptor cannot satisfy the proc-ns-file requirement.
+        let exists = fd::with_table(current_task_id(), |table| {
+            table.get(userns_fd as u32).is_some()
+        })
+        .unwrap_or(false);
+        return Err(if exists { EINVAL } else { EBADF });
+    }
+
+    Ok(())
+}
+
+struct ReturnCapture<'a> {
+    inner: &'a mut dyn TrapContext,
+    ret: Option<SyscallReturn>,
+}
+
+impl TrapContext for ReturnCapture<'_> {
+    fn args(&self) -> &crate::syscall::SyscallArgs {
+        self.inner.args()
+    }
+
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.ret = Some(ret);
+    }
+
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+
+    fn rip(&self) -> u64 {
+        self.inner.rip()
+    }
+
+    fn set_rip(&mut self, rip: u64) {
+        self.inner.set_rip(rip);
+    }
+
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        self.inner.redirect_to_kernel(rip, rsp)
+    }
+}
+
+fn discard_open_tree_fd(task: u64, fd_no: u32) {
+    let mount_id = mount_of(task, fd_no);
+    fd::with_table(task, |table| table.close(fd_no));
+    if let Some(mount_id) = mount_id {
+        with_mounts(|mounts| mounts.remove(&mount_id));
+    }
+}
+
 /// `fsopen(fsname, flags)` → fs-context fd.
 pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
@@ -551,6 +705,10 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
 pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let task = current_task_id();
+    if let Err(errno) = validate_open_tree_flags(a.arg2) {
+        ctx.set_return(err(errno));
+        return;
+    }
     let raw_path = match copy_user_cstr(a.arg1, 4096) {
         Some(s) => s,
         None => {
@@ -680,8 +838,48 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
         a.arg2 & OPEN_TREE_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        None => {
+            with_mounts(|mounts| mounts.remove(&mid));
+            ctx.set_return(err(EBADF));
+        }
     }
+}
+
+/// `open_tree_attr(dfd, path, flags, attr, size)` → an O_PATH or detached
+/// mount fd with atomically requested mount attributes.
+pub fn sys_open_tree_attr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    if a.arg3 == 0 && a.arg4 != 0 {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+
+    // Linux prepares the open-tree file first and publishes its descriptor
+    // only after mount-attribute validation succeeds. NARF's fd table API
+    // installs immediately, so capture the result and discard that private,
+    // not-yet-observable descriptor on any later validation error.
+    let mut capture = ReturnCapture {
+        inner: ctx,
+        ret: None,
+    };
+    sys_open_tree(&mut capture);
+    let opened = capture.ret.unwrap_or_else(SyscallReturn::invalid_op);
+    if opened.status != SyscallReturn::OK || (opened.value as i64) < 0 {
+        capture.inner.set_return(opened);
+        return;
+    }
+
+    let fd_no = opened.value as u32;
+    if a.arg3 != 0 {
+        if let Err(errno) =
+            validate_mount_attr(a.arg3, a.arg4 as usize, a.arg2 & OPEN_TREE_CLONE != 0)
+        {
+            discard_open_tree_fd(current_task_id(), fd_no);
+            capture.inner.set_return(err(errno));
+            return;
+        }
+    }
+    capture.inner.set_return(opened);
 }
 
 /// `fspick(dfd, path, flags)` → fs-context fd for an existing mount (for
@@ -725,13 +923,13 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
 /// `mount_setattr(dfd, path, flags, attr, size)`.
 pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    // struct mount_attr is 32 bytes; reject obviously-wrong sizes. NARF
-    // doesn't enforce per-mount RO/NOSUID/... at this layer (same as the
-    // MS_* bits sys_mount accepts), so a well-formed call just succeeds.
-    let size = a.arg4 as usize;
-    if size == 0 || size > 64 {
+    const ALLOWED_FLAGS: u64 = AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    if a.arg2 & !ALLOWED_FLAGS != 0 {
         ctx.set_return(err(EINVAL));
         return;
     }
-    ctx.set_return(ok(0));
+    match validate_mount_attr(a.arg3, a.arg4 as usize, false) {
+        Ok(()) => ctx.set_return(ok(0)),
+        Err(errno) => ctx.set_return(err(errno)),
+    }
 }

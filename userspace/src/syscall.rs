@@ -2285,6 +2285,10 @@ pub enum Syscall {
     /// Linux (x86_64=428, aarch64=428).
     OpenTree,
 
+    /// `open_tree_attr(dfd, path, flags, attr, size)` — open a mount tree and
+    /// atomically apply mount attributes. Linux (x86_64=467, aarch64=467).
+    OpenTreeAttr,
+
     /// `move_mount(from_dfd, from_path, to_dfd, to_path, flags)` — attach a
     /// detached mount. Linux (x86_64=429, aarch64=429).
     MoveMount,
@@ -2533,6 +2537,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::NameToHandleAt, 303),
     (Syscall::OpenByHandleAt, 304),
     (Syscall::OpenTree, 428),
+    (Syscall::OpenTreeAttr, 467),
     (Syscall::MoveMount, 429),
     (Syscall::Fsopen, 430),
     (Syscall::Fsconfig, 431),
@@ -3008,6 +3013,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::NameToHandleAt, 264),
     (Syscall::OpenByHandleAt, 265),
     (Syscall::OpenTree, 428),
+    (Syscall::OpenTreeAttr, 467),
     (Syscall::MoveMount, 429),
     (Syscall::Fsopen, 430),
     (Syscall::Fsconfig, 431),
@@ -3362,6 +3368,7 @@ fn is_sandbox_syscall(name: Option<&str>) -> bool {
                 | "move_mount"
                 | "mount_setattr"
                 | "open_tree"
+                | "open_tree_attr"
                 | "fsopen"
                 | "fsconfig"
                 | "fsmount"
@@ -3492,7 +3499,15 @@ pub fn kernel_syscall_entry_plain_with_state(
             #[cfg(feature = "syscall-trace")]
             {
                 use core::fmt::Write as _;
-                let _ = writeln!(narf_console::Writer, "UNKNOWN_SYSCALL num={}", num);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                    num,
+                    args.arg0,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                );
             }
             return SyscallReturn::invalid_op();
         }
@@ -3580,12 +3595,16 @@ pub fn kernel_syscall_entry_plain_with_state(
             if !errors_only || is_reportable_syscall_error(r.value) {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "SYSR t={} {} = {} ({:#x}) st={:?}",
+                    "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
                     crate::handlers::current_task_id(),
                     table.name_of(n).unwrap_or("?"),
                     r.value as i64,
                     r.value,
                     r.status,
+                    args.arg0,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
                 );
                 // Errors-only mode suppresses the SYSC entry line, so decode the
                 // path args HERE to show which file/mount the failing op targeted.

@@ -2144,17 +2144,20 @@ fn smoke_propagation_only_noop() -> TestResult {
 kernel_test_in!("userspace/mount", smoke_propagation_only_noop);
 
 // ── Smoke 16: mount_setattr size validation ────────────────────────
-// mount_setattr(dfd, path, flags, attr, size): a well-formed size (1..=64)
-// returns 0; size 0 or > 64 returns -EINVAL. NARF doesn't enforce per-mount
-// attrs, so a valid call just succeeds.
+// mount_setattr(dfd, path, flags, attr, size): Linux's v0 record is 32 bytes,
+// records above one page return E2BIG, and a nonzero extension must be zero.
+// NARF doesn't enforce per-mount attrs, so a valid call just succeeds.
 // Linux ref: fs/namespace.c:SyS_mount_setattr (usize check).
 fn smoke_mount_setattr_size_validation() -> TestResult {
     set_task(0x71_11);
 
     const EINVAL: u64 = (-22i64) as u64;
+    const E2BIG: u64 = (-7i64) as u64;
+    let attr = [0u8; 32];
     // Well-formed: size == 32 (sizeof struct mount_attr) → 0.
     let mut good = StubCtx {
         args: SyscallArgs {
+            arg3: attr.as_ptr() as u64,
             arg4: 32,
             ..Default::default()
         },
@@ -2174,21 +2177,22 @@ fn smoke_mount_setattr_size_validation() -> TestResult {
     crate::mount_api::sys_mount_setattr(&mut zero);
     let zero_einval = matches!(zero.ret, Some(r) if r.value == EINVAL);
 
-    // size == 65 (> 64) → EINVAL.
+    // size > PAGE_SIZE → E2BIG before the pointer is accessed.
     let mut big = StubCtx {
         args: SyscallArgs {
-            arg4: 65,
+            arg3: 1,
+            arg4: 4097,
             ..Default::default()
         },
         ret: None,
     };
     crate::mount_api::sys_mount_setattr(&mut big);
-    let big_einval = matches!(big.ret, Some(r) if r.value == EINVAL);
+    let big_e2big = matches!(big.ret, Some(r) if r.value == E2BIG);
 
-    if good_ok && zero_einval && big_einval {
+    if good_ok && zero_einval && big_e2big {
         TestResult::Pass
     } else {
-        TestResult::Fail("mount_setattr: size 1..=64 → 0, size 0 or >64 → EINVAL")
+        TestResult::Fail("mount_setattr: v0 size → 0, size 0 → EINVAL, >page → E2BIG")
     }
 }
 kernel_test_in!("userspace/mount", smoke_mount_setattr_size_validation);

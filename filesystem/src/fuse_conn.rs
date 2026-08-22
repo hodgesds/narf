@@ -30,6 +30,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -46,6 +47,12 @@ use crate::{
 struct FuseReply {
     error: i32,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct FuseReplySlot {
+    reply: Option<FuseReply>,
+    waker: Option<Waker>,
 }
 
 type PollState = (Arc<AtomicU32>, Arc<AtomicBool>);
@@ -104,7 +111,7 @@ pub struct FuseConnection {
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     background_deferred: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     background_active: IrqSafeSpinLock<BTreeSet<u64>>,
-    replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
+    replies: IrqSafeSpinLock<BTreeMap<u64, FuseReplySlot>>,
     delivered: IrqSafeSpinLock<BTreeSet<u64>>,
     poll_requests: IrqSafeSpinLock<BTreeMap<u64, PendingPoll>>,
     poll_handles: IrqSafeSpinLock<BTreeMap<u64, PollState>>,
@@ -388,14 +395,24 @@ impl FuseConnection {
     pub fn disconnect(&self) {
         self.connected.store(false, Ordering::Release);
         // Fail every outstanding request with -ENOTCONN so awaiters wake.
-        let mut g = self.replies.lock();
-        for slot in g.values_mut() {
-            if slot.is_none() {
-                *slot = Some(FuseReply {
-                    error: -(ENOTCONN as i32),
-                    body: Vec::new(),
-                });
+        let wakers = {
+            let mut g = self.replies.lock();
+            let mut wakers = Vec::new();
+            for slot in g.values_mut() {
+                if slot.reply.is_none() {
+                    slot.reply = Some(FuseReply {
+                        error: -(ENOTCONN as i32),
+                        body: Vec::new(),
+                    });
+                }
+                if let Some(waker) = slot.waker.take() {
+                    wakers.push(waker);
+                }
             }
+            wakers
+        };
+        for waker in wakers {
+            waker.wake();
         }
         self.pending.lock().clear();
         self.delivered.lock().clear();
@@ -435,7 +452,7 @@ impl FuseConnection {
         };
         let mut msg = pod_as_bytes(&hdr);
         msg.extend_from_slice(body);
-        self.replies.lock().insert(unique, None);
+        self.replies.lock().insert(unique, FuseReplySlot::default());
         self.pending.lock().push_back(msg);
         unique
     }
@@ -801,28 +818,24 @@ impl FuseConnection {
         }
         self.delivered.lock().remove(&hdr.unique);
         let mut g = self.replies.lock();
-        match g.get_mut(&hdr.unique) {
-            Some(slot @ None) => {
-                *slot = Some(FuseReply {
+        let wake = match g.get_mut(&hdr.unique) {
+            Some(slot) if slot.reply.is_none() => {
+                slot.reply = Some(FuseReply {
                     error: hdr.error,
                     body,
                 });
-                Some(claimed)
+                slot.waker.take()
             }
             // Unknown or already-completed unique: drop it (a duplicate
             // reply is not fatal), still report bytes consumed so the
             // daemon's write loop advances.
-            _ => Some(claimed),
-        }
-    }
-
-    /// Take the completed reply for `unique`, if it has landed.
-    fn take_reply(&self, unique: u64) -> Option<FuseReply> {
-        let mut g = self.replies.lock();
-        match g.get(&unique) {
-            Some(Some(_)) => g.remove(&unique).flatten(),
             _ => None,
+        };
+        drop(g);
+        if let Some(waker) = wake {
+            waker.wake();
         }
+        Some(claimed)
     }
 
     /// Submit a request and await its reply. On success returns the reply
@@ -901,11 +914,10 @@ fn parse_connection_limit(data: &[u8]) -> Result<u32, FsError> {
     Ok(value)
 }
 
-/// Future that parks a VFS caller until its FUSE reply lands. Each poll
-/// checks the reply map; while pending it re-arms its own waker so the
-/// cooperative scheduler re-polls it (the daemon task, driven on the same
-/// executor, fills the slot between polls). On a dead connection it
-/// resolves to an `-ENOTCONN` reply so callers never park forever.
+/// Future that parks a VFS caller until its FUSE reply lands. A pending poll
+/// installs the caller's waker in the reply slot; daemon completion or
+/// disconnect takes and wakes it after publishing the result. Registration
+/// and result inspection share one lock, closing the lost-wakeup race.
 struct ReplyFuture {
     conn: Arc<FuseConnection>,
     unique: u64,
@@ -927,21 +939,44 @@ impl core::future::Future for ReplyFuture {
         self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        if let Some(reply) = self.conn.take_reply(self.unique) {
-            return core::task::Poll::Ready(reply);
+        let mut replies = self.conn.replies.lock();
+        if replies
+            .get(&self.unique)
+            .and_then(|slot| slot.reply.as_ref())
+            .is_some()
+        {
+            let slot = replies
+                .remove(&self.unique)
+                .expect("observed FUSE reply slot disappeared under lock");
+            return core::task::Poll::Ready(
+                slot.reply
+                    .expect("observed completed FUSE reply disappeared under lock"),
+            );
         }
         if !self.conn.is_connected() {
+            replies.remove(&self.unique);
             // Connection died with no reply — synthesize ENOTCONN.
             return core::task::Poll::Ready(FuseReply {
                 error: -(ENOTCONN as i32),
                 body: Vec::new(),
             });
         }
-        // Re-arm: the daemon completes the reply on another task, so we
-        // must be re-polled. `wake_by_ref` schedules exactly that on the
-        // cooperative executor (and is a no-op-safe re-poll under the
-        // test's manual poll loop too).
-        cx.waker().wake_by_ref();
+        let Some(slot) = replies.get_mut(&self.unique) else {
+            // A connected request cannot normally lose its slot. Treat a
+            // transport-side cancellation as a disconnected request instead
+            // of parking forever on an event which can no longer arrive.
+            return core::task::Poll::Ready(FuseReply {
+                error: -(ENOTCONN as i32),
+                body: Vec::new(),
+            });
+        };
+        if slot
+            .waker
+            .as_ref()
+            .is_none_or(|waker| !waker.will_wake(cx.waker()))
+        {
+            slot.waker = Some(cx.waker().clone());
+        }
         core::task::Poll::Pending
     }
 }

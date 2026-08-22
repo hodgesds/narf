@@ -3174,6 +3174,62 @@ fn smoke_fs_fuse_syncfs_enosys_is_cached() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_syncfs_enosys_is_cached);
 
+fn smoke_fs_fuse_reply_wakes_exact_waiter() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    #[derive(Debug)]
+    struct CountWake(&'static AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static WAKES: AtomicUsize = AtomicUsize::new(0);
+    WAKES.store(0, Ordering::Relaxed);
+    let conn = Arc::new(FuseConnection::new());
+    let fs = FuseFs::new("fuse-waker", Arc::clone(&conn));
+    let mut future = alloc::boxed::Box::pin(fs.init());
+    let waker = Waker::from(Arc::new(CountWake(&WAKES)));
+    let mut cx = Context::from_waker(&waker);
+
+    if !matches!(future.as_mut().poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("FUSE_INIT unexpectedly completed before daemon reply");
+    }
+    if WAKES.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("pending FUSE reply future self-woke");
+    }
+    let request = match conn.dequeue_request() {
+        Some(request) => request,
+        None => return TestResult::Fail("FUSE_INIT request was not queued"),
+    };
+    let reply = match fuse_daemon_answer(&request) {
+        Some(reply) => reply,
+        None => return TestResult::Fail("test daemon did not answer FUSE_INIT"),
+    };
+    if conn.complete_reply(&reply) != Some(reply.len()) {
+        return TestResult::Fail("FUSE_INIT reply was not accepted");
+    }
+    if WAKES.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("FUSE completion did not wake exactly one waiter");
+    }
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(_)) => TestResult::Pass,
+        Poll::Ready(Err(_)) => TestResult::Fail("woken FUSE_INIT returned an error"),
+        Poll::Pending => TestResult::Fail("woken FUSE reply remained pending"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_reply_wakes_exact_waiter);
+
 fn smoke_fs_fuse_request_timeout_aborts_connection() -> TestResult {
     use crate::fuse_conn::FuseConnection;
     use alloc::sync::Arc;

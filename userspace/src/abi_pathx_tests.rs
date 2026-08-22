@@ -760,6 +760,58 @@ fn smoke_abi_pathx_newfstatat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_neg);
 
+fn smoke_abi_pathx_newfstatat_exact_errnos() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2/f\0";
+        let empty = b"\0";
+        let mut sb = [0u8; 256];
+
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("newfstatat with a null stat buffer must return -EFAULT");
+        }
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, empty.as_ptr() as u64, sb.as_mut_ptr() as u64, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("newfstatat with an empty path and no AT_EMPTY_PATH must return -ENOENT");
+        }
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                AT_FDCWD,
+                path.as_ptr() as u64,
+                sb.as_mut_ptr() as u64,
+                1u64 << 31,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("newfstatat with unknown flags must return -EINVAL");
+        }
+
+        let file_fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("newfstatat errno test could not open its regular-file dirfd"),
+        };
+        let relative = b"child\0";
+        match call(
+            Syscall::Newfstatat.raw(),
+            a3(file_fd, relative.as_ptr() as u64, sb.as_mut_ptr() as u64, 0),
+        ) {
+            Some(ENOTDIR) => Ok(()),
+            _ => Err("newfstatat relative to a non-directory fd must return -ENOTDIR"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_exact_errnos);
+
 // ── openat2 (dirfd, NUL-term path, open_how*, size) → fd / -EINVAL ──
 //
 // open_how is { u64 flags; u64 mode; u64 resolve } (24 bytes). how==NULL

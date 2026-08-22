@@ -41,14 +41,20 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   `write`, `truncate`, persistent `set_perms`/`set_owners`, directory
   metadata mutation, `lookup_async`, `lookup_dir_async`, and
   `enumerate_async`.
+- The per-volume DMA scratch pool is a bounded async resource. Exhaustion
+  registers the filesystem task's waker; returning a buffer wakes one waiter.
+  Dropping a waiting future removes its own registration.
 
 ## 4. Invariants
 
 - **Magic check:** Mount fails if `s_magic != 0xEF53`.
 - **Block 0 of group 0** holds the superblock (at offset 1024) and is
   never returned as data.
-- **Cap-bound I/O:** Exactly one `Cap<DmaBuffer, Write>` is minted at
-  mount and reused; the cap is unregistered when the volume is dropped.
+- **Cap-bound I/O:** A fixed pool of `Cap<DmaBuffer, Write>` values is minted
+  at mount and reused; every cap is unregistered when the volume is dropped.
+- **Scratch waitqueue:** No caller busy-polls an exhausted scratch pool.
+  Buffer return publishes the free cap before waking one registered waiter;
+  cancelled waiters cannot leave permanent registrations behind.
 - **No `Cap::bootstrap()` in hot paths.** All sector reads derive from
   the volume cap via `Cap::derive::<Read>()`.
 - **Indirect block walks bounded** by the inode's `i_blocks` / file

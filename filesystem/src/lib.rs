@@ -489,6 +489,11 @@ impl From<CapError> for FsError {
 // `async-trait`-style return-position-impl-trait once stabilised.
 
 /// Future returned by every async file/dir op.
+///
+/// Implementations which return `Poll::Pending` must retain the supplied
+/// waker (or register it with the lower async primitive they await) and wake
+/// it after publishing completion, failure, disconnect, or newly available
+/// capacity. A filesystem future must not self-wake merely to request polling.
 pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Send + 'a>>;
 
 /// Result of an asynchronous filesystem-backed ioctl.
