@@ -2733,6 +2733,357 @@ unsafe extern "C" fn user_mode_resume(_state: *const UserState) -> ! {
     );
 }
 
+#[cfg(all(target_arch = "aarch64", feature = "user-mode-e2e"))]
+mod aarch64_el0_preemption_e2e {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_user_task_hooks,
+        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess,
+    };
+
+    use super::{kernel_test_in, TestResult};
+
+    const CODE_VADDR: u64 = 0x0040_0000;
+    const STACK_VADDR: u64 = 0x0041_0000;
+    const SHARED_VADDR: u64 = 0x0042_0000;
+    const PAGE_BYTES: u64 = 4096;
+    const TIMER_TVAL_TICKS: u64 = 5_000_000;
+
+    const FLAG_OFFSET: usize = 0;
+    const A_TLS_OFFSET: usize = 8;
+    const A_SIMD_OFFSET: usize = 16;
+    const B_SIMD_OFFSET: usize = 32;
+    const A_DONE_OFFSET: usize = 48;
+    const B_TLS_OFFSET: usize = 56;
+    const A_PATTERN_OFFSET: usize = 64;
+    const B_PATTERN_OFFSET: usize = 80;
+
+    const TLS_A: u64 = 0x1122_3344_5566_7788;
+    const TLS_B: u64 = 0x8877_6655_4433_2211;
+    const SIMD_A: u8 = 0x5a;
+    const SIMD_B: u8 = 0xa5;
+
+    #[inline]
+    fn movz(rd: u32, imm: u16, shift: u32) -> u32 {
+        0xd280_0000 | ((shift / 16) << 21) | (u32::from(imm) << 5) | rd
+    }
+
+    #[inline]
+    fn movk(rd: u32, imm: u16, shift: u32) -> u32 {
+        0xf280_0000 | ((shift / 16) << 21) | (u32::from(imm) << 5) | rd
+    }
+
+    fn load_u64(code: &mut Vec<u32>, rd: u32, value: u64) {
+        code.push(movz(rd, value as u16, 0));
+        code.push(movk(rd, (value >> 16) as u16, 16));
+        code.push(movk(rd, (value >> 32) as u16, 32));
+        code.push(movk(rd, (value >> 48) as u16, 48));
+    }
+
+    #[inline]
+    fn msr_tpidr_el0(rt: u32) -> u32 {
+        0xd51b_d040 | rt
+    }
+
+    #[inline]
+    fn mrs_tpidr_el0(rt: u32) -> u32 {
+        0xd53b_d040 | rt
+    }
+
+    #[inline]
+    fn ldr_x(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        debug_assert_eq!(byte_offset % 8, 0);
+        0xf940_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+    }
+
+    #[inline]
+    fn str_x(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        debug_assert_eq!(byte_offset % 8, 0);
+        0xf900_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt
+    }
+
+    #[inline]
+    fn ldr_q(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        debug_assert_eq!(byte_offset % 16, 0);
+        0x3dc0_0000 | ((byte_offset / 16) << 10) | (rn << 5) | rt
+    }
+
+    #[inline]
+    fn str_q(rt: u32, rn: u32, byte_offset: u32) -> u32 {
+        debug_assert_eq!(byte_offset % 16, 0);
+        0x3d80_0000 | ((byte_offset / 16) << 10) | (rn << 5) | rt
+    }
+
+    #[inline]
+    fn cbz_x(rt: u32, delta_instructions: i32) -> u32 {
+        let imm19 = (delta_instructions as u32) & 0x7_ffff;
+        0xb400_0000 | (imm19 << 5) | rt
+    }
+
+    fn emit_exit(code: &mut Vec<u32>) {
+        load_u64(code, 8, u64::from(Syscall::ExitTask.raw()));
+        code.push(movz(0, 0, 0));
+        code.push(0xd400_0001); // svc #0
+        code.push(0x1400_0000); // b . (must not execute if exit is wired)
+    }
+
+    fn spinner_program() -> Vec<u32> {
+        let mut code = Vec::new();
+        load_u64(&mut code, 9, SHARED_VADDR);
+        load_u64(&mut code, 10, TLS_A);
+        code.push(msr_tpidr_el0(10));
+        code.push(ldr_q(8, 9, A_PATTERN_OFFSET as u32));
+
+        // No syscall, WFE, or cooperative yield exists in this loop. The
+        // releaser can run only if the generic-timer path involuntarily
+        // switches this EL0 continuation back to the executor.
+        let loop_index = code.len();
+        code.push(ldr_x(11, 9, FLAG_OFFSET as u32));
+        let cbz_index = code.len();
+        code.push(cbz_x(11, loop_index as i32 - cbz_index as i32));
+
+        code.push(mrs_tpidr_el0(12));
+        code.push(str_x(12, 9, A_TLS_OFFSET as u32));
+        code.push(str_q(8, 9, A_SIMD_OFFSET as u32));
+        code.push(movz(13, 1, 0));
+        code.push(str_x(13, 9, A_DONE_OFFSET as u32));
+        emit_exit(&mut code);
+        code
+    }
+
+    fn releaser_program() -> Vec<u32> {
+        let mut code = Vec::new();
+        load_u64(&mut code, 9, SHARED_VADDR);
+        load_u64(&mut code, 10, TLS_B);
+        code.push(msr_tpidr_el0(10));
+        code.push(ldr_q(8, 9, B_PATTERN_OFFSET as u32));
+        code.push(str_q(8, 9, B_SIMD_OFFSET as u32));
+        code.push(mrs_tpidr_el0(12));
+        code.push(str_x(12, 9, B_TLS_OFFSET as u32));
+        code.push(movz(11, 1, 0));
+        code.push(str_x(11, 9, FLAG_OFFSET as u32));
+        emit_exit(&mut code);
+        code
+    }
+
+    fn build_process(
+        code: &[u32],
+        code_phys: PhysAddr,
+        stack_phys: PhysAddr,
+        shared_phys: PhysAddr,
+    ) -> Result<UserProcess, &'static str> {
+        // SAFETY: the kernel test runs after paging and the frame allocator are
+        // live, which is `new_for_user`'s precondition.
+        let address_space = unsafe { AddressSpace::new_for_user() }.map_err(|_| "new_for_user")?;
+
+        // Write through the kernel direct-map alias so this remains valid on
+        // AArch64 after TTBR1 replaces the low identity map.
+        // SAFETY: code_phys names a freshly allocated 4 KiB frame, and the
+        // generated program is much smaller than one page.
+        unsafe {
+            core::ptr::write_bytes(code_phys.kernel_mut_ptr::<u8>(), 0, PAGE_BYTES as usize);
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr().cast::<u8>(),
+                code_phys.kernel_mut_ptr::<u8>(),
+                core::mem::size_of_val(code),
+            );
+            narf_arch::aarch64::asm::flush_icache_range(
+                code_phys.kernel_ptr::<u8>() as u64,
+                core::mem::size_of_val(code) as u64,
+            );
+        }
+
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(CODE_VADDR),
+                len: PAGE_BYTES,
+                perms: RegionPerms::READ | RegionPerms::EXEC,
+                phys: alloc::vec![code_phys],
+            })
+            .map_err(|_| "map code")?;
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(STACK_VADDR),
+                len: PAGE_BYTES,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![stack_phys],
+            })
+            .map_err(|_| "map stack")?;
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(SHARED_VADDR),
+                len: PAGE_BYTES,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![shared_phys],
+            })
+            .map_err(|_| "map shared")?;
+
+        // SAFETY: all mapped physical frames above are live and the page-table
+        // allocator is initialized by the kernel-test boot path.
+        unsafe { address_space.materialize() }.map_err(|_| "materialize")?;
+
+        Ok(UserProcess {
+            pid: narf_userspace::alloc_pid(),
+            address_space: Arc::new(address_space),
+            entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+            stack_top: VirtAddr::new(STACK_VADDR + PAGE_BYTES),
+            fs_base: None,
+            entry_arg: None,
+            loaded_mappings: alloc::vec::Vec::new(),
+        })
+    }
+
+    fn alloc_phys() -> Result<PhysAddr, &'static str> {
+        narf_memory::alloc_frame()
+            .map(|frame| frame.start_address())
+            .map_err(|_| "alloc frame")
+    }
+
+    fn read_u64(shared: PhysAddr, offset: usize) -> u64 {
+        // SAFETY: shared is a live page and all u64 fields are naturally
+        // aligned within it. Volatile keeps the post-execution observations
+        // explicit to the compiler.
+        unsafe {
+            shared
+                .kernel_ptr::<u8>()
+                .add(offset)
+                .cast::<u64>()
+                .read_volatile()
+        }
+    }
+
+    fn smoke_aarch64_el0_tick_preempts_and_preserves_context() -> TestResult {
+        __test_clear_global();
+        narf_userspace::user_task::__test_clear_hooks();
+        narf_scheduler::__reset_queues_for_test();
+
+        let shared_phys = match alloc_phys() {
+            Ok(phys) => phys,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let code_a = match alloc_phys() {
+            Ok(phys) => phys,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let stack_a = match alloc_phys() {
+            Ok(phys) => phys,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let code_b = match alloc_phys() {
+            Ok(phys) => phys,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let stack_b = match alloc_phys() {
+            Ok(phys) => phys,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+
+        // SAFETY: shared_phys names a fresh 4 KiB frame. The two patterns and
+        // result fields are disjoint and bounded by the page.
+        unsafe {
+            let shared = core::slice::from_raw_parts_mut(
+                shared_phys.kernel_mut_ptr::<u8>(),
+                PAGE_BYTES as usize,
+            );
+            shared.fill(0);
+            shared[A_PATTERN_OFFSET..A_PATTERN_OFFSET + 16].fill(SIMD_A);
+            shared[B_PATTERN_OFFSET..B_PATTERN_OFFSET + 16].fill(SIMD_B);
+            core::arch::asm!("dsb ishst", options(nostack, preserves_flags));
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        let spinner = match build_process(&spinner_program(), code_a, stack_a, shared_phys) {
+            Ok(process) => process,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+        let releaser = match build_process(&releaser_program(), code_b, stack_b, shared_phys) {
+            Ok(process) => process,
+            Err(reason) => return TestResult::Fail(reason),
+        };
+
+        let mut table = SyscallTable::new();
+        install_core_syscalls(&mut table);
+        install_global(table);
+        install_user_task_hooks();
+
+        let ticks_before = narf_interrupts::aarch64::timer::timer_ticks_for(0);
+        narf_userspace::user_task::spawn_user_process(
+            spinner,
+            narf_scheduler::TaskSpec::unthrottled(),
+        );
+        narf_userspace::user_task::spawn_user_process(
+            releaser,
+            narf_scheduler::TaskSpec::unthrottled(),
+        );
+
+        // Unlike the normal async-demo boot path, the kernel-test harness
+        // deliberately leaves the BSP generic timer stopped and IRQs masked.
+        // This smoke owns that preemption source for its duration and restores
+        // the incoming IRQ state before returning to the rest of the suite.
+        let irqs_were_enabled = narf_arch::interrupts_enabled();
+        // SAFETY: GICv3 and the timer PPI are initialized before kernel tests
+        // run, and no IRQ-unsafe lock is held here.
+        unsafe {
+            narf_interrupts::aarch64::timer::start_timer(TIMER_TVAL_TICKS);
+            narf_arch::enable_interrupts();
+        }
+
+        // If EL0 timer preemption is broken, the first task never leaves its
+        // load/CBZ loop and this call times out at the QEMU harness. There is
+        // deliberately no cooperative escape hatch in the user program.
+        narf_scheduler::run_until_empty();
+        let ticks_after = narf_interrupts::aarch64::timer::timer_ticks_for(0);
+
+        // SAFETY: this test exclusively armed the BSP timer above. Restore the
+        // harness's prior interrupt-mask state after disabling that source.
+        unsafe {
+            narf_interrupts::aarch64::timer::stop_timer();
+            if irqs_were_enabled {
+                narf_arch::enable_interrupts();
+            } else {
+                narf_arch::disable_interrupts();
+            }
+        }
+
+        narf_userspace::user_task::__test_clear_hooks();
+        __test_clear_global();
+
+        if ticks_after <= ticks_before {
+            return TestResult::Fail("BSP generic timer did not tick during EL0 execution");
+        }
+        if read_u64(shared_phys, FLAG_OFFSET) != 1 || read_u64(shared_phys, A_DONE_OFFSET) != 1 {
+            return TestResult::Fail("releaser did not unblock the busy EL0 task");
+        }
+        if read_u64(shared_phys, A_TLS_OFFSET) != TLS_A
+            || read_u64(shared_phys, B_TLS_OFFSET) != TLS_B
+        {
+            return TestResult::Fail("TPIDR_EL0 leaked across task preemption");
+        }
+
+        // SAFETY: the recorded 16-byte SIMD results are within the live shared
+        // page. The executor is quiescent, so no user task can mutate them.
+        let shared = unsafe {
+            core::slice::from_raw_parts(shared_phys.kernel_ptr::<u8>(), PAGE_BYTES as usize)
+        };
+        if shared[A_SIMD_OFFSET..A_SIMD_OFFSET + 16] != [SIMD_A; 16] {
+            return TestResult::Fail("spinner SIMD state was not restored");
+        }
+        if shared[B_SIMD_OFFSET..B_SIMD_OFFSET + 16] != [SIMD_B; 16] {
+            return TestResult::Fail("releaser SIMD sentinel was not executed");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "verification/aarch64-el0",
+        smoke_aarch64_el0_tick_preempts_and_preserves_context
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Full end-to-end: build a user AS with a code + stack page,
@@ -2747,8 +3098,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
+        TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -2840,7 +3191,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     install_global(t);
 
     // SAFETY: Valid memory or trusted environment
-    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user failed"),
     };
@@ -2930,8 +3281,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
+        TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -3078,7 +3429,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     install_global(t);
 
     // SAFETY: Valid memory or trusted environment
-    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
@@ -3238,7 +3589,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     //   int 0x80
     //   jmp $
     // SAFETY: Valid memory or trusted environment
-    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
@@ -3344,14 +3695,15 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         __test_clear_global();
         let r = OBSERVED_REASONS.load(Ordering::Relaxed);
         if r != 3 {
-            return TestResult::Fail("did not observe both Yielded and Exited");
+            TestResult::Fail("did not observe both Yielded and Exited")
+        } else {
+            TestResult::Pass
         }
-        return TestResult::Pass;
     } else {
         clear_current_user_task();
         narf_userspace::user_task::__test_clear_hooks();
         __test_clear_global();
-        return TestResult::Fail("unexpected longjmp value");
+        TestResult::Fail("unexpected longjmp value")
     }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -3371,7 +3723,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_core_syscalls, install_global, install_user_task_hooks,
-        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess, UserTaskFuture,
+        syscall::__test_clear_global, Syscall, SyscallTable, UserProcess,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -3398,7 +3750,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     install_global(t);
 
     // SAFETY: Valid memory or trusted environment
-    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
@@ -3460,8 +3812,8 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         stack_top: VirtAddr::new(stack_top),
         fs_base: None,
         entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
     };
-    let address_space_clone = proc.address_space.clone();
 
     // Boot the executor + wire the user-task hooks so Yield/Exit
     // longjmps reach the polling future.
@@ -3470,12 +3822,11 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
 
     // The user task itself, plus a ".join()" outer task that flips
     // OUTER_DONE once the user task's future has Ready'd. Spawning
-    // the user task via `spawn_user` is the load-bearing line —
+    // the user task via `spawn_user_process` is the load-bearing line —
     // this is the path that wasn't possible before.
-    let _user_id = narf_scheduler::spawn_user(
-        UserTaskFuture::new(proc),
+    let _user_id = narf_userspace::user_task::spawn_user_process(
+        proc,
         narf_scheduler::TaskSpec::unthrottled(),
-        address_space_clone,
     );
     narf_scheduler::spawn(async {
         // Wait one yield round so the user task gets polled at least
@@ -3545,8 +3896,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, Syscall, SyscallHandler, SyscallTable,
+        TrapContext,
     };
 
     // The user code emits two syscalls:

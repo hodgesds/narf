@@ -583,3 +583,11 @@ argument = "The generic-timer path reaches the private scheduler switch only aft
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Every AArch64 user switch-out saves Q0-Q31, FPCR, FPSR, and the live TPIDR_EL0 into task-owned stable storage before current-task publication is cleared. Dispatch activates the slot's retained address space and restores its TLS and FP/SIMD image before resuming the saved continuation; zero TLS has explicit validity and cannot leak a prior task's value. Fork/clone seed the child from live parent TLS and FP/SIMD state, while exec clears both as Linux arm64 does. Involuntary returns remain non-quiescent for QSBR, and syscall continuations remain non-preemptible except at explicit safe exit/park boundaries."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler edit adds only clippy-required safety documentation to existing AArch64 verification code. It changes no executable statement, context-switch precondition, saved state, scheduling decision, capability check, domain transition, or TCB boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The own-stack reset is compiled only under the kernel-test feature and is invoked only by the existing userspace test-hook cleanup. It restores the verification initial state between distributed smokes; production builds retain the one-way own-stack enablement contract, and no policy crate gains access to stacks, trap frames, saved domain state, or context-switch mechanics."

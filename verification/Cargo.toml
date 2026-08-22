@@ -79,12 +79,12 @@ narf-modules      = { path = "../modules" }
 
 [features]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the
-# user-mode round-trip / yield-resume / poll_yield_exit / future
-# yield_exit smokes that build a user AS, issue `int 0x80`, and
-# longjmp back without terminating the kernel. Disabled by default
-# because the tests leave subsystem state that other suites don't
-# need to pay for; enable with
-# `cargo xtask test --arch=x86_64 --features=user-mode-e2e`.
+# x86_64 user-mode round-trip / yield-resume smokes plus the aarch64
+# two-task EL0 timer-preemption context-isolation smoke. The tests build
+# user address spaces and embed instructions directly, without boot-init or
+# filesystem input. Disabled by default because they leave subsystem state
+# that other suites do not need to pay for; enable with
+# `cargo xtask test --arch=<x86_64|aarch64> --features=user-mode-e2e`.
 user-mode-e2e = []
 # Opt-in real-Rust-binary end-to-end test. This implies
 # `user-mode-e2e` and additionally enables
@@ -108,6 +108,10 @@ boot-init = ["dep:narf-busybox"]
 # so the entry/longjmp plumbing is in scope. The runner exits the
 # kernel on success (same shape as user-mode-testbin).
 narf-libc-validate = ["user-mode-e2e"]
+# Mirror the frame-level bring-up feature for tests that intentionally install
+# unsigned firmware blobs. Kept separate from user-mode-e2e so ordinary EL0
+# tests retain production signature policy.
+firmware-allow-unsigned = ["narf-firmware/firmware-allow-unsigned"]
 
 [lints]
 workspace = true

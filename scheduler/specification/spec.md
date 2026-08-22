@@ -96,6 +96,9 @@ Own-stack user tasks are timer-preemptible at the CPL3 scheduler tick. The
 preemption path retains the task's live trap frame, FPU state, address space,
 TLS base, and dedicated kernel-stack continuation across requeue, so a
 syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
+Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
+the userspace test-hook reset invokes it so distributed tests remain independent
+of link-order. Production builds neither compile nor call this reset.
 Their CPL0 syscall continuations remain run-to-completion except at explicit
 park/yield points. NARF now has a nestable CPU-local `preempt_disable()` guard,
 but syscall/driver critical regions have not completed the adoption audit;

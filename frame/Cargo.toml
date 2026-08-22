@@ -235,7 +235,10 @@ boot-smoke = []
 # initramfs blobs packed with `xtask pack-firmware` (all-zero
 # signature sentinel) actually load. Production builds disable
 # this and require keyed signatures.
-firmware-allow-unsigned = ["narf-firmware/firmware-allow-unsigned"]
+firmware-allow-unsigned = [
+    "narf-firmware/firmware-allow-unsigned",
+    "narf-verification?/firmware-allow-unsigned",
+]
 # Run the narf-verification kernel-test harness instead of the async demo.
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
 kernel-test  = [
