@@ -165,6 +165,11 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
+Blocking stream `send(2)` and `sendmsg(2)` park on the connected ring's durable
+writable readiness when no byte fits, then re-execute after space or closure is
+published. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
+`sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
+its first message would block it follows the same park-or-`EAGAIN` rule.
 AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
 queues an accept-ready endpoint. Accepting the final pending endpoint followed
 by a new connection before the next epoll scan remains a deliverable

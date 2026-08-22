@@ -51,10 +51,37 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
         // MUST report EAGAIN, never a bogus 0-byte "success": returning 0 for a
         // non-empty buffer makes correct clients busy-loop or treat the stream
         // as broken, and matches nothing Linux ever returns from send(2).
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            socket_send_would_block(ctx, fd, flags, sock.as_ref());
+        }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         // Send never yields Accepted/Received/Addr; keep the match total.
         _ => ctx.set_return(fail),
     }
+}
+
+pub(super) fn socket_send_would_block(
+    ctx: &mut dyn TrapContext,
+    fd: u32,
+    flags: u32,
+    sock: &crate::socket::SocketFile,
+) {
+    const MSG_DONTWAIT: u32 = 0x40;
+    let task = current_task_id();
+    if flags & MSG_DONTWAIT != 0 || socket_listener_nonblock(task, fd, sock) {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+    if park_reexecute_on_fd(
+        ctx,
+        sock,
+        narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+    ) {
+        return;
+    }
+    // Kernel-test/non-stackful context cannot sleep; expose the retryable
+    // condition rather than fabricating a zero-byte successful send.
+    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
 }

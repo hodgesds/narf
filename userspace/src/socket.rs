@@ -2139,6 +2139,8 @@ impl FileOps for SocketFile {
             let r = self.do_send(buf, 0, None);
             match r {
                 Ok(n) => Ok(n),
+                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
+                Err(SockError::Pipe) => Err(FsError::BrokenPipe),
                 Err(_) => Err(FsError::Unsupported),
             }
         })

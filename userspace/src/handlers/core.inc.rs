@@ -7027,9 +7027,14 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
         crate::user_task::yield_hook(),
     ) {
         let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
-        // re-entry re-runs this syscall with its original args.
-        let resume_rip = ctx.rip().wrapping_sub(2);
+        // Rewind past the architecture's syscall instruction so re-entry
+        // re-runs this syscall with its original args (`syscall`/`int 0x80`
+        // are 2 bytes; AArch64 `svc` is one fixed-width 4-byte instruction).
+        #[cfg(target_arch = "x86_64")]
+        const SYSCALL_INSN_LEN: u64 = 2;
+        #[cfg(target_arch = "aarch64")]
+        const SYSCALL_INSN_LEN: u64 = 4;
+        let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
         ctx.set_rip(resume_rip);
         // SAFETY: `uctx` is the live per-task UserTaskCtx from
         // current_user_task(); we hold the only reference while setting the
@@ -7056,6 +7061,41 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
         // unreachable — hook() longjmps to the executor
     }
     false
+}
+
+/// Park a blocking syscall on one descriptor's durable readiness cell, then
+/// re-execute the syscall from its original user arguments.  The readiness arm
+/// happens before the task becomes unrunnable, so a peer that frees space in
+/// that window cannot lose the wake.  Descriptors that have not migrated to a
+/// durable cell retain the existing generation-guarded I/O park.
+pub(crate) fn park_reexecute_on_fd(
+    ctx: &mut dyn TrapContext,
+    ops: &dyn narf_filesystem::FileOps,
+    interest: u32,
+) -> bool {
+    // CaptureCtx deliberately reports RIP 0 for a nested sendmsg used by
+    // sendmmsg.  The outer handler must decide whether re-execution is safe
+    // after accounting for any messages it already transmitted.
+    if ctx.rip() == 0 {
+        return false;
+    }
+    let task = current_task_id();
+    let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
+        return false;
+    };
+    match ops.arm_readiness(task, interest, &waker) {
+        Some(Poll::Ready(_)) => {
+            ops.disarm_readiness(task);
+            ctx.set_rip(ctx.rip().wrapping_sub(2));
+            true
+        }
+        Some(Poll::Pending) => {
+            let parked = park_reexecute_on_io(ctx);
+            ops.disarm_readiness(task);
+            parked
+        }
+        None => park_reexecute_on_io(ctx),
+    }
 }
 
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a

@@ -3995,6 +3995,38 @@ kernel_test_in!(
     smoke_abi_socket_sendmsg_full_ring_reports_eagain
 );
 
+/// A non-blocking `sendmmsg()` whose first message cannot make progress must
+/// return EAGAIN, not a successful zero-message count.  The nested sendmsg
+/// handler cannot itself rewind the outer syscall; sendmmsg owns that decision.
+fn smoke_abi_socket_sendmmsg_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, _fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut mmsg = [0u8; 64];
+        mmsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        mmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+
+        let r = call(
+            Syscall::Sendmmsg.raw(),
+            a3(fd0, mmsg.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("full-ring sendmmsg status")?;
+        if r != EAGAIN {
+            return Err("sendmmsg on a full non-blocking ring did not report EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmmsg_full_ring_reports_eagain
+);
+
 /// An fd-passing `sendmsg()` (SCM_RIGHTS) on a FULL ring must report EAGAIN and
 /// must NOT swallow the descriptor: after the peer drains, the retried send
 /// delivers the fd intact. The pre-fix path returned Ok(0) here AND dropped the

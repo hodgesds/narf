@@ -80,6 +80,14 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             };
         return match send {
             Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(crate::socket::SockError::WouldBlock) => {
+                handler_sys_socket_send::socket_send_would_block(
+                    ctx,
+                    fd,
+                    flags,
+                    sock.as_ref(),
+                )
+            }
             Err(e) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
         };
     }
@@ -93,6 +101,9 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         // Map the real socket error to its errno (EAGAIN/ENOTCONN/EPIPE/…)
         // instead of the bare -1 sentinel (which musl reads as EPERM and
         // libwayland treats as a fatal connection error).
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref());
+        }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
