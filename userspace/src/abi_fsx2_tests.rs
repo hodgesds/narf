@@ -1537,6 +1537,7 @@ fn smoke_abi_fsx2_rename_resolves_in_private_mount_namespace() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        const AT_FDCWD: u64 = (-100i64) as u64;
         let result = (|| {
             if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
                 return Err("private mount namespace setup failed");
@@ -1564,8 +1565,8 @@ fn smoke_abi_fsx2_rename_resolves_in_private_mount_namespace() -> TestResult {
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
 
             let r = call(
-                Syscall::Rename.raw(),
-                a1(tmp.as_ptr() as u64, fin.as_ptr() as u64),
+                Syscall::Renameat.raw(),
+                a3(AT_FDCWD, tmp.as_ptr() as u64, AT_FDCWD, fin.as_ptr() as u64),
             );
             match r {
                 Some(0) => {}
@@ -1606,6 +1607,7 @@ fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
         const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
         const RENAME_NOREPLACE: u64 = 1;
         const AT_FDCWD: u64 = (-100i64) as u64;
+        const AT_REMOVEDIR: u64 = 0x200;
         let result = (|| {
             if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
                 return Err("private mount namespace setup failed");
@@ -1656,7 +1658,7 @@ fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
             if !make(u) {
                 return Err("could not create the unlink target");
             }
-            if call(Syscall::Unlink.raw(), a0(u.as_ptr() as u64)) != Some(0) {
+            if call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, u.as_ptr() as u64, 0)) != Some(0) {
                 return Err("unlink did not resolve in the private mount namespace");
             }
             if call_open(u.as_ptr() as u64, 0).unwrap_or(-1) >= 0 {
@@ -1667,8 +1669,8 @@ fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
             let link = b"/abi-nsmut/a-link\0";
             let target = b"r2-dst\0";
             if call(
-                Syscall::Symlink.raw(),
-                a1(target.as_ptr() as u64, link.as_ptr() as u64),
+                Syscall::Symlinkat.raw(),
+                a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
             ) != Some(0)
             {
                 return Err("symlink did not resolve in the private mount namespace");
@@ -1676,10 +1678,18 @@ fn smoke_abi_fsx2_mutations_resolve_in_private_mount_namespace() -> TestResult {
 
             // rmdir
             let d = b"/abi-nsmut/a-dir\0";
-            if call(Syscall::Mkdir.raw(), a1(d.as_ptr() as u64, 0o755)) != Some(0) {
+            if call(
+                Syscall::Mkdirat.raw(),
+                a2(AT_FDCWD, d.as_ptr() as u64, 0o755),
+            ) != Some(0)
+            {
                 return Err("mkdir did not resolve in the private mount namespace");
             }
-            if call(Syscall::Rmdir.raw(), a0(d.as_ptr() as u64)) != Some(0) {
+            if call(
+                Syscall::Unlinkat.raw(),
+                a2(AT_FDCWD, d.as_ptr() as u64, AT_REMOVEDIR),
+            ) != Some(0)
+            {
                 return Err("rmdir did not resolve in the private mount namespace");
             }
             Ok(())
@@ -1704,6 +1714,7 @@ fn smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
         const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+        const AT_FDCWD: u64 = (-100i64) as u64;
         let result = (|| {
             if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
                 return Err("private mount namespace setup failed");
@@ -1719,7 +1730,11 @@ fn smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace() -> TestResult {
                 return Err("private-namespace mount setup failed");
             }
             for dir in [b"/abi-nsxdir/from\0".as_ref(), b"/abi-nsxdir/to\0".as_ref()] {
-                if call(Syscall::Mkdir.raw(), a1(dir.as_ptr() as u64, 0o755)) != Some(0) {
+                if call(
+                    Syscall::Mkdirat.raw(),
+                    a2(AT_FDCWD, dir.as_ptr() as u64, 0o755),
+                ) != Some(0)
+                {
                     return Err("mkdir of a cross-directory rename endpoint failed");
                 }
             }
@@ -1732,8 +1747,13 @@ fn smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace() -> TestResult {
             let _ = call(Syscall::Close.raw(), a0(fd as u64));
 
             match call(
-                Syscall::Rename.raw(),
-                a1(src.as_ptr() as u64, dst.as_ptr() as u64),
+                Syscall::Renameat.raw(),
+                a3(
+                    AT_FDCWD,
+                    src.as_ptr() as u64,
+                    AT_FDCWD,
+                    dst.as_ptr() as u64,
+                ),
             ) {
                 Some(0) => {}
                 Some(-2) => {

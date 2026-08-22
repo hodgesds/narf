@@ -6142,6 +6142,10 @@ kernel_test_in!(
 /// up. NARF AF_UNIX delivers synchronously (no local send queue) so it reports
 /// 0. A real `&mut i32` backs the `copy_to_user` the ioctl performs.
 fn smoke_socket_ioctl_siocoutq_is_zero() -> TestResult {
+    // `SocketFile::ioctl` exercises the real uaccess path. The destination is
+    // a kernel-test stack slot standing in for a user `int`, so opt this test
+    // into the same tightly scoped fixture used by the syscall ABI harness.
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
     let sock = SocketFile::new(AF_UNIX, SOCK_STREAM);
     let mut out: i32 = -1;
     match sock.ioctl(SIOCOUTQ, &mut out as *mut i32 as usize) {

@@ -1063,6 +1063,7 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_stat_tty_fields_from_ctty);
 
 // ── fork(2) / vfork(2) — no live address space in the harness ──
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_fork_neg() -> TestResult {
     with_setup(|| {
         // No user address space is installed in the harness, so sys_fork's
@@ -1078,8 +1079,10 @@ fn smoke_abi_proc_fork_neg() -> TestResult {
         }
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_fork_neg);
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_vfork_neg() -> TestResult {
     with_setup(|| {
         // Vfork maps to sys_fork; same no-AS path → -ENOMEM (not EINVAL).
@@ -1091,10 +1094,26 @@ fn smoke_abi_proc_vfork_neg() -> TestResult {
         }
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_vfork_neg);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_proc_legacy_fork_is_unwired() -> TestResult {
+    // The aarch64 Generic ABI has neither fork(2) nor vfork(2); libc creates
+    // processes through clone(2). Keep absent variants out of the reverse
+    // syscall table instead of assigning non-Linux wire numbers to them.
+    if Syscall::Fork.raw() == u32::MAX && Syscall::Vfork.raw() == u32::MAX {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("aarch64 unexpectedly wires legacy fork/vfork syscall numbers")
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_fork_is_unwired);
 
 // ── clone(2) — no live address space ──
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone_neg() -> TestResult {
     with_setup(|| {
         // clone routes through do_clone3, whose first step is the
@@ -1107,7 +1126,23 @@ fn smoke_abi_proc_clone_neg() -> TestResult {
         }
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone_neg);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_proc_clone_is_enosys() -> TestResult {
+    with_setup(|| {
+        // The wire number is part of the aarch64 ABI, but the EL0 child-task
+        // construction path has not landed on this architecture yet.
+        if call(Syscall::Clone.raw(), a0(0)) == Some(-38) {
+            Ok(())
+        } else {
+            Err("aarch64 clone stub did not return -ENOSYS")
+        }
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_clone_is_enosys);
 
 fn smoke_abi_proc_legacy_clone_pidfd_pointer() -> TestResult {
     const CLONE_PIDFD: u64 = 0x1000;
@@ -1124,6 +1159,7 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_clone_pidfd_pointer);
 
 // ── clone3(2) — struct validation + no live address space ──
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone3_badarg() -> TestResult {
     with_setup(|| {
         // LINUX ABI: the two failure modes are now distinguished (were both
@@ -1144,7 +1180,23 @@ fn smoke_abi_proc_clone3_badarg() -> TestResult {
         Ok(())
     })
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_badarg);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_abi_proc_clone3_is_enosys() -> TestResult {
+    with_setup(|| {
+        // An unavailable syscall reports ENOSYS before interpreting its
+        // arguments, which is what libc uses to fall back to clone(2).
+        if call(Syscall::Clone3.raw(), a1(0, 64)) == Some(-38) {
+            Ok(())
+        } else {
+            Err("aarch64 clone3 stub did not return -ENOSYS")
+        }
+    })
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_clone3_is_enosys);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_clone3_no_as() -> TestResult {
