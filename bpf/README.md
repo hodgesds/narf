@@ -103,6 +103,15 @@ backend and the isolation strength grows as subsystems move state into private
 domains. Residual: subsystem private-domain tagging, which turns the fence from
 an escape-containment property into a positive one (below).
 
+Atomic BPF also has a genuinely domain-owned stack on PKS: its dedicated
+per-CPU stack leaves are mapped with protection key `DomainId::BPF`, rather
+than merely occupying a BPF-named virtual window. Sleepable BPF cannot retain a
+per-CPU stack or a CPU-local rights snapshot across `.await`; it uses a
+future-owned heap stack and enters/exits the BPF domain independently around
+each poll. The guard disables involuntary switching only for that poll, making
+scheduler migration fail-safe while leaving the heap
+allocation itself in FRAME pending a domain-aware heap allocator.
+
 Two former JIT residuals now lower. **Fetching bitwise arena atomics**: x86_64
 via a `cmpxchg` loop that preserves R0 in a reserved frame word, aarch64 via its
 LSE fetch. **Arena access under a BPF-to-BPF call**: x86_64 anchors the entry

@@ -114,9 +114,41 @@ __narf_vector_table:
     mrs     x1,  spsr_el1
     stp     x0,  x1,  [sp, #-16]!
     str     x30,      [sp, #-16]!
+
+    /* Domain prefix: save live SCTLR/GCR and suspend tag checks before any
+     * Rust runs. ID_AA64PFR1_EL1.MTE >= 2 is required for GCR_EL1. ATA stays
+     * enabled so restoring GCR remains architecturally valid. */
+    mrs     x0, id_aa64pfr1_el1
+    ubfx    x0, x0, #8, #4
+    cmp     x0, #2
+    b.lo    991f
+    mrs     x0, sctlr_el1
+    mrs     x1, s3_0_c1_c0_6
+    stp     x0, x1, [sp, #-16]!
+    mov     x1, #0xf
+    lsl     x1, x1, #38                /* TCF0[39:38] + TCF[41:40] */
+    bic     x0, x0, x1
+    msr     sctlr_el1, x0
+    isb
+    b       992f
+991:
+    stp     xzr, xzr, [sp, #-16]!
+992:
 .endm
 
 .macro RESTORE_ALL_GPRS
+    /* Restore domain state before the interrupted continuation. The remaining
+     * stack accesses are FRAME accesses, which every admitted domain retains. */
+    mrs     x0, id_aa64pfr1_el1
+    ubfx    x0, x0, #8, #4
+    cmp     x0, #2
+    b.lo    993f
+    ldp     x0, x1, [sp]
+    msr     s3_0_c1_c0_6, x1
+    msr     sctlr_el1, x0
+    isb
+993:
+    add     sp, sp, #16
     ldr     x30,      [sp], #16
     ldp     x0,  x1,  [sp], #16
     msr     elr_el1,  x0

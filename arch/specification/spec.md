@@ -47,31 +47,50 @@ pub trait DomainPrimitive {
     type SavedState: Copy;
 
     /// Read the live domain-rights state on this CPU into `out`.
-    unsafe fn save(out: &mut Self::SavedState);
+    unsafe fn save() -> Self::SavedState;
 
     /// Restore `s` to the live domain-rights state on this CPU.
     /// Must serialise with respect to subsequent loads / stores.
-    unsafe fn restore(s: &Self::SavedState);
-
-    /// Assign `domain` to `region`. On PKS, edits PTE PK bits.
-    /// On MTE, writes tag storage for every 16-B granule in `region`;
-    /// callers MUST NOT pass sub-granule ranges.
-    unsafe fn assign(region: VirtRange, domain: DomainId);
+    unsafe fn restore(s: Self::SavedState);
 
     /// Rights-flip helper. On PKS this is a single `WRMSR IA32_PKRS`.
     /// On MTE there is no equivalent — the function reconfigures
     /// `SCTLR_EL1.TCF` and relies on pointer-tag discipline for the
     /// actual access check. Callers must not treat the two as
     /// performance-equivalent.
-    unsafe fn set_rights(domain: DomainId, rights: DomainRights);
+    unsafe fn set_rights(domain: u8, rights: Self::Rights);
+
+    unsafe fn enter_domain(frame: u8, target: u8) -> Self::SavedState;
+    unsafe fn exit_domain(saved: Self::SavedState);
 }
 
 pub enum DomainBackend { Pks, Mte }
 
-/// Architecture-owned continuation state used only by the executor core.
-/// Policy crates never receive this type or the switch entry point.
+/// Architecture-owned trap ABI. `frame` materialises this exact layout in
+/// assembly and the executor receives only a typed reference when deciding
+/// whether to preempt. Neither crate keeps a mirror definition.
+#[cfg(target_arch = "x86_64")]
+pub struct x86_64::trap_frame::TrapFrame { /* domain prefix, GPRs, return frame */ }
 #[cfg(target_arch = "aarch64")]
-pub struct aarch64::kernel_ctx::KernelContext { /* x19-x29, SP, PC, DAIF */ }
+pub struct aarch64::trap_frame::TrapFrame { /* MTE prefix, GPRs, ELR/SPSR */ }
+
+/// Architecture-owned continuation state used only by the executor core.
+/// Domain state is an opaque tail saved/restored by `kernel_switch`, before
+/// any outgoing-context store and after the last incoming-context load.
+/// Policy crates never receive this type or the switch entry point.
+#[cfg(target_arch = "x86_64")]
+pub struct x86_64::kernel_ctx::KernelContext {
+    /* callee-saved GPRs, RSP, RIP, RFLAGS, opaque PKRS-or-CR3 state */
+}
+#[cfg(target_arch = "aarch64")]
+pub struct aarch64::kernel_ctx::KernelContext {
+    /* x19-x29, SP, PC, DAIF, opaque SCTLR/GCR state */
+}
+#[cfg(target_arch = "x86_64")]
+pub unsafe extern "C" fn x86_64::kernel_ctx::kernel_switch(
+    out: *mut x86_64::kernel_ctx::KernelContext,
+    incoming: *const x86_64::kernel_ctx::KernelContext,
+);
 #[cfg(target_arch = "aarch64")]
 pub unsafe extern "C" fn aarch64::kernel_ctx::kernel_switch(
     out: *mut aarch64::kernel_ctx::KernelContext,

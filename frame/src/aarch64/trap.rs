@@ -10,49 +10,8 @@ use core::fmt::Write;
 use narf_arch::aarch64::sysreg;
 use narf_console::Writer;
 
-/// On-stack layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
-/// The last push is `str x30, [sp, #-16]!`, which grows the stack
-/// by 16 bytes but only stores 8 — so there's an 8-byte pad between
-/// `x30` and the start of the saved GPR pairs. ELR_EL1 + SPSR_EL1
-/// ride on the stack above x30 so handlers can rewrite them.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct TrapFrame {
-    pub x30: u64,
-    pub _pad: u64, // forced by `str x30, [sp, #-16]!`
-    pub elr: u64,  // ELR_EL1 — return RIP
-    pub spsr: u64, // SPSR_EL1 — return PSTATE + target EL
-    pub x0: u64,
-    pub x1: u64,
-    pub x2: u64,
-    pub x3: u64,
-    pub x4: u64,
-    pub x5: u64,
-    pub x6: u64,
-    pub x7: u64,
-    pub x8: u64,
-    pub x9: u64,
-    pub x10: u64,
-    pub x11: u64,
-    pub x12: u64,
-    pub x13: u64,
-    pub x14: u64,
-    pub x15: u64,
-    pub x16: u64,
-    pub x17: u64,
-    pub x18: u64,
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64,
-}
+/// The architecture-owned layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
+pub use narf_arch::aarch64::trap_frame::TrapFrame;
 
 /// Called from `__narf_vec_irq` in `vec.S`. Reads the GIC's ICC_IAR1_EL1
 /// to acknowledge the IRQ, dispatches to the registered handler by
@@ -133,7 +92,7 @@ pub extern "C" fn rust_aarch64_irq(frame: &TrapFrame) {
         // SAFETY: this is the live vector frame, and EOI/accounting completed
         // above before a switch can strand the trap continuation.
         unsafe {
-            narf_scheduler::stackful::try_preempt_aarch64(frame as *const TrapFrame as usize);
+            narf_scheduler::stackful::try_preempt_aarch64(frame);
         }
     }
 }
@@ -867,6 +826,8 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
     // Dummy frame — every register slot gets a unique sentinel
     // so a swapped pair would be obvious in the assertion.
     let mut frame = TrapFrame {
+        domain_sctlr: 0,
+        domain_gcr: 0,
         x30: 0x3030_3030_3030_3030,
         _pad: 0,
         elr: 0xE1E1_E1E1_E1E1_E1E1u64,
@@ -1013,6 +974,8 @@ impl Aarch64SmokeStack {
 
 fn smoke_aarch64_trap_frame(elr: u64) -> TrapFrame {
     TrapFrame {
+        domain_sctlr: 0,
+        domain_gcr: 0,
         x30: 0x3030_3030_3030_3030,
         _pad: 0,
         elr,

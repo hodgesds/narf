@@ -447,16 +447,18 @@ control callback.
 - A task-scoped PMU event is active only between its matching switch-in and
   switch-out hook calls. The hook must stop and fold the current CPU's counter
   before the executor or another task runs.
-- **PKRS / TCF save/restore is the scheduler's responsibility.** On
+- **Domain state is task context, with mechanism owned below policy.** On
   every cooperative poll return the executor calls
   `memory::save_domain_state()` before touching
   any executor-local state. On every resume it calls
   `memory::restore_domain_state(&task.domain_saved)` before the
   first instruction of the resumed task executes. No memory access in
   the new task's domain is allowed before the restore. Without this,
-  every preemption is a TOCTOU window on domain rights. Involuntary switch and
-  trap-prologue completion remains an explicit gate; this invariant must not
-  be inferred merely from cooperative poll coverage.
+  every preemption is a TOCTOU window on domain rights. For stackful and
+  involuntary paths, architecture-owned trap frames and `kernel_switch` close
+  the same boundary without exposing register details to scheduler policy:
+  entry neutralises before Rust/outgoing stores, and restore occurs after the
+  last incoming-context load and before the resumed continuation.
 - A future true direct-transfer primitive must restore the callee's domain
   state before its first instruction. Today's `donate_to` only moves budget
   credit and queue position; it does not branch directly to the donee and must
@@ -643,8 +645,8 @@ Task waking and IRQ integration follows
 
 ## 10. Open implementation gates
 
-- Trap-entry neutralisation and first-instruction domain restore for every
-  involuntary/direct-transfer boundary.
+- MTE allocation-tag ownership on aarch64 (switch/vector state preservation is
+  complete; enforcement is structural until the allocator is tag-aware).
 - Aarch64 EL0 own-stack handoff and preemption.
 - Adoption audit for arbitrary CPL0 user-continuation preempt guards.
 - NMI/FIQ entry wiring and a bounded softirq execution policy.

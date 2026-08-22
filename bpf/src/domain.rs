@@ -32,6 +32,8 @@
 //! *mechanism* is complete on every backend; the isolation *strength* grows as
 //! subsystems move their state into private domains.
 
+use core::future::Future;
+
 /// An active confinement scope. While it lives, supervisor data accesses
 /// are gated to the FRAME and BPF domains; [`Drop`] restores the prior
 /// protection-key rights.
@@ -46,6 +48,13 @@ pub struct Confined {
     saved: Option<narf_arch::x86_64::pks::SavedPkrs>,
     #[cfg(target_arch = "aarch64")]
     saved: Option<narf_arch::aarch64::mte::SavedMteState>,
+    /// A saved hardware rights register belongs to the CPU that captured it.
+    /// Prevent a guard from crossing an executor migration by construction.
+    _not_send: core::marker::PhantomData<*mut ()>,
+    /// Prevent an arbitrary stackful tick from migrating the continuation
+    /// between capture and restore. Sleepable execution drops this at each
+    /// poll boundary, so it remains fully schedulable while parked.
+    _preempt: narf_scheduler::PreemptGuard,
 }
 
 /// Enter the BPF domain for the lifetime of the returned guard.
@@ -55,6 +64,7 @@ pub struct Confined {
 /// reads under MTE, and a plain construction when no backend is live.
 #[inline]
 pub fn enter() -> Confined {
+    let preempt = narf_scheduler::preempt_disable();
     #[cfg(target_arch = "x86_64")]
     {
         use narf_arch::x86_64::{pcid, pks, Pks};
@@ -70,9 +80,17 @@ pub fn enter() -> Confined {
             // under PCID (a bootstrap byte-clone, so every BPF kernel-VA region
             // stays mapped). Balanced by `Pks::exit_domain` in `Drop`.
             let saved = unsafe { Pks::enter_domain(DomainId::FRAME.raw(), DomainId::BPF.raw()) };
-            return Confined { saved: Some(saved) };
+            return Confined {
+                saved: Some(saved),
+                _not_send: core::marker::PhantomData,
+                _preempt: preempt,
+            };
         }
-        Confined { saved: None }
+        Confined {
+            saved: None,
+            _not_send: core::marker::PhantomData,
+            _preempt: preempt,
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -85,15 +103,42 @@ pub fn enter() -> Confined {
             // enforcement pairs with the MTE-tag-aware allocator, a Stage-3
             // task); balanced by `Mte::exit_domain` in `Drop`.
             let saved = unsafe { Mte::enter_domain(DomainId::FRAME.raw(), DomainId::BPF.raw()) };
-            return Confined { saved: Some(saved) };
+            return Confined {
+                saved: Some(saved),
+                _not_send: core::marker::PhantomData,
+                _preempt: preempt,
+            };
         }
-        Confined { saved: None }
+        Confined {
+            saved: None,
+            _not_send: core::marker::PhantomData,
+            _preempt: preempt,
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         // No domain primitive on this target; execution is unconfined.
-        Confined {}
+        Confined {
+            _not_send: core::marker::PhantomData,
+            _preempt: preempt,
+        }
     }
+}
+
+/// Poll a sleepable BPF computation inside the BPF domain.
+///
+/// Confinement is entered and exited around each individual poll. A hardware
+/// rights snapshot is CPU-local, so retaining [`Confined`] across `.await`
+/// would restore one CPU's prior state after the future migrated to another.
+/// This wrapper instead leaves every suspension point in neutral scheduler
+/// state and re-enters on whichever CPU performs the next poll.
+pub async fn run_sleepable<F: Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    core::future::poll_fn(|cx| {
+        let _confined = enter();
+        future.as_mut().poll(cx)
+    })
+    .await
 }
 
 impl Drop for Confined {

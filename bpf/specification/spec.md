@@ -161,10 +161,22 @@ pub fn try_enter() -> Option<StackLease>;   // None ⇒ decline the program
 pub const fn bytes_per_level() -> u64;      // the verifier's stack bound
 ```
 
-`StackLease` is `!Send` and releases on drop; it must be taken and dropped
-inside one non-preemptible region, because the depth counter is a per-CPU
-non-atomic RMW. Sleepable programs use a heap stack instead (§4.8), so this is
-not the only path — `STACK_BYTES` is public so both size identically.
+`StackLease` is `!Send` and releases its recorded origin CPU's atomic nesting
+slot on drop, so preemption cannot double-lease a slice. On x86_64 PKS systems,
+the mapped stack leaves carry `DomainId::BPF` in their PTE protection-key field;
+FRAME-neutral execution and BPF confinement can access them, while unrelated
+confined domains cannot. Sleepable programs use a future-owned heap stack
+instead (§4.8), so this is not the only path.
+
+```rust
+// bpf/src/domain.rs — execution confinement
+pub fn enter() -> Confined; // CPU-local, !Send + preempt-disabled atomic scope
+pub async fn run_sleepable<F: Future>(future: F) -> F::Output;
+```
+
+`Confined` contains the scheduler's nestable preemption guard, so an arbitrary
+stackful tick cannot migrate a live CPU-local snapshot. `run_sleepable` enters
+and exits around each poll and never carries either guard across an `.await`.
 
 ```rust
 // memory/src/wx.rs — the W^X capability gate
@@ -512,7 +524,11 @@ fentry attach type, not a follow-up.
 **4.8 — Atomic and sleepable programs use different stacks.** Atomic programs
 draw frames from the per-CPU BPF stack region; sleepable programs get a heap
 stack owned by the future, because a sleeping program cannot hold a per-CPU
-slot across a yield.
+slot across a yield. Atomic execution holds a `!Send`, preemption-disabled
+domain guard for the whole non-sleeping run. Sleepable execution re-enters
+`DomainId::BPF` for every
+poll and drops the guard before returning `Pending`, so suspension always hands
+neutral rights back to the scheduler and migration is safe.
 
 **4.9 — Fuel bounds total work and is never refilled.** `narf_yield()` lets a
 sleepable program cooperate; it does not restore fuel. Exhaustion terminates
@@ -971,21 +987,15 @@ and the perf event layer, all of which are closed.
     half, which cannot see a mapping. An implementation that never frees passes
     one and fails the other, and vice versa.
 
-14. **The BPF runtime has no hardware domain tag, so a verifier escape is a
-    full Ring-0 primitive.** Every other Ring-0 subsystem that the framekernel
-    does not fully trust sits behind a PKS/MTE domain; BPF — the one subsystem
-    that runs attacker-authored code — is the exception: JIT text at shared slot
-    273, maps on the global heap, arena at shared slot 275, no pkey anywhere. The
-    verifier is BPF's *software* isolation; the missing piece is the *hardware*
-    isolation that backs it up. Because NARF BPF already reaches memory only
-    through its own stack/ctx/maps/arena (no `probe_read`, no raw kernel deref —
-    §4, `interp.rs:613`), confining the runtime to one `DOMAIN_BPF` pkey costs
-    almost nothing and turns an escape from arbitrary-Ring-0 into
-    contained-to-BPF. Full design, threat model, the `run_atomic` enter/exit
-    seam, the maps-sharing wrinkle, the tracing read model (mediated
-    `narf_probe_read` off trusted pointers only, and why BTF is not the way
-    there), and the idle-governor first milestone are in
-    `domain-confinement.md`.
+14. **Resolved — BPF has a first-class hardware domain.** `DomainId::BPF = 14`
+    is entered for atomic execution and around every poll of sleepable
+    execution. On PKS, the dedicated per-CPU stack pages are tagged to that
+    domain. x86_64 PCID performs the corresponding BPF-root CR3 switch. Aarch64
+    preserves the full SCTLR/GCR task context but remains structurally confined
+    until allocation tags are deployed. Maps and sleepable heap stacks remain
+    FRAME allocations, so the present guarantee is escape containment from
+    other private subsystem domains, not isolation from FRAME itself. Full
+    design and residual ownership work are in `domain-confinement.md`.
 
 ## 9. Post-review corrections
 

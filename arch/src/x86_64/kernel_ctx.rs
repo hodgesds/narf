@@ -11,8 +11,9 @@
 //!
 //! ## Layout
 //!
-//! `KernelContext` is 64 bytes, 16-byte aligned, holding the
-//! callee-saved GPRs (SysV-AMD64) + RSP + saved RIP. Byte offsets
+//! `KernelContext` is 96 bytes, 16-byte aligned, holding the
+//! callee-saved GPRs (SysV-AMD64), RSP, saved RIP/RFLAGS, and the opaque
+//! hardware-domain state. Byte offsets
 //! are load-bearing — the naked asm reads/writes by offset:
 //!
 //! ```text
@@ -26,6 +27,9 @@
 //!    40     r15
 //!    48     rsp
 //!    56     rip
+//!    64     rflags
+//!    72     domain_state (PKRS or CR3)
+//!    80     domain_kind (0 inactive, 1 PKRS, 2 CR3/PCID)
 //! ```
 //!
 //! Caller-saved GPRs (rax, rcx, rdx, rsi, rdi, r8-r11) are NOT
@@ -94,6 +98,11 @@ pub struct KernelContext {
     /// run with IF=0 — no timer ticks, no IRQ delivery, the kernel
     /// hangs even though it's not in any specific wait.
     pub rflags: u64,
+    /// Architecture-owned protection state. The executor deliberately cannot
+    /// interpret this pair; `kernel_switch` saves it before touching the
+    /// outgoing context and restores it only after its final memory access.
+    pub domain_state: u64,
+    pub domain_kind: u64,
 }
 
 impl KernelContext {
@@ -113,6 +122,8 @@ impl KernelContext {
             rsp: 0,
             rip: 0,
             rflags: 0,
+            domain_state: 0,
+            domain_kind: 0,
         }
     }
 
@@ -135,6 +146,10 @@ impl KernelContext {
             rip: entry,
             // IF=1 (bit 9) + reserved bit 1.
             rflags: 0x202,
+            // A fresh task inherits the neutral state in which the executor
+            // dispatches it. Its first switch-out captures a concrete state.
+            domain_state: 0,
+            domain_kind: 0,
         }
     }
 }
@@ -169,6 +184,46 @@ impl KernelContext {
 #[unsafe(naked)]
 pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const KernelContext) {
     naked_asm!(
+        // A switch is one indivisible ownership transfer. Capture the caller's
+        // IF state, then prevent a trap from observing half-saved domain/GPR
+        // state. The incoming context's IF is restored at the tail.
+        "pushfq",
+        "pop r11",
+        "cli",
+        // Capture task-local domain rights and enter neutral FRAME state before
+        // writing `out`. This ordering lets a confined task yield safely even
+        // when its current rights deny scheduler/arch storage.
+        "mov rax, cr4",
+        "bt rax, 24",
+        "jc 3f",
+        "bt rax, 17",
+        "jnc 5f",
+        "mov r8, [rip + NARF_X86_FRAME_PML4]",
+        "test r8, r8",
+        "jz 5f",
+        "mov r9, cr3",
+        "or r8, 1",
+        "bts r8, 63",
+        "mov cr3, r8",
+        "mov [rdi + 72], r9",
+        "mov qword ptr [rdi + 80], 2",
+        "jmp 6f",
+        "3:",
+        "mov ecx, 0x6e1",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "mov r8, rax",
+        "xor eax, eax",
+        "xor edx, edx",
+        "wrmsr",
+        "mov [rdi + 72], r8",
+        "mov qword ptr [rdi + 80], 1",
+        "jmp 6f",
+        "5:",
+        "mov qword ptr [rdi + 72], 0",
+        "mov qword ptr [rdi + 80], 0",
+        "6:",
         // ── Save outgoing context ──────────────────────────────
         //
         // SysV: rdi = out, rsi = incoming.
@@ -193,9 +248,7 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         // per SysV. Critical for the preempt-from-trap path where
         // we switch out of an IF=0 trap-handler context but the
         // executor needs to resume with IF=1.
-        "pushfq",
-        "pop rax",
-        "mov [rdi + 64], rax",
+        "mov [rdi + 64], r11",
         // ── Restore incoming context ───────────────────────────
         //
         // Load callee-saved GPRs from incoming[0..6].
@@ -205,10 +258,10 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "mov r13, [rsi + 24]",
         "mov r14, [rsi + 32]",
         "mov r15, [rsi + 40]",
-        // Restore rsp BEFORE we touch [rsi + 56] (rcx is caller-
-        // saved per SysV, free to use as scratch).
+        // Restore rsp before loading the resume PC. r11 is caller-saved and
+        // remains available while the PKRS path uses ECX for its MSR index.
         "mov rsp, [rsi + 48]",
-        "mov rcx, [rsi + 56]",
+        "mov r11, [rsi + 56]",
         // Load saved RFLAGS into rdx; we'll use just the IF bit
         // (bit 9) to decide whether to STI/CLI before the final
         // jmp. Other rflags bits are caller-saved per SysV ABI.
@@ -216,10 +269,33 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         // zero rax for the return-value convention without
         // clobbering the flag-setting test.
         "mov rdx, [rsi + 64]",
+        // Read all incoming domain fields while FRAME is still neutral. Their
+        // restore is deliberately the final privileged operation before the
+        // interrupt-state handoff and branch; no memory is touched afterward.
+        "mov r8, [rsi + 72]",
+        "mov r9, [rsi + 80]",
         // Zero rax — convention is this fn returns 0; the side
         // resumed-into observes rax=0 in their "post-kernel_switch"
         // continuation. Done BEFORE the IF test so the test's
         // flag side-effect isn't clobbered by the xor.
+        "xor eax, eax",
+        "cmp r9, 1",
+        "je 7f",
+        "cmp r9, 2",
+        "je 8f",
+        "jmp 9f",
+        "7:",
+        "mov rax, r8",
+        "mov r10, rdx",
+        "shr rdx, 32",
+        "mov ecx, 0x6e1",
+        "wrmsr",
+        "mov rdx, r10",
+        "jmp 9f",
+        "8:",
+        "bts r8, 63",
+        "mov cr3, r8",
+        "9:",
         "xor eax, eax",
         "test rdx, 0x200",
         "jz 2f",
@@ -228,13 +304,13 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         // executes its first instruction with IF on but no IRQ
         // can land between the STI and the jmp.
         "sti",
-        "jmp rcx",
+        "jmp r11",
         "2:",
         // Incoming IF was 0: explicitly CLI (so a previously-STI
         // caller doesn't leak IF=1 into a context that wants IF=0,
         // e.g. resuming inside a trap handler).
         "cli",
-        "jmp rcx",
+        "jmp r11",
     );
 }
 
@@ -251,8 +327,10 @@ const _: () = {
     assert!(core::mem::offset_of!(KernelContext, rsp) == 48);
     assert!(core::mem::offset_of!(KernelContext, rip) == 56);
     assert!(core::mem::offset_of!(KernelContext, rflags) == 64);
-    // Size 72 + align 16 padding → 80 bytes total.
-    assert!(core::mem::size_of::<KernelContext>() == 80);
+    assert!(core::mem::offset_of!(KernelContext, domain_state) == 72);
+    assert!(core::mem::offset_of!(KernelContext, domain_kind) == 80);
+    // Size 88 + align 16 padding → 96 bytes total.
+    assert!(core::mem::size_of::<KernelContext>() == 96);
     assert!(core::mem::align_of::<KernelContext>() == 16);
 };
 

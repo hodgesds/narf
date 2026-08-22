@@ -330,7 +330,14 @@ unsafe fn map_stack_page(va: u64, phys: PhysAddr) -> Result<(), StackError> {
     // RW, never executable, GLOBAL: the stack is identical under every CR3
     // (the top-level entry is snapshot-copied into every address space), so
     // there is nothing for a CR3 switch to invalidate.
-    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::GLOBAL;
+    let mut flags = PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::GLOBAL;
+    // PK bits are meaningful only after PKS is enabled. With PKS live, make
+    // the dedicated BPF stack genuinely BPF-owned rather than merely living
+    // in a BPF-named VA window. Neutral FRAME state permits every key; a
+    // confined BPF run permits FRAME+BPF and denies the remaining domains.
+    if narf_arch::x86_64::pks::is_active() {
+        flags |= PtFlags::pk(narf_lib::id::DomainId::BPF.raw());
+    }
     // SAFETY: `root` is the recorded kernel root whose BPF top-level entry
     // exists; `va` is fresh, page-aligned VA in that window.
     unsafe { map_4kb(root, VirtAddr::new(va), phys, flags).map_err(|_| StackError::MapFailed) }
@@ -366,6 +373,21 @@ fn smoke_bpf_stack_region_is_backed() -> TestResult {
     let cpu = narf_lib::percpu::current_cpu();
     let base = base_of(cpu);
     let top = top_of(cpu);
+    #[cfg(target_arch = "x86_64")]
+    if narf_arch::x86_64::pks::is_active() {
+        use crate::x86_64::paging;
+        let Some(root) = crate::bpf_text::kernel_root_for_mapping() else {
+            return TestResult::Fail("BPF stack root disappeared after init");
+        };
+        // SAFETY: `root` is the live identity-reachable kernel root retained by
+        // bpf_text, and `base` is the first mapped stack page.
+        let Some(flags) = (unsafe { paging::flags_at(root, VirtAddr::new(base)) }) else {
+            return TestResult::Fail("BPF stack leaf flags are unavailable");
+        };
+        if flags.pk_of() != narf_lib::id::DomainId::BPF.raw() {
+            return TestResult::Fail("BPF stack page is not tagged to DomainId::BPF");
+        }
+    }
     // Touch the first and last usable words. Anything wrong with the mapping
     // (wrong root, wrong slot, off-by-a-page against the guards) faults here.
     // SAFETY: `[base, top)` was mapped RW by `init`; both accesses are inside

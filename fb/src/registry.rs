@@ -20,7 +20,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_ipc::shared_ring::SharedConsumer;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -33,7 +33,6 @@ use crate::{select_active, FbWriter};
 /// holding the top-level REGISTRY lock.
 struct EntryState {
     consumer: SharedConsumer<DrawCmd, RING_DEPTH>,
-    drained: u64,
 }
 
 /// One live FB connection. The handle id is the public name; pid
@@ -44,13 +43,18 @@ pub struct Entry {
     pub scanout_id: u32,
     pub phys: u64,
     state: IrqSafeSpinLock<EntryState>,
+    /// Excludes concurrent and sleep-pump-recursive execution for this entry
+    /// without making either caller spin. The consumer lock is held only long
+    /// enough to pop a command; device I/O runs after IRQs are restored.
+    draining: AtomicBool,
+    drained: AtomicU64,
 }
 
 impl Entry {
     /// Cumulative drain count for this handle — observed by
     /// `flush_wait`.
     pub fn drained(&self) -> u64 {
-        self.state.lock().drained
+        self.drained.load(Ordering::Acquire)
     }
 }
 
@@ -114,10 +118,9 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
         pid,
         scanout_id,
         phys: phys.raw(),
-        state: IrqSafeSpinLock::new(EntryState {
-            consumer,
-            drained: 0,
-        }),
+        state: IrqSafeSpinLock::new(EntryState { consumer }),
+        draining: AtomicBool::new(false),
+        drained: AtomicU64::new(0),
     }));
     Ok(handle)
 }
@@ -185,29 +188,57 @@ pub fn disconnect_all_for_pid(pid: u64) -> u32 {
 /// Walk every registered ring; drain each through the supplied
 /// FbWriter. Returns `(executed, errors)` summed across rings.
 ///
-/// Locking strategy: REGISTRY is held for the whole walk, and each
-/// entry's inner `state` lock is taken for the duration of that
-/// entry's drain. This is a real reduction vs the previous shape,
-/// which held REGISTRY across all entries' drains directly — now a
-/// concurrent re-entry from the sleep-pump path (drain_all called
-/// recursively from `responsive_spin_until`) lands on a different
-/// entry's state lock instead of contending the same REGISTRY.
-/// Tried snapshot-and-release; abandoned because the sleep-pump
-/// re-entry path deadlocks the per-entry `IrqSafeSpinLock` when
-/// REGISTRY is unlocked mid-drain (re-entry pops the same entry's
-/// state lock recursively → IrqSafeSpinLock isn't reentrant).
+/// Locking strategy: snapshot `Arc<Entry>` values under `REGISTRY`, then drop
+/// that IRQ-masking lock before executing anything. A non-blocking per-entry
+/// claim preserves command order and makes recursive/concurrent drain passes
+/// skip an entry already in flight. The consumer lock is held for one
+/// `try_recv` only; in particular it is never held across virtio-gpu's device
+/// round trip, whose responsive wait invokes the sleep pumps recursively.
 pub fn drain_all(writer: &FbWriter) -> (u32, u32) {
     let mut total_ok = 0u32;
     let mut total_err = 0u32;
-    let g = REGISTRY.lock();
-    for e in g.iter() {
-        let mut st = e.state.lock();
-        let (ok, err) = cmd_ring::drain(&mut st.consumer, writer);
-        st.drained = st.drained.saturating_add(ok as u64);
-        total_ok += ok;
-        total_err += err;
+    let entries = REGISTRY.lock().clone();
+    for e in &entries {
+        let Some(_claim) = DrainClaim::try_acquire(&e.draining) else {
+            continue;
+        };
+        loop {
+            let cmd = {
+                let mut st = e.state.lock();
+                st.consumer.try_recv().ok()
+            };
+            let Some(cmd) = cmd else {
+                break;
+            };
+            if cmd_ring::execute(cmd, writer).is_ok() {
+                let _ = e
+                    .drained
+                    .fetch_update(Ordering::Release, Ordering::Relaxed, |n| {
+                        Some(n.saturating_add(1))
+                    });
+                total_ok += 1;
+            } else {
+                total_err += 1;
+            }
+        }
     }
     (total_ok, total_err)
+}
+
+struct DrainClaim<'a>(&'a AtomicBool);
+
+impl<'a> DrainClaim<'a> {
+    fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for DrainClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Number of registered connections — for diagnostics + tests.

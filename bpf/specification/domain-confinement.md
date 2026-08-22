@@ -1,8 +1,8 @@
 # `bpf/` — hardware-domain confinement (design note)
 
-Status: **design, pre-implementation.** Companion to `spec.md`. Scoped to
-PKS/Intel enforces per-page; AMD PCID (CR3-swap) and aarch64 MTE (structural)
-are now wired too (§8, §11).
+Status: **implemented, with allocator hardening residuals.** Companion to
+`spec.md`. PKS/Intel enforcement, AMD PCID (CR3-swap), and aarch64 MTE state
+preservation (structural until allocation tags land) are wired (§8, §11).
 
 ## 1. Purpose
 
@@ -81,10 +81,11 @@ Two nuances that make PKS the *right* primitive here:
 2. It is per-page, in the *shared* page tables, so no CR3 switch and no
    per-domain PML4 is needed (that is the AMD-PCID story, §7).
 
-Today BPF is domain-blind: JIT text at shared slot 273 (`bpf_text.rs`), maps on
-the global heap (`map.rs`), arena at shared slot 275 (`arena.rs`), zero coupling
-to the domain machinery. A verifier escape is therefore a **full Ring-0
-primitive**.
+The runtime now enters `DomainId::BPF`; on PKS the dedicated per-CPU atomic
+stack is tagged with that key. JIT text at shared slot 273, maps on the global
+heap, arena slot 275, and sleepable heap stacks remain FRAME-visible. The
+current property is therefore containment from other private subsystem domains,
+with further allocator tagging strengthening the boundary incrementally.
 
 ## 3. Threat model
 
@@ -125,19 +126,20 @@ store — only the memory that other subsystems have tagged into *their own*
 domains. That is the correct framekernel shape (protection is per-domain, not
 per-privilege), and it means:
 
-- BPF's own memory — interpreter stack, maps on the heap, arena frames (slot
-  275), JIT text — can stay in FRAME and keep working with **no tagging
-  required** for the core fence. (This is why wiring the fence was non-breaking:
-  every page BPF touches today is FRAME.)
+- BPF maps, arena frames (slot 275), JIT text, and sleepable heap stacks can
+  stay in FRAME for the core fence. Atomic per-CPU stack pages are now tagged
+  `DomainId::BPF` on PKS, proving that the BPF-owned mapping works without
+  requiring a general domain-aware heap allocator.
 - The isolation the fence buys today is BPF-from-every-other-subsystem-domain.
   Optionally tagging BPF's private memory into `DOMAIN_BPF` is *hardening* (so a
   confined driver cannot read a map/arena either); it is not needed for the
   escape-containment property and is deferred.
 
-### 4.2 The enter/exit seam is `run_atomic`
+### 4.2 Atomic and sleepable enter/exit seams
 
-`BpfProg::run_atomic` (`prog.rs`) already brackets an IRQs-masked section — the
-natural and only seam. Shape:
+`BpfProg::run_atomic` (`prog.rs`) is the atomic seam. Its `Confined` guard is
+`!Send` and holds the scheduler's nestable preemption guard, so a saved
+hardware-rights snapshot cannot migrate. Shape:
 
 ```
 run_atomic(ctx, n):
@@ -147,6 +149,11 @@ run_atomic(ctx, n):
     pks::restore(saved)                       // one WRMSR
     return outcome
 ```
+
+Sleepable execution uses `domain::run_sleepable`: it constructs a fresh guard
+around each `Future::poll` and drops it before propagating `Pending`. A parked
+program therefore leaves the CPU neutral, and its next poll safely re-enters on
+the CPU to which the scheduler assigns it.
 
 A kfunc that legitimately needs broader reach does **not** widen the program's
 pkey; it is a call into FRAME-visible kernel code that already runs with full
