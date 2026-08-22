@@ -66,7 +66,7 @@ cat > "$RD/probe.sh" <<'PROBE'
 echo "STRESS-START pid=$$"
 DUR="${STRESS_DUR:-6s}"
 echo "=== required regression: mmapfork completion ==="
-if ! /usr/bin/stress-ng --mmapfork 1 --mmapfork-bytes 4M \
+if ! /usr/bin/stress-ng --temp-path /tmp --mmapfork 1 --mmapfork-bytes 4M \
         --mmapfork-ops 1 --timeout 30s --verify --metrics-brief 2>&1; then
   echo "MMAPFORK-FAIL"
   exit 1
@@ -88,7 +88,7 @@ echo "MREMAP-DONE"
 # stressor would conflate buddy high-order fragmentation with the stressor under
 # test. `--sequential` still forks fresh workers for every selected stressor.
 echo "=== required sequential MM/process matrix ==="
-if ! /usr/bin/stress-ng --sequential 2 \
+if ! /usr/bin/stress-ng --temp-path /tmp --sequential 2 \
         --with fork,malloc,vm,mmap,brk,stack,vma,mlock,madvise,fault,shm,pthread,pipe,sock,switch,clone,sigrt,cpu \
         --malloc-bytes 32M --vm-bytes 32M --mmap-bytes 32M \
         --shm-bytes 16M \
@@ -99,7 +99,7 @@ fi
 echo "STRESS-MATRIX-DONE"
 echo "=== perf stat: stress-ng cpu ==="
 PERF_OUT="$(/usr/bin/perf stat -x, -e 'task-clock,task-clock:u,task-clock:k' -- \
-  /usr/bin/stress-ng --cpu 4 --timeout 1s --metrics-brief 2>&1)"
+  /usr/bin/stress-ng --temp-path /tmp --cpu 4 --timeout 1s --metrics-brief 2>&1)"
 echo "$PERF_OUT"
 # Linux defines the privilege filters as no-ops for software CPU clocks. The
 # three inherited counts must therefore agree, and a four-worker one-second
