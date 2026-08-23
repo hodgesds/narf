@@ -56,14 +56,18 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
-    if !capture_queued_siginfo(target, sig, a.arg3) {
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
-        return;
-    }
+    let depth = match capture_queued_siginfo(target, sig, a.arg3) {
+        Some(d) => d,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
+            return;
+        }
+    };
     raise_signal_pending(target, sig);
-    // Back-pressure — see sys_rt_sigqueueinfo.
+    // Back-pressure — see sys_rt_sigqueueinfo. `depth` comes from the enqueue,
+    // so there is no second sigqueue-bucket lock/scan on this send path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
+    if depth > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();
     }
     ctx.set_return(SyscallReturn::ok(0));

@@ -3240,33 +3240,44 @@ pub(crate) fn store_sigqueue_info(
     si_value: u64,
     si_pid: u32,
 ) -> bool {
+    store_sigqueue_info_depth(task, signum, si_code, si_value, si_pid).is_some()
+}
+
+/// Like [`store_sigqueue_info`], but returns the target's TOTAL queued-payload
+/// depth AFTER the insert (`None` when the per-task cap was already hit, i.e.
+/// the caller must surface -EAGAIN). The depth is computed from the same
+/// `range().sum()` the cap check already walks, so the sender-side
+/// back-pressure decision (see `sys_rt_sigqueueinfo`) reads it here instead of
+/// re-taking the bucket lock and re-scanning in a separate `sigqueue_depth`
+/// call — one lock round-trip per send instead of two.
+pub(crate) fn store_sigqueue_info_depth(
+    task: u64,
+    signum: u32,
+    si_code: i32,
+    si_value: u64,
+    si_pid: u32,
+) -> Option<usize> {
     let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
-    if signum >= SIGRT_QUEUE_MIN {
-        // Cap check across ALL of the target's queues (the per-process
-        // pending budget, like Linux's ucounts sigpending charge).
-        let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
-        if queued >= SIGQUEUE_MAX_PER_TASK {
-            return false;
-        }
+    // Total queued across ALL of the target's signums (the per-process pending
+    // budget, like Linux's ucounts sigpending charge). For RT signals this is
+    // the cap gate; for every send it is the depth returned for back-pressure.
+    let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
+    if signum >= SIGRT_QUEUE_MIN && queued >= SIGQUEUE_MAX_PER_TASK {
+        return None;
     }
     let q = m.entry((task, signum)).or_default();
     if signum < SIGRT_QUEUE_MIN {
+        // Standard signals coalesce: replace the slot with the latest payload.
+        // If the slot already held an instance, that entry was part of
+        // `queued`, so the depth is unchanged; a brand-new slot adds one.
+        let existed = !q.is_empty();
         q.clear();
+        q.push_back((si_code, si_value, si_pid));
+        return Some(if existed { queued } else { queued + 1 });
     }
     q.push_back((si_code, si_value, si_pid));
-    true
-}
-
-/// Total queued rt_sigqueueinfo payloads pending for `task` across every
-/// signum — the sender-side back-pressure probe (see `sys_rt_sigqueueinfo`).
-/// Only consulted on supported own-stack reschedule paths.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub(crate) fn sigqueue_depth(task: u64) -> usize {
-    let g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
-    g.as_ref()
-        .map(|m| m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum())
-        .unwrap_or(0)
+    Some(queued + 1)
 }
 
 /// Threshold above which a signal sender is asked to yield at syscall exit:
@@ -4873,28 +4884,39 @@ fn linux_tid_for_task(task: u64) -> u64 {
     }
 }
 
-/// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
-/// sigval union, offset 24) out of a user `siginfo_t` and stash them for
-/// delivery / sigtimedwait / signalfd. Returns `false` only when the
-/// target's queue is full (RLIMIT_SIGPENDING shape → sender returns
-/// -EAGAIN); a NULL/unreadable info queues nothing but "succeeds" (the
-/// bare signal still delivers, like a payload-less kill).
-fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> bool {
+/// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the sigval
+/// union, offset 24) out of a user `siginfo_t` and stash them for delivery /
+/// sigtimedwait / signalfd.
+///
+/// Copy the sender's siginfo (si_code/si_pid/si_value) into `target`'s queue.
+/// Returns `Some(depth)` where `depth` is the target's total queued-payload
+/// depth after the enqueue (used for sender back-pressure), or `None` when the
+/// per-task cap is hit (the caller surfaces -EAGAIN). A NULL/unreadable info
+/// queues nothing but "succeeds" with depth 0 (a bare kill(2)-shaped send).
+fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> Option<usize> {
     if info_ptr == 0 {
-        return true;
+        return Some(0);
     }
-    // SAFETY: info_ptr is non-zero; copy_from_user_vec range-validates the
-    // 32-byte read covering si_signo..si_value.
-    if let Ok(b) = unsafe { copy_from_user_vec(info_ptr, 32) } {
+    // Read the 32-byte siginfo prefix into a fixed stack buffer: this is the
+    // per-send hot path (a sigqueue(2) loop hits it once per signal), so the
+    // read must not churn the kernel heap with a throwaway Vec.
+    let mut b = [0u8; 32];
+    if validate_user_range(info_ptr, 32).is_err() {
+        return Some(0);
+    }
+    // SAFETY: validate_user_range above confirmed [info_ptr, info_ptr+32) is a
+    // readable user range; copy_from_user SMAP-brackets the read covering
+    // si_signo..si_value. A copy error just queues nothing.
+    if unsafe { copy_from_user(&mut b, info_ptr) }.is_ok() {
         let si_code = i32::from_le_bytes(b[8..12].try_into().unwrap());
         // si_pid (offset 16 in the rt union) — musl/glibc `sigqueue` fill
         // getpid() here, and consumers reply to it (stress-ng --sigrt's
         // child does `sigqueue(info.si_pid, ...)`).
         let si_pid = u32::from_le_bytes(b[16..20].try_into().unwrap());
         let si_value = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        return store_sigqueue_info(target, sig, si_code, si_value, si_pid);
+        return store_sigqueue_info_depth(target, sig, si_code, si_value, si_pid);
     }
-    true
+    Some(0)
 }
 
 // ── futex — minimal scaffold ────────────────────────────────────────

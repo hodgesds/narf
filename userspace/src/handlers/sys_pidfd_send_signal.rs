@@ -81,7 +81,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // (do_pidfd_send_signal). Record it so the receiver's signalfd names
         // the sender, matching kill/tkill/tgkill.
         queue_sender_siginfo(target, signum);
-    } else if !capture_queued_siginfo(target, signum, a.arg2) {
+    } else if capture_queued_siginfo(target, signum, a.arg2).is_none() {
         // Non-NULL info: the caller's own siginfo (systemd's pidref_sigqueue
         // sends SI_QUEUE). Stashed BEFORE the pending bit is visible so a
         // consumer that observes the bit never races ahead of its siginfo. A
