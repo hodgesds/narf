@@ -320,6 +320,54 @@ pub trait Scheduler: Send + Sync + 'static {
     /// this callback is observational and must not block or re-enter the
     /// scheduler.
     fn on_cpu_state_change(&self, _cpu: CpuId, _change: CpuStateChange) {}
+
+    // ── Wakeup pipeline (Linux `try_to_wake_up`: select_task_rq → enqueue →
+    //    wakeup_preempt → task_woken). These let a policy place and prioritize a
+    //    just-woken task instead of leaving it on its home CPU's queue tail. All
+    //    are advisory: the core validates the choice against affinity / CPU
+    //    online state and falls back to today's behavior on any stale/invalid
+    //    return, and none may block or re-enter the scheduler. ──
+
+    /// Choose the CPU a just-woken task should run on (Linux `select_task_rq`).
+    /// `home` is where the task last ran; `waker` is the CPU that woke it;
+    /// `idle_mask` bit `i` is set when CPU `i` is halted/idle. Default keeps the
+    /// task on `home` — no wake migration, today's behavior.
+    fn select_wake_cpu(
+        &self,
+        _task: TaskMeta,
+        _waker: CpuId,
+        home: CpuId,
+        _idle_mask: u64,
+    ) -> CpuId {
+        home
+    }
+
+    /// Whether the just-woken `woken` task should preempt `current` on `cpu`
+    /// (Linux `wakeup_preempt`). Default `false` — no wakeup preemption, so the
+    /// woken task waits for the current one to yield or be timer-preempted.
+    fn wakeup_preempt(&self, _cpu: CpuId, _woken: TaskMeta, _current: Option<TaskMeta>) -> bool {
+        false
+    }
+
+    /// Notification that `task` became runnable on `cpu` (Linux `task_woken`),
+    /// fired after placement + enqueue. Observational; the natural home for
+    /// wake-time bookkeeping.
+    fn task_woken(&self, _cpu: CpuId, _task: TaskMeta) {}
+
+    /// Per-tick policy hook (Linux `task_tick`). Returns `true` to request that
+    /// `current` be preempted at this tick. Default `false` leaves the core's
+    /// timer-slice preemption unchanged.
+    fn task_tick(&self, _cpu: CpuId, _current: TaskMeta) -> bool {
+        false
+    }
+
+    /// Accrue `delta_ns` of on-CPU runtime to `current` (Linux `update_curr`),
+    /// for policies that track virtual runtime. Default no-op.
+    fn update_curr(&self, _cpu: CpuId, _current: TaskMeta, _delta_ns: u64) {}
+
+    /// `sched_yield` by `current` on `cpu` (Linux `yield_task`). Default no-op —
+    /// the core still cycles the queue.
+    fn yield_task(&self, _cpu: CpuId, _current: TaskMeta) {}
 }
 
 /// First-in-first-out scheduler — today's stage-3+ behaviour.
