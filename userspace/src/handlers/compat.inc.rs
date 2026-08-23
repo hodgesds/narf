@@ -149,15 +149,183 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     }
 }
 
+/// The number of symlink expansions (`SYMLOOP_MAX`) a single
+/// `resolve_vfs_symlink_path` call will perform before giving up with
+/// `ELOOP`. Matches Linux (the 2.6-era de-facto ceiling) and the
+/// filesystem-local resolver's own `SYMLOOP_MAX` in `resolve_async_ext`.
+const SYMLOOP_MAX: usize = 40;
+
+/// True when every component of `path` is served by a SINGLE covering mount,
+/// so a per-component walk against that mount's `fs.root()` faithfully
+/// reproduces VFS resolution. Returns `false` (→ take the slow per-prefix
+/// path) when a proper prefix of `path` enters a deeper mount, or when
+/// `path` is an ancestor of a mount point (a component that has no real
+/// node in the covering filesystem, only a synthetic dir). Both cases mean
+/// a component "crosses a mount", which the single-fs fast walk cannot see.
+fn fast_walk_stays_in_one_mount(path: &str) -> bool {
+    // Longest mount prefix covering the full path — the mount the fast walk
+    // would descend within. `current_mount_list` is namespace-aware.
+    let mounts = current_mount_list();
+    let cover_len = mounts
+        .iter()
+        .filter(|m| {
+            path == m.as_str()
+                || m.as_str() == "/"
+                || (path.starts_with(m.as_str())
+                    && path.as_bytes().get(m.len()) == Some(&b'/'))
+        })
+        .map(|m| m.len())
+        .max();
+    let Some(cover_len) = cover_len else {
+        // No mount covers the path (not even "/"): nothing for the fast
+        // walk to descend. Defer to the slow path.
+        return false;
+    };
+    for m in &mounts {
+        // A deeper mount whose path lies strictly inside `path` (at a
+        // component boundary) means a proper prefix crosses into it: e.g.
+        // resolving `/a/b/c` while `/a/b` is its own mount. Bail so the
+        // per-prefix slow walk re-selects the covering mount per component.
+        if m.len() > cover_len
+            && path.starts_with(m.as_str())
+            && (path.len() == m.len() || path.as_bytes().get(m.len()) == Some(&b'/'))
+        {
+            return false;
+        }
+    }
+    // A path that is a proper ancestor of a mount point has no real node in
+    // the covering fs (only a synthetic S_IFDIR); the fast walk would miss
+    // it. Defer to the slow path, which the callers already reconcile with
+    // the mount-ancestor stat/mkdir synthesis.
+    if path_is_mount_ancestor(path) {
+        return false;
+    }
+    true
+}
+
+/// Fast path for [`resolve_vfs_symlink_path`]: a single O(depth) forward walk
+/// that carries the parent-directory handle and looks each component up
+/// WITHOUT following symlinks. Returns `Some(path)` only when it has PROVEN
+/// the whole path resolves through real directories with no symlink to
+/// expand (so the input needs no rewriting); returns `None` to signal the
+/// caller to fall back to the slow per-prefix loop — either because a symlink
+/// was found (it must be expanded there) or because a lookup could not
+/// prove the component is a plain directory.
+///
+/// This replaces the old O(depth²) behaviour where the caller rebuilt and
+/// re-resolved `/c0/…/ci` from the mount root for every component `i`.
+fn resolve_vfs_symlink_path_fast(
+    expanded: &str,
+    follow_final: bool,
+) -> Option<alloc::string::String> {
+    // Only sound while the whole path lives in one mount (see the helper):
+    // the walk descends within a single `fs.root()` and cannot cross a
+    // mount boundary the way the slow per-prefix resolver does.
+    if !fast_walk_stays_in_one_mount(expanded) {
+        return None;
+    }
+
+    // Clone the covering mount's root `Arc` AND the path RELATIVE to that
+    // mount OUT of the mount-table lock before any (block-)I/O: the lookups
+    // below drive `poll_blocking`, which busy-spins on the backing device
+    // IRQ. Holding the IrqSafeSpinLock across that deadlocks the box (see
+    // `resolve_absolute`). `rel` has the mount prefix stripped, so the walk
+    // starts at `fs.root()` and steps through the in-mount components only.
+    let (root, rel) = current_resolve_absolute(expanded, |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    })?;
+
+    let components: alloc::vec::Vec<&str> =
+        rel.split('/').filter(|component| !component.is_empty()).collect();
+    if components.is_empty() {
+        // The path IS the mount root. A file-rooted mount's root could in
+        // principle be a symlink (`fs.root_file()`), so defer to the slow
+        // path, which inspects the root node exactly as before rather than
+        // assuming the mount root is a plain directory.
+        return None;
+    }
+
+    let mut current_dir = root;
+    for (index, component) in components.iter().enumerate() {
+        let is_final = index + 1 == components.len();
+
+        // NOFOLLOW single-component lookup: `lookup_async` returns the raw
+        // node so a symlink is SEEN, not followed. `resolve_async_nofollow`
+        // only spares the FINAL component of a multi-component path, so a
+        // one-component lookup is exactly the nofollow primitive we need.
+        let node = poll_blocking(current_dir.lookup_async(component)).and_then(|r| r.ok());
+
+        let Some(node) = node else {
+            // Not a file-shaped node. It may be a dir-only child (e.g.
+            // `/dev/pts`): descend if we can. If neither, the component is
+            // absent or non-traversable — no symlink to expand here, and
+            // any downstream error matches the slow path returning the
+            // path unchanged.
+            if is_final {
+                return Some(alloc::string::String::from(expanded));
+            }
+            match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+                Some(next) => {
+                    current_dir = next;
+                    continue;
+                }
+                None => return Some(alloc::string::String::from(expanded)),
+            }
+        };
+
+        let kind = node.stat().mode.file_type;
+        if kind == narf_filesystem::FileType::Symlink {
+            if is_final && !follow_final {
+                // NOFOLLOW final symlink: the link itself is the answer;
+                // nothing to expand. Mirrors the slow loop's
+                // `is_final && !follow_final` skip.
+                return Some(alloc::string::String::from(expanded));
+            }
+            // A symlink that must be expanded (any intermediate symlink, or
+            // a final one under FOLLOW). The fast path cannot rewrite the
+            // path itself — hand off to the slow per-prefix loop.
+            return None;
+        }
+
+        if is_final {
+            // Final real file/dir, no symlink anywhere on the path.
+            return Some(alloc::string::String::from(expanded));
+        }
+
+        // Intermediate component: it must be a real directory to keep
+        // walking. If it is not (a plain file, or a dir with no `DirOps`
+        // shape), stop — there is no symlink here and the path needs no
+        // rewrite; downstream open/stat produces the same error the slow
+        // path would.
+        if kind != narf_filesystem::FileType::Dir {
+            return Some(alloc::string::String::from(expanded));
+        }
+        match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+            Some(next) => current_dir = next,
+            None => return Some(alloc::string::String::from(expanded)),
+        }
+    }
+    Some(alloc::string::String::from(expanded))
+}
+
 /// Expand symlinks component-by-component through the current task's mount
 /// table. This supplies the VFS boundary that a filesystem-local resolver
 /// cannot cross after an absolute symlink target.
+///
+/// A symlink-free path in a single mount takes the O(depth) fast walk
+/// ([`resolve_vfs_symlink_path_fast`]); anything with a symlink to expand,
+/// or that crosses a mount boundary, falls through to the O(depth²) slow
+/// per-prefix loop below (which re-selects the covering mount per component
+/// and performs the splice / re-root / ELOOP handling).
 pub(crate) fn resolve_vfs_symlink_path(
     path: &str,
     follow_final: bool,
 ) -> Option<alloc::string::String> {
     let mut expanded = normalize_abs(path);
-    const SYMLOOP_MAX: usize = 40;
+
+    if let Some(resolved) = resolve_vfs_symlink_path_fast(&expanded, follow_final) {
+        return Some(resolved);
+    }
 
     for _ in 0..SYMLOOP_MAX {
         let components: alloc::vec::Vec<&str> = expanded
@@ -165,6 +333,8 @@ pub(crate) fn resolve_vfs_symlink_path(
             .filter(|component| !component.is_empty())
             .collect();
         let mut prefix = alloc::string::String::new();
+        // SLOW PATH marker: reached only when the fast walk found a symlink
+        // to expand or a mount boundary it could not cross.
         let mut followed = false;
 
         for (index, component) in components.iter().enumerate() {

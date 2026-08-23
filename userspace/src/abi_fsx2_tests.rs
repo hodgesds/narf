@@ -1034,6 +1034,67 @@ kernel_test_in!(
     smoke_abi_fsx2_mount_bind_symlink_directory_pos
 );
 
+// openat/chdir must follow a final symlink whose ABSOLUTE target lands in a
+// DIFFERENT mount. `resolve_vfs_symlink_path`'s fast walk stays inside one
+// mount, so a symlink here forces the slow per-prefix loop, which re-roots
+// the absolute target and re-selects the covering mount — crossing the
+// boundary. The fast path must NOT swallow the symlink and leave the path
+// pointing inside the source mount.
+fn smoke_abi_path_openat_absolute_symlink_crosses_mount() -> TestResult {
+    with_setup(|| {
+        // Two independent tmpfs mounts.
+        let src = b"/abi-xmnt-src\0";
+        let dst = b"/abi-xmnt-dst\0";
+        let tmpfs = b"tmpfs\0";
+        let none = b"none\0";
+        for root in [src.as_slice(), dst.as_slice()] {
+            let mount = SyscallArgs {
+                arg0: none.as_ptr() as u64,
+                arg1: root.as_ptr() as u64,
+                arg2: tmpfs.as_ptr() as u64,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), mount) != Some(0) {
+                return Err("cross-mount setup tmpfs mount failed");
+            }
+        }
+
+        // Target directory in the DESTINATION mount.
+        let target = b"/abi-xmnt-dst/target\0";
+        if call(Syscall::Mkdir.raw(), a2(target.as_ptr() as u64, 0o755, 0)) != Some(0) {
+            return Err("cross-mount target dir creation failed");
+        }
+
+        // Absolute symlink in the SOURCE mount pointing into the dst mount.
+        let link = b"/abi-xmnt-src/link\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("cross-mount symlink creation failed");
+        }
+
+        // chdir(link) follows the final symlink across the mount boundary;
+        // it must land on the real directory in the destination mount.
+        let followed = call(Syscall::Chdir.raw(), a0(link.as_ptr() as u64)) == Some(0);
+        let root = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+
+        // Teardown mounts before returning.
+        let _ = call(Syscall::Umount2.raw(), a1(link.as_ptr() as u64, 0));
+        let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+        let _ = call(Syscall::Umount2.raw(), a1(dst.as_ptr() as u64, 0));
+        let _ = call(Syscall::Umount2.raw(), a1(src.as_ptr() as u64, 0));
+
+        if followed {
+            Ok(())
+        } else {
+            Err("chdir must follow an absolute symlink that crosses into another mount")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_openat_absolute_symlink_crosses_mount
+);
+
 fn smoke_abi_fsx2_mount_bind_file_to_self_pos() -> TestResult {
     with_memfs(
         "/abi-self-bind",

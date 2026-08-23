@@ -1954,6 +1954,88 @@ kernel_test_in!(
     smoke_abi_pathx_chdir_follows_directory_symlink
 );
 
+// A DEEP, symlink-free tree exercises the O(depth) fast path in
+// `resolve_vfs_symlink_path`: every component is a real directory in one
+// mount, so the single forward walk proves "no symlink" without the old
+// per-prefix re-resolution. Create the tree, resolve the leaf (chdir +
+// open), then remove it bottom-up — all through the fast path.
+fn smoke_abi_pathx_deep_tree_fast_path_no_symlink() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        // /p2/a/b/c/d — four nested real directories, no symlink anywhere.
+        let a = b"/p2/a\0";
+        let ab = b"/p2/a/b\0";
+        let abc = b"/p2/a/b/c\0";
+        let abcd = b"/p2/a/b/c/d\0";
+        for dir in [a.as_slice(), ab.as_slice(), abc.as_slice(), abcd.as_slice()] {
+            if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+                return Err("deep-tree mkdir failed");
+            }
+        }
+
+        // chdir to the deep leaf routes through resolve_vfs_symlink_path
+        // (follow_final=true); the fast walk must reach it as a directory.
+        if call(Syscall::Chdir.raw(), a0(abcd.as_ptr() as u64)) != Some(0) {
+            return Err("chdir into a deep symlink-free tree must succeed");
+        }
+        // open() of the same leaf as a directory fd must also resolve.
+        let dfd = open_fd(abcd)?;
+        let _ = call(Syscall::Close.raw(), a0(dfd as u64));
+
+        // Restore cwd before removing the tree (chdir left cwd inside it).
+        let root = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+        for dir in [abcd.as_slice(), abc.as_slice(), ab.as_slice(), a.as_slice()] {
+            if call_rmdir(dir.as_ptr() as u64) != Some(0) {
+                return Err("deep-tree rmdir failed");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_deep_tree_fast_path_no_symlink
+);
+
+// An INTERMEDIATE symlink-to-directory must still be followed: the fast
+// walk detects the symlink component and falls back to the slow per-prefix
+// loop, which splices the target in. Regression guard for the reverted
+// optimisation, whose probe auto-followed the directory symlink and so
+// never saw it — leaving the unexpanded path for downstream handling.
+fn smoke_abi_pathx_deep_tree_intermediate_symlink_still_followed() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        // Real target directory holding a leaf directory:
+        //   /p2/real/leaf
+        let real = b"/p2/real\0";
+        let real_leaf = b"/p2/real/leaf\0";
+        if call_mkdir(real.as_ptr() as u64, 0o755) != Some(0)
+            || call_mkdir(real_leaf.as_ptr() as u64, 0o755) != Some(0)
+        {
+            return Err("intermediate-symlink target mkdir failed");
+        }
+        // Intermediate directory symlink:  /p2/link -> real
+        let target = b"real\0";
+        let link = b"/p2/link\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("intermediate directory symlink creation failed");
+        }
+
+        // chdir through the intermediate symlink to the leaf: the walk must
+        // follow /p2/link -> /p2/real and land on /p2/real/leaf.
+        let via_link = b"/p2/link/leaf\0";
+        if call(Syscall::Chdir.raw(), a0(via_link.as_ptr() as u64)) != Some(0) {
+            return Err("chdir through an intermediate directory symlink must succeed");
+        }
+        let root = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_deep_tree_intermediate_symlink_still_followed
+);
+
 // ── unlinkat (dirfd, NUL-term path, flags) → 0 / -1 ────────────────
 //
 // flags=0 → unlink; AT_REMOVEDIR (0x200) → rmdir.
