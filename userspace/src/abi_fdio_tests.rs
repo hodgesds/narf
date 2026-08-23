@@ -1661,6 +1661,151 @@ fn smoke_abi_fdio_splice_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_neg);
 
+/// splice(pipe → pipe) moves the queued bytes exactly once, reports the
+/// moved count, and leaves the source drained. Exercises the pipe-source
+/// fast path (`splice_pipe_source` → `pipe_take`) that replaced the 64 KiB
+/// zeroed bounce for the stress-ng `pipe → pipe → /dev/null` pipeline.
+fn smoke_abi_fdio_splice_pipe_to_pipe() -> TestResult {
+    with_setup(|| {
+        let (src_rd, src_wr) = make_pipe()?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        // Seed the source pipe with 5 bytes.
+        let payload = *b"hello";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(5)
+        {
+            return Err("seeding the source pipe failed");
+        }
+        // splice(src_rd, NULL, dst_wr, NULL, 5, 0) → 5 bytes moved.
+        match call_raw(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src_rd as u64,
+                arg1: 0,
+                arg2: dst_wr as u64,
+                arg3: 0,
+                arg4: 5,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == 5 => {}
+            _ => return Err("splice pipe→pipe did not move 5 bytes"),
+        }
+        // The bytes land in the destination pipe exactly once...
+        let mut b = [0u8; 8];
+        match call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, b.as_mut_ptr() as u64, 8),
+        ) {
+            Some(5) if &b[..5] == b"hello" => {}
+            _ => return Err("spliced bytes did not arrive in the destination pipe"),
+        }
+        // ...and the source is drained: a nonblocking read now EAGAINs (empty,
+        // writer still open) rather than re-delivering the moved bytes.
+        let _ = (src_rd, dst_wr);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_pipe_to_pipe);
+
+/// vmsplice on a pipe READ end copies queued bytes OUT to user memory
+/// (`fs/splice.c` SPLICE_TO_USER). This direction used to hit
+/// `PipeRead::write`'s EBADF and abort stress-ng's vm-splice loop on the
+/// first iteration; it now drains the ring into the iov buffer.
+fn smoke_abi_fdio_vmsplice_from_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        // Queue 4 bytes into the pipe.
+        let src = *b"data";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, src.as_ptr() as u64, src.len() as u64),
+        ) != Some(4)
+        {
+            return Err("seeding the pipe failed");
+        }
+        // vmsplice(rd, iov→dst, 1, 0) drains up to 8 bytes into dst; the pipe
+        // only holds 4, so it returns 4 and fills dst[..4].
+        let mut dst = [0u8; 8];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(dst.len() as u64).to_le_bytes());
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
+            Some(4) if &dst[..4] == b"data" => Ok(()),
+            _ => Err("vmsplice from a pipe read end did not drain 4 bytes"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_from_pipe);
+
+/// The stress-ng vm-splice loop shape: vmsplice user memory INTO the pipe,
+/// splice it OUT to a sink, then vmsplice the pipe read end back to memory —
+/// all three make forward progress and the round-trip preserves the bytes.
+/// Before the fix the final read-end vmsplice returned EBADF, which broke
+/// the loop (0 bogo-ops).
+fn smoke_abi_fdio_vmsplice_roundtrip_progress() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        let (sink_rd, sink_wr) = make_pipe()?;
+        let payload = *b"vmsplice-roundtrip";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        // 1) gather user memory into the pipe write end.
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("vmsplice into the pipe did not gather the payload");
+        }
+        // 2) splice it out of the pipe read end into a sink pipe.
+        match call_raw(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: rd as u64,
+                arg1: 0,
+                arg2: sink_wr as u64,
+                arg3: 0,
+                arg4: payload.len() as u64,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == payload.len() as i64 => {}
+            _ => return Err("splice draining the pipe made no progress"),
+        }
+        // The source pipe is now empty, so a second vmsplice INTO it proceeds
+        // (would have EAGAIN'd against a stuck-full pipe).
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("second vmsplice into the drained pipe did not proceed");
+        }
+        // 3) vmsplice the read end back to memory and verify the bytes.
+        let mut back = [0u8; 32];
+        let mut iov_back = [0u8; 16];
+        iov_back[..8].copy_from_slice(&(back.as_mut_ptr() as u64).to_le_bytes());
+        iov_back[8..].copy_from_slice(&(back.len() as u64).to_le_bytes());
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, iov_back.as_ptr() as u64, 1, 0),
+        ) {
+            Some(n) if n == payload.len() as i64 && back[..payload.len()] == payload => {}
+            _ => return Err("read-end vmsplice did not recover the payload"),
+        }
+        let _ = (sink_rd,);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_roundtrip_progress);
+
 // ── copy_file_range ────────────────────────────────────────────────
 
 fn smoke_abi_fdio_copy_file_range_pos() -> TestResult {

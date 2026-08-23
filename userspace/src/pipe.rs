@@ -226,8 +226,13 @@ impl FileOps for PipeRead {
             }
             if n != 0 {
                 // Draining can clear POLL_IN (queue now empty) and set POLL_OUT
-                // (room freed); republish so a writer parked on this pipe wakes.
+                // (room freed); republish so a writer parked on this pipe's
+                // readiness cell wakes, and bump the global notify generation so
+                // a writer parked via `park_reexecute_on_io` (armed on that
+                // generation, not the cell) re-runs instead of sleeping out its
+                // deadline.
                 self.shared.sync_readiness();
+                narf_net::readiness::notify(0);
             }
             Ok(n)
         })
@@ -326,6 +331,49 @@ impl FileOps for PipeRead {
         // Copy the front `n` bytes without consuming them — tee(2)
         // duplicates pipe data, leaving the source readable.
         Some(q.iter().copied().take(n).collect())
+    }
+
+    fn pipe_take(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut q = self.shared.queue.lock();
+        let avail = q.len();
+        let n = core::cmp::min(max, avail);
+        // Drain the front `n` bytes straight into a fresh Vec (no pre-zeroed
+        // bounce): `drain(..n).collect()` builds it from the ring's two
+        // contiguous slices. This is `PipeRead::read`'s bulk drain minus the
+        // caller-supplied buffer — the `splice(2)` pipe-source fast path.
+        let out: alloc::vec::Vec<u8> = q.drain(..n).collect();
+        let became_writable = avail == PIPE_BUF_BYTES && n != 0;
+        drop(q);
+        if became_writable {
+            self.shared.writable_token.fetch_add(1, Ordering::Release);
+        }
+        if n != 0 {
+            // Room freed: republish (sets POLL_OUT, may clear POLL_IN) and
+            // bump the global notify generation so a writer parked via
+            // `park_reexecute_on_io` (armed on that generation) re-runs.
+            self.shared.sync_readiness();
+            narf_net::readiness::notify(0);
+        }
+        Some(out)
+    }
+
+    fn pipe_unread(&self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        let mut q = self.shared.queue.lock();
+        // Prepend in original order: push each byte to the front from the
+        // back of `bytes` so the ring's front byte is `bytes[0]` again. This
+        // returns a splice sink's unwritten tail to the source with no loss.
+        for &b in bytes.iter().rev() {
+            q.push_front(b);
+        }
+        drop(q);
+        // Data is readable again; the token/readiness bump keeps a reader
+        // parked on POLL_IN consistent (POLL_OUT may clear if now full).
+        self.shared.readable_token.fetch_add(1, Ordering::Release);
+        self.shared.sync_readiness();
+        true
     }
 
     fn pipe_capacity(&self) -> Option<usize> {

@@ -67,7 +67,16 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         }
         // Kernel-test context: fall through and report the 0-byte copy.
     }
-    match copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, len) {
+    // Pipe source: drain the ring straight into the sink (no 64 KiB zeroed
+    // bounce). Non-pipe source (a pipe SINK splice, e.g. /dev/zero → pipe)
+    // keeps the offset-aware copy core. off_in is guaranteed 0 for a pipe
+    // source (the ESPIPE check above), so no offset write-back is needed.
+    let outcome = if in_is_pipe {
+        splice_pipe_source(task, fd_in, fd_out, len)
+    } else {
+        copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, len)
+    };
+    match outcome {
         Some(Err(narf_filesystem::FsError::WouldBlock)) if len > 0 && in_is_pipe => {
             // Empty pipe source, writer still open: an empty first read
             // consumes nothing, so EAGAIN or park+re-exec is safe
