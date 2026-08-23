@@ -496,6 +496,10 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
+    /// This slot's task id (0 until first enqueued). A wake publishes it into
+    /// the target CPU's `RUN_NEXT` hint so the just-woken task is picked next
+    /// instead of waiting behind the ready-queue backlog (targeted wakeup).
+    task: AtomicU64,
     /// Diagnostic: times `run_until_empty` popped this slot, and times it
     /// re-queued it because the awake flag was clear. A stranded slot is
     /// ambiguous without these — "the CPU is running rounds" does not say
@@ -512,6 +516,83 @@ pub(crate) struct WakeCell {
 /// both un-IPI'd AND unobserved.
 static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Targeted-wakeup hint (Linux `try_to_wake_up`'s "run the woken task promptly"
+/// slice): the task id a wake asked CPU `i` to pick NEXT (0 = none). A wake
+/// publishes it first-wins; `pick_next_slot` consumes it and, if that task is
+/// present and dispatchable at the best eligibility tier, picks it ahead of the
+/// FIFO backlog — so a just-woken task resumes without waiting behind the other
+/// ready slots (the scheduling hop). It is ONLY a pick-order bias over
+/// already-runnable work: it never sets the awake/runnable bit and never
+/// touches the halt handshake, so it cannot create or mask a lost wakeup, and a
+/// stale id (task gone/migrated) is simply ignored.
+static RUN_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Publish a run-next hint for `cpu` (first-wins: a burst of wakes in one round
+/// biases toward the first woken task rather than thrashing the pick).
+fn set_run_next(cpu: u32, task: u64) {
+    if task == 0 || cpu as usize >= narf_lib::percpu::MAX_CPUS {
+        return;
+    }
+    let _ = RUN_NEXT[cpu as usize].compare_exchange(0, task, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Consume `cpu`'s run-next hint. Called by `pick_next_slot`.
+pub(crate) fn take_run_next(cpu: crate::affinity::CpuId) -> Option<u64> {
+    let i = cpu.0 as usize;
+    if i >= narf_lib::percpu::MAX_CPUS {
+        return None;
+    }
+    match RUN_NEXT[i].swap(0, Ordering::AcqRel) {
+        0 => None,
+        t => Some(t),
+    }
+}
+
+/// The task id each CPU picked most recently. Used to reject a run-next hint
+/// that names the just-picked task: a cooperatively-yielding task wakes ITSELF
+/// (the yield heartbeat), which would otherwise re-boost it to the front every
+/// pick and starve the queue. A self-wake is a yield — it goes to the tail like
+/// any yield; only a wake from ANOTHER task/IRQ earns the run-next boost.
+static LAST_PICKED: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+pub(crate) fn last_picked(cpu: crate::affinity::CpuId) -> u64 {
+    LAST_PICKED
+        .get(cpu.0 as usize)
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_last_picked(cpu: crate::affinity::CpuId, task: u64) {
+    if let Some(c) = LAST_PICKED.get(cpu.0 as usize) {
+        c.store(task, Ordering::Relaxed);
+    }
+}
+
+/// One-pick cooldown after a run-next boost. Forces the very next pick to use
+/// FIFO order, so two tasks that wake each other (a ping-pong pair) can win the
+/// boost at most every OTHER pick — guaranteeing the FIFO queue always makes
+/// progress and other queued tasks can never be starved by the boost.
+static RUN_NEXT_COOLDOWN: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Whether a run-next boost is allowed this pick (not on cooldown). Consumes
+/// the cooldown.
+pub(crate) fn run_next_allowed(cpu: crate::affinity::CpuId) -> bool {
+    RUN_NEXT_COOLDOWN
+        .get(cpu.0 as usize)
+        .map(|c| !c.swap(false, Ordering::Relaxed))
+        .unwrap_or(true)
+}
+
+/// Arm the cooldown after a pick honored a run-next boost.
+pub(crate) fn arm_run_next_cooldown(cpu: crate::affinity::CpuId) {
+    if let Some(c) = RUN_NEXT_COOLDOWN.get(cpu.0 as usize) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Per-CPU periodic-budget boundaries for the currently polling slot. Zero
 /// means no period budget. The timer trap reads these without touching the
@@ -1442,6 +1523,7 @@ fn enqueue_on(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) {
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
+    slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
     let awake = slot.awake.flag.load(Ordering::Acquire);
     let meta = policy::TaskMeta::from_slot(&slot);
     policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
@@ -1577,6 +1659,7 @@ where
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
+            task: AtomicU64::new(0),
             pops: AtomicU64::new(0),
             not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
@@ -1637,6 +1720,7 @@ where
     let slot = TaskSlot {
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake: Arc::new(WakeCell {
+            task: AtomicU64::new(0),
             pops: AtomicU64::new(0),
             not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
@@ -1859,6 +1943,7 @@ where
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
+            task: AtomicU64::new(0),
             pops: AtomicU64::new(0),
             not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
@@ -2373,10 +2458,13 @@ unsafe fn wake_raw(data: *const ()) {
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
     arc.flag.store(true, Ordering::Release);
+    let cpu = arc.cpu.load(Ordering::Acquire);
+    // Bias the target CPU to pick this just-woken task next (targeted wakeup).
+    set_run_next(cpu, arc.task.load(Ordering::Relaxed));
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
-    resched_remote(arc.cpu.load(Ordering::Acquire));
+    resched_remote(cpu);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -2385,10 +2473,15 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let cpu = unsafe {
+    let (cpu, task) = unsafe {
         (*ptr).flag.store(true, Ordering::Release);
-        (*ptr).cpu.load(Ordering::Acquire)
+        (
+            (*ptr).cpu.load(Ordering::Acquire),
+            (*ptr).task.load(Ordering::Relaxed),
+        )
     };
+    // Bias the target CPU to pick this just-woken task next (targeted wakeup).
+    set_run_next(cpu, task);
     resched_remote(cpu);
 }
 
@@ -2519,6 +2612,7 @@ pub fn poll_one_round() -> usize {
         // Running on this CPU now — aim future wakes' reschedule IPI here
         // (the slot may have been work-stolen since it was enqueued).
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
+        slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
         let waker = make_waker(slot.awake.clone());
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
@@ -2803,6 +2897,7 @@ pub fn run_until_empty() {
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
+            slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
 
             // Save the kernel per-AS register before activating
             // the user AS so we can swap back after `poll()`
@@ -4202,6 +4297,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+        task: AtomicU64::new(0),
         pops: AtomicU64::new(0),
         not_awake_requeues: AtomicU64::new(0),
     });
