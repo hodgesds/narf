@@ -3434,9 +3434,18 @@ impl AddressSpace {
         // page in one shot. The bound keeps a wild pointer far below the stack
         // a real SEGV rather than silently mapping a huge gap.
         const MAX_GROW: u64 = 256 * 1024; // 64 pages
+                                          // Locate the stack guard at or above the faulting page via the ordered
+                                          // VMA index (O(log VMA)), not a linear scan over every region: the
+                                          // `stack` stressor grows the stack thousands of times, so a per-fault
+                                          // walk of the whole table would make the workload quadratic. A 4 KiB
+                                          // fault lands inside the guard (`containing`); a large `sub rsp, N`
+                                          // step lands below it, so fall back to the first region at or after
+                                          // `v_page` (`successor`). Either way validate the STACK_GUARD flag and
+                                          // the bounded gap so a wild pointer far below the stack stays a SEGV.
         let guard_base = regions
-            .iter()
-            .find(|r| {
+            .containing(v_page)
+            .or_else(|| regions.successor(v_page))
+            .filter(|r| {
                 r.perms.contains(RegionPerms::STACK_GUARD) && {
                     let gb = r.base.as_u64();
                     gb >= v_page && gb - v_page <= MAX_GROW
@@ -3462,7 +3471,7 @@ impl AddressSpace {
         }
         // The new footprint we are claiming is [new_guard_base, guard_base):
         // the fresh guard page plus every page from `v_page` up to (but not
-        // including) the old guard page — which stays region `idx`. Reject if
+        // including) the old guard page — which is consumed below. Reject if
         // any OTHER region intersects it: the stack arena has run into the
         // heap / mmap window and the user gets a real SEGV.
         if regions.has_overlap(new_guard_base, guard_base) {
@@ -3494,16 +3503,45 @@ impl AddressSpace {
             new_phys.push(phys);
             p += 0x1000;
         }
-        // Replace the one-page guard region with the expanded mapped stack
-        // span [v_page, guard_base + 0x1000).
-        let mut promoted = regions
+        // Consume the one-page guard and extend the stack DOWNWARD in place.
+        // The freshly mapped span [v_page, guard_base + 0x1000) is contiguous
+        // with the existing stack VMA directly above the guard, so prepend the
+        // new frames to that region and lower its base instead of inserting a
+        // new fragment. This keeps the stack a SINGLE VMA across arbitrarily
+        // many growths (the `stack` stressor otherwise accreted one region per
+        // fault, turning every subsequent lookup into an O(regions) walk) and
+        // preserves the stack's own perms — including an executable stack —
+        // rather than forcing R+W. Fresh zeroed frames have refcount 1, so a
+        // COW-after-fork stack stays correct: the prepended pages are private.
+        regions
             .remove(guard_base)
             .expect("stack guard disappeared under region lock");
-        promoted.base = VirtAddr::new(v_page);
-        promoted.len = npages * 0x1000;
-        promoted.perms = RegionPerms::READ | RegionPerms::WRITE;
-        promoted.phys = new_phys;
-        assert!(regions.insert(promoted).is_none());
+        let above_base = guard_base + 0x1000;
+        match regions.remove(above_base) {
+            Some(mut stack) if !stack.perms.contains(RegionPerms::STACK_GUARD) => {
+                new_phys.extend_from_slice(&stack.phys);
+                stack.base = VirtAddr::new(v_page);
+                stack.len += npages * 0x1000;
+                stack.phys = new_phys;
+                assert!(regions.insert(stack).is_none());
+            }
+            other => {
+                // No adjacent stack VMA (alternate test layouts / a guard with
+                // nothing above it): fall back to a standalone R+W span, and
+                // put back anything we removed that was not a stack.
+                if let Some(region) = other {
+                    assert!(regions.insert(region).is_none());
+                }
+                assert!(regions
+                    .insert(Region {
+                        base: VirtAddr::new(v_page),
+                        len: npages * 0x1000,
+                        perms: RegionPerms::READ | RegionPerms::WRITE,
+                        phys: new_phys,
+                    })
+                    .is_none());
+            }
+        }
 
         // Install a fresh one-page guard region below. Lazy phys
         // (the slot stays unbacked — guard pages never need a
@@ -3534,9 +3572,12 @@ impl AddressSpace {
         // frame allocation touches a page several pages below the stack bottom
         // in one step, landing below the one-page guard. Grow down to cover it.
         const MAX_GROW: u64 = 256 * 1024; // 64 pages
+                                          // O(log VMA) guard lookup via the ordered index — see the x86_64
+                                          // sibling for the quadratic-`stack`-stressor rationale.
         let guard_base = regions
-            .iter()
-            .find(|r| {
+            .containing(v_page)
+            .or_else(|| regions.successor(v_page))
+            .filter(|r| {
                 r.perms.contains(RegionPerms::STACK_GUARD) && {
                     let gb = r.base.as_u64();
                     gb >= v_page && gb - v_page <= MAX_GROW
@@ -3586,14 +3627,34 @@ impl AddressSpace {
             new_phys.push(phys);
             p += 0x1000;
         }
-        let mut promoted = regions
+        // Extend the stack in place — see the x86_64 sibling for why this
+        // merges into the adjacent stack VMA rather than inserting a fragment.
+        regions
             .remove(guard_base)
             .expect("stack guard disappeared under region lock");
-        promoted.base = VirtAddr::new(v_page);
-        promoted.len = npages * 0x1000;
-        promoted.perms = RegionPerms::READ | RegionPerms::WRITE;
-        promoted.phys = new_phys;
-        assert!(regions.insert(promoted).is_none());
+        let above_base = guard_base + 0x1000;
+        match regions.remove(above_base) {
+            Some(mut stack) if !stack.perms.contains(RegionPerms::STACK_GUARD) => {
+                new_phys.extend_from_slice(&stack.phys);
+                stack.base = VirtAddr::new(v_page);
+                stack.len += npages * 0x1000;
+                stack.phys = new_phys;
+                assert!(regions.insert(stack).is_none());
+            }
+            other => {
+                if let Some(region) = other {
+                    assert!(regions.insert(region).is_none());
+                }
+                assert!(regions
+                    .insert(Region {
+                        base: VirtAddr::new(v_page),
+                        len: npages * 0x1000,
+                        perms: RegionPerms::READ | RegionPerms::WRITE,
+                        phys: new_phys,
+                    })
+                    .is_none());
+            }
+        }
 
         assert!(regions
             .insert(Region {

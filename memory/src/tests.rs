@@ -6938,9 +6938,13 @@ fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
 kernel_test_in!("memory", smoke_memory_try_grow_stack_collision_rejected);
 
 /// Sequential grows: starting from a single guard, three grows
-/// produce three R+W stack pages and a guard sitting at the
-/// new bottom. Catches a regression where the new guard install
-/// races against the promotion bookkeeping.
+/// coalesce into ONE R+W stack VMA (three pages) with a guard
+/// sitting at the new bottom. The stack is extended downward in
+/// place — the first grow's fragment becomes the region every
+/// later grow merges into — so the table never accretes one VMA
+/// per fault (the `stack` stressor otherwise turned each grow into
+/// an O(regions) walk). Catches a regression where the new guard
+/// install races against the promotion bookkeeping.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_try_grow_stack_sequential() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
@@ -6969,14 +6973,14 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         cur -= 0x1000;
     }
     let snap = a.regions_snapshot();
-    let rw_count = snap
+    let rw_regions: alloc::vec::Vec<_> = snap
         .iter()
         .filter(|r| {
             !r.perms.contains(RegionPerms::STACK_GUARD)
                 && r.perms.contains(RegionPerms::READ)
                 && r.perms.contains(RegionPerms::WRITE)
         })
-        .count();
+        .collect();
     let guard_count = snap
         .iter()
         .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
@@ -6987,8 +6991,23 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         .map(|r| r.base.as_u64())
         .min();
     core::mem::forget(a);
-    if rw_count != 3 {
-        return TestResult::Fail("expected 3 promoted stack pages");
+    // The three growths coalesce into a single R+W VMA rather than
+    // three fragments: one region, three pages. The first growth
+    // promotes the guard page AT `guard0`, the next two the pages
+    // below, so the merged stack is based two pages below `guard0`
+    // and the fresh trailing guard sits one page below that.
+    if rw_regions.len() != 1 {
+        return TestResult::Fail("grows did not coalesce into one stack VMA");
+    }
+    let stack = rw_regions[0];
+    if stack.len != 3 * 0x1000 {
+        return TestResult::Fail("merged stack VMA not three pages long");
+    }
+    if stack.base.as_u64() != guard0 - 2 * 0x1000 {
+        return TestResult::Fail("merged stack VMA not based two pages below start");
+    }
+    if stack.phys.len() != 3 || stack.phys.iter().any(|p| p.raw() == 0) {
+        return TestResult::Fail("merged stack VMA has an unbacked page");
     }
     if guard_count != 1 {
         return TestResult::Fail("expected exactly one trailing guard");
@@ -7000,6 +7019,124 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_try_grow_stack_sequential);
+
+/// Realistic layout: a backed stack VMA sits directly above the
+/// guard. Many one-page growths extend that VMA downward in place
+/// — the stack stays a SINGLE region (region count stays flat, not
+/// one-per-fault), the region's own perms are preserved (an
+/// executable stack stays executable, not forced to R+W), every
+/// grown page is freshly backed + zeroed + writable, and a guard
+/// tracks the new bottom. This is the `stack`-stressor fast path.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_extends_one_vma() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // One backed, EXECUTABLE stack page, with a guard directly below.
+    let stack_base = 0x0000_0080_0600_0000u64;
+    let stack_frame = match crate::frame::alloc_user_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("no frame for stack page");
+        }
+    };
+    a.map_region(Region {
+        base: VirtAddr::new(stack_base),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC,
+        phys: alloc::vec![stack_frame],
+    })
+    .expect("map_region stack");
+    let guard0 = stack_base - 0x1000;
+    a.map_region(Region {
+        base: VirtAddr::new(guard0),
+        len: 0x1000,
+        perms: RegionPerms::STACK_GUARD,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region guard");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+
+    // Grow the stack down 16 pages, one fault at a time.
+    const GROWS: u64 = 16;
+    let mut cur = guard0;
+    for _ in 0..GROWS {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
+        if unsafe { a.try_grow_stack(VirtAddr::new(cur + 0x40)) }.is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("in-place stack grow failed mid-loop");
+        }
+        cur -= 0x1000;
+    }
+
+    let snap = a.regions_snapshot();
+    // Every grown page must be present in the tables and writable.
+    let mut all_present_writable = true;
+    let mut p = guard0;
+    for _ in 0..GROWS {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
+        if unsafe { translate_arch(a.root, VirtAddr::new(p)) }.is_none() {
+            all_present_writable = false;
+        }
+        p -= 0x1000;
+    }
+    let stack_regions: alloc::vec::Vec<_> = snap
+        .iter()
+        .filter(|r| {
+            !r.perms.contains(RegionPerms::STACK_GUARD) && r.perms.contains(RegionPerms::WRITE)
+        })
+        .collect();
+    let guard_count = snap
+        .iter()
+        .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
+        .count();
+    let stack_ok = stack_regions.len() == 1 && {
+        let s = stack_regions[0];
+        // One VMA: original page + GROWS grown pages, based GROWS pages
+        // below the original, EXEC preserved, densely backed & zeroed.
+        s.base.as_u64() == stack_base - GROWS * 0x1000
+            && s.len == (GROWS + 1) * 0x1000
+            && s.perms.contains(RegionPerms::EXEC)
+            && s.phys.len() as u64 == GROWS + 1
+            && !s.phys.iter().any(|ph| ph.raw() == 0)
+    };
+    // Read back one grown page: try_grow_stack zeroes each frame.
+    let lowest = stack_base - GROWS * 0x1000;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let zeroed = unsafe { translate_arch(a.root, VirtAddr::new(lowest)) }
+        .map(|pa| {
+            // SAFETY: identity-mapped low physical memory.
+            let byte = unsafe { core::ptr::read_volatile(pa.raw() as *const u8) };
+            byte == 0
+        })
+        .unwrap_or(false);
+    core::mem::forget(a);
+
+    if !all_present_writable {
+        return TestResult::Fail("a grown stack page was not present");
+    }
+    if !stack_ok {
+        return TestResult::Fail("stack did not stay one EXEC VMA across grows");
+    }
+    if guard_count != 1 {
+        return TestResult::Fail("expected exactly one trailing guard");
+    }
+    if !zeroed {
+        return TestResult::Fail("grown stack page was not zeroed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_try_grow_stack_extends_one_vma);
 
 /// STACK_GUARD bit lives outside the POSIX prot mask so an
 /// `mprotect`-style query on the region's perms doesn't observe
