@@ -62,6 +62,11 @@ struct SemSet {
 static SEMS: IrqSafeSpinLock<Option<BTreeMap<u64, SemSet>>> = IrqSafeSpinLock::new(None);
 static SEM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Upper bound on `nsops` for a single `semop`, matching the accepted
+/// `nsems` cap. Sizes the on-stack sops read buffer (MAX_SOPS * 6 B) so a
+/// semop performs no heap allocation.
+const MAX_SOPS: usize = 1024;
+
 fn with_sems<R>(f: impl FnOnce(&mut BTreeMap<u64, SemSet>) -> R) -> R {
     let mut g = SEMS.lock();
     f(g.get_or_insert_with(BTreeMap::new))
@@ -121,20 +126,21 @@ fn semop_common(ctx: &mut dyn TrapContext, _timed: bool) {
     let semid = a.arg0;
     let sops_ptr = a.arg1;
     let nsops = a.arg2 as usize;
-    if nsops == 0 || nsops > 1024 || sops_ptr == 0 {
+    if nsops == 0 || nsops > MAX_SOPS || sops_ptr == 0 {
         ctx.set_return(err(EINVAL));
         return;
     }
     // struct sembuf { unsigned short sem_num; short sem_op; short sem_flg; } — 6 B.
-    // SAFETY: sops_ptr is checked non-zero; copy_from_user_vec range-validates
-    // and SMAP-brackets the read of the nsops sembuf entries.
-    let buf = match unsafe { crate::handlers::copy_from_user_vec(sops_ptr, nsops * 6) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(err(EINVAL));
-            return;
-        }
-    };
+    // Read the sops array into a fixed on-stack buffer so a semop costs no
+    // heap traffic (the hot stress path is a single-sembuf P/V pair).
+    let nbytes = nsops * 6;
+    let mut buf = [0u8; MAX_SOPS * 6];
+    // SAFETY: sops_ptr is checked non-zero; copy_from_user range-validates and
+    // SMAP-brackets the read of the nbytes sembuf entries into the stack slice.
+    if unsafe { crate::handlers::copy_from_user(&mut buf[..nbytes], sops_ptr) }.is_err() {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
     let parse = |i: usize| -> (usize, i16, i16) {
         let o = i * 6;
         let num = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
@@ -144,29 +150,46 @@ fn semop_common(ctx: &mut dyn TrapContext, _timed: bool) {
     };
     let result = with_sems(|m| {
         let set = m.get_mut(&semid).ok_or(EINVAL)?;
-        // Phase 1: verify every op can proceed against a scratch copy.
-        let mut scratch = set.sems.clone();
+        // Bounds-check every referenced sem_num up front so the apply pass
+        // (which mutates the live vector) can only be reached once the whole
+        // sops array is known-valid.
         for i in 0..nsops {
-            let (num, op, flg) = parse(i);
-            if num >= scratch.len() {
+            let (num, _, _) = parse(i);
+            if num >= set.sems.len() {
                 return Err(EINVAL);
             }
-            let cur = scratch[num];
-            let _ = flg; // IPC_NOWAIT vs block: we never block, so always EAGAIN.
+        }
+        // Apply each op in order against the RUNNING value (accumulating
+        // repeated sem_num within this call, as Linux's atomic block does).
+        // On the first op that would block, roll back every applied delta so
+        // the operation is all-or-nothing without cloning the vector.
+        let mut applied = 0usize;
+        let mut fail: Option<i64> = None;
+        for i in 0..nsops {
+            let (num, op, _flg) = parse(i);
+            let cur = set.sems[num];
             if op == 0 {
                 if cur != 0 {
-                    return Err(EAGAIN); // wait-for-zero would block
+                    fail = Some(EAGAIN); // wait-for-zero would block
+                    break;
                 }
+            } else if cur + op as i32 >= 0 {
+                set.sems[num] = cur + op as i32;
             } else {
-                let next = cur + op as i32;
-                if next < 0 {
-                    return Err(EAGAIN); // would block; non-blocking → EAGAIN
-                }
-                scratch[num] = next;
+                fail = Some(EAGAIN); // would block; non-blocking → EAGAIN
+                break;
             }
+            applied = i + 1;
         }
-        // Phase 2: commit.
-        set.sems = scratch;
+        if let Some(e) = fail {
+            for i in (0..applied).rev() {
+                let (num, op, _) = parse(i);
+                if op != 0 {
+                    set.sems[num] -= op as i32;
+                }
+            }
+            return Err(e);
+        }
         Ok(())
     });
     match result {
@@ -330,22 +353,31 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(EINVAL));
         return;
     }
-    // Read mtype (8 B) + msgsz payload bytes.
-    // SAFETY: msgp checked non-zero; copy_from_user_vec range-validates and
-    // brackets the read of the 8-byte mtype + msgsz payload.
-    let raw = match unsafe { crate::handlers::copy_from_user_vec(msgp, 8 + msgsz) } {
-        Ok(b) => b,
-        Err(_) => {
-            ctx.set_return(err(EINVAL));
-            return;
-        }
-    };
-    let mtype = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    // Read the 8-byte mtype header into a stack slot; validate it before
+    // touching the heap so a bad type costs no allocation.
+    let mut hdr = [0u8; 8];
+    // SAFETY: msgp checked non-zero; copy_from_user range-validates and
+    // brackets the read of the 8-byte mtype header.
+    if unsafe { crate::handlers::copy_from_user(&mut hdr, msgp) }.is_err() {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let mtype = i64::from_le_bytes(hdr);
     if mtype <= 0 {
         ctx.set_return(err(EINVAL));
         return;
     }
-    let payload = raw[8..8 + msgsz].to_vec();
+    // Allocate the queued payload buffer exactly once and fill it directly
+    // from userspace (no intermediate header+payload copy).
+    let mut payload = alloc::vec![0u8; msgsz];
+    if msgsz != 0 {
+        // SAFETY: copy_from_user range-validates `msgp + 8` and brackets the
+        // read of the msgsz payload bytes into the freshly sized buffer.
+        if unsafe { crate::handlers::copy_from_user(&mut payload, msgp + 8) }.is_err() {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    }
     let r = with_msgs(|m| {
         let q = m.get_mut(&msqid).ok_or(EINVAL)?;
         q.msgs.push_back((mtype, payload));
@@ -405,13 +437,21 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
         // for simplicity — the common path passes a large-enough buffer.
         payload.truncate(msgsz);
     }
-    let mut out = Vec::with_capacity(8 + payload.len());
-    out.extend_from_slice(&mtype.to_le_bytes());
-    out.extend_from_slice(&payload);
-    // SAFETY: msgp checked non-zero; copy_to_user validates the mtype+payload write.
-    if unsafe { crate::handlers::copy_to_user(msgp, &out) }.is_err() {
+    // Write the mtype header and payload directly to the user buffer with no
+    // intermediate combined allocation. The header goes down first; if the
+    // payload write faults the message is already dequeued (matches the
+    // truncate-on-small-buffer relaxation above).
+    // SAFETY: msgp checked non-zero; copy_to_user validates the mtype write range.
+    if unsafe { crate::handlers::copy_to_user(msgp, &mtype.to_le_bytes()) }.is_err() {
         ctx.set_return(err(EINVAL));
         return;
+    }
+    if !payload.is_empty() {
+        // SAFETY: copy_to_user validates the `msgp + 8` payload write range.
+        if unsafe { crate::handlers::copy_to_user(msgp + 8, &payload) }.is_err() {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
     }
     ctx.set_return(SyscallReturn::ok(payload.len() as u64));
 }

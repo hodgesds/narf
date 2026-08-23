@@ -500,6 +500,95 @@ fn smoke_abi_ipc_semop_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_neg);
 
+// A multi-sop semop is all-or-nothing across the sops array, accumulating
+// repeated sem_num within the call (Linux atomic-block semantics). Set sem 0
+// to 1, then submit {sem0 -1, sem0 -1}: the first -1 succeeds (1→0), the
+// second would block, so the WHOLE op is rolled back — sem 0 stays 1.
+fn smoke_abi_ipc_semop_atomic_rollback() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(2)?;
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("setup: SETVAL sem0=1 failed");
+        }
+        // Two ops on the SAME sem_num: -1 then -1. Running value hits -1 on
+        // the second, so the whole op must be EAGAIN with no net change.
+        let mut sops = [0u8; 12];
+        // sop0: sem_num=0, sem_op=-1
+        sops[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        // sop1: sem_num=0, sem_op=-1
+        sops[6..8].copy_from_slice(&0u16.to_le_bytes());
+        sops[8..10].copy_from_slice(&(-1i16).to_le_bytes());
+        match call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 2)) {
+            Some(v) if v == EAGAIN => {}
+            _ => return Err("blocking multi-sop semop must return EAGAIN"),
+        }
+        // Rollback must have restored sem 0 to 1 (not left it at 0).
+        match call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) {
+            Some(1) => Ok(()),
+            _ => Err("failed multi-sop semop left a partial delta (rollback bug)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_atomic_rollback);
+
+// A multi-sop semop that fully succeeds applies every delta. Set sem0=0,
+// sem1=5; submit {sem0 +2, sem1 -5, sem0 +1}: all satisfiable → sem0=3,
+// sem1=0.
+fn smoke_abi_ipc_semop_multi_commit() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(2)?;
+        if call(Syscall::Semctl.raw(), a3(id, 1, SETVAL, 5)) != Some(0) {
+            return Err("setup: SETVAL sem1=5 failed");
+        }
+        let mut sops = [0u8; 18];
+        // sop0: sem0 += 2
+        sops[2..4].copy_from_slice(&2i16.to_le_bytes());
+        // sop1: sem1 -= 5
+        sops[6..8].copy_from_slice(&1u16.to_le_bytes());
+        sops[8..10].copy_from_slice(&(-5i16).to_le_bytes());
+        // sop2: sem0 += 1
+        sops[12..14].copy_from_slice(&0u16.to_le_bytes());
+        sops[14..16].copy_from_slice(&1i16.to_le_bytes());
+        if call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 3)) != Some(0) {
+            return Err("satisfiable multi-sop semop should return 0");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(3) {
+            return Err("sem0 should be 3 after +2 then +1");
+        }
+        match call(Syscall::Semctl.raw(), a3(id, 1, GETVAL, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("sem1 should be 0 after -5"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_multi_commit);
+
+// Many private sem sets are created and each is independently addressable —
+// exercises the keyed id lookup that replaced the old scratch-clone path.
+fn smoke_abi_ipc_semget_many_lookup() -> TestResult {
+    with_setup(|| {
+        const N: usize = 64;
+        let mut ids = [0u64; N];
+        for (i, slot) in ids.iter_mut().enumerate() {
+            let id = make_semset(1)?;
+            // Stamp a distinct value so a mixed-up id shows up on read-back.
+            if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, i as u64)) != Some(0) {
+                return Err("setup: SETVAL failed");
+            }
+            *slot = id;
+        }
+        // Every set must still read back exactly its stamped value.
+        for (i, &id) in ids.iter().enumerate() {
+            match call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) {
+                Some(v) if v == i as i64 => {}
+                _ => return Err("a sem set read back a foreign value (id lookup bug)"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semget_many_lookup);
+
 // ── Semtimedop ──────────────────────────────────────────────────────
 //
 // Same shape as semop with a trailing timeout (ignored — never blocks).
@@ -697,6 +786,68 @@ fn smoke_abi_ipc_msgrcv_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_neg);
+
+// msgrcv type selection with the two-write output path: send mtype 3 then
+// mtype 1; msgtyp=1 must skip the type-3 message and deliver the type-1 one,
+// writing the mtype header and payload correctly.
+fn smoke_abi_ipc_msgrcv_type_select() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        // Send type 3 = "three", then type 1 = "one!".
+        let mut s3 = [0u8; 8 + 5];
+        s3[0..8].copy_from_slice(&3i64.to_le_bytes());
+        s3[8..13].copy_from_slice(b"three");
+        if call(Syscall::Msgsnd.raw(), a3(id, s3.as_ptr() as u64, 5, 0)) != Some(0) {
+            return Err("setup: msgsnd type 3 failed");
+        }
+        let mut s1 = [0u8; 8 + 4];
+        s1[0..8].copy_from_slice(&1i64.to_le_bytes());
+        s1[8..12].copy_from_slice(b"one!");
+        if call(Syscall::Msgsnd.raw(), a3(id, s1.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: msgsnd type 1 failed");
+        }
+        // msgtyp = 1 → first message of exactly type 1 (skips the type-3 head).
+        let mut rbuf = [0xEEu8; 8 + 8];
+        let r = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: rbuf.as_mut_ptr() as u64,
+                arg2: 8,
+                arg3: 1, // msgtyp
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if r.status != SyscallReturn::OK || r.value as i64 != 4 {
+            return Err("msgrcv(msgtyp=1) should return the 4-byte type-1 payload");
+        }
+        if i64::from_le_bytes(rbuf[0..8].try_into().unwrap()) != 1 {
+            return Err("msgrcv wrote the wrong mtype header");
+        }
+        if &rbuf[8..12] != b"one!" {
+            return Err("msgrcv delivered the wrong (type-3) message body");
+        }
+        // The type-3 message must still be queued: a msgtyp=0 recv gets it.
+        let mut r2 = [0u8; 8 + 8];
+        let g = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: r2.as_mut_ptr() as u64,
+                arg2: 8,
+                arg3: 0,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if g.value as i64 != 5 || &r2[8..13] != b"three" {
+            return Err("the skipped type-3 message was not left on the queue");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_type_select);
 
 // ── Msgctl ──────────────────────────────────────────────────────────
 
