@@ -1909,9 +1909,21 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
         narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
             .map_err(|_remaining| EFAULT)?;
     }
-    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
-    // volatile read of each in-range user byte is the access path.
-    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // guarded copy catches any unrecoverable EL1 data abort (a validated-
+    // but-unmapped user page, or a racing munmap) as Err instead of a
+    // kernel panic — Linux's arm64 uaccess extable-fixup -EFAULT semantics.
+    // A legitimately-healable fault (demand page / stack grow / COW) heals
+    // in the data-abort handler first and the copy resumes transparently.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+            .map_err(|_remaining| EFAULT)?;
+    }
+    // SAFETY: any other target — plain volatile read of each in-range user
+    // byte (no fault-fixup surface implemented there).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in dst.iter_mut().enumerate() {
@@ -1963,9 +1975,18 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
         narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
             .map_err(|_remaining| EFAULT)?;
     }
-    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
-    // volatile write of each in-range user byte is the access path.
-    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: src is a live kernel slice; dst is range-validated; the
+    // guarded copy catches any unrecoverable EL1 data abort as Err — see
+    // copy_from_user. Healable faults heal first and the copy resumes.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
+            .map_err(|_remaining| EFAULT)?;
+    }
+    // SAFETY: any other target — plain volatile write of each in-range user
+    // byte (no fault-fixup surface implemented there).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in src.iter().enumerate() {

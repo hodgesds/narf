@@ -2163,7 +2163,11 @@ fn smoke_mount_setattr_size_validation() -> TestResult {
         },
         ret: None,
     };
-    crate::mount_api::sys_mount_setattr(&mut good);
+    // The attr buffer lives on the kernel stack, which is high-half on
+    // aarch64 (TTBR1); `with_kernel_buffers` opts this copy past
+    // `validate_user_range`'s user-half check so the well-formed case
+    // reaches the field validation on every arch, not just x86_64.
+    crate::handlers::with_kernel_buffers(|| crate::mount_api::sys_mount_setattr(&mut good));
     let good_ok = matches!(good.ret, Some(r) if r.value == 0);
 
     // size == 0 → EINVAL.

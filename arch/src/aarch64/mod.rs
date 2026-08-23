@@ -23,6 +23,7 @@ pub mod nv2;
 pub mod pac;
 pub mod pie;
 pub mod pmu;
+pub mod probe;
 pub mod psci;
 pub mod rme;
 pub mod rndr;
@@ -37,6 +38,7 @@ pub mod sysreg;
 pub mod timer;
 pub mod trap_frame;
 pub mod trbe;
+pub mod uaccess;
 pub mod user_mode;
 
 pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch_word};
