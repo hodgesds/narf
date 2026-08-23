@@ -9948,6 +9948,151 @@ fn smoke_materialize_range_installs_only_intersection() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_materialize_range_installs_only_intersection);
 
+/// System V `shmat` maps a segment's registry-owned frames into the caller's
+/// address space and installs the PTEs for ONLY that segment's VA window via
+/// `materialize_range` (not a whole-address-space `materialize`, which the
+/// shm-sysv shmget/shmat/shmdt loop otherwise re-paid per attach). This
+/// mirrors that attach shape at the address-space layer and pins its three
+/// load-bearing invariants:
+///   * shared visibility — a second attach (a second AS here) aliases the
+///     SAME physical frame, so a write through one attach is visible through
+///     the other (`shmat` maps, never copies);
+///   * range-scoped PTE install — `materialize_range` installs exactly the
+///     segment window and nothing else;
+///   * shared-frame lifetime — a SHARED region borrows registry-owned frames,
+///     so dropping one attaching AS unmaps its PTEs but must NOT free the
+///     frame while another AS still maps it (the cross-AS double-free hazard).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shmat_shared_attach_range_materialize() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::x86_64::paging::translate(a.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::aarch64::paging::translate(a.root, va) }
+    }
+
+    // Two independent user address spaces stand in for two processes attaching
+    // the same segment. SAFETY: test-owned roots; neither is ever activated.
+    // SAFETY: test-owned user root; it is never activated.
+    let as_a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AS a alloc failed"),
+    };
+    // SAFETY: test-owned user root; it is never activated.
+    let as_b = match unsafe { AddressSpace::new_for_user() } {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("AS b alloc failed"),
+    };
+
+    // One page of registry-owned backing stands in for the shmem segment's
+    // frame list. A single frame keeps the shared-alias reasoning exact.
+    let seg = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    const SEG_LEN: u64 = 4096;
+    // Above the low-4-GiB identity window so the leaf doesn't collide with the
+    // kernel's shared huge PML4[0] identity mapping.
+    let base_a = VirtAddr::new(0x0000_4090_0000_0000);
+    let base_b = VirtAddr::new(0x0000_4098_0000_0000);
+
+    // Attach shape: SHARED marks the frames as borrowed so neither unmap nor
+    // AS-drop frees them; the transaction serializes the alias install exactly
+    // as `sys_shmat` does. A single frame maps into both roots — no copy.
+    let attach = |as_ref: &AddressSpace, base: VirtAddr| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: registry snapshot + alias insertion share one transaction;
+            // the root is live per new_for_user, and the range install below
+            // touches only this just-registered window.
+            unsafe {
+                as_ref.map_shared_region_locked(Region {
+                    base,
+                    len: SEG_LEN,
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                    phys: alloc::vec![seg],
+                })?;
+                as_ref.materialize_range(base, SEG_LEN)
+            }
+        })
+    };
+    if attach(&as_a, base_a).is_err() {
+        return TestResult::Fail("first attach (map_shared + materialize_range) failed");
+    }
+    if attach(&as_b, base_b).is_err() {
+        return TestResult::Fail("second attach (map_shared + materialize_range) failed");
+    }
+
+    // Range-scoped install: exactly the segment window is present, and both
+    // attaches resolve to the SAME physical frame (shared visibility, not a
+    // copy).
+    // SAFETY: both roots are live test-owned user roots.
+    if unsafe { translated(&as_a, base_a) } != Some(seg) {
+        return TestResult::Fail("attach A did not install the segment PTE");
+    }
+    // SAFETY: as above.
+    if unsafe { translated(&as_b, base_b) } != Some(seg) {
+        return TestResult::Fail("attach B did not alias the SAME frame (visibility broken)");
+    }
+    // materialize_range must not spill outside the one-page window.
+    // SAFETY: as above.
+    if unsafe { translated(&as_a, VirtAddr::new(base_a.as_u64() + SEG_LEN)) }.is_some() {
+        return TestResult::Fail("materialize_range installed a page past the segment");
+    }
+
+    // Write through the shared frame and read it back through B's mapping:
+    // both attaches see the same bytes. The frame is identity-mapped, so its
+    // phys doubles as a kernel VA here.
+    const SENTINEL: u64 = 0x5347_5F53_484D_4154;
+    // SAFETY: `seg` is a live, identity-mapped, freshly allocated frame.
+    unsafe { core::ptr::write_volatile(seg.raw() as *mut u64, SENTINEL) };
+    // SAFETY: B translated to `seg`; reading through that phys observes the
+    // write, proving cross-attach shared visibility.
+    let seen = unsafe { core::ptr::read_volatile(seg.raw() as *const u64) };
+    if seen != SENTINEL {
+        return TestResult::Fail("shared write not visible through the second attach");
+    }
+
+    // Detach one attach (drop A). A SHARED region unmaps its PTEs but must NOT
+    // free the borrowed frame while B still maps it — the marginal-buddy
+    // cross-AS double-free hazard.
+    drop(as_a);
+    // B still resolves the frame and still reads the sentinel: A's teardown
+    // neither unmapped B nor freed the shared frame.
+    // SAFETY: B owns a live user root; `seg` stays identity-mapped.
+    if unsafe { translated(&as_b, base_b) } != Some(seg) {
+        return TestResult::Fail("detaching A tore down B's still-live attach");
+    }
+    // SAFETY: as above.
+    if unsafe { core::ptr::read_volatile(seg.raw() as *const u64) } != SENTINEL {
+        return TestResult::Fail("shared frame was clobbered by A's detach");
+    }
+    // The clinching double-free check: had A's drop freed the still-mapped
+    // frame, the allocator's free list would now hand it back. It must not.
+    let probe = crate::alloc_frame().ok();
+    if let Some(f) = probe.as_ref() {
+        if f.start_address() == seg {
+            return TestResult::Fail("detach freed a frame still attached elsewhere (double-free)");
+        }
+    }
+
+    // Cleanup: drop B (releases its borrow, still no free of `seg`), return the
+    // probe frame, then free the segment frame we own outright.
+    drop(as_b);
+    if let Some(f) = probe {
+        crate::frame::free_frame(f);
+    }
+    crate::frame::free_frame(crate::frame::PhysFrame::new(seg));
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shmat_shared_attach_range_materialize);
+
 /// A bad, unrelated VMA must not poison incremental materialisation of a
 /// valid mmap range. A test-owned huge leaf gives a deterministic structural
 /// conflict that the full construction walk rejects.
