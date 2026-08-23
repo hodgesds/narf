@@ -3129,6 +3129,36 @@ const NARF_EXTENSION_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Alarm, 0x4073),
 ];
 
+/// Direct-indexed reverse map (wire number → variant) for the standard Linux
+/// table, built once at compile time. `from_raw` is on the syscall hot path —
+/// called on every trap and on every parked-syscall backstop re-poll — so a
+/// linear scan of the ~300-row `LINUX_TABLE` was pure per-syscall tax. Linux
+/// wire numbers are all `< FROM_RAW_LEN`; NARF extensions (`0x4000+`) stay a
+/// short linear scan since they're sparse and far out of range.
+const FROM_RAW_LEN: usize = 1024;
+
+const fn build_from_raw() -> [Option<Syscall>; FROM_RAW_LEN] {
+    let mut t = [None; FROM_RAW_LEN];
+    let mut i = 0;
+    while i < LINUX_TABLE.len() {
+        let n = LINUX_TABLE[i].1 as usize;
+        // Every standard Linux wire number must fit the direct-index table; a
+        // const-eval panic here fails the build if a new row exceeds the range.
+        assert!(
+            n < FROM_RAW_LEN,
+            "LINUX_TABLE wire number exceeds FROM_RAW_LEN"
+        );
+        // First row wins, matching the old top-down linear scan.
+        if t[n].is_none() {
+            t[n] = Some(LINUX_TABLE[i].0);
+        }
+        i += 1;
+    }
+    t
+}
+
+static LINUX_FROM_RAW: [Option<Syscall>; FROM_RAW_LEN] = build_from_raw();
+
 impl Syscall {
     /// Wire number for this syscall on the calling architecture.
     /// Returns the per-arch Linux number for Linux-equivalent
@@ -3164,14 +3194,15 @@ impl Syscall {
     /// the arch-specific wire number `n`. Returns `None` if `n` is
     /// not mapped (surfaces InvalidOp to the user).
     #[inline]
-    pub const fn from_raw(n: u32) -> Option<Self> {
-        let mut i = 0;
-        while i < LINUX_TABLE.len() {
-            if LINUX_TABLE[i].1 == n {
-                return Some(LINUX_TABLE[i].0);
+    pub fn from_raw(n: u32) -> Option<Self> {
+        // O(1) direct index for the standard Linux range (the hot path).
+        if let Some(&entry) = LINUX_FROM_RAW.get(n as usize) {
+            if entry.is_some() {
+                return entry;
             }
-            i += 1;
         }
+        // NARF extensions live at 0x4000+ (sparse, far out of the Linux range);
+        // a short linear scan is fine and keeps them out of the dense table.
         let mut j = 0;
         while j < NARF_EXTENSION_TABLE.len() {
             if NARF_EXTENSION_TABLE[j].1 == n {
@@ -4419,4 +4450,54 @@ pub fn __test_clear_global() {
         // SAFETY: Valid memory or trusted environment
         unsafe { drop(Box::from_raw(ptr)) };
     }
+}
+
+#[cfg(feature = "kernel-test")]
+mod from_raw_tests {
+    use super::{Syscall, LINUX_TABLE, NARF_EXTENSION_TABLE};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The O(1) direct-indexed `from_raw` must agree with the source tables for
+    /// every wire number and reject an unmapped one. It is on the syscall hot
+    /// path, so a mismatch would mis-dispatch or silently drop a syscall. The
+    /// oracle is the original top-down linear scan; the O(1) table must return
+    /// the identical variant for every number (a variant may be aliased to more
+    /// than one wire number, so compare against the scan, not a raw() round-trip).
+    fn ref_from_raw(n: u32) -> Option<Syscall> {
+        for &(v, m) in LINUX_TABLE.iter() {
+            if m == n {
+                return Some(v);
+            }
+        }
+        for &(v, m) in NARF_EXTENSION_TABLE.iter() {
+            if m == n {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn smoke_syscall_from_raw_matches_tables() -> TestResult {
+        // Every wire number in both tables resolves to the same variant the
+        // linear scan would have picked.
+        for &(_v, n) in LINUX_TABLE.iter().chain(NARF_EXTENSION_TABLE.iter()) {
+            if Syscall::from_raw(n).map(|v| v as u32) != ref_from_raw(n).map(|v| v as u32) {
+                return TestResult::Fail("from_raw disagreed with the linear-scan oracle");
+            }
+        }
+        // And every number across the dense range agrees too (catches a stray
+        // table cell), including the unmapped ones which must be None.
+        let mut n = 0u32;
+        while n < super::FROM_RAW_LEN as u32 {
+            if Syscall::from_raw(n).map(|v| v as u32) != ref_from_raw(n).map(|v| v as u32) {
+                return TestResult::Fail("dense-range from_raw disagreed with the oracle");
+            }
+            n += 1;
+        }
+        if Syscall::from_raw(u32::MAX).is_some() {
+            return TestResult::Fail("from_raw invented a variant for u32::MAX");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/syscall", smoke_syscall_from_raw_matches_tables);
 }
