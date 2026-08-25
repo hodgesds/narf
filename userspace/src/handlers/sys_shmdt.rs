@@ -20,7 +20,7 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     let attachment = {
         let mut attachments = SHM_ATTACHMENTS.lock();
         attachments
-            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .get_or_insert_with(ShmAttachmentRegistry::new)
             .get(&(as_key, addr))
             .and_then(|entries| {
                 // Linux scans VMAs upward from `addr`; if SHM_REMAP left an
@@ -80,7 +80,7 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     }
     {
         let mut attachments = SHM_ATTACHMENTS.lock();
-        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
         let remove_key = if let Some(entries) = map.get_mut(&(as_key, addr)) {
             if let Some(index) = entries.iter().position(|entry| {
                 entry.shmid == attachment.shmid && entry.fragments == attachment.fragments

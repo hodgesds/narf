@@ -197,17 +197,33 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    {
+    let mut fragments = alloc::vec::Vec::new();
+    if fragments.try_reserve_exact(1).is_err() {
+        let _ = as_ref.unmap_region(VirtAddr::new(base));
+        shm_cancel_attach(object);
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        return;
+    }
+    fragments.push((base, map_len));
+    let attachment = ShmAttachment {
+        ipc_ns,
+        shmid,
+        base,
+        fragments,
+        pending_mremap: None,
+    };
+    let registered = {
         let mut attachments = SHM_ATTACHMENTS.lock();
-        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
-        map.entry((as_key, base))
-            .or_default()
-            .push(ShmAttachment {
-                ipc_ns,
-                shmid,
-                base,
-                fragments: alloc::vec![(base, map_len)],
-            });
+        attachments
+            .get_or_insert_with(ShmAttachmentRegistry::new)
+            .try_push((as_key, base), attachment)
+            .is_ok()
+    };
+    if !registered {
+        let _ = as_ref.unmap_region(VirtAddr::new(base));
+        shm_cancel_attach(object);
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        return;
     }
     let now = shm_now_seconds();
     if let Some(seg) = SHM_SEGMENTS

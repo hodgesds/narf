@@ -90,11 +90,26 @@ a concurrent identical-address replacement makes the receipt stale and cannot
 be materialized, removed, or registered by the losing syscall.
 
 `mremap(2)` supports no-op resize, real tail shrink, in-place lazy grow,
-`MREMAP_MAYMOVE`, and disjoint `MREMAP_FIXED` replacement while preserving
-resident backing without copying it. The current operation requires one
-complete private base-page VMA. Shared/huge/sub-VMA moves and
-`MREMAP_DONTUNMAP` fail explicitly; retaining an ordinary private alias would
-not implement Linux's old-range fault/userfaultfd contract safely.
+`MREMAP_MAYMOVE`, disjoint `MREMAP_FIXED`, and `MREMAP_DONTUNMAP`. Private
+relocation transfers resident backing without copying it; DONTUNMAP leaves a
+lazy anonymous source range and transfers its lock contract to the
+destination. One-Region base-page shared mappings support equal-length
+DONTUNMAP and the historical `old_len == 0` duplication form. Shared backing
+remains owned by both VMAs while resident leaves move for DONTUNMAP and are
+cloned for legacy duplication. File-demand slices and SysV attachment/nattch
+state are prepared and published atomically with the destination. Huge,
+swapped, cross-Region, and ordinary shared resize/move operations still fail
+explicitly.
+Parameter checks precede VMA lookup as on Linux. Every accepted lookup,
+resource-limit decision, resize, and move shares one address-space transaction,
+so a CLONE_VM peer cannot replace the source between validation and mutation.
+Growth checks locked bytes first (`EAGAIN`), then page-rounded `RLIMIT_AS` and
+private-writable non-stack `RLIMIT_DATA` (`ENOMEM`), including Linux's
+soft-DATA-zero/hard-limit compatibility rule. Fixed replacement conditionally
+takes the global shared-backing transaction only when the target overlaps
+borrowed backing; file/SysV owner rows are retired on success and on typed
+post-punch failure, and eager locked-tail population runs after all IRQ-safe
+transactions are released.
 
 Linux-compatible `brk(2)` likewise changes only the address-space break and
 its single anonymous heap VMA. Growth appends lazy zero-backed page slots and
