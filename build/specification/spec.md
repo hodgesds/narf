@@ -61,9 +61,17 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
   §8.8 record. `--release-baseline <record.json>` adds the cumulative
   slow-cooking check. Both comparisons require the same runner, accelerator,
   guest architecture, unit, direction, inner-iteration count, warmup, and work
-  declaration; a record from an unverified runner or dirty source tree remains
-  explicitly advisory. Records carry the source-tree dirty bit so an
-  uncommitted candidate cannot be mistaken for the named commit.
+  declaration. An unverified run prints only advisory diagnostics and emits no
+  JSON record; a dirty source tree may emit a non-publishable record carrying
+  its dirty bit so an
+  uncommitted candidate cannot be mistaken for the named commit. The runner
+  rejects a missing or inconsistent guest end marker, a declared/sample count
+  mismatch, N below 30, and N below 100 when observed CV exceeds 5%. Guest
+  `irq_masked` and `tick_reliable` flags are part of the publishability gate,
+  not informational metadata, and the publication path requires exactly 10,000
+  bootstrap resamples. The host observes temperature and hardware throttle
+  counters for 30 seconds before launch. An explicitly allowed development run
+  may print advisory statistics but emits no JSON performance record.
 - `cargo xtask image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a

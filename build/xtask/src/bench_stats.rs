@@ -45,6 +45,12 @@ pub struct Series {
     pub delta_pct: f64,
     /// The benchmark this one is the A/B counterpart of.
     pub pair: Option<String>,
+    /// Sample count declared by the guest record header. The host checks this
+    /// against the values actually harvested from the serial stream.
+    pub declared_n: usize,
+    /// Benchmark-declared sample target (§8.1), which an operator override may
+    /// raise but never lower.
+    pub target_n: usize,
     pub samples: Vec<f64>,
 }
 

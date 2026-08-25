@@ -67,6 +67,12 @@ The first three are dependency-free of the kernel and host-testable via
 that would be a cycle. The `bpf(2)` handler lives in `narf-userspace`, which
 depends on `narf-bpf`.
 
+`narf-bpf-bench` serial output uses grammar version 2. Each record publishes
+both its collected `n` and benchmark-declared `target_n`; an operator override
+may raise but never lower that target. Value chunks carry their starting sample
+index and terminate in a record/skip count marker consumed by `cargo xtask
+bpf-bench`.
+
 ### 3.2 The kfunc contract
 
 `narf_bpf_verifier::kfunc` — `KfuncDesc`, `ArgDesc`, `ValidityDomain`,
@@ -806,10 +812,10 @@ and the perf event layer, all of which are closed.
    Runner caveat: collected under KVM on an AMD Zen4 laptop whose §8.2
    noise-control preconditions (governor, boost, SMT, ASLR) are **not** met.
    `bpf-bench` refuses such a runner unless `--allow-unverified-runner` is
-   passed and marks every record it emits `noise_control: unverified`. These
-   are development measurements, not publishable perf numbers; the conclusion
-   survives because the effect is an order of magnitude below δ, not because
-   the environment was clean.
+   passed. That mode prints advisory diagnostics but emits no JSON performance
+   record. These are development measurements, not publishable perf numbers;
+   the conclusion survives because the effect is an order of magnitude below
+   δ, not because the environment was clean.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
