@@ -1,6 +1,23 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Linux mlock-family errno projection. Keep this exhaustive so a new memory
+/// error cannot silently fall into the wrong ABI bucket.
+pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
+    match error {
+        narf_memory::AddressSpaceError::OutOfRange
+        | narf_memory::AddressSpaceError::AlignmentMismatch => 22, // EINVAL
+        narf_memory::AddressSpaceError::Unmapped => 12, // ENOMEM
+        narf_memory::AddressSpaceError::LockFailed
+        | narf_memory::AddressSpaceError::ReclaimPressure
+        | narf_memory::AddressSpaceError::NotImplemented
+        | narf_memory::AddressSpaceError::Overlap
+        | narf_memory::AddressSpaceError::InvalidNode
+        | narf_memory::AddressSpaceError::SharedMapping
+        | narf_memory::AddressSpaceError::NoDemotionTarget => 11, // EAGAIN
+    }
+}
+
 /// `mprotect(base, len, prot)` — change permissions on every
 /// region in the calling task's AS that intersects `[base,
 /// base + len)`. Walks the region table, mutates `Region.perms`,
@@ -28,15 +45,8 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     };
     match as_ref.mlock_range(VirtAddr::new(args.arg0), args.arg1) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        // Linux mlock(2): EINVAL for an out-of-range request, EAGAIN when the
-        // lock could not be satisfied (unimplemented backing here), and ENOMEM
-        // for the dominant case — the range spans an unmapped hole.
-        Err(narf_memory::AddressSpaceError::OutOfRange) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64))
-        }
-        Err(narf_memory::AddressSpaceError::NotImplemented) => {
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64))
-        }
-        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+        // Linux: EINVAL for malformed/range-overflow input, ENOMEM for a VMA
+        // coverage hole, and EAGAIN when eager population cannot complete.
+        Err(error) => ctx.set_return(SyscallReturn::ok((-mlock_errno(error)) as u64)),
     }
 }

@@ -10796,11 +10796,11 @@ fn smoke_memory_mlock_spans_multiple_regions() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mlock_spans_multiple_regions);
 
-/// A mapped-unmapped-mapped range is not partially lockable.  Validate the
-/// complete range before allocating or setting flags so failure leaves both
-/// mapped islands untouched.
+/// Linux applies mlock flags VMA-by-VMA, so a later hole returns ENOMEM after
+/// the mapped prefix has already changed. The island after the hole is not
+/// reached.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn smoke_memory_mlock_hole_is_atomic() -> TestResult {
+fn smoke_memory_mlock_hole_preserves_linux_prefix_effect() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
     // SAFETY: fresh user AS used only by this test.
@@ -10827,20 +10827,88 @@ fn smoke_memory_mlock_hole_is_atomic() -> TestResult {
         core::mem::forget(a);
         return TestResult::Fail("mlock across a hole succeeded");
     }
-    let untouched = a
-        .regions_snapshot()
+    let snapshot = a.regions_snapshot();
+    let first_locked = snapshot
         .iter()
-        .filter(|r| r.base.as_u64() == base || r.base.as_u64() == base + 0x2000)
-        .all(|r| !r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
+        .find(|r| r.base.as_u64() == base)
+        .is_some_and(|r| r.perms.contains(RegionPerms::LOCKED));
+    let later_untouched = snapshot
+        .iter()
+        .find(|r| r.base.as_u64() == base + 0x2000)
+        .is_some_and(|r| !r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
     core::mem::forget(a);
-    if untouched {
+    if first_locked && later_untouched {
         TestResult::Pass
     } else {
-        TestResult::Fail("failed mlock partially changed mapped pages")
+        TestResult::Fail("mlock hole did not preserve Linux prefix-side effect")
     }
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-kernel_test_in!("memory", smoke_memory_mlock_hole_is_atomic);
+kernel_test_in!(
+    "memory",
+    smoke_memory_mlock_hole_preserves_linux_prefix_effect
+);
+
+/// do_mlock publishes VM_LOCKED before page population and never rolls it
+/// back when GUP later fails. A PROT_NONE lazy page deterministically exercises
+/// that ordering without draining the global frame allocator.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_population_failure_keeps_lock() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_2A00_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x1000,
+        perms: RegionPerms::default(),
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    if a.mlock_range(VirtAddr::new(base), 0x1000) != Err(AddressSpaceError::Unmapped) {
+        core::mem::forget(a);
+        return TestResult::Fail("PROT_NONE population did not fail as a coverage fault");
+    }
+    let locked = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == base)
+        .is_some_and(|r| r.perms.contains(RegionPerms::LOCKED));
+    core::mem::forget(a);
+    if locked {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("population failure rolled back LOCKED")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_mlock_population_failure_keeps_lock);
+
+/// Only arithmetic wrap is EINVAL. A non-wrapping range beyond the user VMA
+/// window is simply uncovered and therefore ENOMEM at the syscall boundary.
+fn smoke_memory_mlock_range_error_classes_match_linux() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, VirtAddr};
+
+    let a = AddressSpace::empty();
+    if a.mlock_range(VirtAddr::new(u64::MAX - 0x100), 0x200) != Err(AddressSpaceError::OutOfRange) {
+        return TestResult::Fail("wrapping mlock range did not classify as invalid");
+    }
+    if a.mlock_range(VirtAddr::new(AddressSpace::USER_HALF_END - 0x800), 0x1000)
+        != Err(AddressSpaceError::Unmapped)
+    {
+        return TestResult::Fail("uncovered high mlock range did not classify as ENOMEM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mlock_range_error_classes_match_linux);
 
 /// Negative pair: a range intersecting nothing is `Unmapped`, for both
 /// verbs. `munlock` had no negative test at all, so a change making it

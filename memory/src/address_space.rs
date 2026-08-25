@@ -568,6 +568,14 @@ impl RegionTable {
     }
 
     fn covers_range(&self, lo: u64, hi: u64) -> bool {
+        self.covered_prefix_end(lo, hi) >= hi
+    }
+
+    /// End of the contiguous mapped prefix beginning exactly at `lo`.
+    /// Linux mlock-family operations modify earlier VMAs before reporting a
+    /// later hole, so callers need the prefix boundary rather than only a
+    /// whole-range boolean.
+    fn covered_prefix_end(&self, lo: u64, hi: u64) -> u64 {
         let mut cursor = lo;
         if let Some(region) = self
             .by_base
@@ -580,21 +588,21 @@ impl RegionTable {
             if begin <= cursor && end > cursor {
                 cursor = end;
                 if cursor >= hi {
-                    return true;
+                    return hi;
                 }
             }
         }
         for (_, region) in self.by_base.range(cursor..hi) {
             let begin = region.base.as_u64();
             if begin > cursor {
-                return false;
+                return cursor;
             }
             cursor = cursor.max(begin.saturating_add(region.len));
             if cursor >= hi {
-                return true;
+                return hi;
             }
         }
-        false
+        cursor
     }
 
     fn snapshot(&self) -> Vec<Region> {
@@ -687,6 +695,11 @@ pub enum AddressSpaceError {
     OutOfRange,
     AlignmentMismatch,
     Unmapped,
+    /// An eager `mlock` population pass could not obtain or install backing.
+    /// Linux exposes this separately from an unmapped range: population-time
+    /// failure is `EAGAIN`, a coverage hole is `ENOMEM`, and malformed range
+    /// arithmetic is `EINVAL`.
+    LockFailed,
     /// Anonymous demand backing hit the protected userspace-allocation
     /// reserve. The fault path may wake reclaim, park outside every
     /// address-space/allocator lock, and retry once; this is distinct from a
@@ -706,6 +719,20 @@ fn anonymous_demand_alloc_error(reserve_pressure: bool) -> AddressSpaceError {
         AddressSpaceError::ReclaimPressure
     } else {
         AddressSpaceError::OutOfRange
+    }
+}
+
+/// `demand_alloc_page` serves both page faults and eager `mlock`. Once mlock
+/// has validated complete VMA coverage, its allocation-flavoured errors no
+/// longer describe malformed virtual-address input; Linux reports them as a
+/// population failure (`EAGAIN`).
+#[inline]
+fn mlock_population_error(error: AddressSpaceError) -> AddressSpaceError {
+    match error {
+        AddressSpaceError::OutOfRange | AddressSpaceError::ReclaimPressure => {
+            AddressSpaceError::LockFailed
+        }
+        error => error,
     }
 }
 
@@ -3802,9 +3829,7 @@ impl AddressSpace {
     ///
     /// The region table is ordered by base, so coverage starts at the one
     /// predecessor that can contain `lo` and walks only the requested span.
-    /// This helper is used before changing residency state: Linux returns
-    /// `ENOMEM` when an `mlock`/`munlock` range contains a hole rather than
-    /// partially changing the mapped fragments on either side.
+    /// This helper is used by VM operations that require atomic full coverage.
     fn regions_cover_range(regions: &RegionTable, lo: u64, hi: u64) -> bool {
         regions.covers_range(lo, hi)
     }
@@ -3932,14 +3957,15 @@ impl AddressSpace {
         let hi = requested_hi
             .checked_add(0xFFF)
             .map(|end| end & !0xFFF)
-            .filter(|end| *end <= Self::USER_HALF_END)
             .ok_or(AddressSpaceError::OutOfRange)?;
         Ok((lo, hi))
     }
 
     /// `mlock(base, len)` — force-back every lazy page in the rounded
     /// `[base, base + len)` range and set LOCKED on exactly that range.
-    /// Returns Unmapped if any page in the request is unmapped.
+    /// Returns Unmapped if any page in the request is unmapped. As on Linux,
+    /// LOCKED is published before eager population and is not rolled back if
+    /// a later page cannot be populated.
     pub fn mlock_range(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
         let (lo, hi) = Self::rounded_lock_range(base, len)?;
         // For a page-aligned address Linux treats zero bytes as a no-op. An
@@ -3948,189 +3974,64 @@ impl AddressSpace {
         if lo == hi {
             return Ok(());
         }
-        // Force-back any zero phys entries first; do this with
-        // the lock dropped so frame allocation doesn't recurse
-        // on an IRQ-safe lock. Snapshot the pages that need backing BY
-        // VIRTUAL ADDRESS, not by (region index, slot index): a sibling
-        // thread's mmap/munmap/mprotect between the two lock holds
-        // reshuffles/splits the region list, so a saved index can point at
-        // a DIFFERENT (possibly shorter) region on re-acquire — the old
-        // index-keyed restamp then indexed `phys` out of bounds (kernel
-        // panic with the regions lock held → every sibling VMA op spins
-        // IRQs-off forever, wedging the whole machine under stress-ng
-        // --vma's mlock-vs-mprotect churn) or stamped a frame into the
-        // wrong region. VAs stay meaningful across any reshuffle.
-        let mut anonymous_vas: Vec<u64> = Vec::new();
-        let mut file_vas: Vec<u64> = Vec::new();
-        let mut swap_vas: Vec<u64> = Vec::new();
-        {
-            let g = self.regions.lock();
-            if !Self::regions_cover_range(&g, lo, hi) {
+        let transitioning = {
+            let mut g = self.regions.lock();
+            let covered_hi = g.covered_prefix_end(lo, hi);
+            let transitioning = g.swap_pages.range(lo..covered_hi).any(|(_, state)| {
+                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
+            });
+            // Linux's do_mlock applies VM_LOCKED before __mm_populate and does
+            // not roll it back when population later fails. Publishing the
+            // flag in this coverage-validation transaction also avoids a
+            // reclaim window between validation and the first allocation.
+            Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, true);
+            if covered_hi < hi {
                 return Err(AddressSpaceError::Unmapped);
             }
-            if g.swap_pages.range(lo..hi).any(|(_, state)| {
-                matches!(state, SwapPageState::Evicting(_) | SwapPageState::Loading)
-            }) {
-                return Err(AddressSpaceError::NotImplemented);
-            }
-            g.for_each_overlapping(lo, hi, |r| {
-                let rb = r.base.as_u64();
-                let re = rb.saturating_add(r.len);
-                if rb >= hi || re <= lo {
-                    return;
-                }
-                let first = ((lo.max(rb) - rb) >> 12) as usize;
-                let last = ((hi.min(re) - rb) >> 12) as usize;
-                for i in first..last {
-                    if r.phys[i].raw() == 0 {
-                        let va = rb + ((i as u64) << 12);
-                        if g.swap_pages.get(&va) == Some(&SwapPageState::Swapped) {
-                            swap_vas.push(va);
-                        } else if r.perms.contains(RegionPerms::FILE_DEMAND) {
-                            file_vas.push(va);
-                        } else {
-                            anonymous_vas.push(va);
-                        }
-                    }
-                }
-            });
+            transitioning
+        };
+        if transitioning {
+            return Err(AddressSpaceError::LockFailed);
         }
 
-        // Preserved swap contents take precedence over anonymous zero-fill.
-        // The first fault may batch-read consecutive entries; later VAs then
-        // take the already-resident recovery path without changing contents.
-        for va in swap_vas {
-            // SAFETY: mlock operates on this live address-space root.
-            unsafe { self.demand_alloc_page(VirtAddr::new(va))? };
-        }
-
-        // FILE_DEMAND pages are borrowed from their backing file.  Routing
-        // them through the normal fault path is essential: allocating an
-        // anonymous zero page here would both hide file contents and leak it
-        // because SHARED teardown correctly never frees borrowed frames.
-        for va in file_vas {
-            // SAFETY: mlock is invoked for the current live address space;
-            // demand_alloc_page has the same MMU/frame-allocator contract.
-            unsafe { self.demand_alloc_page(VirtAddr::new(va))? };
-        }
-
-        // Allocate frames outside the lock.
-        let mut allocations: alloc::vec::Vec<(u64, PhysAddr)> =
-            alloc::vec::Vec::with_capacity(anonymous_vas.len());
-        for va in anonymous_vas {
-            let phys = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
-                Ok(frame) => frame.start_address(),
-                Err(_) => {
-                    for (_, allocated) in allocations {
-                        crate::frame::free_frame(crate::frame::PhysFrame::new(allocated));
-                    }
-                    return Err(AddressSpaceError::OutOfRange);
-                }
-            };
-            // SAFETY: identity-mapped on x86_64; aarch64
-            // uses kernel_mut_ptr for the same purpose.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-                #[cfg(target_arch = "aarch64")]
-                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
-            }
-            allocations.push((va, phys));
-        }
-        allocations.sort_unstable_by_key(|&(va, _)| va);
-
-        // Re-acquire the lock, stamp the new frames by VA + set the
-        // LOCKED flag, then re-materialise (still under the lock — see
-        // `change_perms_range` for why the rewrite must not run after the
-        // lock drop) so PTEs land for the freshly-backed pages.
-        let mut g = self.regions.lock();
-        if !Self::regions_cover_range(&g, lo, hi) {
-            drop(g);
-            for (_, phys) in allocations {
-                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
-            }
-            return Err(AddressSpaceError::Unmapped);
-        }
-
-        // Ensure every still-lazy slot can be satisfied by the anonymous
-        // allocation snapshot before publishing any of those frames.  If a
-        // concurrent VMA replacement changed the range while the lock was
-        // dropped, fail without partially setting LOCKED or placing an
-        // anonymous frame in a newly-created FILE_DEMAND mapping.
-        let mut restamp_valid = true;
-        g.for_each_overlapping(lo, hi, |r| {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            if rb >= hi || re <= lo {
-                return;
-            }
-            let first = ((lo.max(rb) - rb) >> 12) as usize;
-            let last = ((hi.min(re) - rb) >> 12) as usize;
-            for i in first..last {
-                if r.phys[i].raw() != 0 {
-                    continue;
-                }
-                let va = rb + ((i as u64) << 12);
-                if r.perms.contains(RegionPerms::FILE_DEMAND)
-                    || allocations.binary_search_by_key(&va, |&(v, _)| v).is_err()
-                {
-                    restamp_valid = false;
-                    return;
-                }
-            }
-        });
-        if !restamp_valid {
-            drop(g);
-            for (_, phys) in allocations {
-                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
-            }
-            return Err(AddressSpaceError::Unmapped);
-        }
-
-        let mut stamped_vas = Vec::new();
-        for (va, phys) in allocations {
-            let mut consumed = false;
-            if let Some(r) = g.containing_mut(va) {
-                let rb = r.base.as_u64();
-                let i = ((va - rb) >> 12) as usize;
-                if i < r.phys.len()
-                    && r.phys[i].raw() == 0
-                    && !r.perms.contains(RegionPerms::FILE_DEMAND)
-                {
-                    r.phys[i] = phys;
-                    consumed = true;
-                    stamped_vas.push(va);
-                }
-            }
-            if !consumed {
-                // Raced with a demand fault (or an unmap) that beat us to
-                // this page — give the frame back.
-                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
-            }
-        }
-        Self::set_region_flag_range(&mut g, lo, hi, RegionPerms::LOCKED, true);
-        // LOCKED itself does not change page permissions, so only anonymous
-        // pages newly backed above need PTE installation. Rewriting every
-        // resident page made repeated mlock/mlockall proportional to the
-        // entire locked working set even when no residency changed.
-        let mut to_materialise = Vec::with_capacity(stamped_vas.len());
-        for va in stamped_vas {
-            if let Some(region) = g.containing(va) {
+        // Populate page-by-page through the ordinary ticketed fault path. It
+        // already distinguishes anonymous, file-demand, and swapped backing,
+        // installs the leaf and reverse map transactionally, and releases an
+        // unpublished frame on races. No proportional snapshot/allocation is
+        // needed merely to enumerate the range under memory pressure.
+        let mut va = lo;
+        while va < hi {
+            let needs_population = {
+                let regions = self.regions.lock();
+                let region = regions.containing(va).ok_or(AddressSpaceError::Unmapped)?;
                 let index = ((va - region.base.as_u64()) >> 12) as usize;
-                to_materialise.push(Region {
-                    base: VirtAddr::new(va),
-                    len: 4096,
-                    perms: region.perms,
-                    phys: alloc::vec![region.phys[index]],
-                });
+                region
+                    .phys
+                    .get(index)
+                    .ok_or(AddressSpaceError::Unmapped)?
+                    .raw()
+                    == 0
+            };
+            if needs_population {
+                // SAFETY: mlock operates on this live address-space root and
+                // the same allocator/MMU prerequisites as a user page fault.
+                unsafe { self.demand_alloc_page(VirtAddr::new(va)) }
+                    .map_err(mlock_population_error)?;
+                // `demand_alloc_page` returns Ok when a peer owns this page's
+                // ticket or a swap transition is in progress. mlock cannot
+                // claim eager population completed until backing is visible.
+                let backed = {
+                    let regions = self.regions.lock();
+                    let region = regions.containing(va).ok_or(AddressSpaceError::Unmapped)?;
+                    let index = ((va - region.base.as_u64()) >> 12) as usize;
+                    region.phys.get(index).is_some_and(|phys| phys.raw() != 0)
+                };
+                if !backed {
+                    return Err(AddressSpaceError::LockFailed);
+                }
             }
+            va += 4096;
         }
-        // SAFETY: same identity-map invariant; touched regions
-        // are valid bookkeeping entries.
-        // SAFETY: Valid memory or trusted environment
-        unsafe { self.rewrite_perms_pages(&to_materialise) };
-        drop(g);
         Ok(())
     }
 
@@ -4145,10 +4046,11 @@ impl AddressSpace {
             return Ok(());
         }
         let mut regions = self.regions.lock();
-        if !Self::regions_cover_range(&regions, lo, hi) {
+        let covered_hi = regions.covered_prefix_end(lo, hi);
+        Self::set_region_flag_range(&mut regions, lo, covered_hi, RegionPerms::LOCKED, true);
+        if covered_hi < hi {
             return Err(AddressSpaceError::Unmapped);
         }
-        Self::set_region_flag_range(&mut regions, lo, hi, RegionPerms::LOCKED, true);
         Ok(())
     }
 
@@ -4161,10 +4063,11 @@ impl AddressSpace {
             return Ok(());
         }
         let mut g = self.regions.lock();
-        if !Self::regions_cover_range(&g, lo, hi) {
+        let covered_hi = g.covered_prefix_end(lo, hi);
+        Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, false);
+        if covered_hi < hi {
             return Err(AddressSpaceError::Unmapped);
         }
-        Self::set_region_flag_range(&mut g, lo, hi, RegionPerms::LOCKED, false);
         Ok(())
     }
 
@@ -7113,6 +7016,22 @@ kernel_test_in!(
     "memory",
     smoke_memory_demand_pressure_is_distinct_from_range_failure
 );
+
+/// Eager mlock converts allocation-shaped demand errors into its distinct
+/// population-failure surface after VMA coverage has already been validated.
+fn smoke_memory_mlock_population_error_is_typed() -> TestResult {
+    if mlock_population_error(AddressSpaceError::OutOfRange) != AddressSpaceError::LockFailed
+        || mlock_population_error(AddressSpaceError::ReclaimPressure)
+            != AddressSpaceError::LockFailed
+    {
+        return TestResult::Fail("mlock allocation failure retained range errno semantics");
+    }
+    if mlock_population_error(AddressSpaceError::Unmapped) != AddressSpaceError::Unmapped {
+        return TestResult::Fail("mlock coverage failure lost ENOMEM semantics");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mlock_population_error_is_typed);
 
 /// A `FILE_DEMAND` region's unbacked page is filled by the installed hook, not
 /// by the frame allocator, and the frame it names is the one that lands in the

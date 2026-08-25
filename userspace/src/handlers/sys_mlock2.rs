@@ -24,14 +24,8 @@ pub(crate) fn sys_mlock2(ctx: &mut dyn TrapContext) {
     };
     match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        // Same error surface as mlock(2): EINVAL out-of-range, EAGAIN when the
-        // lock can't be satisfied, else ENOMEM for the unmapped-hole case.
-        Err(narf_memory::AddressSpaceError::OutOfRange) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64))
-        }
-        Err(narf_memory::AddressSpaceError::NotImplemented) => {
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64))
-        }
-        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+        Err(error) => ctx.set_return(SyscallReturn::ok(
+            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
+        )),
     }
 }

@@ -94,9 +94,13 @@ returns the previous break as required by the Linux syscall ABI.
 
 `mlock(2)` and `munlock(2)` round byte intervals outward to pages, reject a
 non-empty range containing any unmapped page, and split VMAs so LOCKED applies
-exactly to the request; a zero length is a successful no-op. Plain `mlock`
-eagerly populates anonymous and file-demand
-pages. `mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;
+exactly to the visited request prefix; as on Linux, a later hole does not undo
+flags already applied to earlier VMAs. A zero length is a successful no-op.
+Plain `mlock` publishes LOCKED before eagerly populating anonymous and
+file-demand pages, and population failure does not roll that flag back.
+Malformed/wrapping range arithmetic returns `EINVAL`, an uncovered range
+returns `ENOMEM`, and eager-population failure returns `EAGAIN`.
+`mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;
 their ordinary first fault supplies backing that reclaim must then retain.
 `munlock` clears the marker without discarding resident contents.
 `mlockall(MCL_CURRENT|MCL_ONFAULT)` applies the same lazy pinning to existing

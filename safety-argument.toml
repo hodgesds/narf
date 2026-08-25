@@ -679,3 +679,7 @@ argument = "Global heap failure no longer enters reclaim callbacks or retries th
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L90"
 argument = "Scheduler watchdog telemetry remains executor-owned and read-only. The change replaces three shared relaxed counters with cache-line-isolated per-CPU relaxed counters and preserves the existing aggregate public snapshots modulo the same u64 wraparound behavior. It does not alter task identity, queue state, wake decisions, IPI ordering, affinity, migration, domain save/restore, capability checks, or any address-space access, and it grants no new cross-domain authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Eager mlock now publishes the existing LOCKED metadata before population, matching Linux failure ordering, while every page still uses the established page-scoped demand ticket, authoritative region lock, architecture leaf installer, reverse-map publication, and unpublished-frame rollback path. A typed LockFailed result changes only the syscall errno projection after complete range validation; it grants no mapping permission, frame ownership, capability, domain authority, or cross-address-space access."

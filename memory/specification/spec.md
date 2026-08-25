@@ -385,7 +385,10 @@ impl AddressSpace {
         new_base: VirtAddr,
         new_len: u64,
     ) -> Result<(), AddressSpaceError>;
-    /// Eagerly populate and pin exactly the rounded mapped range.
+    /// Publish LOCKED on the mapped prefix, then eagerly populate it. A later
+    /// coverage hole returns `Unmapped` without rolling back the earlier VMA
+    /// flags; malformed arithmetic returns `OutOfRange`; backing allocation or
+    /// installation failure returns `LockFailed` and also retains LOCKED.
     pub fn mlock_range(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
     /// Pin exactly the rounded mapped range without populating lazy pages.
