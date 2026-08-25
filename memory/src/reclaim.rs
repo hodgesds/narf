@@ -34,16 +34,15 @@
 //!      report `Freed` are dropped from tracking, the rest stay
 //!      tracked with their handler's outcome recorded.
 //!
-//! # Why Stage-1 is *only* the foreground path
+//! # Allocation context
 //!
-//! A background kthread that wakes up under low-watermark pressure is
-//! the eventual shape — but it needs the scheduler + sleep-pump
-//! integration that we won't have wired through cleanly until the
-//! kthread infrastructure stabilises. Until then the caller drives
-//! reclaim explicitly from the failing alloc site (e.g. in front of
-//! a buddy `Err(Exhausted)`). The same API surface that the
-//! foreground path uses is what the kthread will eventually call —
-//! no second redesign required when we install it.
+//! Global allocation may happen while an arbitrary subsystem lock is held, so
+//! it never invokes reclaim callbacks or sleeps. Allocation failures publish a
+//! bounded, per-node request through `request_reclaim`; the scheduler-owned
+//! kswapd task consumes it and drives the reclaim APIs below. Existing explicit
+//! callers remain outside `GlobalAlloc` and must independently uphold their
+//! lock and execution-context contract; migrating cgroup charging is separate
+//! follow-up work.
 //!
 //! # Why active/inactive instead of CLOCK or LRFU
 //!
@@ -93,7 +92,7 @@ extern crate alloc as alloc_crate;
 
 use alloc_crate::collections::VecDeque;
 use alloc_crate::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -348,29 +347,105 @@ pub fn user_alloc_would_breach_reserve() -> bool {
 
 static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Set when the allocator could not satisfy a KERNEL allocation even after the
-/// reserve and the vmalloc fallback — i.e. genuine, unrecoverable exhaustion,
-/// not a transient dip below `min`. Only THIS arms the reclaimer's OOM killer;
-/// ordinary reserve-breach wakes just reclaim + reap. Keeping the OOM decision
-/// gated on real exhaustion is what stops the reclaimer from killing (and, with
-/// stress-ng `--abort`, failing) a workload that the reserve + vmalloc already
-/// carry without any kill.
-static OOM_NEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Requested reclaim work, in base pages, for each NUMA node. Allocation
+/// failures publish work here instead of running shrinkers inline while the
+/// caller may hold an arbitrary kernel lock. Multiple producers coalesce to
+/// the largest outstanding target; the node's sole kswapd consumes it.
+static RECLAIM_REQUEST_PAGES: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; crate::frame::MAX_NUMA_NODES];
 
-/// Signal that a kernel allocation genuinely failed, and wake the reclaimer to
-/// OOM-kill. Called from the frame allocator's exhaustion path.
-pub fn signal_oom_needed() {
-    OOM_NEEDED.store(true, Ordering::Release);
-    // Genuine kernel exhaustion is global: wake EVERY node's kswapd so each
-    // reclaims its own node and the OOM/reap backlog is drained (every kthread
-    // checks the OOM signal after its reclaim pass regardless of its own
-    // watermark; the signal is single-consumer, so exactly one kill results).
-    wake_all_kswapd();
+/// Ask the background reclaimer for up to `pages` base pages on `node`.
+///
+/// Requests are allocation-free, non-blocking, and coalesced by maximum rather
+/// than addition so a burst of failures cannot manufacture an unbounded debt.
+/// A zero-sized or out-of-range request is ignored.
+pub fn request_reclaim(node: usize, pages: usize) {
+    if pages == 0 {
+        return;
+    }
+    let Some(request) = RECLAIM_REQUEST_PAGES.get(node) else {
+        return;
+    };
+    request.fetch_max(pages, Ordering::AcqRel);
+    wake_kswapd(node);
 }
 
-/// Consume the pending-OOM signal (the reclaimer checks this before killing).
-pub fn take_oom_needed() -> bool {
-    OOM_NEEDED.swap(false, Ordering::AcqRel)
+/// Consume the coalesced reclaim target for `node`. Only that node's kswapd
+/// should call this; allocation paths only publish through [`request_reclaim`].
+pub fn take_reclaim_request(node: usize) -> usize {
+    RECLAIM_REQUEST_PAGES
+        .get(node)
+        .map_or(0, |request| request.swap(0, Ordering::AcqRel))
+}
+
+mod reclaim_request_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{request_reclaim, request_reclaim_with_oom, take_oom_needed, take_reclaim_request};
+
+    fn smoke_reclaim_requests_coalesce_and_consume() -> TestResult {
+        const NODE: usize = crate::frame::MAX_NUMA_NODES - 2;
+
+        let _ = take_reclaim_request(NODE);
+        let _ = take_oom_needed(NODE);
+        request_reclaim(NODE, 2);
+        request_reclaim(NODE, 7);
+        request_reclaim(NODE, 3);
+        request_reclaim(NODE, 0);
+        if take_reclaim_request(NODE) != 7 {
+            return TestResult::Fail("reclaim requests did not coalesce by maximum");
+        }
+        if take_reclaim_request(NODE) != 0 {
+            return TestResult::Fail("reclaim request was not consumed exactly once");
+        }
+        request_reclaim(crate::frame::MAX_NUMA_NODES, 9);
+        if take_reclaim_request(crate::frame::MAX_NUMA_NODES) != 0 {
+            return TestResult::Fail("out-of-range reclaim request was retained");
+        }
+
+        request_reclaim_with_oom(NODE, 4);
+        if take_reclaim_request(NODE) != 4 || !take_oom_needed(NODE) {
+            return TestResult::Fail("OOM authorization was not paired with its request");
+        }
+        if take_oom_needed(NODE) {
+            return TestResult::Fail("OOM authorization was not consumed exactly once");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_requests_coalesce_and_consume
+    );
+}
+
+/// Per-node OOM authorization. A kernel allocation failure always arms its
+/// node; a reserve-refused user allocation does so only when the configured
+/// overcommit policy permits killing. Ordinary low-watermark wakes never set
+/// these flags.
+static OOM_NEEDED: [core::sync::atomic::AtomicBool; crate::frame::MAX_NUMA_NODES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::frame::MAX_NUMA_NODES];
+
+/// Publish background work for a genuinely failed allocation and authorize OOM
+/// policy if its reclaim pass makes no progress. Keeping both operations in one
+/// API prevents a wake from exposing the request before its OOM flag is armed.
+pub fn request_reclaim_with_oom(node: usize, pages: usize) {
+    if pages == 0 {
+        return;
+    }
+    let Some(oom_needed) = OOM_NEEDED.get(node) else {
+        return;
+    };
+    oom_needed.store(true, Ordering::Release);
+    request_reclaim(node, pages);
+}
+
+/// Consume this node's pending-OOM signal when its reclaimer accepts the
+/// matching explicit reclaim request.
+pub fn take_oom_needed(node: usize) -> bool {
+    OOM_NEEDED
+        .get(node)
+        .is_some_and(|oom_needed| oom_needed.swap(false, Ordering::AcqRel))
 }
 
 // ── Overcommit policy (vm.overcommit_memory analogue) ──────────────────
@@ -744,7 +819,7 @@ pub fn shrinkable_objects() -> usize {
 /// (it is `Copy`), then the lock is dropped before invoking any `scan`
 /// — a shrinker's `scan` may take its own locks, and must never run
 /// while the registry lock is held. This is why the whole path avoids
-/// `Vec`: `shrink_all` is callable from the allocation-failure path. The
+/// `Vec`: `shrink_all` is callable while memory is scarce. The
 /// callback contract is strict: every `scan(n)` must itself cap physical
 /// release and its report at `n`; the defensive clamp below prevents a broken
 /// callback from corrupting the caller's accounting, but cannot undo excess
@@ -858,12 +933,12 @@ pub fn __reset_lru_for_test() {
     state.sweep_count = 0;
 }
 
-/// Free up to `target` reclaimable pages for a caller under allocation
-/// pressure — the direct-reclaim entry point. Returns the number freed.
+/// Free up to `target` reclaimable pages for a policy-aware caller under
+/// pressure. Returns the number freed.
 ///
-/// ALLOCATION-FREE: this is called from `GlobalAlloc::alloc` when an
-/// allocation fails, where allocating is precisely what must not happen.
-/// Both arms it drives are allocation-free:
+/// ALLOCATION-FREE: kswapd and legacy explicit charge paths can enter while
+/// memory is scarce. `GlobalAlloc::alloc` never calls this function because it
+/// may run while a shrinker-owned lock is held. Both arms are allocation-free:
 ///   1. the per-page frame LRU (`reclaim_target_pages`) — reclaims the
 ///      oldest cold tracked frames first (proper aging), and
 ///   2. the shrinker path (`shrink_all`) for the remaining deficit —
@@ -1924,9 +1999,8 @@ pub fn reclaim_target_pages(n: usize) -> usize {
     // apply outcomes. Repeat until we hit `n` or run out.
     //
     // ALLOCATION-FREE: the batch lives in fixed-size stack arrays, never
-    // the heap. `reclaim_target_pages` runs on the direct-reclaim path
-    // (`try_to_free`), reached precisely when allocation is already
-    // failing, so it must not allocate. Batch size 8 balances lock-thrash
+    // the heap. `reclaim_target_pages` runs under memory pressure through
+    // `try_to_free`, so it must not allocate. Batch size 8 balances lock-thrash
     // against the rare case where the first reclaim would have freed the
     // rest; every field is `Copy`, so the scratch arrays need no drop glue.
     const BATCH: usize = 8;

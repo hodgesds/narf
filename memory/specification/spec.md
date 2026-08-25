@@ -207,6 +207,13 @@ pub fn try_to_free(target_pages: usize) -> usize;
 /// dependency in this crate.
 pub fn set_kswapd_wake_hook(hook: fn(node: usize));
 pub fn wake_kswapd(node: usize);
+/// Publish bounded allocation-failure work. Concurrent requests for one node
+/// coalesce to their maximum target rather than accumulating without bound.
+pub fn request_reclaim(node: usize, target_pages: usize);
+/// Order OOM authorization before the matching reclaim request and wake.
+pub fn request_reclaim_with_oom(node: usize, target_pages: usize);
+/// Consume one node's coalesced target; called only by that node's kswapd.
+pub fn take_reclaim_request(node: usize) -> usize;
 
 /// Fixed-point proportional-set-size units (one private resident page).
 pub const PSS_UNITS_PER_PAGE: u64;
@@ -721,15 +728,22 @@ x86_64 is rejected at runtime.
   path reached during final-owner return is itself allocation-free. Test
   cleanup unregisters only its named/test-marked shrinkers and cannot erase a
   live slab, page-cache, or other production registration.
-- `GlobalAlloc` direct reclaim is a non-sleepable emergency retry, not a
-  balance-to-high loop: after waking the local kswapd it reclaims at most eight
-  base pages synchronously and retries the backend once. Longer reclaim,
-  anonymous swap, and OOM policy remain in schedulable kswapd context. User-
-  backing allocations proactively wake local kswapd below the low watermark
-  and wake it again when a buddy/cpuset allocation fails after passing the
-  reserve gate. A `brk` extension reserves virtual address space only; physical
-  user frames are allocated lazily by the demand-fault path and inherit the
-  same watermark policy.
+- `GlobalAlloc` invokes its selected backend exactly once. On failure it
+  publishes a bounded per-node reclaim request, wakes kswapd, and returns null;
+  it never invokes a shrinker, sleeps, or retries while its caller may hold an
+  arbitrary kernel lock. Concurrent requests coalesce to the largest target.
+  Kernel and user-backing frame allocations proactively wake local kswapd below
+  the low watermark, and an explicit allocation-failure request is serviced
+  even when aggregate free pages remain above that watermark. OOM policy runs
+  only in schedulable kswapd context: a pending kill is considered only after
+  an explicit requested pass makes no progress and pressure still remains
+  below the minimum watermark; progress or a concurrent recovery defers killing
+  until a later failed allocation requests another pass. OOM authorization is
+  published before its matching reclaim request and consumed when kswapd accepts
+  that request, so a failure arriving during a pass remains pending for the next
+  pass. A `brk` extension reserves virtual address space only; physical user
+  frames are allocated lazily by the demand-fault path and inherit the same
+  watermark policy.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.

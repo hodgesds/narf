@@ -136,8 +136,19 @@ async fn kswapd_kthread(node: usize) {
         })
         .await;
 
+        // Consume explicit allocation-failure work once per wake. A request is
+        // serviced even if the node is above its low watermark; allocation
+        // failure can come from fragmentation or reclaimable slab/cache state
+        // that the aggregate free-page watermark does not expose.
+        let requested = narf_memory::reclaim::take_reclaim_request(node);
+        // Snapshot the OOM authorization with this request. A failure arriving
+        // during the pass leaves its newly armed flag and request for the next
+        // wake instead of having the older pass consume either one.
+        let oom_requested = requested > 0 && narf_memory::reclaim::take_oom_needed(node);
+        let mut explicit_remaining = requested;
+
         // Batch floor scales with the online CPU count (concurrent allocators);
-        // the actual target also tracks the free-memory deficit.
+        // the low-watermark target also tracks the free-memory deficit.
         let cpu_floor =
             (narf_scheduler::online_cpu_set().len() as usize).saturating_mul(KSWAPD_PAGES_PER_CPU);
 
@@ -146,8 +157,18 @@ async fn kswapd_kthread(node: usize) {
         // kills, so it is safe to run freely under the routine transient dips a
         // fork/vmalloc storm produces.
         let mut pass = 0;
-        while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark_node(node) {
-            let target = narf_memory::reclaim::reclaim_goal_node(node).max(cpu_floor);
+        let mut total_freed = 0usize;
+        while pass < MAX_PASSES
+            && (explicit_remaining > 0 || narf_memory::reclaim::under_low_watermark_node(node))
+        {
+            let under_low = narf_memory::reclaim::under_low_watermark_node(node);
+            let target = if under_low {
+                narf_memory::reclaim::reclaim_goal_node(node)
+                    .max(cpu_floor)
+                    .max(explicit_remaining)
+            } else {
+                explicit_remaining
+            };
 
             // Split the target between anonymous (swap) and file-cache reclaim
             // per `vm.swappiness`: higher swappiness pushes more onto anon.
@@ -183,6 +204,8 @@ async fn kswapd_kthread(node: usize) {
                 // No forward progress — nothing more to shed this wake.
                 break;
             }
+            total_freed = total_freed.saturating_add(freed);
+            explicit_remaining = explicit_remaining.saturating_sub(freed);
             // Release fault waiters promptly after real progress rather than
             // keeping them asleep until the complete high-watermark batch.
             reclaim_wait::notify_reclaim_progress();
@@ -190,18 +213,23 @@ async fn kswapd_kthread(node: usize) {
             narf_scheduler::yield_now().await;
         }
 
-        // OOM-kill ONLY on a genuine exhaustion signal: a KERNEL allocation
-        // actually failed (reserve empty), or user pressure under an overcommit
-        // policy that permits killing. NOT on a mere dip below `min` — those
-        // are routine under fork/vmalloc churn and the reserve + vmalloc carry
-        // them without a kill (killing a stress-ng worker there would fail the
-        // run under `--abort`). The victim's pages come back via `reap_all`.
-        if narf_memory::reclaim::take_oom_needed() {
-            if let Some(pid) = narf_memory::oom::request_oom_relief() {
-                let _ = writeln!(
-                    console::Writer,
-                    "  oom: Killed process pid={pid} to relieve memory pressure"
-                );
+        // OOM-kill ONLY after a genuine exhaustion signal was paired with an
+        // explicit pass on this node and that pass reclaimed nothing. A pass
+        // that made progress consumes the signal but defers killing; a later
+        // failed allocation can request another bounded pass. Non-requested
+        // nodes cannot consume this node-scoped signal before the failing node
+        // has had its reclaim opportunity.
+        if oom_requested {
+            // Re-check pressure after the pass. Concurrent frees may have made
+            // the failed allocation viable even though this kswapd reclaimed
+            // nothing; killing in that case would be a stale OOM decision.
+            if total_freed == 0 && narf_memory::reclaim::under_min_watermark() {
+                if let Some(pid) = narf_memory::oom::request_oom_relief() {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  oom: Killed process pid={pid} to relieve memory pressure"
+                    );
+                }
             }
         }
         narf_memory::oom::reap_all();

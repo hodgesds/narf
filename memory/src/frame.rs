@@ -861,13 +861,15 @@ impl AllocContext {
 /// inherits the same policy — a user path cannot silently drain the reserve.
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
+    let node = current_cpu_node();
+    // Start background balancing at the low watermark for both kernel and user
+    // allocations rather than waiting for either to collide with the protected
+    // minimum. Kernel allocations may consume the reserve but must still wake
+    // the task-context reclaimer proactively.
+    if crate::reclaim::under_low_watermark_node(node) {
+        crate::reclaim::wake_kswapd(node);
+    }
     if ctx == AllocContext::User {
-        let node = current_cpu_node();
-        // Start background balancing at the low watermark rather than waiting
-        // for the faulting allocation to collide with the protected minimum.
-        if crate::reclaim::under_low_watermark_node(node) {
-            crate::reclaim::wake_kswapd(node);
-        }
         if !crate::reclaim::user_alloc_would_breach_reserve() {
             return Ok(());
         }
@@ -877,9 +879,10 @@ fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
         // pressure reclaims a hog rather than only failing the faulting task.
         // Under `Never` (the default) this stays a graceful ENOMEM — no
         // process is killed.
-        crate::reclaim::wake_kswapd(node);
         if crate::reclaim::user_pressure_arms_oom() {
-            crate::reclaim::signal_oom_needed();
+            crate::reclaim::request_reclaim_with_oom(node, 1);
+        } else {
+            crate::reclaim::request_reclaim(node, 1);
         }
         return Err(FrameAllocError::Exhausted);
     }
@@ -1218,6 +1221,11 @@ pub(crate) fn alloc_frame_on_strict_for_ctx(
     if r.is_err() {
         crate::cgroup_charge::uncharge(PAGE_SIZE);
     }
+    if r.is_err() {
+        // A strict-node miss may be local fragmentation rather than global
+        // exhaustion, so request a background pass without arming OOM.
+        crate::reclaim::request_reclaim(node.min(MAX_NUMA_NODES - 1), 1);
+    }
     r
 }
 
@@ -1281,13 +1289,14 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
             // transient below-`min` dips a fork/vmalloc storm produces, only when
             // a kernel request actually fails — so a workload the reserve +
             // vmalloc already carry is never needlessly OOM-killed.
-            crate::reclaim::signal_oom_needed();
+            let reclaim_node = node.min(MAX_NUMA_NODES - 1);
+            crate::reclaim::request_reclaim_with_oom(reclaim_node, 1);
         } else {
             // The reserve check passed but the selected buddy/cpuset could not
             // satisfy the allocation (for example fragmentation or strict-node
             // pressure). Give kswapd an opportunity to make progress before a
             // later user fault retries.
-            crate::reclaim::wake_kswapd(node);
+            crate::reclaim::request_reclaim(node.min(MAX_NUMA_NODES - 1), 1);
         }
     }
     r
