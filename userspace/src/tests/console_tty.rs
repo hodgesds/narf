@@ -40,8 +40,10 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
     // We need fd 0 to exist; force-create the table entry.
     let _dummy = fd::with_table(task, |_t| ());
 
-    // Dummy output buffer — we ask for 0 bytes.
-    let mut buf = [0u8; 4];
+    // Use a user-shaped address even though no bytes are copied. Linux
+    // performs access_ok(buf, count) before the zero-count fast path, and an
+    // aarch64 kernel-stack address remains invalid when count is zero.
+    const USER_BUF: u64 = 0x1000;
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -67,7 +69,7 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: 0, // fd 0 = stdin
-            arg1: buf.as_mut_ptr() as u64,
+            arg1: USER_BUF,
             arg2: 0, // zero-length read
             ..SyscallArgs::default()
         },
