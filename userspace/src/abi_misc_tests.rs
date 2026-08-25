@@ -339,8 +339,13 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_ptrace_neg);
 
 fn smoke_abi_misc_sendmmsg_pos() -> TestResult {
     with_setup(|| {
-        // sendmmsg(fd, msgs, vlen=0, flags=0) → 0 messages sent.
-        match call(Syscall::Sendmmsg.raw(), a3(3, 0, 0, 0)) {
+        // Linux still resolves the descriptor for vlen=0; use a live socket,
+        // then verify the message-vector pointer is untouched.
+        let fd = call(Syscall::SocketOpen.raw(), a2(1, 1, 0)).ok_or("socket setup failed")?;
+        if fd < 0 {
+            return Err("socket setup failed");
+        }
+        match call(Syscall::Sendmmsg.raw(), a3(fd as u64, 0, 0, 0)) {
             Some(0) => Ok(()),
             _ => Err("sendmmsg with vlen 0 should return 0"),
         }
@@ -350,13 +355,12 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_sendmmsg_pos);
 
 fn smoke_abi_misc_sendmmsg_neg() -> TestResult {
     with_setup(|| {
-        // Bad fd with one zeroed mmsghdr: the inner sendmsg fails, the loop
-        // breaks, and 0 messages are reported sent.
+        // With no transmitted prefix, sendmmsg preserves the first error.
         let hdr = [0u8; 64];
         let args = a3(99, hdr.as_ptr() as u64, 1, 0);
         match call(Syscall::Sendmmsg.raw(), args) {
-            Some(0) => Ok(()),
-            _ => Err("sendmmsg on a bad fd should report 0 sent"),
+            Some(EBADF) => Ok(()),
+            _ => Err("sendmmsg on a bad fd should return EBADF"),
         }
     })
 }

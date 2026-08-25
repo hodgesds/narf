@@ -855,7 +855,7 @@ fn park_should_block(
         // return-to-user delivery path CONSUMES pending SIG_IGN/default-
         // Ignore bits (see `deliver_one_signal`), so breaking the park can't
         // busy-spin on a bit nobody clears.
-        let signal_pending = crate::handlers::is_signal_pending(task_id);
+        let signal_pending = crate::handlers::has_interrupting_signal(task_id);
         if now < deadline && !signal_pending {
             // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
             // raise path calls `wake_signal`, which fires this entry), THEN
@@ -2811,7 +2811,7 @@ impl core::future::Future for UserTaskFuture {
             // rewound rt_sigtimedwait re-executes and consumes it.
             let tid = crate::handlers::current_task_id();
             let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
-            let signal_pending = crate::handlers::is_signal_pending(tid)
+            let signal_pending = crate::handlers::has_interrupting_signal(tid)
                 || (sw != 0 && crate::handlers::sigwait_should_wake(tid, sw));
             if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;

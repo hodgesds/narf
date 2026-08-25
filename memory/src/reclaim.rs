@@ -681,9 +681,10 @@ pub fn plan_watermark_reclaim(
 pub struct Shrinker {
     /// Stable identifier for diagnostics (`"page-cache"`, `"dentry"`, …).
     pub name: &'static str,
-    /// Number of reclaimable objects the cache currently holds.
+    /// Upper bound on the number of reclaimable base pages the cache holds.
     pub count: fn() -> usize,
-    /// Try to free up to `nr` objects; returns the number actually freed.
+    /// Try to free at most `nr_pages` base pages; returns the number actually
+    /// freed. A callback must never free or report more than its argument.
     pub scan: fn(usize) -> usize,
 }
 
@@ -719,8 +720,8 @@ pub fn register_shrinker(s: Shrinker) {
     }
 }
 
-/// Total reclaimable objects across all registered shrinkers.
-pub fn shrinkable_objects() -> usize {
+/// Total reclaimable base pages across all registered shrinkers.
+pub fn shrinkable_pages() -> usize {
     let snap = *SHRINKERS.lock();
     snap.iter()
         .flatten()
@@ -728,21 +729,35 @@ pub fn shrinkable_objects() -> usize {
         .fold(0usize, |a, c| a.saturating_add(c))
 }
 
-/// Drive all shrinkers to free about `target` objects, distributing the
+/// Compatibility alias for callers that predate the page-denominated
+/// shrinker contract.
+pub fn shrinkable_objects() -> usize {
+    shrinkable_pages()
+}
+
+/// Drive all shrinkers to free at most `target_pages` base pages, distributing the
 /// pressure in proportion to each shrinker's current size (Linux's
-/// proportional-pressure model). Returns the total number of objects
-/// actually freed (which may exceed or fall short of `target`).
+/// proportional-pressure model). Returns the total number of base pages
+/// actually freed, which can fall short of but never exceeds `target_pages`.
 ///
 /// Allocation-free: the registry array is copied out under the lock
 /// (it is `Copy`), then the lock is dropped before invoking any `scan`
 /// — a shrinker's `scan` may take its own locks, and must never run
 /// while the registry lock is held. This is why the whole path avoids
-/// `Vec`: `shrink_all` is callable from the allocation-failure path.
-pub fn shrink_all(target: usize) -> usize {
-    if target == 0 {
+/// `Vec`: `shrink_all` is callable from the allocation-failure path. The
+/// callback contract is strict: every `scan(n)` must itself cap physical
+/// release and its report at `n`; the defensive clamp below prevents a broken
+/// callback from corrupting the caller's accounting, but cannot undo excess
+/// physical release.
+pub fn shrink_all(target_pages: usize) -> usize {
+    if target_pages == 0 {
         return 0;
     }
     let snap = *SHRINKERS.lock();
+    shrink_snapshot(&snap, target_pages)
+}
+
+fn shrink_snapshot(snap: &[Option<Shrinker>; MAX_SHRINKERS], target_pages: usize) -> usize {
     let total: usize = snap
         .iter()
         .flatten()
@@ -753,7 +768,7 @@ pub fn shrink_all(target: usize) -> usize {
     }
     let mut freed = 0usize;
     for s in snap.iter().flatten() {
-        if freed >= target {
+        if freed >= target_pages {
             break;
         }
         let count = (s.count)();
@@ -761,18 +776,70 @@ pub fn shrink_all(target: usize) -> usize {
             continue;
         }
         // This shrinker's proportional share of the target, at least 1 so a
-        // small cache still contributes when it holds anything.
-        let share = ((target.saturating_mul(count)) / total).max(1);
-        freed = freed.saturating_add((s.scan)(share));
+        // small cache still contributes when it holds anything. Clamp it to
+        // the remaining global budget before entering subsystem code.
+        let remaining = target_pages - freed;
+        let share = (((target_pages as u128) * (count as u128) / (total as u128)) as usize)
+            .max(1)
+            .min(remaining);
+        let scanned = (s.scan)(share);
+        debug_assert!(scanned <= share, "shrinker exceeded its page budget");
+        freed += scanned.min(share);
     }
     freed
 }
 
-/// Test-only: drop all registered shrinkers so a test's mock never
-/// leaks into another test's `shrink_all`.
+/// Test-only: unregister one named shrinker without disturbing live
+/// production reclaimers.
+#[doc(hidden)]
+pub fn __unregister_shrinker_for_test(name: &str) -> bool {
+    let mut g = SHRINKERS.lock();
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(s) if s.name == name) {
+            *slot = None;
+            return true;
+        }
+    }
+    false
+}
+
+/// Test-only: register a scoped mock at the front of the scan order without
+/// removing or overwriting any production entry. This makes a one-page test
+/// target deterministic while preserving the live registry; callers must pair
+/// it with [`__unregister_shrinker_for_test`]. Returns `false` when all slots
+/// are live.
+#[doc(hidden)]
+pub fn __register_shrinker_first_for_test(s: Shrinker) -> bool {
+    let mut g = SHRINKERS.lock();
+    // Re-registration is still idempotent by name. Clearing the old position
+    // creates the empty slot used by the stable right shift below.
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(existing) if existing.name == s.name) {
+            *slot = None;
+            break;
+        }
+    }
+    let Some(empty) = g.iter().position(Option::is_none) else {
+        return false;
+    };
+    for index in (1..=empty).rev() {
+        g[index] = g[index - 1];
+    }
+    g[0] = Some(s);
+    true
+}
+
+/// Test-only compatibility cleanup. Remove only explicitly test-named
+/// shrinkers; never erase production entries such as the slab or page-cache
+/// shrinkers. New tests should prefer [`__unregister_shrinker_for_test`].
 #[doc(hidden)]
 pub fn __reset_shrinkers_for_test() {
-    *SHRINKERS.lock() = [None; MAX_SHRINKERS];
+    let mut g = SHRINKERS.lock();
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(s) if s.name.ends_with("-test")) {
+            *slot = None;
+        }
+    }
 }
 
 /// Test-only: clear the per-page frame LRU (slots + both lists + stats) so a
@@ -1207,13 +1274,13 @@ mod range_planner_tests {
 }
 
 /// Shrinker-registry tests. Always compiled so they register + run under
-/// `cargo xtask test`. A mock shrinker backed by an atomic object count
-/// exercises registration, proportional `shrink_all`, and idempotent
-/// re-registration; the registry is reset before/after so the mock never
-/// leaks into another test.
+/// `cargo xtask test`. The proportional scan is exercised against a private
+/// snapshot so live production shrinkers are neither invoked nor removed.
 mod shrinker_tests {
     use super::{
-        __reset_shrinkers_for_test, register_shrinker, shrink_all, shrinkable_objects, Shrinker,
+        __register_shrinker_first_for_test, __reset_shrinkers_for_test,
+        __unregister_shrinker_for_test, register_shrinker, shrink_snapshot, Shrinker,
+        MAX_SHRINKERS,
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -1242,45 +1309,71 @@ mod shrinker_tests {
         freed
     }
 
-    fn smoke_reclaim_shrinker_proportional() -> TestResult {
-        __reset_shrinkers_for_test();
+    fn smoke_reclaim_shrinker_page_budget() -> TestResult {
         MOCK_AVAIL.store(100, Ordering::Relaxed);
-        register_shrinker(Shrinker {
-            name: "mock",
+        let mock = Shrinker {
+            name: "memory-mock-test",
             count: mock_count,
             scan: mock_scan,
-        });
-        let result = (|| {
-            if shrinkable_objects() != 100 {
-                return TestResult::Fail("registry should report the mock's 100 objects");
-            }
-            if shrink_all(30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
-                return TestResult::Fail("shrink_all(30) should free exactly 30");
-            }
-            // Re-register same name → replace, not duplicate.
-            register_shrinker(Shrinker {
-                name: "mock",
-                count: mock_count,
-                scan: mock_scan,
-            });
-            if shrinkable_objects() != 70 {
-                return TestResult::Fail("re-register by name must not duplicate the shrinker");
-            }
-            // Over-target request frees all that remains.
-            shrink_all(1000);
-            if MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
-                return TestResult::Fail("over-target shrink should drain the cache");
-            }
-            // Nothing left → shrink_all is a no-op.
-            if shrink_all(10) != 0 {
-                return TestResult::Fail("empty cache should free nothing");
-            }
-            TestResult::Pass
-        })();
-        __reset_shrinkers_for_test();
-        result
+        };
+        let mut snap = [None; MAX_SHRINKERS];
+        snap[0] = Some(mock);
+        if shrink_snapshot(&snap, 30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
+            return TestResult::Fail("30-page shrink budget was not enforced exactly");
+        }
+        // An over-large target may drain the cache, but the reported return is
+        // still the number of base pages actually released.
+        if shrink_snapshot(&snap, 1000) != 70 || MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("over-target page shrink did not report actual release");
+        }
+        if shrink_snapshot(&snap, 0) != 0 {
+            return TestResult::Fail("zero page budget should be a no-op");
+        }
+        TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_proportional);
+    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_page_budget);
+
+    fn production_count() -> usize {
+        1
+    }
+
+    fn production_scan(nr: usize) -> usize {
+        nr.min(1)
+    }
+
+    fn smoke_reclaim_test_cleanup_preserves_live_registry() -> TestResult {
+        const LIVE: &str = "memory-production-sentinel";
+        const TEST: &str = "memory-registry-test";
+        register_shrinker(Shrinker {
+            name: LIVE,
+            count: production_count,
+            scan: production_scan,
+        });
+        if !__register_shrinker_first_for_test(Shrinker {
+            name: TEST,
+            count: mock_count,
+            scan: mock_scan,
+        }) {
+            let _ = __unregister_shrinker_for_test(LIVE);
+            return TestResult::Fail("test registry had no free slot");
+        }
+        // Compatibility cleanup may remove test-owned names, but must leave
+        // every production name in place.
+        __reset_shrinkers_for_test();
+        let live_survived = __unregister_shrinker_for_test(LIVE);
+        let test_survived = __unregister_shrinker_for_test(TEST);
+        if !live_survived {
+            return TestResult::Fail("test cleanup erased a live production shrinker");
+        }
+        if test_survived {
+            return TestResult::Fail("test cleanup left its scoped mock registered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_test_cleanup_preserves_live_registry
+    );
 }
 
 /// Frame-LRU ↔ `try_to_free` integration tests. Always compiled so they
@@ -1289,12 +1382,12 @@ mod shrinker_tests {
 /// as `__text_start` — so those host-only tests never execute anywhere;
 /// this module gives the direct-reclaim path real in-kernel coverage.)
 /// Exercises the allocation-free `reclaim_target_pages` batch path through
-/// the `try_to_free` entry point, including the multi-batch loop. Resets the
-/// LRU + shrinker registries before/after so pages never leak between tests.
+/// the `try_to_free` entry point, including the multi-batch loop. Resets only
+/// its private fake LRU pages; live shrinkers remain registered and untouched.
 mod frame_lru_tests {
     use super::{
-        __reset_lru_for_test, __reset_shrinkers_for_test, lru_stats, register_page, try_to_free,
-        PageEntry, PageFlags, PhysAddr, ReclaimFn, ReclaimOutcome, INITIAL_AGE,
+        __reset_lru_for_test, lru_stats, register_page, try_to_free, PageEntry, PageFlags,
+        PhysAddr, ReclaimFn, ReclaimOutcome, INITIAL_AGE,
     };
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -1313,7 +1406,6 @@ mod frame_lru_tests {
 
     fn smoke_try_to_free_drains_frame_lru() -> TestResult {
         __reset_lru_for_test();
-        __reset_shrinkers_for_test();
         // More pages than one BATCH (8) so try_to_free must loop the
         // allocation-free batch path across a batch boundary.
         for i in 0..10 {
@@ -1332,9 +1424,9 @@ mod frame_lru_tests {
             if lru_stats().total != 8 {
                 return TestResult::Fail("try_to_free left the wrong tracked count");
             }
-            // Ask for more than remain, spanning the 8-page batch boundary —
-            // caps at the 8 still tracked.
-            if try_to_free(100) != 8 {
+            // Ask for exactly the remaining pages, spanning the 8-page batch
+            // boundary without applying pressure to unrelated live shrinkers.
+            if try_to_free(8) != 8 {
                 return TestResult::Fail("try_to_free did not drain across batches");
             }
             if lru_stats().total != 0 {
@@ -1347,7 +1439,6 @@ mod frame_lru_tests {
             TestResult::Pass
         })();
         __reset_lru_for_test();
-        __reset_shrinkers_for_test();
         result
     }
     kernel_test_in!("memory/reclaim", smoke_try_to_free_drains_frame_lru);

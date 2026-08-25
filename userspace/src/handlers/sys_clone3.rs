@@ -88,9 +88,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
-    if ca.flags & CLONE_INTO_CGROUP != 0
-        && (size < CLONE_ARGS_MIN || ca.cgroup > i32::MAX as u64)
-    {
+    if ca.flags & CLONE_INTO_CGROUP != 0 && (size < CLONE_ARGS_MIN || ca.cgroup > i32::MAX as u64) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }

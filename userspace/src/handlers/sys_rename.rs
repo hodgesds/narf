@@ -67,8 +67,8 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
     }
     let new_leaf = &new_path[new_split + 1..];
     let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
-            poll_blocking(parent.rename(old_leaf, new_leaf))
-        });
+        poll_blocking(parent.rename(old_leaf, new_leaf))
+    });
     match outcome {
         Some(Some(Ok(()))) => {
             // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.

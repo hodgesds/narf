@@ -12,32 +12,38 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
     // datagram sends).
     let addr_ptr = args.arg4;
     let addr_len = args.arg5;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // Copy user send buffer into kernel memory under the SMAP bracket.
-    // Validate length before allocating — reject oversized len with EINVAL.
+    // Linux `__sys_sendto()` imports the payload iterator before looking up the
+    // descriptor.  NARF eagerly copies that iterator into a kernel Vec, so an
+    // unreadable non-empty payload must likewise win over EBADF/ENOTSOCK.
     let buf = if buf_len > 0 {
         // SAFETY: AS active; SMAP bracket inside copy_from_user_vec.
         match unsafe { copy_from_user_vec(buf_ptr, buf_len) } {
             Ok(b) => b,
-            Err(_) => {
-                ctx.set_return(fail);
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
                 return;
             }
         }
     } else {
         alloc::vec::Vec::new()
     };
-    let dest = if addr_ptr != 0 && addr_len >= 2 {
-        copy_user_addr(addr_ptr, addr_len)
-    } else {
-        None
+    let sock = match current_socket_result(fd) {
+        Ok(socket) => socket,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+    // sendto's sockaddr import follows descriptor/socket validation.  Unlike
+    // sendmsg, move_addr_to_kernel rejects (rather than clamps) a length above
+    // sockaddr_storage, and a failed user copy is EFAULT rather than silently
+    // turning the call into a connected send.
+    let dest = match import_sendto_addr(addr_ptr, addr_len) {
+        Ok(addr) => addr,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
     };
     match sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &buf,
@@ -58,8 +64,32 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         // Send never yields Accepted/Received/Addr; keep the match total.
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
     }
+}
+
+fn import_sendto_addr(ptr: u64, raw_len: u64) -> Result<Option<crate::socket::SockAddr>, i64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let len = raw_len as i32;
+    if !(0..=128).contains(&len) {
+        return Err(22); // EINVAL
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+    if len < 2 {
+        return Err(22); // no complete sa_family_t
+    }
+    let mut bytes = alloc::vec![0u8; len as usize];
+    // SAFETY: copy_from_user validates the complete address range and opens the
+    // architecture user-access window.
+    unsafe { copy_from_user(&mut bytes, ptr) }.map_err(|_| 14i64)?;
+    Ok(Some(crate::socket::SockAddr {
+        family: u16::from_ne_bytes([bytes[0], bytes[1]]),
+        body: bytes[2..].to_vec(),
+    }))
 }
 
 pub(super) fn socket_send_would_block(

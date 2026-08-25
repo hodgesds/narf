@@ -49,6 +49,15 @@ const FIFO_BUF_BYTES: usize = 65536;
 const PIPE_BUF: usize = 4096;
 const PEER_PRESENT: u32 = 1;
 
+/// Result classes for a named FIFO's transactional vmsplice-to-user drain.
+/// User-copy errno is kept intact for the Linux syscall layer.
+#[derive(Debug)]
+pub enum VmspliceDrainError {
+    WouldBlock,
+    User(u64),
+    BadFd,
+}
+
 /// The shared, mutable state of a named pipe: the byte queue plus live
 /// reader/writer OPEN counts. Both counts are the per-open population of
 /// [`FifoHandle`]s currently referencing this FIFO, incremented when a
@@ -401,6 +410,50 @@ impl FifoHandle {
         }
     }
 
+    /// Copy the current FIFO prefix through `copy`, consuming it only after
+    /// that complete user-copy transaction succeeds.
+    ///
+    /// Linux's `pipe_to_user` actor advances/removes a pipe buffer only after
+    /// `copy_page_to_iter` reports the requested length. Holding the queue lock
+    /// across the callback gives named FIFOs the same observe/copy/commit
+    /// semantics: an inaccessible or concurrently unmapped destination leaves
+    /// every byte queued, while another reader cannot reorder the prefix. This
+    /// FIFO stores bytes rather than per-write pipe_buffer boundaries, so the
+    /// selected prefix is conservatively one logical buffer and commits
+    /// all-or-none across a vector copy.
+    pub fn vmsplice_to_user(
+        &self,
+        max: usize,
+        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        if !self.can_read {
+            return Err(VmspliceDrainError::BadFd);
+        }
+
+        // Allocate before taking the IRQ-safe queue lock. A FIFO cannot supply
+        // more than its fixed capacity, even for a larger user iovec.
+        let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, FIFO_BUF_BYTES));
+        let mut q = self.shared.queue.lock();
+        let avail = q.len();
+        if avail == 0 {
+            return if self.shared.writers.load(Ordering::Acquire) == 0 {
+                Ok(0)
+            } else {
+                Err(VmspliceDrainError::WouldBlock)
+            };
+        }
+        let n = core::cmp::min(max, avail);
+        staging.extend(q.iter().copied().take(n));
+
+        copy(&staging).map_err(VmspliceDrainError::User)?;
+        q.drain(..n);
+        drop(q);
+        if n != 0 {
+            self.shared.sync_readiness();
+        }
+        Ok(n)
+    }
+
     /// Linux suppresses `POLLHUP` on a read-only FIFO opened with no writer
     /// until that particular open description has observed a writer.  Without
     /// this per-open edge check, `poll(POLLIN)` returns immediately on a fresh
@@ -632,5 +685,9 @@ impl FileOps for FifoHandle {
 
     fn fifo_shared(&self) -> Option<Arc<FifoShared>> {
         Some(Arc::clone(&self.shared))
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }

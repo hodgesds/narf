@@ -183,6 +183,9 @@ async fn kswapd_kthread(node: usize) {
                 // No forward progress — nothing more to shed this wake.
                 break;
             }
+            // Release fault waiters promptly after real progress rather than
+            // keeping them asleep until the complete high-watermark batch.
+            reclaim_wait::notify_reclaim_progress();
             pass += 1;
             narf_scheduler::yield_now().await;
         }
@@ -202,6 +205,11 @@ async fn kswapd_kthread(node: usize) {
             }
         }
         narf_memory::oom::reap_all();
+
+        // Also publish completion after a zero-progress pass and after OOM
+        // reaping. A waiter retries once and then fails, so an unreclaimable
+        // workload cannot leave a task asleep forever.
+        reclaim_wait::notify_reclaim_progress();
 
         // Gentle background compaction on THIS node when it was under memory
         // pressure this wake (`pass > 0`): one bounded dual-scanner pass migrates
@@ -227,6 +235,7 @@ pub mod aarch64;
 mod canary;
 mod cross_crate_init;
 mod measure;
+mod reclaim_wait;
 mod secure_boot;
 /// SMP exercise for the JIT-text W^X seal. Lives here rather than in
 /// `memory/` because it needs to pin a task to a peer CPU and the scheduler

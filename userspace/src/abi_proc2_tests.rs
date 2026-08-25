@@ -1119,10 +1119,10 @@ fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
                 _ => return Err("fdinfo backing open failed"),
             };
             let ino = crate::fd::with_table(FAKE_TASK, |table| {
-                let entry = table.get_mut(fd)?;
-                entry.offset = 37;
-                entry.status_flags = 0o2002;
-                Some(entry.ops.ino())
+                let ino = table.get(fd)?.ops.ino();
+                table.set_offset(fd, 37)?;
+                table.set_status_flags(fd, 0o2002)?;
+                Some(ino)
             })
             .flatten()
             .ok_or("fdinfo entry disappeared")?;

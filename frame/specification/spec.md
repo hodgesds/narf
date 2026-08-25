@@ -62,6 +62,15 @@ shared type directly; it does not define or cast a mirror layout.
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
 - A trap handler never allocates.
+- Anonymous user demand faults that hit the protected memory reserve may yield
+  only after memory has retired the page claim, released address-space and
+  allocator locks, and frame has cleared the active per-CPU mempolicy slot.
+  The waiter registry is a fixed `MAX_USER_TASKS`-entry array; registration and
+  notification are bounded, allocate nothing, and use the task-owned scheduler
+  waker so CPU migration/hotplug do not invalidate a wait. Reclaim progress/completion wakes
+  every installed waiter through a generation-ordered handshake. A task retries
+  once; no stackful task, table exhaustion, or repeated zero progress fails
+  without another park or busy-yield.
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel

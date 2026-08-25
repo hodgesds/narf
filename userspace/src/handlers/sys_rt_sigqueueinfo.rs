@@ -1,10 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `rt_sigqueueinfo(pid, sig, info)` — queue `sig` to `pid`. NARF's
-/// pending-signal model is a per-task bitmask, so the accompanying
-/// `siginfo_t` payload isn't preserved, but the signal is delivered
-/// exactly like `kill(2)`/`tkill(2)`.
+/// `rt_sigqueueinfo(pid, sig, info)` — queue `sig` and its `siginfo_t`
+/// payload to `pid` for signal delivery, sigtimedwait, or signalfd.
 ///
 /// `pid` is interpreted in the CALLER's PID namespace, exactly like
 /// `kill(2)`: Linux `kernel/signal.c` routes `do_rt_sigqueueinfo` →
@@ -24,32 +22,52 @@ use super::*;
 /// manager forks fresh workers up to the `children_max=18` ceiling.
 pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
+    // Linux copies siginfo before validating the target or signal. In
+    // particular NULL/unreadable uinfo wins with EFAULT over EINVAL/ESRCH.
+    let info = match import_queued_siginfo(a.arg2) {
+        Ok(info) => info,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let user_pid = a.arg0 as i32;
     let sig = a.arg1 as u32;
-    if sig > 64 {
-        ctx.set_return(SyscallReturn::invalid_op());
+    // Users may supply SI_QUEUE and the other negative user-origin codes, but
+    // may not impersonate the kernel or tkill when targeting another task.
+    if siginfo_requires_self_target(info)
+        && user_pid != linux_tid_for_task(current_task_id()) as i32
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         return;
     }
-    #[allow(unused_mut)]
-    let mut pid = a.arg0;
-    #[cfg(feature = "container")]
-    {
-        match crate::pid_ns::resolve_inner_pid(current_task_id(), pid) {
-            Some(outer) => pid = outer,
-            None => {
-                // Not bound in the caller's namespace → ESRCH, never a
-                // same-numbered process from another namespace.
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-                return;
-            }
-        }
-    }
+    let pid = if user_pid > 0 {
+        accept_pid_from(current_task_id(), user_pid as u64)
+    } else {
+        None
+    };
+    let Some(pid) = pid else {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+        return;
+    };
     let target = pid_to_task_raw(pid).unwrap_or(pid);
     // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
     if !signal_target_exists(target) {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
-    let depth = match capture_queued_siginfo(target, sig, a.arg2) {
+    // kill_pid_info reaches signal validation only after resolving a live
+    // target, so a missing target wins over an invalid signum.
+    if sig > 64 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // Signal 0 is an existence/permission probe; imported siginfo is not queued.
+    if sig == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let depth = match enqueue_imported_siginfo(target, sig, info) {
         Some(d) => d,
         None => {
             // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING
@@ -62,7 +80,7 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
                                        // Producer/consumer back-pressure: the target is falling behind —
                                        // yield this sender at syscall exit so the consumer(s) drain (see
                                        // SIGQUEUE_BACKPRESSURE_DEPTH). `depth` is the post-enqueue queue
-                                       // depth returned by capture_queued_siginfo, so no second scan/lock.
+                                       // depth returned by enqueue_imported_siginfo, so no second scan/lock.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if depth > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();

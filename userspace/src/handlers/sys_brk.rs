@@ -8,10 +8,11 @@ use super::*;
 /// `AddressSpace::brk_top`.
 ///
 /// The heap is a SINGLE growable VMA rooted at `BRK_DEFAULT_BASE`. A grow
-/// extends that VMA in place (`brk_extend_region`) and materializes only the
-/// appended pages (`materialize_range`); a shrink tail-punches the freed range
-/// (`punch_fixed`). Repeated small grows therefore stay O(log VMA + pages-added)
-/// instead of accumulating one VMA per grow and rescanning every earlier VMA.
+/// extends that VMA in place (`brk_extend_region`) with lazy zero-backed slots;
+/// first touch allocates through the user-reserve-aware demand-fault path. A
+/// shrink tail-punches the freed range (`punch_fixed`). Repeated small grows
+/// therefore stay O(log VMA + pages-added) without allocating resident pages
+/// or entering direct reclaim from the syscall.
 ///
 /// Returns the resulting break (Linux `brk` reports the break value, never an
 /// errno; glibc's wrapper detects failure by comparing against the request).
@@ -54,57 +55,28 @@ fn brk_core(as_ref: &AddressSpace, new_break: u64) -> u64 {
         return new_break;
     }
 
-    // Grow path: extend the single heap VMA in place with freshly zeroed frames,
-    // then materialize ONLY the appended range. On any failure roll the break
-    // back to `cur` (POSIX brk failure contract) without leaking frames or
-    // leaving the heap VMA grown past a range whose PTEs never installed.
+    // Grow path: extend the single heap VMA with lazy zero-backed slots. Linux
+    // only extends the VMA here (unless VM_LOCKED requires population); first
+    // touch allocates through AddressSpace::demand_alloc_page with User reserve
+    // semantics. This keeps frame allocation and reclaim out of the syscall.
     let pages = (new_aligned - cur_aligned) >> 12;
     if pages == 0 {
         // Within-page grow — just record the new break, no PTE work.
         as_ref.set_brk_top(new_break);
         return new_break;
     }
-    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        alloc::vec::Vec::with_capacity(pages as usize);
-    for _ in 0..pages {
-        let phys = match narf_memory::alloc_frame() {
-            Ok(f) => f.start_address(),
-            Err(_) => {
-                // Free the frames already reserved for this grow — a
-                // `Vec<PhysAddr>` drop frees nothing, so the old code leaked one
-                // frame per page on every OOM'd heap grow.
-                for p in &phys_list {
-                    narf_memory::free_frame(narf_memory::PhysFrame::new(*p));
-                }
-                return cur;
-            }
-        };
-        // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
-        unsafe {
-            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000);
-        }
-        phys_list.push(phys);
-    }
-    // `brk_extend_region` moves `phys_list` into the heap VMA on success; on
-    // failure it leaves it untouched so we free the frames and roll back.
-    if as_ref
-        .brk_extend_region(VirtAddr::new(BRK_DEFAULT_BASE), cur_aligned, phys_list.clone())
-        .is_err()
-    {
-        for p in &phys_list {
-            narf_memory::free_frame(narf_memory::PhysFrame::new(*p));
-        }
+    let Ok(page_count) = usize::try_from(pages) else {
+        return cur;
+    };
+    let mut lazy = alloc::vec::Vec::new();
+    if lazy.try_reserve_exact(page_count).is_err() {
         return cur;
     }
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
-    // appended pages were just registered on the heap VMA, so materialize_range
-    // installs only their PTEs and skips every earlier VMA.
-    if unsafe { as_ref.materialize_range(VirtAddr::new(cur_aligned), pages * 0x1000) }.is_err() {
-        // Undo the extension: punch the just-appended tail (tears down any PTEs
-        // that installed, frees its frames, truncates the heap VMA back to
-        // `cur_aligned`), then report the unchanged break. Leaving the heap
-        // grown would wedge every future grow on a stale successor overlap.
-        let _ = as_ref.punch_fixed(VirtAddr::new(cur_aligned), pages * 0x1000);
+    lazy.resize(page_count, narf_memory::PhysAddr::new(0));
+    if as_ref
+        .brk_extend_region(VirtAddr::new(BRK_DEFAULT_BASE), cur_aligned, lazy)
+        .is_err()
+    {
         return cur;
     }
 
@@ -205,7 +177,10 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("userspace", smoke_brk_break_is_address_space_scoped_and_inherited);
+    kernel_test_in!(
+        "userspace",
+        smoke_brk_break_is_address_space_scoped_and_inherited
+    );
 
     /// Count heap VMAs (bases inside the brk arena) currently registered.
     fn heap_vma_count(aspace: &AddressSpace) -> usize {
@@ -217,10 +192,9 @@ mod tests {
     }
 
     /// The heap is a SINGLE growable VMA: many small grows extend it in place
-    /// (one VMA, not N) and materialize only the appended pages; a shrink
-    /// tail-punches. This pins the O(1)-VMA growth, that grown pages are
-    /// readable + zeroed, exact partial-page break semantics, and that a grow
-    /// which fails to register leaves the break unchanged (POSIX rollback).
+    /// (one VMA, not N) with lazy zero slots; a shrink tail-punches. This pins
+    /// O(1)-VMA growth, no resident-frame allocation in brk(2), exact
+    /// partial-page break semantics, and rollback when registration fails.
     fn smoke_brk_single_growable_vma() -> TestResult {
         let base = BRK_DEFAULT_BASE;
         // SAFETY: kernel tests run with paging live and the frame allocator
@@ -252,9 +226,8 @@ mod tests {
             return TestResult::Fail("break did not advance across small grows");
         }
 
-        // Every grown page is mapped, and its backing frame is zeroed. The AS is
-        // not activated in a kernel test, so read the frame through the low-4-GiB
-        // identity map (same window brk_core zeroes through).
+        // Every grown page belongs to the heap VMA but remains nonresident.
+        // First touch, not brk(2), must allocate and zero user backing.
         let region = match aspace.lookup(VirtAddr::new(base)) {
             Some(r) => r,
             None => return TestResult::Fail("heap VMA absent after grows"),
@@ -262,22 +235,20 @@ mod tests {
         if region.len != grows * 0x1000 {
             return TestResult::Fail("heap VMA len did not track the grows");
         }
-        for (pg, phys) in region.phys.iter().enumerate() {
-            if phys.raw() == 0 {
-                return TestResult::Fail("grown heap page is unbacked");
-            }
-            // SAFETY: identity-mapped low 4 GiB; frame is page-aligned and was
-            // just allocated + zeroed for this heap.
-            let byte = unsafe { core::ptr::read_volatile(phys.raw() as *const u8) };
-            if byte != 0 {
-                let _ = pg;
-                return TestResult::Fail("grown heap page is not zeroed");
-            }
+        if region
+            .phys
+            .iter()
+            .any(|phys| *phys != narf_memory::PhysAddr::new(0))
+        {
+            return TestResult::Fail("brk growth eagerly allocated a resident frame");
+        }
+        let stats = aspace.memory_stats();
+        if stats.resident_pages != 0 {
+            return TestResult::Fail("lazy brk VMA contributed resident pages");
         }
 
-        // `top` is page aligned, so a grow into it needs the containing page
-        // backed: growing to `top+0x40` adds exactly one page and lands the
-        // break mid-page.
+        // `top` is page aligned, so growing to `top+0x40` adds exactly one lazy
+        // slot and lands the break mid-page.
         let mid = top + 0x40;
         if brk_core(&aspace, mid) != mid {
             return TestResult::Fail("grow into a fresh page did not return the new break");

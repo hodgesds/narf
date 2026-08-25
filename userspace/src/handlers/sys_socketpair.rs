@@ -44,7 +44,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     socket_arc_register(&a);
     socket_arc_register(&b);
     let fd_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-    let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+    let status_flags = crate::fd::O_RDWR | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
     let task = current_task_id();
     let mk = |ops: alloc::sync::Arc<crate::socket::SocketFile>| {
         fd::with_table(task, |t| {

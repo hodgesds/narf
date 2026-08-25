@@ -187,6 +187,27 @@ pub fn watermark_low() -> u64;
 pub fn watermark_high() -> u64;
 pub fn reclaim_goal_pages() -> usize;
 
+/// Cache reclaim is denominated exclusively in 4 KiB base pages. `count`
+/// returns an upper bound; `scan(n)` may free fewer pages but must neither free
+/// nor report more than `n`.
+pub struct Shrinker {
+    pub name: &'static str,
+    pub count: fn() -> usize,
+    pub scan: fn(usize) -> usize,
+}
+pub fn register_shrinker(shrinker: Shrinker);
+pub fn shrinkable_pages() -> usize;
+/// Compatibility alias with the same base-page unit.
+pub fn shrinkable_objects() -> usize;
+/// Allocation-free; returns a value in `0..=target_pages`.
+pub fn shrink_all(target_pages: usize) -> usize;
+/// Frame LRU first, then shrinkers for the remaining page deficit.
+pub fn try_to_free(target_pages: usize) -> usize;
+/// Install/wake the per-node background reclaimer without a scheduler
+/// dependency in this crate.
+pub fn set_kswapd_wake_hook(hook: fn(node: usize));
+pub fn wake_kswapd(node: usize);
+
 /// Fixed-point proportional-set-size units (one private resident page).
 pub const PSS_UNITS_PER_PAGE: u64;
 pub struct ReclaimRangeCandidate {
@@ -300,6 +321,14 @@ impl AddressSpace {
     ) -> SwapBatchReport;
     /// Materialize every recorded base-page region; used for exec/fork build.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
+    /// Back one anonymous/file-demand page. Anonymous reserve refusal returns
+    /// `AddressSpaceError::ReclaimPressure` only after its page ticket and all
+    /// address-space/allocator locks have been released; `Unmapped` and
+    /// `OutOfRange` retain their non-reclaim meanings.
+    pub unsafe fn demand_alloc_page(
+        &self,
+        vaddr: VirtAddr,
+    ) -> Result<(), AddressSpaceError>;
     /// Materialize only current regions intersecting a page-aligned user range.
     /// The region lock is held through the page-table walk.
     pub unsafe fn materialize_range(
@@ -638,6 +667,15 @@ x86_64 is rejected at runtime.
   replacement can appear. A cancelled anonymous allocation remains owned by
   the fault path and returns to the frame allocator; a cancelled file alias is
   released through its backing-owner hook.
+- An anonymous demand fault refused by the protected user reserve reports
+  `ReclaimPressure` only after cancelling its exact page ticket and releasing
+  the region and allocator locks. The frame fault path may then register the
+  current stackful task in a fixed allocation-free waiter table, park, and
+  retry once after kswapd progress or completion. A generation handshake
+  orders waiter publication against completion, while absent stackful context,
+  full waiter capacity, and a second zero-progress failure all fail without
+  sleeping again. File refusal, missing VMAs, and ordinary placement/range
+  exhaustion never enter this wait path.
 - COW write faults use the same page-scoped exclusion principle. The ticket
   owner takes a temporary source-frame reference before releasing the region
   lock, allocates and copies outside that lock, and republishes only if the
@@ -661,6 +699,27 @@ x86_64 is rejected at runtime.
   return in bounded 64-frame batches; x86_64 still requires a live ownership-
   registry entry at every reclaimed level, so copied kernel tables remain
   outside the detached set and can never enter a batch.
+- Reclaim progress is denominated only in physical 4 KiB base pages. Every
+  shrinker scan receives a strict page budget and may report no more than that
+  budget; object counts never advance watermark or allocation-retry progress.
+  The slab converts free blocks to page estimates per size class, visits the
+  4 KiB class first while dividing pressure fairly across the remaining
+  classes, and reclaims only a frame whose complete block set is present on the
+  central list. It detaches those blocks and updates class ownership under the
+  class lock, then releases that lock before buddy return, cgroup uncharge, or
+  any callback that can re-enter the allocator. The negative cgroup uncharge
+  path reached during final-owner return is itself allocation-free. Test
+  cleanup unregisters only its named/test-marked shrinkers and cannot erase a
+  live slab, page-cache, or other production registration.
+- `GlobalAlloc` direct reclaim is a non-sleepable emergency retry, not a
+  balance-to-high loop: after waking the local kswapd it reclaims at most eight
+  base pages synchronously and retries the backend once. Longer reclaim,
+  anonymous swap, and OOM policy remain in schedulable kswapd context. User-
+  backing allocations proactively wake local kswapd below the low watermark
+  and wake it again when a buddy/cpuset allocation fails after passing the
+  reserve gate. A `brk` extension reserves virtual address space only; physical
+  user frames are allocated lazily by the demand-fault path and inherit the
+  same watermark policy.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
@@ -859,8 +918,9 @@ breakdown. Modules in tree:
 - `context.rs` — `is_sleepable()`, `irqs_enabled()`,
   `AllocContext` enum, debug assert at slab-alloc entry.
 
-Stage 2 / 4 still owe: domain tagging through `SlabOpts`,
-shrinker subsystem, per-domain accounting.
+Stage 2 / 4 still owe: domain tagging through `SlabOpts` and per-domain
+accounting. The allocation-free, page-denominated shrinker subsystem is in
+tree, including bounded slab-page return and per-node kswapd wake integration.
 
 ## 8. Resolved decisions
 

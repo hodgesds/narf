@@ -12,10 +12,9 @@
 //!     ingress delivery are selected by that identity.
 //!   * `IpcNamespace`  — CLONE_NEWIPC (0x08000000). Per-ns SysV
 //!     IPC keyspace (shmget/semget/msgget) and POSIX mqueue keys.
-//!     The subsystems are themselves stubbed in NARF, so this
-//!     skill mints the per-ns counter and resolves no real
-//!     segments — full impl lands once the SysV IPC surface
-//!     does.
+//!     The real SysV object tables use this namespace's identity and
+//!     independent id allocators, so an id is meaningful only together
+//!     with the caller's current IPC namespace.
 //!
 //! All three are stored behind `Arc<…>` in per-task BTreeMaps
 //! keyed by `current_task_id()`, mirroring how Wave-67's
@@ -308,7 +307,9 @@ impl Drop for NetNamespace {
 #[derive(Debug)]
 pub struct IpcNamespace {
     id: NsId,
-    next_id: AtomicU32,
+    next_shm_id: AtomicU32,
+    next_sem_id: AtomicU32,
+    next_msg_id: AtomicU32,
     inner: IrqSafeSpinLock<IpcInner>,
 }
 
@@ -323,9 +324,15 @@ impl IpcNamespace {
     /// Fresh namespace — id counter starts at 1 so `0` (IPC_PRIVATE
     /// in Linux) never collides with a real id.
     pub fn new() -> Arc<Self> {
+        Self::new_with_id(alloc_ns_id())
+    }
+
+    fn new_with_id(id: NsId) -> Arc<Self> {
         Arc::new(Self {
-            id: alloc_ns_id(),
-            next_id: AtomicU32::new(1),
+            id,
+            next_shm_id: AtomicU32::new(1),
+            next_sem_id: AtomicU32::new(1),
+            next_msg_id: AtomicU32::new(1),
             inner: IrqSafeSpinLock::new(IpcInner::default()),
         })
     }
@@ -335,8 +342,16 @@ impl IpcNamespace {
         self.id
     }
 
-    fn alloc_id(&self) -> u32 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn alloc_shm_id(&self) -> u32 {
+        self.next_shm_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn alloc_sem_id(&self) -> u32 {
+        self.next_sem_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn alloc_msg_id(&self) -> u32 {
+        self.next_msg_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// `shmget(key, …)` — return the id for `key`, allocating one
@@ -346,7 +361,7 @@ impl IpcNamespace {
         if let Some(&id) = g.shm.get(&key) {
             return id;
         }
-        let id = self.alloc_id();
+        let id = self.alloc_shm_id();
         g.shm.insert(key, id);
         id
     }
@@ -356,7 +371,7 @@ impl IpcNamespace {
         if let Some(&id) = g.sem.get(&key) {
             return id;
         }
-        let id = self.alloc_id();
+        let id = self.alloc_sem_id();
         g.sem.insert(key, id);
         id
     }
@@ -366,9 +381,22 @@ impl IpcNamespace {
         if let Some(&id) = g.msg.get(&key) {
             return id;
         }
-        let id = self.alloc_id();
+        let id = self.alloc_msg_id();
         g.msg.insert(key, id);
         id
+    }
+}
+
+impl Drop for IpcNamespace {
+    fn drop(&mut self) {
+        // Linux removes an IPC namespace's public ids when the final task/nsfd
+        // reference disappears. Existing SysV SHM VMAs retain their backing
+        // until their final detach; semaphore/message waiters wake with EIDRM.
+        #[cfg(feature = "linux-compat")]
+        {
+            crate::handlers::shm_ipc_namespace_drop(self.id);
+            crate::sysvipc::ipc_namespace_drop(self.id);
+        }
     }
 }
 
@@ -390,11 +418,20 @@ static IPC_BY_TASK: IrqSafeSpinLock<Option<IpcTable>> = IrqSafeSpinLock::new(Non
 // Global / default namespaces. Tasks without a per-task override
 // read/write these.
 static GLOBAL_UTS: IrqSafeSpinLock<Option<Arc<UtsNamespace>>> = IrqSafeSpinLock::new(None);
+static GLOBAL_IPC: IrqSafeSpinLock<Option<Arc<IpcNamespace>>> = IrqSafeSpinLock::new(None);
 
 fn global_uts() -> Arc<UtsNamespace> {
     let mut g = GLOBAL_UTS.lock();
     if g.is_none() {
         *g = Some(UtsNamespace::new_default());
+    }
+    g.as_ref().expect("just inserted").clone()
+}
+
+fn global_ipc() -> Arc<IpcNamespace> {
+    let mut g = GLOBAL_IPC.lock();
+    if g.is_none() {
+        *g = Some(IpcNamespace::new_with_id(initial_ns_id(&INITIAL_IPC_NS_ID)));
     }
     g.as_ref().expect("just inserted").clone()
 }
@@ -468,6 +505,12 @@ pub fn current_ipc_ns(task: u64) -> Option<Arc<IpcNamespace>> {
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
+/// Return the namespace every task actually sees. An absent per-task override
+/// means the shared initial namespace, not a fresh private namespace.
+pub fn current_ipc_namespace(task: u64) -> Arc<IpcNamespace> {
+    current_ipc_ns(task).unwrap_or_else(global_ipc)
+}
+
 /// Install a per-task UTS namespace, cloned from whatever the task
 /// currently sees. Called from `sys_unshare(CLONE_NEWUTS)`.
 pub fn unshare_uts(task: u64) {
@@ -492,6 +535,11 @@ pub fn unshare_net(task: u64) {
 
 /// Install a fresh per-task IPC namespace.
 pub fn unshare_ipc(task: u64) {
+    #[cfg(feature = "linux-compat")]
+    crate::sysvipc::sem_undo_process_exit(
+        crate::handlers::task_to_pid_raw(task).unwrap_or(task),
+        task,
+    );
     let fresh = IpcNamespace::new();
     ensure_ipc_table();
     let mut g = IPC_BY_TASK.lock();
@@ -1007,8 +1055,22 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
         HeldNs::Uts(n) => setns_uts(caller, n.clone()),
         HeldNs::Net(n) => setns_net(caller, n.clone()),
         HeldNs::NetGlobal(_) => setns_initial_net(caller),
-        HeldNs::Ipc(n) => setns_ipc(caller, n.clone()),
-        HeldNs::IpcGlobal(_) => setns_initial_ipc(caller),
+        HeldNs::Ipc(n) => {
+            #[cfg(feature = "linux-compat")]
+            crate::sysvipc::sem_undo_process_exit(
+                crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
+                caller,
+            );
+            setns_ipc(caller, n.clone());
+        }
+        HeldNs::IpcGlobal(_) => {
+            #[cfg(feature = "linux-compat")]
+            crate::sysvipc::sem_undo_process_exit(
+                crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
+                caller,
+            );
+            setns_initial_ipc(caller);
+        }
         HeldNs::User(n) => setns_user(caller, n.clone()),
         HeldNs::Pid(n) => {
             let _ = crate::pid_ns::attach_to_ns(caller, outer_pid, n.clone());
@@ -1037,5 +1099,6 @@ pub fn __test_reset_all() {
     *IPC_BY_TASK.lock() = None;
     *USER_BY_TASK.lock() = None;
     *GLOBAL_UTS.lock() = None;
+    *GLOBAL_IPC.lock() = None;
     *GLOBAL_USER.lock() = None;
 }

@@ -85,6 +85,13 @@ complete private base-page VMA. Shared/huge/sub-VMA moves and
 `MREMAP_DONTUNMAP` fail explicitly; retaining an ordinary private alias would
 not implement Linux's old-range fault/userfaultfd contract safely.
 
+Linux-compatible `brk(2)` likewise changes only the address-space break and
+its single anonymous heap VMA. Growth appends lazy zero-backed page slots and
+does not allocate, zero, or materialize resident frames in syscall context;
+first touch uses the ordinary user-reserve-aware demand-fault path. Shrink
+retires only the rounded tail, while a metadata-allocation or overlap failure
+returns the previous break as required by the Linux syscall ABI.
+
 `mlock(2)` and `munlock(2)` round byte intervals outward to pages, reject a
 non-empty range containing any unmapped page, and split VMAs so LOCKED applies
 exactly to the request; a zero length is a successful no-op. Plain `mlock`
@@ -152,6 +159,24 @@ duplicate descriptor keeps the watch live after the original descriptor
 closes, and final close invalidates the watch without the epoll instance
 artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
 regardless of the registered interest mask, matching Linux epoll semantics.
+`poll(2)` and `ppoll(2)` likewise report `POLLERR`, `POLLHUP`, and
+`POLLNVAL` without requiring those bits in the requested event mask.
+`select(2)` and `pselect6(2)` use Linux's distinct fd-set mapping: hangup and
+error make a requested read set ready, error makes a requested write set
+ready, and only priority/OOB data makes a requested exception set ready.
+Their return value counts ready result-set bits (so one descriptor ready in
+two sets contributes two), and an invalid selected descriptor returns `EBADF`.
+Bad fd-set, timeout, signal-mask, or pselect argpack pointers return `EFAULT`;
+negative descriptor counts, invalid timeout fields, and an invalid non-null
+signal-mask size return `EINVAL`. Descriptor counts are signed 32-bit values
+and positive counts are clamped to the process fdtable's current `max_fds`,
+not libc's `FD_SETSIZE`; only the native-word-rounded prefix of each set is
+accessed. Empty sets still perform an interruptible timeout wait. `pselect6`
+installs its validated temporary signal mask atomically for the whole wait and
+restores the prior mask on readiness, timeout, or post-handler `sigreturn`.
+Both raw syscalls retain nanosecond deadline precision and best-effort write
+the remaining timeout back without replacing the syscall's primary result if
+that write-back faults.
 An epoll wait accepts at most `maxevents` entries. Only entries actually
 returned to the caller advance edge-trigger tokens, acknowledge provider-local
 readiness, take an exclusive claim, or disarm `EPOLLONESHOT`; additional ready
@@ -170,6 +195,148 @@ writable readiness when no byte fits, then re-execute after space or closure is
 published. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
 `sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
 its first message would block it follows the same park-or-`EAGAIN` rule.
+Native `read(2)`, `write(2)`, `readv(2)`, and `writev(2)` resolve the
+descriptor and required access mode before user-range or iovec import,
+including zero-length operations. Scalar buffers and every imported iovec are
+validated before I/O, vector counts above 1024 return `EINVAL`, and effective
+length is capped at Linux `MAX_RW_COUNT`. Transfers use bounded kernel staging,
+preserve exact filesystem errors before progress, return an accepted prefix
+after progress, and distinguish blocking, `O_NONBLOCK`/`EAGAIN`, interrupting
+signals/`EINTR`, and broken-pipe `SIGPIPE`/`EPIPE`. A writev no larger than
+`PIPE_BUF` reaches a pipe as one write transaction across iovec boundaries.
+Anonymous-pipe and named-FIFO reads hold their queue prefix until the complete
+guarded scalar or vector user copy succeeds, so a protection change racing
+validation cannot consume unread bytes. NARF's byte queues do not retain Linux
+pipe-buffer/write boundaries, so the selected prefix is one logical buffer:
+an iovec fault after an earlier copied fragment still leaves that whole prefix
+queued, matching Linux's rule that the currently faulting pipe buffer is not
+consumed. Fanotify removes a selected event on a copy fault as Linux does, but
+reserves its object-fd numbers invisibly and publishes those fds only after the
+complete metadata copy succeeds; EFAULT therefore cannot leak an object fd.
+
+Each fd slot references a separate shared open-file-description object for
+file position and mutable status flags. `dup*`, `F_DUPFD`, fork inheritance,
+and `SCM_RIGHTS` alias that object, while `FD_CLOEXEC` remains per descriptor;
+independent opens create independent descriptions. Consequently `lseek`,
+sequential I/O, readiness-at-offset, `/proc/*/fdinfo`, and `F_GETFL/F_SETFL`
+observe changes made through any alias. Stdin is `O_RDONLY`, stdout/stderr are
+`O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
+type-based access-mode exceptions. Sequential transfer syscalls pin these
+descriptions, lock distinct implicit positions in stable address order (or an
+alias once), snapshot positions only after locking, and commit directly to the
+pinned descriptions rather than a numeric fd that may have been closed and
+reused. Independent `O_APPEND` opens share an inode/FileOps append lock held
+across EOF selection and write, while their ordinary positions remain
+independent.
+
+The native send-family preserves Linux validation and errno ordering.
+`send(2)` validates a non-empty payload range before descriptor lookup;
+`sendmsg(2)` and `sendmmsg(2)` reject the kernel-only compat-control flag
+before distinguishing `EBADF` from `ENOTSOCK`, then import the complete native
+message header, address, iovec array, ancillary data, and payload without
+discarding user-copy failures. More than 1024 vectors returns `EMSGSIZE` and an
+unrepresentable ancillary length returns `ENOBUFS`. `sendmmsg` resolves its
+socket even when `vlen` is zero, caps `vlen` to 1024, returns the exact first
+message or `msg_len` write-back error when no message completed, and suppresses
+a later error only in favor of the number of already-completed messages.
+`sendfile(2)` imports and later writes back its optional 64-bit offset even
+when the transfer result is an error. It validates the readable input fd and
+explicit-offset seekability before resolving the writable output fd, rejects
+an append-mode output, clamps successful transfers to Linux `MAX_RW_COUNT`,
+and advances input and output positions only by bytes accepted by the sink.
+Exact filesystem, `EAGAIN`, broken-pipe/`SIGPIPE`, and user-copy errors are
+preserved; zero count still performs fd and mode validation. NARF stream
+inputs currently fail closed because their `FileOps` do not expose Linux's
+transactional `splice_read` source operation.
+`copy_file_range(2)` likewise serializes and commits implicit positions through
+the pinned descriptions. Explicit `loff_t` imports and write-backs use guarded
+user copies, so an unmapped or concurrently protected offset word returns
+`EFAULT` rather than silently supplying zero or reporting success.
+`splice(2)` returns zero for zero length before inspecting flags, descriptors,
+or offsets. Nonzero calls reject bits outside `SPLICE_F_ALL`, resolve input
+then output, reject a pipe-side offset with `ESPIPE` before user access, import
+`off_out` then `off_in`, and only then validate read/write modes and the
+one-pipe-required shape. Explicit non-pipe offsets are advanced only by the
+accepted prefix and are written back after a nonnegative result. Endpoint
+`O_NONBLOCK` implies `SPLICE_F_NONBLOCK`; empty/full live pipes park or return
+`EAGAIN`, while a closed sink raises `SIGPIPE` and returns `EPIPE`. Pipe moves
+are transactional: a short sink consumes only the accepted source prefix.
+Linux `vmsplice(2)` preserves the kernel entry-point's observable validation
+order: unknown flags are rejected before descriptor lookup; descriptor and
+access-mode errors precede iovec import; a valid descriptor's iovec copy and
+per-segment range errors precede the non-pipe and full-pipe checks. A NULL
+zero-segment iovec and any imported zero-total vector return zero before pipe
+identity or readiness is sampled. A valid nonblocking transfer into a full
+pipe returns `EAGAIN` only after those validations have succeeded. `O_PATH`
+remains part of the stored open-file status and represents neither readable nor
+writable mode, so `vmsplice` returns `EBADF` before importing its iovec. Both
+anonymous-pipe and named-FIFO read ends copy then commit each destination
+segment: a failed user copy cannot consume that segment's queued prefix, and a
+failure after earlier segments returns only the already-copied byte count.
+Native `getdents(2)` and `getdents64(2)` resolve the descriptor before touching
+the output range and distinguish `EBADF` from `ENOTDIR`. They snapshot a bounded
+directory batch per call, including the synchronous iterator fallback, so both
+wire formats retain linear full-directory traversal. Backend failures retain
+their Linux errno instead of becoming a false end-of-directory. A first record
+that cannot fit returns `EINVAL`; a first copy fault returns `EFAULT`; after any
+complete record, a later size, allocation, or copy failure returns the completed
+byte prefix and advances the directory cursor only through that prefix. The
+unsigned `count` argument is truncated to its native 32-bit ABI width.
+System V semaphore operations use Linux's default 500-operation `SEMOPM`
+boundary and validation order: `E2BIG`/zero-count validation precedes sembuf
+import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout
+first but validates its fields after the sembufs. Multi-operation changes are
+atomic. Blocking operations park interruptibly unless their blocking sembuf
+has `IPC_NOWAIT`; relative timed waits retain one absolute deadline across
+park/re-execution. Imported operation arrays and message payloads remain
+kernel-owned across that wait, so later user-memory mutation cannot alter an
+in-flight operation. `SEM_UNDO` adjustments are accumulated per process,
+atomically committed with the operation, shared by `CLONE_SYSVSEM`, cleared by
+`SETVAL`/`SETALL`, and reversed when the final sharing process exits. System V
+message send imports the type and payload before queue lookup and reports copy
+faults as `EFAULT`. Queues enforce
+Linux's default 16-KiB byte and zero-length-message count limit; full blocking
+sends park, while `IPC_NOWAIT` returns `EAGAIN`. Receive supports Linux type
+selection, `IPC_NOWAIT`, `MSG_NOERROR`, `MSG_EXCEPT`, and `MSG_COPY`; an
+oversize receive without `MSG_NOERROR` returns `E2BIG` without dequeueing.
+Normal receives reserve the exact selected record and remove it only after one
+range-validated header-plus-payload copyout, so `EFAULT` is non-destructive.
+Queue removal wakes staged semaphore, sender, and receiver waits with `EIDRM`.
+Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
+`IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;
+owner, creator, mode, supplementary-group, queue-limit, metadata timestamp,
+message count/byte count, and last-sender/receiver fields follow Linux.
+Shared-memory, semaphore, and message identifiers and key lookups are scoped
+to the caller's current IPC namespace. Ordinary clone/fork inheritance shares
+the same namespace object and tables; `CLONE_NEWIPC` creates fresh empty tables
+with independent per-family id allocation, so equal numeric ids in different
+namespaces never alias. `CLONE_NEWIPC|CLONE_SYSVSEM` is rejected with `EINVAL`.
+The final task/ns-fd reference removes semaphore and message objects and wakes
+their waiters with `EIDRM`; shared-memory ids disappear at namespace teardown
+while already-attached VMAs retain their backing until final detach.
+System V shared-memory attachment follows Linux's native 64-bit ABI and
+validation order. `shmat(2)` validates signed ids and address shape first,
+rounds `SHM_RND` addresses to `SHMLBA`, requires a non-null address for
+`SHM_REMAP`, ignores otherwise unknown attach bits, and checks the requested
+read/write/execute permission before mapping. A fixed attach rejects overlap
+with `EINVAL` unless `SHM_REMAP` is present; replacement, registration, and
+materialization maintain exact rollback and backing-lifetime accounting.
+`SHM_RDONLY` and `SHM_EXEC` produce the corresponding shared VMA permissions.
+Attachments retain their original detach address across VMA splits and partial
+replacement. A single mm-level transaction serializes SysV VMA creation,
+fixed-range punching, attachment publication/removal, and `shm_nattch` changes
+across `CLONE_VM` siblings. `munmap(2)`, `MAP_FIXED`, `SHM_REMAP`, and an
+`MREMAP_FIXED` destination replacement update `shm_nattch`; a
+later `shmdt(2)` removes every surviving VMA fragment belonging to the selected
+logical attachment. Fork duplicates each inherited attachment and its count,
+whereas `CLONE_VM` processes share one mm-level attachment; exec and final
+process exit close the old address space's attachments. Segment backing belongs
+to the IPC object rather than its creator process. `IPC_RMID` removes the public id and key immediately but
+defers backing destruction until the final attachment closes. Native
+`shmctl(2)` imports the complete `shmid64_ds` before an `IPC_SET` lookup,
+resolves and permission-checks `IPC_STAT` before copyout, and reports owner,
+mode, size, creator/last-operation pids, attach count, and timestamps at their
+architecture ABI offsets.
 AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
 queues an accept-ready endpoint. Accepting the final pending endpoint followed
 by a new connection before the next epoll scan remains a deliverable
@@ -189,6 +356,14 @@ because another event joined an already-readable queue.
 Signalfd uses a per-task pending-set generation that advances only when the
 set changes from empty to nonempty, including the allocation-free IRQ raise
 path.
+Queued-signal syscalls import the complete native kernel `siginfo` prefix before
+publishing pending state. `rt_sigqueueinfo` and `rt_tgsigqueueinfo` require a
+readable non-null info pointer and preserve Linux's `EFAULT`-before-argument
+validation ordering; invalid targets and signals report `ESRCH` and `EINVAL`
+respectively without delivery. `pidfd_send_signal` rejects unsupported flags
+before fd resolution, validates non-null `si_signo`, checks that the pidfd still
+names a live target (including signal 0 probes), and never queues a payload or
+pending bit after a failed import or validation.
 Explicit stream shutdown publishes the same readiness notification as final
 descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 `POLL_IN|POLL_HUP` and can consume EOF.

@@ -273,11 +273,23 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
 // produced them. Concurrent calls are serialised through the backend's
 // own atomics (the bump path is a lock-free CAS loop), so the impl is
 // sound under the multi-threaded use the global allocator sees.
-/// Minimum pages `GlobalAlloc::alloc` asks direct reclaim to free when an
-/// allocation fails: shed ~2 MiB of clean cache so a small allocation's
-/// retry has ample headroom (a large allocation asks for its own size,
-/// rounded up, if bigger).
-const RECLAIM_ON_ALLOC_FAIL_PAGES: usize = 512;
+/// Maximum pages one `GlobalAlloc::alloc` may reclaim synchronously. The
+/// allocator can run beneath arbitrary syscall/kernel locks and cannot sleep;
+/// a small bounded pass may make the immediate retry succeed, while kswapd
+/// performs the unbounded balancing work in schedulable task context.
+const DIRECT_RECLAIM_MAX_PAGES: usize = 8;
+
+#[inline]
+const fn direct_reclaim_target(size: usize) -> usize {
+    let pages = size.saturating_add(4095) / 4096;
+    if pages == 0 {
+        1
+    } else if pages > DIRECT_RECLAIM_MAX_PAGES {
+        DIRECT_RECLAIM_MAX_PAGES
+    } else {
+        pages
+    }
+}
 
 // SAFETY: the backend dispatched to (`current_backend`) upholds the
 // `GlobalAlloc` contract; alloc/dealloc forward the caller's layout
@@ -306,10 +318,11 @@ unsafe impl GlobalAlloc for BumpAllocator {
         if !ptr.is_null() {
             return ptr;
         }
-        // Direct reclaim: the allocation failed, so shed reclaimable cached
-        // memory and retry ONCE before giving up (a null return routes to the
-        // alloc-error handler / panic). This turns transient memory pressure
-        // into backpressure instead of an instant OOM kill.
+        // Wake background reclaim first. Direct reclaim below is deliberately
+        // bounded because GlobalAlloc may run inside a syscall while unrelated
+        // locks are held and therefore cannot park or monopolize the CPU for a
+        // 512-page scan. kswapd owns the longer balance-to-high loop.
+        crate::reclaim::wake_kswapd(crate::frame::current_cpu_node());
         //
         // Safe against re-entry: the failed `backend.alloc` above already
         // released its locks, and `reclaim::try_to_free` is allocation-free
@@ -317,10 +330,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // `alloc`), so it cannot recurse into this path. The retry is a plain
         // `backend.alloc` (unhooked), so failure returns null directly with no
         // second reclaim attempt.
-        let want_pages = layout
-            .size()
-            .div_ceil(4096)
-            .max(RECLAIM_ON_ALLOC_FAIL_PAGES);
+        let want_pages = direct_reclaim_target(layout.size());
         if crate::reclaim::try_to_free(want_pages) == 0 {
             return core::ptr::null_mut();
         }
@@ -381,3 +391,17 @@ pub fn spill_stats() -> (usize, usize) {
 /// Backwards-compat alias. The constant is now BOOTSTRAP_CAPACITY,
 /// but external diagnostics may still reference HEAP_CAPACITY.
 pub const HEAP_CAPACITY: usize = BOOTSTRAP_CAPACITY;
+
+#[cfg(test)]
+mod tests {
+    use super::{direct_reclaim_target, DIRECT_RECLAIM_MAX_PAGES};
+
+    #[test]
+    fn direct_reclaim_target_is_nonzero_and_strictly_bounded() {
+        assert_eq!(direct_reclaim_target(0), 1);
+        assert_eq!(direct_reclaim_target(1), 1);
+        assert_eq!(direct_reclaim_target(4096), 1);
+        assert_eq!(direct_reclaim_target(4097), 2);
+        assert_eq!(direct_reclaim_target(usize::MAX), DIRECT_RECLAIM_MAX_PAGES);
+    }
+}

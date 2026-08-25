@@ -274,7 +274,24 @@ impl PipeRead {
         max: usize,
     ) -> Result<usize, VmspliceDrainError> {
         crate::handlers::validate_user_range(dst, max).map_err(VmspliceDrainError::User)?;
+        self.read_to_user(max, |bytes| {
+            // SAFETY: validate_user_range accepted the complete destination;
+            // guarded copy catches a racing unmap/protection change.
+            unsafe { crate::handlers::copy_to_user(dst, bytes) }
+        })
+    }
 
+    /// Transactional pipe read used by read/readv/vmsplice: copy a stable
+    /// prefix through `copy`, and consume it only after the complete guarded
+    /// user-copy succeeds. The byte queue does not preserve Linux pipe_buffer
+    /// boundaries, so this selected prefix is one logical buffer: a fault in a
+    /// later iovec retains even an earlier copied fragment rather than wrongly
+    /// consuming part of the currently faulting buffer.
+    pub(crate) fn read_to_user(
+        &self,
+        max: usize,
+        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
         // Allocate before disabling IRQs on the queue lock.  A pipe can never
         // supply more than its fixed capacity, even if the iovec is larger.
         let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, PIPE_BUF_BYTES));
@@ -290,11 +307,7 @@ impl PipeRead {
         let n = core::cmp::min(max, avail);
         staging.extend(q.iter().copied().take(n));
 
-        // SAFETY: validate_user_range accepted the entire destination above;
-        // the guarded copy converts a racing unmap/protection change to an
-        // error.  The queue is still untouched on that error path.
-        unsafe { crate::handlers::copy_to_user(dst, &staging) }
-            .map_err(VmspliceDrainError::User)?;
+        copy(&staging).map_err(VmspliceDrainError::User)?;
         q.drain(..n);
         let became_writable = avail == PIPE_BUF_BYTES;
         drop(q);

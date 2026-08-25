@@ -599,6 +599,26 @@ pub fn with_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
     }
 }
 
+/// Allocation-free variant for final-owner accounting paths. Unlike
+/// [`with_chain_states`], an unplaced/exited pid is ignored instead of falling
+/// back through `root()`, whose controller reconciliation may allocate. Map
+/// lookups, `Arc` clones, parent traversal, and state downcasts do not allocate;
+/// callers must keep `f` allocation-free as well.
+pub(super) fn with_existing_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
+    pid: u64,
+    name: &'static str,
+    mut f: F,
+) {
+    let mut cur = { TASK_CGROUP.lock().get(&pid).cloned() };
+    while let Some(c) = cur {
+        let state = c.ctrl_state.lock().get(name).cloned();
+        if let Some(s) = state {
+            f(&s);
+        }
+        cur = c.parent.clone();
+    }
+}
+
 /// `cg` plus every ancestor up to the root, bottom-up — the levels that
 /// membership charging walks.
 fn charge_chain(cg: &Arc<Cgroup>) -> Vec<Arc<Cgroup>> {

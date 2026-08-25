@@ -504,11 +504,7 @@ pub fn active_user_as() -> Option<Arc<AddressSpace>> {
 pub fn exit_landing() -> Option<(u64, u64)> {
     let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
     let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
-    if rip == 0 {
-        None
-    } else {
-        Some((rip, rsp))
-    }
+    if rip == 0 { None } else { Some((rip, rsp)) }
 }
 
 // ── Exit-landing registration ──────────────────────────────────────
@@ -592,8 +588,8 @@ struct BootstrapHeader {
 
 use alloc::collections::BTreeMap;
 use narf_abi::{
-    completion_channel, submission_channel, Completion, CompletionDrain, CompletionQueue,
-    SharedRing, Submission, SubmissionDrain, SubmissionQueue,
+    Completion, CompletionDrain, CompletionQueue, SharedRing, Submission, SubmissionDrain,
+    SubmissionQueue, completion_channel, submission_channel,
 };
 use narf_memory::PhysAddr;
 
@@ -946,15 +942,16 @@ fn open_impl(
             return;
         }
     }
-    // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR) plus the settable
-    // status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
+    // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR), O_PATH identity, and
+    // the settable status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
     // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
     // access mode via F_GETFL and rejects the stream with EINVAL if it
     // doesn't match the requested mode — systemd fdopens a `cgroup.procs`
     // it opened O_WRONLY, so a dropped access mode failed that check.
     // (O_NONBLOCK matters on its own for libinput's evdev nodes — see
     // `InputEventFile::nonblock_read_eagain`.)
-    let open_status_flags = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
+    let open_status_flags =
+        (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK | crate::fd::O_PATH);
     let task = current_task_id();
     // Linux open/openat reject an empty pathname with ENOENT. Do this before
     // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
@@ -1189,7 +1186,7 @@ fn open_impl(
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
                     flags: 0,
-                    status_flags: 0,
+                    status_flags: open_status_flags,
                 })
             });
             match new_fd {
@@ -1239,6 +1236,7 @@ fn open_impl(
                     let errno = match error {
                         narf_filesystem::FsError::NotFound => 2,          // ENOENT
                         narf_filesystem::FsError::PermissionDenied => 13, // EACCES
+                        narf_filesystem::FsError::OperationNotPermitted => 1, // EPERM
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
                         narf_filesystem::FsError::InvalidPath
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
@@ -1625,10 +1623,9 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
                         if let Some(uctx) = crate::user_task::current_user_task() {
                             // SAFETY: live per-task ctx; single-threaded syscall.
                             unsafe {
-                                (*uctx).fifo_open_pending_fd.store(
-                                    0,
-                                    core::sync::atomic::Ordering::Release,
-                                );
+                                (*uctx)
+                                    .fifo_open_pending_fd
+                                    .store(0, core::sync::atomic::Ordering::Release);
                             }
                         }
                         ctx.set_return(SyscallReturn::ok(fd as u64));
@@ -1673,47 +1670,138 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
 
 // ── Read — arg0=fd, arg1=buf, arg2=len ─────────────────────────────
 
-/// Drain a fanotify group's queued events into `buf` as
-/// `struct fanotify_event_metadata` records, opening a fresh fd to each
-/// affected object in `task`'s fd table. Called from sys_read with NO
-/// fd-table lock held (the install below needs it).
+/// Drain fanotify events and copy their metadata transactionally with respect
+/// to object-fd publication. Linux removes the event even when copy_to_user
+/// faults, but reserves and installs the embedded fd only after all event data
+/// copied successfully; an EFAULT must not leak a reachable descriptor.
 #[cfg(feature = "linux-compat")]
-fn fanotify_read_into(task: u64, gid: u64, buf: &mut [u8]) -> usize {
-    let cap = buf.len() / crate::mqueue::FAN_EVENT_METADATA_LEN;
+fn fanotify_read_to_user(
+    task: u64,
+    gid: u64,
+    max: usize,
+    copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+) -> Result<usize, u64> {
+    let cap = max / crate::mqueue::FAN_EVENT_METADATA_LEN;
     if cap == 0 {
-        return 0;
+        return Ok(0);
     }
     let events = crate::mqueue::fanotify_drain(gid, cap);
-    let mut written = 0usize;
+    let mut resolved = alloc::vec::Vec::with_capacity(events.len());
+    let mut fd_count = 0usize;
     for (path, mask, pid) in events {
-        let fd = fanotify_open_object(task, &path);
-        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
-        buf[written..written + crate::mqueue::FAN_EVENT_METADATA_LEN].copy_from_slice(&meta);
-        written += crate::mqueue::FAN_EVENT_METADATA_LEN;
+        let ops = fanotify_resolve_object(&path);
+        fd_count += usize::from(ops.is_some());
+        resolved.push((ops, mask, pid));
     }
-    written
+    let reserved = fd::with_table(task, |table| table.reserve_fds(fd_count)).unwrap_or_default();
+    if reserved.len() != fd_count {
+        return Err(EFAULT);
+    }
+    let mut reserved_iter = reserved.iter().copied();
+    let mut installs = alloc::vec::Vec::with_capacity(fd_count);
+    let mut staging = alloc::vec::Vec::with_capacity(resolved.len() * crate::mqueue::FAN_EVENT_METADATA_LEN);
+    for (ops, mask, pid) in resolved {
+        let fd = match ops {
+            Some(ops) => {
+                let fd = reserved_iter.next().expect("one reservation per resolved fanotify object");
+                installs.push((fd, ops));
+                fd as i32
+            }
+            None => -1,
+        };
+        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
+        staging.extend_from_slice(&meta);
+    }
+    if let Err(errno) = copy(&staging) {
+        let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
+        return Err(errno);
+    }
+    let installed = fd::with_table(task, |table| {
+        let entries = installs
+            .into_iter()
+            .map(|(fd, ops)| {
+                (
+                    fd,
+                    fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: crate::fd::O_RDONLY,
+                    },
+                )
+            })
+            .collect();
+        table.install_reserved_batch(entries)
+    });
+    if installed != Some(true) {
+        let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
+        return Err(EFAULT);
+    }
+    Ok(staging.len())
 }
 
-/// Resolve `abs` and install a fresh read fd for it in `task`'s table;
-/// returns the fd number, or FAN_NOFD (-1) on failure.
+/// Require every page in a fanotify metadata destination to belong to the
+/// active user address space before entering the guarded copy. x86 keeps a
+/// supervisor-only low-memory identity map live while user CR3 is active;
+/// STAC disables SMAP, so a shape-valid low pointer with no user VMA could
+/// otherwise write that supervisor mapping without faulting. Linux's user
+/// page tables have no such alias and `copy_to_user` returns EFAULT.
+///
+/// This check runs from the copy closure, after fanotify selected/removed the
+/// event and reserved its embedded fd number, preserving Linux's event
+/// consumption ordering. Publication still happens only after the guarded
+/// copy succeeds.
 #[cfg(feature = "linux-compat")]
-fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
+    if len == 0 {
+        return Ok(());
+    }
+    validate_user_range(ptr, len)?;
+    if let Some(aspace) = current_address_space() {
+        let last = ptr + len as u64 - 1;
+        let mut page = ptr & !0xfff;
+        let last_page = last & !0xfff;
+        loop {
+            if !aspace.contains_address(VirtAddr::new(page)) {
+                return Err(EFAULT);
+            }
+            if page == last_page {
+                return Ok(());
+            }
+            page += 0x1000;
+        }
+    }
+
+    // ABI kernel tests have no active user AS and deliberately use kernel
+    // scratch buffers under an explicit scope. Preserve that test-only bridge,
+    // but never let a lower-half address fall through to x86's identity map.
+    #[cfg(feature = "kernel-test")]
+    if kernel_buf_scope::active() && !in_user_half(ptr) {
+        return Ok(());
+    }
+    Err(EFAULT)
+}
+
+#[cfg(feature = "linux-compat")]
+fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
     let root_rel = narf_filesystem::registry()
         .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
-    let (root, rel) = match root_rel {
-        Some(x) => x,
-        None => return -1,
-    };
-    let ops = match poll_blocking(narf_filesystem::resolve_async(root, &rel)) {
-        Some(Ok(o)) => o,
-        _ => return -1,
+    let (root, rel) = root_rel?;
+    poll_blocking(narf_filesystem::resolve_async(root, &rel))?.ok()
+}
+
+/// Resolve `abs` and install a fresh read fd for open_by_handle_at.
+#[cfg(feature = "linux-compat")]
+fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+    let Some(ops) = fanotify_resolve_object(abs) else {
+        return -1;
     };
     match fd::with_table(task, |t| {
         t.open(fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            status_flags: crate::fd::O_RDONLY,
         })
     }) {
         Some(n) => n as i32,
@@ -3084,66 +3172,203 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
 /// table's FileOps. When `in_off_ptr` is non-zero it is a user
 /// pread-style offset pointer (read from, updated, and the fd's own
 /// offset is left untouched); zero uses and advances the fd offset.
-/// Returns the bytes copied, or `None` on a bad fd / fault.
+/// Returns the accepted byte count or the first filesystem error before any
+/// progress. Syscall-specific fd, offset-uaccess, and errno ordering stays in
+/// the sendfile/splice entry modules.
 enum CopyFdError {
     Fs(narf_filesystem::FsError),
-    Fault,
+}
+
+/// One fd-table snapshot held across a sendfile/splice transfer.  Linux's
+/// `fdget()` pins the open file while the syscall runs; cloning the FileOps
+/// Arc gives NARF the same lifetime even if a CLONE_FILES peer closes the
+/// numeric descriptor concurrently. The captured description similarly pins
+/// f_pos and receives every commit directly, so close+numeric-fd reuse cannot
+/// redirect an update to an unrelated file.
+struct CopyFdEndpoint {
+    ops: Arc<dyn narf_filesystem::FileOps>,
+    description: crate::fd::Description,
+    status_flags: u32,
+}
+
+impl CopyFdEndpoint {
+    fn readable(&self) -> bool {
+        self.status_flags & crate::fd::O_PATH == 0
+            && self.status_flags & crate::fd::O_ACCMODE != crate::fd::O_WRONLY
+    }
+
+    fn writable(&self) -> bool {
+        self.status_flags & crate::fd::O_PATH == 0
+            && self.status_flags & crate::fd::O_ACCMODE != crate::fd::O_RDONLY
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.status_flags & crate::fd::O_NONBLOCK != 0
+    }
+
+    fn append(&self) -> bool {
+        self.status_flags & crate::fd::O_APPEND != 0
+    }
+
+    fn is_pipe(&self) -> bool {
+        self.ops.stat().mode.file_type == narf_filesystem::FileType::Fifo
+    }
+}
+
+fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
+    match error {
+        narf_filesystem::FsError::NotFound => 2,
+        narf_filesystem::FsError::PermissionDenied => 13,
+        narf_filesystem::FsError::OperationNotPermitted => 1,
+        narf_filesystem::FsError::Io(_) => 5,
+        narf_filesystem::FsError::InvalidPath
+        | narf_filesystem::FsError::InvalidData
+        | narf_filesystem::FsError::Unsupported => 22,
+        narf_filesystem::FsError::CrossDevice => 18,
+        narf_filesystem::FsError::Busy => 16,
+        narf_filesystem::FsError::ReadOnly => 30,
+        narf_filesystem::FsError::NoSpace => 28,
+        narf_filesystem::FsError::QuotaExceeded => 122,
+        narf_filesystem::FsError::BrokenPipe => 32,
+        narf_filesystem::FsError::BadFd => 9,
+        narf_filesystem::FsError::WouldBlock => EAGAIN_CODE as i64,
+    }
+}
+
+const LINUX_MAX_RW_COUNT: usize = 0x7fff_f000;
+const LINUX_IOV_MAX: usize = 1024;
+
+/// Linux `access_ok()` shape for read/write buffers, without NARF's generic
+/// 16-MiB single-copy allocation cap. Large I/O is staged in bounded chunks;
+/// range validation must still cover the caller's original count before fd
+/// state or a destructive stream is touched.
+fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
+    // access_ok(NULL, 0) succeeds, while a zero-length address outside the
+    // user half still fails. The generic helper deliberately rejects NULL for
+    // pointer-bearing structures, so preserve this syscall-specific rule.
+    if len == 0 && ptr == 0 {
+        return Ok(());
+    }
+    let Some(end) = ptr.checked_add(len as u64) else {
+        return Err(EFAULT);
+    };
+    let last = if len == 0 { ptr } else { end - 1 };
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        if !in_user_half(ptr) || !in_user_half(last) {
+            #[cfg(feature = "kernel-test")]
+            if kernel_buf_scope::active()
+                && canonical(ptr)
+                && canonical(last)
+                && (ptr >> 63) == (last >> 63)
+            {
+                return Ok(());
+            }
+            return Err(EFAULT);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Copy, Clone)]
+struct ImportedRwIovec {
+    base: u64,
+    len: usize,
+}
+
+fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
+    if iovcnt == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    if iovcnt > LINUX_IOV_MAX {
+        return Err(22); // EINVAL
+    }
+    // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
+    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    let mut out = alloc::vec::Vec::with_capacity(iovcnt);
+    let mut remaining = LINUX_MAX_RW_COUNT;
+    for slot in raw.chunks_exact(16) {
+        let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
+        let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
+        validate_rw_user_range(base, requested)?;
+        let len = core::cmp::min(requested, remaining);
+        remaining -= len;
+        out.push(ImportedRwIovec { base, len });
+    }
+    Ok(out)
+}
+
+fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
+    fd::with_table(task, |table| {
+        let entry = table.get(fd_num)?;
+        Some(CopyFdEndpoint {
+            ops: entry.ops.clone(),
+            description: table.description(fd_num)?,
+            status_flags: table.status_flags(fd_num)?,
+        })
+    })
+    .flatten()
 }
 
 fn copy_fd_to_fd(
-    task: u64,
-    in_fd: u32,
-    out_fd: u32,
-    in_off_ptr: u64,
-    out_off_ptr: u64,
+    input: &CopyFdEndpoint,
+    output: &CopyFdEndpoint,
+    explicit_in_off: Option<u64>,
+    explicit_out_off: Option<u64>,
     count: usize,
-) -> Option<Result<usize, CopyFdError>> {
-    let use_off_ptr = in_off_ptr != 0;
-    let mut in_off: u64 = if use_off_ptr {
-        // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
-        // range-validates the 8-byte read.
-        let b = match unsafe { copy_from_user_vec(in_off_ptr, 8) } {
-            Ok(bytes) => bytes,
-            Err(_) => return Some(Err(CopyFdError::Fault)),
-        };
-        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    } else {
-        0
-    };
-    let use_out_off_ptr = out_off_ptr != 0;
-    let mut out_off: u64 = if use_out_off_ptr {
-        // SAFETY: same guarded `off_t*` input contract as `in_off_ptr`.
-        let b = match unsafe { copy_from_user_vec(out_off_ptr, 8) } {
-            Ok(bytes) => bytes,
-            Err(_) => return Some(Err(CopyFdError::Fault)),
-        };
-        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    } else {
-        0
-    };
+) -> Result<usize, CopyFdError> {
+    let use_off_ptr = explicit_in_off.is_some();
+    let use_out_off_ptr = explicit_out_off.is_some();
+    let same_description = Arc::ptr_eq(&input.description, &output.description);
 
-    // Snapshot the file objects and implicit positions, then drop the fd-table
-    // lock before any FileOps poll. A genuinely asynchronous filesystem may
-    // park in poll_blocking; doing that under the IRQ-disabling table lock
-    // deadlocks its completion path and every CLONE_FILES peer.
-    let snapshot = fd::with_table(task, |t| {
-        let input = t.get(in_fd)?;
-        let output = t.get(out_fd)?;
-        Some((
-            input.ops.clone(),
-            output.ops.clone(),
-            input.offset,
-            output.offset,
-        ))
-    })
-    .flatten()?;
-    let (input_ops, output_ops, input_offset, output_offset) = snapshot;
-    if !use_off_ptr {
-        in_off = input_offset;
+    // Linux locks each `struct file::f_pos` across the complete positioned
+    // transfer. Acquire distinct descriptions by stable address order so two
+    // opposite-direction copies cannot ABBA deadlock; aliases lock once.
+    let mut input_position_guard = None;
+    let mut output_position_guard = None;
+    if !use_off_ptr && !use_out_off_ptr && !same_description {
+        let input_key = Arc::as_ptr(&input.description) as usize;
+        let output_key = Arc::as_ptr(&output.description) as usize;
+        if input_key < output_key {
+            input_position_guard = poll_blocking(input.description.position_lock.lock());
+            if input_position_guard.is_some() {
+                output_position_guard = poll_blocking(output.description.position_lock.lock());
+            }
+        } else {
+            output_position_guard = poll_blocking(output.description.position_lock.lock());
+            if output_position_guard.is_some() {
+                input_position_guard = poll_blocking(input.description.position_lock.lock());
+            }
+        }
+        if input_position_guard.is_none() || output_position_guard.is_none() {
+            return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+        }
+    } else if (!use_off_ptr || !use_out_off_ptr) && same_description {
+        input_position_guard = poll_blocking(input.description.position_lock.lock());
+        if input_position_guard.is_none() {
+            return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+        }
+    } else {
+        if !use_off_ptr {
+            input_position_guard = poll_blocking(input.description.position_lock.lock());
+            if input_position_guard.is_none() {
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+            }
+        }
+        if !use_out_off_ptr {
+            output_position_guard = poll_blocking(output.description.position_lock.lock());
+            if output_position_guard.is_none() {
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+            }
+        }
     }
-    if !use_out_off_ptr {
-        out_off = output_offset;
-    }
+
+    // Snapshot implicit positions only after their serialization lock is held.
+    // Explicit-offset sides neither read nor modify the shared cursor.
+    let mut in_off = explicit_in_off.unwrap_or_else(|| input.description.offset());
+    let mut out_off = explicit_out_off.unwrap_or_else(|| output.description.offset());
+    let input_ops = &input.ops;
+    let output_ops = &output.ops;
 
     let mut total = 0usize;
     // Transfer granularity for splice/sendfile/copy_file_range. Sized to a
@@ -3179,7 +3404,7 @@ fn copy_fd_to_fd(
                 Ok(n) => n,
                 Err(error) => {
                     if total == 0 {
-                        return Some(Err(CopyFdError::Fs(error)));
+                        return Err(CopyFdError::Fs(error));
                     }
                     break;
                 }
@@ -3200,34 +3425,33 @@ fn copy_fd_to_fd(
         let moved = match moved {
             Ok(moved) => moved,
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                return Some(Err(CopyFdError::Fs(
-                    narf_filesystem::FsError::WouldBlock,
-                )));
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::WouldBlock));
             }
-            Err(error) if total == 0 => return Some(Err(CopyFdError::Fs(error))),
+            Err(error) if total == 0 => return Err(CopyFdError::Fs(error)),
             Err(_) => break,
         };
 
-        // Commit implicit file positions only after the sink accepted the
-        // prefix. This lock section contains no FileOps call and cannot park.
+        // Commit to the pinned descriptions, never by numeric fd. A concurrent
+        // close+reuse cannot redirect cursor updates to an unrelated file.
         if !use_off_ptr || !use_out_off_ptr {
-            let _ = fd::with_table(task, |t| {
-                if in_fd == out_fd {
-                    let entry = t.get_mut(in_fd)?;
-                    // Linux's two local positions advance by the same accepted
-                    // byte count and are copied back to one f_pos, not summed.
-                    entry.offset = entry.offset.saturating_add(moved as u64);
-                } else {
-                    let (input, output) = t.get_pair_mut(in_fd, out_fd)?;
-                    if !use_off_ptr {
-                        input.offset = input.offset.saturating_add(moved as u64);
-                    }
-                    if !use_out_off_ptr {
-                        output.offset = output.offset.saturating_add(moved as u64);
-                    }
+            if same_description && !use_off_ptr && !use_out_off_ptr {
+                // Both local cursors started together and advanced by the same
+                // accepted prefix; one shared f_pos is advanced once.
+                input
+                    .description
+                    .set_offset(in_off.saturating_add(moved as u64));
+            } else {
+                if !use_off_ptr {
+                    input
+                        .description
+                        .set_offset(in_off.saturating_add(moved as u64));
                 }
-                Some(())
-            });
+                if !use_out_off_ptr {
+                    output
+                        .description
+                        .set_offset(out_off.saturating_add(moved as u64));
+                }
+            }
         }
         total += moved;
         in_off = in_off.saturating_add(moved as u64);
@@ -3237,21 +3461,7 @@ fn copy_fd_to_fd(
         }
     }
 
-    if use_off_ptr {
-        // SAFETY: `in_off_ptr` is the user `off_t*` (non-zero); copy_to_user
-        // range-validates the 8-byte write-back of the advanced offset.
-        if unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) }.is_err() {
-            return Some(Err(CopyFdError::Fault));
-        }
-    }
-    if use_out_off_ptr {
-        // SAFETY: `out_off_ptr` was range-validated by the initial guarded
-        // read; a racing unmap is still caught by the guarded write-back.
-        if unsafe { copy_to_user(out_off_ptr, &out_off.to_ne_bytes()) }.is_err() {
-            return Some(Err(CopyFdError::Fault));
-        }
-    }
-    Some(Ok(total))
+    Ok(total)
 }
 
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
@@ -4245,11 +4455,7 @@ fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
     } else {
         policy.nodemask & allowed
     };
-    if effective == 0 {
-        allowed
-    } else {
-        effective
-    }
+    if effective == 0 { allowed } else { effective }
 }
 
 fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
@@ -5589,6 +5795,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_PARENT: u64 = 0x0000_8000;
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
     const CLONE_NEWUSER: u64 = 0x1000_0000;
     const CLONE_NEWPID: u64 = 0x2000_0000;
 
@@ -5630,6 +5837,9 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
         return Err(EINVAL);
     }
     if ca.flags & CLONE_FS != 0 && ca.flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_NEWIPC != 0 && ca.flags & CLONE_SYSVSEM != 0 {
         return Err(EINVAL);
     }
     if ca.flags & CLONE_THREAD != 0 && ca.flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 {
@@ -5704,7 +5914,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     let share_fs = (flags & CLONE_FS) != 0;
     let _share_files = (flags & CLONE_FILES) != 0;
     let share_sighand = (flags & CLONE_SIGHAND) != 0;
-    let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
+    let share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
 
     // No-VM (fork-shaped) path: redirect to sys_fork's machinery.
     // The clone_args fields not consumed by fork are accepted-and-
@@ -5835,6 +6045,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     } else {
         crate::alloc_pid().raw()
     };
+    #[cfg(feature = "linux-compat")]
+    if !share_thread {
+        crate::sysvipc::clone_sem_undo(
+            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+            child_visible_pid,
+            share_sysvsem,
+        );
+    }
 
     // Parent-of bookkeeping MUST be published BEFORE the child is spawned (a
     // new *process*; threads are not waitpid-reapable). `spawn_user_process*`
@@ -6241,6 +6459,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // This is the publication point for the child. Everything keyed by its
     // TaskId, including the copied fd table used by the immediate executor
     // fexecve, has been installed above.
+    #[cfg(feature = "linux-compat")]
+    if !share_thread {
+        shm_fork_process(&parent_as, &child_as, child_visible_pid, share_vm);
+    }
     pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
 
@@ -6291,25 +6513,25 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             #[cfg(target_arch = "aarch64")]
             if !narf_scheduler::stackful::user_own_stack_enabled() {
                 if let Some(hook) = crate::user_task::yield_hook() {
-                // aarch64 uses the polling-future path: keep the parent's
-                // saved syscall return parked until vfork_child_release calls
-                // wake_signal and clears this infinite deadline.
-                // SAFETY: uctx is the live poller-owned context and hook
-                // longjmps back through its installed JmpBuf.
-                let uc = unsafe { &*uctx };
-                uc.sleep_deadline_ns
-                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
-                if vfork_is_pending(child_visible_pid) {
-                    // SAFETY: `uc` and the legacy JmpBuf remain live for this
-                    // poll; the hook diverges back to that saved continuation.
-                    unsafe {
-                        ctx.save_user_state(uc.state.get() as *mut u8);
-                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                        hook(uctx);
+                    // aarch64 uses the polling-future path: keep the parent's
+                    // saved syscall return parked until vfork_child_release calls
+                    // wake_signal and clears this infinite deadline.
+                    // SAFETY: uctx is the live poller-owned context and hook
+                    // longjmps back through its installed JmpBuf.
+                    let uc = unsafe { &*uctx };
+                    uc.sleep_deadline_ns
+                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                    if vfork_is_pending(child_visible_pid) {
+                        // SAFETY: `uc` and the legacy JmpBuf remain live for this
+                        // poll; the hook diverges back to that saved continuation.
+                        unsafe {
+                            ctx.save_user_state(uc.state.get() as *mut u8);
+                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                            hook(uctx);
+                        }
                     }
-                }
-                uc.sleep_deadline_ns
-                    .store(0, core::sync::atomic::Ordering::Release);
+                    uc.sleep_deadline_ns
+                        .store(0, core::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -6697,6 +6919,8 @@ pub fn wait_init() {
     // the OCI teardown #UD).
     #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
+    #[cfg(feature = "linux-compat")]
+    crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
@@ -6958,11 +7182,7 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
     }
-    if is_waitid {
-        0
-    } else {
-        reaped_visible as u64
-    }
+    if is_waitid { 0 } else { reaped_visible as u64 }
 }
 
 /// Per-task-own-stack blocking wait4/waitid: reap-or-park loop that returns the
@@ -9299,14 +9519,7 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
 
 #[cfg(feature = "container")]
 fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
-    if let Some(ns) = crate::namespaces::current_ipc_ns(task) {
-        return ns;
-    }
-    // Lazy-install a per-task IPC NS so the get-by-key family has a
-    // stable id space even for tasks that never unshared. Matches the
-    // shape Linux uses (every task is always in some IPC NS).
-    crate::namespaces::unshare_ipc(task);
-    crate::namespaces::current_ipc_ns(task).expect("unshare_ipc just installed an entry")
+    crate::namespaces::current_ipc_namespace(task)
 }
 
 // ── System V shared memory (linux-compat) ────────────────────────────
@@ -9323,6 +9536,11 @@ struct ShmSegment {
     handle: u64,
     key: u32,
     len: u64,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u32,
     /// Creator's OUTER ProcessId (shmid_ds.shm_cpid), set at shmget.
     cpid: u64,
     /// OUTER ProcessId of the last shmat (shmid_ds.shm_lpid); 0 until the
@@ -9330,13 +9548,57 @@ struct ShmSegment {
     /// IPC_STAT. shmdt unmaps by address (no shmid in hand) so it is not
     /// tracked as a last-op here.
     lpid: u64,
+    atime: i64,
+    dtime: i64,
+    ctime: i64,
+    nattch: u64,
+    /// `IPC_RMID` removes the id/key immediately but retains the backing and
+    /// metadata until the last live (or in-progress) attachment is gone.
+    removed: bool,
 }
 
 #[cfg(feature = "linux-compat")]
+#[derive(Clone)]
+struct ShmAttachment {
+    ipc_ns: u64,
+    shmid: u64,
+    /// Original address passed to `shmdt`. `SHM_REMAP` may punch this mapping
+    /// into fragments, which remain one logical attachment.
+    base: u64,
+    fragments: alloc::vec::Vec<(u64, u64)>,
+}
+
+#[cfg(feature = "linux-compat")]
+type ShmAttachmentMap =
+    alloc::collections::BTreeMap<(u64, u64), alloc::vec::Vec<ShmAttachment>>;
+#[cfg(feature = "linux-compat")]
+type ShmAddressSpaceOwners =
+    alloc::collections::BTreeMap<u64, alloc::collections::BTreeSet<u64>>;
+#[cfg(feature = "linux-compat")]
+type ShmObjectKey = (u64, u64); // (IPC namespace id, namespace-local shmid)
+
+#[cfg(feature = "linux-compat")]
 static SHM_SEGMENTS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, ShmSegment>>,
+    Option<alloc::collections::BTreeMap<ShmObjectKey, ShmSegment>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 #[cfg(feature = "linux-compat")]
+static SHM_ATTACHMENTS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmAttachmentMap>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+static SHM_AS_OWNERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmAddressSpaceOwners>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+type ShmMappingTransactions = alloc::collections::BTreeMap<
+    u64,
+    alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>>,
+>;
+#[cfg(feature = "linux-compat")]
+static SHM_MAPPING_TRANSACTIONS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmMappingTransactions>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(all(feature = "linux-compat", not(feature = "container")))]
 static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "linux-compat")]
@@ -9346,9 +9608,378 @@ const IPC_EXCL: u64 = 0o2000;
 #[cfg(feature = "linux-compat")]
 const IPC_RMID: u64 = 0;
 #[cfg(feature = "linux-compat")]
-const IPC_64: u64 = 0x100;
+const IPC_SET: u64 = 1;
+#[cfg(feature = "linux-compat")]
+const IPC_STAT: u64 = 2;
 #[cfg(feature = "linux-compat")]
 const SHM_RDONLY: u64 = 0o10000;
+#[cfg(feature = "linux-compat")]
+const SHM_RND: u64 = 0o20000;
+#[cfg(feature = "linux-compat")]
+const SHM_REMAP: u64 = 0o40000;
+#[cfg(feature = "linux-compat")]
+const SHM_EXEC: u64 = 0o100000;
+#[cfg(feature = "linux-compat")]
+const SHMLBA: u64 = 4096;
+
+#[cfg(feature = "linux-compat")]
+fn shm_now_seconds() -> i64 {
+    narf_scheduler::narf_time::now_wall().secs
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_as_key(as_ref: &Arc<AddressSpace>) -> u64 {
+    shm_as_key_ref(as_ref)
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_as_key_ref(as_ref: &AddressSpace) -> u64 {
+    let root = as_ref.root.as_u64();
+    if root != 0 {
+        root
+    } else {
+        as_ref as *const AddressSpace as usize as u64
+    }
+}
+
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+fn current_shm_ipc_ns() -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
+    crate::namespaces::current_ipc_namespace(current_task_id())
+}
+
+#[cfg(all(feature = "linux-compat", not(feature = "container")))]
+fn current_shm_ipc_ns_id() -> u64 {
+    0
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_register_as_owner(as_key: u64, pid: u64) {
+    SHM_AS_OWNERS
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(as_key)
+        .or_default()
+        .insert(pid);
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_mapping_transaction(
+    as_key: u64,
+) -> alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>> {
+    SHM_MAPPING_TRANSACTIONS
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(as_key)
+        .or_insert_with(|| alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(())))
+        .clone()
+}
+
+/// Mirror Linux `shm_open` across fork. A separate address space gets one
+/// additional logical attachment for every inherited mapping; `CLONE_VM`
+/// merely adds another process owner of the same mm and does not change
+/// `shm_nattch`.
+#[cfg(feature = "linux-compat")]
+fn shm_fork_process(
+    parent_as: &Arc<AddressSpace>,
+    child_as: &Arc<AddressSpace>,
+    child_pid: u64,
+    share_vm: bool,
+) {
+    let parent_key = shm_as_key(parent_as);
+    let child_key = shm_as_key(child_as);
+    let parent_tracked = SHM_AS_OWNERS
+        .lock()
+        .as_ref()
+        .is_some_and(|owners| owners.contains_key(&parent_key));
+    if !parent_tracked {
+        return;
+    }
+    let mapping_transaction = shm_mapping_transaction(parent_key);
+    let _mapping_guard = mapping_transaction.lock();
+    shm_register_as_owner(child_key, child_pid);
+    if share_vm {
+        return;
+    }
+
+    let inherited = {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let inherited: alloc::vec::Vec<_> = map
+            .iter()
+            .filter(|((as_key, _), _)| *as_key == parent_key)
+            .flat_map(|((_, base), entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| (*base, entry))
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+            .collect();
+        for (base, entry) in &inherited {
+            map.entry((child_key, *base))
+                .or_default()
+                .push(entry.clone());
+        }
+        inherited
+    };
+    let mut segments = SHM_SEGMENTS.lock();
+    let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+    for (_, attachment) in inherited {
+        if let Some(seg) = map.get_mut(&(attachment.ipc_ns, attachment.shmid)) {
+            seg.nattch = seg.nattch.saturating_add(1);
+        }
+    }
+}
+
+/// Process-exit half of Linux `exit_shm`: only the final process sharing an
+/// address space closes its inherited logical attachments.
+#[cfg(feature = "linux-compat")]
+pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
+    let closing_keys = {
+        let mut owners = SHM_AS_OWNERS.lock();
+        let map = owners.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let mut closing = alloc::vec::Vec::new();
+        let keys: alloc::vec::Vec<_> = map.keys().copied().collect();
+        for key in keys {
+            let remove = map.get_mut(&key).is_some_and(|pids| {
+                pids.remove(&pid);
+                pids.is_empty()
+            });
+            if remove {
+                map.remove(&key);
+                closing.push(key);
+            }
+        }
+        closing
+    };
+    if closing_keys.is_empty() {
+        return;
+    }
+    // `closing_keys` follows BTreeMap key order, giving multi-mm teardown a
+    // stable lock order even for synthetic tests that associate one pid with
+    // more than one address space.
+    let mapping_transactions: alloc::vec::Vec<_> = closing_keys
+        .iter()
+        .map(|key| shm_mapping_transaction(*key))
+        .collect();
+    let mapping_guards: alloc::vec::Vec<_> = mapping_transactions
+        .iter()
+        .map(|transaction| transaction.lock())
+        .collect();
+    let detached = {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let keys: alloc::vec::Vec<_> = map
+            .keys()
+            .filter(|(as_key, _)| closing_keys.contains(as_key))
+            .copied()
+            .collect();
+        keys.into_iter()
+            .flat_map(|key| map.remove(&key).unwrap_or_default())
+            .map(|attachment| (attachment.ipc_ns, attachment.shmid))
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let now = shm_now_seconds();
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        for object in detached {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.nattch = seg.nattch.saturating_sub(1);
+            seg.lpid = pid;
+            seg.dtime = now;
+            if seg.removed && seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+    drop(mapping_guards);
+    let mut transactions = SHM_MAPPING_TRANSACTIONS.lock();
+    if let Some(map) = transactions.as_mut() {
+        for key in closing_keys {
+            map.remove(&key);
+        }
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
+    // Linux ipcperms collapses owner/group/other request bits into one rwx
+    // mask before comparing it with the caller-selected permission class.
+    let request = ((request >> 6) | (request >> 3) | request) & 0o7;
+    let cred = current_ucred();
+    if cred.uid == 0 {
+        return true;
+    }
+    let groups = current_groups();
+    let granted = if cred.uid == seg.uid || cred.uid == seg.cuid {
+        (seg.mode >> 6) & 0o7
+    } else if cred.gid == seg.gid
+        || cred.gid == seg.cgid
+        || groups.contains(&seg.gid)
+        || groups.contains(&seg.cgid)
+    {
+        (seg.mode >> 3) & 0o7
+    } else {
+        seg.mode & 0o7
+    };
+    granted & request == request
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_ipc_owner(seg: &ShmSegment) -> bool {
+    let uid = current_ucred().uid;
+    uid == 0 || uid == seg.uid || uid == seg.cuid
+}
+
+/// Drop an in-progress attach reservation. If `IPC_RMID` raced the mapping,
+/// the final reservation owns destruction of the now-unreachable backing.
+#[cfg(feature = "linux-compat")]
+fn shm_cancel_attach(object: ShmObjectKey) {
+    let destroy = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let Some(seg) = map.get_mut(&object) else {
+            return;
+        };
+        seg.nattch = seg.nattch.saturating_sub(1);
+        if seg.removed && seg.nattch == 0 {
+            map.remove(&object).map(|seg| seg.handle)
+        } else {
+            None
+        }
+    };
+    if let (Some(handle), Some(vtable)) = (destroy, shmem_vtable()) {
+        if handle != 0 {
+            (vtable.destroy)(handle);
+        }
+    }
+}
+
+/// Account for mappings displaced by `SHM_REMAP`. Fully covered logical
+/// attachments detach; partially covered ones retain the surviving fragments
+/// so a later `shmdt(original_base)` still finds and removes them.
+#[cfg(feature = "linux-compat")]
+fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
+    let mut detached_ids = alloc::vec::Vec::new();
+    {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let keys: alloc::vec::Vec<_> = map
+            .keys()
+            .filter(|(key, _)| *key == as_key)
+            .copied()
+            .collect();
+        for key in keys {
+            let Some(entries) = map.remove(&key) else {
+                continue;
+            };
+            let mut surviving = alloc::vec::Vec::new();
+            for mut attachment in entries {
+                let mut kept = alloc::vec::Vec::new();
+                for &(base, len) in &attachment.fragments {
+                    let end = base.saturating_add(len);
+                    if end <= lo || base >= hi {
+                        kept.push((base, len));
+                        continue;
+                    }
+                    if base < lo {
+                        kept.push((base, lo - base));
+                    }
+                    if end > hi {
+                        kept.push((hi, end - hi));
+                    }
+                }
+                attachment.fragments = kept;
+                if attachment.fragments.is_empty() {
+                    detached_ids.push((attachment.ipc_ns, attachment.shmid));
+                } else {
+                    surviving.push(attachment);
+                }
+            }
+            if !surviving.is_empty() {
+                map.insert(key, surviving);
+            }
+        }
+    }
+    if detached_ids.is_empty() {
+        return;
+    }
+    let now = shm_now_seconds();
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        for object in detached_ids {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.nattch = seg.nattch.saturating_sub(1);
+            seg.lpid = lpid;
+            seg.dtime = now;
+            if seg.removed && seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
+
+/// Final `ipc_namespace` teardown removes every public id immediately. SHM
+/// mappings survive exactly as Linux VMAs do; their namespace-qualified
+/// attachment records retain the backing until final detach/process exit.
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let objects: alloc::vec::Vec<_> = map
+            .keys()
+            .filter(|(namespace, _)| *namespace == ipc_ns)
+            .copied()
+            .collect();
+        for object in objects {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.removed = true;
+            seg.key = 0;
+            if seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
 
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 

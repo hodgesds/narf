@@ -1065,6 +1065,57 @@ fn read_current(cg: &Arc<dyn DirOps>) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Test-only heap backend installed for the exact negative-uncharge call. It
+/// delegates to the production slab while counting GlobalAlloc entries, so the
+/// regression detects any present or future `Vec`/Box/String construction in
+/// the direct-reclaim accounting path without adding a production hot-path
+/// diagnostic branch.
+#[cfg(feature = "cgroup-memory")]
+#[derive(Debug)]
+struct UnchargeCountingHeap {
+    allocs: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "cgroup-memory")]
+impl UnchargeCountingHeap {
+    const fn new() -> Self {
+        Self {
+            allocs: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn alloc_count(&self) -> u64 {
+        self.allocs.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "cgroup-memory")]
+impl narf_memory::HeapBackend for UnchargeCountingHeap {
+    fn name(&self) -> &'static str {
+        "cgroup-uncharge-counting-test"
+    }
+
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        self.allocs
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match narf_memory::slab::alloc(layout) {
+            Ok(ptr) => ptr.as_ptr(),
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        if let Some(ptr) = core::ptr::NonNull::new(ptr) {
+            // SAFETY: the global allocator supplies the same pointer/layout
+            // pair returned by `alloc`, which delegates to this slab.
+            unsafe { narf_memory::slab::dealloc(ptr, layout) };
+        }
+    }
+}
+
+#[cfg(feature = "cgroup-memory")]
+static UNCHARGE_COUNTING_HEAP: UnchargeCountingHeap = UnchargeCountingHeap::new();
+
 // ── charge_hook re-entrancy guard ───────────────────────────────────
 //
 // A nested `charge_hook` entry (the guard already raised, as happens
@@ -1127,6 +1178,64 @@ fn smoke_cgroup_charge_reentrancy_guard() -> TestResult {
 }
 #[cfg(feature = "cgroup-memory")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_charge_reentrancy_guard);
+
+// Returning a slab frame during GlobalAlloc direct reclaim invokes the
+// negative charge hook. That call must perform accounting without entering the
+// global allocator, or the failed allocation recursively starts another
+// allocation/reclaim cycle. Install a counting delegating backend for exactly
+// the uncharge window and assert zero allocator entries.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_uncharge_is_allocation_free() -> TestResult {
+    use crate::cgroupfs::memory;
+    use narf_capabilities::{Cap, Grant};
+    use narf_memory::{install_heap_backend, HeapAuthority, SLAB_BACKEND};
+
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_mem_uncharge_noalloc", |cg| {
+        let pid: u64 = 4_200_000_005;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        if !memory::charge_hook_for_test(pid, 4096) {
+            task_exited(pid);
+            return TestResult::Fail("setup charge was denied");
+        }
+        let charged = read_current(cg);
+        let cap: Cap<HeapAuthority, Grant> = Cap::<HeapAuthority, Grant>::bootstrap();
+        if install_heap_backend(&cap, &UNCHARGE_COUNTING_HEAP).is_err() {
+            let _ = memory::charge_hook_for_test(pid, -4096);
+            task_exited(pid);
+            return TestResult::Fail("could not install counting heap");
+        }
+        let allocs_before = UNCHARGE_COUNTING_HEAP.alloc_count();
+        let allowed = memory::charge_hook_for_test(pid, -4096);
+        let allocs_after = UNCHARGE_COUNTING_HEAP.alloc_count();
+
+        // Restore the production backend before any formatted read or cleanup,
+        // including failure reporting, can allocate.
+        let restored = install_heap_backend(&cap, &SLAB_BACKEND).is_ok();
+        let after = read_current(cg);
+        task_exited(pid);
+        if !restored {
+            return TestResult::Fail("could not restore production slab backend");
+        }
+        if !allowed {
+            return TestResult::Fail("negative charge hook rejected an uncharge");
+        }
+        if allocs_after != allocs_before {
+            return TestResult::Fail("negative uncharge entered GlobalAlloc");
+        }
+        if after != charged.saturating_sub(4096) {
+            return TestResult::Fail("allocation-free uncharge changed the wrong byte count");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_uncharge_is_allocation_free
+);
 
 // A membership BTreeMap insertion/removal may allocate while TASK_CGROUP is
 // locked. The allocator's charge hook must bypass cgroup bookkeeping memory;
@@ -1360,11 +1469,13 @@ fn smoke_cgroup_memory_high_triggers_reclaim() -> TestResult {
     crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
 
     // Arm the mock shrinker so `try_to_free` -> `shrink_all` consults it.
-    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+    if !narf_memory::reclaim::__register_shrinker_first_for_test(narf_memory::reclaim::Shrinker {
         name: "cgroup-high-test",
         count: high_reclaim_count,
         scan: high_reclaim_scan,
-    });
+    }) {
+        return TestResult::Fail("shrinker registry full");
+    }
     HIGH_RECLAIM_SCANS.store(0, Ordering::Relaxed);
 
     let out = with_root_controller("memory", "t_mem_high", |cg| {
@@ -1465,11 +1576,13 @@ fn smoke_cgroup_memory_max_reclaim_then_oom() -> TestResult {
     use crate::cgroupfs::memory;
     crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
 
-    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+    if !narf_memory::reclaim::__register_shrinker_first_for_test(narf_memory::reclaim::Shrinker {
         name: "cgroup-max-test",
         count: max_reclaim_count,
         scan: max_reclaim_scan,
-    });
+    }) {
+        return TestResult::Fail("shrinker registry full");
+    }
     narf_memory::oom::register_oom_killer(&NO_VICTIM_OOM_KILLER);
     MAX_RECLAIM_SCANS.store(0, Ordering::Relaxed);
     MAX_OOM_CONSULTED.store(false, Ordering::Relaxed);
@@ -1577,11 +1690,13 @@ fn smoke_cgroup_memory_max_reclaim_relieves() -> TestResult {
     use crate::cgroupfs::{memory, with_chain_states};
     crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
 
-    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+    if !narf_memory::reclaim::__register_shrinker_first_for_test(narf_memory::reclaim::Shrinker {
         name: "cgroup-relief-test",
         count: relief_reclaim_count,
         scan: relief_reclaim_scan,
-    });
+    }) {
+        return TestResult::Fail("shrinker registry full");
+    }
 
     let out = with_root_controller("memory", "t_mem_relief", |cg| {
         let pid: u64 = 4_200_000_012;

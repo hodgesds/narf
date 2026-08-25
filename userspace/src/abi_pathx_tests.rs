@@ -2087,7 +2087,7 @@ fn smoke_abi_pathx_getdents64_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents64_pos);
+kernel_test_in!("syscall_abi/getdents", smoke_abi_pathx_getdents64_pos);
 
 fn smoke_abi_pathx_getdents64_neg() -> TestResult {
     with_setup(|| {
@@ -2103,7 +2103,53 @@ fn smoke_abi_pathx_getdents64_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents64_neg);
+kernel_test_in!("syscall_abi/getdents", smoke_abi_pathx_getdents64_neg);
+
+fn smoke_abi_pathx_getdents64_errno_order_and_small_buffer() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    with_memfs("/p2", "p2", &[("a", b"x")], || {
+        let dfd = open_fd(b"/p2\0")?;
+        let regular = open_fd(b"/p2/a\0")?;
+        let mut too_small = [0u8; 23];
+
+        if call(Syscall::Getdents64.raw(), a2(9292, BAD_PTR, 256)) != Some(EBADF) {
+            return Err("getdents64 must resolve a bad fd before touching dirp");
+        }
+        if call(Syscall::Getdents64.raw(), a2(regular as u64, BAD_PTR, 256)) != Some(ENOTDIR) {
+            return Err("getdents64 non-directory fd must return ENOTDIR before dirp fault");
+        }
+        if call(Syscall::Getdents64.raw(), a2(dfd as u64, BAD_PTR, 256)) != Some(EFAULT) {
+            return Err("getdents64 bad output pointer must return EFAULT");
+        }
+        if call(
+            Syscall::Getdents64.raw(),
+            a2(
+                dfd as u64,
+                too_small.as_mut_ptr() as u64,
+                too_small.len() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getdents64 first record that cannot fit must return EINVAL");
+        }
+        if call(
+            Syscall::Getdents64.raw(),
+            a2(
+                dfd as u64,
+                too_small.as_mut_ptr() as u64,
+                (1u64 << 32) | too_small.len() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getdents64 count must use the native unsigned-int width");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/getdents",
+    smoke_abi_pathx_getdents64_errno_order_and_small_buffer
+);
 
 // ── getdents (legacy 32-bit-offset dirfd, buf, count) → bytes / -1 ──
 //
@@ -2152,7 +2198,7 @@ fn smoke_abi_pathx_getdents_pos() -> TestResult {
     })
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_pos);
+kernel_test_in!("syscall_abi/getdents", smoke_abi_pathx_getdents_pos);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_pathx_getdents_neg() -> TestResult {
@@ -2169,7 +2215,55 @@ fn smoke_abi_pathx_getdents_neg() -> TestResult {
     })
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_neg);
+kernel_test_in!("syscall_abi/getdents", smoke_abi_pathx_getdents_neg);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_pathx_getdents_errno_order_and_small_buffer() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    with_memfs("/p2", "p2", &[("a", b"x")], || {
+        let dfd = open_fd(b"/p2\0")?;
+        let regular = open_fd(b"/p2/a\0")?;
+        let mut too_small = [0u8; 23];
+
+        if call(Syscall::Getdents.raw(), a2(9292, BAD_PTR, 256)) != Some(EBADF) {
+            return Err("getdents must resolve a bad fd before touching dirp");
+        }
+        if call(Syscall::Getdents.raw(), a2(regular as u64, BAD_PTR, 256)) != Some(ENOTDIR) {
+            return Err("getdents non-directory fd must return ENOTDIR before dirp fault");
+        }
+        if call(Syscall::Getdents.raw(), a2(dfd as u64, BAD_PTR, 256)) != Some(EFAULT) {
+            return Err("getdents bad output pointer must return EFAULT");
+        }
+        if call(
+            Syscall::Getdents.raw(),
+            a2(
+                dfd as u64,
+                too_small.as_mut_ptr() as u64,
+                too_small.len() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getdents first record that cannot fit must return EINVAL");
+        }
+        if call(
+            Syscall::Getdents.raw(),
+            a2(
+                dfd as u64,
+                too_small.as_mut_ptr() as u64,
+                (1u64 << 32) | too_small.len() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getdents count must use the native unsigned-int width");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/getdents",
+    smoke_abi_pathx_getdents_errno_order_and_small_buffer
+);
 
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //

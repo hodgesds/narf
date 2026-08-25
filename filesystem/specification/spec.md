@@ -138,7 +138,9 @@ so a peer that opens and closes before the waiter runs still completes the
 blocking `open`. A read-only handle opened before any writer suppresses
 `POLLHUP` until its own writer-presence snapshot changes, matching Linux's
 per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the ordinary per-file
-readiness cell.
+readiness cell. `FifoHandle::vmsplice_to_user` holds the observed queue prefix
+through its copy callback and consumes it only after success, so a failed user
+copy neither discards nor reorders named-FIFO data.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
@@ -626,6 +628,10 @@ without creating the snapshot.
 `FsError::QuotaExceeded` is the storage-independent hard-quota failure and maps
 to Linux `EDQUOT`. It remains distinct from `FsError::NoSpace`/`ENOSPC`, so a
 caller can distinguish policy exhaustion from exhausted backing storage.
+`FsError::OperationNotPermitted` represents an operation prohibited by object
+state and maps to Linux `EPERM`; it remains distinct from access-mode or
+credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem
+(`ReadOnly`/`EROFS`). Memfd seal violations use this variant.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

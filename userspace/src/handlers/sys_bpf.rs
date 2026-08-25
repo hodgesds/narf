@@ -38,9 +38,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-use narf_bpf::map::{
-    BpfMap, BpfMapCap, MapAccess, MapAttr, MapError, MapFile, MapKind,
-};
+use narf_bpf::map::{BpfMap, BpfMapCap, MapAccess, MapAttr, MapError, MapFile, MapKind};
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadMetadata, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
@@ -546,9 +544,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     // is verified *for*, and attaching to a hook that provides the other one
     // is rejected by type at attach (spec §4.5).
     let context = match prog_type {
-        BPF_PROG_TYPE_XDP | BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => {
-            Context::Atomic
-        }
+        BPF_PROG_TYPE_XDP | BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => Context::Atomic,
         BPF_PROG_TYPE_SYSCALL => Context::Sleepable,
         // LINUX-GAP: socket filters, cgroup hooks, LSM, struct_ops, and
         // the rest arrive with their attach surfaces in Phase 5/6.
@@ -736,12 +732,7 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
 /// the same pointer provenance as the live classifier path. NARF does not yet
 /// translate Linux's optional `xdp_md`, CPU selection, or batched test mode;
 /// accepting any of them partially would make the ABI look safer than it is.
-fn prog_test_run_xdp(
-    prog: &BpfProg,
-    attr_uptr: u64,
-    size: usize,
-    attr: &[u8; ATTR_BUF],
-) -> i64 {
+fn prog_test_run_xdp(prog: &BpfProg, attr_uptr: u64, size: usize, attr: &[u8; ATTR_BUF]) -> i64 {
     if size < T_DURATION + 4 {
         return -EINVAL;
     }
@@ -848,10 +839,8 @@ fn map_cap() -> &'static Cap<BpfMapCap, Grant> {
         IrqSafeSpinLock::new(None);
     let mut g = SLOT.lock();
     if g.is_none() {
-        let c: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<
-            BpfMapCap,
-            Grant,
-        >::bootstrap()));
+        let c: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<BpfMapCap, Grant>::bootstrap()));
         *g = Some(c);
     }
     g.expect("just installed")
@@ -953,10 +942,7 @@ fn map_create(attr_uptr: u64, size: usize) -> i64 {
     } else {
         0
     };
-    if map_flags
-        & !(BPF_F_NO_PREALLOC | BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_ZERO_SEED)
-        != 0
-    {
+    if map_flags & !(BPF_F_NO_PREALLOC | BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_ZERO_SEED) != 0 {
         // Every remaining flag changes observable behaviour — mmapability,
         // NUMA placement, LRU tuning — so accepting one silently
         // would be a lie about what the map does. `EINVAL` is what Linux
@@ -994,9 +980,7 @@ fn map_create(attr_uptr: u64, size: usize) -> i64 {
 }
 
 /// Recover the map and descriptor-local access behind a file descriptor.
-fn map_file_from_fd(
-    fd: u32,
-) -> Result<(alloc::sync::Arc<narf_bpf::map::BpfMap>, MapAccess), i64> {
+fn map_file_from_fd(fd: u32) -> Result<(alloc::sync::Arc<narf_bpf::map::BpfMap>, MapAccess), i64> {
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
         _ => return Err(-EBADF_),
@@ -1434,7 +1418,11 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
             break;
         }
         if and_delete {
-            match write.as_ref().expect("and_delete admitted a writer").delete(&key_buf) {
+            match write
+                .as_ref()
+                .expect("and_delete admitted a writer")
+                .delete(&key_buf)
+            {
                 Ok(()) => {}
                 // Same race — skip without counting it.
                 Err(MapError::NotFound) => {
@@ -1455,8 +1443,12 @@ fn map_batch_read(attr_uptr: u64, size: usize, and_delete: bool) -> i64 {
             return -(e as i64);
         }
         // SAFETY: as above.
-        let wrote_val =
-            unsafe { copy_to_user(values_uptr + u64::from(filled) * value_bytes as u64, &val_buf) };
+        let wrote_val = unsafe {
+            copy_to_user(
+                values_uptr + u64::from(filled) * value_bytes as u64,
+                &val_buf,
+            )
+        };
         if let Err(e) = wrote_val {
             return -(e as i64);
         }
@@ -1563,8 +1555,7 @@ fn map_batch_write(attr_uptr: u64, size: usize, delete: bool) -> i64 {
 struct ResolvedProgMaps {
     maps: alloc::vec::Vec<(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)>,
     map_indices: alloc::vec::Vec<narf_bpf::prog::IndexedMap>,
-    load_references:
-        alloc::vec::Vec<alloc::sync::Arc<dyn narf_bpf::prog::LoadReference>>,
+    load_references: alloc::vec::Vec<alloc::sync::Arc<dyn narf_bpf::prog::LoadReference>>,
 }
 
 /// Read one signed descriptor from the caller's fd array.
@@ -1605,9 +1596,7 @@ fn add_prog_map(
     Ok(())
 }
 
-fn distinct_prog_maps(
-    maps: &[(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)],
-) -> usize {
+fn distinct_prog_maps(maps: &[(i32, alloc::sync::Arc<narf_bpf::map::BpfMap>)]) -> usize {
     maps.iter()
         .enumerate()
         .filter(|(i, (_, map))| {
@@ -1704,15 +1693,13 @@ fn resolve_prog_maps(
                     if fd_array == 0 {
                         return Err(-EPROTO);
                     }
-                    let fd = fd_array_entry(
-                        fd_array,
-                        u64::try_from(index).map_err(|_| -EFAULT)?,
-                    )?;
+                    let fd = fd_array_entry(fd_array, u64::try_from(index).map_err(|_| -EFAULT)?)?;
                     let map = map_from_fd(fd as u32)?;
                     add_prog_map(&mut maps, fd, alloc::sync::Arc::clone(&map), false)?;
-                    if !map_indices.iter().any(
-                        |known: &narf_bpf::prog::IndexedMap| known.index == index,
-                    ) {
+                    if !map_indices
+                        .iter()
+                        .any(|known: &narf_bpf::prog::IndexedMap| known.index == index)
+                    {
                         map_indices.push(narf_bpf::prog::IndexedMap { index, fd, map });
                     }
                 }

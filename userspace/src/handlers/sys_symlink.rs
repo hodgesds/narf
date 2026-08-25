@@ -36,8 +36,8 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
 /// symlink targets may legitimately be relative and must not be rewritten.
 pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link_path: &str) {
     let outcome = current_resolve_parent_absolute(link_path, |_fs, parent, leaf| {
-            poll_blocking(parent.symlink(leaf, target_str))
-        });
+        poll_blocking(parent.symlink(leaf, target_str))
+    });
     match outcome {
         Some(Some(Ok(_))) => {
             // inotify: a new symlink is IN_CREATE on the link path.

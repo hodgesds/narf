@@ -987,7 +987,7 @@ const ENOTCONN: u32 = 107;
 /// Translate a FUSE `-errno` reply into an [`FsError`].
 fn errno_to_fs_error(neg_errno: i32) -> FsError {
     match -neg_errno {
-        1 => FsError::PermissionDenied,       // EPERM
+        1 => FsError::OperationNotPermitted,  // EPERM
         2 => FsError::NotFound,               // ENOENT
         13 => FsError::PermissionDenied,      // EACCES
         11 | 16 | 17 | 39 => FsError::Busy,   // EAGAIN / EBUSY / EEXIST / ENOTEMPTY

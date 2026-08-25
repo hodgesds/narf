@@ -282,9 +282,13 @@ static FRAME_CACHES: [CpuFrameCacheLock; narf_lib::percpu::MAX_CPUS] =
     [const { CpuFrameCacheLock::new() }; narf_lib::percpu::MAX_CPUS];
 static FRAME_CACHE_FREE: [AtomicUsize; MAX_NUMA_NODES] =
     [const { AtomicUsize::new(0) }; MAX_NUMA_NODES];
+#[cfg(feature = "kernel-test")]
 static FRAME_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
 static FRAME_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
 static FRAME_CACHE_REFILLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
 static FRAME_CACHE_SPILLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "kernel-test")]
 static FRAME_CACHE_BATCH_FREE_LOCKS: AtomicU64 = AtomicU64::new(0);
@@ -857,14 +861,23 @@ impl AllocContext {
 /// inherits the same policy — a user path cannot silently drain the reserve.
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
-    if ctx == AllocContext::User && crate::reclaim::user_alloc_would_breach_reserve() {
+    if ctx == AllocContext::User {
+        let node = current_cpu_node();
+        // Start background balancing at the low watermark rather than waiting
+        // for the faulting allocation to collide with the protected minimum.
+        if crate::reclaim::under_low_watermark_node(node) {
+            crate::reclaim::wake_kswapd(node);
+        }
+        if !crate::reclaim::user_alloc_would_breach_reserve() {
+            return Ok(());
+        }
         // Wake the local node's reclaimer so it can shed clean cache and let
         // the retry succeed. Under an overcommit policy that permits it
         // (Heuristic / Always), also arm the OOM killer so sustained user
         // pressure reclaims a hog rather than only failing the faulting task.
         // Under `Never` (the default) this stays a graceful ENOMEM — no
         // process is killed.
-        crate::reclaim::wake_kswapd(current_cpu_node());
+        crate::reclaim::wake_kswapd(node);
         if crate::reclaim::user_pressure_arms_oom() {
             crate::reclaim::signal_oom_needed();
         }
@@ -966,11 +979,13 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
         local.len -= 1;
         let frame = local.frames[local.len];
         FRAME_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
+        #[cfg(feature = "kernel-test")]
         FRAME_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         buddy::audit_cached_alloc(frame);
         return Some(buddy::frame_from_no(frame));
     }
 
+    #[cfg(feature = "kernel-test")]
     FRAME_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     let mut zone = ZONES[node].0.lock();
     let first = alloc_below_ceiling(&mut zone)?;
@@ -984,6 +999,7 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
         local.len += 1;
         FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(feature = "kernel-test")]
     FRAME_CACHE_REFILLS.fetch_add(1, Ordering::Relaxed);
     Some(first)
 }
@@ -1010,6 +1026,7 @@ fn free_order0_to_cache(node: usize, frame: u64) -> bool {
             zone.free_cached(local.frames[local.len], 0);
         }
         FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
+        #[cfg(feature = "kernel-test")]
         FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
     }
     local.frames[local.len] = frame;
@@ -1068,6 +1085,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
                 spill_len += 1;
             }
             FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
+            #[cfg(feature = "kernel-test")]
             FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
         }
         local.frames[local.len] = frame;
@@ -1254,15 +1272,23 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
         // balanced with the actual page population.
         crate::cgroup_charge::uncharge(PAGE_SIZE);
     }
-    if r.is_err() && ctx == AllocContext::Kernel {
-        // A KERNEL allocation could not be satisfied even into the `min`
-        // reserve — genuine, unrecoverable exhaustion (a `User` alloc would
-        // have been refused earlier by `reserve_permits`, keeping this reserve
-        // intact). Arm the reclaimer's OOM killer. This does NOT fire on the
-        // transient below-`min` dips a fork/vmalloc storm produces, only when
-        // a kernel request actually fails — so a workload the reserve +
-        // vmalloc already carry is never needlessly OOM-killed.
-        crate::reclaim::signal_oom_needed();
+    if r.is_err() {
+        if ctx == AllocContext::Kernel {
+            // A KERNEL allocation could not be satisfied even into the `min`
+            // reserve — genuine, unrecoverable exhaustion (a `User` alloc would
+            // have been refused earlier by `reserve_permits`, keeping this reserve
+            // intact). Arm the reclaimer's OOM killer. This does NOT fire on the
+            // transient below-`min` dips a fork/vmalloc storm produces, only when
+            // a kernel request actually fails — so a workload the reserve +
+            // vmalloc already carry is never needlessly OOM-killed.
+            crate::reclaim::signal_oom_needed();
+        } else {
+            // The reserve check passed but the selected buddy/cpuset could not
+            // satisfy the allocation (for example fragmentation or strict-node
+            // pressure). Give kswapd an opportunity to make progress before a
+            // later user fault retries.
+            crate::reclaim::wake_kswapd(node);
+        }
     }
     r
 }
@@ -2311,6 +2337,7 @@ fn smoke_buddy_zone_locks_are_independent() -> narf_kernel_test::TestResult {
 }
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_buddy_zone_locks_are_independent);
 
+#[cfg(feature = "kernel-test")]
 fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     use narf_kernel_test::TestResult;
 
@@ -2341,6 +2368,7 @@ fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_order0_frame_cache_round_trip);
 
 #[cfg(feature = "kernel-test")]

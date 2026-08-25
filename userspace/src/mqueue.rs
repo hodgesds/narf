@@ -77,9 +77,7 @@ fn read_i64(buf: &[u8]) -> i64 {
 fn namespace_id(task: u64) -> u64 {
     #[cfg(feature = "container")]
     {
-        crate::namespaces::current_ipc_ns(task)
-            .map(|namespace| namespace.id())
-            .unwrap_or(0)
+        crate::namespaces::current_ipc_namespace(task).id()
     }
     #[cfg(not(feature = "container"))]
     {
@@ -529,14 +527,17 @@ pub fn sys_mq_getsetattr(ctx: &mut dyn TrapContext) {
             return;
         }
         let _ = fd::with_table(task, |table| {
-            if let Some(entry) = table.get_mut(a.arg0 as u32) {
-                entry.status_flags = (entry.status_flags & !fd::O_NONBLOCK)
+            let descriptor = a.arg0 as u32;
+            let old = table.status_flags(descriptor)?;
+            table.set_status_flags(
+                descriptor,
+                (old & !fd::O_NONBLOCK)
                     | if flags & O_NONBLOCK as i64 != 0 {
                         fd::O_NONBLOCK
                     } else {
                         0
-                    };
-            }
+                    },
+            )
         });
     }
     ctx.set_return(SyscallReturn::ok(0));

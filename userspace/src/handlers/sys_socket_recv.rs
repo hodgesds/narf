@@ -28,8 +28,8 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     const MSG_DONTWAIT: u32 = 0x40;
     let nonblock = (flags & MSG_DONTWAIT) != 0
         || fd::with_table(current_task_id(), |t| {
-            t.get(fd)
-                .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
+            t.status_flags(fd)
+                .map(|flags| flags & crate::fd::O_NONBLOCK != 0)
                 .unwrap_or(false)
         })
         .unwrap_or(false);

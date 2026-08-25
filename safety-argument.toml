@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "31f2268bffec442b347c24e5edc1e220634de3250af6506c7eb3c4b240b76a50"
+prompt_hash = "ebedd0c0a9b5c6bf58a25e7ede31105d76e0eb74249832cfd8d10a37a0efba29"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -145,15 +145,15 @@ argument = "The frame edit changes only the diagnostic time budget attached to t
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The scheduler and frame edits add forward-progress accounting, idle-state reporting, and fatal-path stall diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
+argument = "The scheduler and frame edits remove per-slot pop/requeue and per-executor-round diagnostic atomic updates from the scheduler hot path while retaining bounded, cold-path queue, affinity, halted, and lock-state fatal diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "Forward-progress counters and queue diagnostics neither bypass nor alter capability checks, domain tags, PKRS state, or domain transitions. The watchdog reads aggregate scheduling state and can only diagnose or panic after runnable work has made no progress."
+argument = "Removing observational hot-path counters does not change the wake flag, ready queues, task affinity, context/domain restore, capability checks, domain tags, PKRS state, or domain transitions. The retained watchdog snapshots are read-only and execute only after a suspected stall."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L62"
-argument = "The new scheduler observations are aggregate queue depths, a monotonic progress counter, and fatal-path task state. They remain within the existing documented per-CPU scheduling-state exception and do not expose task memory or capabilities to userspace."
+argument = "The retained scheduler observations expose only bounded queue depth, awake/home/affinity state, and CPU halted/lock state to the in-kernel fatal watchdog. They remain within the existing documented per-CPU scheduling-state exception and expose neither task memory nor capabilities to userspace."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -599,3 +599,47 @@ argument = "The scheduler change adds one opaque pointer field to the existing p
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Userspace publishes Arc::as_ptr(Task) only while the enclosing pinned UserTaskFuture retains that Arc through the full KernelTask lifetime. CURRENT_STACKFUL_TASK selects the pointer from the actually executing continuation across direct resume and migration, is cleared before switch-out/exit, and KernelTask reclamation remains RCU-deferred; acquire/release publication prevents a syscall from observing an uninitialized context, while cross-task lookups retain the refcounted registry path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Address-space materialization retains the authoritative region lock and exact backing vector while the existing architecture scatter installer holds the live root's mutation shard and derives each leaf's user, write/COW, and execute permissions from the same region metadata as the prior scalar path. Lazy zero backing remains absent. Because the scatter helper intentionally permits partial progress, every error is recovered through the idempotent scalar installer over the complete requested slice: an already-installed prefix and pre-existing leaves each acquire the same deduplicated reverse mapping, while a genuine structural or allocation error still fails construction before metadata or backing ownership is released. Successful batches add reverse mappings only after descriptor publication completes. Batching therefore changes lock and table-walk frequency, not mapped physical addresses, permissions, COW ownership, failure visibility, or stale-translation retirement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Calling the already-specified x86_64 and AArch64 scatter installers from address-space construction is an internal optimization inside the existing memory domain-manager TCB. It adds no capability, domain identifier, trusted subsystem, externally supplied pointer, mapping authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "x86_64 signal delivery now performs every user-stack write through the architecture's existing guarded user-copy primitive. The earlier writability probe remains only an optimization: a sibling sharing the address space may revoke or unmap the page afterward, but the final copy converts that race into ordinary delivery failure instead of allowing a supervisor page fault or kernel panic. No kernel-half address passes validate_user_range, no signal-frame pointer is dereferenced directly, and no capability, domain right, or mapping authority is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Stack growth retains the authoritative region lock while locating and replacing only the explicit STACK_GUARD region. The optimized ordered lookup is preserved, but the adjacent unmarked VMA is no longer merged or assigned fresh anonymous backing: this prevents an unmapped-and-replaced stack neighbor from importing SHARED, FILE_DEMAND, or COW ownership semantics. Fresh frames remain private, zeroed, and mapped only at the promoted guard span; executable permission is copied only as a leaf authority hint without modifying the adjacent region."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The targeted-wake scheduler fast path is removed because it could bypass the active policy and compare priority without scheduling class, selecting Batch work ahead of Realtime work. Dispatch again uses the established core/policy selection and eligibility validation path exclusively; removing the unused hooks grants no new policy observation, task handle, capability, domain state, or queue mutation authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Demand-fault publication now keeps the backing slot lazy until leaf installation succeeds. On failure the exact page ticket is retired while ownership stays with the fault path, which releases the unpublished anonymous or file-backed frame; a later fault may safely claim the page again. On success the leaf, Region backing slot, reverse-map owner, and ticket retirement are completed under the authoritative region lock before overlapping VMA teardown can free the frame. This closes the x86 post-unlock stale-rmap race, gives AArch64 the same reverse ownership, and preserves ticket-based protection against VMA removal/replacement ABA."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Every x86 shootdown invalidation now reaches an architecture helper with compiler_fence(SeqCst) immediately before and after the TLB instruction. Plain INVLPG requests route through the fenced memory primitive, INVPCID variants share one fenced raw wrapper, and CR3 fallback already uses fenced control-register helpers. The fences constrain compiler motion only; request ownership, target completion, invalidation scope, mapping authority, and hardware instruction semantics are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Production order-0 frame allocation and return no longer update global cache hit, miss, refill, or spill counters. The counters and their round-trip assertion remain compiled under the kernel-test feature, while allocator decisions continue to depend exclusively on the unchanged per-CPU cache contents, drain/hotplug bypass state, free-page accounting, and buddy locks. Removing observational atomic RMWs changes no frame identity, ownership transition, NUMA choice, reserve check, cache capacity, or reclamation visibility."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Demand-fault ownership remains address-space and page scoped under the existing authoritative region lock, but the common live claims now occupy a fixed inline table and use a checked per-address-space ticket counter instead of allocating a BTree node and incrementing a global atomic on every first touch. Exact tickets still deduplicate same-page faults and reject owners cancelled by VMA removal/replacement. A rare overflow map preserves progress beyond the inline capacity, so CPU migration, hotplug, nested faults, and future concurrency cannot create an ownerless retry. Ticket exhaustion fails closed without identifier reuse, and no physical-address sentinel or mapping permission changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Anonymous demand allocation reports reserve pressure only after cancelling its exact page-scoped claim and returning through every address-space and allocator lock. Frame then publishes only the current task's scheduler-owned waker into a fixed MAX_USER_TASKS-sized table; it stores no task pointer, address-space pointer, frame owner, capability, or domain state. A sequentially consistent generation handshake orders registration against kswapd completion, slots remain owner-held through resume to prevent ABA reuse, and task-owned wake routing remains valid across migration and CPU hotplug."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The page-fault backpressure path allocates no memory and performs only a bounded fixed-table scan before switching out. It clears the per-CPU mempolicy publication before parking, invokes no wake callback while holding a waiter lock, and retries demand allocation at most once. Missing stackful context, full waiter capacity, non-pressure errors, and a second zero-progress failure all fail closed without sleeping or spinning, so trap progress cannot depend on an unbounded reclaim loop."

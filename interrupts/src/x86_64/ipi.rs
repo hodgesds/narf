@@ -215,13 +215,10 @@ unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
             let n = if pages == 0 { 1 } else { pages };
             for k in 0..n {
                 let addr = va + k * 4096;
-                // SAFETY: INVLPG at CPL=0 is always legal.
+                // SAFETY: INVLPG at CPL=0 is always legal; the memory helper
+                // supplies the mandatory compiler-fence pair.
                 unsafe {
-                    core::arch::asm!(
-                        "invlpg [{a}]",
-                        a = in(reg) addr,
-                        options(nostack, preserves_flags),
-                    );
+                    narf_memory::x86_64::paging::invlpg(narf_memory::VirtAddr::new(addr));
                 }
             }
         } else {
@@ -241,13 +238,10 @@ unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
         let n = if pages == 0 { 1 } else { pages };
         for k in 0..n {
             let addr = va + k * 4096;
-            // SAFETY: INVLPG at CPL=0 is always legal.
+            // SAFETY: INVLPG at CPL=0 is always legal; the memory helper
+            // supplies the mandatory compiler-fence pair.
             unsafe {
-                core::arch::asm!(
-                    "invlpg [{a}]",
-                    a = in(reg) addr,
-                    options(nostack, preserves_flags),
-                );
+                narf_memory::x86_64::paging::invlpg(narf_memory::VirtAddr::new(addr));
             }
         }
     }

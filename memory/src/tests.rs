@@ -6937,14 +6937,10 @@ fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_try_grow_stack_collision_rejected);
 
-/// Sequential grows: starting from a single guard, three grows
-/// coalesce into ONE R+W stack VMA (three pages) with a guard
-/// sitting at the new bottom. The stack is extended downward in
-/// place — the first grow's fragment becomes the region every
-/// later grow merges into — so the table never accretes one VMA
-/// per fault (the `stack` stressor otherwise turned each grow into
-/// an O(regions) walk). Catches a regression where the new guard
-/// install races against the promotion bookkeeping.
+/// Sequential grows: starting from a single guard, three indexed lookups
+/// create three backed R+W fragments with a guard at the new bottom.  Keeping
+/// fragments avoids annexing an unmarked adjacent VMA; RegionSet makes guard
+/// discovery O(log VMA) despite the fragments.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_try_grow_stack_sequential() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
@@ -6991,23 +6987,16 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         .map(|r| r.base.as_u64())
         .min();
     core::mem::forget(a);
-    // The three growths coalesce into a single R+W VMA rather than
-    // three fragments: one region, three pages. The first growth
-    // promotes the guard page AT `guard0`, the next two the pages
-    // below, so the merged stack is based two pages below `guard0`
-    // and the fresh trailing guard sits one page below that.
-    if rw_regions.len() != 1 {
-        return TestResult::Fail("grows did not coalesce into one stack VMA");
+    if rw_regions.len() != 3 {
+        return TestResult::Fail("sequential grows did not produce three fragments");
     }
-    let stack = rw_regions[0];
-    if stack.len != 3 * 0x1000 {
-        return TestResult::Fail("merged stack VMA not three pages long");
-    }
-    if stack.base.as_u64() != guard0 - 2 * 0x1000 {
-        return TestResult::Fail("merged stack VMA not based two pages below start");
-    }
-    if stack.phys.len() != 3 || stack.phys.iter().any(|p| p.raw() == 0) {
-        return TestResult::Fail("merged stack VMA has an unbacked page");
+    for expected in [guard0 - 2 * 0x1000, guard0 - 0x1000, guard0] {
+        let Some(fragment) = rw_regions.iter().find(|r| r.base.as_u64() == expected) else {
+            return TestResult::Fail("sequential stack fragment has the wrong base");
+        };
+        if fragment.len != 0x1000 || fragment.phys.len() != 1 || fragment.phys[0].raw() == 0 {
+            return TestResult::Fail("sequential stack fragment is not singly backed");
+        }
     }
     if guard_count != 1 {
         return TestResult::Fail("expected exactly one trailing guard");
@@ -7020,15 +7009,11 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_try_grow_stack_sequential);
 
-/// Realistic layout: a backed stack VMA sits directly above the
-/// guard. Many one-page growths extend that VMA downward in place
-/// — the stack stays a SINGLE region (region count stays flat, not
-/// one-per-fault), the region's own perms are preserved (an
-/// executable stack stays executable, not forced to R+W), every
-/// grown page is freshly backed + zeroed + writable, and a guard
-/// tracks the new bottom. This is the `stack`-stressor fast path.
+/// Realistic layout: a backed executable stack VMA sits directly above the
+/// guard. Many one-page growths preserve EXEC on separate anonymous fragments
+/// without changing the original VMA, and a guard tracks the new bottom.
 #[cfg(target_arch = "x86_64")]
-fn smoke_memory_try_grow_stack_extends_one_vma() -> TestResult {
+fn smoke_memory_try_grow_stack_preserves_exec_without_annexing() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -7099,16 +7084,18 @@ fn smoke_memory_try_grow_stack_extends_one_vma() -> TestResult {
         .iter()
         .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
         .count();
-    let stack_ok = stack_regions.len() == 1 && {
-        let s = stack_regions[0];
-        // One VMA: original page + GROWS grown pages, based GROWS pages
-        // below the original, EXEC preserved, densely backed & zeroed.
-        s.base.as_u64() == stack_base - GROWS * 0x1000
-            && s.len == (GROWS + 1) * 0x1000
-            && s.perms.contains(RegionPerms::EXEC)
-            && s.phys.len() as u64 == GROWS + 1
-            && !s.phys.iter().any(|ph| ph.raw() == 0)
-    };
+    // The original VMA must remain intact rather than being annexed by the
+    // grow path.  Each promoted guard is its own one-page anonymous fragment;
+    // the ordered RegionSet still finds the next guard in O(log VMA), and the
+    // executable-stack permission propagates across every fragment.
+    let stack_ok = stack_regions.len() as u64 == GROWS + 1
+        && stack_regions.iter().all(|s| {
+            s.len == 0x1000
+                && s.perms.contains(RegionPerms::EXEC)
+                && s.phys.len() == 1
+                && s.phys[0].raw() != 0
+        })
+        && stack_regions.iter().any(|s| s.base.as_u64() == stack_base);
     // Read back one grown page: try_grow_stack zeroes each frame.
     let lowest = stack_base - GROWS * 0x1000;
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -7125,7 +7112,7 @@ fn smoke_memory_try_grow_stack_extends_one_vma() -> TestResult {
         return TestResult::Fail("a grown stack page was not present");
     }
     if !stack_ok {
-        return TestResult::Fail("stack did not stay one EXEC VMA across grows");
+        return TestResult::Fail("stack growth annexed a VMA or lost EXEC permissions");
     }
     if guard_count != 1 {
         return TestResult::Fail("expected exactly one trailing guard");
@@ -7136,7 +7123,10 @@ fn smoke_memory_try_grow_stack_extends_one_vma() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_memory_try_grow_stack_extends_one_vma);
+kernel_test_in!(
+    "memory",
+    smoke_memory_try_grow_stack_preserves_exec_without_annexing
+);
 
 /// STACK_GUARD bit lives outside the POSIX prot mask so an
 /// `mprotect`-style query on the region's perms doesn't observe
@@ -9941,6 +9931,13 @@ fn smoke_materialize_range_installs_only_intersection() -> TestResult {
         // SAFETY: test-owned live root.
         if unsafe { translated(&a, va) } != Some(*frame) {
             return TestResult::Fail("full materialize disagreed with range backing");
+        }
+        // The full batch encounters the already-mapped middle page after
+        // installing its first-page prefix. Recovery must record that prefix
+        // as well as the pre-existing and remaining leaves, without duplicate
+        // owners on this test-owned backing.
+        if crate::rmap::owner_count(*frame) != 1 {
+            return TestResult::Fail("partial batch recovery left inconsistent rmap owners");
         }
     }
     TestResult::Pass

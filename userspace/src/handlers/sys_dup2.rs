@@ -19,24 +19,9 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(oldfd)?;
-        // dup2(2) shares the open file description — offset + status flags
-        // travel with the duplicate (see the LINUX-GAP note in sys_dup:
-        // NARF snapshots rather than aliases them). Resetting them to zero
-        // here was a real divergence: the X server's Popen child does
-        // `dup2(pipefd, 0)` and the duplicate must keep the description's
-        // flags.
-        let clone = crate::fd::FdEntry {
-            ops: entry.ops.clone(),
-            offset: entry.offset,
-            flags: 0,
-            status_flags: entry.status_flags,
-        };
-        // Replace whatever sat at `newfd` (POSIX: silently close).
-        t.set(newfd, clone);
-        Some(())
-    });
+    // Replacing the target slot installs another reference to oldfd's shared
+    // open-file description; descriptor flags start clear.
+    let outcome = fd::with_table(task, |t| t.duplicate_to(oldfd, newfd, 0));
     match outcome {
         Some(Some(())) => {
             #[cfg(feature = "linux-compat")]

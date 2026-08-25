@@ -693,11 +693,20 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_send_signal_pos);
 
 fn smoke_abi_proc_pidfd_send_signal_neg() -> TestResult {
     with_setup(|| {
-        // signum > 64 → EINVAL (checked before any fd resolution). 64 is
-        // valid now (SIGRTMAX), so 65 is the out-of-range probe.
-        match call(Syscall::PidfdSendSignal.raw(), a3(3, 65, 0, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("pidfd_send_signal with sig 65 did not return -EINVAL"),
+        // fd resolution precedes signum validation, so use a real pidfd to
+        // isolate the invalid-signal result.
+        let pidfd = match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("pidfd_open setup failed"),
+        };
+        match call(Syscall::PidfdSendSignal.raw(), a3(pidfd, 65, 0, 0)) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("pidfd_send_signal with sig 65 did not return -EINVAL"),
+        }
+        // The same bad signal cannot hide an unresolved descriptor.
+        match call(Syscall::PidfdSendSignal.raw(), a3(4242, 65, 0, 0)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("pidfd_send_signal must resolve fd before validating signal"),
         }
     })
 }
@@ -713,6 +722,44 @@ fn smoke_abi_proc_pidfd_send_signal_badfd() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_send_signal_badfd);
+
+fn smoke_abi_proc_pidfd_send_signal_flags_first() -> TestResult {
+    with_setup(|| {
+        // NARF supports no pidfd signal-scope flags yet. Their rejection is the
+        // syscall wrapper's first check, ahead of fd, signal, and info errors.
+        match call(Syscall::PidfdSendSignal.raw(), a3(4242, 65, u64::MAX, 1)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("pidfd_send_signal flags must return -EINVAL first"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_send_signal_flags_first);
+
+fn smoke_abi_proc_pidfd_send_signal_missing_target() -> TestResult {
+    with_setup(|| {
+        const MISSING_PID: u64 = 0xDEAD_1000;
+        let state = crate::pidfd::mint_for(MISSING_PID, 0, false);
+        let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+            alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
+        let pidfd = crate::fd::with_table(FAKE_TASK, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: file,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        })
+        .ok_or("fd table missing")?;
+        match call(Syscall::PidfdSendSignal.raw(), a3(pidfd as u64, 0, 0, 0)) {
+            Some(v) if v == ESRCH => Ok(()),
+            _ => Err("pidfd_send_signal must return -ESRCH for an exited target"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_pidfd_send_signal_missing_target
+);
 
 // ── pidfd_getfd(2) — clone an fd out of a pidfd's target ──
 

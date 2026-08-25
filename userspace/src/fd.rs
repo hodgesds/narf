@@ -13,7 +13,7 @@
 //! `detach(task_id)` removes the whole table on task exit.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -24,9 +24,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone)]
 pub struct FdEntry {
     pub ops: Arc<dyn FileOps>,
-    /// File-pointer offset into the underlying object. Updated on
-    /// every `Read` / `Write` so they're position-tracking by
-    /// default (POSIX semantics).
+    /// Initial/debug mirror of the shared description position. Runtime users
+    /// must call `FdTable::offset`; dup/fork aliases intentionally do not keep
+    /// every slot mirror synchronized.
     pub offset: u64,
     /// Per-fd-slot flags. `FD_CLOEXEC = bit 0`. Mirrors the kernel
     /// fd-table "fd flags" word that `fcntl(F_GETFD/F_SETFD)`
@@ -34,10 +34,64 @@ pub struct FdEntry {
     /// (those live in `status_flags`).
     pub flags: u32,
     /// Open-file-description status flags (`F_GETFL`/`F_SETFL`).
-    /// `O_NONBLOCK | O_APPEND | O_DIRECT` are honoured; access mode
-    /// bits (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) are stored but not yet
-    /// enforced at the syscall layer. Defaults to 0 on every new fd.
+    /// This value seeds the shared description when a fresh fd is installed;
+    /// runtime users must call `FdTable::status_flags`, because aliases may
+    /// change the shared value without updating every slot's debug mirror.
     pub status_flags: u32,
+}
+
+/// State owned by a Linux open-file description (`struct file`), rather than
+/// by one descriptor-table slot.  `dup*` and `fork` install another reference
+/// to this object, so file position and mutable status flags remain shared;
+/// `FD_CLOEXEC` deliberately stays in [`FdEntry::flags`] because it is per-fd.
+#[derive(Debug)]
+struct OpenFileState {
+    offset: u64,
+    status_flags: u32,
+}
+
+/// Shared `struct file` analogue. The async mutex serializes sequential I/O
+/// across dup/fork aliases without disabling IRQs while FileOps may park.
+#[derive(Debug)]
+pub(crate) struct OpenFileDescription {
+    state: IrqSafeSpinLock<OpenFileState>,
+    pub(crate) position_lock: narf_lib::mutex::Mutex<()>,
+    /// Index into the bounded inode/FileOps append-lock shard table.
+    append_lock_index: usize,
+}
+
+pub(crate) type Description = Arc<OpenFileDescription>;
+
+const APPEND_LOCK_SHARDS: usize = 64;
+static APPEND_LOCKS: [narf_lib::mutex::Mutex<()>; APPEND_LOCK_SHARDS] =
+    [const { narf_lib::mutex::Mutex::new(()) }; APPEND_LOCK_SHARDS];
+
+fn append_lock_index(ops: &Arc<dyn FileOps>) -> usize {
+    // Stable inode numbers also cover filesystems that return a fresh FileOps
+    // wrapper per lookup. Synthetic zero-inode objects fall back to Arc
+    // identity. Collisions only serialize unrelated appenders; they cannot
+    // weaken atomicity, and the fixed table avoids an unbounded global map.
+    let mut key = ops.ino() as usize;
+    if key == 0 {
+        key = Arc::as_ptr(ops) as *const () as usize;
+    }
+    key ^= key >> 17;
+    key ^= key >> 9;
+    key % APPEND_LOCK_SHARDS
+}
+
+impl OpenFileDescription {
+    pub(crate) fn offset(&self) -> u64 {
+        self.state.lock().offset
+    }
+
+    pub(crate) fn set_offset(&self, offset: u64) {
+        self.state.lock().offset = offset;
+    }
+
+    pub(crate) fn append_lock(&self) -> &'static narf_lib::mutex::Mutex<()> {
+        &APPEND_LOCKS[self.append_lock_index]
+    }
 }
 
 /// `FD_CLOEXEC` — bit 0 of `FdEntry::flags`. Mirrors POSIX. Kept
@@ -59,6 +113,9 @@ pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_DIRECT: u32 = 0o40000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+/// Path-only open description. Unlike the access-mode value 0 (`O_RDONLY`),
+/// an `O_PATH` file has neither Linux `FMODE_READ` nor `FMODE_WRITE`.
+pub const O_PATH: u32 = 0o10000000;
 
 /// Settable subset of file status flags per `F_SETFL`. Linux honours
 /// these and silently masks the rest.
@@ -77,14 +134,47 @@ impl core::fmt::Debug for FdEntry {
 /// Per-task fd table. Slot 0/1/2 are stdin/stdout/stderr; the
 /// kernel populates them at task creation (today's helper:
 /// `attach_console_stdio`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FdTable {
     slots: Vec<Option<FdEntry>>,
+    /// Parallel to `slots`. An occupied fd always has exactly one description.
+    descriptions: Vec<Option<Description>>,
+    /// In-flight fd-number reservations (fanotify delivery). Reserved slots
+    /// are not visible through get()/procfs/fork and contain no published file,
+    /// but concurrent opens skip them until commit or rollback.
+    reserved: BTreeSet<u32>,
+    // Linux exposes the allocated fdtable extent to select(2): positive
+    // `nfds` is clamped to this value, not to libc's FD_SETSIZE. Keep the
+    // semantic extent explicit instead of depending on Vec's allocator-
+    // chosen capacity.
+    max_fds: usize,
 }
 
 impl FdTable {
+    const INITIAL_MAX_FDS: usize = 64;
+
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            descriptions: Vec::new(),
+            reserved: BTreeSet::new(),
+            max_fds: Self::INITIAL_MAX_FDS,
+        }
+    }
+
+    fn grow_max_fds_for(&mut self, fd: usize) {
+        if fd < self.max_fds {
+            return;
+        }
+        self.max_fds = fd
+            .saturating_add(1)
+            .next_power_of_two()
+            .max(Self::INITIAL_MAX_FDS);
+    }
+
+    /// Current semantic fdtable extent used by Linux select(2) clamping.
+    pub fn max_fds(&self) -> usize {
+        self.max_fds
     }
 
     /// The fd numbers currently open in this table, ascending. Backs
@@ -107,15 +197,10 @@ impl FdTable {
     /// unconditionally made every `cmd &` in the distro fail with
     /// "can't open '/dev/null'".
     pub fn open(&mut self, entry: FdEntry) -> u32 {
-        for (i, s) in self.slots.iter_mut().enumerate() {
-            if s.is_none() {
-                *s = Some(entry);
-                return i as u32;
-            }
-        }
-        let i = self.slots.len();
-        self.slots.push(Some(entry));
-        i as u32
+        let description = Self::new_description(&entry);
+        let fd = self.next_free_from(0) as u32;
+        self.set_with_description(fd, entry, description);
+        fd
     }
 
     /// Insert `entry` at the lowest free slot ≥ `min`. Used by
@@ -123,28 +208,188 @@ impl FdTable {
     /// lowest free fd at or above `min` — honour `min` verbatim (a free
     /// slot below 3, e.g. a closed stdio fd, is a valid target).
     pub fn open_at_least(&mut self, entry: FdEntry, min: u32) -> u32 {
-        let min = min as usize;
-        while self.slots.len() <= min {
-            self.slots.push(None);
-        }
-        for (i, s) in self.slots.iter_mut().enumerate().skip(min) {
-            if s.is_none() {
-                *s = Some(entry);
-                return i as u32;
+        let description = Self::new_description(&entry);
+        let fd = self.next_free_from(min as usize) as u32;
+        self.set_with_description(fd, entry, description);
+        fd
+    }
+
+    fn next_free_from(&self, mut candidate: usize) -> usize {
+        loop {
+            let occupied = self.slots.get(candidate).is_some_and(Option::is_some);
+            if !occupied && !self.reserved.contains(&(candidate as u32)) {
+                return candidate;
             }
+            candidate = candidate.saturating_add(1);
         }
-        let i = self.slots.len();
-        self.slots.push(Some(entry));
-        i as u32
     }
 
     /// Place `entry` at a specific slot (typically used for stdio).
     pub fn set(&mut self, fd: u32, entry: FdEntry) {
+        let description = Self::new_description(&entry);
+        self.set_with_description(fd, entry, description);
+    }
+
+    fn set_with_description(&mut self, fd: u32, entry: FdEntry, description: Description) {
         let i = fd as usize;
+        self.grow_max_fds_for(i);
         while self.slots.len() <= i {
             self.slots.push(None);
+            self.descriptions.push(None);
         }
         self.slots[i] = Some(entry);
+        self.descriptions[i] = Some(description);
+        self.reserved.remove(&fd);
+    }
+
+    /// Reserve lowest-free fd numbers without publishing FileOps. Used by
+    /// fanotify, whose metadata must contain the eventual fd number even though
+    /// Linux does not install that fd until the user copy has succeeded.
+    pub(crate) fn reserve_fds(&mut self, count: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(count);
+        let mut candidate = 0u32;
+        while out.len() < count {
+            let occupied = self
+                .slots
+                .get(candidate as usize)
+                .is_some_and(Option::is_some);
+            if !occupied && !self.reserved.contains(&candidate) {
+                self.reserved.insert(candidate);
+                self.grow_max_fds_for(candidate as usize);
+                out.push(candidate);
+            }
+            candidate = candidate.saturating_add(1);
+        }
+        out
+    }
+
+    pub(crate) fn install_reserved_batch(&mut self, entries: Vec<(u32, FdEntry)>) -> bool {
+        if entries.iter().any(|(fd, _)| {
+            !self.reserved.contains(fd) || self.slots.get(*fd as usize).is_some_and(Option::is_some)
+        }) {
+            return false;
+        }
+        for (fd, entry) in entries {
+            let removed = self.reserved.remove(&fd);
+            debug_assert!(removed);
+            self.set(fd, entry);
+        }
+        true
+    }
+
+    pub(crate) fn release_reserved(&mut self, fds: &[u32]) {
+        for fd in fds {
+            self.reserved.remove(fd);
+        }
+    }
+
+    fn new_description(entry: &FdEntry) -> Description {
+        Arc::new(OpenFileDescription {
+            state: IrqSafeSpinLock::new(OpenFileState {
+                offset: entry.offset,
+                status_flags: entry.status_flags,
+            }),
+            position_lock: narf_lib::mutex::Mutex::new(()),
+            append_lock_index: append_lock_index(&entry.ops),
+        })
+    }
+
+    /// Duplicate `oldfd` into the lowest free slot, sharing its open-file
+    /// description while resetting the new slot's descriptor flags.
+    pub fn duplicate(&mut self, oldfd: u32, min: u32, flags: u32) -> Option<u32> {
+        let old = oldfd as usize;
+        let entry = self.slots.get(old)?.as_ref()?;
+        let description = self.descriptions.get(old)?.as_ref()?.clone();
+        let state = description.state.lock();
+        let clone = FdEntry {
+            ops: entry.ops.clone(),
+            offset: state.offset,
+            flags,
+            status_flags: state.status_flags,
+        };
+        drop(state);
+
+        let min = min as usize;
+        self.grow_max_fds_for(min);
+        while self.slots.len() <= min {
+            self.slots.push(None);
+            self.descriptions.push(None);
+        }
+        let target = self.next_free_from(min);
+        self.set_with_description(target as u32, clone, description);
+        Some(target as u32)
+    }
+
+    /// Duplicate `oldfd` onto one exact slot, atomically replacing that slot.
+    pub fn duplicate_to(&mut self, oldfd: u32, newfd: u32, flags: u32) -> Option<()> {
+        // An in-flight fanotify event owns this number until its metadata copy
+        // commits or rolls back; do not publish another object into it.
+        if self.reserved.contains(&newfd) {
+            return None;
+        }
+        let old = oldfd as usize;
+        let entry = self.slots.get(old)?.as_ref()?;
+        let description = self.descriptions.get(old)?.as_ref()?.clone();
+        let state = description.state.lock();
+        let clone = FdEntry {
+            ops: entry.ops.clone(),
+            offset: state.offset,
+            flags,
+            status_flags: state.status_flags,
+        };
+        drop(state);
+        self.set_with_description(newfd, clone, description);
+        Some(())
+    }
+
+    /// Export one open file for SCM_RIGHTS. The returned description is the
+    /// same object used by dup/fork, not a snapshot.
+    pub(crate) fn export_description(
+        &self,
+        fd: u32,
+    ) -> Option<(Arc<dyn FileOps>, Description, u32)> {
+        let i = fd as usize;
+        let entry = self.slots.get(i)?.as_ref()?;
+        let description = self.descriptions.get(i)?.as_ref()?.clone();
+        let status_flags = description.state.lock().status_flags;
+        Some((entry.ops.clone(), description, status_flags))
+    }
+
+    /// Install an SCM_RIGHTS file as a fresh fd slot while retaining the
+    /// sender's open-file description identity.
+    pub(crate) fn open_transferred(
+        &mut self,
+        ops: Arc<dyn FileOps>,
+        description: Option<Description>,
+        status_flags: u32,
+        flags: u32,
+    ) -> u32 {
+        let entry = FdEntry {
+            ops,
+            offset: description
+                .as_ref()
+                .map(|description| description.state.lock().offset)
+                .unwrap_or(0),
+            flags,
+            status_flags,
+        };
+        let Some(description) = description else {
+            return self.open(entry);
+        };
+        let target = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.slots.len());
+        if target == self.slots.len() {
+            self.grow_max_fds_for(target);
+            self.slots.push(Some(entry));
+            self.descriptions.push(Some(description));
+        } else {
+            self.slots[target] = Some(entry);
+            self.descriptions[target] = Some(description);
+        }
+        target as u32
     }
 
     /// Remove the entry at `fd`. Returns `true` if it existed.
@@ -153,6 +398,7 @@ impl FdTable {
         match self.slots.get_mut(i) {
             Some(slot @ Some(_)) => {
                 *slot = None;
+                self.descriptions[i] = None;
                 true
             }
             _ => false,
@@ -187,12 +433,13 @@ impl FdTable {
         if hi < lo {
             return;
         }
-        for slot in self.slots[lo..=hi].iter_mut() {
+        for (relative, slot) in self.slots[lo..=hi].iter_mut().enumerate() {
             if let Some(entry) = slot {
                 if cloexec {
                     entry.flags |= FD_CLOEXEC;
                 } else {
                     *slot = None;
+                    self.descriptions[lo + relative] = None;
                 }
             }
         }
@@ -204,10 +451,11 @@ impl FdTable {
     /// when this was the last holder).
     pub fn close_cloexec_slots(&mut self) -> usize {
         let mut n = 0;
-        for slot in self.slots.iter_mut() {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(entry) = slot {
                 if entry.flags & FD_CLOEXEC != 0 {
                     *slot = None;
+                    self.descriptions[i] = None;
                     n += 1;
                 }
             }
@@ -225,28 +473,60 @@ impl FdTable {
         self.slots.get_mut(fd as usize).and_then(Option::as_mut)
     }
 
-    /// Borrow two distinct descriptor entries mutably under one table lock.
-    /// Transfer syscalls need this so the input position is advanced only by
-    /// bytes the output actually accepted; splitting the operations across
-    /// separate table acquisitions exposes a bogus intermediate position on
-    /// a short write.
-    pub(crate) fn get_pair_mut(
-        &mut self,
-        first: u32,
-        second: u32,
-    ) -> Option<(&mut FdEntry, &mut FdEntry)> {
-        let first = first as usize;
-        let second = second as usize;
-        if first == second || first >= self.slots.len() || second >= self.slots.len() {
-            return None;
+    /// Snapshot the shared open-file-description position.
+    pub fn offset(&self, fd: u32) -> Option<u64> {
+        Some(
+            self.descriptions
+                .get(fd as usize)?
+                .as_ref()?
+                .state
+                .lock()
+                .offset,
+        )
+    }
+
+    /// Set the shared open-file-description position.
+    pub fn set_offset(&mut self, fd: u32, offset: u64) -> Option<()> {
+        let i = fd as usize;
+        let description = self.descriptions.get(i)?.as_ref()?;
+        description.set_offset(offset);
+        if let Some(entry) = self.slots.get_mut(i)?.as_mut() {
+            entry.offset = offset;
         }
-        if first < second {
-            let (lo, hi) = self.slots.split_at_mut(second);
-            Some((lo.get_mut(first)?.as_mut()?, hi.first_mut()?.as_mut()?))
-        } else {
-            let (lo, hi) = self.slots.split_at_mut(first);
-            Some((hi.first_mut()?.as_mut()?, lo.get_mut(second)?.as_mut()?))
+        Some(())
+    }
+
+    /// Snapshot the shared open-file-description status flags.
+    pub fn status_flags(&self, fd: u32) -> Option<u32> {
+        Some(
+            self.descriptions
+                .get(fd as usize)?
+                .as_ref()?
+                .state
+                .lock()
+                .status_flags,
+        )
+    }
+
+    /// Replace the shared open-file-description status flags.
+    pub fn set_status_flags(&mut self, fd: u32, status_flags: u32) -> Option<()> {
+        let i = fd as usize;
+        let description = self.descriptions.get(i)?.as_ref()?;
+        description.state.lock().status_flags = status_flags;
+        if let Some(entry) = self.slots.get_mut(i)?.as_mut() {
+            entry.status_flags = status_flags;
         }
+        Some(())
+    }
+
+    pub(crate) fn description(&self, fd: u32) -> Option<Description> {
+        self.descriptions.get(fd as usize)?.as_ref().cloned()
+    }
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -273,7 +553,7 @@ fn fresh_table() -> FdTable {
                 ops: console.clone(),
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags: if fd == 0 { O_RDONLY } else { O_WRONLY },
             },
         );
     }
@@ -944,7 +1224,9 @@ impl FileOps for ConsoleFile {
 /// of the descriptor table whose entries reference the same
 /// underlying open-file objects (Arc::clone on the inner `FileOps`
 /// trait object — refcount up, no extra `Box::new`). Per-fd `flags`
-/// and `offset` snapshot at fork time.
+/// remain per-slot. The open-file descriptions themselves are shared, exactly
+/// as Linux shares `struct file`: file position and status changes made by
+/// either process are immediately visible to the other.
 ///
 /// Idempotent only if the child table doesn't already exist; if it
 /// does, the existing table is overwritten with the parent's
@@ -957,13 +1239,22 @@ pub fn fork(parent: u64, child: u64) -> usize {
     // INDEPENDENT copy in a fresh Arc, install for the child. Never hold two
     // shard locks at once → no lock-ordering hazard.
     let parent_arc = TABLES[table_shard(parent)].lock().get(&parent).cloned();
-    let parent_slots: Vec<Option<FdEntry>> = match parent_arc {
-        Some(a) => a.lock().slots.clone(),
-        None => Vec::new(),
+    let (parent_slots, parent_descriptions, parent_max_fds) = match parent_arc {
+        Some(a) => {
+            let table = a.lock();
+            (
+                table.slots.clone(),
+                table.descriptions.clone(),
+                table.max_fds,
+            )
+        }
+        None => (Vec::new(), Vec::new(), FdTable::INITIAL_MAX_FDS),
     };
     let copied = parent_slots.iter().filter(|s| s.is_some()).count();
     let mut child_table = FdTable::new();
     child_table.slots = parent_slots;
+    child_table.descriptions = parent_descriptions;
+    child_table.max_fds = parent_max_fds;
     TABLES[table_shard(child)]
         .lock()
         .insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));

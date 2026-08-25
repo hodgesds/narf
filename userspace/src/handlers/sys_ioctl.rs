@@ -46,15 +46,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 return;
             }
             let quota = if flags & BTRFS_SUBVOL_QGROUP_INHERIT != 0 {
-                let inherit_size = match usize::try_from(u64::from_ne_bytes(
-                    input[24..32].try_into().unwrap(),
-                )) {
-                    Ok(n) if (72..=4096).contains(&n) => n,
-                    _ => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let inherit_size =
+                    match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
+                        Ok(n) if (72..=4096).contains(&n) => n,
+                        _ => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 let inherit_ptr = u64::from_ne_bytes(input[32..40].try_into().unwrap());
                 let mut payload = alloc::vec![0u8; inherit_size];
                 // SAFETY: the UAPI size is page-bounded and copy_from_user
@@ -64,15 +63,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 let inherit_flags = u64::from_ne_bytes(payload[0..8].try_into().unwrap());
-                let count = match usize::try_from(u64::from_ne_bytes(
-                    payload[8..16].try_into().unwrap(),
-                )) {
-                    Ok(count) => count,
-                    Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let count =
+                    match usize::try_from(u64::from_ne_bytes(payload[8..16].try_into().unwrap())) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 if inherit_flags & !1 != 0
                     || u64::from_ne_bytes(payload[16..24].try_into().unwrap()) != 0
                     || u64::from_ne_bytes(payload[24..32].try_into().unwrap()) != 0
@@ -119,8 +117,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         };
         let source = fd::with_table(task, |t| {
-            t.get(source_fd as u32)
-                .and_then(|entry| entry.ops.as_dir())
+            t.get(source_fd as u32).and_then(|entry| entry.ops.as_dir())
         })
         .flatten();
         let Some(source) = source else {
@@ -132,9 +129,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         };
         let result = match quota {
-            Some(quota) => poll_blocking(destination.snapshot_with_quota_async(
-                source, name, readonly, quota,
-            )),
+            Some(quota) => {
+                poll_blocking(destination.snapshot_with_quota_async(source, name, readonly, quota))
+            }
             None => poll_blocking(destination.snapshot_async(source, name, readonly)),
         };
         let rc = match result {
@@ -179,7 +176,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 return false;
             };
             entry.ops = cloned;
-            entry.offset = 0;
+            let _ = entry;
+            t.set_offset(fd, 0);
             true
         })
         .unwrap_or(false);
@@ -503,15 +501,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     & BTRFS_SUBVOL_QGROUP_INHERIT
                     != 0
             {
-                let inherit_size = match usize::try_from(u64::from_ne_bytes(
-                    input[24..32].try_into().unwrap(),
-                )) {
-                    Ok(n) if (72..=4096).contains(&n) => n,
-                    _ => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let inherit_size =
+                    match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
+                        Ok(n) if (72..=4096).contains(&n) => n,
+                        _ => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 let inherit_ptr = u64::from_ne_bytes(input[32..40].try_into().unwrap());
                 let old_len = input.len();
                 input.resize(old_len + inherit_size, 0);

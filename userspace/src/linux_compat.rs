@@ -328,7 +328,7 @@ impl FileOps for MemFdFile {
         Box::pin(async move {
             let seals = self.seals.load(Ordering::Acquire);
             if (seals & F_SEAL_WRITE) != 0 {
-                return Err(FsError::ReadOnly);
+                return Err(FsError::OperationNotPermitted);
             }
             let mut g = self.store.lock();
             let off = offset as usize;
@@ -336,7 +336,7 @@ impl FileOps for MemFdFile {
             // F_SEAL_GROW: only fill existing space.
             if new_end > g.len && (seals & F_SEAL_GROW) != 0 {
                 if off >= g.len {
-                    return Err(FsError::ReadOnly);
+                    return Err(FsError::OperationNotPermitted);
                 }
                 let n = g.len - off;
                 let mut tmp = buf[..n].to_vec();
@@ -372,10 +372,10 @@ impl FileOps for MemFdFile {
             let mut g = self.store.lock();
             let cur = g.len as u64;
             if len < cur && (seals & F_SEAL_SHRINK) != 0 {
-                return Err(FsError::ReadOnly);
+                return Err(FsError::OperationNotPermitted);
             }
             if len > cur && (seals & F_SEAL_GROW) != 0 {
-                return Err(FsError::ReadOnly);
+                return Err(FsError::OperationNotPermitted);
             }
             // Allocate frames up-front (the shm pattern truncates to the pool
             // size before mmap). Shrinking keeps frames to avoid dangling an

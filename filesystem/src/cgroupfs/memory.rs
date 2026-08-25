@@ -150,21 +150,28 @@ fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
     }
     let _guard = Guard(cpu);
 
-    // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
-    // can iterate them twice without holding the chain lock across the
-    // closure body).
-    let mut states: Vec<Arc<dyn ControllerState>> = Vec::new();
-    super::with_chain_states(pid, "memory", |s| states.push(s.clone()));
-
     if delta_bytes < 0 {
         let amount = delta_bytes.unsigned_abs();
-        for s in &states {
+        // Final-owner frame return is reachable from GlobalAlloc's direct-
+        // reclaim retry, so this branch must not allocate or it recursively
+        // re-enters GlobalAlloc. Walk only an existing membership chain (no
+        // allocating root fallback), clone one already-owned Arc at a time,
+        // and perform the atomic uncharge inline. An exited/unplaced pid is a
+        // documented best-effort miss, not a reason to construct cgroup state.
+        super::with_existing_chain_states(pid, "memory", |s| {
             if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
                 m.uncharge(amount);
             }
-        }
+        });
         return true;
     }
+
+    // Positive charging needs a two-phase precheck/commit transaction. Collect
+    // the chain's `MemoryState`s once (clone the `Arc`s so we can iterate them
+    // twice without holding the chain lock across the closure body). This arm
+    // may allocate; it is never entered by final-owner direct reclaim.
+    let mut states: Vec<Arc<dyn ControllerState>> = Vec::new();
+    super::with_chain_states(pid, "memory", |s| states.push(s.clone()));
 
     let amount = delta_bytes as u64;
 

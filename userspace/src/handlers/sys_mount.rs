@@ -166,9 +166,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             let result = current_fs_arc_at(&target).map(|fs| fs.reconfigure(&data));
             ctx.set_return(match result {
                 Some(Ok(())) => SyscallReturn::ok(0),
-                Some(Err(narf_filesystem::FsError::NoSpace)) => {
-                    SyscallReturn::ok((-28i64) as u64)
-                }
+                Some(Err(narf_filesystem::FsError::NoSpace)) => SyscallReturn::ok((-28i64) as u64),
                 Some(Err(_)) => einval,
                 None => enoent,
             });
@@ -440,13 +438,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                     ctx.set_return(einval);
                     return;
                 }
-                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new(
-                    "overlay", upper, lowers,
-                ))
+                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers))
             }
-            (None, None) => alloc::sync::Arc::new(
-                narf_filesystem::OverlayFs::new_read_only("overlay", lowers),
-            ),
+            (None, None) => {
+                alloc::sync::Arc::new(narf_filesystem::OverlayFs::new_read_only("overlay", lowers))
+            }
             _ => unreachable!(),
         };
         return match current_mount_arc(&auth, target.as_str(), fs) {

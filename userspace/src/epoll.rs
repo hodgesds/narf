@@ -776,8 +776,8 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     };
     let target = if tfd >= 0 {
         fd::with_table(task, |t| {
-            t.get(tfd as u32)
-                .map(|entry| (entry.ops.clone(), entry.offset))
+            let entry = t.get(tfd as u32)?;
+            Some((entry.ops.clone(), t.offset(tfd as u32)?))
         })
         .flatten()
     } else {

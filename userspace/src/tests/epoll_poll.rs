@@ -3,6 +3,11 @@
 #![allow(unused_imports)]
 use super::*;
 
+// A canonical-hole address on x86_64 and outside NARF's user range on every
+// supported architecture. Unlike address 1, this remains invalid in the
+// kernel-test identity map and cannot accidentally name boot memory.
+const BAD_USER_PTR: u64 = 0x0000_8000_0000_0000;
+
 // ── Poll tests (≥ 6) ─────────────────────────────────────────────────
 
 /// poll: 1 fd, 0 timeout, data ready → returns 1
@@ -369,9 +374,9 @@ fn smoke_select_readfds_partial_ready() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_select_readfds_partial_ready);
+kernel_test_in!("userspace/select", smoke_select_readfds_partial_ready);
 
-/// pselect6: sigmask pointer accepted (silently ignored)
+/// pselect6 accepts a valid temporary signal mask and restores the old mask.
 fn smoke_pselect6_sigmask_accepted() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -386,8 +391,9 @@ fn smoke_pselect6_sigmask_accepted() -> TestResult {
     rfds[fd_ready as usize / 8] |= 1 << (fd_ready % 8);
     // ts = {0, 0} → nonblock
     let ts: [i64; 2] = [0, 0];
-    // Fake sigmask pair: { ptr=1, size=8 } — non-null but content ignored.
-    let sigmask_pair: [u64; 2] = [1, 8];
+    let old_mask = crate::handlers::set_signal_mask_for_task(task, 1 << 9);
+    let sigmask = 0u64;
+    let sigmask_pair: [u64; 2] = [&sigmask as *const u64 as u64, 8];
 
     let r = call(
         Syscall::Pselect6,
@@ -401,15 +407,17 @@ fn smoke_pselect6_sigmask_accepted() -> TestResult {
         },
     );
     crate::syscall::__test_clear_global();
+    let restored = crate::handlers::signal_mask_of(task) == (1 << 9);
+    let _ = crate::handlers::set_signal_mask_for_task(task, old_mask);
     if r.status != SyscallReturn::OK {
         return TestResult::Fail("pselect6 returned non-OK");
     }
-    if r.value == (!0u64) {
-        return TestResult::Fail("pselect6 returned -1");
+    if r.value == (!0u64) || !restored {
+        return TestResult::Fail("pselect6 failed or did not restore the prior signal mask");
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_pselect6_sigmask_accepted);
+kernel_test_in!("userspace/select", smoke_pselect6_sigmask_accepted);
 
 /// select: no fds ready, timeout=0 → returns 0
 fn smoke_select_no_ready_returns_zero() -> TestResult {
@@ -443,7 +451,361 @@ fn smoke_select_no_ready_returns_zero() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_select_no_ready_returns_zero);
+kernel_test_in!("userspace/select", smoke_select_no_ready_returns_zero);
+
+/// Linux select maps HUP into a requested read set, not exceptfds. This is
+/// what lets a reader observe EOF after the final writer closes.
+fn smoke_select_hup_is_read_not_except() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, narf_filesystem::POLL_HUP);
+    let mut rfds = [0u8; 128];
+    let mut efds = [0u8; 128];
+    rfds[fd as usize / 8] |= 1 << (fd % 8);
+    efds[fd as usize / 8] |= 1 << (fd % 8);
+    let tv: [i64; 2] = [0, 0];
+
+    let r = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(fd + 1),
+            arg1: rfds.as_mut_ptr() as u64,
+            arg3: efds.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let read = (rfds[fd as usize / 8] >> (fd % 8)) & 1;
+    let except = (efds[fd as usize / 8] >> (fd % 8)) & 1;
+    if r.status != SyscallReturn::OK || r.value != 1 || read != 1 || except != 0 {
+        return TestResult::Fail("select must report HUP in readfds only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/select", smoke_select_hup_is_read_not_except);
+
+/// One fd ready in both readfds and writefds contributes two to select's
+/// return value. ERR is not exceptional/OOB readiness.
+fn smoke_select_err_is_read_and_write_counted_twice() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, narf_filesystem::POLL_ERR);
+    let mut rfds = [0u8; 128];
+    let mut wfds = [0u8; 128];
+    let mut efds = [0u8; 128];
+    for set in [&mut rfds, &mut wfds, &mut efds] {
+        set[fd as usize / 8] |= 1 << (fd % 8);
+    }
+    let tv: [i64; 2] = [0, 0];
+
+    let r = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(fd + 1),
+            arg1: rfds.as_mut_ptr() as u64,
+            arg2: wfds.as_mut_ptr() as u64,
+            arg3: efds.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let bit = |set: &[u8; 128]| (set[fd as usize / 8] >> (fd % 8)) & 1;
+    if r.status != SyscallReturn::OK
+        || r.value != 2
+        || bit(&rfds) != 1
+        || bit(&wfds) != 1
+        || bit(&efds) != 0
+    {
+        return TestResult::Fail("select must map ERR to read+write and count both sets");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/select",
+    smoke_select_err_is_read_and_write_counted_twice
+);
+
+/// pselect6 shares select's core and maps POLLPRI to exceptfds.
+fn smoke_pselect6_pri_is_except() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let fd = install_ready_file(task, narf_filesystem::POLL_PRI);
+    let mut efds = [0u8; 128];
+    efds[fd as usize / 8] |= 1 << (fd % 8);
+    let ts: [i64; 2] = [0, 0];
+
+    let r = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg0: u64::from(fd + 1),
+            arg3: efds.as_mut_ptr() as u64,
+            arg4: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let except = (efds[fd as usize / 8] >> (fd % 8)) & 1;
+    if r.status != SyscallReturn::OK || r.value != 1 || except != 1 {
+        return TestResult::Fail("pselect6 must report POLLPRI in exceptfds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/select", smoke_pselect6_pri_is_except);
+
+/// Error classes retain Linux's exact errno values instead of collapsing to
+/// bare -1 (which libc would misread as EPERM).
+fn smoke_select_exact_errnos() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let tv: [i64; 2] = [0, 0];
+
+    // A closed descriptor below Linux's initial max_fds=64 is EBADF.
+    let fd = 10u32;
+    let mut rfds = [0u8; 128];
+    rfds[fd as usize / 8] |= 1 << (fd % 8);
+    let bad_fd = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(fd + 1),
+            arg1: rfds.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if bad_fd.value != (-9i64) as u64 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("select invalid fd must return EBADF");
+    }
+
+    // Invalid fd_set and timeval pointers are EFAULT.
+    let bad_set = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: 1,
+            arg1: BAD_USER_PTR,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let bad_time = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg4: BAD_USER_PTR,
+            ..SyscallArgs::default()
+        },
+    );
+    if bad_set.value != (-14i64) as u64 || bad_time.value != (-14i64) as u64 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("select bad pointers must return EFAULT");
+    }
+
+    // Negative descriptor counts and negative timeout fields are EINVAL.
+    let negative_nfds = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            ..SyscallArgs::default()
+        },
+    );
+    let clamped_nfds = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: 2000,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let bad_tv: [i64; 2] = [0, -1];
+    let bad_timeout = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg4: bad_tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    // Linux normalizes tv_usec values at or above one second.
+    let normalized_tv: [i64; 2] = [0, 1_000_000];
+    let ready_fd = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut normalized_rfds = [0u8; 128];
+    normalized_rfds[ready_fd as usize / 8] |= 1 << (ready_fd % 8);
+    let normalized_timeout = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(ready_fd + 1),
+            arg1: normalized_rfds.as_mut_ptr() as u64,
+            arg4: normalized_tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    // A non-null pselect argpack with the wrong sigset size is EINVAL; a bad
+    // argpack pointer itself is EFAULT.
+    let mask = 0u64;
+    let wrong_size: [u64; 2] = [&mask as *const u64 as u64, 7];
+    let bad_mask_size = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg5: wrong_size.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let bad_argpack = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg5: BAD_USER_PTR,
+            ..SyscallArgs::default()
+        },
+    );
+    // Linux copies outer arguments in this order: timeval before nfds for
+    // select, and pselect's argpack before both timeout and nfds.
+    let select_order = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg4: BAD_USER_PTR,
+            ..SyscallArgs::default()
+        },
+    );
+    let pselect_order = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg5: BAD_USER_PTR,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if negative_nfds.value != (-22i64) as u64
+        || bad_timeout.value != (-22i64) as u64
+        || bad_mask_size.value != (-22i64) as u64
+        || bad_argpack.value != (-14i64) as u64
+        || normalized_timeout.value != 1
+        || clamped_nfds.value != 0
+        || select_order.value != (-14i64) as u64
+        || pselect_order.value != (-14i64) as u64
+    {
+        return TestResult::Fail("select/pselect errno or timeval normalization mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/select", smoke_select_exact_errnos);
+
+/// Raw select is not capped by libc FD_SETSIZE. It follows the fdtable's
+/// power-of-two extent and copies only the native-word-rounded prefix.
+fn smoke_select_dynamic_fdtable_and_prefix_copy() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let source = install_ready_file(task, narf_filesystem::POLL_IN);
+    let high_fd = 1100u32;
+    let installed = crate::fd::with_table(task, |table| {
+        let entry = table.get(source).cloned();
+        if let Some(entry) = entry {
+            table.set(high_fd, entry);
+            table.max_fds() >= 2048
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false);
+    if !installed {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("failed to grow fdtable beyond FD_SETSIZE");
+    }
+
+    let mut rfds = [0xA5u8; 160];
+    rfds[..144].fill(0);
+    rfds[high_fd as usize / 8] |= 1 << (high_fd % 8);
+    let tv = [0i64, 0];
+    let result = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: u64::from(high_fd + 1),
+            arg1: rfds.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    let ready = (rfds[high_fd as usize / 8] >> (high_fd % 8)) & 1;
+    if result.value != 1 || ready != 1 || rfds[144..] != [0xA5; 16] {
+        return TestResult::Fail("select did not honor dynamic max_fds/prefix copy");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/select",
+    smoke_select_dynamic_fdtable_and_prefix_copy
+);
+
+/// A fresh Linux fdtable has max_fds=64: bits beyond that snapshot are not
+/// read or cleared, and nfds is a C int whose high 32 bits are discarded.
+fn smoke_select_initial_clamp_and_int_truncation() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let _task = setup_poll_test();
+    let mut rfds = [0u8; 128];
+    rfds[127 / 8] = 1 << (127 % 8);
+    let tv = [0i64, 0];
+    let clamped = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: 128,
+            arg1: rfds.as_mut_ptr() as u64,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let truncated = call(
+        Syscall::Select,
+        SyscallArgs {
+            arg0: 1u64 << 32,
+            arg1: 1,
+            arg4: tv.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if clamped.value != 0 || rfds[127 / 8] == 0 || truncated.value != 0 {
+        return TestResult::Fail("select max_fds clamp or int truncation mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/select",
+    smoke_select_initial_clamp_and_int_truncation
+);
+
+/// pselect's null inner mask ignores size, but non-null masks validate size
+/// before dereferencing the pointed set.
+fn smoke_pselect6_argpack_inner_validation() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    setup_poll_test();
+    let ts = [0i64, 0];
+    let null_mask_bad_size = [0u64, u64::MAX];
+    let accepted = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg4: ts.as_ptr() as u64,
+            arg5: null_mask_bad_size.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    let bad_mask = [BAD_USER_PTR, 8];
+    let fault = call(
+        Syscall::Pselect6,
+        SyscallArgs {
+            arg4: ts.as_ptr() as u64,
+            arg5: bad_mask.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if accepted.value != 0 || fault.value != (-14i64) as u64 {
+        return TestResult::Fail("pselect6 inner argpack validation mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/select", smoke_pselect6_argpack_inner_validation);
 
 // ── epoll tests (≥ 7) ───────────────────────────────────────────────
 

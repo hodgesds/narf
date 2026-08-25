@@ -496,17 +496,6 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
-    /// This slot's task id (0 until first enqueued). A wake publishes it into
-    /// the target CPU's `RUN_NEXT` hint so the just-woken task is picked next
-    /// instead of waiting behind the ready-queue backlog (targeted wakeup).
-    task: AtomicU64,
-    /// Diagnostic: times `run_until_empty` popped this slot, and times it
-    /// re-queued it because the awake flag was clear. A stranded slot is
-    /// ambiguous without these — "the CPU is running rounds" does not say
-    /// whether THIS slot is reached, and "awake=true" does not say whether
-    /// the swap that would clear it was ever executed.
-    pops: AtomicU64,
-    not_awake_requeues: AtomicU64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -516,83 +505,6 @@ pub(crate) struct WakeCell {
 /// both un-IPI'd AND unobserved.
 static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
-
-/// Targeted-wakeup hint (Linux `try_to_wake_up`'s "run the woken task promptly"
-/// slice): the task id a wake asked CPU `i` to pick NEXT (0 = none). A wake
-/// publishes it first-wins; `pick_next_slot` consumes it and, if that task is
-/// present and dispatchable at the best eligibility tier, picks it ahead of the
-/// FIFO backlog — so a just-woken task resumes without waiting behind the other
-/// ready slots (the scheduling hop). It is ONLY a pick-order bias over
-/// already-runnable work: it never sets the awake/runnable bit and never
-/// touches the halt handshake, so it cannot create or mask a lost wakeup, and a
-/// stale id (task gone/migrated) is simply ignored.
-static RUN_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
-
-/// Publish a run-next hint for `cpu` (first-wins: a burst of wakes in one round
-/// biases toward the first woken task rather than thrashing the pick).
-fn set_run_next(cpu: u32, task: u64) {
-    if task == 0 || cpu as usize >= narf_lib::percpu::MAX_CPUS {
-        return;
-    }
-    let _ = RUN_NEXT[cpu as usize].compare_exchange(0, task, Ordering::AcqRel, Ordering::Relaxed);
-}
-
-/// Consume `cpu`'s run-next hint. Called by `pick_next_slot`.
-pub(crate) fn take_run_next(cpu: crate::affinity::CpuId) -> Option<u64> {
-    let i = cpu.0 as usize;
-    if i >= narf_lib::percpu::MAX_CPUS {
-        return None;
-    }
-    match RUN_NEXT[i].swap(0, Ordering::AcqRel) {
-        0 => None,
-        t => Some(t),
-    }
-}
-
-/// The task id each CPU picked most recently. Used to reject a run-next hint
-/// that names the just-picked task: a cooperatively-yielding task wakes ITSELF
-/// (the yield heartbeat), which would otherwise re-boost it to the front every
-/// pick and starve the queue. A self-wake is a yield — it goes to the tail like
-/// any yield; only a wake from ANOTHER task/IRQ earns the run-next boost.
-static LAST_PICKED: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
-
-pub(crate) fn last_picked(cpu: crate::affinity::CpuId) -> u64 {
-    LAST_PICKED
-        .get(cpu.0 as usize)
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
-pub(crate) fn set_last_picked(cpu: crate::affinity::CpuId, task: u64) {
-    if let Some(c) = LAST_PICKED.get(cpu.0 as usize) {
-        c.store(task, Ordering::Relaxed);
-    }
-}
-
-/// One-pick cooldown after a run-next boost. Forces the very next pick to use
-/// FIFO order, so two tasks that wake each other (a ping-pong pair) can win the
-/// boost at most every OTHER pick — guaranteeing the FIFO queue always makes
-/// progress and other queued tasks can never be starved by the boost.
-static RUN_NEXT_COOLDOWN: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
-
-/// Whether a run-next boost is allowed this pick (not on cooldown). Consumes
-/// the cooldown.
-pub(crate) fn run_next_allowed(cpu: crate::affinity::CpuId) -> bool {
-    RUN_NEXT_COOLDOWN
-        .get(cpu.0 as usize)
-        .map(|c| !c.swap(false, Ordering::Relaxed))
-        .unwrap_or(true)
-}
-
-/// Arm the cooldown after a pick honored a run-next boost.
-pub(crate) fn arm_run_next_cooldown(cpu: crate::affinity::CpuId) {
-    if let Some(c) = RUN_NEXT_COOLDOWN.get(cpu.0 as usize) {
-        c.store(true, Ordering::Relaxed);
-    }
-}
 
 /// Per-CPU periodic-budget boundaries for the currently polling slot. Zero
 /// means no period budget. The timer trap reads these without touching the
@@ -1523,7 +1435,6 @@ fn enqueue_on(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) {
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-    slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
     let awake = slot.awake.flag.load(Ordering::Acquire);
     let meta = policy::TaskMeta::from_slot(&slot);
     policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
@@ -1659,9 +1570,6 @@ where
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
-            task: AtomicU64::new(0),
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -1720,9 +1628,6 @@ where
     let slot = TaskSlot {
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake: Arc::new(WakeCell {
-            task: AtomicU64::new(0),
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(cpu as u32),
         }),
@@ -1943,9 +1848,6 @@ where
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
-            task: AtomicU64::new(0),
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -2458,13 +2360,10 @@ unsafe fn wake_raw(data: *const ()) {
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
     arc.flag.store(true, Ordering::Release);
-    let cpu = arc.cpu.load(Ordering::Acquire);
-    // Bias the target CPU to pick this just-woken task next (targeted wakeup).
-    set_run_next(cpu, arc.task.load(Ordering::Relaxed));
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
-    resched_remote(cpu);
+    resched_remote(arc.cpu.load(Ordering::Acquire));
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -2473,15 +2372,10 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let (cpu, task) = unsafe {
+    let cpu = unsafe {
         (*ptr).flag.store(true, Ordering::Release);
-        (
-            (*ptr).cpu.load(Ordering::Acquire),
-            (*ptr).task.load(Ordering::Relaxed),
-        )
+        (*ptr).cpu.load(Ordering::Acquire)
     };
-    // Bias the target CPU to pick this just-woken task next (targeted wakeup).
-    set_run_next(cpu, task);
     resched_remote(cpu);
 }
 
@@ -2612,7 +2506,6 @@ pub fn poll_one_round() -> usize {
         // Running on this CPU now — aim future wakes' reschedule IPI here
         // (the slot may have been work-stolen since it was enqueued).
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-        slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
         let waker = make_waker(slot.awake.clone());
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
@@ -2882,11 +2775,7 @@ pub fn run_until_empty() {
 
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
-            slot.awake.pops.fetch_add(1, Ordering::Relaxed);
             if !slot.awake.flag.swap(false, Ordering::Acquire) {
-                slot.awake
-                    .not_awake_requeues
-                    .fetch_add(1, Ordering::Relaxed);
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
@@ -2897,7 +2786,6 @@ pub fn run_until_empty() {
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-            slot.awake.task.store(slot.id.raw(), Ordering::Relaxed);
 
             // Save the kernel per-AS register before activating
             // the user AS so we can swap back after `poll()`
@@ -3209,13 +3097,6 @@ pub fn run_until_empty() {
         // still run on the all-parked branch below (every idle cycle, i.e.
         // once per request/response since the loop idles between them), plus
         // a ~1 ms forced fallback so a perpetual self-waker can't starve them.
-        // One tick per executor round on this CPU. A parked task whose wake
-        // landed but never ran is ambiguous without this: it distinguishes
-        // "this CPU is looping and skipping the slot" from "this CPU stopped
-        // iterating entirely", which are different bugs. Diagnostic only.
-        if cpu < narf_lib::percpu::MAX_CPUS {
-            EXEC_ROUNDS[cpu].fetch_add(1, Ordering::Relaxed);
-        }
         let runnable_now = narf_time::now_cycles();
         let any_runnable = {
             let q = READY[cpu].lock();
@@ -3615,29 +3496,11 @@ pub fn runnable_task_count() -> usize {
 ///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
 /// - `locked`               ⇒ a holder is stuck inside the queue lock.
 ///
-/// Executor rounds completed per CPU. See the increment site.
-static EXEC_ROUNDS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
-
-/// Rounds this CPU's executor loop has run.
-pub fn dbg_exec_rounds(cpu: usize) -> u64 {
-    if cpu >= narf_lib::percpu::MAX_CPUS {
-        return 0;
-    }
-    EXEC_ROUNDS[cpu].load(Ordering::Relaxed)
-}
-
 /// Scheduler-side state of the slot owning `task_id`, if it is queued:
-/// `(awake_flag, home_cpu, rounds_on_that_cpu, queue_len)`.
-///
-/// A parked task that has been woken but never re-polled leaves a specific
-/// fingerprint here. `awake == true` says the wake reached the slot, so
-/// the readiness and waker layers did their job; if the home CPU's round
-/// counter is ALSO advancing, the executor is iterating and skipping the
-/// slot; if it is flat, that CPU has stopped running rounds and every task
-/// homed on it is stranded regardless of its own state.
-#[allow(clippy::type_complexity)]
-pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool, u64, u64)> {
+/// `(awake_flag, home_cpu, queue_len, affinity_bits, queued_cpu, allowed)`.
+/// This is sampled only when the stall watchdog reports a stranded waiter;
+/// collecting it requires no counters on the normal scheduling path.
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, usize, u64, u32, bool)> {
     for (cpu, ready) in READY.iter().enumerate() {
         if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
             continue;
@@ -3660,13 +3523,10 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
             return Some((
                 slot.awake.flag.load(Ordering::Acquire),
                 home,
-                dbg_exec_rounds(home as usize),
                 d.len(),
                 allowed.bits(),
                 cpu as u32,
                 allowed.contains(CpuId(cpu as u32)),
-                slot.awake.pops.load(Ordering::Relaxed),
-                slot.awake.not_awake_requeues.load(Ordering::Relaxed),
             ));
         }
     }
@@ -3674,26 +3534,19 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
 }
 
 /// Per-slot snapshot of `cpu`'s ready queue, newest-first, for the stall
-/// watchdog: `(tid, awake, home_cpu, affinity_bits, allowed_here, pops,
-/// not_awake_requeues)`.
+/// watchdog: `(tid, awake, home_cpu, affinity_bits, allowed_here)`.
 ///
 /// [`dbg_cpu_stall`] reports that a halted CPU has runnable work, but not
 /// WHICH work or why it is not running, and the stall dump's summary counts
-/// are compatible with two completely different bugs. An awake slot that
-/// never runs is either an affinity bounce — it is queued on a CPU its mask
-/// excludes, so `run_until_empty` re-queues it WITHOUT consuming the flag and
-/// it circulates forever (`allowed_here == false`, `not_awake_requeues`
-/// climbing) — or a slot the executor simply stopped visiting (`allowed_here
-/// == true`, `pops` flat). Those need opposite fixes, and only per-slot state
-/// separates them.
+/// are compatible with different bugs. `allowed_here == false` directly
+/// identifies an affinity bounce without maintaining per-slot counters.
 ///
 /// Capped at [`DBG_READY_SLOTS_MAX`]: this runs from a timer trap onto a
 /// synchronous serial console, where dumping an unbounded queue would itself
 /// become the stall. `try_lock`, for the same reason [`dbg_slot_state`] uses
 /// it — blocking on the queue lock held by the CPU under investigation would
 /// deadlock the reporter.
-#[allow(clippy::type_complexity)]
-pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool, u64, u64)> {
+pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool)> {
     let mut out = alloc::vec::Vec::new();
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return out;
@@ -3710,8 +3563,6 @@ pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool
             slot.awake.cpu.load(Ordering::Relaxed),
             allowed.bits(),
             allowed.contains(CpuId(cpu as u32)),
-            slot.awake.pops.load(Ordering::Relaxed),
-            slot.awake.not_awake_requeues.load(Ordering::Relaxed),
         ));
     }
     out
@@ -4297,9 +4148,6 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
-        task: AtomicU64::new(0),
-        pops: AtomicU64::new(0),
-        not_awake_requeues: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

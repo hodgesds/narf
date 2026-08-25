@@ -289,11 +289,7 @@ fn try_heal_user_data_abort(esr: u64, far: u64) -> bool {
             // Publish the faulting task's NUMA mempolicy for `far` so
             // demand-paging steers the fresh frame (set_mempolicy/mbind
             // enforcement). Cleared right after.
-            narf_userspace::publish_mempolicy_for_fault(far);
-            // SAFETY: low-RAM phys-as-virt window is live; AS is the active
-            // user AS by construction.
-            let r = unsafe { as_arc.demand_alloc_page(v) };
-            narf_userspace::clear_mempolicy_for_fault();
+            let r = crate::bare::reclaim_wait::demand_page(&as_arc, v);
             if r.is_ok() {
                 return true;
             }

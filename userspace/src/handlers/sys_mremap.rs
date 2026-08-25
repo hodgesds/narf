@@ -47,6 +47,18 @@ fn mremap_core(
     if old_end > AddressSpace::USER_HALF_END {
         return Err(EFAULT);
     }
+    #[cfg(feature = "linux-compat")]
+    let task = current_task_id();
+    #[cfg(feature = "linux-compat")]
+    let lpid = task_to_pid_raw(task).unwrap_or(task);
+    #[cfg(feature = "linux-compat")]
+    let as_key = shm_as_key_ref(as_ref);
+    #[cfg(feature = "linux-compat")]
+    shm_register_as_owner(as_key, lpid);
+    #[cfg(feature = "linux-compat")]
+    let shm_transaction = shm_mapping_transaction(as_key);
+    #[cfg(feature = "linux-compat")]
+    let _shm_guard = shm_transaction.lock();
 
     // NARF's region table is the VMA authority. Require the complete region
     // instead of merging fragments with potentially different permissions or
@@ -76,6 +88,10 @@ fn mremap_core(
             .punch_fixed(VirtAddr::new(new_addr), new_len)
             .map_err(|_| ENOMEM)?;
         crate::mapped_file::punch_current(new_addr, new_len);
+        #[cfg(feature = "linux-compat")]
+        {
+            shm_record_fixed_punch(as_key, new_addr, new_addr + new_len, lpid);
+        }
         // SAFETY: mremap_core holds an Arc-owned live address space; both
         // disjoint ranges were page/bounds validated above.
         unsafe {
@@ -101,10 +117,7 @@ fn mremap_core(
         crate::mapped_file::punch_current(tail, old_len - new_len);
         return Ok(old_addr);
     }
-    if as_ref
-        .grow_region(VirtAddr::new(old_addr), new_len)
-        .is_ok()
-    {
+    if as_ref.grow_region(VirtAddr::new(old_addr), new_len).is_ok() {
         return Ok(old_addr);
     }
     if flags & MREMAP_MAYMOVE == 0 {
@@ -204,14 +217,7 @@ mod tests {
         if mremap_core(&aspace, BASE, 2 * 4096, 4 * 4096, 0, 0) != Err(ENOMEM) {
             return TestResult::Fail("colliding grow without MAYMOVE did not fail");
         }
-        let moved = match mremap_core(
-            &aspace,
-            BASE,
-            2 * 4096,
-            4 * 4096,
-            MREMAP_MAYMOVE,
-            0,
-        ) {
+        let moved = match mremap_core(&aspace, BASE, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE, 0) {
             Ok(address) if address != BASE => address,
             _ => return TestResult::Fail("MAYMOVE did not relocate"),
         };
@@ -271,8 +277,7 @@ mod tests {
         if aspace.map_region(lazy_region(BASE, 2)).is_err() {
             return TestResult::Fail("initial region failed");
         }
-        if mremap_core(&aspace, BASE, 8192, 8192, MREMAP_FIXED, BASE + 0x20_0000)
-            != Err(EINVAL)
+        if mremap_core(&aspace, BASE, 8192, 8192, MREMAP_FIXED, BASE + 0x20_0000) != Err(EINVAL)
             || mremap_core(
                 &aspace,
                 BASE,

@@ -16,14 +16,14 @@ pub(crate) fn sys_fchmodat2(ctx: &mut dyn TrapContext) {
 
 fn metadata_errno(error: narf_filesystem::FsError) -> i64 {
     match error {
-        narf_filesystem::FsError::NotFound => -2,          // -ENOENT
+        narf_filesystem::FsError::NotFound => -2, // -ENOENT
         narf_filesystem::FsError::PermissionDenied => -13, // -EACCES
-        narf_filesystem::FsError::InvalidPath => -22,      // -EINVAL
-        narf_filesystem::FsError::NoSpace => -28,          // -ENOSPC
-        narf_filesystem::FsError::QuotaExceeded => -122,   // -EDQUOT
-        narf_filesystem::FsError::ReadOnly => -30,         // -EROFS
-        narf_filesystem::FsError::Unsupported => -95,      // -EOPNOTSUPP
-        _ => -5,                                           // -EIO
+        narf_filesystem::FsError::InvalidPath => -22, // -EINVAL
+        narf_filesystem::FsError::NoSpace => -28, // -ENOSPC
+        narf_filesystem::FsError::QuotaExceeded => -122, // -EDQUOT
+        narf_filesystem::FsError::ReadOnly => -30, // -EROFS
+        narf_filesystem::FsError::Unsupported => -95, // -EOPNOTSUPP
+        _ => -5,                                  // -EIO
     }
 }
 
@@ -51,9 +51,8 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
             if args.arg0 as i64 == -100 {
                 let cwd = resolve_cwd_path(current_task_id(), ".");
                 if let Some(dir) = resolve_dir_absolute(&cwd) {
-                    match poll_blocking(
-                        dir.set_dir_mode_async((args.arg2 as u32 & 0o7777) as u16),
-                    ) {
+                    match poll_blocking(dir.set_dir_mode_async((args.arg2 as u32 & 0o7777) as u16))
+                    {
                         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
                         Some(Err(error)) => {
                             ctx.set_return(SyscallReturn::ok(metadata_errno(error) as u64));

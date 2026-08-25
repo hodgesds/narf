@@ -1,113 +1,212 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `shmat(shmid, shmaddr, shmflg)` — map the segment's frames into the AS.
+/// `shmat(shmid, shmaddr, shmflg)` — attach a System V segment.
+///
+/// Validation follows Linux `ipc/shm.c::do_shmat`: signed-id and address
+/// shape first, access permission next, then overlap/replacement and mapping.
+/// Unknown `shmflg` bits are ignored by Linux and therefore by NARF.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let shmid = a.arg0;
-    let flg = a.arg2;
-    let (handle, len) = {
-        let g = SHM_SEGMENTS.lock();
-        match g.as_ref().and_then(|m| m.get(&shmid)) {
-            Some(s) => (s.handle, s.len),
-            None => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    let signed_shmid = a.arg0 as u32 as i32;
+    let shmid = signed_shmid as u32 as u64;
+    let mut base = a.arg1;
+    let flg = a.arg2 as u32 as u64;
+    #[cfg(feature = "container")]
+    let ipc_namespace = current_shm_ipc_ns();
+    #[cfg(feature = "container")]
+    let ipc_ns = ipc_namespace.id();
+    #[cfg(not(feature = "container"))]
+    let ipc_ns = current_shm_ipc_ns_id();
+    let object = (ipc_ns, shmid);
+
+    if signed_shmid < 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+    if base != 0 {
+        if base & (SHMLBA - 1) != 0 {
+            if flg & SHM_RND != 0 {
+                base &= !(SHMLBA - 1);
+                if base == 0 && flg & SHM_REMAP != 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    return;
+                }
+            } else if base & 0xFFF != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
                 return;
             }
         }
+    } else if flg & SHM_REMAP != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+
+    let request = 0o4
+        | if flg & SHM_RDONLY == 0 { 0o2 } else { 0 }
+        | if flg & SHM_EXEC != 0 { 0o1 } else { 0 };
+    let (handle, len) = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let Some(seg) = segments
+            .as_mut()
+            .and_then(|map| map.get_mut(&object))
+            .filter(|seg| !seg.removed)
+        else {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            return;
+        };
+        if !shm_ipc_allowed(seg, request) {
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+            return;
+        }
+        // Reserve backing lifetime against a racing IPC_RMID.
+        seg.nattch = seg.nattch.saturating_add(1);
+        (seg.handle, seg.len)
     };
-    let v = match shmem_vtable() {
-        Some(v) => v,
+
+    let reserve_len = match len.checked_add(0xFFF) {
+        Some(value) => value & !0xFFF,
         None => {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            return;
+        }
+    };
+    if base != 0 && flg & SHM_REMAP == 0 && base.checked_add(reserve_len).is_none() {
+        shm_cancel_attach(object);
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
+
+    let vtable = match shmem_vtable() {
+        Some(vtable) => vtable,
+        None => {
+            shm_cancel_attach(object);
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
     };
     let as_ref = match current_address_space() {
-        Some(a) => a,
+        Some(as_ref) => as_ref,
         None => {
+            shm_cancel_attach(object);
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
     };
-    // SHARED marks the frames as borrowed (narf-shmem owns them), so a
-    // second shmat of the same segment may alias them and neither unmap
-    // nor AS-drop frees them.
+    if base == 0 {
+        base = as_ref.reserve_mmap_va_aligned(reserve_len, SHMLBA);
+        if base == 0 {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            return;
+        }
+    }
+
+    let caller = current_task_id();
+    let lpid = task_to_pid_raw(caller).unwrap_or(caller);
+    let as_key = shm_as_key(&as_ref);
+    // Serialize every address-space mutation that can create, punch, or detach
+    // a SysV VMA with SHM_ATTACHMENTS/nattch publication. This is the
+    // userspace equivalent of Linux's mmap write lock plus shm ids lock for
+    // CLONE_VM siblings sharing this address space.
+    shm_register_as_owner(as_key, lpid);
+    let mapping_transaction = shm_mapping_transaction(as_key);
+    let _mapping_guard = mapping_transaction.lock();
+    if flg & SHM_REMAP != 0 {
+        let Some(end) = base.checked_add(reserve_len) else {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            return;
+        };
+        if as_ref
+            .punch_fixed(VirtAddr::new(base), reserve_len)
+            .is_err()
+        {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+            return;
+        }
+        // Linux MAP_FIXED does not restore displaced mappings if the new mmap
+        // later fails. Keep System V attachment accounting synchronized with
+        // the hole that has already been punched.
+        shm_record_fixed_punch(as_key, base, end, lpid);
+    }
+
     let mut perms = RegionPerms::READ | RegionPerms::SHARED;
     if flg & SHM_RDONLY == 0 {
         perms = perms | RegionPerms::WRITE;
     }
-    // Reserve a page-aligned VA window: the segment maps one PTE per
-    // page-granular backing frame, so a sub-page `len` still consumes a
-    // whole page (matching the region registered below).
-    let reserve_len = match len.checked_add(0xFFF) {
-        Some(value) => value & !0xFFF,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-            return;
-        }
-    };
-    let base = as_ref.reserve_mmap_va(reserve_len);
-    if base == 0 {
-        // mmap arena exhausted (cursor at MMAP_WINDOW_TOP) — fail closed.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
-        return;
+    if flg & SHM_EXEC != 0 {
+        perms = perms | RegionPerms::EXEC;
     }
     let mapped = narf_memory::with_shared_mapping_transaction(|| {
         let mut frames_raw = alloc::vec::Vec::new();
-        if !(v.frames)(handle, &mut frames_raw) {
+        if !(vtable.frames)(handle, &mut frames_raw) {
             return Err(narf_memory::AddressSpaceError::Unmapped);
         }
-        let phys_list: alloc::vec::Vec<_> = frames_raw
+        let map_len = (frames_raw.len() as u64) << 12;
+        if map_len != reserve_len {
+            return Err(narf_memory::AddressSpaceError::AlignmentMismatch);
+        }
+        let phys = frames_raw
             .into_iter()
             .map(narf_memory::PhysAddr::new)
             .collect();
-        // The backing frames are page-granular, so the mapped region spans
-        // exactly one PTE per shared frame. `map_region_inner` requires a
-        // page-aligned `len` that matches the scatter list one-to-one, so
-        // derive it from the frame count rather than the raw (possibly
-        // sub-page) segment size.
-        let map_len = (phys_list.len() as u64) << 12;
         // SAFETY: registry snapshot and alias insertion share one transaction.
         unsafe {
             as_ref.map_shared_region_locked(Region {
                 base: VirtAddr::new(base),
                 len: map_len,
                 perms,
-                phys: phys_list,
+                phys,
             })?;
         }
         Ok(map_len)
     });
     let map_len = match mapped {
         Ok(map_len) => map_len,
+        Err(narf_memory::AddressSpaceError::Overlap) if flg & SHM_REMAP == 0 => {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            return;
+        }
         Err(_) => {
-            // Backing frames unavailable / could not be aliased → ENOMEM.
+            shm_cancel_attach(object);
             ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
     };
-    // Install PTEs for ONLY the just-attached segment's VA window
-    // `[base, base + map_len)` instead of re-walking every VMA in the AS.
-    // shmget/shmat/shmdt in a tight loop otherwise re-materialized the whole
-    // address space per attach (the shm-sysv hot path). `map_len` matches the
-    // page-aligned span registered above.
-    //
-    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
-    // region was just registered, so this installs only its PTEs.
+
+    // SAFETY: the region was just registered in this live address space.
     if unsafe { as_ref.materialize_range(VirtAddr::new(base), map_len) }.is_err() {
-        // PTE installation failed after the region was registered → ENOMEM.
+        let _ = as_ref.unmap_region(VirtAddr::new(base));
+        shm_cancel_attach(object);
         ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
     }
-    // Record the attaching process as the segment's last-op pid (shm_lpid).
-    let caller = current_task_id();
-    let lpid = task_to_pid_raw(caller).unwrap_or(caller);
-    if let Some(m) = SHM_SEGMENTS.lock().as_mut() {
-        if let Some(seg) = m.get_mut(&shmid) {
-            seg.lpid = lpid;
-        }
+
+    {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        map.entry((as_key, base))
+            .or_default()
+            .push(ShmAttachment {
+                ipc_ns,
+                shmid,
+                base,
+                fragments: alloc::vec![(base, map_len)],
+            });
+    }
+    let now = shm_now_seconds();
+    if let Some(seg) = SHM_SEGMENTS
+        .lock()
+        .as_mut()
+        .and_then(|map| map.get_mut(&object))
+    {
+        seg.lpid = lpid;
+        seg.atime = now;
     }
     ctx.set_return(SyscallReturn::ok(base));
 }

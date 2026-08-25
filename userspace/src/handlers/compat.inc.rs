@@ -1,4 +1,3 @@
-
 // ── Per-task cwd state ────────────────────────────────────────────
 //
 // Storage shape mirrors the other per-task tables in this file:
@@ -171,8 +170,7 @@ fn fast_walk_stays_in_one_mount(path: &str) -> bool {
         .filter(|m| {
             path == m.as_str()
                 || m.as_str() == "/"
-                || (path.starts_with(m.as_str())
-                    && path.as_bytes().get(m.len()) == Some(&b'/'))
+                || (path.starts_with(m.as_str()) && path.as_bytes().get(m.len()) == Some(&b'/'))
         })
         .map(|m| m.len())
         .max();
@@ -235,8 +233,10 @@ fn resolve_vfs_symlink_path_fast(
         (fs.root(), alloc::string::String::from(rel))
     })?;
 
-    let components: alloc::vec::Vec<&str> =
-        rel.split('/').filter(|component| !component.is_empty()).collect();
+    let components: alloc::vec::Vec<&str> = rel
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
     if components.is_empty() {
         // The path IS the mount root. A file-rooted mount's root could in
         // principle be a symlink (`fs.root_file()`), so defer to the slow
@@ -663,11 +663,7 @@ impl narf_filesystem::FileOps for DirFdFile {
     fn owners(&self) -> (u32, u32) {
         self.dir.dir_owners()
     }
-    fn set_owners<'a>(
-        &'a self,
-        uid: u32,
-        gid: u32,
-    ) -> narf_filesystem::FsFuture<'a, ()> {
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> narf_filesystem::FsFuture<'a, ()> {
         self.dir.set_dir_owners_async(uid, gid)
     }
     fn set_perms<'a>(&'a self, perms: u16) -> narf_filesystem::FsFuture<'a, ()> {
@@ -712,19 +708,11 @@ struct CurrentTtyFile {
 
 #[cfg(feature = "linux-compat")]
 impl narf_filesystem::FileOps for CurrentTtyFile {
-    fn read<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.read(offset, buf)
     }
 
-    fn write<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.write(offset, buf)
     }
 
@@ -1307,9 +1295,9 @@ fn do_execve_resolved(
         }
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
-                // SAFETY: canonical user vaddr from the new image's TLS staging.
-                unsafe { narf_scheduler::set_user_fs_base(fb) };
-                narf_scheduler::stackful::set_current_user_fs_base(fb);
+            // SAFETY: canonical user vaddr from the new image's TLS staging.
+            unsafe { narf_scheduler::set_user_fs_base(fb) };
+            narf_scheduler::stackful::set_current_user_fs_base(fb);
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -1328,6 +1316,8 @@ fn do_execve_resolved(
         // (if Step 5 displaced one) is dead to this task. Release both local
         // refs now — after activate(), so teardown of a last-ref pre-exec AS
         // never races the CR3 it used to back.
+        #[cfg(feature = "linux-compat")]
+        shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(new_as);
         drop(prev_slot_as);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
@@ -1389,6 +1379,8 @@ fn do_execve_resolved(
         // every heap-owning local by hand first. (`req` was consumed into
         // `pending_exec`; the ExecRequest itself is freed by the poll that
         // applies it.)
+        #[cfg(feature = "linux-compat")]
+        shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(argv_refs);
         drop(envp_refs);
         drop(new_proc);
@@ -2301,7 +2293,12 @@ fn current_path_is_mount_root(path: &str) -> bool {
     };
     current_mount_namespace()
         .map(|ns| ns.list().iter().any(|mount| mount == path))
-        .unwrap_or_else(|| narf_filesystem::registry().list().iter().any(|mount| mount == path))
+        .unwrap_or_else(|| {
+            narf_filesystem::registry()
+                .list()
+                .iter()
+                .any(|mount| mount == path)
+        })
 }
 
 pub(crate) fn current_mount_arc(
@@ -2948,12 +2945,7 @@ fn task_account_cpu() -> usize {
     narf_lib::percpu::current_cpu() % TASK_ACCOUNT_CPUS
 }
 
-fn task_account_add_on_cpu(
-    ledgers: &TaskCpuLedgers,
-    cpu: usize,
-    task: u64,
-    delta_ns: u64,
-) {
+fn task_account_add_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64, delta_ns: u64) {
     let mut values = ledgers[cpu % TASK_ACCOUNT_CPUS].values.lock();
     let entry = values.entry(task).or_insert(0);
     *entry = entry.saturating_add(delta_ns);
@@ -3055,7 +3047,9 @@ pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
 /// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
 /// only, never the sleep in between.
 pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    let start = uc.kern_span_start_ns.swap(0, core::sync::atomic::Ordering::AcqRel);
+    let start = uc
+        .kern_span_start_ns
+        .swap(0, core::sync::atomic::Ordering::AcqRel);
     if start == 0 {
         return;
     }
@@ -3112,7 +3106,11 @@ pub fn __test_open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64
 /// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
 /// when a matching resume must re-open the span.
 fn pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
+    if uc
+        .kern_span_start_ns
+        .load(core::sync::atomic::Ordering::Acquire)
+        == 0
+    {
         return false;
     }
     close_kernel_span(uc, task);
@@ -3576,8 +3574,7 @@ pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
     false
 }
 
-static SIGNAL_MASK: SignalBitsTable =
-    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+static SIGNAL_MASK: SignalBitsTable = [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 /// fork/clone inheritance of the signal mask (Linux `copy_process`
 /// copies `blocked` unconditionally, for threads and forks alike).
@@ -3711,6 +3708,35 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
     g.as_mut().and_then(|m| m.remove(&task))
 }
 
+/// Install a syscall-scoped temporary signal mask while preserving the mask
+/// from the syscall's first entry across RIP-rewind park/re-executions.
+///
+/// pselect6/ppoll/epoll_pwait share Linux's TIF_RESTORE_SIGMASK model with
+/// rt_sigsuspend: normal completion restores the saved mask directly, while
+/// an interrupting signal delivery consumes the saved value and arranges for
+/// sigreturn to restore it after the handler.
+pub(crate) fn install_temporary_signal_mask(task: u64, mask: u64) {
+    let already_installed = SUSPEND_SAVED_MASK
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&task));
+    if already_installed {
+        let _ = set_signal_mask_for_task(task, mask);
+        return;
+    }
+    let prior = set_signal_mask_for_task(task, mask);
+    set_suspend_saved_mask(task, prior);
+}
+
+/// Restore a syscall-scoped temporary signal mask on a non-signal return.
+/// If signal delivery already consumed the saved value, sigreturn owns the
+/// restoration and this is intentionally a no-op.
+pub(crate) fn restore_temporary_signal_mask(task: u64) {
+    if let Some(prior) = take_suspend_saved_mask(task) {
+        let _ = set_signal_mask_for_task(task, prior);
+    }
+}
+
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
@@ -3719,6 +3745,13 @@ pub fn signal_init() {
     signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
+    // Pending bits and queued siginfo payloads are one logical signal state.
+    // Reinitialising only the bitmaps leaves an unreachable payload behind;
+    // the next signal of the same number can then consume stale si_code/value
+    // even though the failed/current send never published anything. This is
+    // also what made ABI transactionality tests misattribute a payload queued
+    // by an earlier fixture to a later EFAULT/EINVAL call.
+    sigqueue_clear();
 }
 
 /// Reset the registries — test hook. Drops every per-task entry.
@@ -4047,7 +4080,7 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
         // Address spaces are keyed by TaskId; resolve the outer ProcessId first.
         let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
         task.map(|as_arc| as_arc.mapped_bytes().saturating_add(4095) / 4096)
-        .unwrap_or(0)
+            .unwrap_or(0)
     };
     let total = stats.total.max(1);
     let base = (rss_pages as i64 * 1000 / total as i64) as i32;
@@ -4509,7 +4542,7 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
     let tid = proc_pid_to_tid(pid);
     let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
-        Some((entry.offset, entry.status_flags, entry.ops.ino()))
+        Some((table.offset(n)?, table.status_flags(n)?, entry.ops.ino()))
     })
     .flatten()?;
     // Preferred: the real backing path recorded at open() time (the same
@@ -4782,11 +4815,10 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
         return false;
     }
     if let Some(was_empty) = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
-            let was_empty = *slot == 0;
-            *slot |= sig_bit(signum);
-            was_empty
-        })
-    {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(signum);
+        was_empty
+    }) {
         if was_empty
             && signal_bits_update_existing(&SIGNAL_READABLE_GEN, task, |generation| {
                 *generation = generation.wrapping_add(1);
@@ -5075,39 +5107,51 @@ fn linux_tid_for_task(task: u64) -> u64 {
     }
 }
 
-/// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the sigval
-/// union, offset 24) out of a user `siginfo_t` and stash them for delivery /
-/// sigtimedwait / signalfd.
+/// Linux's in-kernel siginfo representation is 48 bytes on both architectures
+/// NARF supports. `copy_siginfo_from_user()` imports this whole fixed prefix,
+/// even though queued-signal delivery currently consumes only the fields below.
+const KERNEL_SIGINFO_SIZE: usize = 48;
+
+#[derive(Copy, Clone)]
+struct ImportedSiginfo {
+    signo: u32,
+    code: i32,
+    pid: u32,
+    value: u64,
+}
+
+/// Import a user `siginfo_t` without changing signal state.
 ///
-/// Copy the sender's siginfo (si_code/si_pid/si_value) into `target`'s queue.
-/// Returns `Some(depth)` where `depth` is the target's total queued-payload
-/// depth after the enqueue (used for sender back-pressure), or `None` when the
-/// per-task cap is hit (the caller surfaces -EAGAIN). A NULL/unreadable info
-/// queues nothing but "succeeds" with depth 0 (a bare kill(2)-shaped send).
-fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> Option<usize> {
-    if info_ptr == 0 {
-        return Some(0);
-    }
-    // Read the 32-byte siginfo prefix into a fixed stack buffer: this is the
-    // per-send hot path (a sigqueue(2) loop hits it once per signal), so the
-    // read must not churn the kernel heap with a throwaway Vec.
-    let mut b = [0u8; 32];
-    if validate_user_range(info_ptr, 32).is_err() {
-        return Some(0);
-    }
-    // SAFETY: validate_user_range above confirmed [info_ptr, info_ptr+32) is a
-    // readable user range; copy_from_user SMAP-brackets the read covering
-    // si_signo..si_value. A copy error just queues nothing.
-    if unsafe { copy_from_user(&mut b, info_ptr) }.is_ok() {
-        let si_code = i32::from_le_bytes(b[8..12].try_into().unwrap());
+/// Keeping copy and enqueue separate is load-bearing: Linux performs the user
+/// copy before most argument/target validation, and a failed copy must return
+/// `EFAULT` without making a pending bit or payload visible. The rt_sigqueueinfo
+/// wrappers overwrite `si_signo` with their syscall argument after this copy;
+/// pidfd_send_signal instead compares the imported value with that argument.
+fn import_queued_siginfo(info_ptr: u64) -> Result<ImportedSiginfo, u64> {
+    let mut b = [0u8; KERNEL_SIGINFO_SIZE];
+    // SAFETY: copy_from_user validates the complete fixed-size user range and
+    // SMAP/fault-brackets the read. NULL and unreadable pointers become EFAULT.
+    unsafe { copy_from_user(&mut b, info_ptr) }?;
+    Ok(ImportedSiginfo {
+        signo: u32::from_ne_bytes(b[0..4].try_into().unwrap()),
+        code: i32::from_ne_bytes(b[8..12].try_into().unwrap()),
         // si_pid (offset 16 in the rt union) — musl/glibc `sigqueue` fill
-        // getpid() here, and consumers reply to it (stress-ng --sigrt's
-        // child does `sigqueue(info.si_pid, ...)`).
-        let si_pid = u32::from_le_bytes(b[16..20].try_into().unwrap());
-        let si_value = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        return store_sigqueue_info_depth(target, sig, si_code, si_value, si_pid);
-    }
-    Some(0)
+        // getpid() here, and consumers reply to it.
+        pid: u32::from_ne_bytes(b[16..20].try_into().unwrap()),
+        value: u64::from_ne_bytes(b[24..32].try_into().unwrap()),
+    })
+}
+
+/// Store an already-imported payload. `None` is the queued-signal budget's
+/// `EAGAIN`; user-copy failures cannot reach this function.
+fn enqueue_imported_siginfo(target: u64, sig: u32, info: ImportedSiginfo) -> Option<usize> {
+    store_sigqueue_info_depth(target, sig, info.code, info.value, info.pid)
+}
+
+#[inline]
+fn siginfo_requires_self_target(info: ImportedSiginfo) -> bool {
+    const SI_TKILL: i32 = -6;
+    info.code >= 0 || info.code == SI_TKILL
 }
 
 // ── futex — minimal scaffold ────────────────────────────────────────
@@ -5205,9 +5249,9 @@ fn futex_timeout_deadline(
     if remaining <= 0 {
         Ok(Some(monotonic_now))
     } else {
-        Ok(Some(
-            monotonic_now.saturating_add(u64::try_from(remaining).unwrap_or(u64::MAX)),
-        ))
+        Ok(Some(monotonic_now.saturating_add(
+            u64::try_from(remaining).unwrap_or(u64::MAX),
+        )))
     }
 }
 
@@ -6049,8 +6093,22 @@ fn is_restartable_syscall(raw: u32) -> bool {
             | crate::syscall::Syscall::RtSigtimedwait
             | crate::syscall::Syscall::RtSigsuspend
             | crate::syscall::Syscall::Poll
+            | crate::syscall::Syscall::Ppoll
+            | crate::syscall::Syscall::Select
+            | crate::syscall::Syscall::Pselect6
             | crate::syscall::Syscall::EpollWait
+            | crate::syscall::Syscall::EpollPwait
+            | crate::syscall::Syscall::EpollPwait2
+            | crate::syscall::Syscall::Semop
+            | crate::syscall::Syscall::Semtimedop
+            | crate::syscall::Syscall::Msgsnd
+            | crate::syscall::Syscall::Msgrcv
     )
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_is_restartable_syscall(raw: u32) -> bool {
+    is_restartable_syscall(raw)
 }
 
 /// Build the `SigDeliveryParams` for `(task, action, signum,
@@ -6856,6 +6914,19 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
         })
 }
 
+/// Resolve a socket descriptor without collapsing Linux's two descriptor
+/// errors.  `current_socket()` predates exact errno reporting and returns
+/// `None` for both an absent slot and a live non-socket file; send-family
+/// syscalls must distinguish those as `EBADF` and `ENOTSOCK` respectively.
+fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::SocketFile>, i64> {
+    let task = current_task_id();
+    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+        .flatten()
+        .ok_or(9i64)?; // EBADF
+    let raw = alloc::sync::Arc::as_ptr(&entry.ops) as *const ();
+    socket_arc_lookup(raw).ok_or(88) // ENOTSOCK
+}
+
 /// Install the kernel-held admin authority returned by a successful stack
 /// attach onto one of the calling task's route-netlink sockets.
 ///
@@ -7000,24 +7071,19 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
 /// transferred systemd activation socket cannot accidentally become blocking;
 /// retain the slot bit as a compatibility fallback for older construction
 /// paths that populated only `FdEntry::status_flags`.
-fn socket_listener_nonblock(
-    task: u64,
-    fd: u32,
-    socket: &crate::socket::SocketFile,
-) -> bool {
+fn socket_listener_nonblock(task: u64, fd: u32, socket: &crate::socket::SocketFile) -> bool {
     socket.is_nonblock()
         || fd::with_table(task, |table| {
             table
-                .get(fd)
-                .is_some_and(|entry| entry.status_flags & crate::fd::O_NONBLOCK != 0)
+                .status_flags(fd)
+                .is_some_and(|flags| flags & crate::fd::O_NONBLOCK != 0)
         })
         .unwrap_or(false)
 }
 
 pub(crate) fn __test_socket_listener_nonblock(fd: u32) -> bool {
     let task = current_task_id();
-    current_socket(fd)
-        .is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
+    current_socket(fd).is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
 }
 
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
@@ -7048,7 +7114,12 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             } else {
                 0
             };
-            let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+            let status_flags = crate::fd::O_RDWR
+                | if nonblock {
+                    crate::fd::O_NONBLOCK
+                } else {
+                    0
+                };
             socket_arc_register(&socket);
             let task = current_task_id();
             // Pairs with UNIXENQ (socket.rs Connect): stamps when the
@@ -7197,13 +7268,14 @@ fn parse_scm_rights_fds(
                     return Err(9); // EBADF
                 }
                 let Some(passed) = fd::with_table(task, |t| {
-                    t.get(fd as u32).map(|entry| crate::socket::ScmRightsFile {
-                        ops: entry.ops.clone(),
-                        status_flags: entry.status_flags,
+                    let (ops, description, status_flags) = t.export_description(fd as u32)?;
+                    Some(crate::socket::ScmRightsFile {
+                        ops,
+                        status_flags,
+                        description: Some(description),
                     })
                 })
-                .flatten()
-                else {
+                .flatten() else {
                     return Err(9); // EBADF: send no payload or partial rights
                 };
                 out.push(passed);
@@ -7293,13 +7365,14 @@ fn install_recv_ancillary(
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
     for passed in fds.into_iter().take(rights_to_install) {
-        let entry = fd::FdEntry {
-            ops: passed.ops,
-            offset: 0,
-            flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-            status_flags: passed.status_flags,
-        };
-        if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
+        if let Some(newfd) = fd::with_table(task, |t| {
+            t.open_transferred(
+                passed.ops,
+                passed.description,
+                passed.status_flags,
+                if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
+            )
+        }) {
             new_fds.push(newfd as i32);
         } else {
             truncated = true;
@@ -7369,17 +7442,6 @@ fn read_user_u64(ptr: u64) -> u64 {
     // SAFETY: same contract as read_user_u32.
     let _ = unsafe { copy_from_user(&mut b, ptr) };
     u64::from_ne_bytes(b)
-}
-
-/// Write a u64 to a user address (helper for `copy_file_range`'s
-/// `loff_t *off_in` / `*off_out` write-back, etc.)
-#[inline]
-fn write_user_u64(ptr: u64, val: u64) {
-    let b = val.to_ne_bytes();
-    // SAFETY: caller range-validated `ptr` for 8 bytes; copy_to_user
-    // re-checks and SMAP-brackets the write.
-    // SAFETY: Valid memory or trusted environment
-    let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
 /// Write a u32 to a user address (helper for getsockopt length field, etc.)
@@ -7670,9 +7732,7 @@ pub fn abi_file_op_bridge(
     if kind == narf_abi::FileOpKind::Munmap {
         let status = current_address_space()
             .ok_or(())
-            .and_then(|as_ref| {
-                handler_sys_munmap::munmap_native_v1(&as_ref, args.a0)
-            })
+            .and_then(|as_ref| handler_sys_munmap::munmap_native_v1(&as_ref, args.a0))
             .map(|()| 0)
             .unwrap_or(1);
         return narf_abi::FileOpReturn { status, value: 0 };
@@ -8561,16 +8621,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "memfd_create",
         RawFnHandler(sys_memfd_create),
     );
-    table.install_raw(
-        Syscall::Fchmod,
-        "fchmod",
-        RawFnHandler(sys_fchmod),
-    );
-    table.install_raw(
-        Syscall::Fchown,
-        "fchown",
-        RawFnHandler(sys_fchown),
-    );
+    table.install_raw(Syscall::Fchmod, "fchmod", RawFnHandler(sys_fchmod));
+    table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchown));
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat));
     table.install_raw(
         Syscall::Fchownat,
@@ -8606,11 +8658,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access));
     table.install_raw(Syscall::Chmod, "chmod", RawFnHandler(sys_chmod));
-    table.install_raw(
-        Syscall::Chown,
-        "chown",
-        RawFnHandler(sys_chown),
-    );
+    table.install_raw(Syscall::Chown, "chown", RawFnHandler(sys_chown));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
@@ -8756,11 +8804,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     // Batch 14: filesystem misc (legacy x86_64-only entries).
     table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
-    table.install_raw(
-        Syscall::Lchown,
-        "lchown",
-        RawFnHandler(sys_lchown),
-    );
+    table.install_raw(Syscall::Lchown, "lchown", RawFnHandler(sys_lchown));
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
     table.install_raw(Syscall::Futimesat, "futimesat", RawFnHandler(sys_futimesat));
@@ -9493,12 +9537,12 @@ mod handler_sys_at2_reshape;
 mod handler_sys_bootstrap;
 #[path = "sys_bpf.rs"]
 mod handler_sys_bpf;
+#[path = "sys_bpf_attach.rs"]
+mod handler_sys_bpf_attach;
 #[path = "sys_bpf_btf.rs"]
 mod handler_sys_bpf_btf;
 #[path = "sys_bpf_info.rs"]
 mod handler_sys_bpf_info;
-#[path = "sys_bpf_attach.rs"]
-mod handler_sys_bpf_attach;
 #[path = "sys_bpf_pin.rs"]
 mod handler_sys_bpf_pin;
 #[path = "sys_brk.rs"]
@@ -9817,6 +9861,8 @@ mod handler_sys_pwrite64;
 mod handler_sys_pwritev;
 #[path = "sys_pwritev2.rs"]
 mod handler_sys_pwritev2;
+#[path = "sys_quotactl.rs"]
+mod handler_sys_quotactl;
 #[path = "sys_read.rs"]
 mod handler_sys_read;
 #[path = "sys_readahead.rs"]
@@ -10005,8 +10051,6 @@ mod handler_sys_splice;
 mod handler_sys_stat;
 #[path = "sys_stat_linux.rs"]
 mod handler_sys_stat_linux;
-#[path = "sys_quotactl.rs"]
-mod handler_sys_quotactl;
 #[path = "sys_statfs.rs"]
 mod handler_sys_statfs;
 #[path = "sys_statx.rs"]
@@ -10084,10 +10128,10 @@ mod handler_sys_yield;
 pub(crate) use handler_sys_arch_prctl::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf::*;
+pub(crate) use handler_sys_bpf_attach::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf_btf::*;
 pub(crate) use handler_sys_bpf_info::*;
-pub(crate) use handler_sys_bpf_attach::*;
 pub(crate) use handler_sys_bpf_pin::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
@@ -10289,6 +10333,7 @@ pub(crate) use {
     handler_sys_pwrite64::sys_pwrite64,
     handler_sys_pwritev::sys_pwritev,
     handler_sys_pwritev2::sys_pwritev2,
+    handler_sys_quotactl::sys_quotactl,
     handler_sys_read::sys_read,
     handler_sys_readahead::sys_readahead,
     handler_sys_readlink::sys_readlink,
@@ -10375,7 +10420,6 @@ pub(crate) use {
     handler_sys_socketpair::sys_socketpair,
     handler_sys_splice::sys_splice,
     handler_sys_stat::{stat_absolute, sys_stat},
-    handler_sys_quotactl::sys_quotactl,
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,

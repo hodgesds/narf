@@ -72,7 +72,12 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             } else {
                 0
             },
-            status_flags: if sock_nonblock { 0x800 } else { 0 }, // O_NONBLOCK
+            status_flags: crate::fd::O_RDWR
+                | if sock_nonblock {
+                    crate::fd::O_NONBLOCK
+                } else {
+                    0
+                },
         })
     }) {
         Some(n) => n,

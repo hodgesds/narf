@@ -483,7 +483,10 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
             ops: Arc::new(CountingFile),
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            // The smoke exercises both read(2) and write(2) through one open
+            // file description, so model an O_RDWR open rather than relying
+            // on the old type-based access-mode exception.
+            status_flags: crate::fd::O_RDWR,
         })
     })
     .expect("with_table");
@@ -537,7 +540,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         return TestResult::Fail("Read didn't return 16");
     }
     // Offset should now be 16.
-    let got_offset = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    let got_offset = fd::with_table(7, |t| t.offset(fd_n)).flatten();
     if got_offset != Some(16) {
         return TestResult::Fail("Read didn't advance fd offset");
     }
@@ -567,7 +570,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         return TestResult::Fail("FileOps::write didn't observe payload bytes");
     }
     // Offset should be 16 + 8 = 24.
-    let got_offset2 = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    let got_offset2 = fd::with_table(7, |t| t.offset(fd_n)).flatten();
     if got_offset2 != Some(24) {
         return TestResult::Fail("Write didn't advance fd offset");
     }
@@ -848,8 +851,8 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK && r.value & want == want => {}
         _ => return TestResult::Fail("F_GETFL did not round-trip O_NONBLOCK|O_APPEND"),
     }
-    // Verify the FdEntry actually carries the bits.
-    let observed = fd::with_table(task, |x| x.get(fd_n).map(|e| e.status_flags))
+    // Verify the shared open-file description carries the bits.
+    let observed = fd::with_table(task, |x| x.status_flags(fd_n))
         .flatten()
         .unwrap_or(0);
     if (observed as u64) & want != want {
@@ -1095,20 +1098,32 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
         return TestResult::Fail("two task tables should be live");
     }
 
-    // Mutating offset via get_mut.
-    fd::with_table(task_a, |t| {
-        if let Some(e) = t.get_mut(3) {
-            e.offset += 100;
-        }
-    });
-    let off_a = fd::with_table(task_a, |t| t.get(3).map(|e| e.offset)).flatten();
+    // Mutating the open-file-description offset.
+    fd::with_table(task_a, |t| t.set_offset(3, 100));
+    let off_a = fd::with_table(task_a, |t| t.offset(3)).flatten();
     if off_a != Some(100) {
         return TestResult::Fail("offset update did not stick");
     }
-    let off_b = fd::with_table(task_b, |t| t.get(3).map(|e| e.offset)).flatten();
+    let off_b = fd::with_table(task_b, |t| t.offset(3)).flatten();
     if off_b != Some(0) {
         return TestResult::Fail("task B's offset should be independent");
     }
+
+    // fork copies descriptor slots but aliases each open-file description.
+    let child = 0xCC;
+    if fd::fork(task_a, child) < 4 {
+        return TestResult::Fail("fork did not inherit the parent fd table");
+    }
+    fd::with_table(child, |t| {
+        t.set_offset(3, 125);
+        t.set_status_flags(3, crate::fd::O_NONBLOCK);
+    });
+    let parent_state =
+        fd::with_table(task_a, |t| Some((t.offset(3)?, t.status_flags(3)?))).flatten();
+    if parent_state != Some((125, crate::fd::O_NONBLOCK)) {
+        return TestResult::Fail("fork did not share offset/status description state");
+    }
+    fd::detach(child);
 
     // Close fd 3 in A, then re-open should reuse slot 3.
     let closed = fd::with_table(task_a, |t| t.close(3));
@@ -1927,7 +1942,7 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         MemFs::with_seeds("cfr-test", &[("src", b"abcdefghij"), ("dst", b"")]),
     );
 
-    fn open(path: &str) -> Option<u32> {
+    fn open(path: &str, flags: u64) -> Option<u32> {
         struct FakeCtx {
             args: SyscallArgs,
             ret: Option<SyscallReturn>,
@@ -1959,14 +1974,14 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
             #[cfg(target_arch = "x86_64")]
             args: SyscallArgs {
                 arg0: cpath.as_ptr() as u64,
-                arg1: 0, // flags
+                arg1: flags,
                 ..SyscallArgs::default()
             },
             #[cfg(target_arch = "aarch64")]
             args: SyscallArgs {
                 arg0: 0xffffffffffffff9c, // AT_FDCWD
                 arg1: cpath.as_ptr() as u64,
-                arg2: 0, // flags
+                arg2: flags,
                 ..SyscallArgs::default()
             },
             ret: None,
@@ -1981,11 +1996,13 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         }
     }
 
-    let fd_in = match open("/cfr/src") {
+    let fd_in = match open("/cfr/src", crate::fd::O_RDONLY as u64) {
         Some(f) => f,
         None => return TestResult::Fail("open src failed"),
     };
-    let fd_out = match open("/cfr/dst") {
+    // O_RDWR keeps the output writable for copy_file_range and readable for
+    // the positional verification below. Linux's f_mode checks require both.
+    let fd_out = match open("/cfr/dst", crate::fd::O_RDWR as u64) {
         Some(f) => f,
         None => return TestResult::Fail("open dst failed"),
     };
@@ -2550,7 +2567,8 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
         None => return TestResult::Fail("fcntl F_GET_SEALS no return (post)"),
     };
 
-    // Write after sealing — must fail.
+    // Write after sealing — Linux returns EPERM (not EROFS and not the
+    // transport-level InvalidOp sentinel).
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: fd as u64,
@@ -2561,9 +2579,9 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
-    let w2_rejected = matches!(
+    let w2_eperm = matches!(
         ctx.ret,
-        Some(r) if r.value == (-1i64) as u64 || r.status != SyscallReturn::OK
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64
     );
 
     crate::fd::__test_reset();
@@ -2578,8 +2596,8 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
     if post_seals & F_SEAL_WRITE == 0 {
         return TestResult::Fail("F_SEAL_WRITE not visible after add");
     }
-    if !w2_rejected {
-        return TestResult::Fail("post-seal write was not rejected");
+    if !w2_eperm {
+        return TestResult::Fail("post-seal write did not return EPERM");
     }
     TestResult::Pass
 }
@@ -3447,18 +3465,24 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
         }
     };
 
-    let install = |ops: Arc<dyn narf_filesystem::FileOps>| {
+    let install = |ops: Arc<dyn narf_filesystem::FileOps>, status_flags| {
         fd::with_table(task, |tab| {
             tab.open(FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags,
             })
         })
     };
     let slave: Arc<dyn narf_filesystem::FileOps> = slave;
-    let (mfd, sfd) = match (install(master.clone()), install(slave.clone())) {
+    // posix_openpt/open(/dev/pts/N) are O_RDWR in the terminal-emulator path;
+    // the integration smoke exercises both directions and must not construct
+    // read-only descriptions then expect slave writes to succeed.
+    let (mfd, sfd) = match (
+        install(master.clone(), crate::fd::O_RDWR),
+        install(slave.clone(), crate::fd::O_RDWR),
+    ) {
         (Some(m), Some(s)) => (m, s),
         _ => {
             narf_filesystem::devfs_pty::ptmx_close(idx);
@@ -3691,7 +3715,8 @@ fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
             ops,
             offset: 0,
             flags: 0,
-            status_flags: crate::fd::O_NONBLOCK,
+            // Linux eventfd_file_create installs O_RDWR | user flags.
+            status_flags: crate::fd::O_RDWR | crate::fd::O_NONBLOCK,
         })
     }) else {
         __test_clear_global();

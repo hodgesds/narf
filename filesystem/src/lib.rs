@@ -19,8 +19,8 @@
 //!   `DriverFuture<'a>` uses.
 //! - `Stat`: size / blocks / mode / mtime in monotonic cycles
 //!   (`narf_time::Instant::as_cycles`).
-//! - `FsError`: `NotFound`, `PermissionDenied`, `Io(BlockError)`,
-//!   `InvalidPath`, `Busy`, `ReadOnly`, `Unsupported`. `From<CapError>`
+//! - `FsError`: `NotFound`, `PermissionDenied`, `OperationNotPermitted`,
+//!   `Io(BlockError)`, `InvalidPath`, `Busy`, `ReadOnly`, `Unsupported`. `From<CapError>`
 //!   collapses revocation onto `PermissionDenied` so the cap-gated
 //!   mount path surfaces a meaningful FS error.
 //! - `resolve(root, path)`: walks an ASCII path segment-by-segment.
@@ -423,6 +423,10 @@ impl Mode {
 pub enum FsError {
     NotFound,
     PermissionDenied,
+    /// The operation is forbidden by object state rather than filesystem
+    /// access permissions. Maps to Linux `EPERM`; memfd seals use this so a
+    /// sealed write is not confused with a read-only filesystem (`EROFS`).
+    OperationNotPermitted,
     Io(BlockError),
     InvalidPath,
     /// Operation would cross a filesystem/overlay boundary. Maps to EXDEV.

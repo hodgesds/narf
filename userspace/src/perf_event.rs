@@ -3373,8 +3373,27 @@ impl FileOps for PerfEventFile {
             let format = self.attr.read_format;
             let mut cursor = 0;
 
-            if format & PERF_FORMAT_GROUP != 0 {
-                let members = self.member_files();
+            // Linux caches this as event->read_size and rejects a short
+            // userspace buffer with ENOSPC before copying any words
+            // (kernel/events/core.c::__perf_read). Work out the complete
+            // record size up front so group reads are transactional too.
+            let members = (format & PERF_FORMAT_GROUP != 0).then(|| self.member_files());
+            let timed_words = usize::from(format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0)
+                + usize::from(format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0);
+            let per_event_words = 1
+                + usize::from(format & PERF_FORMAT_ID != 0)
+                + usize::from(format & PERF_FORMAT_LOST != 0);
+            let required_words = match &members {
+                Some(group_members) => {
+                    1 + timed_words + (1 + group_members.len()) * per_event_words
+                }
+                None => timed_words + per_event_words,
+            };
+            if buf.len() < required_words.saturating_mul(core::mem::size_of::<u64>()) {
+                return Err(FsError::NoSpace);
+            }
+
+            if let Some(members) = members {
                 Self::push_word(buf, &mut cursor, 1 + members.len() as u64)?;
                 if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
                     Self::push_word(buf, &mut cursor, time_enabled)?;

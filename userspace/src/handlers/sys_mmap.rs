@@ -72,6 +72,23 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
 
     let pages = (len >> 12) as usize;
     let perms = perms_of_prot(prot);
+    #[cfg(feature = "linux-compat")]
+    let task = current_task_id();
+    #[cfg(feature = "linux-compat")]
+    let lpid = task_to_pid_raw(task).unwrap_or(task);
+    #[cfg(feature = "linux-compat")]
+    let as_key = shm_as_key(&as_ref);
+    #[cfg(feature = "linux-compat")]
+    if flags & MAP_FIXED != 0 {
+        shm_register_as_owner(as_key, lpid);
+    }
+    #[cfg(feature = "linux-compat")]
+    let shm_transaction =
+        (flags & MAP_FIXED != 0).then(|| shm_mapping_transaction(as_key));
+    #[cfg(feature = "linux-compat")]
+    let _shm_guard = shm_transaction
+        .as_ref()
+        .map(|transaction| transaction.lock());
 
     // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
     // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
@@ -84,6 +101,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // this way, and the ELF-header page between them must stay mapped.
         if as_ref.punch_fixed(VirtAddr::new(hint), len).is_ok() {
             crate::mapped_file::punch_current(hint, len);
+            #[cfg(feature = "linux-compat")]
+            {
+                shm_record_fixed_punch(as_key, hint, hint + len, lpid);
+            }
         }
         hint
     } else {

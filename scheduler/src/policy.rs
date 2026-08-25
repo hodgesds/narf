@@ -320,54 +320,6 @@ pub trait Scheduler: Send + Sync + 'static {
     /// this callback is observational and must not block or re-enter the
     /// scheduler.
     fn on_cpu_state_change(&self, _cpu: CpuId, _change: CpuStateChange) {}
-
-    // ── Wakeup pipeline (Linux `try_to_wake_up`: select_task_rq → enqueue →
-    //    wakeup_preempt → task_woken). These let a policy place and prioritize a
-    //    just-woken task instead of leaving it on its home CPU's queue tail. All
-    //    are advisory: the core validates the choice against affinity / CPU
-    //    online state and falls back to today's behavior on any stale/invalid
-    //    return, and none may block or re-enter the scheduler. ──
-
-    /// Choose the CPU a just-woken task should run on (Linux `select_task_rq`).
-    /// `home` is where the task last ran; `waker` is the CPU that woke it;
-    /// `idle_mask` bit `i` is set when CPU `i` is halted/idle. Default keeps the
-    /// task on `home` — no wake migration, today's behavior.
-    fn select_wake_cpu(
-        &self,
-        _task: TaskMeta,
-        _waker: CpuId,
-        home: CpuId,
-        _idle_mask: u64,
-    ) -> CpuId {
-        home
-    }
-
-    /// Whether the just-woken `woken` task should preempt `current` on `cpu`
-    /// (Linux `wakeup_preempt`). Default `false` — no wakeup preemption, so the
-    /// woken task waits for the current one to yield or be timer-preempted.
-    fn wakeup_preempt(&self, _cpu: CpuId, _woken: TaskMeta, _current: Option<TaskMeta>) -> bool {
-        false
-    }
-
-    /// Notification that `task` became runnable on `cpu` (Linux `task_woken`),
-    /// fired after placement + enqueue. Observational; the natural home for
-    /// wake-time bookkeeping.
-    fn task_woken(&self, _cpu: CpuId, _task: TaskMeta) {}
-
-    /// Per-tick policy hook (Linux `task_tick`). Returns `true` to request that
-    /// `current` be preempted at this tick. Default `false` leaves the core's
-    /// timer-slice preemption unchanged.
-    fn task_tick(&self, _cpu: CpuId, _current: TaskMeta) -> bool {
-        false
-    }
-
-    /// Accrue `delta_ns` of on-CPU runtime to `current` (Linux `update_curr`),
-    /// for policies that track virtual runtime. Default no-op.
-    fn update_curr(&self, _cpu: CpuId, _current: TaskMeta, _delta_ns: u64) {}
-
-    /// `sched_yield` by `current` on `cpu` (Linux `yield_task`). Default no-op —
-    /// the core still cycles the queue.
-    fn yield_task(&self, _cpu: CpuId, _current: TaskMeta) {}
 }
 
 /// First-in-first-out scheduler — today's stage-3+ behaviour.
@@ -784,55 +736,19 @@ pub(crate) fn pick_next_slot(
                 },
             );
         }
-        crate::set_last_picked(cpu, slot.id.raw());
         return Some((TaskHandle::from_id(slot.id), slot));
     }
     let first_dispatchable = q.iter().position(|slot| dispatch_tier(slot) == best_tier);
-    // Targeted wakeup (Linux TTWU's run-the-woken-task-promptly slice): if a
-    // wake named a task for this CPU, run it ahead of the FIFO backlog — but
-    // ONLY among the best-tier AND best-priority slots, so it reorders the
-    // woken task ahead of its equals without ever inverting priority or
-    // bypassing throttling. Two starvation guards: skip a hint that names the
-    // just-picked task (a self-wake/yield goes to the tail, not the front), and
-    // honor a boost at most every other pick (cooldown) so a ping-pong pair
-    // can't monopolize the CPU. The hint is consumed every pick regardless.
-    let best_prio = q
-        .iter()
-        .filter(|slot| dispatch_tier(slot) == best_tier)
-        .map(|slot| slot.spec.priority.raw())
-        .min();
-    let boost_allowed = crate::run_next_allowed(cpu);
-    let hint = crate::take_run_next(cpu);
-    let last = crate::last_picked(cpu);
-    let run_next_pos = if boost_allowed {
-        hint.filter(|&id| id != last).and_then(|id| {
-            q.iter().position(|slot| {
-                slot.id.raw() == id
-                    && dispatch_tier(slot) == best_tier
-                    && Some(slot.spec.priority.raw()) == best_prio
-            })
-        })
-    } else {
-        None
-    };
     let requested_pos = requested.and_then(|h| {
         q.iter()
             .position(|slot| slot.id == h.task_id())
             .and_then(|pos| (dispatch_tier(&q[pos]) == best_tier).then_some((h, pos)))
     });
-    let (handle, pos, via_boost) = if let Some(pos) = run_next_pos {
-        (TaskHandle::from_id(q[pos].id), pos, true)
-    } else if let Some((h, pos)) = requested_pos {
-        (h, pos, false)
-    } else {
+    let (handle, pos) = requested_pos.or_else(|| {
         let pos = first_dispatchable?;
-        (TaskHandle::from_id(q[pos].id), pos, false)
-    };
+        q.get(pos).map(|slot| (TaskHandle::from_id(slot.id), pos))
+    })?;
     let slot = q.remove(pos)?;
-    crate::set_last_picked(cpu, slot.id.raw());
-    if via_boost {
-        crate::arm_run_next_cooldown(cpu);
-    }
     if let Some(scheduler) = scheduler {
         scheduler.on_task_queue_event(
             cpu,

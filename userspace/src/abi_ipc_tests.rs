@@ -6,10 +6,9 @@
 //! [`crate::abi_test_support`].
 //!
 //! Harness caveats that shape these tests:
-//!   * There is no user address space wired in (`current_address_space()`
-//!     returns `None`), so any handler that maps frames into an AS
-//!     (`shmem_map`, `shmat`, `shmdt`) cannot reach its success path —
-//!     those get a negative/stub test only.
+//!   * The default fixture has no user address space. Focused System V shared
+//!     memory tests install a fresh real `AddressSpace` for their duration so
+//!     `shmat`/`shmdt` success and rollback paths are exercised.
 //!   * `copy_to_user` / `copy_from_user` validate canonicality + length
 //!     only (not user-vs-kernel range), so kernel-stack buffers round-trip
 //!     fine — the side-table IPC objects (`sem*`, `msg*`, `mq_*`) exercise
@@ -21,20 +20,59 @@
 #![allow(dead_code)] // errno/flag reference table + harness helpers
 
 use crate::abi_test_support::*;
+use alloc::sync::Arc;
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 // IPC flag bits (octal, matching the handlers).
 const IPC_CREAT: u64 = 0o1000;
 const IPC_EXCL: u64 = 0o2000;
+const IPC_NOWAIT: u64 = 0o4000;
 const IPC_RMID: u64 = 0;
+const IPC_SET: u64 = 1;
 const IPC_STAT: u64 = 2;
+const IPC_64: u64 = 0x100;
+const SHM_RDONLY: u64 = 0o10000;
+const SHM_RND: u64 = 0o20000;
+const SHM_REMAP: u64 = 0o40000;
+const SHM_EXEC: u64 = 0o100000;
 const SETVAL: u64 = 16;
 const GETVAL: u64 = 12;
+const E2BIG: i64 = -7;
+const ENOMSG: i64 = -42;
+const MSG_NOERROR: u64 = 0o10000;
+const SEM_UNDO: i16 = 0o10000;
+const EIDRM: i64 = -43;
+const BAD_PTR: u64 = 0x0001_0000_0000_0000;
 
 const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_RDWR: u64 = 0o2;
 const O_RDONLY: u64 = 0;
 const O_NONBLOCK: u64 = 0o4000;
+
+static IPC_SHM_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+
+fn lookup_ipc_shm_as() -> Option<Arc<AddressSpace>> {
+    IPC_SHM_AS.lock().clone()
+}
+
+fn with_ipc_shm_as(
+    body: impl FnOnce(&Arc<AddressSpace>) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    // SAFETY: kernel tests run after paging is enabled; the new root remains
+    // owned by IPC_SHM_AS for the complete syscall sequence.
+    let as_ref = match unsafe { AddressSpace::new_for_user() } {
+        Ok(as_ref) => Arc::new(as_ref),
+        Err(_) => return Err("failed to create shared-memory test address space"),
+    };
+    *IPC_SHM_AS.lock() = Some(Arc::clone(&as_ref));
+    crate::handlers::install_address_space_lookup(lookup_ipc_shm_as);
+    let result = body(&as_ref);
+    crate::handlers::restore_address_space_lookup(None);
+    *IPC_SHM_AS.lock() = None;
+    result
+}
 
 // ════════════════════════════════════════════════════════════════════
 // POSIX message queues
@@ -492,9 +530,10 @@ fn smoke_abi_ipc_semop_neg() -> TestResult {
         let mut sop = [0u8; 6];
         sop[0..2].copy_from_slice(&0u16.to_le_bytes());
         sop[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        sop[4..6].copy_from_slice(&(IPC_NOWAIT as i16).to_le_bytes());
         match call(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1)) {
             Some(v) if v == EAGAIN => Ok(()),
-            _ => Err("semop -1 on a 0 sem must be EAGAIN (non-blocking)"),
+            _ => Err("semop IPC_NOWAIT -1 on a 0 sem must be EAGAIN"),
         }
     })
 }
@@ -515,9 +554,11 @@ fn smoke_abi_ipc_semop_atomic_rollback() -> TestResult {
         let mut sops = [0u8; 12];
         // sop0: sem_num=0, sem_op=-1
         sops[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        sops[4..6].copy_from_slice(&(IPC_NOWAIT as i16).to_le_bytes());
         // sop1: sem_num=0, sem_op=-1
         sops[6..8].copy_from_slice(&0u16.to_le_bytes());
         sops[8..10].copy_from_slice(&(-1i16).to_le_bytes());
+        sops[10..12].copy_from_slice(&(IPC_NOWAIT as i16).to_le_bytes());
         match call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 2)) {
             Some(v) if v == EAGAIN => {}
             _ => return Err("blocking multi-sop semop must return EAGAIN"),
@@ -530,6 +571,31 @@ fn smoke_abi_ipc_semop_atomic_rollback() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_atomic_rollback);
+
+// Linux checks SEMOPM before importing sops, but a non-null semtimedop timeout
+// is imported by the wrapper before either check.
+fn smoke_abi_ipc_semop_errno_order() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Semop.raw(), a2(u64::MAX, BAD_PTR, 501)) != Some(E2BIG) {
+            return Err("semop nsops>SEMOPM must be E2BIG before sops/semid access");
+        }
+        if call(Syscall::Semop.raw(), a2(u64::MAX, BAD_PTR, 1)) != Some(EFAULT) {
+            return Err("semop bad sops must be EFAULT before semid lookup");
+        }
+        if call(Syscall::Semop.raw(), a2(u64::MAX, BAD_PTR, 0)) != Some(EINVAL) {
+            return Err("semop nsops=0 must be EINVAL before sops access");
+        }
+        if call(
+            Syscall::Semtimedop.raw(),
+            a3(u64::MAX, BAD_PTR, 501, BAD_PTR),
+        ) != Some(EFAULT)
+        {
+            return Err("semtimedop must import timeout before the nsops E2BIG check");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_errno_order);
 
 // A multi-sop semop that fully succeeds applies every delta. Set sem0=0,
 // sem1=5; submit {sem0 +2, sem1 -5, sem0 +1}: all satisfiable → sem0=3,
@@ -591,7 +657,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_semget_many_lookup);
 
 // ── Semtimedop ──────────────────────────────────────────────────────
 //
-// Same shape as semop with a trailing timeout (ignored — never blocks).
+// Same atomic operation as semop with a trailing relative timeout.
 
 fn smoke_abi_ipc_semtimedop_pos() -> TestResult {
     with_setup(|| {
@@ -599,7 +665,7 @@ fn smoke_abi_ipc_semtimedop_pos() -> TestResult {
         let mut sop = [0u8; 6];
         sop[0..2].copy_from_slice(&0u16.to_le_bytes());
         sop[2..4].copy_from_slice(&2i16.to_le_bytes());
-        // arg3 = timeout pointer (ignored); pass 0.
+        // A null timeout is an indefinite wait, irrelevant on this ready op.
         match call(Syscall::Semtimedop.raw(), a3(id, sop.as_ptr() as u64, 1, 0)) {
             Some(0) => Ok(()),
             _ => Err("semtimedop +2 should return 0"),
@@ -650,6 +716,163 @@ fn smoke_abi_ipc_semctl_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_neg);
+
+fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
+    with_setup(|| {
+        #[cfg(target_arch = "x86_64")]
+        const SIZE: usize = 104;
+        #[cfg(target_arch = "x86_64")]
+        const NSEMS: usize = 80;
+        #[cfg(target_arch = "aarch64")]
+        const SIZE: usize = 88;
+        #[cfg(target_arch = "aarch64")]
+        const NSEMS: usize = 64;
+
+        let id = make_semset(2)?;
+        if call(Syscall::Semctl.raw(), a3(987_654, 0, IPC_STAT, BAD_PTR)) != Some(EINVAL) {
+            return Err("semctl IPC_STAT must resolve id before copyout");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_STAT, BAD_PTR)) != Some(EFAULT) {
+            return Err("live semctl IPC_STAT bad output must be EFAULT");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_STAT | IPC_64, BAD_PTR)) != Some(EINVAL) {
+            return Err("native semctl must reject IPC_64 tagged commands");
+        }
+        let mut stat = [0u8; SIZE];
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("semctl IPC_STAT failed");
+        }
+        if u64::from_ne_bytes(stat[NSEMS..NSEMS + 8].try_into().unwrap()) != 2 {
+            return Err("semctl IPC_STAT wrote sem_nsems at the wrong ABI offset");
+        }
+
+        let mut update = [0u8; SIZE];
+        update[20..24].copy_from_slice(&0o640u32.to_ne_bytes());
+        if call(Syscall::Semctl.raw(), a3(987_654, 0, IPC_SET, BAD_PTR)) != Some(EFAULT) {
+            return Err("semctl IPC_SET must import the full struct before id lookup");
+        }
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_SET, update.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("semctl IPC_SET failed");
+        }
+        stat.fill(0);
+        let _ = call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+        );
+        if u32::from_ne_bytes(stat[20..24].try_into().unwrap()) & 0o777 != 0o640 {
+            return Err("semctl IPC_SET mode did not round-trip through IPC_STAT");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(EACCES)
+        {
+            return Err("non-readable semctl IPC_STAT must return EACCES");
+        }
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_SET, update.as_ptr() as u64),
+        ) != Some(EPERM)
+        {
+            return Err("non-owner semctl IPC_SET must return EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_stat_set_layout);
+
+fn smoke_abi_ipc_sem_undo_and_rmid_wake() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut sop = [0u8; 6];
+        sop[2..4].copy_from_slice(&1i16.to_le_bytes());
+        sop[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        if call(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1)) != Some(0) {
+            return Err("SEM_UNDO setup operation failed");
+        }
+        let pid = u64::from(crate::handlers::current_ucred().pid);
+        crate::sysvipc::sem_undo_process_exit(pid, crate::handlers::current_task_id());
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("process exit did not reverse SEM_UNDO adjustment");
+        }
+
+        crate::sysvipc::__test_begin_removed_wait(0, id);
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("semctl IPC_RMID setup failed");
+        }
+        if call(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1)) != Some(EIDRM) {
+            return Err("a semaphore waiter awakened by RMID must receive EIDRM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_sem_undo_and_rmid_wake);
+
+fn smoke_abi_ipc_retained_semop_and_shared_undo() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut original = [0u8; 6];
+        original[2..4].copy_from_slice(&1i16.to_le_bytes());
+        crate::sysvipc::__test_stage_sem_wait(id, &original);
+        original[2..4].copy_from_slice(&2i16.to_le_bytes());
+        if call(Syscall::Semop.raw(), a2(id, original.as_ptr() as u64, 1)) != Some(0) {
+            return Err("staged semop re-execution failed");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("semop re-imported a user-mutated sembuf after park");
+        }
+
+        let mut undo = [0u8; 6];
+        undo[2..4].copy_from_slice(&1i16.to_le_bytes());
+        undo[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        if call(Syscall::Semop.raw(), a2(id, undo.as_ptr() as u64, 1)) != Some(0) {
+            return Err("shared SEM_UNDO setup failed");
+        }
+        let parent = u64::from(crate::handlers::current_ucred().pid);
+        let child = parent.wrapping_add(0x4000_0000);
+        crate::sysvipc::clone_sem_undo(parent, child, true);
+        crate::sysvipc::sem_undo_process_exit(parent, 0);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(2) {
+            return Err("CLONE_SYSVSEM applied undo before the final sharer exited");
+        }
+        crate::sysvipc::sem_undo_process_exit(child, 0);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("final CLONE_SYSVSEM sharer did not apply the shared undo list");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_retained_semop_and_shared_undo);
+
+fn smoke_abi_ipc_wait_restart_classification() -> TestResult {
+    with_setup(|| {
+        for syscall in [
+            Syscall::Semop,
+            Syscall::Semtimedop,
+            Syscall::Msgsnd,
+            Syscall::Msgrcv,
+        ] {
+            if crate::handlers::__test_is_restartable_syscall(syscall.raw()) {
+                return Err("blocking SysV IPC syscall must not be SA_RESTART-restarted");
+            }
+        }
+        if !crate::handlers::__test_is_restartable_syscall(Syscall::Read.raw()) {
+            return Err("restart classification test control unexpectedly failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_wait_restart_classification);
 
 // ════════════════════════════════════════════════════════════════════
 // System V message queues
@@ -720,6 +943,58 @@ fn smoke_abi_ipc_msgsnd_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgsnd_neg);
 
+fn smoke_abi_ipc_msgsnd_fault_order() -> TestResult {
+    with_setup(|| {
+        // Linux's ksys_msgsnd imports mtype before do_msgsnd validates msgsz
+        // or resolves msqid.
+        match call(
+            Syscall::Msgsnd.raw(),
+            a3(u64::MAX, BAD_PTR, 8193, IPC_NOWAIT),
+        ) {
+            Some(EFAULT) => Ok(()),
+            _ => Err("msgsnd bad msgp must be EFAULT before size/id validation"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgsnd_fault_order);
+
+fn smoke_abi_ipc_msgsnd_retains_kernel_snapshot() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut user_msg = [0u8; 11];
+        user_msg[..8].copy_from_slice(&9i64.to_ne_bytes());
+        user_msg[8..].copy_from_slice(b"new");
+        crate::sysvipc::__test_stage_msg_send(id, 7, b"old", 0);
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, user_msg.as_ptr() as u64, 3, 0),
+        ) != Some(0)
+        {
+            return Err("staged msgsnd re-execution failed");
+        }
+        let mut received = [0u8; 11];
+        let result = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: received.as_mut_ptr() as u64,
+                arg2: 3,
+                arg3: 0,
+                arg4: IPC_NOWAIT,
+                ..Default::default()
+            },
+        );
+        if result.status != SyscallReturn::OK || result.value != 3 {
+            return Err("receiving retained msgsnd snapshot failed");
+        }
+        if i64::from_ne_bytes(received[..8].try_into().unwrap()) != 7 || &received[8..] != b"old" {
+            return Err("msgsnd re-imported user-mutated type or payload after park");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgsnd_retains_kernel_snapshot);
+
 // ── Msgrcv ──────────────────────────────────────────────────────────
 //
 // msgrcv(msqid, msgp, msgsz, msgtyp, msgflg). Returns the payload length.
@@ -742,7 +1017,7 @@ fn smoke_abi_ipc_msgrcv_pos() -> TestResult {
                 arg1: rbuf.as_mut_ptr() as u64,
                 arg2: 4,
                 arg3: 0,
-                arg4: 0,
+                arg4: IPC_NOWAIT,
                 ..Default::default()
             },
         );
@@ -773,12 +1048,11 @@ fn smoke_abi_ipc_msgrcv_neg() -> TestResult {
                 arg1: rbuf.as_mut_ptr() as u64,
                 arg2: 4,
                 arg3: 0,
-                arg4: 0,
+                arg4: IPC_NOWAIT,
                 ..Default::default()
             },
         );
-        // ENOMSG = -42 (not in the harness errno table).
-        if r.status == SyscallReturn::OK && r.value as i64 == -42 {
+        if r.status == SyscallReturn::OK && r.value as i64 == ENOMSG {
             Ok(())
         } else {
             Err("msgrcv on an empty queue must be ENOMSG (-42)")
@@ -787,7 +1061,100 @@ fn smoke_abi_ipc_msgrcv_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_neg);
 
-// msgrcv type selection with the two-write output path: send mtype 3 then
+fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut sent = [0u8; 12];
+        sent[..8].copy_from_slice(&7i64.to_le_bytes());
+        sent[8..].copy_from_slice(b"data");
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: msgsnd failed");
+        }
+
+        let mut short = [0u8; 10];
+        let recv = |ptr, size, flags| {
+            call_raw(
+                Syscall::Msgrcv.raw(),
+                SyscallArgs {
+                    arg0: id,
+                    arg1: ptr,
+                    arg2: size,
+                    arg3: 0,
+                    arg4: flags,
+                    ..Default::default()
+                },
+            )
+        };
+        if recv(short.as_mut_ptr() as u64, 2, IPC_NOWAIT).value as i64 != E2BIG {
+            return Err("oversize msgrcv without MSG_NOERROR must return E2BIG");
+        }
+        if recv(BAD_PTR, 4, IPC_NOWAIT).value as i64 != EFAULT {
+            return Err("selected-message copyout fault must return EFAULT");
+        }
+        let mut full = [0u8; 12];
+        let r = recv(full.as_mut_ptr() as u64, 4, IPC_NOWAIT);
+        if r.value as i64 != 4 || &full[8..] != b"data" {
+            return Err("E2BIG/EFAULT destructively removed the queued message");
+        }
+
+        // MSG_NOERROR is the only mode that permits truncation and removal.
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: second msgsnd failed");
+        }
+        let mut truncated = [0u8; 10];
+        let r = recv(truncated.as_mut_ptr() as u64, 2, IPC_NOWAIT | MSG_NOERROR);
+        if r.value as i64 != 2 || &truncated[8..] != b"da" {
+            return Err("MSG_NOERROR must truncate to msgsz and return copied length");
+        }
+        if recv(full.as_mut_ptr() as u64, 4, IPC_NOWAIT).value as i64 != ENOMSG {
+            return Err("successful MSG_NOERROR receive must dequeue the message");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_msgrcv_size_and_fault_transaction
+);
+
+fn smoke_abi_ipc_msgrcv_negative_selects_lowest_type() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        for (mtype, byte) in [(3i64, b'3'), (1, b'1'), (2, b'2')] {
+            let mut msg = [0u8; 9];
+            msg[..8].copy_from_slice(&mtype.to_le_bytes());
+            msg[8] = byte;
+            if call(Syscall::Msgsnd.raw(), a3(id, msg.as_ptr() as u64, 1, 0)) != Some(0) {
+                return Err("setup: typed msgsnd failed");
+            }
+        }
+        let mut out = [0u8; 9];
+        let r = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: (-3i64) as u64,
+                arg4: IPC_NOWAIT,
+                ..Default::default()
+            },
+        );
+        if r.value as i64 != 1
+            || i64::from_le_bytes(out[..8].try_into().unwrap()) != 1
+            || out[8] != b'1'
+        {
+            return Err("negative msgtyp must select the lowest eligible type");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_msgrcv_negative_selects_lowest_type
+);
+
+// msgrcv type selection with the transactional output path: send mtype 3 then
 // mtype 1; msgtyp=1 must skip the type-3 message and deliver the type-1 one,
 // writing the mtype header and payload correctly.
 fn smoke_abi_ipc_msgrcv_type_select() -> TestResult {
@@ -874,6 +1241,103 @@ fn smoke_abi_ipc_msgctl_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_neg);
 
+fn smoke_abi_ipc_msgctl_capacity_stat_and_rmid() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut update = [0u8; 120];
+        update[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+        update[88..96].copy_from_slice(&1u64.to_ne_bytes());
+        if call(Syscall::Msgctl.raw(), a2(987_654, IPC_SET, BAD_PTR)) != Some(EFAULT) {
+            return Err("msgctl IPC_SET must import the full struct before id lookup");
+        }
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_SET, update.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("msgctl IPC_SET qbytes=1 failed");
+        }
+
+        let mut msg = [0u8; 9];
+        msg[..8].copy_from_slice(&1i64.to_ne_bytes());
+        msg[8] = b'x';
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, msg.as_ptr() as u64, 1, IPC_NOWAIT),
+        ) != Some(0)
+        {
+            return Err("first message should fit qbytes=1");
+        }
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, msg.as_ptr() as u64, 1, IPC_NOWAIT),
+        ) != Some(EAGAIN)
+        {
+            return Err("full queue IPC_NOWAIT send must return EAGAIN");
+        }
+
+        let mut stat = [0u8; 120];
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("msgctl IPC_STAT failed");
+        }
+        if u64::from_ne_bytes(stat[72..80].try_into().unwrap()) != 1
+            || u64::from_ne_bytes(stat[80..88].try_into().unwrap()) != 1
+            || u64::from_ne_bytes(stat[88..96].try_into().unwrap()) != 1
+        {
+            return Err("msgctl IPC_STAT byte/count/qbytes metadata mismatch");
+        }
+
+        let mut drained = [0u8; 9];
+        let receive = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: drained.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: IPC_NOWAIT,
+                ..Default::default()
+            },
+        );
+        if receive.value as i64 != 1 {
+            return Err("capacity-test receive failed");
+        }
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, msg.as_ptr() as u64, 1, IPC_NOWAIT),
+        ) != Some(0)
+        {
+            return Err("dequeue did not release message-queue capacity");
+        }
+
+        crate::sysvipc::__test_begin_removed_wait(2, id);
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("msgctl IPC_RMID failed");
+        }
+        let mut out = [0u8; 9];
+        let result = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: IPC_NOWAIT,
+                ..Default::default()
+            },
+        );
+        if result.value as i64 != EIDRM {
+            return Err("message receiver awakened by RMID must receive EIDRM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_capacity_stat_and_rmid);
+
 // ════════════════════════════════════════════════════════════════════
 // System V shared memory (linux-compat: sys_shmget_compat / shmat / …)
 // ════════════════════════════════════════════════════════════════════
@@ -912,41 +1376,375 @@ fn smoke_abi_ipc_shmget_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmget_neg);
 
+/// Real SysV objects are scoped by the current IPC namespace. Namespace
+/// inheritance shares all three tables by reference, while CLONE_NEWIPC's
+/// fresh namespace may reuse the same numeric ids without aliasing them.
+#[cfg(feature = "container")]
+fn smoke_abi_sysvipc_namespace_share_and_isolation() -> TestResult {
+    with_setup(|| {
+        crate::namespaces::__test_reset_all();
+        let result = (|| {
+            const SHARED_TASK: u64 = FAKE_TASK + 1;
+            const FRESH_TASK: u64 = FAKE_TASK + 2;
+            const SEM_KEY: u64 = 0x51_1001;
+            const MSG_KEY: u64 = 0x51_1002;
+            const SHM_KEY: u64 = 0x51_1003;
+
+            crate::namespaces::unshare_ipc(FAKE_TASK);
+            let shared_ns = crate::namespaces::current_ipc_ns(FAKE_TASK)
+                .ok_or("setup: initial private IPC namespace missing")?;
+
+            set_task(FAKE_TASK);
+            let sem_a = call(Syscall::Semget.raw(), a2(SEM_KEY, 1, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: namespace-A semget failed")? as u64;
+            if call(Syscall::Semctl.raw(), a3(sem_a, 0, SETVAL, 7)) != Some(0) {
+                return Err("setup: namespace-A SETVAL failed");
+            }
+            let msg_a = call(Syscall::Msgget.raw(), a1(MSG_KEY, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: namespace-A msgget failed")? as u64;
+            let shm_a = call(Syscall::Shmget.raw(), a2(SHM_KEY, 4096, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: namespace-A shmget failed")? as u64;
+
+            crate::namespaces::setns_ipc(SHARED_TASK, shared_ns);
+            set_task(SHARED_TASK);
+            if call(Syscall::Semget.raw(), a2(SEM_KEY, 1, 0)) != Some(sem_a as i64)
+                || call(Syscall::Semctl.raw(), a3(sem_a, 0, GETVAL, 0)) != Some(7)
+                || call(Syscall::Msgget.raw(), a1(MSG_KEY, 0)) != Some(msg_a as i64)
+                || call(Syscall::Shmget.raw(), a2(SHM_KEY, 0, 0)) != Some(shm_a as i64)
+            {
+                return Err("inherited IPC namespace did not share all SysV tables");
+            }
+
+            crate::namespaces::unshare_ipc(FRESH_TASK);
+            set_task(FRESH_TASK);
+            if call(Syscall::Semget.raw(), a2(SEM_KEY, 1, 0)) != Some(ENOENT)
+                || call(Syscall::Msgget.raw(), a1(MSG_KEY, 0)) != Some(ENOENT)
+                || call(Syscall::Shmget.raw(), a2(SHM_KEY, 0, 0)) != Some(ENOENT)
+            {
+                return Err("fresh IPC namespace leaked a SysV key from its parent");
+            }
+            let sem_c = call(Syscall::Semget.raw(), a2(SEM_KEY, 1, IPC_CREAT | 0o600))
+                .ok_or("fresh namespace semget failed")? as u64;
+            let msg_c = call(Syscall::Msgget.raw(), a1(MSG_KEY, IPC_CREAT | 0o600))
+                .ok_or("fresh namespace msgget failed")? as u64;
+            let shm_c = call(Syscall::Shmget.raw(), a2(SHM_KEY, 8192, IPC_CREAT | 0o600))
+                .ok_or("fresh namespace shmget failed")? as u64;
+            if sem_c != sem_a || msg_c != msg_a || shm_c != shm_a {
+                return Err("fresh IPC namespace did not use an independent per-family id space");
+            }
+            if call(Syscall::Semctl.raw(), a3(sem_c, 0, GETVAL, 0)) != Some(0) {
+                return Err("same numeric semid aliased the parent namespace's semaphore");
+            }
+            let mut fresh_stat = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(shm_c, IPC_STAT, fresh_stat.as_mut_ptr() as u64),
+            ) != Some(0)
+                || u64::from_ne_bytes(fresh_stat[48..56].try_into().unwrap()) != 8192
+            {
+                return Err("same numeric shmid aliased the parent namespace's segment");
+            }
+            let _ = call(Syscall::Semctl.raw(), a3(sem_c, 0, IPC_RMID, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(msg_c, IPC_RMID, 0));
+            let _ = call(Syscall::Shmctl.raw(), a2(shm_c, IPC_RMID, 0));
+
+            set_task(SHARED_TASK);
+            let mut shared_stat = [0u8; 112];
+            if call(Syscall::Semctl.raw(), a3(sem_a, 0, GETVAL, 0)) != Some(7)
+                || call(Syscall::Msgget.raw(), a1(MSG_KEY, 0)) != Some(msg_a as i64)
+                || call(
+                    Syscall::Shmctl.raw(),
+                    a2(shm_a, IPC_STAT, shared_stat.as_mut_ptr() as u64),
+                ) != Some(0)
+                || u64::from_ne_bytes(shared_stat[48..56].try_into().unwrap()) != 4096
+            {
+                return Err("removing colliding fresh-namespace ids damaged shared namespace");
+            }
+            let _ = call(Syscall::Semctl.raw(), a3(sem_a, 0, IPC_RMID, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(msg_a, IPC_RMID, 0));
+            let _ = call(Syscall::Shmctl.raw(), a2(shm_a, IPC_RMID, 0));
+            Ok(())
+        })();
+        crate::namespaces::__test_reset_all();
+        set_task(FAKE_TASK);
+        result
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi/sysvipc_namespace",
+    smoke_abi_sysvipc_namespace_share_and_isolation
+);
+
 // ── Shmat ───────────────────────────────────────────────────────────
 //
-// shmat(shmid, shmaddr, shmflg). The success path maps frames into the
-// caller's address space, which the harness has none of — so only the
-// invalid-shmid error path (returned before the AS lookup) is reachable.
+// shmat(shmid, shmaddr, shmflg). Entry validation precedes object lookup and
+// the focused positive test installs a live address space.
 
 fn smoke_abi_ipc_shmat_neg() -> TestResult {
     with_setup(|| {
-        // Unknown shmid → EINVAL (segment lookup fails first).
-        match call(Syscall::Shmat.raw(), a2(987654, 0, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("shmat on a bad shmid must be EINVAL"),
+        if call(Syscall::Shmat.raw(), a2(987654, 0, 0)) != Some(EINVAL) {
+            return Err("shmat on a bad shmid must be EINVAL");
         }
+        let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o700))
+            .filter(|id| *id > 0)
+            .ok_or("setup: shmget failed")? as u64;
+        if call(Syscall::Shmat.raw(), a2(id, 0, SHM_REMAP)) != Some(EINVAL) {
+            return Err("SHM_REMAP with a NULL address was not EINVAL");
+        }
+        if call(Syscall::Shmat.raw(), a2(id, 0x4000_0001, 0)) != Some(EINVAL) {
+            return Err("unaligned shmat without SHM_RND was not EINVAL");
+        }
+        if call(Syscall::Shmat.raw(), a2(id, 0x123, SHM_RND | SHM_REMAP)) != Some(EINVAL) {
+            return Err("SHM_RND|SHM_REMAP accepted an address rounded to NULL");
+        }
+        // Linux ignores unknown shmat bits. With no fixture AS, reaching the
+        // normal mapping guard yields InvalidOp/None rather than EINVAL.
+        if call(Syscall::Shmat.raw(), a2(id, 0, 0x2)).is_some() {
+            return Err("shmat rejected an otherwise ignored unknown flag bit");
+        }
+        let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmat_neg);
 
+fn smoke_abi_ipc_shmat_address_modes_and_remap() -> TestResult {
+    with_setup(|| {
+        with_ipc_shm_as(|as_ref| {
+            let id = call(Syscall::Shmget.raw(), a2(0, 8192, IPC_CREAT | 0o700))
+                .filter(|id| *id > 0)
+                .ok_or("setup: first shmget failed")? as u64;
+            let rounded = AddressSpace::USER_FIXED_FLOOR + 0x20_0000;
+            if call(Syscall::Shmat.raw(), a2(id, rounded + 0x123, SHM_RND)) != Some(rounded as i64)
+            {
+                return Err("SHM_RND did not round the fixed address down");
+            }
+            if call(Syscall::Shmat.raw(), a2(id, rounded, 0)) != Some(EINVAL) {
+                return Err("fixed shmat silently replaced an overlap without SHM_REMAP");
+            }
+
+            let exec_base = rounded + 0x4000;
+            if call(
+                Syscall::Shmat.raw(),
+                a2(id, exec_base, SHM_RDONLY | SHM_EXEC),
+            ) != Some(exec_base as i64)
+            {
+                return Err("SHM_RDONLY|SHM_EXEC attach failed");
+            }
+            let exec_region = as_ref
+                .regions_snapshot()
+                .into_iter()
+                .find(|region| region.base.as_u64() == exec_base)
+                .ok_or("readonly executable attach has no VMA")?;
+            if !exec_region.perms.contains(RegionPerms::READ)
+                || !exec_region.perms.contains(RegionPerms::EXEC)
+                || !exec_region.perms.contains(RegionPerms::SHARED)
+                || exec_region.perms.contains(RegionPerms::WRITE)
+            {
+                return Err("SHM_RDONLY|SHM_EXEC produced wrong region permissions");
+            }
+            if call(Syscall::MProtect.raw(), a2(exec_base + 4096, 4096, 1)) != Some(0) {
+                return Err("mprotect could not split the tracked SysV attachment");
+            }
+
+            let id2 = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: second shmget failed")? as u64;
+            if call(Syscall::Shmat.raw(), a2(id2, rounded, SHM_REMAP)) != Some(rounded as i64) {
+                return Err("SHM_REMAP did not replace the fixed mapping");
+            }
+            let munmap_base = rounded + 0x8000;
+            if call(Syscall::Shmat.raw(), a2(id2, munmap_base, 0)) != Some(munmap_base as i64)
+                || call(Syscall::Munmap.raw(), a1(munmap_base, 4096)) != Some(0)
+            {
+                return Err("munmap did not remove a complete SysV attachment");
+            }
+
+            let mut stat1 = [0u8; 112];
+            let mut stat2 = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(id, IPC_STAT, stat1.as_mut_ptr() as u64),
+            ) != Some(0)
+                || call(
+                    Syscall::Shmctl.raw(),
+                    a2(id2, IPC_STAT, stat2.as_mut_ptr() as u64),
+                ) != Some(0)
+            {
+                return Err("IPC_STAT after SHM_REMAP failed");
+            }
+            if u64::from_ne_bytes(stat1[88..96].try_into().unwrap()) != 2
+                || u64::from_ne_bytes(stat2[88..96].try_into().unwrap()) != 1
+            {
+                return Err("SHM_REMAP did not update shm_nattch exactly");
+            }
+            if call(Syscall::Shmdt.raw(), a0(rounded)) != Some(0)
+                || call(Syscall::Shmdt.raw(), a0(rounded)) != Some(0)
+                || call(Syscall::Shmdt.raw(), a0(exec_base)) != Some(0)
+            {
+                return Err("shmdt failed for a tracked attachment");
+            }
+            let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+            let _ = call(Syscall::Shmctl.raw(), a2(id2, IPC_RMID, 0));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shmat_address_modes_and_remap
+);
+
+fn smoke_abi_ipc_mremap_fixed_detaches_destination_shm() -> TestResult {
+    with_setup(|| {
+        with_ipc_shm_as(|as_ref| {
+            const TARGET: u64 = AddressSpace::USER_FIXED_FLOOR + 0x60_0000;
+            const SOURCE: u64 = TARGET + 0x20_0000;
+            const MREMAP_MAYMOVE_FIXED: u64 = 3;
+            let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: shmget failed")? as u64;
+            if call(Syscall::Shmat.raw(), a2(id, TARGET, 0)) != Some(TARGET as i64) {
+                return Err("setup: fixed shmat destination failed");
+            }
+            if as_ref
+                .map_region(Region {
+                    base: VirtAddr::new(SOURCE),
+                    len: 4096,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: alloc::vec![PhysAddr::new(0)],
+                })
+                .is_err()
+            {
+                return Err("setup: private mremap source failed");
+            }
+            let moved = call(
+                Syscall::Mremap.raw(),
+                SyscallArgs {
+                    arg0: SOURCE,
+                    arg1: 4096,
+                    arg2: 4096,
+                    arg3: MREMAP_MAYMOVE_FIXED,
+                    arg4: TARGET,
+                    ..Default::default()
+                },
+            );
+            if moved != Some(TARGET as i64) {
+                return Err("MREMAP_FIXED did not replace the SysV destination");
+            }
+            let mut stat = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+            ) != Some(0)
+                || u64::from_ne_bytes(stat[88..96].try_into().unwrap()) != 0
+            {
+                return Err("MREMAP_FIXED destination punch did not decrement shm_nattch");
+            }
+            if call(Syscall::Shmdt.raw(), a0(TARGET)) != Some(EINVAL) {
+                return Err("displaced SysV destination left a stale shmdt attachment");
+            }
+            let _ = call(Syscall::Munmap.raw(), a1(TARGET, 4096));
+            let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_mremap_fixed_detaches_destination_shm
+);
+
 // ── Shmdt ───────────────────────────────────────────────────────────
 //
-// shmdt(shmaddr). The handler dereferences current_address_space() FIRST,
-// which is None in this harness, so it returns invalid_op() for every
-// input — neither the ok(0) nor the -EINVAL Linux paths are reachable.
+// shmdt(shmaddr) requires a page-aligned original attachment address.
 
 fn smoke_abi_ipc_shmdt_neg() -> TestResult {
     with_setup(|| {
-        // No address space → invalid_op (call() returns None).
-        // LINUX-GAP: Linux returns -EINVAL for an unmapped/unknown addr;
-        // here the missing-AS guard short-circuits to a non-Ok status.
-        match call(Syscall::Shmdt.raw(), a0(0x4000_0000)) {
-            None => Ok(()),
-            Some(_) => Err("shmdt with no address space should be invalid_op (None)"),
+        if call(Syscall::Shmdt.raw(), a0(0x4000_0001)) != Some(EINVAL)
+            || call(Syscall::Shmdt.raw(), a0(0x4000_0000)) != Some(EINVAL)
+        {
+            Err("shmdt invalid/misaligned address was not EINVAL")
+        } else {
+            Ok(())
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmdt_neg);
+
+fn smoke_abi_ipc_shm_rmid_defers_until_shmdt() -> TestResult {
+    with_setup(|| {
+        with_ipc_shm_as(|as_ref| {
+            let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: shmget failed")? as u64;
+            let base = call(Syscall::Shmat.raw(), a2(id, 0, 0))
+                .filter(|base| *base > 0)
+                .ok_or("automatic shmat failed")? as u64;
+            if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+                return Err("IPC_RMID of attached segment failed");
+            }
+            let mut stat = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+            ) != Some(EINVAL)
+            {
+                return Err("IPC_RMID did not remove the public shmid immediately");
+            }
+            if as_ref.region_len_at_base(narf_memory::VirtAddr::new(base)) != Some(4096) {
+                return Err("IPC_RMID destroyed a still-attached mapping");
+            }
+            if call(Syscall::Shmdt.raw(), a0(base)) != Some(0)
+                || call(Syscall::Shmdt.raw(), a0(base)) != Some(EINVAL)
+            {
+                return Err("final shmdt lifecycle/duplicate result was wrong");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shm_rmid_defers_until_shmdt
+);
+
+fn smoke_abi_ipc_shm_process_exit_updates_nattch() -> TestResult {
+    with_setup(|| {
+        with_ipc_shm_as(|_| {
+            let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+                .filter(|id| *id > 0)
+                .ok_or("setup: shmget failed")? as u64;
+            if call(Syscall::Shmat.raw(), a2(id, 0, 0)).is_none() {
+                return Err("setup: shmat failed");
+            }
+            let pid = u64::from(crate::handlers::current_ucred().pid);
+            crate::handlers::shm_process_exit(pid, crate::handlers::current_task_id());
+
+            let mut stat = [0u8; 112];
+            if call(
+                Syscall::Shmctl.raw(),
+                a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+            ) != Some(0)
+                || u64::from_ne_bytes(stat[88..96].try_into().unwrap()) != 0
+            {
+                return Err("process exit did not close the inherited SysV attachment");
+            }
+            if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+                return Err("IPC_RMID after implicit exit detach failed");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shm_process_exit_updates_nattch
+);
 
 // ── Shmctl ──────────────────────────────────────────────────────────
 //
@@ -956,14 +1754,18 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_shmdt_neg);
 
 fn smoke_abi_ipc_shmctl_pos() -> TestResult {
     with_setup(|| {
-        // Create a real segment, then IPC_STAT (buf=0) → 0.
+        // Create a real segment, then IPC_STAT fills one complete shmid64_ds.
         let id = match call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)) {
             Some(id) if id > 0 => id as u64,
             _ => return Err("setup: shmget create failed (shmem vtable absent?)"),
         };
-        let stat = call(Syscall::Shmctl.raw(), a3(id, IPC_STAT, 0, 0));
-        if stat != Some(0) {
-            return Err("shmctl IPC_STAT (buf=0) on a live segment should return 0");
+        let mut stat = [0u8; 112];
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("shmctl IPC_STAT on a live segment should return 0");
         }
         // Clean up: IPC_RMID → 0.
         match call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) {
@@ -984,6 +1786,85 @@ fn smoke_abi_ipc_shmctl_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmctl_neg);
+
+fn smoke_abi_ipc_shmctl_exact_order_permissions_and_set() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Shmctl.raw(), a2(987654, IPC_SET, BAD_PTR)) != Some(EFAULT) {
+            return Err("IPC_SET did not import shmid_ds before id lookup");
+        }
+        if call(Syscall::Shmctl.raw(), a2(987654, 0x7f, BAD_PTR)) != Some(EINVAL)
+            || call(
+                Syscall::Shmctl.raw(),
+                a2(987654, IPC_STAT | IPC_64, BAD_PTR),
+            ) != Some(EINVAL)
+        {
+            return Err("native shmctl did not reject unknown/IPC_64-tagged commands first");
+        }
+
+        let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+            .filter(|id| *id > 0)
+            .ok_or("setup: shmget failed")? as u64;
+        if call(Syscall::Shmctl.raw(), a2(id, IPC_STAT, BAD_PTR)) != Some(EFAULT) {
+            return Err("IPC_STAT bad output pointer was not EFAULT");
+        }
+        let mut set = [0u8; 112];
+        set[4..8].copy_from_slice(&2000u32.to_ne_bytes());
+        set[8..12].copy_from_slice(&3000u32.to_ne_bytes());
+        set[20..24].copy_from_slice(&0o640u32.to_ne_bytes());
+        if call(Syscall::Shmctl.raw(), a2(id, IPC_SET, set.as_ptr() as u64)) != Some(0) {
+            return Err("owner IPC_SET failed");
+        }
+        let mut stat = [0u8; 112];
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+            || u32::from_ne_bytes(stat[4..8].try_into().unwrap()) != 2000
+            || u32::from_ne_bytes(stat[8..12].try_into().unwrap()) != 3000
+            || u32::from_ne_bytes(stat[20..24].try_into().unwrap()) != 0o640
+        {
+            return Err("IPC_SET fields did not round-trip through IPC_STAT");
+        }
+
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("failed to install non-owner test credentials");
+        }
+        let non_owner_set = call(Syscall::Shmctl.raw(), a2(id, IPC_SET, set.as_ptr() as u64));
+        let non_owner_rmid = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if non_owner_set != Some(-1) || non_owner_rmid != Some(-1) {
+            return Err("non-owner shmctl mutation was not EPERM");
+        }
+        let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shmctl_exact_order_permissions_and_set
+);
+
+fn smoke_abi_ipc_shmat_permission_denied_before_as() -> TestResult {
+    with_setup(|| {
+        let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o400))
+            .filter(|id| *id > 0)
+            .ok_or("setup: shmget failed")? as u64;
+        let _ = call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000));
+        let readonly = call(Syscall::Shmat.raw(), a2(id, 0, SHM_RDONLY));
+        let writable = call(Syscall::Shmat.raw(), a2(id, 0, 0));
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
+        if readonly != Some(EACCES) || writable != Some(EACCES) {
+            Err("shmat did not enforce read/write IPC permissions before mapping")
+        } else {
+            Ok(())
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/shmat",
+    smoke_abi_ipc_shmat_permission_denied_before_as
+);
 
 // #33: shmctl(IPC_STAT) fills shm_cpid (creator) at offset 80, translated into
 // the reader's namespace, instead of leaving it caller-zeroed. shm_lpid stays

@@ -70,7 +70,8 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
                     if item.fd < 0 {
                         None
                     } else {
-                        t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
+                        let entry = t.get(item.fd as u32)?;
+                        Some((entry.ops.clone(), t.offset(item.fd as u32)?))
                     }
                 })
                 .collect()
@@ -323,7 +324,9 @@ pub(crate) fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
                 if item.fd < 0 {
                     return None;
                 }
-                let live = t.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset));
+                let live = t
+                    .get(item.fd as u32)
+                    .and_then(|e| Some((e.ops.clone(), t.offset(item.fd as u32)?)));
                 match (&entry_files, live) {
                     // Still open: poll the file we resolved at entry, at its
                     // CURRENT offset. In Linux the offset lives inside the
@@ -463,7 +466,8 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
                 if item.fd < 0 {
                     None
                 } else {
-                    tbl.get(item.fd as u32).map(|e| (e.ops.clone(), e.offset))
+                    let entry = tbl.get(item.fd as u32)?;
+                    Some((entry.ops.clone(), tbl.offset(item.fd as u32)?))
                 }
             })
             .collect()
@@ -526,6 +530,215 @@ fn disarm_readiness_cells(task_id: u64, fds: &[PollFd]) {
             }
         }
     });
+}
+
+/// Result of the kernel-buffer poll wait used by select/pselect. `deadline_ns`
+/// is the original absolute deadline and lets the raw syscall write the
+/// remaining timeout back exactly as Linux does.
+pub(crate) enum KernelPollWait {
+    Ready {
+        deadline_ns: Option<u64>,
+    },
+    TimedOut {
+        deadline_ns: Option<u64>,
+    },
+    Interrupted {
+        deadline_ns: Option<u64>,
+    },
+    /// The task was parked after its RIP was rewound. The syscall must return
+    /// without copying result sets or restoring a temporary signal mask; it
+    /// will be re-entered on wake.
+    Parked,
+}
+
+/// Complete a park prepared by [`poll_wait_kernel`]. Keeping the scheduler
+/// handoff separate lets select persist its entry-time kernel snapshot before
+/// a legacy yield hook (which does not return) transfers control.
+pub(crate) fn complete_kernel_poll_park(ctx: &mut dyn TrapContext) {
+    let Some(uctx_ptr) = crate::user_task::current_user_task() else {
+        return;
+    };
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        crate::handlers::own_stack_block(ctx);
+        return;
+    }
+    if let Some(yield_hook) = crate::user_task::yield_hook() {
+        // SAFETY: poll_wait_kernel prepared the current live UserTaskCtx and
+        // the legacy scheduler hook transfers control without returning.
+        unsafe { yield_hook(uctx_ptr) }
+    }
+}
+
+fn finish_kernel_poll_wait(task_id: u64, fds: &[PollFd], uctx: &crate::user_task::UserTaskCtx) {
+    use core::sync::atomic::Ordering;
+    disarm_readiness_cells(task_id, fds);
+    uctx.sleep_deadline_ns.store(0, Ordering::Release);
+    uctx.blocking_deadline_ns.store(0, Ordering::Release);
+    uctx.net_io_wait.store(false, Ordering::Release);
+    clear_poll_wait_record(task_id, uctx);
+}
+
+/// Poll a kernel-owned fd array with nanosecond timeout precision and the same
+/// interruptible park/re-execution machinery as poll(2). This exists so
+/// select/pselect do not fall back to the old busy-spin `do_poll` path.
+///
+/// `timeout_ns == None` means infinite, `Some(0)` is nonblocking, and any
+/// other value is a relative duration on first entry. The absolute deadline
+/// is persisted in `UserTaskCtx::blocking_deadline_ns` across RIP rewinds.
+pub(crate) fn poll_wait_kernel(
+    ctx: &mut dyn TrapContext,
+    task_id: u64,
+    fds: &mut [PollFd],
+    timeout_ns: Option<u64>,
+    syscall_no: u32,
+) -> KernelPollWait {
+    use core::sync::atomic::Ordering;
+
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let uctx_opt = crate::user_task::current_user_task();
+    let deadline_ns = match (timeout_ns, uctx_opt) {
+        (None, _) => None,
+        (Some(0), _) => Some(0),
+        (Some(duration), Some(p)) => {
+            // SAFETY: current_user_task returns the live context for this trap.
+            let uctx = unsafe { &*p };
+            let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+            let deadline = if persisted != 0 {
+                persisted
+            } else {
+                let deadline = now.saturating_add(duration);
+                uctx.blocking_deadline_ns.store(deadline, Ordering::Release);
+                deadline
+            };
+            Some(deadline)
+        }
+        (Some(duration), None) => Some(now.saturating_add(duration)),
+    };
+
+    // Kernel-test/early-boot fallback: there is no schedulable user context,
+    // so retain exact readiness/deadline/signal semantics by cooperatively
+    // pumping. Production userspace always has a UserTaskCtx and takes the
+    // park path below.
+    let Some(uctx_ptr) = uctx_opt else {
+        loop {
+            let ready = poll_scan(task_id, fds);
+            if ready != 0 {
+                return KernelPollWait::Ready { deadline_ns };
+            }
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            if deadline_ns.is_some_and(|d| d == 0 || now >= d) {
+                return KernelPollWait::TimedOut { deadline_ns };
+            }
+            if crate::handlers::has_interrupting_signal(task_id) {
+                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                if let Some(hook) = crate::signal_delivery_hook() {
+                    let _ = hook(ctx, syscall_no);
+                }
+                return KernelPollWait::Interrupted { deadline_ns };
+            }
+            narf_scheduler::sleep_pumps::run();
+            core::hint::spin_loop();
+        }
+    };
+
+    // SAFETY: current_user_task returned this live context for the trap.
+    let uctx = unsafe { &*uctx_ptr };
+    uctx.net_io_wait.store(false, Ordering::Release);
+    uctx.epoll_park_gen
+        .store(narf_net::readiness::generation(), Ordering::Release);
+    uctx.signal_park_gen.store(
+        crate::handlers::signal_raise_generation(task_id),
+        Ordering::Release,
+    );
+    match deadline_ns {
+        None => uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release),
+        Some(0) => uctx.sleep_deadline_ns.store(0, Ordering::Release),
+        Some(deadline) => uctx.sleep_deadline_ns.store(deadline, Ordering::Release),
+    }
+
+    install_poll_files(task_id, fds);
+    let ready = poll_scan(task_id, fds);
+    if ready != 0 {
+        finish_kernel_poll_wait(task_id, fds, uctx);
+        return KernelPollWait::Ready { deadline_ns };
+    }
+
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    if deadline_ns.is_some_and(|d| d == 0 || now >= d) {
+        finish_kernel_poll_wait(task_id, fds, uctx);
+        return KernelPollWait::TimedOut { deadline_ns };
+    }
+
+    // Linux checks deliverable signals after its readiness scan, so a ready
+    // fd wins over an otherwise simultaneous signal.
+    if crate::handlers::has_interrupting_signal(task_id) {
+        ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+        if let Some(hook) = crate::signal_delivery_hook() {
+            let _ = hook(ctx, syscall_no);
+        }
+        finish_kernel_poll_wait(task_id, fds, uctx);
+        return KernelPollWait::Interrupted { deadline_ns };
+    }
+
+    let Some(_yield_hook) = crate::user_task::yield_hook() else {
+        // A userspace context without a scheduler hook can only occur during
+        // early bring-up. Keep pumping rather than incorrectly returning 0.
+        loop {
+            let ready = poll_scan(task_id, fds);
+            if ready != 0 {
+                finish_kernel_poll_wait(task_id, fds, uctx);
+                return KernelPollWait::Ready { deadline_ns };
+            }
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            if deadline_ns.is_some_and(|d| now >= d) {
+                finish_kernel_poll_wait(task_id, fds, uctx);
+                return KernelPollWait::TimedOut { deadline_ns };
+            }
+            if crate::handlers::has_interrupting_signal(task_id) {
+                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                if let Some(hook) = crate::signal_delivery_hook() {
+                    let _ = hook(ctx, syscall_no);
+                }
+                finish_kernel_poll_wait(task_id, fds, uctx);
+                return KernelPollWait::Interrupted { deadline_ns };
+            }
+            narf_scheduler::sleep_pumps::run();
+            core::hint::spin_loop();
+        }
+    };
+
+    if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
+        if arm_readiness_cells(task_id, fds, &waker) {
+            disarm_readiness_cells(task_id, fds);
+            let ready = poll_scan(task_id, fds);
+            if ready != 0 {
+                finish_kernel_poll_wait(task_id, fds, uctx);
+                return KernelPollWait::Ready { deadline_ns };
+            }
+        }
+    }
+
+    uctx.net_io_wait.store(true, Ordering::Release);
+    record_poll_wait(uctx, fds);
+    if let Some(timer_deadline) = poll_nearest_deadline(task_id, fds) {
+        let current = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        uctx.sleep_deadline_ns.store(
+            if current == 0 {
+                timer_deadline
+            } else {
+                current.min(timer_deadline)
+            },
+            Ordering::Release,
+        );
+    }
+    ctx.set_rip(ctx.rip().wrapping_sub(2));
+    // SAFETY: this is the current task's live context and the scheduler owns
+    // the subsequent state transition.
+    unsafe {
+        ctx.save_user_state(uctx.state.get() as *mut u8);
+        *uctx.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+    }
+    KernelPollWait::Parked
 }
 
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {

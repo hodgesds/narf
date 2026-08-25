@@ -1193,7 +1193,7 @@ pub enum Syscall {
     ///   - `CLONE_SIGHAND`         share sigaction table (accepted).
     ///   - `CLONE_FS`              share cwd table.
     ///   - `CLONE_FILES`           share fd table.
-    ///   - `CLONE_SYSVSEM`         accepted-and-ignored (no SysV sem).
+    ///   - `CLONE_SYSVSEM`         shares the process SEM_UNDO adjustment list.
     ///   - `CLONE_PARENT_SETTID`   on success, write child TID to
     ///     `*parent_tid`.
     ///   - `CLONE_CHILD_CLEARTID`  on thread exit, zero `*child_tid`

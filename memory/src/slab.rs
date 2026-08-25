@@ -1266,9 +1266,16 @@ pub fn magazine_stats() -> MagazineStats {
 // would dangle once the frame is freed. Blocks stranded in magazines simply keep
 // their frame un-reclaimable (bounded by MAG_SIZE * MAX_CPUS per class).
 //
-// The scan runs under the class's central lock and allocation-free (it is
+// Detachment runs under the class's central lock and allocation-free (it is
 // reachable from the allocation-failure reclaim path), so it groups blocks by
 // frame with an in-place merge sort of the free list rather than a heap map.
+// Returning detached frames to the buddy happens only after releasing that
+// lock: `free_frame` can invoke accounting hooks that allocate and re-enter the
+// slab, which would otherwise deadlock on this same class.
+
+/// Fixed stack capacity for one class-detachment pass. Larger page budgets
+/// make another bounded pass; reclaim never allocates its own work storage.
+const SLAB_RECLAIM_BATCH_FRAMES: usize = 64;
 
 /// Registered-once guard for the slab shrinker.
 static SLAB_SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1286,47 +1293,70 @@ fn ensure_slab_shrinker_registered() {
     }
 }
 
-/// Shrinker `count`: an upper bound on reclaimable slab objects — total free
-/// blocks across all classes (`grown - in_use`). Only blocks whose whole frame
-/// is central-resident are actually reclaimable, so this over-estimates; the
-/// reclaimer tolerates a shrinker returning less than its proportional share.
+/// Shrinker `count`: an upper bound on reclaimable base pages. Free blocks are
+/// converted to whole-frame units per class before being added, so the global
+/// page reclaimer never mistakes (for example) 256 free 16-byte objects for
+/// 256 pages. Only blocks whose whole frame is central-resident are actually
+/// reclaimable, so this can still over-estimate; the reclaimer tolerates a
+/// shrinker returning less than its proportional share.
 fn slab_reclaimable_count() -> usize {
     let mut n = 0usize;
-    for c in CLASSES.iter() {
-        let grown = c.grown.load(Ordering::Relaxed);
-        let in_use = c.in_use.load(Ordering::Relaxed);
-        n = n.saturating_add(grown.saturating_sub(in_use));
+    for (class_index, class) in CLASSES.iter().enumerate() {
+        let grown = class.grown.load(Ordering::Relaxed);
+        let in_use = class.in_use.load(Ordering::Relaxed);
+        let blocks_per_frame = PAGE_SIZE_USIZE / class_size(class_index);
+        n = n.saturating_add(grown.saturating_sub(in_use) / blocks_per_frame);
     }
     n
 }
 
-/// Shrinker `scan`: return fully-free frames to the buddy, freeing about `nr`
-/// objects. Returns the number of objects (blocks) reclaimed.
-fn slab_shrink(nr: usize) -> usize {
-    if nr == 0 {
+/// Shrinker `scan`: return at most `target_pages` fully-free frames to the
+/// buddy. Classes are visited largest-first, with the remaining page budget
+/// divided across all classes still to visit. This gives the 4 KiB class a
+/// reclaim opportunity on every pass without allowing it to consume the
+/// entire target while other classes hold reclaimable frames.
+fn slab_shrink(target_pages: usize) -> usize {
+    if target_pages == 0 {
         return 0;
     }
     let mut freed = 0usize;
-    for c in 0..N_CLASSES {
-        if freed >= nr {
+    while freed < target_pages {
+        let pass_start = freed;
+        let mut classes_left = N_CLASSES;
+        for c in (0..N_CLASSES).rev() {
+            let remaining = target_pages - freed;
+            if remaining == 0 {
+                break;
+            }
+            // Ceiling division reserves pressure for every remaining class;
+            // the detacher and outer total both enforce the exact page cap.
+            let quota = remaining.saturating_add(classes_left - 1) / classes_left;
+            // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s
+            // blocks, and `quota` is no larger than the remaining page budget.
+            freed += unsafe { reclaim_class_frames(c, quota) };
+            classes_left -= 1;
+        }
+        if freed == pass_start {
             break;
         }
-        // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks.
-        freed = freed.saturating_add(unsafe { reclaim_class_frames(c) });
     }
     freed
 }
 
-/// Reclaim every fully-free frame of class `c`, returning the object count
-/// freed. Holds the class central lock for the whole operation.
+/// Detach up to `max_pages` fully-free frames of class `c` into `frames`.
+/// The class lock is released before returning; no buddy/cgroup operation is
+/// performed while it is held. Returns a base-page count.
 ///
 /// # Safety
-/// `c < N_CLASSES`. The central free list holds only this class's blocks.
-unsafe fn reclaim_class_frames(c: usize) -> usize {
+/// `c < N_CLASSES`; `frames` must be used to return every reported frame to
+/// the buddy exactly once. The central free list holds only this class's
+/// blocks.
+unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) -> usize {
     let class = &CLASSES[c];
     let block_size = class_size(c);
     let n_blocks = PAGE_SIZE_USIZE / block_size;
-    if n_blocks == 0 {
+    let limit = max_pages.min(frames.len());
+    if n_blocks == 0 || limit == 0 {
         return 0;
     }
     let mut g = class.head.lock();
@@ -1346,7 +1376,7 @@ unsafe fn reclaim_class_frames(c: usize) -> usize {
 
     let mut kept_head: Option<NonNull<FreeBlock>> = None;
     let mut kept_tail: Option<NonNull<FreeBlock>> = None;
-    let mut freed_objects = 0usize;
+    let mut detached_pages = 0usize;
 
     let mut cur = sorted;
     while let Some(run_start) = cur {
@@ -1366,19 +1396,12 @@ unsafe fn reclaim_class_frames(c: usize) -> usize {
             scan // first block of the next frame (or None)
         };
 
-        if run_len == n_blocks {
-            // Every block of this frame is free → return it to the buddy.
-            // SAFETY: `frame_base` is the page-aligned kernel VA of a frame this
-            // slab owns; invert the direct map to recover its phys.
-            let phys = crate::PhysAddr::from_kernel_ptr(frame_base as *const u8);
-            #[cfg(feature = "kasan")]
-            // SAFETY: clear the slab poison so the buddy hands out clean shadow.
-            unsafe {
-                crate::kasan::unpoison(frame_base as u64, PAGE_SIZE_USIZE);
-            }
-            crate::frame::free_frame(PhysFrame::new(phys));
-            class.grown.fetch_sub(n_blocks, Ordering::Relaxed);
-            freed_objects += n_blocks;
+        if run_len == n_blocks && detached_pages < limit {
+            // Every block is central-resident and therefore unowned. Omit the
+            // run from the rebuilt list; the caller returns it to the buddy
+            // only after this function releases `class.head`.
+            frames[detached_pages] = frame_base;
+            detached_pages += 1;
         } else {
             // Keep this run: append its blocks to the rebuilt list, in order.
             // SAFETY: the run nodes are valid free blocks we own; we re-null and
@@ -1401,7 +1424,46 @@ unsafe fn reclaim_class_frames(c: usize) -> usize {
         cur = run_end;
     }
     *g = kept_head;
-    freed_objects
+    class
+        .grown
+        .fetch_sub(detached_pages * n_blocks, Ordering::Relaxed);
+    detached_pages
+}
+
+/// Return frames already detached from a slab class to the buddy. This helper
+/// must run with no slab class lock held because `free_frame` can trigger
+/// cgroup accounting hooks that allocate.
+///
+/// # Safety
+/// Every address must name a distinct page-aligned direct-map frame detached
+/// by [`detach_class_frames`], and must be passed exactly once.
+unsafe fn free_detached_slab_frames(frames: &[usize]) {
+    for &frame_base in frames {
+        // SAFETY: the detacher proved this page has no allocated or magazine
+        // blocks and removed every central-list reference before returning it.
+        let phys = crate::PhysAddr::from_kernel_ptr(frame_base as *const u8);
+        #[cfg(feature = "kasan")]
+        // SAFETY: clear the slab poison so the buddy hands out clean shadow.
+        unsafe {
+            crate::kasan::unpoison(frame_base as u64, PAGE_SIZE_USIZE);
+        }
+        crate::frame::free_frame(PhysFrame::new(phys));
+    }
+}
+
+/// Reclaim at most `max_pages` fully-free frames of class `c`. Returns base
+/// pages, never blocks, and never holds the class lock across buddy release.
+///
+/// # Safety
+/// `c < N_CLASSES`. The central free list holds only this class's blocks.
+unsafe fn reclaim_class_frames(c: usize, max_pages: usize) -> usize {
+    let mut frames = [0usize; SLAB_RECLAIM_BATCH_FRAMES];
+    // SAFETY: caller proves the class index/list invariant; every detached
+    // frame is consumed exactly once immediately below.
+    let detached = unsafe { detach_class_frames(c, max_pages, &mut frames) };
+    // SAFETY: exactly the initialized detached prefix is passed once.
+    unsafe { free_detached_slab_frames(&frames[..detached]) };
+    detached
 }
 
 /// Detach up to `n` nodes from the front of `head`; return `(front, rest)`.
@@ -2240,10 +2302,10 @@ fn smoke_slab_sort_free_list_by_addr() -> narf_kernel_test::TestResult {
 }
 kernel_test_in!("memory", smoke_slab_sort_free_list_by_addr);
 
-/// The slab shrinker must return fully-free frames to the buddy: grow a class,
-/// free every block, then assert the shrinker reclaims whole frames (a multiple
-/// of the class's blocks-per-frame) and the allocator still works afterwards.
-fn smoke_slab_shrinker_reclaims_free_frames() -> narf_kernel_test::TestResult {
+/// Slab detachment is page-denominated and releases the class lock before the
+/// buddy/cgroup path: grow a class, detach exactly one frame, prove the lock is
+/// available, and only then free the detached frame.
+fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
     use core::alloc::Layout;
     use narf_kernel_test::TestResult;
     // Class 6 (1024 B → 4 blocks/frame) is large enough to force central-list
@@ -2276,18 +2338,24 @@ fn smoke_slab_shrinker_reclaims_free_frames() -> narf_kernel_test::TestResult {
         unsafe { dealloc(*p, layout) };
     }
 
-    // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks.
-    let freed = unsafe { reclaim_class_frames(c) };
-
-    // Freeing 128 blocks (32 frames) spills far more than one frame's worth onto
-    // the central list, so at least one whole frame must be reclaimable. Reclaim
-    // only ever returns whole frames, so the count is a positive multiple of the
-    // class's blocks-per-frame — concurrency-independent invariants.
-    if freed < n_blocks {
-        return TestResult::Fail("shrinker reclaimed less than one full frame");
+    let grown_before = CLASSES[c].grown.load(Ordering::Relaxed);
+    let mut detached_frames = [0usize; 1];
+    // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks,
+    // and the initialized detached prefix is returned exactly once below.
+    let detached = unsafe { detach_class_frames(c, 1, &mut detached_frames) };
+    if detached != 1 {
+        return TestResult::Fail("one-page detach budget did not reclaim exactly one page");
     }
-    if freed % n_blocks != 0 {
-        return TestResult::Fail("reclaim freed a partial frame (not a block multiple)");
+    // Acquiring the same class lock before returning the frame proves the
+    // detachment transaction ended before buddy/cgroup callbacks can run.
+    let class_guard = CLASSES[c].head.lock();
+    drop(class_guard);
+    // SAFETY: the single initialized entry was detached above and has not yet
+    // been freed.
+    unsafe { free_detached_slab_frames(&detached_frames[..detached]) };
+    let grown_after = CLASSES[c].grown.load(Ordering::Relaxed);
+    if grown_before.saturating_sub(grown_after) != n_blocks {
+        return TestResult::Fail("one reclaimed page used object rather than page accounting");
     }
     // The allocator must still hand out and take back a block cleanly.
     match alloc(layout) {
@@ -2299,4 +2367,79 @@ fn smoke_slab_shrinker_reclaims_free_frames() -> narf_kernel_test::TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_slab_shrinker_reclaims_free_frames);
+kernel_test_in!("memory", smoke_slab_shrinker_detaches_before_free);
+
+/// A two-page scan must make progress in both the 4 KiB and 2 KiB classes,
+/// rather than spending the whole target on the smallest-object class.
+fn smoke_slab_shrinker_mixed_class_progress() -> narf_kernel_test::TestResult {
+    use core::alloc::Layout;
+    use narf_kernel_test::TestResult;
+
+    const SMALLER: usize = 7; // 2 KiB, two blocks per frame.
+    const PAGE_CLASS: usize = 8; // 4 KiB, one block per frame.
+    const M: usize = 64;
+    let smaller_layout = match Layout::from_size_align(class_size(SMALLER), 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad 2 KiB layout"),
+    };
+    let page_layout = match Layout::from_size_align(class_size(PAGE_CLASS), 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad 4 KiB layout"),
+    };
+    let mut smaller: [Option<NonNull<u8>>; M] = [None; M];
+    let mut page: [Option<NonNull<u8>>; M] = [None; M];
+
+    for slot in smaller.iter_mut() {
+        match alloc(smaller_layout) {
+            Ok(p) => *slot = Some(p),
+            Err(_) => {
+                for q in smaller.iter().flatten() {
+                    // SAFETY: allocated above with `smaller_layout`.
+                    unsafe { dealloc(*q, smaller_layout) };
+                }
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    for slot in page.iter_mut() {
+        match alloc(page_layout) {
+            Ok(p) => *slot = Some(p),
+            Err(_) => {
+                for q in page.iter().flatten() {
+                    // SAFETY: allocated above with `page_layout`.
+                    unsafe { dealloc(*q, page_layout) };
+                }
+                for q in smaller.iter().flatten() {
+                    // SAFETY: allocated above with `smaller_layout`.
+                    unsafe { dealloc(*q, smaller_layout) };
+                }
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    for q in smaller.iter().flatten() {
+        // SAFETY: allocated above with `smaller_layout`.
+        unsafe { dealloc(*q, smaller_layout) };
+    }
+    for q in page.iter().flatten() {
+        // SAFETY: allocated above with `page_layout`.
+        unsafe { dealloc(*q, page_layout) };
+    }
+
+    let smaller_before = CLASSES[SMALLER].grown.load(Ordering::Relaxed);
+    let page_before = CLASSES[PAGE_CLASS].grown.load(Ordering::Relaxed);
+    let freed_pages = slab_shrink(2);
+    let smaller_after = CLASSES[SMALLER].grown.load(Ordering::Relaxed);
+    let page_after = CLASSES[PAGE_CLASS].grown.load(Ordering::Relaxed);
+    if freed_pages != 2 {
+        return TestResult::Fail("two-page slab target was not enforced exactly");
+    }
+    if page_before.saturating_sub(page_after) != 1 {
+        return TestResult::Fail("4 KiB class made no progress");
+    }
+    if smaller_before.saturating_sub(smaller_after) != 2 {
+        return TestResult::Fail("fair scan made no 2 KiB-class page progress");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_shrinker_mixed_class_progress);

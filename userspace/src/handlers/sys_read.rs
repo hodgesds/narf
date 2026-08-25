@@ -1,248 +1,263 @@
 #[allow(unused_imports)]
 use super::*;
 
+pub(super) fn park_blocking_read(
+    ctx: &mut dyn TrapContext,
+    ops: &dyn narf_filesystem::FileOps,
+) -> bool {
+    if ops.block_on_input() {
+        if let (Some(uctx), Some(hook)) = (
+            crate::user_task::current_user_task(),
+            crate::user_task::yield_hook(),
+        ) {
+            #[cfg(target_arch = "x86_64")]
+            const SYSCALL_INSN_LEN: u64 = 2;
+            #[cfg(target_arch = "aarch64")]
+            const SYSCALL_INSN_LEN: u64 = 4;
+            ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+            // SAFETY: live per-task context, exclusively held in syscall.
+            unsafe {
+                let uc = &*uctx;
+                uc.console_read_pending
+                    .store(true, core::sync::atomic::Ordering::Release);
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return true;
+                }
+                hook(uctx);
+            }
+        }
+        return false;
+    }
+    park_reexecute_on_fd(
+        ctx,
+        ops,
+        narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+    )
+}
+
+pub(super) enum TransactionalReadError {
+    WouldBlock,
+    User(u64),
+    BadFd,
+}
+
+/// Pipe/FIFO reads must not dequeue bytes before the guarded user copy. A
+/// prior range check cannot exclude a concurrent unmap; these concrete stream
+/// surfaces hold the prefix stable and commit consumption only after copy.
+pub(super) fn transactional_stream_read(
+    ops: &dyn narf_filesystem::FileOps,
+    max: usize,
+    copy: impl Fn(&[u8]) -> Result<(), u64>,
+) -> Option<Result<usize, TransactionalReadError>> {
+    if let Some(pipe) = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+    {
+        return Some(pipe.read_to_user(max, copy).map_err(|error| match error {
+            crate::pipe::VmspliceDrainError::WouldBlock => TransactionalReadError::WouldBlock,
+            crate::pipe::VmspliceDrainError::User(errno) => TransactionalReadError::User(errno),
+        }));
+    }
+    if let Some(fifo) = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+    {
+        return Some(
+            fifo.vmsplice_to_user(max, copy)
+                .map_err(|error| match error {
+                    narf_filesystem::fifo::VmspliceDrainError::WouldBlock => {
+                        TransactionalReadError::WouldBlock
+                    }
+                    narf_filesystem::fifo::VmspliceDrainError::User(errno) => {
+                        TransactionalReadError::User(errno)
+                    }
+                    narf_filesystem::fifo::VmspliceDrainError::BadFd => {
+                        TransactionalReadError::BadFd
+                    }
+                }),
+        );
+    }
+    None
+}
+
+/// `read(fd, buf, count)` with Linux `vfs_read` ordering and partial progress.
 pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd = args.arg0 as u32;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
-    if len == 0 {
+    let fd_num = args.arg0 as u32;
+    let user_ptr = args.arg1;
+    let requested = args.arg2 as usize;
+    let task = current_task_id();
+
+    let Some(endpoint) = copy_fd_endpoint(task, fd_num) else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
+    };
+    if !endpoint.readable() {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
+    }
+    if let Err(errno) = validate_rw_user_range(user_ptr, requested) {
+        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+        return;
+    }
+    let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
+    if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    // Validate the destination pointer before allocating the kernel
-    // staging buffer — EFAULT early rather than after the FileOps call.
-    if let Err(e) = validate_user_range(ptr, len) {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-        return;
-    }
-    // Job control: a background process reading its controlling tty is
-    // stopped (SIGTTIN) before the read runs — and before it is recorded
-    // as the foreground reader below.
+
     #[cfg(feature = "linux-compat")]
-    if let Some(ret) = tty_background_access(current_task_id(), fd, false) {
+    if let Some(ret) = tty_background_access(task, fd_num, false) {
         ctx.set_return(SyscallReturn::ok(ret as u64));
         return;
     }
-    // Track the foreground task: any read syscall counts as "this
-    // task is currently consuming console input." When the input
-    // ring later observes ^C, this is the task SIGINT goes to.
-    note_console_reader(current_task_id());
 
-    // Read into a kernel-owned staging buffer, then copy back with the SMAP
-    // bracket (FileOps never touches user memory). A read() completes in this
-    // frame — `poll_blocking` busy-polls in place and FileOps futures are
-    // heap-boxed, so the kernel stack stays shallow — so the common small read
-    // can stage through a stack buffer and skip a heap alloc+zero on every
-    // call. That per-read churn (slab alloc/free + zero-fill + per-CPU RDTSCP,
-    // ×thousands of small sysfs reads) is what made udev coldplug crawl.
-    const READ_STACK_BUF: usize = 4096;
-    let mut stack_buf = [0u8; READ_STACK_BUF];
-    // Deferred init (no throwaway `Vec::new()` to satisfy -D unused-assignments):
-    // the heap buffer is only assigned — and only borrowed — on the large-read
-    // branch; small reads never touch it.
-    let mut heap_buf: alloc::vec::Vec<u8>;
-    let kbuf: &mut [u8] = if len <= READ_STACK_BUF {
-        &mut stack_buf[..len]
-    } else {
-        heap_buf = alloc::vec![0u8; len];
-        heap_buf.as_mut_slice()
-    };
-    let task = current_task_id();
-
-    // fanotify groups deliver fixed-size metadata records, each carrying a
-    // freshly-opened fd to the affected object. Installing that fd needs
-    // the fd-table lock — which the `with_table` block below holds across
-    // ops.read — so fanotify reads are handled here, before any lock is
-    // taken, to avoid a re-entrant deadlock.
+    // fanotify descriptors synthesize metadata and install object fds while
+    // draining their private event queue; preserve that special read surface.
     #[cfg(feature = "linux-compat")]
-    if crate::mqueue::fanotify_active() {
-        if let Some(gid) = crate::mqueue::fanotify_instance_of(task, fd) {
-            let n = fanotify_read_into(task, gid, &mut kbuf[..]);
-            // SAFETY: ptr validated above; AS still active.
-            match unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
-                Err(e) => ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64)),
-            }
-            return;
+    let fanotify_group = crate::mqueue::fanotify_active()
+        .then(|| crate::mqueue::fanotify_instance_of(task, fd_num))
+        .flatten();
+    #[cfg(feature = "linux-compat")]
+    if let Some(group) = fanotify_group {
+        let max = core::cmp::min(count, 64 * 1024);
+        let result = fanotify_read_to_user(task, group, max, |bytes| {
+            validate_fanotify_copy_range(user_ptr, bytes.len())?;
+            // SAFETY: destination was range-validated above; guarded copy
+            // catches a racing protection change before fds are published.
+            unsafe { copy_to_user(user_ptr, bytes) }
+        });
+        match result {
+            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(errno) => ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64)),
         }
-    }
-
-    // EBADF: fd not open. Checked before the general read path so a
-    // closed/bad fd is distinct from a read I/O error (which keeps the
-    // `_` → InvalidOp arm). Special fds (console/fanotify) returned above.
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
-    // Snapshot the fd's ops + offset, then DROP the fd-table lock before
-    // calling into FileOps.
-    //
-    // Holding it across `ops.read` self-deadlocks on any file whose read
-    // consults the fd table: `/proc/<pid>/fdinfo/<n>` and `/proc/<pid>/fd/<n>`
-    // render via `fd_path_of`, which re-enters `fd::with_table` on the SAME
-    // task's table — and the table lock is a non-reentrant IrqSafeSpinLock,
-    // so the CPU spins forever with interrupts masked. dbus-daemon does
-    // exactly this (`pidfd_open` then read `/proc/self/fdinfo/<n>`), which
-    // wedged the session bus and with it every KDE Plasma startup. Same
-    // lesson as the nested-epoll fix: never call FileOps under the fd-table
-    // lock.
-    //
-    // The offset is re-taken and advanced after the read. Two threads
-    // sharing one fd can now interleave there; Linux serialises that case
-    // with f_pos_lock, which NARF doesn't model yet.
-    let snapshot = fd::with_table(task, |t| {
-        let e = t.get(fd)?;
-        Some((e.ops.clone(), e.offset, e.status_flags))
-    });
-    let (ops, off, status_flags) = match snapshot {
-        Some(Some(v)) => v,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-            return;
-        }
-    };
-    let advance = |n: usize| {
-        let _ = fd::with_table(task, |t| {
-            if let Some(e) = t.get_mut(fd) {
-                e.offset = off.saturating_add(n as u64);
-            }
-        });
-    };
-    // Closure error channel.
-    enum ReadError {
-        /// Non-blocking read with nothing ready → -EAGAIN.
-        Again,
-        /// Descriptor's open mode forbids reading (a pipe write end):
-        /// -EBADF, per the FMODE_READ check in `fs/read_write.c::vfs_read`.
-        BadFd,
-        /// Anything else → invalid-op sentinel (read error).
-        Other,
-    }
-    let outcome = Some((|| {
-        let entry = &ops;
-        let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
-        // evdev device nodes (`nonblock_read_eagain`) provide EAGAIN-on-empty
-        // semantics UNCONDITIONALLY — independent of the fd's O_NONBLOCK bit.
-        //
-        // Why not gate on `nonblock`: libinput/libevdev consume evdev nodes with
-        // a drain-to-EAGAIN loop and are structurally incompatible with a
-        // BLOCKING evdev fd (the sync loop never terminates; the post-epoll read
-        // must not stall the single-threaded dispatch). Their fds SHOULD be
-        // O_NONBLOCK, but when weston opens an input device through libseat/seatd
-        // the fd arrives over SCM_RIGHTS, and NARF installs received fds with
-        // status_flags = 0 (O_NONBLOCK is dropped — it lives per-FdEntry, not on
-        // the shared FileOps). The old `nonblock &&` gate then sent that fd down
-        // the `poll_blocking` path, which busy-spins the empty-ring read future
-        // ~4M times and finally returns Err(ReadOnly) → read() reports EIO →
-        // libinput treats the read error as device-removal and `EPOLL_CTL_DEL`s
-        // the device, so the pointer goes dead. Surfacing EAGAIN here (what an
-        // evdev node is *for*) fixes that and matches how these devices are used.
-        if entry.nonblock_read_eagain() {
-            return match poll_once(entry.read(off, &mut kbuf[..])) {
-                Some(Ok(n)) if n > 0 => {
-                    advance(n);
-                    Ok((n, false, false))
-                }
-                // Empty / would-block ⇒ EAGAIN. `WouldBlock` is the explicit
-                // signal; the bare `Ok(0)` arm covers file ops not yet
-                // converted to it.
-                Some(Err(narf_filesystem::FsError::WouldBlock)) => Err(ReadError::Again),
-                Some(Ok(_)) | None => Err(ReadError::Again),
-                Some(Err(narf_filesystem::FsError::BadFd)) => Err(ReadError::BadFd),
-                Some(Err(_)) => Err(ReadError::Other),
-            };
-        }
-        let res = poll_blocking(entry.read(off, &mut kbuf[..]))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        match res {
-            Ok(n) => {
-                advance(n);
-                Ok((n, false, false))
-            }
-            // The explicit would-block signal, matching what Linux's file ops
-            // return directly (`-EAGAIN` from eventfd_read / pipe_read / …).
-            // O_NONBLOCK ⇒ EAGAIN; otherwise park. `Ok(0)` is exclusively
-            // EOF, so no consumer has to re-classify an ambiguous result.
-            Err(narf_filesystem::FsError::WouldBlock) => {
-                if nonblock {
-                    Err(ReadError::Again)
-                } else {
-                    Ok((0, true, entry.block_on_input()))
-                }
-            }
-            Err(narf_filesystem::FsError::BadFd) => Err(ReadError::BadFd),
-            Err(_) => Err(ReadError::Other),
-        }
-    })());
-    match outcome {
-        Some(Ok((0, _, true))) => {
-            // Empty console input ring: park on the input waker (woken by
-            // the serial/keyboard IRQ via push_global → BYTE_RING_WAKER →
-            // deferred_wake) and RE-EXECUTE the read on resume (rewind RIP,
-            // no return value). The poll routine registers cx.waker() once
-            // `console_read_pending` is set and parks with NO wake-by-ref,
-            // so the task truly idles until a keystroke — no busy-poll.
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                let resume_rip = ctx.rip().wrapping_sub(2);
-                ctx.set_rip(resume_rip);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from
-                // current_user_task(); we hold the only reference while
-                // setting the flag + saving the RIP-rewound CPU state before
-                // the yield hook hands the task to the executor.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.console_read_pending
-                        .store(true, core::sync::atomic::Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
-            }
-            // No executor (kernel-test context): fall back to a 0 read.
-            ctx.set_return(SyscallReturn::ok(0));
-        }
-        Some(Ok((0, true, _))) => {
-            // Arm this descriptor's durable readiness before parking. Pipes
-            // and FIFOs then wake only tasks waiting on this object; legacy
-            // descriptors retain the generation-guarded fallback.
-            if park_reexecute_on_fd(
-                ctx,
-                ops.as_ref(),
-                narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
-            ) {
+    note_console_reader(task);
+
+    let _position_guard = if endpoint.ops.is_stream() {
+        None
+    } else {
+        match poll_blocking(endpoint.description.position_lock.lock()) {
+            Some(guard) => Some(guard),
+            None => {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
                 return;
             }
-            // No executor (kernel-test context): fall back to a 0 read.
-            ctx.set_return(SyscallReturn::ok(0));
         }
-        Some(Ok((n, _, _))) => {
-            // SAFETY: ptr validated above; AS still active.
-            if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
-            } else {
-                ctx.set_return(SyscallReturn::ok(n as u64));
+    };
+
+    const CHUNK: usize = 64 * 1024;
+    let mut total = 0usize;
+    let mut offset = endpoint.description.offset();
+    while total < count {
+        let want = core::cmp::min(CHUNK, count - total);
+        if let Some(outcome) = transactional_stream_read(endpoint.ops.as_ref(), want, |bytes| {
+            // SAFETY: read(2) validated the original range; this guarded
+            // copy catches protection changes racing that validation.
+            unsafe { copy_to_user(user_ptr + total as u64, bytes) }
+        }) {
+            match outcome {
+                Ok(0) => break,
+                Ok(read) if read <= want => {
+                    total += read;
+                    if read < want {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(_) => {
+                    if total == 0 {
+                        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                        return;
+                    }
+                    break;
+                }
+                Err(TransactionalReadError::User(errno)) if total == 0 => {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                Err(TransactionalReadError::BadFd) if total == 0 => {
+                    ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                    return;
+                }
+                Err(TransactionalReadError::WouldBlock) if total == 0 => {
+                    if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
+                        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                        return;
+                    }
+                    if has_interrupting_signal(task) {
+                        ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                        return;
+                    }
+                    if park_blocking_read(ctx, endpoint.ops.as_ref()) {
+                        return;
+                    }
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                Err(_) => break,
             }
         }
-        // Non-blocking read with nothing ready → EAGAIN (errno 11).
-        Some(Err(ReadError::Again)) => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        let mut staging = alloc::vec![0u8; want];
+        let outcome = poll_blocking(endpoint.ops.read(offset, &mut staging))
+            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        match outcome {
+            Ok(0) => break,
+            Ok(read) if read <= staging.len() => {
+                // SAFETY: full destination was validated before FileOps.
+                let copied = unsafe { copy_to_user(user_ptr + total as u64, &staging[..read]) };
+                if let Err(errno) = copied {
+                    if total == 0 {
+                        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                        return;
+                    }
+                    break;
+                }
+                total += read;
+                offset = offset.saturating_add(read as u64);
+                if read < staging.len() {
+                    break;
+                }
+            }
+            Ok(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    return;
+                }
+                break;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                if endpoint.nonblocking() || endpoint.ops.nonblock_read_eagain() {
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    return;
+                }
+                if has_interrupting_signal(task) {
+                    ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                    return;
+                }
+                if park_blocking_read(ctx, endpoint.ops.as_ref()) {
+                    return;
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) => break,
+            Err(error) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    return;
+                }
+                break;
+            }
         }
-        // Wrong-direction descriptor (reading a pipe write end) → -EBADF,
-        // matching `fs/read_write.c::vfs_read`'s FMODE_READ check.
-        Some(Err(ReadError::BadFd)) => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        }
-        // TODO(linux-gap): this `Other` arm catches remaining read I/O
-        // errors — still needs a per-errno split.
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
+
+    if !endpoint.ops.is_stream() {
+        endpoint.description.set_offset(offset);
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
 }

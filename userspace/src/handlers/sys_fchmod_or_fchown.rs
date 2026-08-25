@@ -11,7 +11,7 @@ fn fd_ops(fd: u32) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
 fn fd_metadata_errno(error: narf_filesystem::FsError, chown: bool) -> i64 {
     match error {
         narf_filesystem::FsError::PermissionDenied if chown => -1, // -EPERM
-        narf_filesystem::FsError::PermissionDenied => -13,        // -EACCES
+        narf_filesystem::FsError::PermissionDenied => -13,         // -EACCES
         narf_filesystem::FsError::InvalidPath => -22,
         narf_filesystem::FsError::NoSpace => -28,
         narf_filesystem::FsError::QuotaExceeded => -122,
