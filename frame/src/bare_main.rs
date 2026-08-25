@@ -140,11 +140,9 @@ async fn kswapd_kthread(node: usize) {
         // serviced even if the node is above its low watermark; allocation
         // failure can come from fragmentation or reclaimable slab/cache state
         // that the aggregate free-page watermark does not expose.
-        let requested = narf_memory::reclaim::take_reclaim_request(node);
-        // Snapshot the OOM authorization with this request. A failure arriving
-        // during the pass leaves its newly armed flag and request for the next
-        // wake instead of having the older pass consume either one.
-        let oom_requested = requested > 0 && narf_memory::reclaim::take_oom_needed(node);
+        let request = narf_memory::reclaim::take_reclaim_request(node);
+        let requested = request.target_pages;
+        let oom_requested = request.oom_authorized;
         let mut explicit_remaining = requested;
 
         // Batch floor scales with the online CPU count (concurrent allocators);
@@ -219,17 +217,17 @@ async fn kswapd_kthread(node: usize) {
         // failed allocation can request another bounded pass. Non-requested
         // nodes cannot consume this node-scoped signal before the failing node
         // has had its reclaim opportunity.
-        if oom_requested {
-            // Re-check pressure after the pass. Concurrent frees may have made
-            // the failed allocation viable even though this kswapd reclaimed
-            // nothing; killing in that case would be a stale OOM decision.
-            if total_freed == 0 && narf_memory::reclaim::under_min_watermark() {
-                if let Some(pid) = narf_memory::oom::request_oom_relief() {
-                    let _ = writeln!(
-                        console::Writer,
-                        "  oom: Killed process pid={pid} to relieve memory pressure"
-                    );
-                }
+        if oom_requested && total_freed == 0 {
+            // The OOM helper serializes policy across all node workers, then
+            // re-checks the same <=min predicate that refused the allocation.
+            // It reaps the selected victim before another node may select one.
+            if let Some(pid) = narf_memory::oom::request_oom_relief_and_reap_if(
+                narf_memory::reclaim::user_alloc_would_breach_reserve,
+            ) {
+                let _ = writeln!(
+                    console::Writer,
+                    "  oom: Killed process pid={pid} to relieve memory pressure"
+                );
             }
         }
         narf_memory::oom::reap_all();

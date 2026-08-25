@@ -485,7 +485,7 @@ mod allocation_failure_tests {
         if shrinker_calls != 0 {
             return TestResult::Fail("global allocator invoked a shrinker inline");
         }
-        if request != 2 {
+        if request.target_pages != 2 || request.oom_authorized {
             return TestResult::Fail("global allocator published the wrong reclaim target");
         }
         TestResult::Pass

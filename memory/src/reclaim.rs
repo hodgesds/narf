@@ -347,12 +347,49 @@ pub fn user_alloc_would_breach_reserve() -> bool {
 
 static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Requested reclaim work, in base pages, for each NUMA node. Allocation
-/// failures publish work here instead of running shrinkers inline while the
-/// caller may hold an arbitrary kernel lock. Multiple producers coalesce to
-/// the largest outstanding target; the node's sole kswapd consumes it.
-static RECLAIM_REQUEST_PAGES: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
+/// High bit packed into each request word when the matching failure authorizes
+/// OOM policy. Pages and authorization share one atomic linearization point so
+/// kswapd cannot pair one producer's flag with another producer's target.
+const RECLAIM_OOM_BIT: usize = 1usize << (usize::BITS - 1);
+const RECLAIM_PAGE_MASK: usize = RECLAIM_OOM_BIT - 1;
+
+/// Requested reclaim work for each NUMA node. Multiple producers coalesce to
+/// the largest outstanding page target and OR their OOM authorization; the
+/// node's sole kswapd consumes both fields in one swap.
+static RECLAIM_REQUESTS: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
     [const { AtomicUsize::new(0) }; crate::frame::MAX_NUMA_NODES];
+
+/// One atomically consumed background-reclaim request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimRequest {
+    /// Largest coalesced base-page target.
+    pub target_pages: usize,
+    /// Whether at least one coalesced allocation failure authorized OOM policy.
+    pub oom_authorized: bool,
+}
+
+impl ReclaimRequest {
+    const NONE: Self = Self {
+        target_pages: 0,
+        oom_authorized: false,
+    };
+}
+
+fn publish_reclaim_request(node: usize, pages: usize, authorize_oom: bool) {
+    if pages == 0 {
+        return;
+    }
+    let Some(request) = RECLAIM_REQUESTS.get(node) else {
+        return;
+    };
+    let pages = pages.min(RECLAIM_PAGE_MASK);
+    let oom = if authorize_oom { RECLAIM_OOM_BIT } else { 0 };
+    let _ = request.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let target = (current & RECLAIM_PAGE_MASK).max(pages);
+        Some((current & RECLAIM_OOM_BIT) | oom | target)
+    });
+    wake_kswapd(node);
+}
 
 /// Ask the background reclaimer for up to `pages` base pages on `node`.
 ///
@@ -360,55 +397,79 @@ static RECLAIM_REQUEST_PAGES: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
 /// than addition so a burst of failures cannot manufacture an unbounded debt.
 /// A zero-sized or out-of-range request is ignored.
 pub fn request_reclaim(node: usize, pages: usize) {
-    if pages == 0 {
-        return;
-    }
-    let Some(request) = RECLAIM_REQUEST_PAGES.get(node) else {
-        return;
-    };
-    request.fetch_max(pages, Ordering::AcqRel);
-    wake_kswapd(node);
+    publish_reclaim_request(node, pages, false);
 }
 
-/// Consume the coalesced reclaim target for `node`. Only that node's kswapd
-/// should call this; allocation paths only publish through [`request_reclaim`].
-pub fn take_reclaim_request(node: usize) -> usize {
-    RECLAIM_REQUEST_PAGES
+/// Publish background work for a genuinely failed allocation and authorize OOM
+/// policy if its reclaim pass makes no progress. Target and authorization are
+/// one atomic update, including when an ordinary request is already pending.
+pub fn request_reclaim_with_oom(node: usize, pages: usize) {
+    publish_reclaim_request(node, pages, true);
+}
+
+/// Consume the coalesced target and its OOM authorization for `node` in one
+/// atomic operation. Only that node's kswapd should call this.
+pub fn take_reclaim_request(node: usize) -> ReclaimRequest {
+    let packed = RECLAIM_REQUESTS
         .get(node)
-        .map_or(0, |request| request.swap(0, Ordering::AcqRel))
+        .map_or(0, |request| request.swap(0, Ordering::AcqRel));
+    ReclaimRequest {
+        target_pages: packed & RECLAIM_PAGE_MASK,
+        oom_authorized: packed & RECLAIM_OOM_BIT != 0,
+    }
 }
 
 mod reclaim_request_tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use super::{request_reclaim, request_reclaim_with_oom, take_oom_needed, take_reclaim_request};
+    use super::{request_reclaim, request_reclaim_with_oom, take_reclaim_request, ReclaimRequest};
 
     fn smoke_reclaim_requests_coalesce_and_consume() -> TestResult {
         const NODE: usize = crate::frame::MAX_NUMA_NODES - 2;
 
         let _ = take_reclaim_request(NODE);
-        let _ = take_oom_needed(NODE);
         request_reclaim(NODE, 2);
         request_reclaim(NODE, 7);
         request_reclaim(NODE, 3);
         request_reclaim(NODE, 0);
-        if take_reclaim_request(NODE) != 7 {
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 7,
+                oom_authorized: false,
+            })
+        {
             return TestResult::Fail("reclaim requests did not coalesce by maximum");
         }
-        if take_reclaim_request(NODE) != 0 {
+        if take_reclaim_request(NODE) != ReclaimRequest::NONE {
             return TestResult::Fail("reclaim request was not consumed exactly once");
         }
         request_reclaim(crate::frame::MAX_NUMA_NODES, 9);
-        if take_reclaim_request(crate::frame::MAX_NUMA_NODES) != 0 {
+        if take_reclaim_request(crate::frame::MAX_NUMA_NODES) != ReclaimRequest::NONE {
             return TestResult::Fail("out-of-range reclaim request was retained");
         }
 
+        // Reproduce the state that made separate target/flag atomics racy: an
+        // ordinary request is already pending when an OOM-authorized producer
+        // publishes. One packed swap must return their coalesced target and
+        // authorization together; neither may leak into the next request.
+        request_reclaim(NODE, 2);
         request_reclaim_with_oom(NODE, 4);
-        if take_reclaim_request(NODE) != 4 || !take_oom_needed(NODE) {
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 4,
+                oom_authorized: true,
+            })
+        {
             return TestResult::Fail("OOM authorization was not paired with its request");
         }
-        if take_oom_needed(NODE) {
-            return TestResult::Fail("OOM authorization was not consumed exactly once");
+        request_reclaim(NODE, 3);
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 3,
+                oom_authorized: false,
+            })
+        {
+            return TestResult::Fail("OOM authorization leaked into the next request");
         }
         TestResult::Pass
     }
@@ -417,35 +478,6 @@ mod reclaim_request_tests {
         "memory/reclaim",
         smoke_reclaim_requests_coalesce_and_consume
     );
-}
-
-/// Per-node OOM authorization. A kernel allocation failure always arms its
-/// node; a reserve-refused user allocation does so only when the configured
-/// overcommit policy permits killing. Ordinary low-watermark wakes never set
-/// these flags.
-static OOM_NEEDED: [core::sync::atomic::AtomicBool; crate::frame::MAX_NUMA_NODES] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; crate::frame::MAX_NUMA_NODES];
-
-/// Publish background work for a genuinely failed allocation and authorize OOM
-/// policy if its reclaim pass makes no progress. Keeping both operations in one
-/// API prevents a wake from exposing the request before its OOM flag is armed.
-pub fn request_reclaim_with_oom(node: usize, pages: usize) {
-    if pages == 0 {
-        return;
-    }
-    let Some(oom_needed) = OOM_NEEDED.get(node) else {
-        return;
-    };
-    oom_needed.store(true, Ordering::Release);
-    request_reclaim(node, pages);
-}
-
-/// Consume this node's pending-OOM signal when its reclaimer accepts the
-/// matching explicit reclaim request.
-pub fn take_oom_needed(node: usize) -> bool {
-    OOM_NEEDED
-        .get(node)
-        .is_some_and(|oom_needed| oom_needed.swap(false, Ordering::AcqRel))
 }
 
 // ── Overcommit policy (vm.overcommit_memory analogue) ──────────────────

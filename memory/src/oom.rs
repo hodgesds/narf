@@ -129,6 +129,26 @@ pub trait OomKiller: Send + Sync {
 
 static OOM_KILLER: IrqSafeSpinLock<Option<&'static dyn OomKiller>> = IrqSafeSpinLock::new(None);
 
+/// Global OOM-policy serialization, matching Linux's single `oom_lock` role.
+/// Reclaim itself remains per-node, but only one worker may select and reap a
+/// global victim at a time.
+static OOM_SELECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct OomSelectionGuard;
+
+impl Drop for OomSelectionGuard {
+    fn drop(&mut self) {
+        OOM_SELECTION_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn try_begin_oom_selection() -> Option<OomSelectionGuard> {
+    OOM_SELECTION_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| OomSelectionGuard)
+}
+
 /// Bounded backlog of victims awaiting reaping. Pre-reserved at registration so
 /// enqueue never allocates — freeing memory must not require allocating memory.
 const REAP_BACKLOG: usize = 16;
@@ -179,10 +199,28 @@ pub fn __reset_oom_killer_for_test() {
 /// "Out of memory: Killed process N" line), or `None` if nothing was
 /// eligible. Safe to call from the reclaim pump (executor context).
 pub fn request_oom_relief() -> Option<u64> {
+    let _selection = try_begin_oom_selection()?;
+    request_oom_relief_unserialized()
+}
+
+fn request_oom_relief_unserialized() -> Option<u64> {
     // `&'static dyn OomKiller` is Copy, so this drops the registry lock before
     // calling into the (possibly allocating) policy.
     let killer = (*OOM_KILLER.lock())?;
     enqueue_victim(killer.select_victim()?)
+}
+
+/// Re-check global allocation viability, select at most one victim, and drain
+/// its queued pages while holding the global OOM-selection gate. A competing
+/// node returns `None`; a later allocation failure can retry after this pass.
+pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64> {
+    let _selection = try_begin_oom_selection()?;
+    if !still_needed() {
+        return None;
+    }
+    let killed = request_oom_relief_unserialized();
+    let _ = reap_all();
+    killed
 }
 
 /// Cgroup-scoped variant: kill one victim chosen ONLY from `pids` (a cgroup
@@ -190,8 +228,34 @@ pub fn request_oom_relief() -> Option<u64> {
 /// no listed pid is eligible — in which case the caller fails the charge as
 /// ENOMEM rather than killing outside the offending cgroup (cgroup v2 semantics).
 pub fn request_oom_relief_in(pids: &[u64]) -> Option<u64> {
+    let _selection = try_begin_oom_selection()?;
     let killer = (*OOM_KILLER.lock())?;
     enqueue_victim(killer.select_victim_in(pids)?)
+}
+
+mod selection_gate_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::try_begin_oom_selection;
+
+    fn smoke_oom_selection_gate_serializes_and_releases() -> TestResult {
+        let Some(first) = try_begin_oom_selection() else {
+            return TestResult::Fail("OOM selection gate unexpectedly busy");
+        };
+        if try_begin_oom_selection().is_some() {
+            return TestResult::Fail("concurrent OOM selection was admitted");
+        }
+        drop(first);
+        if try_begin_oom_selection().is_none() {
+            return TestResult::Fail("OOM selection gate did not release");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "memory/oom",
+        smoke_oom_selection_gate_serializes_and_releases
+    );
 }
 
 /// Queue a selected victim for the async reaper and return its pid. Shared by

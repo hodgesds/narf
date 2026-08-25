@@ -212,8 +212,15 @@ pub fn wake_kswapd(node: usize);
 pub fn request_reclaim(node: usize, target_pages: usize);
 /// Order OOM authorization before the matching reclaim request and wake.
 pub fn request_reclaim_with_oom(node: usize, target_pages: usize);
-/// Consume one node's coalesced target; called only by that node's kswapd.
-pub fn take_reclaim_request(node: usize) -> usize;
+pub struct ReclaimRequest {
+    pub target_pages: usize,
+    pub oom_authorized: bool,
+}
+/// Atomically consume one node's coalesced target and OOM authorization.
+pub fn take_reclaim_request(node: usize) -> ReclaimRequest;
+/// Serialize global victim selection, re-check viability, and reap before
+/// another node may select a victim.
+pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64>;
 
 /// Fixed-point proportional-set-size units (one private resident page).
 pub const PSS_UNITS_PER_PAGE: u64;
@@ -736,14 +743,16 @@ x86_64 is rejected at runtime.
   the low watermark, and an explicit allocation-failure request is serviced
   even when aggregate free pages remain above that watermark. OOM policy runs
   only in schedulable kswapd context: a pending kill is considered only after
-  an explicit requested pass makes no progress and pressure still remains
-  below the minimum watermark; progress or a concurrent recovery defers killing
-  until a later failed allocation requests another pass. OOM authorization is
-  published before its matching reclaim request and consumed when kswapd accepts
-  that request, so a failure arriving during a pass remains pending for the next
-  pass. A `brk` extension reserves virtual address space only; physical user
-  frames are allocated lazily by the demand-fault path and inherit the same
-  watermark policy.
+  an explicit requested pass makes no progress and the same reserve predicate
+  still rejects an allocation; progress or a concurrent recovery defers killing
+  until a later failed allocation requests another pass. Global victim selection
+  is serialized across node workers and the chosen victim is reaped before a
+  competing worker may select another. OOM authorization is
+  packed into the same per-node atomic word as its matching reclaim target and
+  consumed with one swap, so neither an existing ordinary request nor a failure
+  arriving during a pass can mismatch the two fields. A `brk` extension
+  reserves virtual address space only; physical user frames are allocated
+  lazily by the demand-fault path and inherit the same watermark policy.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
