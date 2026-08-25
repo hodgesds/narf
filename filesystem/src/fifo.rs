@@ -58,6 +58,10 @@ const PEER_PRESENT: u32 = 1;
 #[derive(Debug)]
 pub struct FifoShared {
     queue: IrqSafeSpinLock<VecDeque<u8>>,
+    /// Serializes opener-count transitions and publication of the derived
+    /// readiness levels. Without this, two open/close paths can snapshot in
+    /// one order and publish in the opposite order, leaving a stale peer level.
+    publish: IrqSafeSpinLock<()>,
     /// Number of read-capable handles currently open (O_RDONLY + O_RDWR).
     readers: AtomicU32,
     /// Number of write-capable handles currently open (O_WRONLY + O_RDWR).
@@ -77,6 +81,7 @@ impl FifoShared {
     fn new() -> Self {
         FifoShared {
             queue: IrqSafeSpinLock::new(VecDeque::with_capacity(FIFO_BUF_BYTES)),
+            publish: IrqSafeSpinLock::new(()),
             readers: AtomicU32::new(0),
             writers: AtomicU32::new(0),
             readiness: narf_lib::readiness::Readiness::new(POLL_OUT | POLL_HUP | POLL_ERR),
@@ -86,6 +91,13 @@ impl FifoShared {
     }
 
     fn sync_readiness(&self) {
+        let _publish = self.publish.lock();
+        self.sync_readiness_locked();
+    }
+
+    /// Publish levels while `publish` is held. Open/close use this form so the
+    /// count transition and its derived presence edge are one ordered action.
+    fn sync_readiness_locked(&self) {
         let q = self.queue.lock();
         let mut mask = 0;
         if !q.is_empty() {
@@ -310,6 +322,7 @@ impl FifoHandle {
         can_read: bool,
         can_write: bool,
     ) -> Self {
+        let publish = shared.publish.lock();
         let peer_seq_at_open = if can_read && !can_write {
             shared.writer_presence.seq()
         } else if can_write && !can_read {
@@ -323,7 +336,8 @@ impl FifoHandle {
         if can_write {
             shared.writers.fetch_add(1, Ordering::AcqRel);
         }
-        shared.sync_readiness();
+        shared.sync_readiness_locked();
+        drop(publish);
         FifoHandle {
             shared,
             _inode_owner: inode_owner,
@@ -386,6 +400,17 @@ impl FifoHandle {
             cell.disarm(task_id);
         }
     }
+
+    /// Linux suppresses `POLLHUP` on a read-only FIFO opened with no writer
+    /// until that particular open description has observed a writer.  Without
+    /// this per-open edge check, `poll(POLLIN)` returns immediately on a fresh
+    /// nonblocking reader, which can make the reader close before a writer gets
+    /// scheduled to complete the rendezvous.
+    fn read_hangup_visible(&self) -> bool {
+        self.can_read
+            && self.shared.writers.load(Ordering::Acquire) == 0
+            && self.shared.writer_presence.seq() != self.peer_seq_at_open
+    }
 }
 
 impl Drop for FifoHandle {
@@ -393,13 +418,15 @@ impl Drop for FifoHandle {
         // Releasing the last write-capable handle flips the reader to EOF;
         // releasing the last read-capable handle makes further writes a
         // broken pipe.
+        let publish = self.shared.publish.lock();
         if self.can_read {
             self.shared.readers.fetch_sub(1, Ordering::AcqRel);
         }
         if self.can_write {
             self.shared.writers.fetch_sub(1, Ordering::AcqRel);
         }
-        self.shared.sync_readiness();
+        self.shared.sync_readiness_locked();
+        drop(publish);
     }
 }
 
@@ -501,7 +528,7 @@ impl FileOps for FifoHandle {
             if !q.is_empty() {
                 mask |= POLL_IN;
             }
-            if self.shared.writers.load(Ordering::Acquire) == 0 {
+            if self.read_hangup_visible() {
                 mask |= POLL_HUP;
             }
         }
@@ -522,6 +549,54 @@ impl FileOps for FifoHandle {
 
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.shared.readiness)
+    }
+
+    fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker) -> Option<Poll<u32>> {
+        // The shared cell is the union of both endpoint views.  Restrict the
+        // interest to bits this open description can actually observe, or a
+        // read-only fd polling POLLOUT (for example) would spin on the shared
+        // buffer's write readiness.
+        let mut local_interest = 0;
+        if self.can_read {
+            local_interest |= interest & (POLL_IN | POLL_HUP);
+        }
+        if self.can_write {
+            local_interest |= interest & (POLL_OUT | POLL_ERR);
+        }
+
+        let suppress_initial_hup = self.can_read
+            && !self.can_write
+            && self.shared.writers.load(Ordering::Acquire) == 0
+            && self.shared.writer_presence.seq() == self.peer_seq_at_open;
+        let first_interest = if suppress_initial_hup {
+            local_interest & !POLL_HUP
+        } else {
+            local_interest
+        };
+
+        let first = self.shared.readiness.arm(task_id, first_interest, waker);
+        if first.is_ready() || !suppress_initial_hup {
+            return Some(first);
+        }
+
+        // A writer appearing is not itself POLLIN, but it changes whether a
+        // later writer close is a visible HUP.  Arm the presence edge after
+        // the data cell, then re-arm the data cell with HUP enabled if that
+        // edge already raced us.  The two register-then-check operations make
+        // both writer-open and writer-open+close races lossless.
+        match self.arm_peer(task_id, waker) {
+            Poll::Pending => Some(Poll::Pending),
+            Poll::Ready(()) => {
+                self.shared.readiness.disarm(task_id);
+                Some(self.shared.readiness.arm(task_id, local_interest, waker))
+            }
+        }
+    }
+
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        self.shared.readiness.disarm(task_id);
+        self.disarm_peer(task_id);
+        true
     }
 
     fn write_should_block(&self) -> bool {

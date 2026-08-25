@@ -135,7 +135,10 @@ Named FIFO handles share durable data-readiness state and direction-specific
 peer-presence cells. `FifoHandle::arm_peer`/`disarm_peer` key waiters by task;
 the handle snapshots the counterpart edge before publishing its own open count,
 so a peer that opens and closes before the waiter runs still completes the
-blocking `open`. Data reads/writes arm the ordinary per-file readiness cell.
+blocking `open`. A read-only handle opened before any writer suppresses
+`POLLHUP` until its own writer-presence snapshot changes, matching Linux's
+per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the ordinary per-file
+readiness cell.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
