@@ -124,7 +124,8 @@ must not hide a foreground task that has stopped making useful progress.
 The three `dbg_*` functions are bounded, read-only fatal-watchdog snapshots.
 They use nonblocking queue acquisition and report current queue ownership,
 awake state, affinity, and CPU idle/lock state. They deliberately maintain no
-per-poll, per-pop, or per-requeue counters on the normal scheduling path.
+per-poll, per-pop, per-requeue, or global per-wake counters on the normal
+scheduling path.
 
 #### 3.1.1 Pluggable scheduling policy
 

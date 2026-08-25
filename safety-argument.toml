@@ -647,3 +647,7 @@ argument = "The page-fault backpressure path allocates no memory and performs on
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "TLB-shootdown verification no longer clears live SMP residency, idle, deferred-flush, or topology publication while scheduler CPUs may be active. Production residency filtering and the idle-to-busy debt handshake retain their sequentially consistent publication order; state-parameterized helpers expose that exact mechanism to isolated test atomics without granting new mapping authority or changing invalidation scope. The remaining live integration checks use monotonic counter deltas and a reserved tracked bucket, so they cannot erase another CPU's obligation or create a missed invalidation window."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler waker no longer performs a diagnostic fetch_add on one global cache line for every wake. The task-owned awake Release store, owner-CPU Acquire load, remote reschedule decision, Arc lifetime rules, queue ownership, policy selection, and migration behavior are unchanged. Removing the framebuffer's observational read grants no scheduling, capability, domain, or task-memory authority."

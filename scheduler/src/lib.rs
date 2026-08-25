@@ -2334,12 +2334,6 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
     RawWaker::new(Arc::into_raw(cloned) as *const (), &TASK_VTABLE)
 }
 
-/// Diagnostic: total `wake` + `wake_by_ref` invocations across all
-/// tasks. Lets a real-HW observer distinguish "wake_by_ref is never
-/// fired" (waker plumbing broken or waker isn't reaching this
-/// vtable) from "wake fires but the executor doesn't re-poll."
-pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 // The cooperative executor idles a CPU exactly when no task is RUNNABLE,
 // matching Linux (`schedule()` picks the idle task iff `nr_running == 0`).
 // "Runnable" is encoded by a task's `awake` flag: a `wake` (self-wake
@@ -2355,7 +2349,6 @@ pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic
 // directly.
 
 unsafe fn wake_raw(data: *const ()) {
-    WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
@@ -2367,7 +2360,6 @@ unsafe fn wake_raw(data: *const ()) {
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
-    WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     let ptr = data as *const WakeCell;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.

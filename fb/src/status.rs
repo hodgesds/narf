@@ -226,10 +226,9 @@ pub fn paint(fb: &FbWriter) {
         None => ("none", 0u64),
     };
     let usb_hid_line = format!(
-        "USB: sup={} yt={} wakes={} clk={}:{} cpns={} irq1={}",
+        "USB: sup={} yt={} clk={}:{} cpns={} irq1={}",
         supervisor_ticks,
         narf_drivers_usb::YIELD_TIMEOUT_POLLS.load(Ordering::Relaxed),
-        narf_scheduler::WAKE_BY_REF_CALLS.load(Ordering::Relaxed),
         clk_name,
         clk_ticks,
         narf_time::cycles_per_ns(),
