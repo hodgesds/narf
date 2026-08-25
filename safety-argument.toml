@@ -654,8 +654,12 @@ argument = "The scheduler waker no longer performs a diagnostic fetch_add on one
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Production TLB shootdowns no longer update global diagnostic counters or recompute an all-peer accounting budget. Kernel-test and host-test builds retain the exact counters used by liveness and filtering smokes; production accessors return zero. Local invalidation, the mandatory StoreLoad fence, residency and idle-debt publication, target selection, IPI fanout, completion ordering, deferred full flushes, ASID/PCID scope, and backing-frame release order are unchanged."
+argument = "TLB-shootdown diagnostics no longer update shared global cache lines: the executing CPU updates only its own 64-byte-aligned counter record, and observational accessors aggregate all records on demand with wrapping semantics. Local invalidation, the mandatory StoreLoad fence, residency and idle-debt publication, target selection, IPI fanout, completion ordering, deferred full flushes, ASID/PCID scope, and backing-frame release order are unchanged."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L89"
 argument = "Slab hit/miss telemetry moves from one shared atomic per size class into the already cache-line-isolated per-CPU magazines and is aggregated only by read-only statistics calls. Allocation and free still select the same current-CPU magazine with interrupts masked, mutate the same stack/top state, preserve the global in-use ownership count, and take the same central-list and buddy locks on misses. Counter placement therefore changes no object identity, allocation authority, domain assignment, zeroisation, canary check, reclaim eligibility, or cross-domain memory access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86 TLB-shootdown receiver updates INVPCID-path, ACK, and ever-received diagnostics only in its own 64-byte-aligned per-CPU record; totals are aggregated only by readers. Request-lane publication, pending-source acquisition, INVPCID/INVLPG selection, the mandatory architectural wrappers and fences, per-request completion bitmap, IPI targeting, incoming-request polling, and the unbounded correctness wait before frame reuse are unchanged."

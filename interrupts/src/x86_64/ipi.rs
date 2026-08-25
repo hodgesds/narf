@@ -60,15 +60,36 @@ static COMPLETED_TARGETS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; 
 /// prevents a local interrupt from reusing this CPU's lane mid-publication.
 static OUTGOING: [IrqSafeSpinLock<()>; MAX_CPUS] = [const { IrqSafeSpinLock::new(()) }; MAX_CPUS];
 
-/// Counter bumped when the handler takes the `INVPCID(tag, ...)`
-/// branch (tag != 0 and `invpcid_supported()` reports true). Tests
-/// sample this to confirm the tag-aware code path actually fires
-/// rather than silently degrading to plain INVLPG.
-static INVPCID_PATH_TAKEN: AtomicU64 = AtomicU64::new(0);
+/// Cache-line-isolated observability for one target CPU. These fields are not
+/// part of completion: [`COMPLETED_TARGETS`] remains the correctness protocol.
+#[repr(C, align(64))]
+struct IpiStats {
+    invpcid_path_taken: AtomicU64,
+    ack_count: AtomicU64,
+    ever_received: AtomicU64,
+    _pad: [u8; 40],
+}
+
+impl IpiStats {
+    const fn new() -> Self {
+        Self {
+            invpcid_path_taken: AtomicU64::new(0),
+            ack_count: AtomicU64::new(0),
+            ever_received: AtomicU64::new(0),
+            _pad: [0; 40],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<IpiStats>() == 64);
+
+static IPI_STATS: [IpiStats; MAX_CPUS] = [const { IpiStats::new() }; MAX_CPUS];
 
 /// Read-back of the INVPCID-branch counter for tests + diagnostics.
 pub fn invpcid_path_taken() -> u64 {
-    INVPCID_PATH_TAKEN.load(Ordering::Relaxed)
+    IPI_STATS.iter().fold(0u64, |total, stats| {
+        total.wrapping_add(stats.invpcid_path_taken.load(Ordering::Relaxed))
+    })
 }
 
 /// Test helper: read the tag belonging to the first source pending for a CPU.
@@ -111,32 +132,18 @@ pub fn __clear_for_test(cpu: u32) {
     REQUESTS[source].va.store(0, Ordering::Relaxed);
 }
 
-/// Per-CPU diagnostic counter. Incremented after each applied request; request
-/// completion itself is tracked by `COMPLETED_TARGETS` so concurrent senders
-/// cannot mistake another request's acknowledgement for their own.
-static ACK_COUNT: [AtomicU64; MAX_CPUS] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; MAX_CPUS]
-};
-
-/// Per-CPU "saw at least one shootdown" flag. Useful for tests that
-/// need to confirm the IPI delivered without instrumenting the
-/// counter at the broadcast site.
-static EVER_RECEIVED: [AtomicU64; MAX_CPUS] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; MAX_CPUS]
-};
-
 /// Read this CPU's accumulated shootdown count.
 pub fn ack_count(cpu: u32) -> u64 {
-    let i = (cpu as usize).min(MAX_CPUS - 1);
-    ACK_COUNT[i].load(Ordering::Relaxed)
+    IPI_STATS[(cpu as usize).min(MAX_CPUS - 1)]
+        .ack_count
+        .load(Ordering::Relaxed)
 }
 
 /// Read this CPU's ever-received counter (test helper).
 pub fn ever_received(cpu: u32) -> u64 {
-    let i = (cpu as usize).min(MAX_CPUS - 1);
-    EVER_RECEIVED[i].load(Ordering::Relaxed)
+    IPI_STATS[(cpu as usize).min(MAX_CPUS - 1)]
+        .ever_received
+        .load(Ordering::Relaxed)
 }
 
 /// Apply one request already claimed from this CPU's pending-source batch.
@@ -190,7 +197,9 @@ unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
         let invpcid_ok = narf_arch::x86_64::pcid::invpcid_supported()
             && narf_arch::x86_64::pcid::pcide_enabled();
         if invpcid_ok {
-            INVPCID_PATH_TAKEN.fetch_add(1, Ordering::Relaxed);
+            IPI_STATS[narf_lib::percpu::current_cpu().min(MAX_CPUS - 1)]
+                .invpcid_path_taken
+                .fetch_add(1, Ordering::Relaxed);
             if va == 0 {
                 // SAFETY: CPL=0; INVPCID gated above.
                 unsafe {
@@ -270,8 +279,10 @@ pub unsafe fn on_shootdown_irq() {
         // release publication follows the complete request tuple.
         unsafe { apply_request(va, pages, tag) };
 
-        EVER_RECEIVED[target].fetch_add(1, Ordering::Relaxed);
-        ACK_COUNT[target].fetch_add(1, Ordering::Relaxed);
+        IPI_STATS[target]
+            .ever_received
+            .fetch_add(1, Ordering::Relaxed);
+        IPI_STATS[target].ack_count.fetch_add(1, Ordering::Relaxed);
         COMPLETED_TARGETS[source].fetch_or(1u64 << target, Ordering::Release);
     }
 }

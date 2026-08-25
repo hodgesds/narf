@@ -127,68 +127,74 @@ impl ShootdownRequest {
 
 // ── Kernel-test counters ─────────────────────────────────────────
 
-#[cfg(any(feature = "kernel-test", test))]
-static SHOOTDOWN_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Number of `shootdown` calls that were satisfied locally without
-/// firing an IPI (the active-AS bitmap reported no peer CPU could
-/// possibly hold the affected PCID). Reduction in this counter
-/// directly equals saved IPI round-trips.
-#[cfg(any(feature = "kernel-test", test))]
-static LOCAL_ONLY_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Number of `shootdown` calls that fanned out via IPI.
-#[cfg(any(feature = "kernel-test", test))]
-static IPI_FANOUT_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Total number of peer-CPU bits that *would* have been IPI'd under a
-/// pure all-but-self broadcast, summed across all `shootdown` calls.
-/// Subtracting `FILTERED_TARGETS` gives the saved IPIs.
-#[cfg(any(feature = "kernel-test", test))]
-static BROADCAST_BUDGET: AtomicU64 = AtomicU64::new(0);
-/// Total number of peer-CPU bits actually IPI'd (post-filter), summed
-/// across all calls. Always <= `BROADCAST_BUDGET`.
-#[cfg(any(feature = "kernel-test", test))]
-static FILTERED_TARGETS: AtomicU64 = AtomicU64::new(0);
+/// Cache-line-isolated counters written only by the executing CPU. Readers
+/// aggregate the array on demand, keeping observability off shared hot lines.
+#[repr(C, align(64))]
+struct ShootdownStats {
+    shootdown_count: AtomicU64,
+    local_only_count: AtomicU64,
+    ipi_fanout_count: AtomicU64,
+    broadcast_budget: AtomicU64,
+    filtered_targets: AtomicU64,
+    lazy_flush_count: AtomicU64,
+    _pad: [u8; 16],
+}
+
+impl ShootdownStats {
+    const fn new() -> Self {
+        Self {
+            shootdown_count: AtomicU64::new(0),
+            local_only_count: AtomicU64::new(0),
+            ipi_fanout_count: AtomicU64::new(0),
+            broadcast_budget: AtomicU64::new(0),
+            filtered_targets: AtomicU64::new(0),
+            lazy_flush_count: AtomicU64::new(0),
+            _pad: [0; 16],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ShootdownStats>() == 64);
+
+static SHOOTDOWN_STATS: [ShootdownStats; MAX_CPUS] = [const { ShootdownStats::new() }; MAX_CPUS];
+
+#[inline]
+fn local_stats() -> &'static ShootdownStats {
+    &SHOOTDOWN_STATS[narf_lib::percpu::current_cpu().min(MAX_CPUS - 1)]
+}
+
+fn sum_stat(select: fn(&ShootdownStats) -> &AtomicU64) -> u64 {
+    SHOOTDOWN_STATS.iter().fold(0u64, |total, stats| {
+        total.wrapping_add(select(stats).load(Ordering::Relaxed))
+    })
+}
 
 /// Total count of shootdowns observed (incremented by every invocation).
 /// Useful for liveness assertions in smokes.
 pub fn shootdown_count() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return SHOOTDOWN_COUNT.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.shootdown_count)
 }
 
 /// Number of `shootdown` calls that elided the IPI entirely.
 pub fn local_only_count() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return LOCAL_ONLY_COUNT.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.local_only_count)
 }
 
 /// Number of `shootdown` calls that fanned out via IPI.
 pub fn ipi_fanout_count() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return IPI_FANOUT_COUNT.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.ipi_fanout_count)
 }
 
 /// Total peer-CPU IPI budget had every call done an all-but-self
 /// broadcast. Diagnostic.
 pub fn broadcast_budget() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return BROADCAST_BUDGET.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.broadcast_budget)
 }
 
 /// Total peer-CPU IPIs actually delivered after PCID filtering.
 /// Difference from `broadcast_budget` is the saving.
 pub fn filtered_targets() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return FILTERED_TARGETS.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.filtered_targets)
 }
 
 // ── Active-AS bitmap ─────────────────────────────────────────────
@@ -257,10 +263,6 @@ static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 /// non-global flush before loading another task address-space context.
 static DEFERRED_FULL_FLUSH: AtomicU64 = AtomicU64::new(0);
 
-/// Number of deferred invalidations discharged by [`mark_busy`].
-#[cfg(any(feature = "kernel-test", test))]
-static LAZY_FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Scheduler hook: announce `cpu` has parked (idle thread / `hlt`).
 /// Calls from `shootdown` to a CPU in this mask will be elided --
 /// the next dispatch on that CPU performs a full INVPCID anyway,
@@ -277,8 +279,9 @@ pub fn mark_idle(cpu: u32) {
 pub fn mark_busy(cpu: u32) {
     if (cpu as usize) < MAX_CPUS && take_deferred_on_busy(cpu, &IDLE_MASK, &DEFERRED_FULL_FLUSH) {
         apply_lazy_local_full();
-        #[cfg(any(feature = "kernel-test", test))]
-        LAZY_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+        SHOOTDOWN_STATS[cpu as usize]
+            .lazy_flush_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -306,10 +309,7 @@ pub fn deferred_flush_mask() -> u64 {
 
 /// Number of lazy idle invalidations completed on wake.
 pub fn lazy_flush_count() -> u64 {
-    #[cfg(any(feature = "kernel-test", test))]
-    return LAZY_FLUSH_COUNT.load(Ordering::Acquire);
-    #[cfg(not(any(feature = "kernel-test", test)))]
-    0
+    sum_stat(|stats| &stats.lazy_flush_count)
 }
 
 fn residency_target_mask(req: ShootdownRequest) -> u64 {
@@ -412,8 +412,9 @@ fn ipi_fanout(req: ShootdownRequest, targets: u64) {
 /// local INVPCID.
 pub fn shootdown(req: ShootdownRequest) {
     apply_local(req);
-    #[cfg(any(feature = "kernel-test", test))]
-    SHOOTDOWN_COUNT.fetch_add(1, Ordering::AcqRel);
+    local_stats()
+        .shootdown_count
+        .fetch_add(1, Ordering::Relaxed);
 
     dispatch_remote(req, req);
 }
@@ -421,8 +422,9 @@ pub fn shootdown(req: ShootdownRequest) {
 /// Complete only the remote half of an invalidation whose caller already
 /// performed the matching local operation after its final page-table write.
 pub fn shootdown_remote(req: ShootdownRequest) {
-    #[cfg(any(feature = "kernel-test", test))]
-    SHOOTDOWN_COUNT.fetch_add(1, Ordering::AcqRel);
+    local_stats()
+        .shootdown_count
+        .fetch_add(1, Ordering::Relaxed);
     dispatch_remote(req, req);
 }
 
@@ -430,8 +432,9 @@ pub fn shootdown_remote(req: ShootdownRequest) {
 /// `residency_tag`. Used by x86 process roots, which all run under flushing
 /// PCID 0 and publish exact active residency around scheduler polls.
 pub fn shootdown_remote_full_for_tag(residency_tag: u16) {
-    #[cfg(any(feature = "kernel-test", test))]
-    SHOOTDOWN_COUNT.fetch_add(1, Ordering::AcqRel);
+    local_stats()
+        .shootdown_count
+        .fetch_add(1, Ordering::Relaxed);
     dispatch_remote(
         ShootdownRequest::full(),
         ShootdownRequest::for_tag(residency_tag),
@@ -449,12 +452,12 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
     // issuing an SGI would perform the same invalidation a second time.
     #[cfg(target_arch = "aarch64")]
     if payload.tag.is_some() {
-        #[cfg(any(feature = "kernel-test", test))]
-        LOCAL_ONLY_COUNT.fetch_add(1, Ordering::Relaxed);
+        local_stats()
+            .local_only_count
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    #[cfg(any(feature = "kernel-test", test))]
     {
         // Accounting: BROADCAST_BUDGET is what an unfiltered fan-out
         // would have cost. FILTERED_TARGETS is what we actually IPI'd.
@@ -462,7 +465,9 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
         let self_cpu = narf_lib::percpu::current_cpu();
         let self_bit = 1u64 << (self_cpu & 63);
         let budget = (online & !self_bit).count_ones() as u64;
-        BROADCAST_BUDGET.fetch_add(budget, Ordering::Relaxed);
+        local_stats()
+            .broadcast_budget
+            .fetch_add(budget, Ordering::Relaxed);
     }
 
     let candidates = residency_target_mask(residency);
@@ -471,14 +476,16 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
     #[cfg(not(target_arch = "x86_64"))]
     let targets = candidates;
     if targets == 0 {
-        #[cfg(any(feature = "kernel-test", test))]
-        LOCAL_ONLY_COUNT.fetch_add(1, Ordering::Relaxed);
+        local_stats()
+            .local_only_count
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    #[cfg(any(feature = "kernel-test", test))]
-    FILTERED_TARGETS.fetch_add(targets.count_ones() as u64, Ordering::Relaxed);
-    #[cfg(any(feature = "kernel-test", test))]
-    IPI_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let stats = local_stats();
+    stats
+        .filtered_targets
+        .fetch_add(targets.count_ones() as u64, Ordering::Relaxed);
+    stats.ipi_fanout_count.fetch_add(1, Ordering::Relaxed);
     ipi_fanout(payload, targets);
 }
 

@@ -69,9 +69,11 @@ remaining CPUs, send fixed-destination x2APIC IPIs only to those CPUs, and wait
 only for the corresponding per-request completion bits. Concurrent senders own
 disjoint source lanes; a target-side pending-source bitmap coalesces only the
 IPI while preserving every request, and each source serializes reuse of its
-lane until all requested targets complete. The cumulative ACK counters remain
-diagnostic only. The unmasked `shoot_range`, `shoot_tag_only`, and `shoot_full`
-helpers remain all-online-peer compatibility wrappers.
+lane until all requested targets complete. The cumulative ACK, ever-received,
+and INVPCID-path counters live in one cache-line-isolated record per CPU. The
+receiver updates only its local record, and readers aggregate across CPUs only
+when a total is requested. The unmasked `shoot_range`, `shoot_tag_only`, and
+`shoot_full` helpers remain all-online-peer compatibility wrappers.
 
 On aarch64, tagged memory requests use Inner Shareable TLBI operations and do
 not enter the SGI bridge. The bridge remains responsible for untagged local
