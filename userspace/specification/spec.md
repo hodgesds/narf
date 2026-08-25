@@ -371,9 +371,12 @@ System V semaphore operations use Linux's default 500-operation `SEMOPM`
 boundary and validation order: `E2BIG`/zero-count validation precedes sembuf
 import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout
 first but validates its fields after the sembufs. Multi-operation changes are
-atomic. Blocking operations park interruptibly unless their blocking sembuf
-has `IPC_NOWAIT`; relative timed waits retain one absolute deadline across
-park/re-execution. Imported operation arrays and message payloads remain
+atomic. An imported `sem_num` outside the selected set returns `EFBIG` before
+the permission check. Only `SEM_UNDO` and `IPC_NOWAIT` affect `sem_flg`; Linux's
+other extension bits are accepted and ignored. Blocking operations park
+interruptibly unless their blocking sembuf has `IPC_NOWAIT`; relative timed
+waits retain one absolute deadline across park/re-execution. Imported operation
+arrays and message payloads remain
 kernel-owned across that wait, so later user-memory mutation cannot alter an
 in-flight operation. `SEM_UNDO` adjustments are accumulated per process,
 atomically committed with the operation, shared by `CLONE_SYSVSEM`, cleared by

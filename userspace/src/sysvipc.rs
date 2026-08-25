@@ -26,6 +26,7 @@ const ENOENT: i64 = 2;
 const EPERM: i64 = 1;
 const EINTR: i64 = 4;
 const E2BIG: i64 = 7;
+const EFBIG: i64 = 27;
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
@@ -81,6 +82,10 @@ const IPC_NOWAIT: i16 = 0o4000;
 const IPC_PRIVATE: u64 = 0;
 const IPC_PERM_MASK: u32 = 0o777;
 const SEM_UNDO: i16 = 0o10000;
+/// Linux treats every other `sem_flg` bit as an ignored extension bit.
+/// Masking at import makes it explicit that unknown bits neither reject the
+/// operation nor accidentally acquire behavior in later bit tests.
+const SEM_BEHAVIOR_FLAGS: i16 = IPC_NOWAIT | SEM_UNDO;
 const SEMVMX: i32 = 32767;
 
 // ipc control cmds (low bits; libc ORs IPC_64 = 0x100 which we mask off).
@@ -804,8 +809,16 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             return;
         }
     }
-    // Linux validates the imported timeout in __do_semtimedop, after importing
-    // the sops array and before looking up the semaphore set.
+    // do_semtimedop imports the entire array before __do_semtimedop validates
+    // the signed id.  The id check then precedes timespec field validation.
+    if semid_raw < 0 {
+        finish_semtimedop_wait(timed);
+        clear_wait(task, WaitKind::Sem, ipc_ns, semid);
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    // Linux validates the imported timeout in __do_semtimedop before looking
+    // up the semaphore set.
     if let Some((sec, nsec)) = timeout {
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             finish_semtimedop_wait(timed);
@@ -814,50 +827,29 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             return;
         }
     }
-    if semid_raw < 0 {
-        finish_semtimedop_wait(timed);
-        clear_wait(task, WaitKind::Sem, ipc_ns, semid);
-        ctx.set_return(err(EINVAL));
-        return;
-    }
     let parse = |i: usize| -> (usize, i16, i16) {
         let o = i * 6;
         let num = u16::from_le_bytes(buf[o..o + 2].try_into().unwrap()) as usize;
         let op = i16::from_le_bytes(buf[o + 2..o + 4].try_into().unwrap());
-        let flg = i16::from_le_bytes(buf[o + 4..o + 6].try_into().unwrap());
+        let flg = i16::from_le_bytes(buf[o + 4..o + 6].try_into().unwrap()) & SEM_BEHAVIOR_FLAGS;
         (num, op, flg)
     };
     let has_undo = (0..nsops).any(|i| parse(i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
     let mut undo_guard = has_undo.then(|| SEM_UNDOS.lock());
     let mut undo_updates = BTreeMap::<usize, i32>::new();
-    if let Some(guard) = undo_guard.as_mut() {
-        let table = guard.get_or_insert_with(BTreeMap::new);
-        for i in 0..nsops {
-            let (num, op, flg) = parse(i);
-            if flg & SEM_UNDO == 0 || op == 0 {
-                continue;
-            }
-            let prior = undo_updates.get(&num).copied().unwrap_or_else(|| {
-                table
-                    .get(&(undo_owner.expect("SEM_UNDO owner"), ipc_ns, semid, num))
-                    .copied()
-                    .unwrap_or(0)
-            });
-            let next = prior - i32::from(op);
-            if !(-SEMVMX..=SEMVMX).contains(&next) {
-                clear_wait(task, WaitKind::Sem, ipc_ns, semid);
-                finish_semtimedop_wait(timed);
-                ctx.set_return(err(ERANGE));
-                return;
-            }
-            undo_updates.insert(num, next);
-        }
-    }
     let result: Result<(), (i64, bool)> = with_sems(|m| {
         let set = m.get_mut(&object).ok_or((EINVAL, true))?;
         let needs_write = (0..nsops).any(|i| parse(i).1 != 0);
         let request = if needs_write { 0o2 } else { 0o4 };
+        // Linux reports EFBIG for an imported sem_num outside this set, and
+        // performs this check before ipcperms.
+        for i in 0..nsops {
+            let (num, _, _) = parse(i);
+            if num >= set.sems.len() {
+                return Err((EFBIG, true));
+            }
+        }
         if !resumed_wait
             && !ipc_allowed(
                 caller_uid,
@@ -872,15 +864,6 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             )
         {
             return Err((EACCES, true));
-        }
-        // Bounds-check every referenced sem_num up front so the apply pass
-        // (which mutates the live vector) can only be reached once the whole
-        // sops array is known-valid.
-        for i in 0..nsops {
-            let (num, _, _) = parse(i);
-            if num >= set.sems.len() {
-                return Err((EINVAL, true));
-            }
         }
         // Apply each op in order against the RUNNING value (accumulating
         // repeated sem_num within this call, as Linux's atomic block does).
@@ -900,11 +883,34 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             } else if next > SEMVMX {
                 fail = Some((ERANGE, true));
                 break;
-            } else if next >= 0 {
-                set.sems[num] = next;
-            } else {
+            } else if next < 0 {
                 fail = Some((EAGAIN, flg & IPC_NOWAIT != 0));
                 break;
+            }
+            // Linux checks each SEM_UNDO adjustment after that operation's
+            // semval admission. Thus an earlier would-block result wins over
+            // a later operation whose undo adjustment would overflow.
+            if flg & SEM_UNDO != 0 && op != 0 {
+                let table = undo_guard
+                    .as_mut()
+                    .expect("SEM_UNDO table guard")
+                    .get_or_insert_with(BTreeMap::new);
+                let prior = undo_updates.get(&num).copied().unwrap_or_else(|| {
+                    table
+                        .get(&(undo_owner.expect("SEM_UNDO owner"), ipc_ns, semid, num))
+                        .copied()
+                        .unwrap_or(0)
+                });
+                let next_undo = prior - i32::from(op);
+                // Linux permits the asymmetric lower endpoint -SEMAEM-1.
+                if !((-SEMVMX - 1)..=SEMVMX).contains(&next_undo) {
+                    fail = Some((ERANGE, true));
+                    break;
+                }
+                undo_updates.insert(num, next_undo);
+            }
+            if op != 0 {
+                set.sems[num] = next;
             }
             applied = i + 1;
         }
@@ -965,11 +971,10 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                     finish_semtimedop_wait(timed);
                     ctx.set_return(err(EIDRM));
                 } else if !park_sem_wait(ctx, timeout) {
-                    // Unit-test contexts have no executor. Runtime callers park
-                    // and re-execute; a synchronous harness needs a finite result.
-                    clear_wait(task, WaitKind::Sem, ipc_ns, semid);
-                    finish_semtimedop_wait(timed);
-                    ctx.set_return(err(EAGAIN));
+                    // A synchronous kernel-test context cannot sleep. Preserve
+                    // the staged operation without fabricating IPC_NOWAIT's
+                    // EAGAIN; a later harness invocation can satisfy and retry
+                    // the same kernel-owned operation.
                 }
             }
         }
@@ -1637,36 +1642,18 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                 ctx.set_return(err(EINTR));
             } else {
                 begin_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                let permission = with_msgs(|queues| {
-                    queues.get(&object).map(|q| {
-                        ipc_allowed(
-                            caller_uid,
-                            caller_gid,
-                            &caller_groups,
-                            q.uid,
-                            q.gid,
-                            q.cuid,
-                            q.cgid,
-                            q.mode,
-                            0o4,
-                        )
-                    })
-                });
-                match permission {
-                    None => {
+                let exists = with_msgs(|queues| queues.contains_key(&object));
+                match exists {
+                    false => {
                         clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
                         ctx.set_return(err(EIDRM));
                     }
-                    Some(false) => {
-                        clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                        ctx.set_return(err(EAGAIN));
+                    true if !crate::handlers::park_reexecute_on_io(ctx) => {
+                        // Kernel-test contexts cannot sleep. Leave the receive
+                        // staged rather than returning IPC_NOWAIT's ENOMSG; a
+                        // later invocation retries after a sender publishes.
                     }
-                    Some(true) if !crate::handlers::park_reexecute_on_io(ctx) => {
-                        // The in-kernel ABI harness has no executor to park on.
-                        clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                        ctx.set_return(err(ENOMSG));
-                    }
-                    Some(true) => {}
+                    true => {}
                 }
             }
             return;
@@ -1877,7 +1864,12 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             });
             match result {
                 Ok(()) => {
-                    mark_waiters_error(WaitKind::MsgRecv, ipc_ns, msqid, EAGAIN);
+                    // Linux uses its internal -EAGAIN receiver sentinel to
+                    // wake and recheck after IPC_SET; it does not return that
+                    // sentinel to userspace. A readiness bump retries both
+                    // receivers (including stricter permissions) and senders
+                    // that may now fit under a larger qbytes.
+                    narf_net::readiness::notify(0);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
                 Err(e) => ctx.set_return(err(e)),

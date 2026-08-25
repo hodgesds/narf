@@ -39,6 +39,7 @@ const SHM_EXEC: u64 = 0o100000;
 const SETVAL: u64 = 16;
 const GETVAL: u64 = 12;
 const E2BIG: i64 = -7;
+const EFBIG: i64 = -27;
 const ENOMSG: i64 = -42;
 const MSG_NOERROR: u64 = 0o10000;
 const SEM_UNDO: i16 = 0o10000;
@@ -597,6 +598,48 @@ fn smoke_abi_ipc_semop_errno_order() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_errno_order);
 
+fn smoke_abi_ipc_semop_flag_tolerance_bounds_and_blocking_retry() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut sop = [0u8; 6];
+        sop[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        // Linux ignores sem_flg extension bits rather than rejecting them or
+        // interpreting them as IPC_NOWAIT.
+        sop[4..6].copy_from_slice(&0x2000i16.to_le_bytes());
+        let blocked = call_raw(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1));
+        if blocked.value != 0xDEAD {
+            return Err("blocking semop fabricated a completed errno/result");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("setup: SETVAL did not satisfy the blocked semop");
+        }
+        // The re-execution must use the kernel-owned sembuf snapshot retained
+        // when the operation blocked, not this now-invalid user pointer.
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            return Err("blocked semop did not retry its retained operation");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("retried semop did not apply its original decrement");
+        }
+
+        let mut out_of_range = [0u8; 6];
+        out_of_range[..2].copy_from_slice(&1u16.to_le_bytes());
+        out_of_range[2..4].copy_from_slice(&1i16.to_le_bytes());
+        if call(
+            Syscall::Semop.raw(),
+            a2(id, out_of_range.as_ptr() as u64, 1),
+        ) != Some(EFBIG)
+        {
+            return Err("semop sem_num outside the set must return EFBIG");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semop_flag_tolerance_bounds_and_blocking_retry
+);
+
 // A multi-sop semop that fully succeeds applies every delta. Set sem0=0,
 // sem1=5; submit {sem0 +2, sem1 -5, sem0 +1}: all satisfiable → sem0=3,
 // sem1=0.
@@ -1085,10 +1128,10 @@ fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
                 },
             )
         };
-        if recv(short.as_mut_ptr() as u64, 2, IPC_NOWAIT).value as i64 != E2BIG {
+        if recv(short.as_mut_ptr() as u64, 2, 0).value as i64 != E2BIG {
             return Err("oversize msgrcv without MSG_NOERROR must return E2BIG");
         }
-        if recv(BAD_PTR, 4, IPC_NOWAIT).value as i64 != EFAULT {
+        if recv(BAD_PTR, 4, 0).value as i64 != EFAULT {
             return Err("selected-message copyout fault must return EFAULT");
         }
         let mut full = [0u8; 12];
@@ -1115,6 +1158,78 @@ fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_ipc_msgrcv_size_and_fault_transaction
+);
+
+fn smoke_abi_ipc_msgrcv_blocking_retry() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut received = [0u8; 12];
+        let args = SyscallArgs {
+            arg0: id,
+            arg1: received.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call_raw(Syscall::Msgrcv.raw(), args).value != 0xDEAD {
+            return Err("blocking msgrcv fabricated ENOMSG/EAGAIN in an empty queue");
+        }
+
+        // Publish from a distinct task so the receiver's staged wait remains
+        // keyed to its original task, as it is for a real blocked process.
+        set_task(FAKE_TASK + 1);
+        let mut sent = [0u8; 12];
+        sent[..8].copy_from_slice(&9i64.to_le_bytes());
+        sent[8..].copy_from_slice(b"wake");
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: peer msgsnd failed");
+        }
+        set_task(FAKE_TASK);
+        let retried = call_raw(Syscall::Msgrcv.raw(), args);
+        if retried.value as i64 != 4 || received[..8] != 9i64.to_le_bytes() {
+            return Err("blocked msgrcv did not retry after message publication");
+        }
+        if &received[8..] != b"wake" {
+            return Err("retried msgrcv copied the wrong payload");
+        }
+
+        // Linux's IPC_SET path wakes sleeping receivers through an internal
+        // EAGAIN sentinel, rechecks the queue, and does not expose EAGAIN when
+        // the receive still needs to block.
+        if call_raw(Syscall::Msgrcv.raw(), args).value != 0xDEAD {
+            return Err("second blocking msgrcv did not remain staged");
+        }
+        let mut update = [0u8; 120];
+        update[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+        update[88..96].copy_from_slice(&16384u64.to_ne_bytes());
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_SET, update.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("msgctl IPC_SET failed while a receiver was staged");
+        }
+        if call_raw(Syscall::Msgrcv.raw(), args).value != 0xDEAD {
+            return Err("IPC_SET leaked its internal EAGAIN retry sentinel");
+        }
+        set_task(FAKE_TASK + 1);
+        sent[8..].copy_from_slice(b"next");
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: second peer msgsnd failed");
+        }
+        set_task(FAKE_TASK);
+        if call_raw(Syscall::Msgrcv.raw(), args).value as i64 != 4 || &received[8..] != b"next" {
+            return Err("IPC_SET retry did not remain wakeable by a later sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msgrcv_blocking_retry
 );
 
 fn smoke_abi_ipc_msgrcv_negative_selects_lowest_type() -> TestResult {
