@@ -1,56 +1,64 @@
 //! Cross-CPU TLB-shootdown IPI on x86_64.
 //!
-//! Mirrors the aarch64 SGI design: the sender publishes a target VA
-//! to a per-CPU "pending shootdown" cell, sends an x2APIC IPI with
-//! the all-but-self destination shorthand, and waits for every
-//! online AP to bump its ack counter past the pre-broadcast snapshot.
+//! Mirrors the aarch64 SGI design: each sender publishes one request
+//! in its source-owned lane, marks itself in every target CPU's pending
+//! bitmap, sends x2APIC IPIs to newly non-empty targets, and waits for
+//! every selected CPU to set its completion bit.
 //!
-//! Today's NARF mappings only mutate during boot and during driver
-//! bring-up — calls are infrequent enough that a busy-wait on the
-//! ack counter is fine. A future "lazy shootdown" optimisation can
-//! batch invalidations.
+//! Shootdowns synchronously wait for completion because callers may reclaim or
+//! reuse a physical frame as soon as this function returns. The target bitmap
+//! coalesces IPIs, but never coalesces distinct source requests or their ACKs.
 //!
 //! Vector: `VECTOR_TLB_SHOOTDOWN` (0xF0).
 
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use narf_lib::percpu::MAX_CPUS;
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::x86_64::apic;
 
-/// Per-CPU pending VA. The sender writes this *before* sending the
-/// IPI; the handler reads, INVLPGs, then bumps the ack counter.
-/// `0` = nothing pending (unmapped VA 0 is also #PF on access — not
-/// a useful shootdown target).
-static PENDING_VA: [AtomicU64; MAX_CPUS] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; MAX_CPUS]
-};
+/// One cache-line-sized request lane per source CPU. Every target of a
+/// shootdown receives the same tuple, so storing a copy for every
+/// `(target, source)` pair would waste roughly 100 KiB of static memory.
+#[repr(C, align(64))]
+struct RequestLane {
+    va: AtomicU64,
+    pages: AtomicU64,
+    tag: AtomicU16,
+    _pad: [u8; 46],
+}
 
-/// Per-CPU pending page count for `shoot_range`. When non-zero the
-/// handler INVLPGs a contiguous range starting at PENDING_VA;
-/// otherwise it INVLPGs a single page. `0` doubles as the "no
-/// range pending" sentinel for the single-page path.
-static PENDING_PAGES: [AtomicU64; MAX_CPUS] = {
-    const Z: AtomicU64 = AtomicU64::new(0);
-    [Z; MAX_CPUS]
-};
+impl RequestLane {
+    const fn new() -> Self {
+        Self {
+            va: AtomicU64::new(0),
+            pages: AtomicU64::new(0),
+            tag: AtomicU16::new(0),
+            _pad: [0; 46],
+        }
+    }
+}
 
-/// Per-CPU pending PCID tag. `0` = "no tag — fall back to plain
-/// INVLPG" (PCID 0 is the reserved no-PCID sentinel per
-/// `arch/x86_64/pcid.rs`, so it never identifies a real domain).
-/// A non-zero value drives the handler down the `INVPCID(tag, va)`
-/// path (Intel SDM Vol 2 INVPCID instruction reference; SDM Vol 3
-/// §4.10 cache + TLB behaviour). Stored as a separate `AtomicU16`
-/// rather than packed into PENDING_PAGES so the publish ordering
-/// stays a plain pair of release stores — the IRQ handler reads
-/// the three slots under acquire and either both match or it picks
-/// up the partial write and harmlessly INVLPGs the previous VA.
-/// At 2 bytes per CPU the storage cost is trivial.
-static PENDING_TAG: [AtomicU16; MAX_CPUS] = {
-    const Z: AtomicU16 = AtomicU16::new(0);
-    [Z; MAX_CPUS]
-};
+const _: () = assert!(core::mem::size_of::<RequestLane>() == 64);
+const _: () = assert!(MAX_CPUS <= u64::BITS as usize);
+
+static REQUESTS: [RequestLane; MAX_CPUS] = [const { RequestLane::new() }; MAX_CPUS];
+
+/// Bit `source` means that source CPU has a published request in this target's
+/// slot. `fetch_or` coalesces concurrent publishers into one IPI; `swap(0)` in
+/// the handler atomically claims the complete batch.
+static PENDING_SENDERS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-source completion bitmap. Target CPU `n` sets bit `n` only after it has
+/// applied that source's request. The source does not reuse its lane until all
+/// requested target bits are visible.
+static COMPLETED_TARGETS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Serialize only nested/concurrent publishers from the same CPU. Different
+/// source CPUs retain fully parallel request lanes; the IRQ-safe guard also
+/// prevents a local interrupt from reusing this CPU's lane mid-publication.
+static OUTGOING: [IrqSafeSpinLock<()>; MAX_CPUS] = [const { IrqSafeSpinLock::new(()) }; MAX_CPUS];
 
 /// Counter bumped when the handler takes the `INVPCID(tag, ...)`
 /// branch (tag != 0 and `invpcid_supported()` reports true). Tests
@@ -63,42 +71,49 @@ pub fn invpcid_path_taken() -> u64 {
     INVPCID_PATH_TAKEN.load(Ordering::Relaxed)
 }
 
-/// Test helper: read this CPU's pending tag slot. The handler clears
-/// it after processing, so observation by tests is racy in a real SMP
-/// run; the `smoke_ipi_shootdown_carries_tag_through` test publishes
-/// to a *peer* slot without sending an IPI so the cell stays valid
-/// for sampling.
+/// Test helper: read the tag belonging to the first source pending for a CPU.
+/// Observation is racy in a real SMP run; the tag-flow smoke publishes to a
+/// peer without sending an IPI so it stays pending for sampling.
 pub fn pending_tag(cpu: u32) -> u16 {
-    let i = (cpu as usize).min(MAX_CPUS - 1);
-    PENDING_TAG[i].load(Ordering::Acquire)
+    let target = (cpu as usize).min(MAX_CPUS - 1);
+    let sources = PENDING_SENDERS[target].load(Ordering::Acquire);
+    if sources == 0 {
+        return 0;
+    }
+    let source = sources.trailing_zeros() as usize;
+    REQUESTS[source].tag.load(Ordering::Relaxed)
 }
 
-/// Test-only helper: publish (tag, va, pages) directly into a peer
-/// CPU's pending slot *without* sending the IPI. Lets the
-/// "tag flows from sender to receiver slot" smoke observe the slot
+/// Test-only helper: publish (tag, va, pages) directly into this source CPU's
+/// lane and mark it pending for a peer *without* sending the IPI. Lets the
+/// "tag flows from sender to receiver" smoke observe the request
 /// before any handler can clear it.
 #[doc(hidden)]
 pub fn __publish_for_test(cpu: u32, va: u64, pages: u64, tag: u16) {
-    let i = (cpu as usize).min(MAX_CPUS - 1);
-    PENDING_TAG[i].store(tag, Ordering::Release);
-    PENDING_PAGES[i].store(pages, Ordering::Release);
-    PENDING_VA[i].store(va, Ordering::Release);
+    let target = (cpu as usize).min(MAX_CPUS - 1);
+    let source = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    REQUESTS[source].tag.store(tag, Ordering::Relaxed);
+    REQUESTS[source].pages.store(pages, Ordering::Relaxed);
+    REQUESTS[source].va.store(va, Ordering::Relaxed);
+    PENDING_SENDERS[target].fetch_or(1u64 << source, Ordering::Release);
 }
 
-/// Test-only helper: clear a peer CPU's pending slot. Used to
+/// Test-only helper: clear a peer CPU's pending bit and source lane. Used to
 /// undo `__publish_for_test` so subsequent IPIs don't see stale
 /// state.
 #[doc(hidden)]
 pub fn __clear_for_test(cpu: u32) {
-    let i = (cpu as usize).min(MAX_CPUS - 1);
-    PENDING_TAG[i].store(0, Ordering::Release);
-    PENDING_PAGES[i].store(0, Ordering::Release);
-    PENDING_VA[i].store(0, Ordering::Release);
+    let target = (cpu as usize).min(MAX_CPUS - 1);
+    let source = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    PENDING_SENDERS[target].fetch_and(!(1u64 << source), Ordering::AcqRel);
+    REQUESTS[source].tag.store(0, Ordering::Relaxed);
+    REQUESTS[source].pages.store(0, Ordering::Relaxed);
+    REQUESTS[source].va.store(0, Ordering::Relaxed);
 }
 
-/// Per-CPU ack counter. Incremented by the handler after INVLPG.
-/// Senders snapshot this before sending and spin until it advances
-/// past the snapshot for every online AP.
+/// Per-CPU diagnostic counter. Incremented after each applied request; request
+/// completion itself is tracked by `COMPLETED_TARGETS` so concurrent senders
+/// cannot mistake another request's acknowledgement for their own.
 static ACK_COUNT: [AtomicU64; MAX_CPUS] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [Z; MAX_CPUS]
@@ -124,32 +139,13 @@ pub fn ever_received(cpu: u32) -> u64 {
     EVER_RECEIVED[i].load(Ordering::Relaxed)
 }
 
-/// Handler invoked from the trap path when VECTOR_TLB_SHOOTDOWN
-/// fires on the current CPU. Reads the pending VA for this CPU,
-/// runs INVLPG, then bumps the ack counter.
+/// Apply one request already claimed from this CPU's pending-source batch.
 ///
 /// # Safety
-/// IRQ context only; per-CPU PENDING_VA is written by the sender
-/// before the IPI lands, so the read here observes the up-to-date
-/// value (x2APIC IPI delivery serialises against the sending WRMSR).
+/// CPL=0; the request fields were published before its source bit with release
+/// ordering, and the handler claimed that bit with acquire ordering.
 #[inline]
-pub unsafe fn on_shootdown_irq() {
-    let cpu = narf_lib::percpu::current_cpu();
-    let i = cpu.min(MAX_CPUS - 1);
-    let va = PENDING_VA[i].load(Ordering::Acquire);
-    let pages = PENDING_PAGES[i].load(Ordering::Acquire);
-    let tag = PENDING_TAG[i].load(Ordering::Acquire);
-
-    // Did this invocation have a real request to service? A CPU can reach here
-    // twice for one shootdown: once by draining via `poll_pending_shootdown`
-    // (lock-spin) which clears the slots, and again when the actual IPI is
-    // delivered (a "stray" no-op, per this fn's contract). Both used to bump
-    // ACK_COUNT, so a peer that drained-then-took-the-IPI ack'd TWICE — benign
-    // for the sender (it waits for ANY advance) but it made the per-IPI accounting
-    // wrong (observed under 16-vCPU KVM as `shoot_range` of 8 pages registering 2
-    // acks). Only ack when we actually consumed a pending request.
-    let had_work = va != 0 || tag != 0;
-
+unsafe fn apply_request(va: u64, pages: u64, tag: u16) {
     // Three shapes:
     //   - tag != 0, va == 0  → "flush every TLB entry for this tag"
     //     (INVPCID type 1). Used by `shoot_tag_only`.
@@ -255,15 +251,34 @@ pub unsafe fn on_shootdown_irq() {
             }
         }
     }
-    // Clear the slots so subsequent stray fires don't re-flush.
-    PENDING_VA[i].store(0, Ordering::Release);
-    PENDING_PAGES[i].store(0, Ordering::Release);
-    PENDING_TAG[i].store(0, Ordering::Release);
-    // Only ack/count a real service — a stray no-op re-entry (slots already
-    // drained) must not double-count (see `had_work`).
-    if had_work {
-        EVER_RECEIVED[i].fetch_add(1, Ordering::Relaxed);
-        ACK_COUNT[i].fetch_add(1, Ordering::Release);
+}
+
+/// Drain every source request queued for this target CPU. Concurrent senders
+/// own disjoint lanes, and the pending-source bitmap lets one IPI claim the
+/// whole batch without losing a later publication.
+///
+/// # Safety
+/// IRQ context or CPL=0 polling context only. Each claimed slot is published
+/// before its source bit and is not reused until this handler acknowledges it.
+#[inline]
+pub unsafe fn on_shootdown_irq() {
+    let target = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    let mut sources = PENDING_SENDERS[target].swap(0, Ordering::AcqRel);
+    while sources != 0 {
+        let source = sources.trailing_zeros() as usize;
+        sources &= sources - 1;
+        let request = &REQUESTS[source];
+        let va = request.va.load(Ordering::Relaxed);
+        let pages = request.pages.load(Ordering::Relaxed);
+        let tag = request.tag.load(Ordering::Relaxed);
+
+        // SAFETY: this source bit was acquired from PENDING_SENDERS, whose
+        // release publication follows the complete request tuple.
+        unsafe { apply_request(va, pages, tag) };
+
+        EVER_RECEIVED[target].fetch_add(1, Ordering::Relaxed);
+        ACK_COUNT[target].fetch_add(1, Ordering::Relaxed);
+        COMPLETED_TARGETS[source].fetch_or(1u64 << target, Ordering::Release);
     }
 }
 
@@ -273,26 +288,23 @@ pub unsafe fn on_shootdown_irq() {
 /// counter).
 ///
 /// Called from `shoot_range`'s ack-wait spin: a CPU sending a shootdown
-/// spins for peer acks with IRQs masked (it is invoked while a
+/// spins for peer acknowledgements with IRQs masked (it is invoked while a
 /// page-table lock is held). If two CPUs shoot down concurrently, each
-/// would wait forever for the other's ack — the other can't take the
+/// would wait forever for the other's acknowledgement — the other can't take the
 /// IPI with IRQs masked. Polling here lets each spinning sender service
 /// the other's request directly, breaking the deadlock. A stray IPI that
-/// later delivers finds the slot already cleared and is a no-op flush.
+/// later delivers finds the pending bitmap empty and is a no-op flush.
 ///
 /// # Safety
-/// CPL=0; consumes only this CPU's per-CPU `PENDING_*` cells.
+/// CPL=0; consumes only this CPU's pending-source bitmap and source lanes.
 #[inline]
 pub unsafe fn poll_pending_shootdown() {
-    let cpu = narf_lib::percpu::current_cpu();
-    let i = cpu.min(MAX_CPUS - 1);
-    // A real request is signalled by a non-zero VA or tag (publish order
-    // is TAG → PAGES → VA, so observing either under acquire is enough).
-    if PENDING_VA[i].load(Ordering::Acquire) == 0 && PENDING_TAG[i].load(Ordering::Acquire) == 0 {
+    let target = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    if PENDING_SENDERS[target].load(Ordering::Acquire) == 0 {
         return;
     }
-    // SAFETY: same contract as the IRQ-path handler; the per-CPU cells
-    // are ours to consume and INVLPG/INVPCID at CPL=0 is always legal.
+    // SAFETY: same contract as the IRQ-path handler; this CPU owns the target
+    // bitmap and every request was release-published before its source bit.
     unsafe {
         on_shootdown_irq();
     }
@@ -300,10 +312,8 @@ pub unsafe fn poll_pending_shootdown() {
 
 /// Broadcast a TLB-shootdown IPI to every CPU except the sender,
 /// requesting an `INVLPG` for `va`. Spins until every online AP has
-/// ack'd. Idempotent across multiple senders — each CPU's PENDING_VA
-/// is per-target, so concurrent shootdowns on the same target VA are
-/// safe; concurrent shootdowns on *different* VAs serialise on the
-/// sender side.
+/// acknowledged this exact source-owned request. Different source CPUs can
+/// publish concurrently; requests originating on one CPU are serialized.
 ///
 /// # Safety
 /// - x2APIC must be online on this CPU.
@@ -366,6 +376,63 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
     }
 }
 
+/// Publish one source-owned request to selected online peers and wait until
+/// every target has applied that exact request.
+///
+/// One source lane is sufficient because every selected target receives the
+/// same tuple. The per-source lock prevents local nesting/reuse while allowing
+/// different CPUs to publish concurrently. A target's pending-source bitmap
+/// acts as a lossless queue and permits one IPI to drain several senders.
+///
+/// # Safety
+/// Same preconditions as [`shoot_range`]. The request shape must be one
+/// understood by [`apply_request`].
+unsafe fn shoot_request_mask(va: u64, pages: u64, tag: u16, target_mask: u64) {
+    let source = narf_lib::percpu::current_cpu().min(MAX_CPUS - 1);
+    let source_bit = 1u64 << source;
+    let targets = target_mask & narf_lib::smp::online_bitmap() & !source_bit;
+    if targets == 0 {
+        return;
+    }
+
+    // IRQs remain masked while this source lane is live. Besides preventing a
+    // nested local publisher from reusing the tuple, that makes current_cpu()
+    // stable until every selected target has acknowledged it.
+    let _outgoing = OUTGOING[source].lock();
+
+    COMPLETED_TARGETS[source].store(0, Ordering::Relaxed);
+    let request = &REQUESTS[source];
+    request.tag.store(tag, Ordering::Relaxed);
+    request.pages.store(pages, Ordering::Relaxed);
+    request.va.store(va, Ordering::Relaxed);
+
+    // A release publication of the source bit makes the complete tuple visible
+    // to the target's acquire swap. Only a transition from an empty target
+    // bitmap needs a new IPI: an already-pending IPI/poller will drain the bit.
+    let mut pending = targets;
+    let mut kick = 0u64;
+    while pending != 0 {
+        let target = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        if PENDING_SENDERS[target].fetch_or(source_bit, Ordering::Release) == 0 {
+            kick |= 1u64 << target;
+        }
+    }
+    if kick != 0 {
+        apic::send_fixed_ipi(kick, crate::VECTOR_TLB_SHOOTDOWN);
+    }
+
+    // This wait must not time out and return: the caller may immediately reuse
+    // a frame whose stale translation is still cached on a target CPU. Polling
+    // incoming requests is necessary because the IRQ-safe guard masks local
+    // interrupts and two simultaneous senders may otherwise wait on each other.
+    while COMPLETED_TARGETS[source].load(Ordering::Acquire) & targets != targets {
+        // SAFETY: CPL=0; consumes only this CPU's pending-source bitmap.
+        unsafe { poll_pending_shootdown() };
+        core::hint::spin_loop();
+    }
+}
+
 /// Targeted range shootdown. Publishes the request and sends an x2APIC
 /// fixed IPI only to online peer CPUs selected by `target_mask`; the ACK
 /// wait covers exactly the same set. This is the sink for
@@ -378,63 +445,8 @@ pub unsafe fn shoot_range_mask(va: u64, pages: u64, tag: u16, target_mask: u64) 
     if va == 0 || pages == 0 {
         return;
     }
-    let self_cpu = narf_lib::percpu::current_cpu() as u32;
-    let self_bit = 1u64 << (self_cpu & 63);
-    let targets = target_mask & narf_lib::smp::online_bitmap() & !self_bit;
-    if targets == 0 {
-        return;
-    }
-
-    // Snapshot every target CPU's ack counter and publish the target
-    // VA + range + tag. Publish order: TAG → PAGES → VA. The handler
-    // reads in the same order under acquire, so when it sees a
-    // non-zero VA the matching tag is already visible.
-    let mut snap = [0u64; MAX_CPUS];
-    let mut pending = targets;
-    while pending != 0 {
-        let cpu = pending.trailing_zeros();
-        pending &= pending - 1;
-        let i = (cpu as usize).min(MAX_CPUS - 1);
-        snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
-        PENDING_TAG[i].store(tag, Ordering::Release);
-        PENDING_PAGES[i].store(pages, Ordering::Release);
-        PENDING_VA[i].store(va, Ordering::Release);
-    }
-
-    // Each fixed-destination WRMSR is serialising, so the matching
-    // PENDING_* stores are visible before that receiver runs.
-    apic::send_fixed_ipi(targets, crate::VECTOR_TLB_SHOOTDOWN);
-
-    // Wait for exactly the CPUs that were sent the request.
-    let mut waiting = targets;
-    while waiting != 0 {
-        let cpu = waiting.trailing_zeros();
-        waiting &= waiting - 1;
-        let i = (cpu as usize).min(MAX_CPUS - 1);
-        let mut spins: u32 = 0;
-        while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
-            // Service any shootdown a peer published to US while we spin —
-            // we hold IRQs masked here (a page-table lock is held by the
-            // caller), so the IPI can't land, and a peer that is likewise
-            // spinning for OUR ack would otherwise deadlock against us.
-            // SAFETY: CPL=0; consumes only this CPU's pending cells.
-            unsafe {
-                poll_pending_shootdown();
-            }
-            // PAUSE hint to release the resource for the other
-            // hyperthread / power down the spin.
-            core::hint::spin_loop();
-            spins = spins.wrapping_add(1);
-            if spins > 10_000_000 {
-                // Bail rather than hang forever — caller logs the
-                // miss; in tests this surfaces as a timeout. In
-                // production a missed shootdown leaves stale TLB
-                // entries on the target CPU, which the next CR3
-                // reload (or context switch) will paper over.
-                break;
-            }
-        }
-    }
+    // SAFETY: caller contract; validation above selects the range shape.
+    unsafe { shoot_request_mask(va, pages, tag, target_mask) };
 }
 
 /// Broadcast a "flush every TLB entry tagged with `tag`" request to
@@ -464,44 +476,8 @@ pub unsafe fn shoot_tag_only_mask(tag: u16, target_mask: u64) {
     if tag == 0 {
         return;
     }
-    let self_cpu = narf_lib::percpu::current_cpu() as u32;
-    let self_bit = 1u64 << (self_cpu & 63);
-    let targets = target_mask & narf_lib::smp::online_bitmap() & !self_bit;
-    if targets == 0 {
-        return;
-    }
-    let mut snap = [0u64; MAX_CPUS];
-    let mut pending = targets;
-    while pending != 0 {
-        let cpu = pending.trailing_zeros();
-        pending &= pending - 1;
-        let i = (cpu as usize).min(MAX_CPUS - 1);
-        snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
-        PENDING_VA[i].store(0, Ordering::Release);
-        PENDING_PAGES[i].store(0, Ordering::Release);
-        PENDING_TAG[i].store(tag, Ordering::Release);
-    }
-    apic::send_fixed_ipi(targets, crate::VECTOR_TLB_SHOOTDOWN);
-    let mut waiting = targets;
-    while waiting != 0 {
-        let cpu = waiting.trailing_zeros();
-        waiting &= waiting - 1;
-        let i = (cpu as usize).min(MAX_CPUS - 1);
-        let mut spins: u32 = 0;
-        while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
-            // Break a concurrent-shootdown cycle exactly as the range
-            // path does when callers enter with IRQs masked.
-            // SAFETY: consumes only this CPU's pending cells at CPL=0.
-            unsafe {
-                poll_pending_shootdown();
-            }
-            core::hint::spin_loop();
-            spins = spins.wrapping_add(1);
-            if spins > 10_000_000 {
-                break;
-            }
-        }
-    }
+    // SAFETY: caller contract; (va=0, tag!=0) selects single-context flush.
+    unsafe { shoot_request_mask(0, 0, tag, target_mask) };
 }
 
 /// Convenience wrapper for installing the shootdown handler on the
