@@ -576,6 +576,7 @@ impl FileOps for FifoHandle {
 
         let first = self.shared.readiness.arm(task_id, first_interest, waker);
         if first.is_ready() || !suppress_initial_hup {
+            self.disarm_peer(task_id);
             return Some(first);
         }
 
