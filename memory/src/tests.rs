@@ -11314,6 +11314,134 @@ fn smoke_memory_mlock_survives_mprotect() -> TestResult {
 #[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
 kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);
 
+/// A mixed huge/base-page mprotect must reserve every base-page split node
+/// before changing a huge leaf.  Otherwise ENOMEM can leave only the huge
+/// prefix protected.  The successful retry also keeps internal VMA flags in
+/// the huge middle, just as the ordinary 4 KiB path does.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "linux-compat",
+    feature = "kernel-test"
+))]
+fn smoke_memory_mprotect_mixed_huge_index_oom_is_preflight() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, reserve_from_regions, HugeSize, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{
+        AddressSpace, AddressSpaceError, HugeRegion, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    const SYNTH_BASE: u64 = 0x40_0000_0000;
+    const USER_VA: u64 = 0x0000_5000_6000_0000;
+    let source = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    // SAFETY: the synthetic frame is mapped for metadata/translation checks
+    // only and is returned to the test reservation before this test exits.
+    let excludes = unsafe { reserve_from_regions(&[source], &[], 1, 0) };
+    if excludes.len() != 1 {
+        return TestResult::Fail("mixed mprotect hugepage reservation failed");
+    }
+    // SAFETY: topology lookup does not dereference the synthetic frame.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("mixed mprotect hugepage allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            let _ = alloc_hugepage_2m_on(node);
+            return TestResult::Fail("mixed mprotect address-space creation failed");
+        }
+    };
+    let huge_base = VirtAddr::new(USER_VA);
+    // SAFETY: the fresh root, aligned VA, and owned aligned frame satisfy the
+    // huge mapping contract.
+    if unsafe {
+        address_space.map_huge_region(HugeRegion {
+            base: huge_base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+            size: HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect huge mapping failed");
+    }
+    let regular_base = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    if address_space
+        .map_region(Region {
+            base: regular_base,
+            len: 0x3000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0); 3],
+        })
+        .is_err()
+    {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect regular mapping failed");
+    }
+
+    let writable_before = address_space.memory_stats().writable_nonexec_bytes;
+    address_space.__test_fail_next_region_index_reserve();
+    let failed =
+        address_space.mprotect_range(huge_base, HUGEPAGE_2M_BYTES + 0x2000, RegionPerms::READ);
+    let failure_atomic = failed == Err(AddressSpaceError::AllocationFailed)
+        && address_space.memory_stats().writable_nonexec_bytes == writable_before
+        && address_space.lookup(regular_base).is_some_and(|region| {
+            region.len == 0x3000 && region.perms.contains(RegionPerms::WRITE)
+        })
+        && address_space
+            .__test_huge_region_perms(huge_base)
+            .is_some_and(|perms| perms.contains(RegionPerms::WRITE));
+    if !failure_atomic {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect ENOMEM partially changed permissions");
+    }
+
+    let retry =
+        address_space.mprotect_range(huge_base, HUGEPAGE_2M_BYTES + 0x2000, RegionPerms::READ);
+    let huge_preserved = address_space
+        .__test_huge_region_perms(huge_base)
+        .is_some_and(|perms| {
+            perms.contains(RegionPerms::LOCKED) && !perms.contains(RegionPerms::WRITE)
+        });
+    let regular_split = address_space
+        .lookup(regular_base)
+        .is_some_and(|region| region.len == 0x2000 && !region.perms.contains(RegionPerms::WRITE))
+        && address_space
+            .lookup(VirtAddr::new(regular_base.as_u64() + 0x2000))
+            .is_some_and(|region| {
+                region.len == 0x1000 && region.perms.contains(RegionPerms::WRITE)
+            });
+    let unmapped = address_space.unmap_huge_region(huge_base).is_ok();
+    let _ = alloc_hugepage_2m_on(node);
+    if retry.is_ok() && huge_preserved && regular_split && unmapped {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mixed mprotect retry lost flags or split metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "linux-compat",
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_mprotect_mixed_huge_index_oom_is_preflight
+);
+
 /// Linux replaces `mm->def_flags` on every mlockall call rather than stacking
 /// successive MCL_FUTURE modes.  In particular, MCL_CURRENT without
 /// MCL_FUTURE clears a previously-installed future policy.

@@ -391,6 +391,12 @@ impl AddressSpace {
     pub fn rollback_mapping(
         &self, receipt: MappingReceipt,
     ) -> Result<(), AddressSpaceError>;
+    /// Atomically changes a completely-covered rounded range across ordinary
+    /// and hardware-huge VMAs. Base-page split capacity and swap state are
+    /// preflighted before any huge leaf changes; internal VMA flags survive.
+    pub fn mprotect_range(
+        &self, base: VirtAddr, len: u64, new_perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError>;
     /// Install real architecture huge/block leaves and take frame ownership.
     pub unsafe fn map_huge_region(
         &self,

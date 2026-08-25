@@ -1317,6 +1317,15 @@ impl AddressSpace {
         self.regions.lock().by_base.fail_next_reserve_for_test();
     }
 
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn __test_huge_region_perms(&self, base: VirtAddr) -> Option<RegionPerms> {
+        self.huge_regions
+            .lock()
+            .iter()
+            .find(|region| region.base == base)
+            .map(|region| region.perms)
+    }
+
     /// Stable identity of this address-space incarnation.
     ///
     /// The value is unique for the kernel lifetime and is allocated once per
@@ -7788,30 +7797,35 @@ impl AddressSpace {
             .checked_add(rounded_len)
             .filter(|end| *end <= Self::USER_HALF_END)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        {
-            let huge = self.huge_regions.lock();
-            let regular = self.regions.lock();
-            if Self::mappings_covered_prefix_end(&huge, &regular, lo, hi) < hi {
-                return Err(AddressSpaceError::Unmapped);
-            }
+        // Keep both topology locks from preflight through publication.  The
+        // older two-phase shape changed huge leaves first and only then tried
+        // to reserve base-page VMA nodes (or noticed a newly-started swap-in),
+        // so an allocation failure could return after half of a mixed
+        // huge/base request had already changed permissions.  VMA operations
+        // use huge -> regular order consistently, and `vma_transaction`
+        // prevents another structural operation from consuming this reserved
+        // capacity before the split is published.
+        let mut huge = self.huge_regions.lock();
+        let mut g = self.regions.lock();
+        if Self::mappings_covered_prefix_end(&huge, &g, lo, hi) < hi {
+            return Err(AddressSpaceError::Unmapped);
         }
-
-        // Avoid changing huge mappings and only then discovering that a
-        // base-page swap-in covering the same request already captured stale
-        // permissions. This is repeated under the region lock below to close
-        // the race with a page-in that starts while huge leaves are updated.
-        if self
-            .regions
-            .lock()
-            .swap_pages
+        if g.swap_pages
             .range(lo..hi)
             .any(|(_, state)| matches!(state, SwapPageState::Loading))
         {
             return Err(AddressSpaceError::NotImplemented);
         }
+        let mut additional_nodes = 0usize;
+        g.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            additional_nodes =
+                additional_nodes.saturating_add(usize::from(rb < lo) + usize::from(re > hi));
+        });
+        g.try_reserve_nodes(additional_nodes)?;
 
         let huge_touched = {
-            let mut huge = self.huge_regions.lock();
             if huge.iter().any(|region| {
                 let rb = region.base.as_u64();
                 let re = rb + region.len;
@@ -7863,25 +7877,11 @@ impl AddressSpace {
                     let _ = self.unmap_huge_leaf(va, region.size);
                     self.map_huge_leaf(va, frame.phys(), region.size, prot)?;
                 }
-                // LINUX-GAP: bare `prot` here drops the internal flags —
-                // LOCKED above all — where the 4 KiB path below preserves them
-                // (`prot | preserved_flags`). Linux keeps `VM_LOCKED` across an
-                // `mprotect`, so an `mlock`ed hugetlb mapping is silently
-                // unlocked by a later `mprotect` of part of it.
-                //
-                // Consequences are contained today only because nothing reads a
-                // *huge* region's LOCKED: the COW and fork paths consult
-                // `self.regions` alone, and `Drop` frees huge frames
-                // unconditionally (huge mappings never honour SHARED either).
-                // The moment a reclaim tier consults huge LOCKED this becomes a
-                // real unlock. Pinned for the 4 KiB path by
-                // `smoke_memory_mlock_survives_mprotect`; deliberately not
-                // "fixed" here because the flag has no consumer to be correct
-                // for yet, and a fix with no test would just be a claim.
+                let preserved_flags = RegionPerms(region.perms.0 & !RegionPerms::PROT_MASK.0);
                 rebuilt.push(HugeRegion {
                     base: VirtAddr::new(split_lo),
                     len: middle_frames.len() as u64 * page_size,
-                    perms: prot,
+                    perms: RegionPerms(prot.0 | preserved_flags.0),
                     size: region.size,
                     frames: middle_frames,
                 });
@@ -7907,21 +7907,6 @@ impl AddressSpace {
         // deferred rewrite re-installed PTEs over them (use-after-free —
         // see `change_perms_range` for the full rationale + why the
         // under-lock broadcast is deadlock-safe).
-        let mut g = self.regions.lock();
-        if g.swap_pages
-            .range(lo..hi)
-            .any(|(_, state)| matches!(state, SwapPageState::Loading))
-        {
-            return Err(AddressSpaceError::NotImplemented);
-        }
-        let mut additional_nodes = 0usize;
-        g.for_each_overlapping(lo, hi, |region| {
-            let rb = region.base.as_u64();
-            let re = rb.saturating_add(region.len);
-            additional_nodes =
-                additional_nodes.saturating_add(usize::from(rb < lo) + usize::from(re > hi));
-        });
-        g.try_reserve_nodes(additional_nodes)?;
         let touched: Vec<Region> = {
             // Drain only the entries intersecting [lo, hi), split them, and
             // reinsert their disjoint fragments under the same lock.
@@ -8005,6 +7990,7 @@ impl AddressSpace {
             unsafe { self.rewrite_perms_pages(&touched) };
         }
         drop(g);
+        drop(huge);
         Ok(())
     }
 
