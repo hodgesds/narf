@@ -651,3 +651,7 @@ argument = "TLB-shootdown verification no longer clears live SMP residency, idle
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The scheduler waker no longer performs a diagnostic fetch_add on one global cache line for every wake. The task-owned awake Release store, owner-CPU Acquire load, remote reschedule decision, Arc lifetime rules, queue ownership, policy selection, and migration behavior are unchanged. Removing the framebuffer's observational read grants no scheduling, capability, domain, or task-memory authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Production TLB shootdowns no longer update global diagnostic counters or recompute an all-peer accounting budget. Kernel-test and host-test builds retain the exact counters used by liveness and filtering smokes; production accessors return zero. Local invalidation, the mandatory StoreLoad fence, residency and idle-debt publication, target selection, IPI fanout, completion ordering, deferred full flushes, ASID/PCID scope, and backing-frame release order are unchanged."

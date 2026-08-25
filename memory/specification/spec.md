@@ -464,6 +464,11 @@ pub fn tlb_shootdown::set_active_as(cpu: u32, tag: u16);
 pub fn tlb_shootdown::clear_active_as(cpu: u32, tag: u16);
 pub fn tlb_shootdown::mark_idle(cpu: u32);
 pub fn tlb_shootdown::mark_busy(cpu: u32);
+/// Verification-only observability; production shootdowns do not update
+/// global diagnostic counters on the invalidation path. Accessors return zero
+/// outside kernel-test and host-test builds.
+pub fn tlb_shootdown::{shootdown_count, local_only_count,
+    ipi_fanout_count, broadcast_budget, filtered_targets, lazy_flush_count}();
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
