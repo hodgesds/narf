@@ -501,15 +501,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         frames
     };
 
+    let mut shared_publication = None;
     if let Some(ops) = shared_file_ops.as_ref() {
-        phys_list = crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+        let (canonical, publication) =
+            crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+        phys_list = canonical;
+        shared_publication = Some(publication);
     }
-
-    // Only the shared-file rollback path needs a second owner-side list.
-    // Anonymous mmap previously cloned its potentially huge all-zero vector
-    // solely to keep `phys_list` available for an error arm that can never use
-    // it, adding another O(pages) copy before returning the lazy VMA.
-    let shared_rollback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
@@ -527,12 +525,17 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         })
         .is_err()
     {
-        if let Some(phys) = shared_rollback_phys.as_deref() {
-            crate::mapped_file::discard_unmapped_shared_file_pages(phys);
-        }
+        // Drop releases only this attempt's pending cache holds. A concurrent
+        // mapper selecting the same canonical page retains its own hold.
+        drop(shared_publication);
         // Generic VMA registration failed → ENOMEM.
         ctx.set_return(SyscallReturn::ok((-12i64) as u64));
         return;
+    }
+    if let Some(publication) = shared_publication.take() {
+        // map_region retained every SHARED frame before returning. Convert
+        // this attempt's pending holds into those committed mapping refs.
+        publication.commit();
     }
     // Anonymous private mappings are entirely lazy (`phys[i] == 0`), so there
     // is nothing to install. Walking every slot here made mmap cost O(length)

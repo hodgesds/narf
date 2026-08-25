@@ -59,6 +59,10 @@ struct SharedFilePage {
     offset: u64,
     phys: PhysAddr,
     mappings: usize,
+    /// Mappers which selected this canonical page but have not yet either
+    /// committed a VMA reference or aborted. Reclaim requires both counters
+    /// to reach zero.
+    pending: usize,
     /// Exact bytes last read from, or successfully written to, the backing
     /// file. Generic mappings cannot rely on hardware dirty bits here, so an
     /// exact snapshot lets fsync skip clean pages without risking a hash
@@ -67,6 +71,56 @@ struct SharedFilePage {
 }
 
 static SHARED_FILE_PAGES: IrqSafeSpinLock<Vec<SharedFilePage>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Consumable reservation for the canonical pages selected by one mmap
+/// attempt. Drop is abort. A successful VMA publication calls [`Self::commit`]
+/// after memory's SHARED retain hooks have recorded committed mappings.
+pub(crate) struct SharedFilePublication {
+    phys: Vec<PhysAddr>,
+    active: bool,
+}
+
+impl SharedFilePublication {
+    pub(crate) fn commit(mut self) {
+        self.release_pending();
+    }
+
+    fn release_pending(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut free = Vec::new();
+        {
+            let mut pages = SHARED_FILE_PAGES.lock();
+            for phys in &self.phys {
+                let page = pages
+                    .iter_mut()
+                    .find(|page| page.phys == *phys)
+                    .expect("pending shared-file publication lost its canonical page");
+                assert!(page.pending != 0, "shared-file pending hold underflow");
+                page.pending -= 1;
+            }
+            let old = core::mem::take(&mut *pages);
+            for page in old {
+                if page.mappings == 0 && page.pending == 0 {
+                    free.push(page.phys);
+                } else {
+                    pages.push(page);
+                }
+            }
+        }
+        self.active = false;
+        for phys in free {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
+        }
+    }
+}
+
+impl Drop for SharedFilePublication {
+    fn drop(&mut self) {
+        self.release_pending();
+    }
+}
 
 fn current_pid() -> u64 {
     let task = crate::handlers::current_task_id();
@@ -148,21 +202,23 @@ pub(crate) fn publish_shared_file_pages(
     ops: &Arc<dyn FileOps>,
     offset: u64,
     candidates: Vec<PhysAddr>,
-) -> Vec<PhysAddr> {
+) -> (Vec<PhysAddr>, SharedFilePublication) {
     let mut rejected = Vec::new();
     let mut canonical = Vec::with_capacity(candidates.len());
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for (index, candidate) in candidates.into_iter().enumerate() {
             let page_offset = offset.saturating_add(index as u64 * 4096);
-            if let Some(existing) = pages
+            let existing = pages
                 .iter()
-                .find(|page| page.offset == page_offset && Arc::ptr_eq(&page.ops, ops))
-            {
-                canonical.push(existing.phys);
-                if candidate.raw() != existing.phys.raw() {
+                .position(|page| page.offset == page_offset && Arc::ptr_eq(&page.ops, ops));
+            let page_index = if let Some(index) = existing {
+                let phys = pages[index].phys;
+                canonical.push(phys);
+                if candidate.raw() != phys.raw() {
                     rejected.push(candidate);
                 }
+                index
             } else {
                 // SAFETY: `candidate` is a freshly allocated, identity-mapped
                 // fallback page which remains owned by this cache entry.
@@ -174,10 +230,13 @@ pub(crate) fn publish_shared_file_pages(
                     offset: page_offset,
                     phys: candidate,
                     mappings: 0,
+                    pending: 0,
                     clean,
                 });
                 canonical.push(candidate);
-            }
+                pages.len() - 1
+            };
+            pages[page_index].pending = pages[page_index].pending.saturating_add(1);
         }
     }
     for phys in rejected {
@@ -185,28 +244,11 @@ pub(crate) fn publish_shared_file_pages(
             narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
         }
     }
-    canonical
-}
-
-/// Abandon cache pages which were published just before a failed map attempt.
-/// Existing pages remain retained by their live mappings; only entries with no
-/// mapping references are reclaimed.
-pub(crate) fn discard_unmapped_shared_file_pages(phys: &[PhysAddr]) {
-    let mut free = Vec::new();
-    {
-        let mut pages = SHARED_FILE_PAGES.lock();
-        let old = core::mem::take(&mut *pages);
-        for page in old {
-            if page.mappings == 0 && phys.contains(&page.phys) {
-                free.push(page.phys);
-            } else {
-                pages.push(page);
-            }
-        }
-    }
-    for phys in free {
-        narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
-    }
+    let receipt = SharedFilePublication {
+        phys: canonical.clone(),
+        active: true,
+    };
+    (canonical, receipt)
 }
 
 /// Memory's `RegionPerms::SHARED` hooks call these to tie each mapped alias to
@@ -229,7 +271,7 @@ pub(crate) fn release_shared_file_page(phys: u64) -> bool {
         };
         let page = &mut pages[index];
         page.mappings = page.mappings.saturating_sub(1);
-        if page.mappings != 0 {
+        if page.mappings != 0 || page.pending != 0 {
             return true;
         }
         pages.swap_remove(index)
@@ -574,4 +616,61 @@ mod tests {
     }
 
     kernel_test_in!("userspace/perf", smoke_mapped_file_owner_lifecycle);
+
+    fn smoke_shared_file_pending_publications_do_not_free_peer_page() -> TestResult {
+        let ops: Arc<dyn FileOps> = Arc::new(TestOwner);
+        let first_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let second_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(first_candidate));
+                return TestResult::Skip("frame allocator drained");
+            }
+        };
+        let (first_phys, first) =
+            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![first_candidate]);
+        let (second_phys, second) =
+            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![second_candidate]);
+        if first_phys != second_phys || first_phys != alloc::vec![first_candidate] {
+            return TestResult::Fail("overlapping mapper did not select canonical page");
+        }
+
+        drop(first);
+        let still_pending = SHARED_FILE_PAGES
+            .lock()
+            .iter()
+            .any(|page| page.phys == first_candidate && page.pending == 1 && page.mappings == 0);
+        if !still_pending {
+            return TestResult::Fail("first abort freed a peer's pending canonical page");
+        }
+
+        if !retain_shared_file_page(first_candidate.raw()) {
+            return TestResult::Fail("pending canonical page could not become mapped");
+        }
+        second.commit();
+        let committed = SHARED_FILE_PAGES
+            .lock()
+            .iter()
+            .any(|page| page.phys == first_candidate && page.pending == 0 && page.mappings == 1);
+        if !committed {
+            return TestResult::Fail("publication commit did not transfer pending hold");
+        }
+        if !release_shared_file_page(first_candidate.raw())
+            || SHARED_FILE_PAGES
+                .lock()
+                .iter()
+                .any(|page| page.phys == first_candidate)
+        {
+            return TestResult::Fail("last mapping did not reclaim canonical page once");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "userspace/perf",
+        smoke_shared_file_pending_publications_do_not_free_peer_page
+    );
 }
