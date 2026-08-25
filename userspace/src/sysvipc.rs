@@ -1811,16 +1811,13 @@ struct MsgQueue {
 }
 
 struct QueuedMessage {
-    id: u64,
     mtype: i64,
     payload: Vec<u8>,
-    reserved: bool,
 }
 
 static MSGS: IrqSafeSpinLock<Option<BTreeMap<IpcObjectKey, MsgQueue>>> = IrqSafeSpinLock::new(None);
 #[cfg(not(feature = "container"))]
 static MSG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static MSG_NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 const MSG_MAX_BYTES: usize = 8192;
 const MSG_DEFAULT_QUEUE_BYTES: usize = 16384;
 const MSG_NOERROR: i64 = 0o10000;
@@ -1936,7 +1933,13 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
             ctx.set_return(err(EINVAL));
             return;
         }
-        let mut payload = alloc::vec![0u8; msgsz];
+        let mut payload = Vec::new();
+        if payload.try_reserve_exact(msgsz).is_err() {
+            clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
+            ctx.set_return(err(ENOMEM));
+            return;
+        }
+        payload.resize(msgsz, 0);
         if msgsz != 0 {
             let Some(payload_ptr) = msgp.checked_add(8) else {
                 clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
@@ -1954,7 +1957,6 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         (mtype, payload, msgflg)
     };
     let msgsz = payload.len();
-    let message_id = MSG_NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
     let mut pending_payload = Some(payload);
     let r: Result<bool, i64> = with_msgs(|m| {
         let q = m.get_mut(&object).ok_or(EINVAL)?;
@@ -1976,11 +1978,10 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         {
             return Ok(false);
         }
+        q.msgs.try_reserve(1).map_err(|_| ENOMEM)?;
         q.msgs.push_back(QueuedMessage {
-            id: message_id,
             mtype,
             payload: pending_payload.take().expect("pending SysV message"),
-            reserved: false,
         });
         q.current_bytes += msgsz;
         q.stime = now_seconds();
@@ -2054,10 +2055,36 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(EINVAL));
         return;
     }
+    // Linux prepares MSG_COPY scratch before looking up the queue.  Reserve
+    // the same bounded capacity here, both preserving ENOMEM precedence and
+    // keeping allocation out of the global queue lock below.
+    let mut copy_payload = Vec::new();
+    if flg & MSG_COPY != 0 {
+        let copy_capacity = core::cmp::min(msgsz, MSG_MAX_BYTES);
+        if copy_payload.try_reserve_exact(copy_capacity).is_err() {
+            clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
+            ctx.set_return(err(ENOMEM));
+            return;
+        }
+        copy_payload.resize(copy_capacity, 0);
+        // Linux prepare_copy() uses load_msg() on the output buffer before
+        // queue lookup.  Although the bytes are only scratch, this makes an
+        // unreadable output pointer report EFAULT ahead of id/permission and
+        // selection errors.
+        // SAFETY: copy_from_user validates the complete MSG_COPY scratch read.
+        if unsafe { crate::handlers::copy_from_user(&mut copy_payload, msgp) }.is_err() {
+            clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
+            ctx.set_return(err(EFAULT));
+            return;
+        }
+    }
 
-    // Select and reserve while holding the queue lock. Reservation makes the
-    // subsequent userspace copy transactional without letting a concurrent
-    // receiver select the same message.
+    // Linux unlinks an ordinary selected message and updates queue metadata
+    // under the queue lock before copying it to userspace.  Consequently an
+    // EFAULT from either output copy still consumes the message.  Take
+    // ownership of the payload here so ordinary receives need no heap copy.
+    // MSG_COPY is deliberately non-destructive and therefore retains one
+    // fallibly allocated snapshot outside the queue lock.
     let picked = with_msgs(|m| {
         let q = m.get_mut(&object).ok_or(EINVAL)?;
         if !ipc_allowed(
@@ -2074,14 +2101,9 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             return Err(EACCES);
         }
         let idx = if flg & MSG_COPY != 0 {
-            usize::try_from(msgtyp).ok().and_then(|ordinal| {
-                q.msgs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, msg)| !msg.reserved)
-                    .nth(ordinal)
-                    .map(|(idx, _)| idx)
-            })
+            usize::try_from(msgtyp)
+                .ok()
+                .and_then(|ordinal| q.msgs.iter().enumerate().nth(ordinal).map(|(idx, _)| idx))
         } else if msgtyp < 0 {
             let limit = if msgtyp == i64::MIN {
                 i64::MAX
@@ -2091,42 +2113,46 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             q.msgs
                 .iter()
                 .enumerate()
-                .filter(|(_, msg)| !msg.reserved && msg.mtype <= limit)
+                .filter(|(_, msg)| msg.mtype <= limit)
                 .min_by_key(|(_, msg)| msg.mtype)
                 .map(|(idx, _)| idx)
         } else {
             q.msgs.iter().position(|msg| {
-                !msg.reserved
-                    && (msgtyp == 0
-                        || if flg & MSG_EXCEPT != 0 {
-                            msg.mtype != msgtyp
-                        } else {
-                            msg.mtype == msgtyp
-                        })
+                msgtyp == 0
+                    || if flg & MSG_EXCEPT != 0 {
+                        msg.mtype != msgtyp
+                    } else {
+                        msg.mtype == msgtyp
+                    }
             })
         };
         match idx {
             Some(i) => {
-                let msg = &mut q.msgs[i];
+                let msg = &q.msgs[i];
                 if msg.payload.len() > msgsz && flg & MSG_NOERROR == 0 {
                     return Err(E2BIG);
                 }
-                let copied_len = core::cmp::min(msg.payload.len(), msgsz);
-                let snapshot = (
-                    msg.id,
-                    msg.mtype,
-                    msg.payload[..copied_len].to_vec(),
-                    msg.payload.len(),
-                );
-                if flg & MSG_COPY == 0 {
-                    msg.reserved = true;
+                if flg & MSG_COPY != 0 && msg.payload.len() > msgsz {
+                    // copy_msg() rejects a source larger than its prepared
+                    // destination even when MSG_NOERROR bypassed E2BIG.
+                    return Err(EINVAL);
                 }
-                Ok(Some(snapshot))
+                let copied_len = core::cmp::min(msg.payload.len(), msgsz);
+                if flg & MSG_COPY != 0 {
+                    copy_payload[..copied_len].copy_from_slice(&msg.payload[..copied_len]);
+                    copy_payload.truncate(copied_len);
+                    return Ok(Some((msg.mtype, core::mem::take(&mut copy_payload))));
+                }
+                let msg = q.msgs.remove(i).expect("selected SysV message");
+                q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
+                q.rtime = now_seconds();
+                q.last_recv_pid = pid as i32;
+                Ok(Some((msg.mtype, msg.payload)))
             }
             None => Ok(None),
         }
     });
-    let (message_id, mtype, payload, original_len) = match picked {
+    let (mtype, payload) = match picked {
         Ok(Some(msg)) => msg,
         Ok(None) => {
             if flg & IPC_NOWAIT as i64 != 0 {
@@ -2159,42 +2185,32 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let mut out = Vec::with_capacity(8 + payload.len());
-    out.extend_from_slice(&mtype.to_le_bytes());
-    out.extend_from_slice(&payload);
-    // SAFETY: one range-validated copy makes header+payload publication
-    // atomic with respect to message removal.
-    if unsafe { crate::handlers::copy_to_user(msgp, &out) }.is_err() {
-        if flg & MSG_COPY == 0 {
-            with_msgs(|m| {
-                if let Some(msg) = m
-                    .get_mut(&object)
-                    .and_then(|q| q.msgs.iter_mut().find(|msg| msg.id == message_id))
-                {
-                    msg.reserved = false;
-                }
-            });
-            narf_net::readiness::notify(0);
-        }
+    if flg & MSG_COPY == 0 {
+        // As in Linux, publish freed queue capacity after unlocking and before
+        // the potentially faulting userspace copy.
+        narf_net::readiness::notify(0);
+    }
+    let copied_len = core::cmp::min(payload.len(), msgsz);
+    // Linux's do_msg_fill publishes mtype first, then mtext.  Either copy may
+    // fault after an ordinary message has already been unlinked.
+    // SAFETY: copy_to_user range-validates and SMAP-brackets each output.
+    let copy_result = unsafe { crate::handlers::copy_to_user(msgp, &mtype.to_le_bytes()) }
+        .and_then(|()| {
+            if copied_len == 0 {
+                return Ok(());
+            }
+            let payload_ptr = msgp.checked_add(8).ok_or(EFAULT as u64)?;
+            // SAFETY: payload_ptr was checked above; copy_to_user validates
+            // the complete destination range.
+            unsafe { crate::handlers::copy_to_user(payload_ptr, &payload[..copied_len]) }
+        });
+    if copy_result.is_err() {
         clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
         ctx.set_return(err(EFAULT));
         return;
     }
-    if flg & MSG_COPY == 0 {
-        with_msgs(|m| {
-            if let Some(q) = m.get_mut(&object) {
-                if let Some(idx) = q.msgs.iter().position(|msg| msg.id == message_id) {
-                    q.msgs.remove(idx);
-                    q.current_bytes = q.current_bytes.saturating_sub(original_len);
-                    q.rtime = now_seconds();
-                    q.last_recv_pid = pid as i32;
-                }
-            }
-        });
-        narf_net::readiness::notify(0);
-    }
     clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-    ctx.set_return(SyscallReturn::ok(payload.len() as u64));
+    ctx.set_return(SyscallReturn::ok(copied_len as u64));
 }
 
 /// `msgctl(msqid, cmd, buf)`.

@@ -399,14 +399,17 @@ the first blocking sembuf from their most recent atomic evaluation;
 interruption, timeout, successful retry, task exit, or set removal retires that
 waiter state. The counts are exact per-set integer state updated with queue
 linkage, so reads are O(1); they are not approximate per-CPU telemetry. System V
-message send imports the type and payload before queue lookup and reports copy
-faults as `EFAULT`. Queues enforce
+message send imports the type and payload before queue lookup, reports copy
+faults as `EFAULT`, and reports payload or queue-record allocation failure as
+`ENOMEM` without partial publication. Queues enforce
 Linux's default 16-KiB byte and zero-length-message count limit; full blocking
 sends park, while `IPC_NOWAIT` returns `EAGAIN`. Receive supports Linux type
 selection, `IPC_NOWAIT`, `MSG_NOERROR`, `MSG_EXCEPT`, and `MSG_COPY`; an
 oversize receive without `MSG_NOERROR` returns `E2BIG` without dequeueing.
-Normal receives reserve the exact selected record and remove it only after one
-range-validated header-plus-payload copyout, so `EFAULT` is non-destructive.
+Normal receives select and unlink the exact record in one locked queue
+transaction before copying the type and payload to userspace in Linux order;
+an ordinary `EFAULT` therefore consumes the selected message, while `MSG_COPY`
+retains it.
 Queue removal wakes staged semaphore, sender, and receiver waits with `EIDRM`.
 Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
 `IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;

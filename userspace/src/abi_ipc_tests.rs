@@ -46,6 +46,7 @@ const E2BIG: i64 = -7;
 const EFBIG: i64 = -27;
 const ENOMSG: i64 = -42;
 const MSG_NOERROR: u64 = 0o10000;
+const MSG_COPY: u64 = 0o40000;
 const SEM_UNDO: i16 = 0o10000;
 const EIDRM: i64 = -43;
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
@@ -1386,7 +1387,7 @@ fn smoke_abi_ipc_msgrcv_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_neg);
 
-fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
+fn smoke_abi_ipc_msgrcv_size_and_fault_order() -> TestResult {
     with_setup(|| {
         let id = make_msgq()?;
         let mut sent = [0u8; 12];
@@ -1417,12 +1418,20 @@ fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
             return Err("selected-message copyout fault must return EFAULT");
         }
         let mut full = [0u8; 12];
-        let r = recv(full.as_mut_ptr() as u64, 4, IPC_NOWAIT);
-        if r.value as i64 != 4 || &full[8..] != b"data" {
-            return Err("E2BIG/EFAULT destructively removed the queued message");
+        if recv(full.as_mut_ptr() as u64, 4, IPC_NOWAIT).value as i64 != ENOMSG {
+            return Err("ordinary msgrcv EFAULT must consume the selected message");
         }
 
-        // MSG_NOERROR is the only mode that permits truncation and removal.
+        // E2BIG remains non-destructive: the original message is still first.
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: replacement msgsnd failed");
+        }
+        let r = recv(full.as_mut_ptr() as u64, 4, IPC_NOWAIT);
+        if r.value as i64 != 4 || &full[8..] != b"data" {
+            return Err("E2BIG must leave the queued message available");
+        }
+
+        // MSG_NOERROR permits truncation and removal.
         if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
             return Err("setup: second msgsnd failed");
         }
@@ -1437,9 +1446,81 @@ fn smoke_abi_ipc_msgrcv_size_and_fault_transaction() -> TestResult {
         Ok(())
     })
 }
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_size_and_fault_order);
+
+fn smoke_abi_ipc_msgrcv_copy_fault_is_non_destructive() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut sent = [0u8; 12];
+        sent[..8].copy_from_slice(&11i64.to_le_bytes());
+        sent[8..].copy_from_slice(b"copy");
+        if call(Syscall::Msgsnd.raw(), a3(id, sent.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: msgsnd failed");
+        }
+        let recv = |ptr, flags| {
+            call_raw(
+                Syscall::Msgrcv.raw(),
+                SyscallArgs {
+                    arg0: id,
+                    arg1: ptr,
+                    arg2: 4,
+                    arg3: 0,
+                    arg4: flags,
+                    ..Default::default()
+                },
+            )
+        };
+        let invalid = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: 987_654,
+                arg1: BAD_PTR,
+                arg2: 4,
+                arg3: 0,
+                arg4: IPC_NOWAIT | MSG_COPY,
+                ..Default::default()
+            },
+        );
+        if invalid.value as i64 != EFAULT {
+            return Err("MSG_COPY must fault its scratch import before queue lookup");
+        }
+        if recv(BAD_PTR, IPC_NOWAIT | MSG_COPY).value as i64 != EFAULT {
+            return Err("MSG_COPY bad output must return EFAULT");
+        }
+        let mut copied = [0u8; 12];
+        let copy_result = recv(copied.as_mut_ptr() as u64, IPC_NOWAIT | MSG_COPY);
+        if copy_result.value as i64 != 4
+            || copied[..8] != 11i64.to_le_bytes()
+            || &copied[8..] != b"copy"
+        {
+            return Err("MSG_COPY must return the selected message without dequeueing it");
+        }
+        let mut short = [0u8; 10];
+        let oversized_copy = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: short.as_mut_ptr() as u64,
+                arg2: 2,
+                arg3: 0,
+                arg4: IPC_NOWAIT | MSG_COPY | MSG_NOERROR,
+                ..Default::default()
+            },
+        );
+        if oversized_copy.value as i64 != EINVAL {
+            return Err("oversize MSG_COPY|MSG_NOERROR must return EINVAL");
+        }
+        let mut full = [0u8; 12];
+        let r = recv(full.as_mut_ptr() as u64, IPC_NOWAIT);
+        if r.value as i64 != 4 || full[..8] != 11i64.to_le_bytes() || &full[8..] != b"copy" {
+            return Err("MSG_COPY EFAULT must leave the selected message queued");
+        }
+        Ok(())
+    })
+}
 kernel_test_in!(
     "syscall_abi",
-    smoke_abi_ipc_msgrcv_size_and_fault_transaction
+    smoke_abi_ipc_msgrcv_copy_fault_is_non_destructive
 );
 
 fn smoke_abi_ipc_msgrcv_blocking_retry() -> TestResult {
