@@ -89,6 +89,8 @@ const SEM_UNDO: i16 = 0o10000;
 /// operation nor accidentally acquire behavior in later bit tests.
 const SEM_BEHAVIOR_FLAGS: i16 = IPC_NOWAIT | SEM_UNDO;
 const SEMVMX: i32 = 32767;
+const MAX_SEMS_PER_SET: usize = 1024;
+const SEM_BITMAP_WORDS: usize = MAX_SEMS_PER_SET.div_ceil(64);
 
 // ipc control cmds (low bits; libc ORs IPC_64 = 0x100 which we mask off).
 const IPC_RMID: u64 = 0;
@@ -577,17 +579,32 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
             .iter()
             .position(|((owner, _, _, _), _)| *owner == undo_owner)
         {
-            let ((_, ipc_ns, semid, semnum), adjustment) = state.undos.remove(index);
-            if adjustment == 0 {
-                continue;
-            }
-            if let Some(set) = state.sets.get_mut(&(ipc_ns, semid)) {
-                if let Some(sem) = set.sems.get_mut(semnum) {
-                    *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
-                    set.pids[semnum] = pid;
+            let (_, ipc_ns, semid, _) = state.undos[index].0;
+            let object = (ipc_ns, semid);
+            let mut changed = false;
+            // One Linux sem_undo contains the adjustment vector for a whole
+            // set. Apply every member while holding this transaction, then
+            // expose the final state to queued operations exactly once.
+            while index < state.undos.len() {
+                let ((owner, namespace, id, semnum), adjustment) = state.undos[index];
+                if owner != undo_owner || (namespace, id) != object {
+                    break;
+                }
+                state.undos.remove(index);
+                if adjustment == 0 {
+                    continue;
+                }
+                if let Some(set) = state.sets.get_mut(&object) {
+                    if let Some(sem) = set.sems.get_mut(semnum) {
+                        *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
+                        set.pids[semnum] = pid;
+                        changed = true;
+                    }
                 }
             }
-            scan_sem_waiters(state, (ipc_ns, semid));
+            if changed {
+                scan_sem_waiters(state, object);
+            }
         }
     });
     drain_sem_wakes();
@@ -652,7 +669,7 @@ fn perform_sem_ops(
     // operation may touch before changing semvals; a later queued handoff is
     // consequently allocation-free.
     if let Some(owner) = undo_owner {
-        let mut missing = [None::<SemUndoKey>; MAX_SOPS];
+        let mut missing = [0u64; SEM_BITMAP_WORDS];
         let mut missing_len = 0usize;
         for i in 0..nsops {
             let (num, op, flg) = parse_sem_op(sops, i);
@@ -660,29 +677,32 @@ fn perform_sem_ops(
                 continue;
             }
             let key = (owner, ipc_ns, semid, num);
-            if sem_undo_index(undos, key).is_err()
-                && !missing[..missing_len]
-                    .iter()
-                    .flatten()
-                    .any(|seen| *seen == key)
-            {
-                missing[missing_len] = Some(key);
+            let word = num / 64;
+            let bit = 1u64 << (num % 64);
+            if sem_undo_index(undos, key).is_err() && missing[word] & bit == 0 {
+                missing[word] |= bit;
                 missing_len += 1;
             }
         }
         if undos.try_reserve(missing_len).is_err() {
             return Err((ENOMEM, true, None));
         }
-        for key in missing[..missing_len].iter().flatten().copied() {
+        for num in 0..set.sems.len() {
+            if missing[num / 64] & (1u64 << (num % 64)) == 0 {
+                continue;
+            }
+            let key = (owner, ipc_ns, semid, num);
             let index = sem_undo_index(undos, key).unwrap_or_else(|index| index);
             undos.insert(index, (key, 0));
         }
     }
 
-    // Bounded, allocation-free transaction scratch. MAX_SOPS is Linux's
-    // observable SEMOPM limit, so a linear duplicate lookup is bounded.
-    let mut undo_updates = [None::<(usize, i32)>; MAX_SOPS];
-    let mut undo_update_len = 0usize;
+    // Index transaction scratch by semaphore number rather than operation.
+    // The largest legal set uses 4 KiB of deltas plus a 128-byte bitmap; the
+    // previous Option<(usize, i32)>[SEMOPM] plus key array exceeded a 32-KiB
+    // task stack for the legal nsops=500 boundary.
+    let mut undo_deltas = [0i32; MAX_SEMS_PER_SET];
+    let mut undo_touched = [0u64; SEM_BITMAP_WORDS];
     let mut applied = 0usize;
     let mut fail = None;
     for i in 0..nsops {
@@ -703,30 +723,16 @@ fn perform_sem_ops(
         }
         if flg & SEM_UNDO != 0 && op != 0 {
             let owner = undo_owner.expect("SEM_UNDO owner");
-            let existing = undo_updates[..undo_update_len]
-                .iter()
-                .flatten()
-                .position(|(semnum, _)| *semnum == num);
-            let prior = existing.map_or_else(
-                || {
-                    sem_undo_index(undos, (owner, ipc_ns, semid, num))
-                        .ok()
-                        .map(|index| undos[index].1)
-                        .unwrap_or(0)
-                },
-                |index| undo_updates[index].expect("occupied undo update").1,
-            );
+            let index = sem_undo_index(undos, (owner, ipc_ns, semid, num))
+                .expect("SEM_UNDO key preallocated");
+            let prior = undos[index].1 + undo_deltas[num];
             let next_undo = prior - i32::from(op);
             if !((-SEMVMX - 1)..=SEMVMX).contains(&next_undo) {
                 fail = Some((ERANGE, true, None));
                 break;
             }
-            if let Some(index) = existing {
-                undo_updates[index] = Some((num, next_undo));
-            } else {
-                undo_updates[undo_update_len] = Some((num, next_undo));
-                undo_update_len += 1;
-            }
+            undo_deltas[num] -= i32::from(op);
+            undo_touched[num / 64] |= 1u64 << (num % 64);
         }
         if op != 0 {
             set.sems[num] = next;
@@ -743,10 +749,13 @@ fn perform_sem_ops(
         return Err(failure);
     }
     if let Some(owner) = undo_owner {
-        for (semnum, adjustment) in undo_updates[..undo_update_len].iter().flatten().copied() {
+        for semnum in 0..set.sems.len() {
+            if undo_touched[semnum / 64] & (1u64 << (semnum % 64)) == 0 {
+                continue;
+            }
             let key = (owner, ipc_ns, semid, semnum);
             let index = sem_undo_index(undos, key).expect("SEM_UNDO key preallocated");
-            undos[index].1 = adjustment;
+            undos[index].1 += undo_deltas[semnum];
         }
     }
     for i in 0..nsops {
@@ -873,13 +882,13 @@ fn scan_sem_waiters(state: &mut SemState, object: IpcObjectKey) {
     set.pending = pending;
 }
 
-fn unlink_sem_wait(state: &mut SemState, task: u64) {
+fn unlink_sem_wait(state: &mut SemState, task: u64) -> Option<SemWait> {
     let Ok(index) = sem_wait_index(&state.waits, task) else {
-        return;
+        return None;
     };
     let wait = state.waits.remove(index);
     if wait.result.is_some() {
-        return;
+        return Some(wait);
     }
     if let Some(set) = state.sets.get_mut(&(wait.ipc_ns, wait.id)) {
         if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
@@ -889,6 +898,7 @@ fn unlink_sem_wait(state: &mut SemState, task: u64) {
             adjust_wait_count(set, blocker, false);
         }
     }
+    Some(wait)
 }
 
 fn finish_pending_sem_wait(task: u64, errno: i64) -> i64 {
@@ -923,16 +933,19 @@ fn finish_pending_sem_wait(task: u64, errno: i64) -> i64 {
 }
 
 fn take_sem_wait_result(task: u64, ipc_ns: u64, id: u64) -> Option<i64> {
-    with_sem_state(|state| {
+    let (result, wait) = with_sem_state(|state| {
         let index = sem_wait_index(&state.waits, task).ok()?;
         let result = state.waits.get(index).and_then(|wait| {
             (wait.ipc_ns == ipc_ns && wait.id == id)
                 .then_some(wait.result)
                 .flatten()
         })?;
-        state.waits.remove(index);
-        Some(result)
-    })
+        Some((result, state.waits.remove(index)))
+    })?;
+    // SemWait owns a retained operation and possibly the final task-waker Arc.
+    // Drop both only after the IRQ-safe global semaphore lock is released.
+    drop(wait);
+    Some(result)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1106,7 +1119,7 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 return Err(ENOENT);
             }
         }
-        if nsems == 0 || nsems > 1024 {
+        if nsems == 0 || nsems > MAX_SEMS_PER_SET {
             return Err(EINVAL);
         }
         let mut sems = Vec::new();

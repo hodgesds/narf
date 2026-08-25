@@ -603,6 +603,30 @@ fn smoke_abi_ipc_semop_errno_order() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_errno_order);
 
+fn smoke_abi_ipc_semop_semopm_boundary() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut sops = alloc::vec![0u8; 500 * 6];
+        for i in 0..500 {
+            let offset = i * 6;
+            let op = if i & 1 == 0 { 1i16 } else { -1i16 };
+            sops[offset + 2..offset + 4].copy_from_slice(&op.to_le_bytes());
+            sops[offset + 4..offset + 6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        }
+        if call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 500)) != Some(0) {
+            return Err("semop must accept the exact Linux SEMOPM boundary");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("500-operation transaction did not preserve its net value");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semop_semopm_boundary
+);
+
 fn smoke_abi_ipc_semop_flag_tolerance_bounds_and_blocking_retry() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
@@ -1000,6 +1024,67 @@ fn smoke_abi_ipc_sem_queue_timeout_and_undo_handoff() -> TestResult {
 kernel_test_in!(
     "syscall_abi/sysvipc_correctness",
     smoke_abi_ipc_sem_queue_timeout_and_undo_handoff
+);
+
+fn smoke_abi_ipc_sem_exit_undo_is_set_atomic() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(2)?;
+        let initial = [1u16, 0u16];
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SETALL, initial.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setup: SETALL [1,0] failed");
+        }
+
+        const OWNER: u64 = FAKE_TASK + 25;
+        let mut establish = [0u8; 12];
+        establish[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        establish[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        establish[6..8].copy_from_slice(&1u16.to_le_bytes());
+        establish[8..10].copy_from_slice(&1i16.to_le_bytes());
+        establish[10..12].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        set_task(OWNER);
+        let owner_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, establish.as_ptr() as u64, 2)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: two-member SEM_UNDO transaction failed");
+        }
+
+        const WAITER: u64 = FAKE_TASK + 26;
+        let mut decrement_both = [0u8; 12];
+        decrement_both[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        decrement_both[6..8].copy_from_slice(&1u16.to_le_bytes());
+        decrement_both[8..10].copy_from_slice(&(-1i16).to_le_bytes());
+        set_task(WAITER);
+        if call_raw(
+            Syscall::Semop.raw(),
+            a2(id, decrement_both.as_ptr() as u64, 2),
+        )
+        .value
+            != 0xDEAD
+        {
+            set_task(FAKE_TASK);
+            return Err("setup: atomic decrement waiter did not block");
+        }
+
+        crate::sysvipc::sem_undo_process_exit(owner_pid, OWNER);
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1)
+            || call(Syscall::Semctl.raw(), a3(id, 1, GETVAL, 0)) != Some(0)
+        {
+            return Err("exit exposed an intermediate SEM_UNDO set state");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 1, GETNCNT, 0)) != Some(1) {
+            return Err("waiter committed between member-wise undo adjustments");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_exit_undo_is_set_atomic
 );
 
 fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {

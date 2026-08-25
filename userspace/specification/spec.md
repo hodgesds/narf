@@ -393,7 +393,9 @@ timed waits return `EAGAIN`, signals return `EINTR`, and removal returns
 `EIDRM`, with the first terminal transition winning. `SEM_UNDO` adjustments are
 accumulated per process, atomically committed with the operation, shared by
 `CLONE_SYSVSEM`, cleared by `SETVAL`/`SETALL`, and reversed when the final
-sharing process exits.
+sharing process exits. Exit applies every adjustment for one semaphore set
+before scanning its wait queue, so no operation observes a member-wise
+intermediate state.
 Semaphores retain Linux's per-member `sempid`: successful `semop` entries,
 including zero waits, `SETVAL`, every member of `SETALL`, and exit-time undo
 publish the responsible process, which `GETPID` translates into the querying
