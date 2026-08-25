@@ -707,3 +707,7 @@ argument = "Mapping receipts and external file-owner buckets are bound to one no
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The program break, its owned VMA tail, and Linux resource-limit admission are revalidated and published under the existing per-address-space VMA transaction, preventing CLONE_VM peers from using a stale break to unmap or annex another mapping. Lazy descriptor allocation occurs before retrying the transaction and carries no physical-frame authority. Below-base requests and failed tail retirement preserve both the prior break and mapping metadata. RLIMIT_DATA metadata is immutable after exec publication and copied only with the existing fork address-space clone. Excluding the synthetic unbacked stack guard from Linux VMA accounting changes no PTE, frame ownership, domain, capability, or access permission."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Base-page VMA growth and relocation reserve their proportional backing-slot metadata fallibly before changing authoritative length or coordinates. Allocation failure returns a typed error with the original source mapping, leaf translations, reverse-map owners, and physical frames unchanged; no new address, domain, capability, or backing authority is published. The successful commit retains the existing VMA transaction, leaf-installation rollback, TLB invalidation, reverse-map transfer, and post-invalidation frame-release ordering."

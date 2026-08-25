@@ -954,6 +954,9 @@ pub enum AddressSpaceError {
     Unmapped,
     /// A mapping receipt was invalidated by a structural VMA mutation.
     StaleMapping,
+    /// Kernel metadata for the requested VMA shape could not be allocated.
+    /// Syscall boundaries normally expose this as `ENOMEM`.
+    AllocationFailed,
     /// An eager `mlock` population pass could not obtain or install backing.
     /// Linux exposes this separately from an unmapped range: population-time
     /// failure is `EAGAIN`, a coverage hole is `ENOMEM`, and malformed range
@@ -2809,6 +2812,15 @@ impl AddressSpace {
             && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
             && !region.perms.contains(RegionPerms::LOCK_EXEMPT)
             && region.perms.prot_only().0 != 0;
+        // VMA metadata allocation is fallible at the syscall boundary. An
+        // unchecked Vec::push loop here lets an unprivileged gigantic
+        // mremap reach the kernel allocator's abort path while IRQs and the
+        // address-space transaction are held. Reserve before publishing any
+        // length/backing change so ENOMEM leaves the source untouched.
+        region
+            .phys
+            .try_reserve_exact(add_pages)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
         for _ in 0..add_pages {
             region.phys.push(PhysAddr::new(0));
         }
@@ -3027,8 +3039,7 @@ impl AddressSpace {
         let source = regions
             .get(old_lo)
             .filter(|region| region.len == old_len)
-            .ok_or(AddressSpaceError::Unmapped)?
-            .clone();
+            .ok_or(AddressSpaceError::Unmapped)?;
         if new_len > old_len
             && source.perms.contains(RegionPerms::LOCKED)
             && !bypass_limit
@@ -3044,13 +3055,26 @@ impl AddressSpace {
         }
 
         let kept_pages = core::cmp::min(old_len, new_len) as usize >> 12;
-        let mut moved = source.clone();
-        moved.base = new_base;
-        moved.len = new_len;
-        moved.phys.truncate(kept_pages);
-        moved
-            .phys
-            .resize((new_len >> 12) as usize, PhysAddr::new(0));
+        let new_pages =
+            usize::try_from(new_len >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
+        // Build every proportional metadata allocation before changing the
+        // source coordinates. extend/resize are infallible after an exact
+        // successful reservation, so the source commit below cannot invoke
+        // the allocator's abort path. A FIXED wrapper may already have retired
+        // its target; that post-punch outcome is surfaced separately by the
+        // syscall transaction rather than hidden as source mutation.
+        let mut moved_phys = Vec::new();
+        moved_phys
+            .try_reserve_exact(new_pages)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        moved_phys.extend(source.phys.iter().take(kept_pages).copied());
+        moved_phys.resize(new_pages, PhysAddr::new(0));
+        let moved = Region {
+            base: new_base,
+            len: new_len,
+            perms: source.perms,
+            phys: moved_phys,
+        };
 
         if self.root.as_u64() != 0 {
             // Preinstall the complete destination while the source remains
@@ -3097,7 +3121,7 @@ impl AddressSpace {
             // publishing the new region coordinates.
             // SAFETY: `source` remains owned by this address space under the
             // region locks, and its validated user range is still mapped.
-            unsafe { self.unmap_region_leaves_local(&source) };
+            unsafe { self.unmap_region_leaves_local(source) };
 
             // Move the reverse-map authority in the same region transaction.
             // Reclaim and migration resolve a resident frame through rmap;
@@ -3121,10 +3145,9 @@ impl AddressSpace {
                 }
             }
         }
-        let removed = regions
+        let source = regions
             .remove(old_lo)
             .expect("relocation source disappeared under region lock");
-        debug_assert_eq!(removed, source);
         assert!(regions.insert(moved).is_none());
         drop(regions);
         drop(huge);

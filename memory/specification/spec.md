@@ -486,8 +486,10 @@ impl AddressSpace {
         -> Result<MappingReceipt, AddressSpaceError>;
     pub unsafe fn replace_region_locked_limited_receipt(/* ... */)
         -> Result<MappingReceipt, AddressSpaceError>;
-    /// Locked VMA resize/move admits growth before mutation. Eager population
-    /// occurs only after the IRQ-safe VMA transaction is released.
+    /// Locked VMA resize/move admits growth before mutation. Proportional VMA
+    /// metadata is fallibly reserved before publication; exhaustion returns
+    /// `AllocationFailed` without changing the source. Eager population occurs
+    /// only after the IRQ-safe VMA transaction is released.
     pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
     pub unsafe fn relocate_region_limited(/* ... */)
         -> Result<(), AddressSpaceError>;

@@ -11843,6 +11843,41 @@ fn smoke_memory_eager_locked_grow_populates_tail() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_eager_locked_grow_populates_tail);
 
+/// A user-half-valid but allocator-impossible mremap grow must report a typed
+/// allocation failure instead of entering the kernel allocator's abort path.
+/// The failed reservation is made before `Region::len` or its backing vector
+/// changes, so the original mapping remains authoritative.
+fn smoke_memory_grow_metadata_allocation_is_fallible() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let base = VirtAddr::new(AddressSpace::MMAP_CURSOR_BASE);
+    if address_space
+        .map_region(Region {
+            base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("metadata-allocation setup failed");
+    }
+    let impossible_len = AddressSpace::USER_HALF_END - base.as_u64();
+    if address_space.grow_region(base, impossible_len) != Err(AddressSpaceError::AllocationFailed) {
+        return TestResult::Fail("impossible metadata grow did not fail cleanly");
+    }
+    if address_space
+        .lookup(base)
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![PhysAddr::new(0)])
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("failed metadata reservation changed the source VMA")
+    }
+}
+kernel_test_in!("memory", smoke_memory_grow_metadata_allocation_is_fallible);
+
 /// A relocating grow preserves the source lock mode and eagerly populates only
 /// the new destination tail.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
