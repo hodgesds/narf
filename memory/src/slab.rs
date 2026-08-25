@@ -584,6 +584,12 @@ const MAG_SIZE: usize = 16;
 #[repr(align(64))] // cache-line-pad to avoid false sharing
 struct Magazine {
     inner: UnsafeCell<MagazineInner>,
+    /// Alloc/free operations served from this CPU's magazine. Keeping the
+    /// telemetry with the already cache-line-isolated fast-path state avoids
+    /// bouncing one size-class-wide counter between CPUs.
+    hit_count: AtomicU64,
+    /// Operations that had to refill, spill, or grow from this CPU.
+    miss_count: AtomicU64,
 }
 
 struct MagazineInner {
@@ -598,21 +604,29 @@ impl Magazine {
                 stack: [None; MAG_SIZE],
                 top: 0,
             }),
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
         }
     }
 }
 
-// SAFETY: per-CPU access pattern. The dispatcher only reads/writes
-// the magazine for the active CPU, so the `UnsafeCell` is never
-// shared across CPUs in flight. The `Sync` bound is what lets us
-// store a `[Magazine; MAX_CPUS]` in a `static`.
+// `MagazineInner` is 136 bytes on both supported 64-bit architectures. The
+// cache-line alignment already rounded the old telemetry-free Magazine to 192
+// bytes, so the two counters consume existing tail padding rather than growing
+// the static per-CPU magazine array.
+const _: () = assert!(core::mem::size_of::<Magazine>() == 192);
+
+// SAFETY: the dispatcher only reads/writes `inner` for the active CPU, so the
+// `UnsafeCell` is never shared across CPUs in flight. Statistics may read every
+// magazine's counters concurrently, but those fields are atomic. The `Sync`
+// bound is what lets us store a `[Magazine; MAX_CPUS]` in a `static`.
 unsafe impl Sync for Magazine {}
 
 /// Per-size-class state. Central free-list head is behind a
 /// spin-lock; the magazine array gives each CPU a fast path that
 /// doesn't touch the lock until the magazine empties or fills.
 ///
-/// The `mag_hit_count` / `mag_miss_count` counters are the
+/// The per-magazine hit/miss counters are the
 /// observability surface Bonwick & Adams (2001) §4 ("Object
 /// Caching with Per-CPU Magazines") describes as essential for
 /// validating that the magazine layer is actually pulling its
@@ -626,15 +640,6 @@ struct SizeClass {
     in_use: AtomicUsize,
     /// Per-CPU magazines. Indexed by `current_cpu()`.
     magazines: [Magazine; MAX_CPUS],
-    /// Number of alloc / free operations served entirely from a
-    /// per-CPU magazine (the lock-free fast path). Summed across
-    /// CPUs via `Relaxed` — readers don't need a coherent snapshot,
-    /// just a monotonic counter that survives wraparound at the
-    /// 64-bit horizon.
-    mag_hit_count: AtomicU64,
-    /// Number of alloc / free operations that missed the magazine
-    /// and had to touch the central lock (or grow a fresh frame).
-    mag_miss_count: AtomicU64,
 }
 
 impl SizeClass {
@@ -644,9 +649,18 @@ impl SizeClass {
             grown: AtomicUsize::new(0),
             in_use: AtomicUsize::new(0),
             magazines: [const { Magazine::new() }; MAX_CPUS],
-            mag_hit_count: AtomicU64::new(0),
-            mag_miss_count: AtomicU64::new(0),
         }
+    }
+
+    /// Sum per-CPU telemetry modulo 2^64, preserving the old global counter's
+    /// wraparound semantics without putting a shared RMW on the fast path.
+    fn magazine_counts(&self) -> (u64, u64) {
+        self.magazines.iter().fold((0, 0), |(hits, misses), mag| {
+            (
+                hits.wrapping_add(mag.hit_count.load(Ordering::Relaxed)),
+                misses.wrapping_add(mag.miss_count.load(Ordering::Relaxed)),
+            )
+        })
     }
 }
 
@@ -801,7 +815,9 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
         if mag.top == 0 {
             // Atomic path never touches the central lock, so an empty
             // magazine is a permanent miss for this caller.
-            class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .miss_count
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
         mag.top -= 1;
@@ -809,7 +825,9 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
         // SAFETY: `blk` was just popped; we hold the only reference.
         unsafe { canary_on_alloc(blk, c) };
         class.in_use.fetch_add(1, Ordering::Relaxed);
-        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .hit_count
+            .fetch_add(1, Ordering::Relaxed);
         let out: NonNull<u8> = blk.cast();
         #[cfg(feature = "kasan")]
         kasan_alloc(out, c);
@@ -850,7 +868,9 @@ pub unsafe fn try_dealloc_atomic(
         if mag.top >= MAG_SIZE {
             // Full magazine in atomic context — we can't drain to the
             // central lock here, so count this as a miss for the caller.
-            class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .miss_count
+                .fetch_add(1, Ordering::Relaxed);
             return Err(AtomicDeallocFull);
         }
         let blk = ptr.cast::<FreeBlock>();
@@ -863,7 +883,9 @@ pub unsafe fn try_dealloc_atomic(
         mag.stack[mag.top] = Some(blk);
         mag.top += 1;
         class.in_use.fetch_sub(1, Ordering::Relaxed);
-        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .hit_count
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     })
 }
@@ -899,8 +921,8 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     narf_lib::sync::without_interrupts(|| {
         let cpu = current_cpu();
 
-        // FAST PATH: pop from the per-CPU magazine. No atomics, no
-        // lock — only the active CPU touches its own magazine cell.
+        // FAST PATH: pop from the per-CPU magazine. No shared atomics or
+        // lock — only the active CPU updates this magazine's cache lines.
         // SAFETY: per-CPU access invariant, IRQs masked above.
         let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
         if mag.top > 0 {
@@ -909,13 +931,17 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             // SAFETY: `blk` was just popped; we hold the only reference.
             unsafe { canary_on_alloc(blk, c) };
             class.in_use.fetch_add(1, Ordering::Relaxed);
-            class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .hit_count
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(blk.cast());
         }
         // Magazine empty — every path from here touches the central
         // lock (refill) or the buddy (grow). Count once per miss event,
         // not per block batched-in.
-        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .miss_count
+            .fetch_add(1, Ordering::Relaxed);
 
         // SLOW PATH 1: refill the magazine from the central free list.
         // Take up to MAG_SIZE/2 blocks under one lock acquisition so
@@ -1053,11 +1079,15 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
             mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
             mag.top += 1;
             class.in_use.fetch_sub(1, Ordering::Relaxed);
-            class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .hit_count
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // Magazine full — we have to spill to the central list.
-        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .miss_count
+            .fetch_add(1, Ordering::Relaxed);
 
         // SLOW PATH: magazine full. Flush the bottom half back to the
         // central free list, compact the top half down, then push the
@@ -1222,12 +1252,13 @@ pub fn stats() -> SlabStats {
         mag_miss_count: 0,
     }; N_CLASSES];
     for (i, c) in CLASSES.iter().enumerate() {
+        let (mag_hit_count, mag_miss_count) = c.magazine_counts();
         classes[i] = ClassStats {
             block_size: class_size(i),
             grown: c.grown.load(Ordering::Relaxed),
             in_use: c.in_use.load(Ordering::Relaxed),
-            mag_hit_count: c.mag_hit_count.load(Ordering::Relaxed),
-            mag_miss_count: c.mag_miss_count.load(Ordering::Relaxed),
+            mag_hit_count,
+            mag_miss_count,
         };
     }
     SlabStats {
@@ -1237,13 +1268,14 @@ pub fn stats() -> SlabStats {
 }
 
 /// Magazine hit / miss totals summed across every size class.
-/// O(N_CLASSES); cheap enough for periodic observability scrapes.
+/// O(N_CLASSES * MAX_CPUS); cheap enough for periodic observability scrapes.
 pub fn magazine_stats() -> MagazineStats {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
     for c in CLASSES.iter() {
-        hits = hits.wrapping_add(c.mag_hit_count.load(Ordering::Relaxed));
-        misses = misses.wrapping_add(c.mag_miss_count.load(Ordering::Relaxed));
+        let (class_hits, class_misses) = c.magazine_counts();
+        hits = hits.wrapping_add(class_hits);
+        misses = misses.wrapping_add(class_misses);
     }
     MagazineStats {
         mag_hit_count: hits,
@@ -1774,14 +1806,14 @@ fn smoke_slab_magazine_spill_to_global() -> narf_kernel_test::TestResult {
         }
     }
 
-    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+    let misses_before = class.magazine_counts().1;
     // SAFETY: layout matches the alloc.
     unsafe {
         for p in ptrs {
             dealloc(p, layout);
         }
     }
-    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+    let misses_after = class.magazine_counts().1;
 
     if misses_after <= misses_before {
         return TestResult::Fail("spill didn't bump mag_miss_count");
@@ -1839,7 +1871,7 @@ fn smoke_slab_magazine_refill_from_global() -> narf_kernel_test::TestResult {
     }
 
     let grown_before = class.grown.load(Ordering::Relaxed);
-    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+    let misses_before = class.magazine_counts().1;
 
     // Step 3: one alloc on an empty magazine — must refill.
     let p = match alloc(layout) {
@@ -1848,7 +1880,7 @@ fn smoke_slab_magazine_refill_from_global() -> narf_kernel_test::TestResult {
     };
 
     let grown_after = class.grown.load(Ordering::Relaxed);
-    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+    let misses_after = class.magazine_counts().1;
 
     if grown_after != grown_before {
         return TestResult::Fail("refill grew a fresh frame instead of using central stock");
@@ -1887,8 +1919,7 @@ fn smoke_slab_magazine_stats_counters() -> narf_kernel_test::TestResult {
     // SAFETY: matching layout.
     unsafe { dealloc(warm, layout) };
 
-    let hits_before = class.mag_hit_count.load(Ordering::Relaxed);
-    let misses_before = class.mag_miss_count.load(Ordering::Relaxed);
+    let (hits_before, misses_before) = class.magazine_counts();
     let agg_before = magazine_stats();
 
     // Steady-state loop: alloc + free in lockstep so the magazine
@@ -1904,8 +1935,7 @@ fn smoke_slab_magazine_stats_counters() -> narf_kernel_test::TestResult {
         unsafe { dealloc(p, layout) };
     }
 
-    let hits_after = class.mag_hit_count.load(Ordering::Relaxed);
-    let misses_after = class.mag_miss_count.load(Ordering::Relaxed);
+    let (hits_after, misses_after) = class.magazine_counts();
     let agg_after = magazine_stats();
 
     let hits_delta = hits_after - hits_before;

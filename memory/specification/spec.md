@@ -553,6 +553,12 @@ impl<T> SlabCache<T> {
 pub fn kalloc(size: usize, align: usize, domain: DomainId) -> Option<NonNull<u8>>;
 pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 
+/// Allocation and per-CPU-magazine telemetry snapshots. Hit/miss totals are
+/// aggregated modulo 2^64 at read time; allocation/free fast paths update only
+/// the executing CPU's cache-line-isolated magazine counters.
+pub fn slab::stats() -> SlabStats;
+pub fn slab::magazine_stats() -> MagazineStats;
+
 // Task-context domain state. Its architecture representation is private so
 // scheduler policies cannot manufacture or directly switch rights state.
 pub struct DomainSavedState {
