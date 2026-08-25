@@ -216,6 +216,20 @@ without it, no PSI cgroup ABI is present. The current PSI implementation
 reports Linux-shaped zero counters and does not yet implement pressure-trigger
 writes or poll notifications.
 
+The memory-controller allocator hook is nonblocking in every allocation
+context. Crossing `memory.high` commits the charge and publishes a capped,
+coalesced background-reclaim request. Breaching `memory.max` publishes the
+same non-OOM-authorized work and returns the allocator's exhaustion result.
+Fallible callers map that result to `ENOMEM`; syscall paths that collapse
+allocation exhaustion into another internal error must preserve it before
+performing their Linux errno mapping. The hook never invokes shrinkers, waits,
+or selects an OOM victim inline because its caller may hold an IRQ-safe lock
+that those paths need. Hierarchical current counters use atomic reservation
+with rollback, so concurrent charges cannot individually pass a stale max
+check and overrun the limit. Background reclaim is currently global rather
+than cgroup-keyed; deferred throttling and scoped memcg OOM require stable
+allocation-owner attribution and remain follow-up work.
+
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
 `/proc/<pid>/numa_maps` reports each registered base-page or hardware
