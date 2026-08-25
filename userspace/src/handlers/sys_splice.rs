@@ -43,6 +43,19 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
+    // The copy fallback may re-read a seekable source after a short sink
+    // write, but that is not possible for a destructive stream read.  The
+    // anonymous-pipe implementation below has an explicit peek/commit
+    // transaction; named FIFOs and sockets do not yet expose one.  Fail
+    // closed instead of silently discarding their unwritten source tail.
+    let input_has_transactional_splice = in_ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        .is_some();
+    if in_ops.is_stream() && !input_has_transactional_splice {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     // fs/splice.c::__do_splice: "if (ipipe && off_in) return -ESPIPE;"
     // (and the same for opipe/off_out) — a pipe has no file position.
     if (in_is_pipe && off_in_ptr != 0) || (out_is_pipe && off_out_ptr != 0) {
@@ -72,13 +85,14 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     // accepted the bytes; a concurrent writer could refill that capacity and
     // the rollback then overfilled the pipe. A future zero-copy path needs an
     // explicit reservation/commit protocol before it can replace this path.
-    let outcome = copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, len);
+    let outcome = copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, off_out_ptr, len);
     match outcome {
-        Some(Err(narf_filesystem::FsError::WouldBlock)) if len > 0 && in_is_pipe => {
-            // Empty pipe source, writer still open: an empty first read
-            // consumes nothing, so EAGAIN or park+re-exec is safe
-            // (`fs/splice.c::splice_file_to_pipe` waits via pipe_wait_*).
-            // Returning the transient 0 as EOF is the lost-data shape.
+        Some(Err(narf_filesystem::FsError::WouldBlock))
+            if len > 0 && (in_is_pipe || out_is_pipe) =>
+        {
+            // Empty source or full sink with no progress consumes nothing, so
+            // EAGAIN or park+re-exec is safe. A partial transfer is returned as
+            // its byte count by the copy core and is never re-executed.
             if flags & SPLICE_F_NONBLOCK != 0 {
                 ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 return;

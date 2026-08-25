@@ -1541,6 +1541,12 @@ fn open_fifo(
         }
     };
 
+    // Opening either direction changes the FIFO peer condition. Blocking
+    // openers use the normal deduplicated I/O-waker registry below; publish
+    // the transition only after the handle/open-count is visible. The shared
+    // readiness generation closes the notify-before-register race.
+    narf_net::readiness::notify(0);
+
     // Peer already present (or O_RDWR / O_NONBLOCK) → return the fd now.
     let peer_ready = rdwr
         || nonblock
@@ -1607,34 +1613,13 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     fifo_park_or_finish(ctx, fd);
 }
 
-/// Park the current task on the ~1ms timer wheel and RIP-rewind so the `open`
-/// syscall re-executes (and `resume_fifo_open` re-checks the peer). Falls back
-/// to returning the fd in a non-executor (kernel-test) context, where no
-/// scheduler can drive the re-check.
+/// Park the current task on the shared I/O-waker registry and RIP-rewind so
+/// the syscall re-executes (and `resume_fifo_open` re-checks the peer). The
+/// timer wheel remains only a ~1ms lost-wake backstop. Falls back to returning
+/// the fd in a non-executor (kernel-test) context.
 fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        let resume_rip = ctx.rip().wrapping_sub(2);
-        ctx.set_rip(resume_rip);
-        // SAFETY: `uctx` is the live per-task ctx; we hold the only reference
-        // while setting the deadline + saving the RIP-rewound CPU state before
-        // the yield hook hands the task to the executor.
-        unsafe {
-            let uc = &*uctx;
-            uc.sleep_deadline_ns
-                .store(dl, core::sync::atomic::Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
-                return;
-            }
-            hook(uctx);
-        }
-        // unreachable — hook() longjmps to the executor
+    if park_reexecute_on_io(ctx) {
+        return;
     }
     // No executor (kernel-test): can't park; hand back the fd so the round
     // trip still completes (the peer-rendezvous blocking is only exercised
@@ -3075,6 +3060,7 @@ fn copy_fd_to_fd(
     in_fd: u32,
     out_fd: u32,
     in_off_ptr: u64,
+    out_off_ptr: u64,
     count: usize,
 ) -> Option<Result<usize, narf_filesystem::FsError>> {
     let use_off_ptr = in_off_ptr != 0;
@@ -3082,6 +3068,14 @@ fn copy_fd_to_fd(
         // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
         // range-validates the 8-byte read.
         let b = unsafe { copy_from_user_vec(in_off_ptr, 8) }.ok()?;
+        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    } else {
+        0
+    };
+    let use_out_off_ptr = out_off_ptr != 0;
+    let mut out_off: u64 = if use_out_off_ptr {
+        // SAFETY: same guarded `off_t*` input contract as `in_off_ptr`.
+        let b = unsafe { copy_from_user_vec(out_off_ptr, 8) }.ok()?;
         u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     } else {
         0
@@ -3095,51 +3089,87 @@ fn copy_fd_to_fd(
     const CHUNK: usize = 65536;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> =
-            fd::with_table(task, |t| {
-                let entry = t.get_mut(in_fd)?;
-                let off = if use_off_ptr { in_off } else { entry.offset };
-                let mut kbuf = alloc::vec![0u8; want];
-                let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
-                    Some(Ok(n)) => n,
-                    Some(Err(error)) => return Some(Err(error)),
-                    None => 0,
-                };
-                kbuf.truncate(n);
-                if !use_off_ptr {
-                    entry.offset = off.saturating_add(n as u64);
+        let step = fd::with_table(task, |t| {
+            let (input, output) = t.get_pair_mut(in_fd, out_fd)?;
+            let input_ops = input.ops.clone();
+            let output_ops = output.ops.clone();
+            let step_out_off = if use_out_off_ptr {
+                out_off
+            } else {
+                output.offset
+            };
+
+            let moved = if let Some(pipe_in) = input_ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+            {
+                if let Some(pipe_out) = output_ops
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
+                {
+                    pipe_in.splice_to_pipe(pipe_out, want)
+                } else {
+                    pipe_in.splice_to_sink(want, |bytes| {
+                        // The source queue is locked until the accepted prefix
+                        // is committed. Never park an executor task while an
+                        // IRQ-disabling pipe lock is held.
+                        poll_once(output_ops.write(step_out_off, bytes))
+                            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+                    })
                 }
-                Some(Ok(kbuf))
-            })
-            .flatten()?;
-        let kbuf = match read_result {
-            Ok(kbuf) => kbuf,
-            // A short copy is reported normally; only an initial would-block
-            // must reach splice so it can park or return EAGAIN instead of
-            // mistaking the empty pipe for EOF.
+            } else {
+                let result = (|| {
+                    let input_off = if use_off_ptr { in_off } else { input.offset };
+                    let mut kbuf = alloc::vec![0u8; want];
+                    let n = poll_blocking(input_ops.read(input_off, &mut kbuf))
+                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))?;
+                    kbuf.truncate(n);
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    let written = poll_blocking(output_ops.write(step_out_off, &kbuf))
+                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))?;
+                    if written > n {
+                        return Err(narf_filesystem::FsError::InvalidData);
+                    }
+                    Ok(Some(written))
+                })();
+                match result {
+                    Ok(Some(written)) => Ok(written),
+                    Ok(None) => return Some(Ok((0, true))),
+                    Err(error) => Err(error),
+                }
+            };
+
+            match moved {
+                Ok(written) => {
+                    if !use_off_ptr {
+                        input.offset = input.offset.saturating_add(written as u64);
+                    }
+                    if !use_out_off_ptr {
+                        output.offset = step_out_off.saturating_add(written as u64);
+                    }
+                    Some(Ok((written, false)))
+                }
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .flatten()?;
+        let (moved, eof) = match step {
+            Ok(step) => step,
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
                 return Some(Err(narf_filesystem::FsError::WouldBlock));
             }
             Err(_) => break,
         };
-        if kbuf.is_empty() {
-            break; // EOF on in_fd
+        if eof {
+            break;
         }
-        in_off = in_off.saturating_add(kbuf.len() as u64);
-        let w: usize = fd::with_table(task, |t| {
-            let entry = t.get_mut(out_fd)?;
-            let off = entry.offset;
-            let w = match poll_blocking(entry.ops.write(off, &kbuf)) {
-                Some(Ok(w)) => w,
-                _ => 0,
-            };
-            entry.offset = off.saturating_add(w as u64);
-            Some(w)
-        })
-        .flatten()?;
-        total += w;
-        if w < kbuf.len() {
-            break; // short write (e.g. pipe full) — stop here
+        total += moved;
+        in_off = in_off.saturating_add(moved as u64);
+        out_off = out_off.saturating_add(moved as u64);
+        if moved < want {
+            break;
         }
     }
 
@@ -3147,6 +3177,11 @@ fn copy_fd_to_fd(
         // SAFETY: `in_off_ptr` is the user `off_t*` (non-zero); copy_to_user
         // range-validates the 8-byte write-back of the advanced offset.
         let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
+    }
+    if use_out_off_ptr {
+        // SAFETY: `out_off_ptr` was range-validated by the initial guarded
+        // read; a racing unmap is still caught by the guarded write-back.
+        let _ = unsafe { copy_to_user(out_off_ptr, &out_off.to_ne_bytes()) };
     }
     Some(Ok(total))
 }

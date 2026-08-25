@@ -224,6 +224,30 @@ impl FdTable {
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
         self.slots.get_mut(fd as usize).and_then(Option::as_mut)
     }
+
+    /// Borrow two distinct descriptor entries mutably under one table lock.
+    /// Transfer syscalls need this so the input position is advanced only by
+    /// bytes the output actually accepted; splitting the operations across
+    /// separate table acquisitions exposes a bogus intermediate position on
+    /// a short write.
+    pub(crate) fn get_pair_mut(
+        &mut self,
+        first: u32,
+        second: u32,
+    ) -> Option<(&mut FdEntry, &mut FdEntry)> {
+        let first = first as usize;
+        let second = second as usize;
+        if first == second || first >= self.slots.len() || second >= self.slots.len() {
+            return None;
+        }
+        if first < second {
+            let (lo, hi) = self.slots.split_at_mut(second);
+            Some((lo.get_mut(first)?.as_mut()?, hi.first_mut()?.as_mut()?))
+        } else {
+            let (lo, hi) = self.slots.split_at_mut(first);
+            Some((hi.first_mut()?.as_mut()?, lo.get_mut(second)?.as_mut()?))
+        }
+    }
 }
 
 // ── Sharded per-task table ─────────────────────────────────────────

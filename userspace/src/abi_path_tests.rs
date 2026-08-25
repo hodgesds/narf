@@ -935,6 +935,54 @@ fn smoke_abi_path_open_opath_fifo_no_block() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_open_opath_fifo_no_block);
 
+/// A FIFO peer-open transition must publish through the I/O readiness
+/// generation. Blocking FIFO openers register in the same deduplicated waker
+/// map as pipe/socket waits; without this edge they only retried on the 1-ms
+/// timer and stress-ng's short-lived nonblocking readers could be missed.
+fn smoke_abi_path_fifo_open_publishes_readiness() -> TestResult {
+    with_memfs("/p", "p", &[], || {
+        const S_IFIFO: u64 = 0o010000;
+        const O_WRONLY: u64 = 1;
+        const O_NONBLOCK: u64 = 0o4000;
+        let path = b"/p/wake.fifo\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("failed to create FIFO readiness fixture");
+        }
+
+        let before = narf_net::readiness::generation();
+        let reader = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_NONBLOCK, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("nonblocking FIFO reader should open without a writer"),
+        };
+        let after_reader = narf_net::readiness::generation();
+        if after_reader == before {
+            return Err("FIFO reader open did not publish a readiness edge");
+        }
+
+        let writer = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("FIFO writer should observe the already-open reader"),
+        };
+        if narf_net::readiness::generation() == after_reader {
+            return Err("FIFO writer open did not publish a readiness edge");
+        }
+        let _ = call(Syscall::Close.raw(), a0(reader));
+        let _ = call(Syscall::Close.raw(), a0(writer));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_fifo_open_publishes_readiness);
+
 fn smoke_abi_path_mknodat_eexist() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         // "f" already exists → mknod over it is -EEXIST, not a clobber.

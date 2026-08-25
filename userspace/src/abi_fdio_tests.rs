@@ -1708,6 +1708,181 @@ fn smoke_abi_fdio_splice_pipe_to_pipe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_pipe_to_pipe);
 
+/// A partially writable destination pipe must consume only the accepted
+/// source prefix. The old generic copy core drained/read 64 KiB first and then
+/// discarded `kbuf[written..]` after a short pipe write.
+fn smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail() -> TestResult {
+    let payload = alloc::vec![0x5Au8; 8192];
+    with_memfs("/abi", "abi", &[("src", &payload)], || {
+        let src = open_fd(b"/abi/src\0")?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        let filler = alloc::vec![0xA5u8; 65536 - 32];
+        if call(
+            Syscall::Write.raw(),
+            a2(dst_wr as u64, filler.as_ptr() as u64, filler.len() as u64),
+        ) != Some(filler.len() as i64)
+        {
+            return Err("failed to leave a 32-byte destination-pipe tail");
+        }
+        let splice = |len: usize| {
+            call(
+                Syscall::Splice.raw(),
+                SyscallArgs {
+                    arg0: src as u64,
+                    arg1: 0,
+                    arg2: dst_wr as u64,
+                    arg3: 0,
+                    arg4: len as u64,
+                    arg5: 0,
+                },
+            )
+        };
+        if splice(payload.len()) != Some(32) {
+            return Err("file splice did not report the accepted pipe prefix");
+        }
+        let mut first = alloc::vec![0u8; 65536];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+            || first[..filler.len()] != filler
+            || first[filler.len()..] != payload[..32]
+        {
+            return Err("first file splice corrupted the destination prefix");
+        }
+        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+            return Err("file splice skipped the tail after a short write");
+        }
+        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
+        ) != Some(tail.len() as i64)
+            || tail != payload[32..]
+        {
+            return Err("file splice lost or reordered its unwritten tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail
+);
+
+/// Pipe-to-pipe splice needs an atomic source-consume/destination-append
+/// transaction: a 32-byte destination vacancy must leave the rest queued in
+/// the source for the next call.
+fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
+    with_setup(|| {
+        let (src_rd, src_wr) = make_pipe()?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        let payload = alloc::vec![0x3Cu8; 8192];
+        let filler = alloc::vec![0xC3u8; 65536 - 32];
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+            || call(
+                Syscall::Write.raw(),
+                a2(dst_wr as u64, filler.as_ptr() as u64, filler.len() as u64),
+            ) != Some(filler.len() as i64)
+        {
+            return Err("failed to seed partial pipe-to-pipe splice");
+        }
+        let splice = |len: usize| {
+            call(
+                Syscall::Splice.raw(),
+                SyscallArgs {
+                    arg0: src_rd as u64,
+                    arg1: 0,
+                    arg2: dst_wr as u64,
+                    arg3: 0,
+                    arg4: len as u64,
+                    arg5: 0,
+                },
+            )
+        };
+        if splice(payload.len()) != Some(32) {
+            return Err("pipe splice did not stop at destination capacity");
+        }
+        let mut first = alloc::vec![0u8; 65536];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+            || first[..filler.len()] != filler
+            || first[filler.len()..] != payload[..32]
+        {
+            return Err("partial pipe splice corrupted the destination");
+        }
+        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+            return Err("partial pipe splice did not retain the source tail");
+        }
+        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
+        ) != Some(tail.len() as i64)
+            || tail != payload[32..]
+        {
+            return Err("partial pipe splice lost or reordered the source tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail
+);
+
+/// A non-pipe splice destination may use an explicit `off_out`. It advances
+/// that pointer without changing the destination fd's own cursor.
+fn smoke_abi_fdio_splice_honors_explicit_output_offset() -> TestResult {
+    with_memfs("/abi", "abi", &[("dst", b"abcdef")], || {
+        let dst = open_fd(b"/abi/dst\0")?;
+        let (src_rd, src_wr) = make_pipe()?;
+        let payload = *b"XY";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(2)
+        {
+            return Err("failed to seed explicit-offset splice source");
+        }
+        let mut out_off = 2u64;
+        if call(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src_rd as u64,
+                arg1: 0,
+                arg2: dst as u64,
+                arg3: (&mut out_off as *mut u64) as u64,
+                arg4: 2,
+                arg5: 0,
+            },
+        ) != Some(2)
+            || out_off != 4
+        {
+            return Err("splice ignored or misadvanced explicit off_out");
+        }
+        let mut bytes = [0u8; 6];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst as u64, bytes.as_mut_ptr() as u64, bytes.len() as u64),
+        ) != Some(6)
+            || &bytes != b"abXYef"
+        {
+            return Err("explicit off_out changed the fd cursor or wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_honors_explicit_output_offset
+);
+
 /// vmsplice on a pipe READ end copies queued bytes OUT to user memory
 /// (`fs/splice.c` SPLICE_TO_USER). This direction used to hit
 /// `PipeRead::write`'s EBADF and abort stress-ng's vm-splice loop on the
