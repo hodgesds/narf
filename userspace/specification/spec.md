@@ -376,7 +376,10 @@ import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout
 first but validates its fields after the sembufs. Multi-operation changes are
 atomic. An imported `sem_num` outside the selected set returns `EFBIG` before
 the permission check. Only `SEM_UNDO` and `IPC_NOWAIT` affect `sem_flg`; Linux's
-other extension bits are accepted and ignored. Blocking operations park
+other extension bits are accepted and ignored. A first `SEM_UNDO` flag,
+including on a zero operation, fallibly prepares the complete per-set
+adjustment array after set-id lookup but before member and permission checks;
+allocation failure therefore returns Linux's `ENOMEM` precedence. Blocking operations park
 interruptibly unless their blocking sembuf has `IPC_NOWAIT`; relative timed
 waits retain one absolute deadline across park/re-execution. Imported operation
 arrays and message payloads remain

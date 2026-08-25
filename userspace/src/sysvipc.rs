@@ -218,6 +218,7 @@ struct SemState {
 }
 
 static SEMS: IrqSafeSpinLock<Option<SemState>> = IrqSafeSpinLock::new(None);
+static FAIL_NEXT_SEM_UNDO_RESERVE: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 struct SemUndoSharing {
     owner_of: BTreeMap<u64, u64>,
@@ -245,6 +246,33 @@ fn sem_wait_index(waits: &[SemWait], task: u64) -> Result<usize, usize> {
 
 fn sem_undo_index(undos: &SemUndoTable, key: SemUndoKey) -> Result<usize, usize> {
     undos.binary_search_by_key(&key, |(entry_key, _)| *entry_key)
+}
+
+fn ensure_sem_undo_set(state: &mut SemState, object: IpcObjectKey, owner: u64) -> Result<(), i64> {
+    let nsems = state.sets.get(&object).ok_or(EINVAL)?.sems.len();
+    let missing = (0..nsems)
+        .filter(|num| sem_undo_index(&state.undos, (owner, object.0, object.1, *num)).is_err())
+        .count();
+    if missing == 0 {
+        return Ok(());
+    }
+    if FAIL_NEXT_SEM_UNDO_RESERVE.swap(false, Ordering::AcqRel) {
+        return Err(ENOMEM);
+    }
+    state.undos.try_reserve(missing).map_err(|_| ENOMEM)?;
+    for semnum in 0..nsems {
+        let key = (owner, object.0, object.1, semnum);
+        if sem_undo_index(&state.undos, key).is_err() {
+            state.undos.push((key, 0));
+        }
+    }
+    state.undos.sort_unstable_by_key(|(key, _)| *key);
+    Ok(())
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_fail_next_sem_undo_reserve() {
+    FAIL_NEXT_SEM_UNDO_RESERVE.store(true, Ordering::Release);
 }
 
 fn now_seconds() -> i64 {
@@ -664,39 +692,6 @@ fn perform_sem_ops(
     pid: u64,
     undo_owner: Option<u64>,
 ) -> Result<(), SemOpFailure> {
-    // Linux allocates a per-set semadj array before a blocking operation is
-    // published. Reserve and install zero placeholders for every key this
-    // operation may touch before changing semvals; a later queued handoff is
-    // consequently allocation-free.
-    if let Some(owner) = undo_owner {
-        let mut missing = [0u64; SEM_BITMAP_WORDS];
-        let mut missing_len = 0usize;
-        for i in 0..nsops {
-            let (num, op, flg) = parse_sem_op(sops, i);
-            if op == 0 || flg & SEM_UNDO == 0 {
-                continue;
-            }
-            let key = (owner, ipc_ns, semid, num);
-            let word = num / 64;
-            let bit = 1u64 << (num % 64);
-            if sem_undo_index(undos, key).is_err() && missing[word] & bit == 0 {
-                missing[word] |= bit;
-                missing_len += 1;
-            }
-        }
-        if undos.try_reserve(missing_len).is_err() {
-            return Err((ENOMEM, true, None));
-        }
-        for num in 0..set.sems.len() {
-            if missing[num / 64] & (1u64 << (num % 64)) == 0 {
-                continue;
-            }
-            let key = (owner, ipc_ns, semid, num);
-            let index = sem_undo_index(undos, key).unwrap_or_else(|index| index);
-            undos.insert(index, (key, 0));
-        }
-    }
-
     // Index transaction scratch by semaphore number rather than operation.
     // The largest legal set uses 4 KiB of deltas plus a 128-byte bitmap; the
     // previous Option<(usize, i32)>[SEMOPM] plus key array exceeded a 32-KiB
@@ -1307,6 +1302,14 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     let has_undo = (0..nsops).any(|i| parse_sem_op(&buf[..nbytes], i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
     let result = with_sem_state(|state| {
+        // Linux find_alloc_undo() creates one dense per-set adjustment array
+        // before EFBIG and permission validation.  Do the same, including for
+        // a zero operation carrying SEM_UNDO, so ENOMEM has Linux precedence.
+        if let Some(owner) = undo_owner {
+            if let Err(errno) = ensure_sem_undo_set(state, object, owner) {
+                return Err((errno, true, None));
+            }
+        }
         let SemState { sets, undos, .. } = state;
         let set = match sets.get_mut(&object) {
             Some(set) => set,
@@ -1640,9 +1643,11 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 set.sems[semnum] = value;
                 set.pids[semnum] = pid;
                 set.ctime = now_seconds();
-                state.undos.retain(|((_, namespace, id, num), _)| {
-                    *namespace != ipc_ns || *id != semid || *num != semnum
-                });
+                for ((_, namespace, id, num), adjustment) in &mut state.undos {
+                    if *namespace == ipc_ns && *id == semid && *num == semnum {
+                        *adjustment = 0;
+                    }
+                }
                 scan_sem_waiters(state, object);
                 Ok(())
             });
@@ -1750,9 +1755,11 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 set.sems.copy_from_slice(&values);
                 set.pids.fill(pid);
                 set.ctime = now_seconds();
-                state
-                    .undos
-                    .retain(|((_, namespace, id, _), _)| *namespace != ipc_ns || *id != semid);
+                for ((_, namespace, id, _), adjustment) in &mut state.undos {
+                    if *namespace == ipc_ns && *id == semid {
+                        *adjustment = 0;
+                    }
+                }
                 scan_sem_waiters(state, object);
                 Ok(())
             });

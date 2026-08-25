@@ -603,6 +603,76 @@ fn smoke_abi_ipc_semop_errno_order() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_errno_order);
 
+fn smoke_abi_ipc_sem_undo_allocation_errno_order() -> TestResult {
+    with_setup(|| {
+        let mut zero_undo = [0u8; 6];
+        zero_undo[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        let valid = make_semset(1)?;
+        crate::sysvipc::__test_fail_next_sem_undo_reserve();
+        if call(
+            Syscall::Semop.raw(),
+            a2(987_654, zero_undo.as_ptr() as u64, 1),
+        ) != Some(EINVAL)
+        {
+            return Err("invalid semid must precede SEM_UNDO allocation");
+        }
+        if call(
+            Syscall::Semop.raw(),
+            a2(valid, zero_undo.as_ptr() as u64, 1),
+        ) != Some(ENOMEM)
+        {
+            return Err("zero SEM_UNDO operation must allocate before evaluation");
+        }
+
+        let invalid_member = make_semset(1)?;
+        let mut out_of_range = [0u8; 6];
+        out_of_range[..2].copy_from_slice(&1u16.to_le_bytes());
+        out_of_range[2..4].copy_from_slice(&1i16.to_le_bytes());
+        out_of_range[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        crate::sysvipc::__test_fail_next_sem_undo_reserve();
+        if call(
+            Syscall::Semop.raw(),
+            a2(invalid_member, out_of_range.as_ptr() as u64, 1),
+        ) != Some(ENOMEM)
+        {
+            return Err("SEM_UNDO ENOMEM must precede EFBIG");
+        }
+        if call(
+            Syscall::Semop.raw(),
+            a2(invalid_member, out_of_range.as_ptr() as u64, 1),
+        ) != Some(EFBIG)
+        {
+            return Err("out-of-range member must return EFBIG after undo allocation");
+        }
+
+        let denied = make_semset(1)?;
+        let mut increment = [0u8; 6];
+        increment[2..4].copy_from_slice(&1i16.to_le_bytes());
+        increment[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        crate::sysvipc::__test_fail_next_sem_undo_reserve();
+        if call(
+            Syscall::Semop.raw(),
+            a2(denied, increment.as_ptr() as u64, 1),
+        ) != Some(ENOMEM)
+        {
+            return Err("SEM_UNDO ENOMEM must precede EACCES");
+        }
+        if call(
+            Syscall::Semop.raw(),
+            a2(denied, increment.as_ptr() as u64, 1),
+        ) != Some(EACCES)
+        {
+            return Err("denied operation must return EACCES after undo allocation");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_undo_allocation_errno_order
+);
+
 fn smoke_abi_ipc_semop_semopm_boundary() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
