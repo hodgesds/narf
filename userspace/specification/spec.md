@@ -78,6 +78,11 @@ pages. Anonymous `MAP_SHARED` mappings eagerly allocate registry-owned frames,
 retain them through the VMA and any fork aliases, and immediately remove their
 internal shmem name; the last alias unmap reclaims the backing without retaining
 one public registry entry per completed mapping until process exit.
+The native mmap entry validates a page-aligned byte offset before descriptor
+lookup, resolves non-anonymous descriptors before `do_mmap`-style validation,
+rejects an exact zero length with `EINVAL`, and distinguishes fixed-address
+misalignment (`EINVAL`), range exhaustion (`ENOMEM`), and the protected
+low-address floor (`EPERM`) in Linux order.
 
 File/device mapping publication holds the address-space transaction and that
 address space's owner bucket while it atomically retires overlapping owners

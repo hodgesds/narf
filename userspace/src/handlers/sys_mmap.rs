@@ -29,9 +29,41 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let flags = args.arg3 as u32;
     let fd = args.arg4 as i64 as i32;
     let offset = args.arg5;
+    const MAP_FIXED: u32 = 0x10;
+    const MAP_ANONYMOUS: u32 = 0x20;
+    const MAP_SHARED: u32 = 0x01;
+    const MAP_LOCKED: u32 = 0x2000;
     const MAP_HUGETLB: u32 = 0x0004_0000;
     const MAP_HUGE_SHIFT: u32 = 26;
     const MAP_HUGE_MASK: u32 = 0x3f;
+    let anonymous = flags & MAP_ANONYMOUS != 0;
+
+    // Both x86_64 and AArch64 reject a non-page-aligned byte offset in the
+    // architecture syscall wrapper before fd lookup or any mmap work.
+    if offset & 0xFFF != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // ksys_mmap_pgoff resolves a non-anonymous fd before huge-flag and
+    // do_mmap length/address validation. Thus EBADF wins over a zero length or
+    // malformed MAP_FIXED address (but not over the arch offset check above).
+    if !anonymous
+        && (fd < 0
+            || fd::with_table(current_task_id(), |table| table.get(fd as u32).is_some())
+                != Some(true))
+    {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        return;
+    }
+
     let huge_size = if flags & MAP_HUGETLB != 0 {
         match (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK {
             0 | 21 => Some(narf_memory::hugepage::HugeSize::M2),
@@ -48,18 +80,19 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         narf_memory::hugepage::HugeSize::M2 => narf_memory::hugepage::HUGEPAGE_2M_BYTES,
         narf_memory::hugepage::HugeSize::G1 => narf_memory::hugepage::HUGEPAGE_1G_BYTES,
     });
+    // Linux do_mmap rejects an exact zero length before rounding and before
+    // get_unmapped_area validates MAP_FIXED. Never promote it to one page.
+    if args.arg1 == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     let len = match args.arg1.checked_add(page_size - 1) {
-        Some(v) => (v & !(page_size - 1)).max(page_size),
+        Some(v) => v & !(page_size - 1),
         None => {
             ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
             return;
         }
     };
-    const MAP_FIXED: u32 = 0x10;
-    const MAP_ANONYMOUS: u32 = 0x20;
-    const MAP_SHARED: u32 = 0x01;
-    const MAP_LOCKED: u32 = 0x2000;
-    let anonymous = flags & MAP_ANONYMOUS != 0;
 
     // Semantic failures must precede MAP_FIXED replacement: an invalid new
     // mapping never destroys the old one on Linux.
@@ -72,43 +105,26 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Reject an impossible fixed hint before taking the scheduler's current-AS
-    // lock and cloning its Arc. stress-ng deliberately probes the complete
-    // power-of-two address space; most of those calls can never reach a NARF
-    // user page table, and making every miss enter shared scheduler state made
-    // the rejection path dominate the useful MAP_FIXED work.
+    // __get_unmapped_area rejects fixed misalignment with EINVAL, range
+    // overflow with ENOMEM, then security_mmap_addr applies the low-address
+    // policy. NARF's USER_FIXED_FLOOR is that policy boundary.
     if flags & MAP_FIXED != 0 {
-        if hint == 0 || hint & (page_size - 1) != 0 {
-            ctx.set_return(SyscallReturn::invalid_op());
+        if hint & (page_size - 1) != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
             return;
         }
-        let fixed_ok = hint
+        let fixed_in_range = hint
             .checked_add(len)
-            .map(|end| hint >= AddressSpace::USER_FIXED_FLOOR && end <= AddressSpace::USER_HALF_END)
+            .map(|end| end <= AddressSpace::USER_HALF_END)
             .unwrap_or(false);
-        if !fixed_ok {
-            const ENOMEM: i64 = 12;
-            ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
+        if !fixed_in_range {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
             return;
         }
-    }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+        if hint < AddressSpace::USER_FIXED_FLOOR {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
             return;
         }
-    };
-    // Linux resolves a non-anonymous mapping's file descriptor in
-    // ksys_mmap_pgoff before do_mmap performs MAP_LOCKED permission/limit
-    // checks. Preserve EBADF precedence over EPERM for an invalid fd.
-    if !anonymous
-        && (fd < 0
-            || fd::with_table(current_task_id(), |table| table.get(fd as u32).is_some())
-                != Some(true))
-    {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-        return;
     }
     let mlock_authority = current_mlock_authority();
     let explicit_lock = flags & MAP_LOCKED != 0;
@@ -933,6 +949,70 @@ mod tests {
             false
         }
     }
+
+    fn mmap_errno(args: SyscallArgs) -> Option<i64> {
+        let mut ctx = TestCtx { args, ret: None };
+        sys_mmap(&mut ctx);
+        ctx.ret
+            .filter(|ret| ret.status == SyscallReturn::OK)
+            .map(|ret| -(ret.value as i64))
+    }
+
+    fn smoke_mmap_linux_validation_errno_order() -> TestResult {
+        let aspace = Arc::new(AddressSpace::empty());
+        *USER_AS.lock() = Some(aspace);
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+
+        let unaligned_offset = mmap_errno(SyscallArgs {
+            arg1: 0,
+            arg3: 0x10, // MAP_FIXED, file-backed
+            arg4: u64::MAX,
+            arg5: 1,
+            ..SyscallArgs::default()
+        });
+        let bad_fd_precedes_zero_len = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0,
+            arg3: 0x10, // MAP_FIXED, file-backed
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let zero_len_precedes_fixed_alignment = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0,
+            arg3: 0x32, // MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let unaligned_fixed = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0x1000,
+            arg3: 0x32,
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let below_security_floor = mmap_errno(SyscallArgs {
+            arg0: 0,
+            arg1: 0x1000,
+            arg3: 0x32,
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        *USER_AS.lock() = None;
+
+        if unaligned_offset != Some(22)
+            || bad_fd_precedes_zero_len != Some(9)
+            || zero_len_precedes_fixed_alignment != Some(22)
+            || unaligned_fixed != Some(22)
+            || below_security_floor != Some(1)
+        {
+            return TestResult::Fail("mmap validation errno/order diverged from Linux");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_mmap_linux_validation_errno_order);
 
     fn smoke_nonfixed_file_mmap_stale_completion_is_success() -> TestResult {
         const BASE: u64 = 0x0000_3f00_0000_0000;
