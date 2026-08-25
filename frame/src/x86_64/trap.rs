@@ -1366,10 +1366,17 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             }
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
-                // Publish the faulting task's NUMA mempolicy for `cr2`
-                // so the demand-paging allocator steers the fresh frame
-                // (set_mempolicy/mbind enforcement). Cleared right after.
-                let r = crate::bare::reclaim_wait::demand_page(&as_arc, v);
+                // A guarded kernel uaccess owns a per-CPU recovery slot (and
+                // has SMAP's AC window open). It may heal by allocating now,
+                // but must not park for reclaim: switching here would expose
+                // that recovery to another task and migration would strand it
+                // on this CPU. Reserve pressure therefore falls through to the
+                // probe fixup, which gives the syscall ordinary EFAULT.
+                let r = if narf_arch::x86_64::smap::guarded_copy_armed() {
+                    crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
+                } else {
+                    crate::bare::reclaim_wait::demand_page(&as_arc, v)
+                };
                 if r.is_ok() {
                     return;
                 }

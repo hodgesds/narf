@@ -663,3 +663,11 @@ argument = "Slab hit/miss telemetry moves from one shared atomic per size class 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The x86 TLB-shootdown receiver updates INVPCID-path, ACK, and ever-received diagnostics only in its own 64-byte-aligned per-CPU record; totals are aggregated only by readers. Request-lane publication, pending-source acquisition, INVPCID/INVLPG selection, the mandatory architectural wrappers and fences, per-request completion bitmap, IPI targeting, incoming-request polling, and the unbounded correctness wait before frame reuse are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Guarded kernel uaccess publishes a cache-line-isolated marker only on the executing CPU while its single-depth recovery probe and interrupt mask are live and, on x86_64, while the SMAP AC window is open. A current-EL translation fault may still install immediately available backing, but reserve pressure uses an allocation-only path that neither registers a reclaim waiter nor switches tasks; it falls through to the already-armed architecture fixup and surfaces EFAULT before the marker, probe, and access window are disarmed in order. Lower-EL demand faults retain generation-ordered reclaim parking and one bounded retry, so the change prevents per-CPU recovery state from crossing task migration without changing mapping authority, frame ownership, or user-fault reclaim progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The guarded-uaccess marker, trap selection, no-wait demand helper, and executor assertion remain inside the existing architecture, frame, memory-manager, and scheduler-core TCB seams. They add no capability, domain identifier, policy authority, externally supplied pointer, or cross-domain data path."

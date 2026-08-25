@@ -71,6 +71,11 @@ shared type directly; it does not define or cast a mirror layout.
   every installed waiter through a generation-ordered handshake. A task retries
   once; no stackful task, table exhaustion, or repeated zero progress fails
   without another park or busy-yield.
+- A kernel/current-EL fault inside guarded uaccess never enters that reclaim
+  wait. The trap may make one non-parking demand-allocation attempt; reserve
+  pressure falls through to the architecture probe fixup and becomes `EFAULT`.
+  This keeps the per-CPU probe slot, x86 SMAP AC window, and IRQ mask within one
+  uninterrupted task/CPU interval.
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel

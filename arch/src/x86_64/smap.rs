@@ -38,9 +38,62 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::cr::{read_cr4, write_cr4};
+
+/// Per-CPU marker for the interval where [`copy_user_guarded`] owns the
+/// recoverable-probe slot (and, on SMAP hardware, has EFLAGS.AC set). A page
+/// fault in this interval may heal synchronously, but it must never park for
+/// reclaim: switching tasks would leave both pieces of CPU-local state live.
+#[repr(C, align(64))]
+struct GuardedCopyMarker {
+    armed: AtomicBool,
+    _pad: [u8; 63],
+}
+
+impl GuardedCopyMarker {
+    const fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            _pad: [0; 63],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GuardedCopyMarker>() == 64);
+
+static GUARDED_COPY: [GuardedCopyMarker; narf_lib::percpu::MAX_CPUS] =
+    [const { GuardedCopyMarker::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn guarded_copy_marker() -> &'static GuardedCopyMarker {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    &GUARDED_COPY[cpu.min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+/// Whether this CPU is inside [`copy_user_guarded`]'s probe/SMAP window.
+///
+/// The page-fault handler uses this to select the allocation-only demand-page
+/// path. Reclaim parking is forbidden until the copy disarms the per-CPU probe
+/// and closes its user-access window.
+#[doc(hidden)]
+#[inline]
+pub fn guarded_copy_armed() -> bool {
+    guarded_copy_marker().armed.load(Ordering::Acquire)
+}
+
+#[inline]
+fn set_guarded_copy_armed(armed: bool) {
+    let marker = guarded_copy_marker();
+    let old = marker.armed.load(Ordering::Relaxed);
+    debug_assert_ne!(old, armed, "nested or unbalanced guarded user copy");
+    // This record has one writer: its own CPU with IRQs masked. A release
+    // store is sufficient for the synchronous fault handler's acquire load
+    // and avoids a locked RMW on every copy chunk.
+    marker.armed.store(armed, Ordering::Release);
+}
 
 /// CR4 bit 21. Architectural — Intel SDM Vol 3 §2.5.
 pub const CR4_SMAP: u64 = 1 << 21;
@@ -235,6 +288,7 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
                 options(nostack, preserves_flags),
             );
         }
+        set_guarded_copy_armed(true);
         probe::arm(recovery);
         // SAFETY: open the user-access window; the matching `clac`
         // below runs on both the fall-through and the recovery path
@@ -265,6 +319,7 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
             clac();
         }
         let caught = probe::disarm();
+        set_guarded_copy_armed(false);
         // Restore IF exactly as found.
         if saved_rflags & (1 << 9) != 0 {
             // SAFETY: re-enabling interrupts we disabled above.

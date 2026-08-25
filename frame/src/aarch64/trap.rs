@@ -180,7 +180,7 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         let far = unsafe { sysreg::read_far_el1() };
         // Demand paging / stack grow / COW split for the EL0 fault. On
         // success we `eret` back to the faulting user instruction.
-        if try_heal_user_data_abort(esr, far) {
+        if try_heal_user_data_abort(esr, far, true) {
             return;
         }
         // Fall through to fatal if the abort wasn't a recoverable
@@ -205,7 +205,8 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // the copy fixup below. Gated to the user half so a genuine kernel-
         // pointer bug can't be COW/demand-heal-attempted. This mirrors the
         // x86_64 #PF handler servicing a CPL=0 fault on a user vaddr.
-        if in_user_half(far) && try_heal_user_data_abort(esr, far) {
+        let may_wait_for_reclaim = !narf_arch::aarch64::uaccess::guarded_copy_armed();
+        if in_user_half(far) && try_heal_user_data_abort(esr, far, may_wait_for_reclaim) {
             return;
         }
 
@@ -261,7 +262,7 @@ fn in_user_half(a: u64) -> bool {
 ///
 /// Shared by the EL0 (lower-EL) abort path and the EL1 (current-EL) guarded
 /// user-copy path so both apply the identical heal-first policy.
-fn try_heal_user_data_abort(esr: u64, far: u64) -> bool {
+fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
     // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
     //   bit  6  (WnR)  : 0 = read, 1 = write
     //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011 indicate a
@@ -286,10 +287,15 @@ fn try_heal_user_data_abort(esr: u64, far: u64) -> bool {
         }
         if let Some(as_arc) = narf_userspace::active_user_as() {
             let v = narf_memory::VirtAddr::new(far);
-            // Publish the faulting task's NUMA mempolicy for `far` so
-            // demand-paging steers the fresh frame (set_mempolicy/mbind
-            // enforcement). Cleared right after.
-            let r = crate::bare::reclaim_wait::demand_page(&as_arc, v);
+            // A guarded EL1 uaccess owns a per-CPU recovery slot. It may heal
+            // with an immediate allocation, but reserve pressure must reach
+            // probe fixup/EFAULT rather than context-switching with that slot
+            // armed. Lower-EL faults retain the reclaim wait path.
+            let r = if may_wait_for_reclaim {
+                crate::bare::reclaim_wait::demand_page(&as_arc, v)
+            } else {
+                crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
+            };
             if r.is_ok() {
                 return true;
             }

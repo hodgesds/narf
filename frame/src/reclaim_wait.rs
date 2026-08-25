@@ -127,9 +127,10 @@ fn try_demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), Address
 fn retry_once_after_pressure(
     mut attempt: impl FnMut() -> Result<(), AddressSpaceError>,
     mut wait: impl FnMut() -> bool,
+    may_wait: bool,
 ) -> Result<(), AddressSpaceError> {
     let first = attempt();
-    if first != Err(AddressSpaceError::ReclaimPressure) || !wait() {
+    if first != Err(AddressSpaceError::ReclaimPressure) || !may_wait || !wait() {
         return first;
     }
     attempt()
@@ -143,6 +144,24 @@ pub(crate) fn demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), 
     retry_once_after_pressure(
         || try_demand_page(aspace, vaddr),
         || park_until_reclaim(observed),
+        true,
+    )
+}
+
+/// Resolve one demand fault without entering the reclaim wait path.
+///
+/// Guarded kernel uaccess owns architecture-local probe state (and x86 SMAP's
+/// AC window), so it cannot context-switch on reserve pressure. A successful
+/// allocation still heals the fault; `ReclaimPressure` is returned unchanged
+/// so the trap can consume the probe and surface `EFAULT` to the syscall.
+pub(crate) fn demand_page_no_wait(
+    aspace: &AddressSpace,
+    vaddr: VirtAddr,
+) -> Result<(), AddressSpaceError> {
+    retry_once_after_pressure(
+        || try_demand_page(aspace, vaddr),
+        || unreachable!("no-wait demand fault entered reclaim parking"),
+        false,
     )
 }
 
@@ -212,6 +231,7 @@ mod tests {
                 Err(AddressSpaceError::ReclaimPressure)
             },
             || true,
+            true,
         );
         if result != Err(AddressSpaceError::ReclaimPressure) || attempts != 2 {
             return TestResult::Fail("zero-progress pressure did not stop after one retry");
@@ -228,6 +248,7 @@ mod tests {
                 waited = true;
                 true
             },
+            true,
         );
         if result != Err(AddressSpaceError::Unmapped) || nonpressure_attempts != 1 || waited {
             return TestResult::Fail("a genuine unmapped fault entered reclaim backpressure");
@@ -235,4 +256,26 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("frame", smoke_reclaim_wait_retry_is_bounded);
+
+    fn smoke_reclaim_no_wait_never_parks_or_retries() -> TestResult {
+        let mut attempts = 0usize;
+        let mut waited = false;
+        let result = retry_once_after_pressure(
+            || {
+                attempts += 1;
+                Err(AddressSpaceError::ReclaimPressure)
+            },
+            || {
+                waited = true;
+                true
+            },
+            false,
+        );
+        if result == Err(AddressSpaceError::ReclaimPressure) && attempts == 1 && !waited {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("guarded-uaccess pressure waited or retried")
+        }
+    }
+    kernel_test_in!("frame", smoke_reclaim_no_wait_never_parks_or_retries);
 }

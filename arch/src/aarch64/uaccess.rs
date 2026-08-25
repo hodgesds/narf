@@ -31,9 +31,56 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::aarch64::probe;
+
+/// Per-CPU marker for the interval where [`copy_user_guarded`] owns the
+/// recoverable-probe slot. A data abort in this interval may allocate a page
+/// synchronously, but may not park for reclaim without leaking the probe into
+/// another task (or another CPU after migration).
+#[repr(C, align(64))]
+struct GuardedCopyMarker {
+    armed: AtomicBool,
+    _pad: [u8; 63],
+}
+
+impl GuardedCopyMarker {
+    const fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            _pad: [0; 63],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GuardedCopyMarker>() == 64);
+
+static GUARDED_COPY: [GuardedCopyMarker; narf_lib::percpu::MAX_CPUS] =
+    [const { GuardedCopyMarker::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn guarded_copy_marker() -> &'static GuardedCopyMarker {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    &GUARDED_COPY[cpu.min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+/// Whether this CPU is inside [`copy_user_guarded`]'s probe window.
+#[doc(hidden)]
+#[inline]
+pub fn guarded_copy_armed() -> bool {
+    guarded_copy_marker().armed.load(Ordering::Acquire)
+}
+
+#[inline]
+fn set_guarded_copy_armed(armed: bool) {
+    let marker = guarded_copy_marker();
+    let old = marker.armed.load(Ordering::Relaxed);
+    debug_assert_ne!(old, armed, "nested or unbalanced guarded user copy");
+    // This record has one writer: its own CPU with IRQs masked. A release
+    // store is sufficient for the synchronous abort handler's acquire load.
+    marker.armed.store(armed, Ordering::Release);
+}
 
 /// Fault-guarded byte copy from `src` to `dst` for `len` bytes.
 ///
@@ -74,6 +121,7 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         unsafe {
             asm!("adr {r}, 99f", r = out(reg) recovery, options(nostack, preserves_flags));
         }
+        set_guarded_copy_armed(true);
         probe::arm(recovery);
 
         let remaining: usize;
@@ -105,6 +153,7 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         compiler_fence(Ordering::SeqCst);
 
         let caught = probe::disarm();
+        set_guarded_copy_armed(false);
 
         // Restore IRQ mask exactly as found.
         if irqs_were_unmasked {
