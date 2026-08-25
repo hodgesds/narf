@@ -7166,7 +7166,11 @@ pub(crate) fn park_reexecute_on_fd(
     match ops.arm_readiness(task, interest, &waker) {
         Some(Poll::Ready(_)) => {
             ops.disarm_readiness(task);
-            ctx.set_rip(ctx.rip().wrapping_sub(2));
+            #[cfg(target_arch = "x86_64")]
+            const SYSCALL_INSN_LEN: u64 = 2;
+            #[cfg(target_arch = "aarch64")]
+            const SYSCALL_INSN_LEN: u64 = 4;
+            ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
             true
         }
         Some(Poll::Pending) => {
