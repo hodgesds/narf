@@ -70,6 +70,7 @@ unsafe fn publish_shared_mremap_alias_locked(
     let early = |error| narf_memory::FixedRelocationError {
         error,
         target_punched: false,
+        source_shrunk: false,
     };
     let source_end = old_addr
         .checked_add(len)
@@ -474,6 +475,7 @@ fn mremap_core_limited(
                     .map_err(|error| narf_memory::FixedRelocationError {
                         error,
                         target_punched: false,
+                        source_shrunk: false,
                     })?
                     .as_u64();
                 // SAFETY: same transaction/live-root contract as above.

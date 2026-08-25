@@ -499,10 +499,11 @@ impl AddressSpace {
     pub unsafe fn replace_region_locked_limited_receipt(/* ... */)
         -> Result<MappingReceipt, AddressSpaceError>;
     /// Locked VMA resize/move admits growth against an explicit MremapLimits
-    /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional VMA
-    /// metadata is fallibly reserved before publication; exhaustion returns
-    /// `AllocationFailed` without changing the source. Eager population occurs
-    /// only after the IRQ-safe VMA transaction is released.
+    /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional
+    /// backing-vector metadata is fallibly reserved before publication;
+    /// exhaustion returns `AllocationFailed` without changing the source.
+    /// Standard BTreeMap node allocation is excluded from that guarantee.
+    /// Eager population occurs only after the IRQ-safe transaction is released.
     pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
     pub unsafe fn grow_region_locked_limited(/* ... */)
         -> Result<Option<(u64, u64)>, AddressSpaceError>;
@@ -510,8 +511,11 @@ impl AddressSpace {
         -> Result<(), AddressSpaceError>;
     pub unsafe fn relocate_region_locked_limited(/* ... */)
         -> Result<Option<(u64, u64)>, AddressSpaceError>;
-    /// Fixed relocation reports whether target retirement committed before a
-    /// later failure, so external file/SysV ownership mirrors memory exactly.
+    /// Private relocation currently requires one exact Region; Linux's
+    /// cross-VMA move-only extension remains unsupported. Fixed relocation
+    /// reports target_punched and source_shrunk independently after a later
+    /// failure, so external file/SysV ownership mirrors Linux's target-retire,
+    /// source-truncate, move ordering exactly for the supported shape.
     pub unsafe fn relocate_region_fixed_limited(/* ... */)
         -> Result<(), FixedRelocationError>;
     pub unsafe fn relocate_region_fixed_locked_limited(/* ... */)

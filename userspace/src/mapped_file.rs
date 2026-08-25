@@ -215,6 +215,7 @@ fn publish_fixed_remap<T>(
         narf_memory::FixedRelocationError {
             error,
             target_punched: false,
+            source_shrunk: false,
         }
     })?;
     let result = publish();
@@ -267,6 +268,7 @@ fn publish_owner_alias<T>(
     let fail = |error| narf_memory::FixedRelocationError {
         error,
         target_punched: false,
+        source_shrunk: false,
     };
     let old_end = old_addr
         .checked_add(len)
@@ -1257,12 +1259,14 @@ mod tests {
             Err::<(), _>(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::AllocationFailed,
                 target_punched: true,
+                source_shrunk: false,
             })
         });
         let early = publish_fixed_remap(ADDRESS_SPACE, EARLY_FAILURE, 0x1000, || {
             Err::<(), _>(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::LockLimit,
                 target_punched: false,
+                source_shrunk: false,
             })
         });
         let split = publish_fixed_remap(ADDRESS_SPACE, SPLIT + 0x1000, 0x1000, || Ok(()));
@@ -1281,11 +1285,13 @@ mod tests {
             != Err(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::AllocationFailed,
                 target_punched: true,
+                source_shrunk: false,
             })
             || early
                 != Err(narf_memory::FixedRelocationError {
                     error: AddressSpaceError::LockLimit,
                     target_punched: false,
+                    source_shrunk: false,
                 })
             || split != Ok(())
             || owners != alloc::vec![EARLY_FAILURE, SPLIT, SPLIT + 0x2000]
@@ -1378,6 +1384,7 @@ mod tests {
             Err::<(), _>(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::LockLimit,
                 target_punched: false,
+                source_shrunk: false,
             })
         });
 
@@ -1394,6 +1401,7 @@ mod tests {
             Err::<(), _>(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::AllocationFailed,
                 target_punched: true,
+                source_shrunk: false,
             })
         });
         let (fixed_prefix, fixed_alias, fixed_suffix, early_preserved, post_removed) =
@@ -1415,11 +1423,13 @@ mod tests {
                 != Err(narf_memory::FixedRelocationError {
                     error: AddressSpaceError::LockLimit,
                     target_punched: false,
+                    source_shrunk: false,
                 })
             || post
                 != Err(narf_memory::FixedRelocationError {
                     error: AddressSpaceError::AllocationFailed,
                     target_punched: true,
+                    source_shrunk: false,
                 })
             || !fixed_prefix
             || !fixed_alias
@@ -1492,11 +1502,13 @@ mod tests {
             != Err(narf_memory::FixedRelocationError {
                 error: AddressSpaceError::Unmapped,
                 target_punched: false,
+                source_shrunk: false,
             })
             || overlap
                 != Err(narf_memory::FixedRelocationError {
                     error: AddressSpaceError::Overlap,
                     target_punched: false,
+                    source_shrunk: false,
                 })
             || gap_publish_calls.load(Ordering::Relaxed) != 0
             || overlap_publish_calls.load(Ordering::Relaxed) != 0

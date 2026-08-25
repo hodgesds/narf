@@ -12281,6 +12281,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
         != Err(FixedRelocationError {
             error: AddressSpaceError::LockLimit,
             target_punched: false,
+            source_shrunk: false,
         })
         || duplicate_as.lookup(duplicate_target).is_none()
     {
@@ -12328,6 +12329,7 @@ fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
     let expected = Err(FixedRelocationError {
         error: AddressSpaceError::MappingLimit,
         target_punched: true,
+        source_shrunk: false,
     });
     if dontunmap_failure == expected
         && dontunmap_as.lookup(dontunmap_target).is_none()
@@ -12562,6 +12564,112 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_shared_duplicate_clones_residency);
 
+/// Private fixed shrinking has the same Linux progress boundary as SHARED:
+/// destination retirement and source truncation remain committed if the later
+/// move fails.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_private_fixed_shrink_reports_source_state() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(0x0000_409c_0000_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x2000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("private fixed-shrink setup failed");
+    }
+
+    crate::address_space::__test_fail_next_fixed_relocation_after_shrink();
+    // SAFETY: AddressSpace::empty is metadata-only and the wrapper supplies
+    // the required VMA transaction.
+    let result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x2000,
+            target,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+        source_shrunk: true,
+    });
+    if result == expected
+        && address_space.lookup(target).is_none()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x1000 && region.phys.len() == 1)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("private fixed-shrink failure state diverged from Linux")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_private_fixed_shrink_reports_source_state
+);
+
+/// Page-table frame exhaustion is an allocation failure (`ENOMEM` at Linux
+/// syscall boundaries), not a malformed address or an occupied destination.
+fn smoke_memory_paging_install_error_classification() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError};
+
+    #[cfg(target_arch = "x86_64")]
+    let correct = {
+        use crate::x86_64::paging::MapError;
+        AddressSpace::paging_install_error(MapError::FrameExhausted)
+            == AddressSpaceError::AllocationFailed
+            && AddressSpace::paging_install_error(MapError::NonCanonical)
+                == AddressSpaceError::OutOfRange
+            && AddressSpace::paging_install_error(MapError::AlreadyMapped)
+                == AddressSpaceError::Overlap
+            && AddressSpace::paging_install_error(MapError::EncounteredHugePage)
+                == AddressSpaceError::Overlap
+    };
+    #[cfg(target_arch = "aarch64")]
+    let correct = {
+        use crate::aarch64::paging::MapError;
+        AddressSpace::paging_install_error(MapError::NoFrame) == AddressSpaceError::AllocationFailed
+            && AddressSpace::paging_install_error(MapError::NonCanonical)
+                == AddressSpaceError::OutOfRange
+            && AddressSpace::paging_install_error(MapError::AlreadyMapped)
+                == AddressSpaceError::Overlap
+            && AddressSpace::paging_install_error(MapError::EncounteredBlock)
+                == AddressSpaceError::Overlap
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let correct = true;
+
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("paging install errors collapsed allocation into range/state")
+    }
+}
+kernel_test_in!("memory", smoke_memory_paging_install_error_classification);
+
 /// A relocating grow preserves the source lock mode and eagerly populates only
 /// the new destination tail.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -12728,6 +12836,7 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
         Err(crate::FixedRelocationError {
             error,
             target_punched: false,
+            source_shrunk: false,
         })
     };
     if limit_result == early(AddressSpaceError::LockLimit)
@@ -12795,6 +12904,7 @@ fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
     let expected = Err(crate::FixedRelocationError {
         error: AddressSpaceError::AllocationFailed,
         target_punched: true,
+        source_shrunk: false,
     });
     let source_preserved = address_space
         .lookup(source)

@@ -53,8 +53,15 @@ static SHARED_UNMAP_TRANSACTIONS: core::sync::atomic::AtomicUsize =
 static FAIL_SHARED_ALIAS_AFTER_INSTALL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "kernel-test")]
+static FAIL_FIXED_RELOCATION_AFTER_SHRINK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
 pub(crate) fn __test_fail_next_shared_alias_after_install() {
     FAIL_SHARED_ALIAS_AFTER_INSTALL.store(true, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_fail_next_fixed_relocation_after_shrink() {
+    FAIL_FIXED_RELOCATION_AFTER_SHRINK.store(true, core::sync::atomic::Ordering::Release);
 }
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_unmap_path_counts() -> (usize, usize) {
@@ -1057,6 +1064,10 @@ pub enum AddressSpaceError {
 pub struct FixedRelocationError {
     pub error: AddressSpaceError,
     pub target_punched: bool,
+    /// Linux fixed shrinking retires the target, truncates the source tail,
+    /// then attempts the move. Upper file/SysV owners must mirror this second
+    /// independently committed topology transition before unlocking.
+    pub source_shrunk: bool,
 }
 
 /// Linux resource limits applied atomically to one `mremap` growth.
@@ -3185,6 +3196,7 @@ impl AddressSpace {
                     .map_err(|error| FixedRelocationError {
                         error,
                         target_punched: false,
+                        source_shrunk: false,
                     })?;
             let relocate = || {
                 // SAFETY: this wrapper holds the VMA transaction, conditionally
@@ -3206,9 +3218,12 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Transaction-held fixed relocation which reports whether its target was
-    /// already retired before a later failure. Upper layers use that bit to
-    /// retire file/SysV owner metadata exactly when memory retired the VMA.
+    /// Transaction-held fixed relocation which independently reports whether
+    /// its target was retired and whether a shrinking source was truncated
+    /// before a later failure. Upper layers mirror both Linux-visible topology
+    /// transitions in file/SysV owner metadata before releasing the locks. The
+    /// supported private source is one exact Region; Linux cross-VMA move-only
+    /// relocation remains an explicit unsupported shape.
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`]. If
@@ -3228,6 +3243,7 @@ impl AddressSpace {
         let early = |error| FixedRelocationError {
             error,
             target_punched: false,
+            source_shrunk: false,
         };
         // Validate every request property that is independent of target
         // contents before MAP_FIXED irreversibly retires that target.
@@ -3236,6 +3252,34 @@ impl AddressSpace {
             .map_err(early)?;
         self.punch_fixed_locked_with_shared(new_base, new_len, shared_transaction_held)
             .map_err(early)?;
+        let mut source_shrunk = false;
+        let move_old_len = if old_len > new_len {
+            let tail_base = VirtAddr::new(old_base.as_u64() + new_len);
+            self.punch_fixed_locked_with_shared(
+                tail_base,
+                old_len - new_len,
+                shared_transaction_held,
+            )
+            .map_err(|error| FixedRelocationError {
+                error,
+                target_punched: true,
+                source_shrunk: false,
+            })?;
+            source_shrunk = true;
+
+            #[cfg(feature = "kernel-test")]
+            if FAIL_FIXED_RELOCATION_AFTER_SHRINK.swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(FixedRelocationError {
+                    error: AddressSpaceError::AllocationFailed,
+                    target_punched: true,
+                    source_shrunk: true,
+                });
+            }
+            new_len
+        } else {
+            old_len
+        };
         // The authoritative pre-punch admission remains valid while the VMA
         // transaction is held. Do not recompute against the smaller
         // post-replacement total.
@@ -3244,7 +3288,7 @@ impl AddressSpace {
         unsafe {
             self.relocate_region_locked(
                 old_base,
-                old_len,
+                move_old_len,
                 new_base,
                 new_len,
                 MremapLimits::UNLIMITED,
@@ -3253,6 +3297,7 @@ impl AddressSpace {
         .map_err(|error| FixedRelocationError {
             error,
             target_punched: true,
+            source_shrunk,
         })
     }
 
@@ -3430,11 +3475,11 @@ impl AddressSpace {
             // and leaves have not changed yet.
             // SAFETY: `moved` is the validated, disjoint destination region
             // and the address space owns the live page-table root.
-            if unsafe { self.install_region_leaves_local(&moved) }.is_err() {
+            if let Err(error) = unsafe { self.install_region_leaves_local(&moved) } {
                 // SAFETY: only leaves belonging to the validated destination
                 // region can have been installed by the failed operation.
                 unsafe { self.unmap_region_leaves_local(&moved) };
-                return Err(AddressSpaceError::OutOfRange);
+                return Err(error);
             }
             // A present source leaf must already have reverse-map authority.
             // Metadata-only internal construction may legitimately record a
@@ -3599,7 +3644,7 @@ impl AddressSpace {
             // SAFETY: the destination is validated free and the address space
             // owns the live root. Restore source metadata on the only fallible
             // page-table step.
-            if unsafe { self.install_region_leaves_local(&moved) }.is_err() {
+            if let Err(error) = unsafe { self.install_region_leaves_local(&moved) } {
                 // SAFETY: remove only a partial destination installed above.
                 unsafe { self.unmap_region_leaves_local(&moved) };
                 regions
@@ -3613,7 +3658,7 @@ impl AddressSpace {
                 // so invalidate every temporary destination translation
                 // before a CLONE_VM peer can retain a stale alias.
                 self.flush_region_broadcast(new_base, len >> 12);
-                return Err(AddressSpaceError::OutOfRange);
+                return Err(error);
             }
             let old_view = Region {
                 base: old_base,
@@ -3762,6 +3807,7 @@ impl AddressSpace {
         let early = |error| FixedRelocationError {
             error,
             target_punched: false,
+            source_shrunk: false,
         };
         Self::relocation_bounds(old_base, len, new_base, len).map_err(early)?;
         self.check_dontunmap_source_locked(old_base, len)
@@ -3774,6 +3820,7 @@ impl AddressSpace {
             |error| FixedRelocationError {
                 error,
                 target_punched: true,
+                source_shrunk: false,
             },
         )
     }
@@ -3952,7 +3999,7 @@ impl AddressSpace {
             // SAFETY: destination is a validated free user range and the caller
             // provides the live-root contract.
             let install_result = unsafe { self.install_region_leaves_local(&leaf_view) };
-            if install_result.is_err() {
+            if let Err(error) = install_result {
                 let _alias = regions
                     .remove(destination_lo)
                     .expect("failed shared alias lost its provisional VMA");
@@ -3963,7 +4010,7 @@ impl AddressSpace {
                 drop(regions);
                 drop(huge);
                 self.flush_region_broadcast(destination, len >> 12);
-                return Err(AddressSpaceError::OutOfRange);
+                return Err(error);
             }
 
             #[cfg(feature = "kernel-test")]
@@ -4145,6 +4192,7 @@ impl AddressSpace {
         let early = |error| FixedRelocationError {
             error,
             target_punched: false,
+            source_shrunk: false,
         };
         Self::relocation_bounds(source, len, destination, len).map_err(early)?;
         if !shared_transaction_held {
@@ -4177,6 +4225,7 @@ impl AddressSpace {
         .map_err(|error| FixedRelocationError {
             error,
             target_punched: true,
+            source_shrunk: false,
         })
     }
 
@@ -4965,6 +5014,38 @@ impl AddressSpace {
     /// consulting or locking the region table. Callers hold the table lock so
     /// backing, permissions, and ownership cannot change during the walk.
     #[cfg(target_arch = "x86_64")]
+    pub(crate) fn paging_install_error(
+        error: crate::x86_64::paging::MapError,
+    ) -> AddressSpaceError {
+        use crate::x86_64::paging::MapError;
+
+        match error {
+            MapError::FrameExhausted => AddressSpaceError::AllocationFailed,
+            MapError::NonCanonical => AddressSpaceError::OutOfRange,
+            MapError::UnalignedVirt | MapError::UnalignedPhys => {
+                AddressSpaceError::AlignmentMismatch
+            }
+            MapError::AlreadyMapped | MapError::EncounteredHugePage => AddressSpaceError::Overlap,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn paging_install_error(
+        error: crate::aarch64::paging::MapError,
+    ) -> AddressSpaceError {
+        use crate::aarch64::paging::MapError;
+
+        match error {
+            MapError::NoFrame => AddressSpaceError::AllocationFailed,
+            MapError::NonCanonical => AddressSpaceError::OutOfRange,
+            MapError::UnalignedVirt | MapError::UnalignedPhys => {
+                AddressSpaceError::AlignmentMismatch
+            }
+            MapError::AlreadyMapped | MapError::EncounteredBlock => AddressSpaceError::Overlap,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     unsafe fn install_region_leaves_local(&self, region: &Region) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb_scatter_range, PtFlags};
         if region.perms.prot_only().0 == 0 {
@@ -4990,7 +5071,7 @@ impl AddressSpace {
                 flags
             })
         }
-        .map_err(|_| AddressSpaceError::OutOfRange)
+        .map_err(Self::paging_install_error)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5019,7 +5100,7 @@ impl AddressSpace {
                 flags
             })
         }
-        .map_err(|_| AddressSpaceError::OutOfRange)
+        .map_err(Self::paging_install_error)
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
