@@ -37,7 +37,11 @@ const SHM_RND: u64 = 0o20000;
 const SHM_REMAP: u64 = 0o40000;
 const SHM_EXEC: u64 = 0o100000;
 const SETVAL: u64 = 16;
+const SETALL: u64 = 17;
+const GETPID: u64 = 11;
 const GETVAL: u64 = 12;
+const GETNCNT: u64 = 14;
+const GETZCNT: u64 = 15;
 const E2BIG: i64 = -7;
 const EFBIG: i64 = -27;
 const ENOMSG: i64 = -42;
@@ -749,6 +753,128 @@ fn smoke_abi_ipc_semctl_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_pos);
 
+fn smoke_abi_ipc_semctl_pid_and_waiter_state() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(2)?;
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETPID, 0)) != Some(0) {
+            return Err("a newly-created semaphore must have sempid 0");
+        }
+
+        // SETALL attributes every member to the setter.
+        const SETTER: u64 = FAKE_TASK + 10;
+        set_task(SETTER);
+        let values = [0u16, 1u16];
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SETALL, values.as_ptr() as u64),
+        ) != Some(0)
+        {
+            set_task(FAKE_TASK);
+            return Err("setup: SETALL failed");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETPID, 0)) != Some(SETTER as i64)
+            || call(Syscall::Semctl.raw(), a3(id, 1, GETPID, 0)) != Some(SETTER as i64)
+        {
+            return Err("SETALL did not publish the setter as sempid for every member");
+        }
+
+        // A complex operation is counted only on its first blocking sembuf:
+        // sem0 -1 blocks first, even though the later sem1 zero-wait also
+        // cannot proceed. A second task waits directly for sem1 to reach zero.
+        const ALTER_WAITER: u64 = FAKE_TASK + 11;
+        const ZERO_WAITER: u64 = FAKE_TASK + 12;
+        let mut complex = [0u8; 12];
+        complex[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        complex[6..8].copy_from_slice(&1u16.to_le_bytes());
+        set_task(ALTER_WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, complex.as_ptr() as u64, 2)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("setup: decrement waiter did not block");
+        }
+        let mut wait_zero = [0u8; 6];
+        wait_zero[..2].copy_from_slice(&1u16.to_le_bytes());
+        set_task(ZERO_WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, wait_zero.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("setup: zero waiter did not block");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(1)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETZCNT, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 1, GETNCNT, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 1, GETZCNT, 0)) != Some(1)
+        {
+            return Err("GETNCNT/GETZCNT did not classify each wait by its first blocker");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETPID, 0)) != Some(SETTER as i64)
+            || call(Syscall::Semctl.raw(), a3(id, 1, GETPID, 0)) != Some(SETTER as i64)
+        {
+            return Err("blocked operations changed sempid before successful completion");
+        }
+
+        // Interrupting a waiter unlinks it from the observable count.
+        crate::handlers::raise_signal_pending(ALTER_WAITER, 10);
+        set_task(ALTER_WAITER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 2)) != Some(EINTR) {
+            set_task(FAKE_TASK);
+            return Err("interrupted semaphore waiter did not return EINTR");
+        }
+        crate::handlers::clear_signal_pending(ALTER_WAITER, 10);
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(0) {
+            return Err("interrupted waiter remained in GETNCNT");
+        }
+
+        // Satisfy and retry the zero waiter. The successful zero operation
+        // updates sempid even though it does not alter semval.
+        if call(Syscall::Semctl.raw(), a3(id, 1, SETVAL, 0)) != Some(0) {
+            return Err("setup: SETVAL did not satisfy zero waiter");
+        }
+        set_task(ZERO_WAITER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("satisfied zero waiter did not complete");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 1, GETZCNT, 0)) != Some(0) {
+            return Err("completed zero waiter remained in GETZCNT");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 1, GETPID, 0)) != Some(ZERO_WAITER as i64) {
+            return Err("successful zero-wait operation did not update sempid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semctl_pid_and_waiter_state
+);
+
+fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
+    with_setup(|| {
+        // Linux's SETVAL wrapper rejects the value before looking up semid.
+        if call(
+            Syscall::Semctl.raw(),
+            a3(987_654, 999, SETVAL, u32::MAX as u64),
+        ) != Some(ERANGE)
+        {
+            return Err("SETVAL must report ERANGE before semid/semnum lookup");
+        }
+        let id = make_semset(1)?;
+        // semctl_main checks read permission before sem_num for GET*.
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        if call(Syscall::Semctl.raw(), a3(id, u32::MAX as u64, GETNCNT, 0)) != Some(EACCES) {
+            return Err("GETNCNT must report EACCES before invalid sem_num");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semctl_observable_errno_order
+);
+
 fn smoke_abi_ipc_semctl_neg() -> TestResult {
     with_setup(|| {
         // IPC_RMID on a non-existent id → EINVAL.
@@ -848,6 +974,9 @@ fn smoke_abi_ipc_sem_undo_and_rmid_wake() -> TestResult {
         if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
             return Err("process exit did not reverse SEM_UNDO adjustment");
         }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETPID, 0)) != Some(pid as i64) {
+            return Err("exit-time SEM_UNDO did not publish the exiting process as sempid");
+        }
 
         crate::sysvipc::__test_begin_removed_wait(0, id);
         if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
@@ -859,7 +988,10 @@ fn smoke_abi_ipc_sem_undo_and_rmid_wake() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_ipc_sem_undo_and_rmid_wake);
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_undo_and_rmid_wake
+);
 
 fn smoke_abi_ipc_retained_semop_and_shared_undo() -> TestResult {
     with_setup(|| {

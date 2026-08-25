@@ -380,8 +380,15 @@ arrays and message payloads remain
 kernel-owned across that wait, so later user-memory mutation cannot alter an
 in-flight operation. `SEM_UNDO` adjustments are accumulated per process,
 atomically committed with the operation, shared by `CLONE_SYSVSEM`, cleared by
-`SETVAL`/`SETALL`, and reversed when the final sharing process exits. System V
-message send imports the type and payload before queue lookup and reports copy
+`SETVAL`/`SETALL`, and reversed when the final sharing process exits.
+Semaphores retain Linux's per-member `sempid`: successful `semop` entries,
+including zero waits, `SETVAL`, every member of `SETALL`, and exit-time undo
+publish the responsible process, which `GETPID` translates into the querying
+task's PID namespace. `GETNCNT` and `GETZCNT` count retained operations by only
+the first blocking sembuf from their most recent atomic evaluation;
+interruption, timeout, successful retry, task exit, or set removal retires that
+waiter state. System V message send
+imports the type and payload before queue lookup and reports copy
 faults as `EFAULT`. Queues enforce
 Linux's default 16-KiB byte and zero-length-message count limit; full blocking
 sends park, while `IPC_NOWAIT` returns `EAGAIN`. Receive supports Linux type

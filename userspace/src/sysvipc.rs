@@ -94,8 +94,11 @@ const IPC_SET: u64 = 1;
 const IPC_STAT: u64 = 2;
 
 // semctl cmds.
+const GETPID: u64 = 11;
 const GETVAL: u64 = 12;
 const GETALL: u64 = 13;
+const GETNCNT: u64 = 14;
+const GETZCNT: u64 = 15;
 const SETVAL: u64 = 16;
 const SETALL: u64 = 17;
 
@@ -157,6 +160,10 @@ fn encode_perm(out: &mut [u8], key: u32, uid: u32, gid: u32, cuid: u32, cgid: u3
 struct SemSet {
     key: u32,
     sems: Vec<i32>,
+    /// Outer process id of the last successful operator for each semaphore.
+    /// It is translated into the reader's pid namespace by GETPID, just as
+    /// Linux retains `struct pid` and calls `pid_vnr()` at query time.
+    pids: Vec<u64>,
     uid: u32,
     gid: u32,
     cuid: u32,
@@ -277,6 +284,10 @@ enum WaitData {
         sops: Vec<u8>,
         nsops: usize,
         timeout: Option<(i64, i64)>,
+        /// The first sembuf that could not proceed during the most recent
+        /// atomic evaluation. Linux associates a queued task with only this
+        /// semaphore for GETNCNT/GETZCNT.
+        blocking: Option<(usize, bool)>, // (sem_num, waits-for-zero)
     },
     MsgSend {
         mtype: i64,
@@ -320,19 +331,27 @@ fn begin_sem_wait(
     sops: &[u8],
     nsops: usize,
     timeout: Option<(i64, i64)>,
+    blocking: Option<(usize, bool)>,
 ) {
     with_waits(|waits| {
-        waits.entry(task).or_insert_with(|| IpcWait {
-            kind: WaitKind::Sem,
-            ipc_ns,
-            id,
-            errno: 0,
-            data: WaitData::Sem {
-                sops: sops.to_vec(),
-                nsops,
-                timeout,
+        // A spurious wake can make a retained operation block on a different
+        // sembuf. Replace the record so observable waiter counts follow its
+        // latest atomic evaluation rather than its original blocker.
+        waits.insert(
+            task,
+            IpcWait {
+                kind: WaitKind::Sem,
+                ipc_ns,
+                id,
+                errno: 0,
+                data: WaitData::Sem {
+                    sops: sops.to_vec(),
+                    nsops,
+                    timeout,
+                    blocking,
+                },
             },
-        });
+        );
     });
 }
 
@@ -353,6 +372,8 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
 }
 
 type StagedSemWait = (Vec<u8>, usize, Option<(i64, i64)>);
+type SemWaitBlocker = (usize, bool); // (sem_num, waits-for-zero)
+type SemOpFailure = (i64, bool, Option<SemWaitBlocker>); // (errno, terminal, blocker)
 
 fn staged_sem_wait(task: u64, ipc_ns: u64, id: u64) -> Option<StagedSemWait> {
     with_waits(|waits| {
@@ -365,9 +386,31 @@ fn staged_sem_wait(task: u64, ipc_ns: u64, id: u64) -> Option<StagedSemWait> {
                 sops,
                 nsops,
                 timeout,
+                ..
             } => Some((sops.clone(), *nsops, *timeout)),
             _ => None,
         }
+    })
+}
+
+fn sem_waiter_count(ipc_ns: u64, id: u64, semnum: usize, waits_for_zero: bool) -> usize {
+    with_waits(|waits| {
+        waits
+            .values()
+            .filter(|wait| {
+                wait.kind == WaitKind::Sem
+                    && wait.ipc_ns == ipc_ns
+                    && wait.id == id
+                    && wait.errno == 0
+                    && matches!(
+                        &wait.data,
+                        WaitData::Sem {
+                            blocking: Some((blocked_num, blocked_for_zero)),
+                            ..
+                        } if *blocked_num == semnum && *blocked_for_zero == waits_for_zero
+                    )
+            })
+            .count()
     })
 }
 
@@ -463,6 +506,7 @@ pub(crate) fn __test_stage_sem_wait(id: u64, sops: &[u8]) {
         sops,
         sops.len() / 6,
         None,
+        None,
     );
 }
 
@@ -526,11 +570,11 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
     }
     with_sems(|sets| {
         for ((_, ipc_ns, semid, semnum), adjustment) in adjustments {
-            if let Some(sem) = sets
-                .get_mut(&(ipc_ns, semid))
-                .and_then(|set| set.sems.get_mut(semnum))
-            {
-                *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
+            if let Some(set) = sets.get_mut(&(ipc_ns, semid)) {
+                if let Some(sem) = set.sems.get_mut(semnum) {
+                    *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
+                    set.pids[semnum] = pid;
+                }
             }
         }
     });
@@ -709,6 +753,7 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
             SemSet {
                 key,
                 sems: alloc::vec![0i32; nsems],
+                pids: alloc::vec![0u64; nsems],
                 uid,
                 gid,
                 cuid: uid,
@@ -838,8 +883,8 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
     let mut undo_guard = has_undo.then(|| SEM_UNDOS.lock());
     let mut undo_updates = BTreeMap::<usize, i32>::new();
-    let result: Result<(), (i64, bool)> = with_sems(|m| {
-        let set = m.get_mut(&object).ok_or((EINVAL, true))?;
+    let result: Result<(), SemOpFailure> = with_sems(|m| {
+        let set = m.get_mut(&object).ok_or((EINVAL, true, None))?;
         let needs_write = (0..nsops).any(|i| parse(i).1 != 0);
         let request = if needs_write { 0o2 } else { 0o4 };
         // Linux reports EFBIG for an imported sem_num outside this set, and
@@ -847,7 +892,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
         for i in 0..nsops {
             let (num, _, _) = parse(i);
             if num >= set.sems.len() {
-                return Err((EFBIG, true));
+                return Err((EFBIG, true, None));
             }
         }
         if !resumed_wait
@@ -863,28 +908,28 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 request,
             )
         {
-            return Err((EACCES, true));
+            return Err((EACCES, true, None));
         }
         // Apply each op in order against the RUNNING value (accumulating
         // repeated sem_num within this call, as Linux's atomic block does).
         // On the first op that would block, roll back every applied delta so
         // the operation is all-or-nothing without cloning the vector.
         let mut applied = 0usize;
-        let mut fail: Option<(i64, bool)> = None;
+        let mut fail: Option<SemOpFailure> = None;
         for i in 0..nsops {
             let (num, op, flg) = parse(i);
             let cur = set.sems[num];
             let next = cur + i32::from(op);
             if op == 0 {
                 if cur != 0 {
-                    fail = Some((EAGAIN, flg & IPC_NOWAIT != 0));
+                    fail = Some((EAGAIN, flg & IPC_NOWAIT != 0, Some((num, true))));
                     break;
                 }
             } else if next > SEMVMX {
-                fail = Some((ERANGE, true));
+                fail = Some((ERANGE, true, None));
                 break;
             } else if next < 0 {
-                fail = Some((EAGAIN, flg & IPC_NOWAIT != 0));
+                fail = Some((EAGAIN, flg & IPC_NOWAIT != 0, Some((num, false))));
                 break;
             }
             // Linux checks each SEM_UNDO adjustment after that operation's
@@ -904,7 +949,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 let next_undo = prior - i32::from(op);
                 // Linux permits the asymmetric lower endpoint -SEMAEM-1.
                 if !((-SEMVMX - 1)..=SEMVMX).contains(&next_undo) {
-                    fail = Some((ERANGE, true));
+                    fail = Some((ERANGE, true, None));
                     break;
                 }
                 undo_updates.insert(num, next_undo);
@@ -922,6 +967,13 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 }
             }
             return Err(failure);
+        }
+        // Linux updates sempid for every member named by a successful atomic
+        // operation, including zero-wait operations and duplicate sem_num
+        // entries. Do this only after the whole operation has committed.
+        for i in 0..nsops {
+            let (num, _, _) = parse(i);
+            set.pids[num] = pid;
         }
         set.otime = now_seconds();
         Ok(())
@@ -947,13 +999,13 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             narf_net::readiness::notify(0);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Err((e, true)) => {
+        Err((e, true, _)) => {
             drop(undo_guard);
             clear_wait(task, WaitKind::Sem, ipc_ns, semid);
             finish_semtimedop_wait(timed);
             ctx.set_return(err(e));
         }
-        Err((e, false)) if e == EAGAIN => {
+        Err((e, false, blocking)) if e == EAGAIN => {
             drop(undo_guard);
             let task = crate::handlers::current_task_id();
             if semtimedop_expired(timeout) {
@@ -965,7 +1017,15 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 finish_semtimedop_wait(timed);
                 ctx.set_return(err(EINTR));
             } else {
-                begin_sem_wait(task, ipc_ns, semid, &buf[..nbytes], nsops, timeout);
+                begin_sem_wait(
+                    task,
+                    ipc_ns,
+                    semid,
+                    &buf[..nbytes],
+                    nsops,
+                    timeout,
+                    blocking,
+                );
                 if !with_sems(|sets| sets.contains_key(&object)) {
                     clear_wait(task, WaitKind::Sem, ipc_ns, semid);
                     finish_semtimedop_wait(timed);
@@ -978,7 +1038,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 }
             }
         }
-        Err((e, _)) => {
+        Err((e, _, _)) => {
             drop(undo_guard);
             clear_wait(task, WaitKind::Sem, ipc_ns, semid);
             finish_semtimedop_wait(timed);
@@ -1125,6 +1185,14 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             });
         }
         SETVAL => {
+            // Linux validates the immediate SETVAL value before set lookup,
+            // sem_num bounds, or permissions.
+            let value = arg as i32;
+            if !(0..=SEMVMX).contains(&value) {
+                ctx.set_return(err(ERANGE));
+                return;
+            }
+            let pid = current_identity().0;
             let mut undo_guard = SEM_UNDOS.lock();
             let r = with_sems(|m| {
                 let set = m.get_mut(&object).ok_or(EINVAL)?;
@@ -1144,11 +1212,8 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 ) {
                     return Err(EACCES);
                 }
-                let value = arg as i32;
-                if !(0..=SEMVMX).contains(&value) {
-                    return Err(ERANGE);
-                }
                 set.sems[semnum] = value;
+                set.pids[semnum] = pid;
                 set.ctime = now_seconds();
                 Ok(())
             });
@@ -1166,12 +1231,11 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 Err(e) => err(e),
             });
         }
-        GETVAL => {
+        GETVAL | GETPID | GETNCNT | GETZCNT => {
             let r = with_sems(|m| {
                 let set = m.get(&object).ok_or(EINVAL)?;
-                if semnum_raw < 0 {
-                    return Err(EINVAL);
-                }
+                // semctl_main performs read permission before validating the
+                // semaphore number for all four per-semaphore read commands.
                 if !ipc_allowed(
                     caller_uid,
                     caller_gid,
@@ -1185,10 +1249,30 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 ) {
                     return Err(EACCES);
                 }
-                set.sems.get(semnum).copied().ok_or(EINVAL)
+                if semnum_raw < 0 || semnum >= set.sems.len() {
+                    return Err(EINVAL);
+                }
+                let value = match cmd {
+                    GETVAL => set.sems[semnum] as u64,
+                    GETPID => {
+                        let outer = set.pids[semnum];
+                        if outer == 0 {
+                            0
+                        } else {
+                            crate::handlers::report_pid_to(
+                                crate::handlers::current_task_id(),
+                                outer,
+                            )
+                        }
+                    }
+                    GETNCNT => sem_waiter_count(ipc_ns, semid, semnum, false) as u64,
+                    GETZCNT => sem_waiter_count(ipc_ns, semid, semnum, true) as u64,
+                    _ => unreachable!(),
+                };
+                Ok(value)
             });
             ctx.set_return(match r {
-                Ok(v) => SyscallReturn::ok(v as u64),
+                Ok(v) => SyscallReturn::ok(v),
                 Err(e) => err(e),
             });
         }
@@ -1235,12 +1319,14 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 values.push(i32::from(value));
             }
             let mut undo_guard = SEM_UNDOS.lock();
+            let pid = current_identity().0;
             let r = with_sems(|m| {
                 let set = m.get_mut(&object).ok_or(EIDRM)?;
                 if set.sems.len() != values.len() {
                     return Err(EIDRM);
                 }
                 set.sems.copy_from_slice(&values);
+                set.pids.fill(pid);
                 set.ctime = now_seconds();
                 Ok(())
             });
