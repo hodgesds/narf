@@ -80,6 +80,10 @@ ref = "security-model/specification/spec.md#L75"
 argument = "mremap source validation, Linux resource-limit admission, target classification, PTE relocation, reverse-map movement, and VMA publication remain under one address-space transaction. Fixed target retirement conditionally serializes borrowed backing before file-owner state; a typed post-punch outcome forces external owner metadata to mirror every destructive memory outcome, and no resident frame is freed until source translations have been invalidated across CPUs."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Ordinary SHARED base-page mremap holds the address-space transaction followed by the global shared-owner transaction from source validation through publication. It fallibly prepares proportional metadata and every required arena-backed VMA node before PTE mutation, moves rather than clones each resident leaf and reverse-map owner, transfers kept external backing exactly once across source splits, rolls a failed ordinary destination installation back to the authoritative source, and releases truncated backing only after cross-CPU source invalidation. Fixed moves reserve the later destination before target retirement; fixed shrink then follows Linux's target-punch, source-truncate, move order and its typed failure independently exposes both destructive steps so upper file/SysV ownership mirrors the exact committed topology. Paging-frame exhaustion propagates as allocation failure rather than a range error. Huge, swapped, and cross-Region sources fail closed until their distinct ownership machinery exists."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."
 

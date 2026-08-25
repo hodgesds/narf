@@ -98,13 +98,16 @@ be materialized, removed, or registered by the losing syscall.
 `MREMAP_MAYMOVE`, disjoint `MREMAP_FIXED`, and `MREMAP_DONTUNMAP`. Private
 relocation transfers resident backing without copying it; DONTUNMAP leaves a
 lazy anonymous source range and transfers its lock contract to the
-destination. One-Region base-page shared mappings support equal-length
-DONTUNMAP and the historical `old_len == 0` duplication form. Shared backing
-remains owned by both VMAs while resident leaves move for DONTUNMAP and are
-cloned for legacy duplication. File-demand slices and SysV attachment/nattch
-state are prepared and published atomically with the destination. Huge,
-swapped, cross-Region, and ordinary shared resize/move operations still fail
-explicitly.
+destination. One-Region base-page shared mappings support ordinary shrink,
+in-place grow, MAYMOVE/FIXED relocation and equal-length DONTUNMAP, plus the
+historical `old_len == 0` duplication form. Ordinary relocation transfers kept
+backing and resident leaves, leaves a grown tail lazy, and releases a truncated
+tail only after source invalidation. DONTUNMAP and legacy duplication instead
+keep the backing owned by both VMAs; resident leaves move for DONTUNMAP and
+clone for duplication. File-demand slices and SysV attachment/nattch state are
+fallibly prepared and published atomically with every memory outcome,
+including fixed target retirement and a later source-tail shrink on failure.
+Huge, swapped, and cross-Region shared moves still fail explicitly.
 Parameter checks precede VMA lookup as on Linux. Every accepted lookup,
 resource-limit decision, resize, and move shares one address-space transaction,
 so a CLONE_VM peer cannot replace the source between validation and mutation.

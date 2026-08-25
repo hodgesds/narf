@@ -57,11 +57,18 @@ static SHARED_UNMAP_TRANSACTIONS: core::sync::atomic::AtomicUsize =
 static FAIL_SHARED_ALIAS_AFTER_INSTALL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "kernel-test")]
+static FAIL_SHARED_RELOCATION_AFTER_INSTALL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
 static FAIL_FIXED_RELOCATION_AFTER_SHRINK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_fail_next_shared_alias_after_install() {
     FAIL_SHARED_ALIAS_AFTER_INSTALL.store(true, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_fail_next_shared_relocation_after_install() {
+    FAIL_SHARED_RELOCATION_AFTER_INSTALL.store(true, core::sync::atomic::Ordering::Release);
 }
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_fail_next_fixed_relocation_after_shrink() {
@@ -3617,6 +3624,518 @@ impl AddressSpace {
         Ok(eager_range)
     }
 
+    /// Move one interval of an ordinary SHARED base-page VMA to a disjoint
+    /// destination, optionally resizing it at the same time. Unlike
+    /// [`Self::alias_shared_region_locked_limited`], this operation transfers
+    /// the source VMA's backing ownership: kept resident PTE/rmap owners move
+    /// to the destination, a grown tail remains lazy, and truncated shared
+    /// backing is released only after the source TLB invalidation completes.
+    ///
+    /// The source interval must be contained by one Region. A prefix and/or
+    /// suffix outside that interval is preserved as a separate Region with its
+    /// original backing. Swap, huge-page, and cross-Region moves return
+    /// [`AddressSpaceError::NotImplemented`] rather than approximating Linux
+    /// with lost backing or permissions.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] followed by
+    /// [`with_shared_mapping_transaction`], and `self.root` must satisfy the
+    /// live-root contract from [`Self::relocate_region`]. External file/SysV
+    /// ownership must be moved in the same outer transaction before faults can
+    /// observe a lazy `FILE_DEMAND` destination.
+    pub unsafe fn relocate_shared_region_locked_limited(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+        limits: MremapLimits,
+    ) -> Result<Option<(u64, u64)>, AddressSpaceError> {
+        let (old_lo, old_hi, new_lo, new_hi) =
+            Self::relocation_bounds(old_base, old_len, new_base, new_len)?;
+
+        let huge = self.huge_regions.lock();
+        if huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            rb < old_hi && old_lo < re
+        }) {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        if huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            rb < new_hi && new_lo < re
+        }) {
+            return Err(AddressSpaceError::Overlap);
+        }
+
+        let mut regions = self.regions.lock();
+        if regions.swap_pages.range(old_lo..old_hi).next().is_some() {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        let source_region = regions
+            .containing(old_lo)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let source_region_base = source_region.base.as_u64();
+        let source_region_end = source_region_base
+            .checked_add(source_region.len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        if old_hi > source_region_end {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        let source_perms = source_region.perms;
+        if !source_perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        if source_perms.contains(RegionPerms::STACK_SEGMENT)
+            || source_perms.contains(RegionPerms::STACK_GUARD)
+        {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        if new_len > old_len {
+            // Normal FILE_DEMAND VMAs are LOCK_EXEMPT because their backing is
+            // externally owned, but remain expandable. The non-file form is
+            // the closest Region analogue of VM_DONTEXPAND/VM_PFNMAP, for
+            // which Linux reports EFAULT on growth.
+            if source_perms.contains(RegionPerms::LOCK_EXEMPT)
+                && !source_perms.contains(RegionPerms::FILE_DEMAND)
+            {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            Self::check_mremap_growth_limits_locked(
+                &regions,
+                &huge,
+                source_perms,
+                new_len - old_len,
+                limits,
+            )?;
+        }
+        if regions.has_overlap(new_lo, new_hi) {
+            return Err(AddressSpaceError::Overlap);
+        }
+
+        let first = usize::try_from((old_lo - source_region_base) >> 12)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let old_pages =
+            usize::try_from(old_len >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let new_pages =
+            usize::try_from(new_len >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let kept_pages = core::cmp::min(old_pages, new_pages);
+        let source_pages = source_region
+            .phys
+            .get(first..first.saturating_add(old_pages))
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let mut source_phys = Vec::new();
+        source_phys
+            .try_reserve_exact(old_pages)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        source_phys.extend_from_slice(source_pages);
+
+        // Prepare every proportional backing vector before touching either
+        // PTE tree. Region nodes are then provisionally inserted while the
+        // table lock still hides them; any page-table allocation failure can
+        // remove those nodes and leave the original source fully authoritative.
+        let mut destination_phys = Vec::new();
+        destination_phys
+            .try_reserve_exact(new_pages)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+        destination_phys.extend(source_phys.iter().take(kept_pages).copied());
+        destination_phys.resize(new_pages, PhysAddr::new(0));
+
+        let head_pages = first;
+        let tail_first = first
+            .checked_add(old_pages)
+            .ok_or(AddressSpaceError::AllocationFailed)?;
+        let tail_pages = source_region.phys.len().saturating_sub(tail_first);
+        let mut head_phys = Vec::new();
+        if head_pages != 0 {
+            head_phys
+                .try_reserve_exact(head_pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            head_phys.extend_from_slice(&source_region.phys[..head_pages]);
+        }
+        let mut tail_phys = Vec::new();
+        if tail_pages != 0 {
+            tail_phys
+                .try_reserve_exact(tail_pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            tail_phys.extend_from_slice(&source_region.phys[tail_first..]);
+        }
+        let mut truncated_phys = Vec::new();
+        if old_pages > kept_pages {
+            truncated_phys
+                .try_reserve_exact(old_pages - kept_pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            truncated_phys.extend_from_slice(&source_phys[kept_pages..]);
+        }
+
+        let destination_region = Region {
+            base: new_base,
+            len: new_len,
+            perms: source_perms,
+            phys: destination_phys,
+        };
+        let tail_region = (tail_pages != 0).then(|| Region {
+            base: VirtAddr::new(old_hi),
+            len: source_region_end - old_hi,
+            perms: source_perms,
+            phys: tail_phys,
+        });
+
+        // Only resident source leaves move. A nonresident shared page retains
+        // its backing metadata and faults at the destination instead of being
+        // accidentally made resident by the metadata transfer.
+        let tracks_resident_leaves = self.root.as_u64() != 0 && source_perms.prot_only().0 != 0;
+        let mut leaf_phys = Vec::new();
+        if tracks_resident_leaves {
+            leaf_phys
+                .try_reserve_exact(new_pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            for (index, &phys) in source_phys.iter().take(kept_pages).enumerate() {
+                if phys.raw() == 0 {
+                    leaf_phys.push(PhysAddr::new(0));
+                    continue;
+                }
+                let source_va = VirtAddr::new(old_lo + index as u64 * 4096);
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: both structural transactions and the regions lock
+                // keep the source PTE/backing pair stable through commit.
+                let mapped = unsafe { crate::x86_64::paging::translate(self.root, source_va) };
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: same live-root/source-transaction proof as x86_64.
+                let mapped = unsafe { crate::aarch64::paging::translate(self.root, source_va) };
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                let mapped = Some(phys);
+                match mapped {
+                    Some(mapped)
+                        if mapped == phys
+                            && crate::rmap::contains_owner(phys, self.root, source_va) =>
+                    {
+                        leaf_phys.push(phys);
+                    }
+                    Some(_) => return Err(AddressSpaceError::NotImplemented),
+                    None => leaf_phys.push(PhysAddr::new(0)),
+                }
+            }
+            leaf_phys.resize(new_pages, PhysAddr::new(0));
+        }
+        let destination_leaf_view = Region {
+            base: new_base,
+            len: new_len,
+            perms: source_perms,
+            phys: leaf_phys,
+        };
+
+        // A contained sub-VMA move publishes the destination and, when the
+        // selected interval has a suffix, one preserved tail. Reserve both
+        // arena slots before installing any destination leaf.
+        regions.try_reserve_nodes(1 + usize::from(tail_pages != 0))?;
+
+        // Publish the provisional tree nodes before the first PTE mutation.
+        // They temporarily overlap the old source only inside this locked
+        // table and are removed on every recoverable exit below. Their arena
+        // capacity was fallibly prepared above, so publication cannot enter
+        // the allocator's abort path.
+        if let Some(tail) = tail_region {
+            assert!(regions.insert_reserved(tail).is_none());
+        }
+        assert!(regions.insert_reserved(destination_region).is_none());
+
+        if self.root.as_u64() != 0 {
+            // SAFETY: destination is validated, disjoint, and free; caller
+            // supplies the live-root contract.
+            if let Err(error) = unsafe { self.install_region_leaves_local(&destination_leaf_view) }
+            {
+                let _destination = regions
+                    .remove(new_lo)
+                    .expect("failed shared relocation lost provisional destination");
+                if tail_pages != 0 {
+                    let _tail = regions
+                        .remove(old_hi)
+                        .expect("failed shared relocation lost provisional suffix");
+                }
+                // SAFETY: removes only the partial destination leaves installed
+                // by the failed operation above.
+                unsafe { self.unmap_region_leaves_local(&destination_leaf_view) };
+                drop(regions);
+                drop(huge);
+                self.flush_region_broadcast(new_base, new_len >> 12);
+                return Err(error);
+            }
+
+            #[cfg(feature = "kernel-test")]
+            if FAIL_SHARED_RELOCATION_AFTER_INSTALL
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
+                let _destination = regions
+                    .remove(new_lo)
+                    .expect("injected shared relocation lost provisional destination");
+                if tail_pages != 0 {
+                    let _tail = regions
+                        .remove(old_hi)
+                        .expect("injected shared relocation lost provisional suffix");
+                }
+                // SAFETY: injection occurs before source/rmap/ownership commit.
+                unsafe { self.unmap_region_leaves_local(&destination_leaf_view) };
+                drop(regions);
+                drop(huge);
+                self.flush_region_broadcast(new_base, new_len >> 12);
+                return Err(AddressSpaceError::AllocationFailed);
+            }
+
+            let source_view = Region {
+                base: old_base,
+                len: old_len,
+                perms: source_perms,
+                phys: Vec::new(),
+            };
+            // SAFETY: names exactly the validated source interval; kept
+            // translations are already installed at their new coordinates.
+            unsafe { self.unmap_region_leaves_local(&source_view) };
+            if tracks_resident_leaves {
+                for (index, &phys) in source_phys.iter().enumerate() {
+                    if phys.raw() == 0 {
+                        continue;
+                    }
+                    let old_va = VirtAddr::new(old_lo + index as u64 * 4096);
+                    if index < kept_pages && destination_leaf_view.phys[index].raw() != 0 {
+                        let new_va = VirtAddr::new(new_lo + index as u64 * 4096);
+                        assert!(
+                            crate::rmap::move_owner(phys, self.root, old_va, new_va),
+                            "resident shared relocation source missing rmap owner"
+                        );
+                    } else {
+                        crate::rmap::remove(phys, self.root, old_va);
+                    }
+                }
+            }
+        }
+
+        // Retire the old VMA generation and publish its optional prefix. The
+        // suffix and destination nodes were already published before the PTE
+        // commit, so no operation returning a recoverable error follows.
+        if head_pages == 0 {
+            let _source = regions
+                .remove(source_region_base)
+                .expect("shared relocation source disappeared under region lock");
+        } else {
+            regions
+                .demand_pages
+                .retain_outside(source_region_base, source_region_end);
+            regions
+                .cow_pages
+                .retain(|&vaddr, _| vaddr < source_region_base || vaddr >= source_region_end);
+            let source = regions
+                .get_mut(source_region_base)
+                .expect("shared relocation source disappeared under region lock");
+            source.len = old_lo - source_region_base;
+            source.phys = head_phys;
+            regions.invalidate_mapping(source_region_base);
+        }
+        drop(regions);
+        drop(huge);
+
+        self.flush_region_broadcast(old_base, old_len >> 12);
+        self.flush_region_broadcast(new_base, new_len >> 12);
+        for phys in truncated_phys {
+            release_shared_phys(phys);
+        }
+        self.bump_mmap_cursor_past(new_lo, new_len);
+        let eager_range = (new_len > old_len
+            && source_perms.contains(RegionPerms::LOCKED)
+            && !source_perms.contains(RegionPerms::LOCK_ONFAULT)
+            && !source_perms.contains(RegionPerms::LOCK_EXEMPT)
+            && source_perms.prot_only().0 != 0)
+            .then_some((new_lo + old_len, new_hi));
+        Ok(eager_range)
+    }
+
+    /// Acquire the VMA/shared transactions around an ordinary shared move and
+    /// finish eager locked-tail population after releasing both IRQ-safe locks.
+    ///
+    /// # Safety
+    /// Same live-root contract as [`Self::relocate_region`].
+    pub unsafe fn relocate_shared_region_limited(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+        limits: MremapLimits,
+    ) -> Result<(), AddressSpaceError> {
+        let eager_range = {
+            let _vma_guard = self.vma_transaction.lock();
+            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            // SAFETY: wrapper supplies both required transactions and forwards
+            // the caller's live-root contract.
+            unsafe {
+                self.relocate_shared_region_locked_limited(
+                    old_base, old_len, new_base, new_len, limits,
+                )
+            }?
+        };
+        self.finish_relocation_population(eager_range);
+        Ok(())
+    }
+
+    fn check_shared_relocation_source_and_limits_locked(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_len: u64,
+        limits: MremapLimits,
+    ) -> Result<(), AddressSpaceError> {
+        let old_lo = old_base.as_u64();
+        let old_hi = old_lo
+            .checked_add(old_len)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let huge = self.huge_regions.lock();
+        if huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            rb < old_hi && old_lo < re
+        }) {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        let regions = self.regions.lock();
+        if regions.swap_pages.range(old_lo..old_hi).next().is_some() {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        let source = regions
+            .containing(old_lo)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if old_hi > source.base.as_u64().saturating_add(source.len) {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        if !source.perms.contains(RegionPerms::SHARED) {
+            return Err(AddressSpaceError::SharedMapping);
+        }
+        if source.perms.contains(RegionPerms::STACK_SEGMENT)
+            || source.perms.contains(RegionPerms::STACK_GUARD)
+        {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        if new_len > old_len {
+            if source.perms.contains(RegionPerms::LOCK_EXEMPT)
+                && !source.perms.contains(RegionPerms::FILE_DEMAND)
+            {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            Self::check_mremap_growth_limits_locked(
+                &regions,
+                &huge,
+                source.perms,
+                new_len - old_len,
+                limits,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Fixed-target shared relocation. Source eligibility and growth limits
+    /// are admitted before the destructive target punch. A shrinking move then
+    /// truncates the source before attempting the move, matching Linux's
+    /// `mremap_to()` ordering. Later failures report both committed topology
+    /// changes so upper file/SysV ownership can match memory exactly.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] followed by
+    /// [`with_shared_mapping_transaction`] and uphold the live-root contract.
+    pub unsafe fn relocate_shared_region_fixed_locked_limited(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+        limits: MremapLimits,
+        shared_transaction_held: bool,
+    ) -> Result<Option<(u64, u64)>, FixedRelocationError> {
+        let early = |error| FixedRelocationError {
+            error,
+            target_punched: false,
+            source_shrunk: false,
+        };
+        Self::relocation_bounds(old_base, old_len, new_base, new_len).map_err(early)?;
+        if !shared_transaction_held {
+            return Err(early(AddressSpaceError::SharedMapping));
+        }
+        self.check_shared_relocation_source_and_limits_locked(old_base, old_len, new_len, limits)
+            .map_err(early)?;
+        self.punch_fixed_locked_with_shared_reserving(new_base, new_len, true, 2)
+            .map_err(early)?;
+        let mut source_shrunk = false;
+        let move_old_len = if old_len > new_len {
+            let tail_base = VirtAddr::new(old_base.as_u64() + new_len);
+            self.punch_fixed_locked_with_shared_reserving(tail_base, old_len - new_len, true, 1)
+                .map_err(|error| FixedRelocationError {
+                    error,
+                    target_punched: true,
+                    source_shrunk: false,
+                })?;
+            source_shrunk = true;
+
+            #[cfg(feature = "kernel-test")]
+            if FAIL_FIXED_RELOCATION_AFTER_SHRINK.swap(false, core::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(FixedRelocationError {
+                    error: AddressSpaceError::AllocationFailed,
+                    target_punched: true,
+                    source_shrunk: true,
+                });
+            }
+            new_len
+        } else {
+            old_len
+        };
+        // SAFETY: caller's VMA/shared/root contracts are forwarded. The
+        // pre-punch admission remains authoritative while the VMA transaction
+        // is held, so it must not be recomputed against the smaller mapping.
+        unsafe {
+            self.relocate_shared_region_locked_limited(
+                old_base,
+                move_old_len,
+                new_base,
+                new_len,
+                MremapLimits::UNLIMITED,
+            )
+        }
+        .map_err(|error| FixedRelocationError {
+            error,
+            target_punched: true,
+            source_shrunk,
+        })
+    }
+
+    /// Transaction-acquiring counterpart of
+    /// [`Self::relocate_shared_region_fixed_locked_limited`].
+    ///
+    /// # Safety
+    /// Same live-root contract as [`Self::relocate_region`].
+    pub unsafe fn relocate_shared_region_fixed_limited(
+        &self,
+        old_base: VirtAddr,
+        old_len: u64,
+        new_base: VirtAddr,
+        new_len: u64,
+        limits: MremapLimits,
+    ) -> Result<(), FixedRelocationError> {
+        let eager_range = {
+            let _vma_guard = self.vma_transaction.lock();
+            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            // SAFETY: wrapper supplies both structural transactions and
+            // forwards the caller's live-root contract.
+            unsafe {
+                self.relocate_shared_region_fixed_locked_limited(
+                    old_base, old_len, new_base, new_len, limits, true,
+                )
+            }?
+        };
+        self.finish_relocation_population(eager_range);
+        Ok(())
+    }
+
     /// Move an exact private anonymous VMA's resident backing to a second VMA
     /// while leaving the source range mapped as lazy anonymous memory. This is
     /// Linux `MREMAP_DONTUNMAP`: the old range faults fresh backing (or can be
@@ -4520,6 +5039,21 @@ impl AddressSpace {
         len: u64,
     ) -> Result<(), AddressSpaceError> {
         self.punch_fixed_locked(base, len)
+    }
+
+    /// Shared-aware syscall punch with both the VMA and shared-owner
+    /// transactions already held in that order.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] and, when
+    /// `shared_transaction_held` is true, [`with_shared_mapping_transaction`].
+    pub unsafe fn punch_fixed_locked_for_syscall_with_shared(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+    ) -> Result<(), AddressSpaceError> {
+        self.punch_fixed_locked_with_shared(base, len, shared_transaction_held)
     }
 
     /// MAP_FIXED punch with the VMA transaction held and, when

@@ -520,6 +520,24 @@ impl AddressSpace {
         -> Result<(), FixedRelocationError>;
     pub unsafe fn relocate_region_fixed_locked_limited(/* ... */)
         -> Result<Option<(u64, u64)>, FixedRelocationError>;
+    /// Ordinary nonzero-length SHARED base-page relocation transfers backing
+    /// and resident PTE/rmap authority instead of creating a second alias.
+    /// One source Region may be split around the selected interval; growth is
+    /// admitted on the delta and appends lazy backing, while shrink releases
+    /// only the truncated backing after source invalidation. Swap, huge, and
+    /// cross-Region sources remain explicit NotImplemented outcomes.
+    pub unsafe fn relocate_shared_region_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_shared_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    /// Fixed shared relocation performs source/limit preflight before target
+    /// retirement. A shrink then truncates the source before attempting its
+    /// move, matching Linux; FixedRelocationError separately reports
+    /// target_punched and source_shrunk so external ownership can mirror both.
+    pub unsafe fn relocate_shared_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn relocate_shared_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
     /// Create a second base-page VMA over an interval wholly contained in one
     /// SHARED Region. Duplicate performs MEMLOCK then AS/DATA admission before
     /// a fixed punch; DontUnmap skips MEMLOCK, admits AS/DATA after a fixed
@@ -561,6 +579,10 @@ impl AddressSpace {
         -> Result<Region, AddressSpaceError>;
     /// Remove a base-page range while preserving non-overlapping fragments.
     pub fn punch_fixed(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    /// Transaction-held syscall form for a SHARED range. The caller supplies
+    /// the VMA -> shared-owner lock-order proof explicitly.
+    pub unsafe fn punch_fixed_locked_for_syscall_with_shared(/* ... */)
         -> Result<(), AddressSpaceError>;
 }
 
@@ -822,10 +844,26 @@ x86_64 is rejected at runtime.
   scrub. It then groups without allocation into bounded NUMA-cache/buddy
   transactions that retain the cache lock until displaced cached frames are
   visible in the zone; alternative allocators use the scalar default.
-- Base-page relocation installs the disjoint destination before removing the
-  source, publishes backing ownership exactly once, invalidates source
-  translations before freeing a truncated tail, and leaves the source intact
-  when destination installation fails.
+- Non-fixed base-page relocation installs the disjoint destination before
+  removing the source, publishes backing ownership exactly once, invalidates
+  source translations before freeing a truncated tail, and leaves it intact
+  when destination installation fails. Ordinary SHARED relocation applies the
+  same ordering while holding the VMA then global shared-owner transactions:
+  it moves (never clones) resident leaf/rmap authority, transfers kept external
+  backing without a retain/release pair, and releases only truncated backing
+  after the source broadcast. Every proportional vector and required VMA-index
+  arena slot is fallibly prepared before PTE mutation. Provisional Region
+  nodes are then published allocation-free; rollback removes those nodes and
+  destination leaves while the original source remains authoritative. Private
+  moves require one exact Region; ordinary SHARED moves may
+  select an interval contained in one Region. Cross-Region/cross-VMA moves are
+  explicit unsupported outcomes. For any fixed shrinking move, Linux ordering
+  is intentionally destructive: target retirement precedes source-tail
+  truncation, which precedes the move.
+  A later failure reports both committed steps so external ownership can make
+  the same transition. Architecture page-table frame exhaustion is distinct
+  from malformed ranges and occupied/huge leaves and propagates as
+  `AllocationFailed` (`ENOMEM` at the syscall boundary).
 - Base-page regions live in an arena-backed AVL tree keyed by virtual base.
   Tree links are stable arena indices, removed slots form a non-allocating
   intrusive free list, and `try_reserve_nodes(n)` makes the following `n`

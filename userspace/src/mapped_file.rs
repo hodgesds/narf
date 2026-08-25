@@ -251,6 +251,166 @@ pub(crate) fn publish_current_owner_alias<T>(
     publish_owner_alias(address_space_id, old_addr, new_addr, len, fixed, publish)
 }
 
+/// Publish an ordinary shared/file-backed mremap move. Unlike alias
+/// publication, this retires the selected source owner interval and transfers
+/// its file offset/lifetime to a possibly resized destination. A fixed move
+/// can additionally commit target-only and target-plus-source-shrink states
+/// when memory reports a late Linux-style failure.
+///
+/// The caller holds the address-space VMA and shared-mapping transactions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_current_owner_relocation<T>(
+    old_addr: u64,
+    old_len: u64,
+    new_addr: u64,
+    new_len: u64,
+    fixed: bool,
+    publish: impl FnOnce() -> Result<T, narf_memory::FixedRelocationError>,
+) -> Result<T, narf_memory::FixedRelocationError> {
+    let Some(address_space_id) = current_address_space_id() else {
+        return publish();
+    };
+    publish_owner_relocation(
+        address_space_id,
+        old_addr,
+        old_len,
+        new_addr,
+        new_len,
+        fixed,
+        publish,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_owner_relocation<T>(
+    address_space_id: u64,
+    old_addr: u64,
+    old_len: u64,
+    new_addr: u64,
+    new_len: u64,
+    fixed: bool,
+    publish: impl FnOnce() -> Result<T, narf_memory::FixedRelocationError>,
+) -> Result<T, narf_memory::FixedRelocationError> {
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return publish();
+    };
+    let mut owners = owner_bucket.lock();
+    let fail = |error| narf_memory::FixedRelocationError {
+        error,
+        target_punched: false,
+        source_shrunk: false,
+    };
+    let destination =
+        prepare_relocated_owners_locked(&owners, old_addr, old_len, new_addr, new_len)
+            .map_err(fail)?;
+    let source_owned = !destination.is_empty();
+    let target_owned = fixed && owner_range_intersects(&owners, new_addr, new_len);
+    if !source_owned && !target_owned {
+        drop(owners);
+        return publish();
+    }
+
+    let target_suffixes = if fixed {
+        prepare_punch_suffixes_locked(&owners, new_addr, new_len).map_err(fail)?
+    } else {
+        Vec::new()
+    };
+    let source_suffixes = if source_owned {
+        prepare_punch_suffixes_locked(&owners, old_addr, old_len).map_err(fail)?
+    } else {
+        Vec::new()
+    };
+    let shrink_suffixes = if source_owned && old_len > new_len {
+        prepare_punch_suffixes_locked(
+            &owners,
+            old_addr
+                .checked_add(new_len)
+                .ok_or_else(|| fail(AddressSpaceError::OutOfRange))?,
+            old_len - new_len,
+        )
+        .map_err(fail)?
+    } else {
+        Vec::new()
+    };
+    let success_growth = target_suffixes
+        .len()
+        .checked_add(source_suffixes.len())
+        .and_then(|count| count.checked_add(destination.len()))
+        .ok_or_else(|| fail(AddressSpaceError::AllocationFailed))?;
+    let failed_growth = target_suffixes
+        .len()
+        .checked_add(shrink_suffixes.len())
+        .ok_or_else(|| fail(AddressSpaceError::AllocationFailed))?;
+    owners
+        .try_reserve_exact(core::cmp::max(success_growth, failed_growth))
+        .map_err(|_| fail(AddressSpaceError::AllocationFailed))?;
+
+    let result = publish();
+    match &result {
+        Ok(_) => {
+            if fixed {
+                commit_prepared_punch_locked(&mut owners, new_addr, new_len, target_suffixes);
+            }
+            if source_owned {
+                commit_prepared_punch_locked(&mut owners, old_addr, old_len, source_suffixes);
+                owners.extend(destination);
+            }
+        }
+        Err(failure) if failure.target_punched => {
+            commit_prepared_punch_locked(&mut owners, new_addr, new_len, target_suffixes);
+            if failure.source_shrunk && old_len > new_len && source_owned {
+                commit_prepared_punch_locked(
+                    &mut owners,
+                    old_addr + new_len,
+                    old_len - new_len,
+                    shrink_suffixes,
+                );
+            }
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+/// Resize an ordinary shared file owner in place. The replacement owner rows
+/// are fully cloned/reserved before memory grows; publication is therefore
+/// failure-atomic and a FILE_DEMAND fault cannot observe the new tail before
+/// its backing file row exists.
+pub(crate) fn publish_current_owner_resize<T>(
+    base: u64,
+    old_len: u64,
+    new_len: u64,
+    publish: impl FnOnce() -> Result<T, AddressSpaceError>,
+) -> Result<T, AddressSpaceError> {
+    let Some(address_space_id) = current_address_space_id() else {
+        return publish();
+    };
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return publish();
+    };
+    let mut owners = owner_bucket.lock();
+    let replacement = prepare_relocated_owners_locked(&owners, base, old_len, base, new_len)?;
+    if replacement.is_empty() {
+        drop(owners);
+        return publish();
+    }
+    let suffixes = prepare_punch_suffixes_locked(&owners, base, old_len)?;
+    owners
+        .try_reserve_exact(
+            suffixes
+                .len()
+                .checked_add(replacement.len())
+                .ok_or(AddressSpaceError::AllocationFailed)?,
+        )
+        .map_err(|_| AddressSpaceError::AllocationFailed)?;
+    let result = publish();
+    if result.is_ok() {
+        commit_prepared_punch_locked(&mut owners, base, old_len, suffixes);
+        owners.extend(replacement);
+    }
+    result
+}
+
 fn publish_owner_alias<T>(
     address_space_id: u64,
     old_addr: u64,
@@ -768,14 +928,179 @@ fn prepare_aliases_locked(
     Ok(aliases)
 }
 
-/// Reserve every allocation required to split owner metadata before the
-/// corresponding memory punch can become destructive. Only a mapping which
-/// survives on both sides needs a new owner row and a copied writeback tail.
-fn prepare_punch_locked(
-    owners: &mut Vec<MappingOwner>,
+fn owner_range_intersects(owners: &[MappingOwner], base: u64, len: u64) -> bool {
+    let Some(end) = base.checked_add(len) else {
+        return false;
+    };
+    owners.iter().any(|mapping| {
+        mapping
+            .base
+            .checked_add(mapping.len)
+            .is_some_and(|mapping_end| mapping.base < end && base < mapping_end)
+    })
+}
+
+/// Fallibly prepare the destination file-owner partition for an ordinary
+/// move. If any file owner intersects the source, owner rows must cover the
+/// entire old interval exactly. This is the file-owner equivalent of memory's
+/// one-Region rule: accepting a hole would leave FILE_DEMAND faults without a
+/// backing object after the move.
+fn prepare_relocated_owners_locked(
+    owners: &[MappingOwner],
+    old_addr: u64,
+    old_len: u64,
+    new_addr: u64,
+    new_len: u64,
+) -> Result<Vec<MappingOwner>, AddressSpaceError> {
+    let old_end = old_addr
+        .checked_add(old_len)
+        .ok_or(AddressSpaceError::OutOfRange)?;
+    let kept_len = core::cmp::min(old_len, new_len);
+    let kept_end = old_addr
+        .checked_add(kept_len)
+        .ok_or(AddressSpaceError::OutOfRange)?;
+    let new_end = new_addr
+        .checked_add(new_len)
+        .ok_or(AddressSpaceError::OutOfRange)?;
+    let count = owners
+        .iter()
+        .filter(|mapping| {
+            mapping
+                .base
+                .checked_add(mapping.len)
+                .is_some_and(|end| mapping.base < old_end && old_addr < end)
+        })
+        .count();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut source_ranges = Vec::new();
+    source_ranges
+        .try_reserve_exact(count)
+        .map_err(|_| AddressSpaceError::AllocationFailed)?;
+    let mut destination = Vec::new();
+    destination
+        .try_reserve_exact(count)
+        .map_err(|_| AddressSpaceError::AllocationFailed)?;
+    for mapping in owners {
+        let Some(mapping_end) = mapping.base.checked_add(mapping.len) else {
+            continue;
+        };
+        let source_base = mapping.base.max(old_addr);
+        let source_end = mapping_end.min(old_end);
+        if source_base >= source_end {
+            continue;
+        }
+        source_ranges.push((source_base, source_end));
+
+        let kept_base = source_base;
+        let kept_mapping_end = source_end.min(kept_end);
+        if kept_base >= kept_mapping_end {
+            continue;
+        }
+        let source_offset = kept_base - mapping.base;
+        let destination_base = new_addr
+            .checked_add(kept_base - old_addr)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let destination_len = kept_mapping_end - kept_base;
+        let writeback = if let Some(original) = mapping.writeback.as_ref() {
+            let first = usize::try_from(source_offset >> 12)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            let pages = usize::try_from(destination_len >> 12)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            let last = first
+                .checked_add(pages)
+                .ok_or(AddressSpaceError::AllocationFailed)?;
+            let source = original
+                .phys
+                .get(first..last)
+                .ok_or(AddressSpaceError::Unmapped)?;
+            let mut phys = Vec::new();
+            phys.try_reserve_exact(source.len())
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            phys.extend_from_slice(source);
+            Some(FileWriteback {
+                offset: original
+                    .offset
+                    .checked_add(source_offset)
+                    .ok_or(AddressSpaceError::OutOfRange)?,
+                phys,
+            })
+        } else {
+            None
+        };
+        destination.push(MappingOwner {
+            base: destination_base,
+            len: destination_len,
+            file_offset: mapping
+                .file_offset
+                .checked_add(source_offset)
+                .ok_or(AddressSpaceError::OutOfRange)?,
+            ops: Arc::clone(&mapping.ops),
+            lifetime: mapping.lifetime.clone(),
+            writeback,
+        });
+    }
+
+    source_ranges.sort_unstable_by_key(|range| range.0);
+    let mut cursor = old_addr;
+    for &(base, end) in &source_ranges {
+        if base != cursor || end <= base {
+            return Err(if base < cursor {
+                AddressSpaceError::Overlap
+            } else {
+                AddressSpaceError::Unmapped
+            });
+        }
+        cursor = end;
+    }
+    if cursor != old_end {
+        return Err(AddressSpaceError::Unmapped);
+    }
+
+    destination.sort_unstable_by_key(|mapping| mapping.base);
+    if new_len > old_len {
+        let tail = destination.last_mut().ok_or(AddressSpaceError::Unmapped)?;
+        let delta = new_len - old_len;
+        if tail.base.saturating_add(tail.len) != new_addr + old_len {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        if let Some(writeback) = tail.writeback.as_mut() {
+            let pages =
+                usize::try_from(delta >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
+            writeback
+                .phys
+                .try_reserve_exact(pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            writeback
+                .phys
+                .resize(writeback.phys.len() + pages, PhysAddr::new(0));
+        }
+        tail.len = tail
+            .len
+            .checked_add(delta)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+    }
+    let mut cursor = new_addr;
+    for mapping in &destination {
+        if mapping.base != cursor || mapping.len == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        cursor = cursor
+            .checked_add(mapping.len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+    }
+    if cursor != new_end {
+        return Err(AddressSpaceError::Unmapped);
+    }
+    Ok(destination)
+}
+
+fn prepare_punch_suffixes_locked(
+    owners: &[MappingOwner],
     base: u64,
     len: u64,
-    additional_rows: usize,
 ) -> Result<Vec<MappingOwner>, AddressSpaceError> {
     let end = base.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
     let split_count = owners
@@ -787,13 +1112,6 @@ fn prepare_punch_locked(
                 .is_some_and(|mapping_end| mapping.base < base && mapping_end > end)
         })
         .count();
-    owners
-        .try_reserve_exact(
-            split_count
-                .checked_add(additional_rows)
-                .ok_or(AddressSpaceError::AllocationFailed)?,
-        )
-        .map_err(|_| AddressSpaceError::AllocationFailed)?;
     let mut suffixes = Vec::new();
     suffixes
         .try_reserve_exact(split_count)
@@ -827,6 +1145,27 @@ fn prepare_punch_locked(
             writeback,
         });
     }
+    Ok(suffixes)
+}
+
+/// Reserve every allocation required to split owner metadata before the
+/// corresponding memory punch can become destructive. Only a mapping which
+/// survives on both sides needs a new owner row and a copied writeback tail.
+fn prepare_punch_locked(
+    owners: &mut Vec<MappingOwner>,
+    base: u64,
+    len: u64,
+    additional_rows: usize,
+) -> Result<Vec<MappingOwner>, AddressSpaceError> {
+    let suffixes = prepare_punch_suffixes_locked(owners, base, len)?;
+    owners
+        .try_reserve_exact(
+            suffixes
+                .len()
+                .checked_add(additional_rows)
+                .ok_or(AddressSpaceError::AllocationFailed)?,
+        )
+        .map_err(|_| AddressSpaceError::AllocationFailed)?;
     Ok(suffixes)
 }
 
@@ -1304,6 +1643,116 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mapped_file_fixed_remap_mirrors_target_outcome
+    );
+
+    fn smoke_mapped_file_shared_relocation_mirrors_all_outcomes() -> TestResult {
+        const ADDRESS_SPACE: u64 = u64::MAX - 16;
+        const SOURCE: u64 = 0x20_000;
+        const TARGET: u64 = 0x40_000;
+        const DESTINATION: u64 = 0x60_000;
+        drop_address_space(ADDRESS_SPACE);
+        let owner: Arc<dyn FileOps> = Arc::new(FixedRemapOwner);
+        register(
+            ADDRESS_SPACE,
+            SOURCE,
+            0x4000,
+            0x80_000,
+            Arc::clone(&owner),
+            None,
+            Some(FileWriteback {
+                offset: 0x80_000,
+                phys: alloc::vec![
+                    PhysAddr::new(0x11_000),
+                    PhysAddr::new(0x12_000),
+                    PhysAddr::new(0x13_000),
+                    PhysAddr::new(0x14_000),
+                ],
+            }),
+        );
+        register(
+            ADDRESS_SPACE,
+            TARGET,
+            0x3000,
+            0,
+            Arc::clone(&owner),
+            None,
+            None,
+        );
+
+        let late =
+            publish_owner_relocation(ADDRESS_SPACE, SOURCE, 0x4000, TARGET, 0x2000, true, || {
+                Err::<(), _>(narf_memory::FixedRelocationError {
+                    error: AddressSpaceError::AllocationFailed,
+                    target_punched: true,
+                    source_shrunk: true,
+                })
+            });
+        let after_failure = existing_mapping_owners(ADDRESS_SPACE)
+            .map(|bucket| {
+                let mut rows = bucket
+                    .lock()
+                    .iter()
+                    .map(|mapping| (mapping.base, mapping.len))
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                rows
+            })
+            .unwrap_or_default();
+        let moved = publish_owner_relocation(
+            ADDRESS_SPACE,
+            SOURCE,
+            0x2000,
+            DESTINATION,
+            0x3000,
+            false,
+            || Ok(()),
+        );
+        let destination = existing_mapping_owners(ADDRESS_SPACE).and_then(|bucket| {
+            bucket
+                .lock()
+                .iter()
+                .find(|mapping| mapping.base == DESTINATION)
+                .map(|mapping| {
+                    (
+                        mapping.len,
+                        mapping.file_offset,
+                        mapping
+                            .writeback
+                            .as_ref()
+                            .map(|writeback| (writeback.offset, writeback.phys.clone())),
+                    )
+                })
+        });
+        drop_address_space(ADDRESS_SPACE);
+        if late
+            != Err(narf_memory::FixedRelocationError {
+                error: AddressSpaceError::AllocationFailed,
+                target_punched: true,
+                source_shrunk: true,
+            })
+            || after_failure != alloc::vec![(SOURCE, 0x2000), (TARGET + 0x2000, 0x1000)]
+            || moved != Ok(())
+            || destination
+                != Some((
+                    0x3000,
+                    0x80_000,
+                    Some((
+                        0x80_000,
+                        alloc::vec![
+                            PhysAddr::new(0x11_000),
+                            PhysAddr::new(0x12_000),
+                            PhysAddr::new(0),
+                        ],
+                    )),
+                ))
+        {
+            return TestResult::Fail("shared relocation owner state diverged from memory");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mapped_file_shared_relocation_mirrors_all_outcomes
     );
 
     fn smoke_mapped_file_alias_slices_owner_and_is_failure_atomic() -> TestResult {

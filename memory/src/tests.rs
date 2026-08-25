@@ -12564,6 +12564,449 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_shared_duplicate_clones_residency);
 
+/// Ordinary nonzero-length shared mremap may select an interval inside one
+/// VMA, preserve both outside fragments, transfer only the kept backing, and
+/// lazily extend a locked destination after admitting the growth delta.
+fn smoke_memory_shared_relocation_splits_and_grows() -> TestResult {
+    use crate::{AddressSpace, MremapLimits, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2c00_0000);
+    let destination = VirtAddr::new(0x0000_4080_2d00_0000);
+    let backing = alloc::vec![
+        PhysAddr::new(0x1100_0000),
+        PhysAddr::new(0x1100_1000),
+        PhysAddr::new(0x1100_2000),
+        PhysAddr::new(0x1100_3000),
+    ];
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x4000,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::SHARED
+                | RegionPerms::LOCKED,
+            phys: backing.clone(),
+        })
+        .is_err()
+    {
+        return TestResult::Fail("shared relocation split setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no live root; the wrapper supplies both
+    // structural transactions for this metadata-only move.
+    let moved = unsafe {
+        address_space.relocate_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x2000,
+            destination,
+            0x3000,
+            MremapLimits {
+                memlock_bytes: 0x5000,
+                address_space_bytes: 0x5000,
+                data_bytes: 0,
+                data_max_bytes: 0,
+                bypass_memlock: false,
+            },
+        )
+    };
+    let head = address_space
+        .lookup(source)
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[0]]);
+    let removed = address_space
+        .lookup(VirtAddr::new(source.as_u64() + 0x1000))
+        .is_none();
+    let tail = address_space
+        .lookup(VirtAddr::new(source.as_u64() + 0x3000))
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[3]]);
+    let destination_correct = address_space.lookup(destination).is_some_and(|region| {
+        region.len == 0x3000
+            && region.perms.contains(RegionPerms::LOCKED)
+            && region.phys == alloc::vec![backing[1], backing[2], PhysAddr::new(0)]
+    });
+    if moved.is_ok() && head && removed && tail && destination_correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared relocation did not preserve split/backing metadata")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_relocation_splits_and_grows);
+
+/// Region-index allocation is part of relocation preflight. Ordinary moves
+/// leave the source authoritative, and fixed moves fail before retiring an
+/// occupied target, when arena capacity cannot be prepared.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_409d_0000_0000);
+    let destination = VirtAddr::new(0x0000_409e_0000_0000);
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR + 0x80_0000);
+    let source_phys = alloc::vec![PhysAddr::new(0), PhysAddr::new(0), PhysAddr::new(0),];
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x3000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            phys: source_phys.clone(),
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("region-index OOM setup failed");
+    }
+
+    address_space.__test_fail_next_region_index_reserve();
+    // SAFETY: AddressSpace::empty is metadata-only and this wrapper supplies
+    // both structural transactions.
+    let ordinary = unsafe {
+        address_space.relocate_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            destination,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if ordinary != Err(AddressSpaceError::AllocationFailed)
+        || address_space.lookup(destination).is_some()
+        || !address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+    {
+        return TestResult::Fail("ordinary shared index OOM mutated VMA state");
+    }
+
+    address_space.__test_fail_next_region_index_reserve();
+    // SAFETY: same metadata-only proof. The occupied target must remain live
+    // because its punch also prepares capacity for the later destination.
+    let fixed = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x3000,
+            target,
+            0x3000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: false,
+        source_shrunk: false,
+    });
+    if fixed == expected
+        && address_space.lookup(target).is_some()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fixed shared index OOM retired source or target")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_relocation_index_oom_is_preflight
+);
+
+/// A resident ordinary shared move transfers PTE/rmap authority instead of
+/// cloning it. A truncated page loses its rmap only after the source leaves
+/// are retired, while a failed post-install attempt rolls back to the source.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
+    use crate::{AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, VirtAddr};
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned root.
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: fresh test root is exclusively owned and never activated.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared relocation root allocation failed"),
+    };
+    let first = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared relocation first frame unavailable"),
+    };
+    let second = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            crate::free_frame(PhysFrame::new(first));
+            return TestResult::Skip("shared relocation second frame unavailable");
+        }
+    };
+    let source = VirtAddr::new(0x0000_4098_0000_0000);
+    #[cfg(feature = "kernel-test")]
+    let rollback_destination = VirtAddr::new(0x0000_4099_0000_0000);
+    let destination = VirtAddr::new(0x0000_409a_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both structural transactions, the live root, and backing
+            // frames remain owned by this test.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x2000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                    phys: alloc::vec![first, second],
+                })?;
+                address_space.materialize_range(source, 0x2000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared relocation materialization failed");
+    }
+
+    #[cfg(feature = "kernel-test")]
+    {
+        crate::address_space::__test_fail_next_shared_relocation_after_install();
+        // SAFETY: wrapper supplies both transactions; injected failure occurs
+        // before any source/rmap/backing commit.
+        let injected = unsafe {
+            address_space.relocate_shared_region_limited(
+                source,
+                0x2000,
+                rollback_destination,
+                0x1000,
+                MremapLimits::UNLIMITED,
+            )
+        };
+        // SAFETY: all translations inspect this test's still-live root.
+        let source_first = unsafe { translated(&address_space, source) };
+        // SAFETY: same live-root proof.
+        let source_second =
+            unsafe { translated(&address_space, VirtAddr::new(source.as_u64() + 0x1000)) };
+        // SAFETY: same live-root proof after rollback.
+        let rolled_back = unsafe { translated(&address_space, rollback_destination) };
+        if injected != Err(crate::AddressSpaceError::AllocationFailed)
+            || source_first != Some(first)
+            || source_second != Some(second)
+            || rolled_back.is_some()
+            || crate::rmap::owner_count(first) != 1
+            || crate::rmap::owner_count(second) != 1
+            || address_space.lookup(rollback_destination).is_some()
+        {
+            return TestResult::Fail("shared relocation post-install rollback leaked state");
+        }
+    }
+
+    // SAFETY: wrapper supplies both transactions; root/backing remain live.
+    let moved = unsafe {
+        address_space.relocate_shared_region_limited(
+            source,
+            0x2000,
+            destination,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: all translations inspect the test-owned live root.
+    let old_first = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof.
+    let old_second = unsafe { translated(&address_space, VirtAddr::new(source.as_u64() + 0x1000)) };
+    // SAFETY: same live-root proof.
+    let new_first = unsafe { translated(&address_space, destination) };
+    let correct = moved.is_ok()
+        && old_first.is_none()
+        && old_second.is_none()
+        && new_first == Some(first)
+        && crate::rmap::owner_count(first) == 1
+        && crate::rmap::contains_owner(first, address_space.root, destination)
+        && crate::rmap::owner_count(second) == 0
+        && address_space.lookup(source).is_none()
+        && address_space
+            .lookup(destination)
+            .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![first]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(first));
+    crate::free_frame(PhysFrame::new(second));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ordinary shared relocation cloned or lost residency")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shared_relocation_moves_residency);
+
+/// Ordinary shared fixed moves admit locked growth before target retirement
+/// and expose every later failure as destructive, matching Linux's ownership
+/// handoff boundary.
+fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("shared fixed relocation setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no live root; wrappers serialize these
+    // metadata-only fixed transactions.
+    let early = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if early
+        != Err(FixedRelocationError {
+            error: AddressSpaceError::LockLimit,
+            target_punched: false,
+            source_shrunk: false,
+        })
+        || address_space.lookup(target).is_none()
+    {
+        return TestResult::Fail("shared fixed preflight retired its target");
+    }
+
+    let impossible_len = source.as_u64() - target.as_u64();
+    // SAFETY: same metadata-only fixed transaction. Proportional preparation
+    // fails only after the one-page target has been punched.
+    let late = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            impossible_len,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if late
+        == Err(FixedRelocationError {
+            error: AddressSpaceError::AllocationFailed,
+            target_punched: true,
+            source_shrunk: false,
+        })
+        && address_space.lookup(target).is_none()
+        && address_space.lookup(source).is_some()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared fixed relocation hid its destructive failure")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_relocation_fixed_order);
+
+/// Linux fixed-shrink ordering retires the destination, truncates the source,
+/// then attempts the move. A late move failure must expose both destructive
+/// steps so external file/SysV owners can publish the identical state.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_shared_fixed_shrink_reports_source_state() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(0x0000_409b_0000_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x2000,
+            perms: RegionPerms::READ | RegionPerms::SHARED,
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("shared fixed-shrink setup failed");
+    }
+
+    crate::address_space::__test_fail_next_fixed_relocation_after_shrink();
+    // SAFETY: AddressSpace::empty is metadata-only and the wrapper supplies
+    // the VMA then shared-owner transactions around the complete operation.
+    let result = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x2000,
+            target,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+        source_shrunk: true,
+    });
+    if result == expected
+        && address_space.lookup(target).is_none()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x1000 && region.phys.len() == 1)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared fixed-shrink failure state diverged from Linux")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_fixed_shrink_reports_source_state
+);
+
 /// Private fixed shrinking has the same Linux progress boundary as SHARED:
 /// destination retirement and source truncation remain committed if the later
 /// move fails.

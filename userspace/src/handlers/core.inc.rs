@@ -10317,10 +10317,9 @@ fn shm_attachment_intersects(attachment: &ShmAttachment, lo: u64, hi: u64) -> bo
 /// address-space mapping transaction makes these capacities stable until the
 /// prepared operation commits or aborts.
 #[cfg(feature = "linux-compat")]
-fn shm_prepare_fixed_punch_capacity(
+fn shm_prepare_punch_capacity(
     as_key: u64,
-    lo: u64,
-    hi: u64,
+    ranges: &[(u64, u64)],
 ) -> Result<alloc::vec::Vec<u64>, ShmMremapPrepareError> {
     let mut attachments = SHM_ATTACHMENTS.lock();
     let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
@@ -10330,20 +10329,29 @@ fn shm_prepare_fixed_punch_capacity(
             continue;
         }
         for attachment in entries {
-            if attachment.pending_mremap.is_some()
-                || !shm_attachment_intersects(attachment, lo, hi)
-            {
+            if attachment.pending_mremap.is_some() {
+                continue;
+            }
+            let intersects = ranges
+                .iter()
+                .any(|&(lo, hi)| shm_attachment_intersects(attachment, lo, hi));
+            if !intersects {
                 continue;
             }
             detach_bound = detach_bound.saturating_add(1);
-            let splits = attachment
-                .fragments
+            let splits = ranges
                 .iter()
-                .filter(|&&(base, len)| {
-                    let end = base.saturating_add(len);
-                    base < lo && end > hi
+                .map(|&(lo, hi)| {
+                    attachment
+                        .fragments
+                        .iter()
+                        .filter(|&&(base, len)| {
+                            let end = base.saturating_add(len);
+                            base < lo && end > hi
+                        })
+                        .count()
                 })
-                .count();
+                .fold(0usize, usize::saturating_add);
             attachment
                 .fragments
                 .try_reserve_exact(splits)
@@ -10355,6 +10363,15 @@ fn shm_prepare_fixed_punch_capacity(
         .try_reserve_exact(detach_bound)
         .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
     Ok(destroy)
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_prepare_fixed_punch_capacity(
+    as_key: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<alloc::vec::Vec<u64>, ShmMremapPrepareError> {
+    shm_prepare_punch_capacity(as_key, &[(lo, hi)])
 }
 
 #[cfg(feature = "linux-compat")]
@@ -10401,19 +10418,97 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
     new_base: u64,
     lpid: u64,
 ) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
-    if len == 0 || old_base & 0xFFF != 0 || new_base & 0xFFF != 0 {
+    // SAFETY: forwards the caller's transaction/range contract.
+    unsafe {
+        shm_prepare_mremap_shared_destination_locked(
+            as_key, old_base, len, new_base, len, lpid, false,
+        )
+    }
+}
+
+/// Prepare the owner transfer for an ordinary nonzero shared move. The hidden
+/// destination is published only on success; failure methods can commit the
+/// fixed-target punch and Linux's separately observable source-tail shrink.
+#[cfg(feature = "linux-compat")]
+pub(crate) unsafe fn shm_prepare_mremap_shared_relocation_locked(
+    as_key: u64,
+    old_base: u64,
+    old_len: u64,
+    new_base: u64,
+    new_len: u64,
+    lpid: u64,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    // SAFETY: forwards the caller's transaction/range contract.
+    unsafe {
+        shm_prepare_mremap_shared_destination_locked(
+            as_key, old_base, old_len, new_base, new_len, lpid, true,
+        )
+    }
+}
+
+/// Prepare a source-tail ownership punch for an in-place shared shrink.
+///
+/// # Safety
+/// The caller holds `shm_mapping_transaction(as_key)` through plan commit/drop.
+#[cfg(feature = "linux-compat")]
+pub(crate) unsafe fn shm_prepare_mremap_punch_locked(
+    as_key: u64,
+    base: u64,
+    len: u64,
+    lpid: u64,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    let hi = base
+        .checked_add(len)
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    if len == 0 || base & 0xfff != 0 {
+        return Err(ShmMremapPrepareError::InvalidRange);
+    }
+    Ok(PreparedShmMremapAlias {
+        as_key,
+        new_base: base,
+        len,
+        lpid,
+        pending: None,
+        destroy_after_punch: shm_prepare_fixed_punch_capacity(as_key, base, hi)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "linux-compat")]
+unsafe fn shm_prepare_mremap_shared_destination_locked(
+    as_key: u64,
+    old_base: u64,
+    old_len: u64,
+    new_base: u64,
+    new_len: u64,
+    lpid: u64,
+    relocation: bool,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    if old_len == 0 || new_len == 0 || old_base & 0xFFF != 0 || new_base & 0xFFF != 0 {
         return Err(ShmMremapPrepareError::InvalidRange);
     }
     let old_hi = old_base
-        .checked_add(len)
+        .checked_add(old_len)
         .ok_or(ShmMremapPrepareError::InvalidRange)?;
     let new_hi = new_base
-        .checked_add(len)
+        .checked_add(new_len)
         .ok_or(ShmMremapPrepareError::InvalidRange)?;
     if old_base < new_hi && new_base < old_hi {
         return Err(ShmMremapPrepareError::InvalidRange);
     }
-    let destroy_after_punch = shm_prepare_fixed_punch_capacity(as_key, new_base, new_hi)?;
+    let source_tail = old_base
+        .checked_add(core::cmp::min(old_len, new_len))
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    let relocation_ranges = [
+        (new_base, new_hi),
+        (old_base, old_hi),
+        (source_tail, old_hi),
+    ];
+    let destroy_after_punch = if relocation {
+        shm_prepare_punch_capacity(as_key, &relocation_ranges)?
+    } else {
+        shm_prepare_fixed_punch_capacity(as_key, new_base, new_hi)?
+    };
 
     let source = {
         let attachments = SHM_ATTACHMENTS.lock();
@@ -10451,7 +10546,7 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
         return Ok(PreparedShmMremapAlias {
             as_key,
             new_base,
-            len,
+            len: new_len,
             lpid,
             pending: None,
             destroy_after_punch,
@@ -10474,7 +10569,7 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
     fragments
         .try_reserve_exact(1)
         .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
-    fragments.push((new_base, len));
+    fragments.push((new_base, new_len));
 
     {
         let mut attachments = SHM_ATTACHMENTS.lock();
@@ -10501,7 +10596,7 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
     Ok(PreparedShmMremapAlias {
         as_key,
         new_base,
-        len,
+        len: new_len,
         lpid,
         pending: Some((token, object)),
         destroy_after_punch,
@@ -10536,7 +10631,7 @@ impl PreparedShmMremapAlias {
     /// Apply the target outcome using only capacities reserved at prepare time.
     /// Unlike the legacy generic punch helper, this performs no Vec growth or
     /// BTree insertion after memory has destructively replaced the target.
-    fn apply_prepared_fixed_punch(&mut self) {
+    fn apply_prepared_punch(&mut self, lo: u64, hi: u64) {
         let now = shm_now_seconds();
         let mut attachments = SHM_ATTACHMENTS.lock();
         let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
@@ -10548,19 +10643,11 @@ impl PreparedShmMremapAlias {
             }
             entries.retain_mut(|attachment| {
                 if attachment.pending_mremap.is_some()
-                    || !shm_attachment_intersects(
-                        attachment,
-                        self.new_base,
-                        self.new_base + self.len,
-                    )
+                    || !shm_attachment_intersects(attachment, lo, hi)
                 {
                     return true;
                 }
-                shm_clip_attachment_prepared(
-                    attachment,
-                    self.new_base,
-                    self.new_base + self.len,
-                );
+                shm_clip_attachment_prepared(attachment, lo, hi);
                 if !attachment.fragments.is_empty() {
                     return true;
                 }
@@ -10598,8 +10685,12 @@ impl PreparedShmMremapAlias {
     /// Linux `shm_open` accounting increments `nattch` and updates atime/lpid.
     pub(crate) fn commit(mut self, target_punched: bool) {
         if target_punched {
-            self.apply_prepared_fixed_punch();
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
         }
+        self.commit_pending();
+    }
+
+    fn commit_pending(&mut self) {
         let Some((token, object)) = self.pending else {
             return;
         };
@@ -10628,13 +10719,52 @@ impl PreparedShmMremapAlias {
         self.pending = None;
     }
 
+    /// Commit an ordinary move: fixed-target retirement, complete source
+    /// transfer, then publication of the prepared destination attachment.
+    pub(crate) fn commit_relocation(
+        mut self,
+        old_base: u64,
+        old_len: u64,
+        target_punched: bool,
+    ) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        self.commit_pending();
+        self.apply_prepared_punch(old_base, old_base + old_len);
+    }
+
     /// Roll back the prepared alias and, when memory already performed a fixed
     /// target punch, retire exactly those displaced destination attachments.
     pub(crate) fn abort(mut self, target_punched: bool) {
         if target_punched {
-            self.apply_prepared_fixed_punch();
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
         }
         self.remove_pending();
+    }
+
+    /// Apply the destructive prefix of a failed ordinary fixed move. Linux can
+    /// expose target retirement alone or target retirement plus source-tail
+    /// truncation before a later move error.
+    pub(crate) fn abort_relocation(
+        mut self,
+        old_base: u64,
+        old_len: u64,
+        new_len: u64,
+        target_punched: bool,
+        source_shrunk: bool,
+    ) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        if source_shrunk && old_len > new_len {
+            self.apply_prepared_punch(old_base + new_len, old_base + old_len);
+        }
+        self.remove_pending();
+    }
+
+    pub(crate) fn commit_punch(mut self) {
+        self.apply_prepared_punch(self.new_base, self.new_base + self.len);
     }
 }
 
@@ -10902,6 +11032,61 @@ mod shm_mremap_registry_tests {
     kernel_test_in!(
         "userspace/sysv_registry",
         smoke_shm_mremap_alias_abort_preserves_pending_during_fixed_punch
+    );
+
+    fn smoke_shm_mremap_relocation_mirrors_fixed_progress() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_segment(TARGET_OBJECT, 1);
+        insert_attachment(SOURCE_OBJECT, SOURCE, alloc::vec![(SOURCE, 0x2000)]);
+        insert_attachment(TARGET_OBJECT, TARGET, alloc::vec![(TARGET, 0x1000)]);
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        let result = (|| {
+            // SAFETY: the synthetic AS mapping transaction remains held.
+            let prepared = unsafe {
+                shm_prepare_mremap_shared_relocation_locked(
+                    AS_KEY, SOURCE, 0x2000, TARGET, 0x1000, 101,
+                )
+            }
+            .map_err(|_| "relocation prepare failed")?;
+            prepared.abort_relocation(SOURCE, 0x2000, 0x1000, true, true);
+            let attachments = SHM_ATTACHMENTS.lock();
+            let map = attachments
+                .as_ref()
+                .ok_or("attachment table disappeared")?;
+            if map.contains_key(&(AS_KEY, TARGET))
+                || map
+                    .get(&(AS_KEY, SOURCE))
+                    .is_none_or(|entries| {
+                        entries.len() != 1
+                            || entries[0].fragments != alloc::vec![(SOURCE, 0x1000)]
+                    })
+            {
+                return Err("failed fixed move did not mirror target+source shrink");
+            }
+            drop(attachments);
+            let segments = SHM_SEGMENTS.lock();
+            let map = segments.as_ref().ok_or("segment table disappeared")?;
+            if map.get(&SOURCE_OBJECT).map(|segment| segment.nattch) != Some(1)
+                || !map
+                    .get(&TARGET_OBJECT)
+                    .is_some_and(|segment| segment.nattch == 0 && segment.lpid == 101)
+            {
+                return Err("failed fixed move changed SysV attachment counts incorrectly");
+            }
+            Ok(())
+        })();
+        drop(guard);
+        cleanup();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_relocation_mirrors_fixed_progress
     );
 
     fn smoke_shm_mremap_alias_fixed_commit_replaces_target_then_opens_source() -> TestResult {
