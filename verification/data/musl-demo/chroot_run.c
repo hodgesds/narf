@@ -11,14 +11,32 @@
 #include <sys/mount.h>
 extern char **environ;
 
+static int detach_scratch_mount(const char *target) {
+    if (umount2(target, MNT_DETACH) == 0)
+        return 0;
+
+    /* Linux reports EINVAL when target exists but is not a mount point, and
+     * ENOENT when the path itself is absent. Both are valid first-run states. */
+    int error = errno;
+    if (error == EINVAL || error == ENOENT)
+        return 0;
+
+    printf("tmpfs-unmount-fail target=%s errno=%d\n", target, error);
+    errno = error;
+    return -1;
+}
+
 static int mount_scratch_tmpfs(const char *target, const char *options) {
     /* Each invocation promises fresh scratch state. A prior chroot_run in the
      * same boot may have left this target mounted; detach it first. ENOENT /
      * EINVAL simply mean there was no earlier mount. */
-    (void)umount2(target, MNT_DETACH);
+    if (detach_scratch_mount(target) != 0)
+        return -1;
     if (mount("tmpfs", target, "tmpfs", MS_NOSUID | MS_NODEV, options) == 0)
         return 0;
-    printf("tmpfs-mount-fail target=%s errno=%d\n", target, errno);
+    int error = errno;
+    printf("tmpfs-mount-fail target=%s errno=%d\n", target, error);
+    errno = error;
     return -1;
 }
 
@@ -30,7 +48,10 @@ int main(int argc, char **argv) {
      * stale scratch files left in the persistent ext image. */
     if (mount_scratch_tmpfs("/mnt/tmp", "mode=1777") != 0) return 1;
     if (mount_scratch_tmpfs("/mnt/dev/shm", "mode=1777") != 0) {
-        (void)umount2("/mnt/tmp", MNT_DETACH);
+        /* The pair is one setup transaction. Do not leave the first new mount
+         * behind when the second cannot be installed; report rollback failure
+         * separately, while retaining the overall setup-failed exit status. */
+        (void)detach_scratch_mount("/mnt/tmp");
         return 1;
     }
     if (chroot("/mnt") != 0) { printf("chroot-fail errno=%d\n", errno); return 1; }
