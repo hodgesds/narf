@@ -11878,6 +11878,690 @@ fn smoke_memory_grow_metadata_allocation_is_fallible() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_grow_metadata_allocation_is_fallible);
 
+/// mremap growth follows Linux's MEMLOCK -> AS -> DATA admission order and
+/// implements the RLIMIT_DATA soft-zero/hard-limit compatibility exception.
+fn smoke_memory_mremap_growth_limit_order_and_data_compat() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    let locked = AddressSpace::empty();
+    let locked_base = VirtAddr::new(0x0000_4080_2500_0000);
+    if locked
+        .map_region(Region {
+            base: locked_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mremap limit-order setup failed");
+    }
+    let both_exceeded = locked.grow_region_limited(
+        locked_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: 0x1000,
+            address_space_bytes: 0x1000,
+            data_bytes: u64::MAX,
+            data_max_bytes: u64::MAX,
+            bypass_memlock: false,
+        },
+    );
+    let as_exceeded = locked.grow_region_limited(
+        locked_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: 0x1000,
+            data_bytes: u64::MAX,
+            data_max_bytes: u64::MAX,
+            bypass_memlock: true,
+        },
+    );
+    if both_exceeded != Err(AddressSpaceError::LockLimit)
+        || as_exceeded != Err(AddressSpaceError::MappingLimit)
+        || locked
+            .lookup(locked_base)
+            .is_none_or(|region| region.len != 0x1000)
+    {
+        return TestResult::Fail("mremap growth limit ordering or rollback was wrong");
+    }
+
+    let soft_zero = AddressSpace::empty();
+    let soft_zero_base = VirtAddr::new(0x0000_4080_2510_0000);
+    if soft_zero
+        .map_region(Region {
+            base: soft_zero_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("RLIMIT_DATA compatibility setup failed");
+    }
+    let compat = soft_zero.grow_region_limited(
+        soft_zero_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: u64::MAX,
+            data_bytes: 0,
+            data_max_bytes: 0x2000,
+            bypass_memlock: true,
+        },
+    );
+
+    let hard = AddressSpace::empty();
+    let hard_base = VirtAddr::new(0x0000_4080_2520_0000);
+    if hard
+        .map_region(Region {
+            base: hard_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("RLIMIT_DATA hard-limit setup failed");
+    }
+    let beyond_hard = hard.grow_region_limited(
+        hard_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: u64::MAX,
+            data_bytes: 0,
+            data_max_bytes: 0x1000,
+            bypass_memlock: true,
+        },
+    );
+    if compat.is_ok()
+        && soft_zero
+            .lookup(soft_zero_base)
+            .is_some_and(|region| region.len == 0x2000)
+        && beyond_hard == Err(AddressSpaceError::MappingLimit)
+        && hard
+            .lookup(hard_base)
+            .is_some_and(|region| region.len == 0x1000)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("RLIMIT_DATA soft-zero compatibility did not match Linux")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_mremap_growth_limit_order_and_data_compat
+);
+
+/// Shared mremap aliases may select an interval inside one Region. Historical
+/// old_len==0 duplication performs MEMLOCK before AS admission and leaves the
+/// source lock state alone; DONTUNMAP skips MEMLOCK, charges the complete new
+/// VMA, and clears the lock bits only after the alias commits.
+fn smoke_memory_shared_mremap_interval_and_limit_modes() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms,
+        SharedMremapMode, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2600_0000);
+    let duplicate = VirtAddr::new(0x0000_4080_2610_0000);
+    let dontunmap = VirtAddr::new(0x0000_4080_2620_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x3000,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::SHARED
+                | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0); 3],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("shared mremap interval setup failed");
+    }
+
+    // The source already accounts for three locked pages, so a fourth page
+    // fails Duplicate's pre-mutation MEMLOCK admission even though AS is open.
+    // SAFETY: AddressSpace::empty has no live root; the test exercises only
+    // serialized metadata publication.
+    let memlock_failure = unsafe {
+        address_space.alias_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            duplicate,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x3000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if memlock_failure != Err(AddressSpaceError::LockLimit)
+        || address_space.lookup(duplicate).is_some()
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("Duplicate did not fail atomically at MEMLOCK");
+    }
+
+    // SAFETY: same metadata-only address-space contract as above.
+    let duplicate_result = unsafe {
+        address_space.alias_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            duplicate,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x4000,
+                address_space_bytes: 0x4000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if duplicate_result.is_err()
+        || address_space.lookup(duplicate).is_none_or(|region| {
+            region.len != 0x1000 || !region.perms.contains(RegionPerms::LOCKED)
+        })
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("Duplicate did not preserve interval/lock metadata");
+    }
+
+    // Four pages are now mapped. DONTUNMAP bypasses a deliberately impossible
+    // MEMLOCK limit but must fail AS admission before changing either VMA.
+    // SAFETY: same metadata-only address-space contract as above.
+    let as_failure = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            dontunmap,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x4000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if as_failure != Err(AddressSpaceError::MappingLimit)
+        || address_space.lookup(dontunmap).is_some()
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("DONTUNMAP AS failure changed source metadata");
+    }
+
+    // SAFETY: same metadata-only address-space contract as above.
+    let dontunmap_result = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            dontunmap,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x5000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if dontunmap_result.is_ok()
+        && address_space.lookup(source).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED)
+                && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+        })
+        && address_space.lookup(dontunmap).is_some_and(|region| {
+            region.len == 0x1000 && region.perms.contains(RegionPerms::LOCKED)
+        })
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("DONTUNMAP did not transfer the shared lock contract")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_mremap_interval_and_limit_modes
+);
+
+/// Linux permits ordinary demand-paged file VMAs in DONTUNMAP despite their
+/// lock-accounting exemption, rejects PFN/device-like DONTUNMAP sources, and
+/// still permits the legacy old_len==0 shared duplication of such sources.
+fn smoke_memory_shared_mremap_lock_exempt_eligibility() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms,
+        SharedMremapMode, VirtAddr,
+    };
+
+    let file_as = AddressSpace::empty();
+    let file_source = VirtAddr::new(0x0000_4080_2630_0000);
+    let file_alias = VirtAddr::new(0x0000_4080_2640_0000);
+    if file_as
+        .map_region(Region {
+            base: file_source,
+            len: 0x1000,
+            perms: RegionPerms::READ
+                | RegionPerms::SHARED
+                | RegionPerms::FILE_DEMAND
+                | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("file DONTUNMAP eligibility setup failed");
+    }
+    // SAFETY: metadata-only address space; wrapper supplies both transactions.
+    let file_result = unsafe {
+        file_as.alias_shared_region_limited(
+            file_source,
+            0x1000,
+            file_alias,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if file_result.is_err() || file_as.lookup(file_alias).is_none() {
+        return TestResult::Fail("demand-paged file DONTUNMAP was rejected");
+    }
+
+    let device_as = AddressSpace::empty();
+    let device_source = VirtAddr::new(0x0000_4080_2650_0000);
+    let duplicate_alias = VirtAddr::new(0x0000_4080_2660_0000);
+    let dontunmap_alias = VirtAddr::new(0x0000_4080_2670_0000);
+    if device_as
+        .map_region(Region {
+            base: device_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("device shared-duplication eligibility setup failed");
+    }
+    // SAFETY: same metadata-only transaction contract as above.
+    let duplicate_result = unsafe {
+        device_as.alias_shared_region_limited(
+            device_source,
+            0x1000,
+            duplicate_alias,
+            SharedMremapMode::Duplicate,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: same metadata-only transaction contract as above.
+    let dontunmap_result = unsafe {
+        device_as.alias_shared_region_limited(
+            device_source,
+            0x1000,
+            dontunmap_alias,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if duplicate_result.is_ok()
+        && dontunmap_result == Err(AddressSpaceError::NotImplemented)
+        && device_as.lookup(duplicate_alias).is_some()
+        && device_as.lookup(dontunmap_alias).is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("LOCK_EXEMPT mode-specific eligibility diverged")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_mremap_lock_exempt_eligibility);
+
+/// Duplicate preflight preserves a fixed target, while DONTUNMAP deliberately
+/// performs full AS admission after target retirement and reports that state.
+fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, SharedMremapMode, VirtAddr,
+    };
+
+    let duplicate_as = AddressSpace::empty();
+    let duplicate_source = VirtAddr::new(0x0000_4080_2700_0000);
+    let duplicate_target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    if duplicate_as
+        .map_region(Region {
+            base: duplicate_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || duplicate_as
+            .map_region(Region {
+                base: duplicate_target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("fixed Duplicate setup failed");
+    }
+    // SAFETY: AddressSpace::empty has no live root; both wrappers serialize
+    // their metadata-only fixed transactions internally.
+    let duplicate_failure = unsafe {
+        duplicate_as.alias_shared_region_fixed_limited(
+            duplicate_source,
+            0x1000,
+            duplicate_target,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if duplicate_failure
+        != Err(FixedRelocationError {
+            error: AddressSpaceError::LockLimit,
+            target_punched: false,
+        })
+        || duplicate_as.lookup(duplicate_target).is_none()
+    {
+        return TestResult::Fail("Duplicate limit failure retired its fixed target");
+    }
+
+    let dontunmap_as = AddressSpace::empty();
+    let dontunmap_source = VirtAddr::new(0x0000_4080_2710_0000);
+    let dontunmap_target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    if dontunmap_as
+        .map_region(Region {
+            base: dontunmap_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || dontunmap_as
+            .map_region(Region {
+                base: dontunmap_target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("fixed DONTUNMAP setup failed");
+    }
+    // SAFETY: same metadata-only fixed transaction contract as above.
+    let dontunmap_failure = unsafe {
+        dontunmap_as.alias_shared_region_fixed_limited(
+            dontunmap_source,
+            0x1000,
+            dontunmap_target,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x1000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::MappingLimit,
+        target_punched: true,
+    });
+    if dontunmap_failure == expected
+        && dontunmap_as.lookup(dontunmap_target).is_none()
+        && dontunmap_as
+            .lookup(dontunmap_source)
+            .is_some_and(|region| region.perms.contains(RegionPerms::LOCKED))
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("DONTUNMAP did not expose its post-punch limit failure")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_mremap_fixed_punch_order);
+
+/// Shared DONTUNMAP moves source residency/rmap authority to the destination,
+/// keeps both backing descriptions, and lets the retained source fault the
+/// same shared frame back in.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
+    use crate::{
+        AddressSpace, MremapLimits, PhysAddr, PhysFrame, Region, RegionPerms, SharedMremapMode,
+        VirtAddr,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: the fresh user root is owned exclusively by this test and is
+    // never activated as a task address space.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared alias root allocation failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared alias backing allocation failed"),
+    };
+    let source = VirtAddr::new(0x0000_4094_0000_0000);
+    let destination = VirtAddr::new(0x0000_4095_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both required structural transactions are held; the root
+            // and allocated backing remain live for publication/materialization.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x1000,
+                    perms: RegionPerms::READ
+                        | RegionPerms::WRITE
+                        | RegionPerms::SHARED
+                        | RegionPerms::LOCKED,
+                    phys: alloc::vec![frame],
+                })?;
+                address_space.materialize_range(source, 0x1000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared alias source materialization failed");
+    }
+
+    #[cfg(feature = "kernel-test")]
+    {
+        crate::address_space::__test_fail_next_shared_alias_after_install();
+        // SAFETY: same live test-root and wrapper-supplied transactions as the
+        // successful publication below. The injected error fires only after
+        // the destination PTE has been installed.
+        let injected = unsafe {
+            address_space.alias_shared_region_limited(
+                source,
+                0x1000,
+                destination,
+                SharedMremapMode::DontUnmap,
+                MremapLimits::UNLIMITED,
+            )
+        };
+        // SAFETY: the rollback has completed while the test root remains live.
+        let rolled_back_destination = unsafe { translated(&address_space, destination) };
+        if injected != Err(crate::AddressSpaceError::AllocationFailed)
+            || rolled_back_destination.is_some()
+            || crate::rmap::owner_count(frame) != 1
+            || address_space.lookup(destination).is_some()
+            || address_space
+                .lookup(source)
+                .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+        {
+            return TestResult::Fail("shared alias post-install rollback leaked state");
+        }
+    }
+
+    // SAFETY: the test-owned user root and backing remain live; the convenience
+    // wrapper supplies VMA then shared-owner serialization.
+    let aliased = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            destination,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: both read-only walks target this test's still-live user root.
+    let source_translation = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof as the source walk.
+    let destination_translation = unsafe { translated(&address_space, destination) };
+    let moved = aliased.is_ok()
+        && source_translation.is_none()
+        && destination_translation == Some(frame)
+        && crate::rmap::owner_count(frame) == 1
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![0])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1])
+        && address_space.lookup(source).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+        })
+        && address_space.lookup(destination).is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+        });
+    if !moved {
+        return TestResult::Fail("shared DONTUNMAP did not move residency/rmap authority");
+    }
+
+    // SAFETY: the retained source VMA still owns shared backing in this live
+    // test root. The backed-fault repair path must reinstall its leaf and rmap.
+    let refaulted = unsafe { address_space.demand_alloc_page(source) };
+    // SAFETY: both walks target the still-live test root after refault repair.
+    let source_after_refault = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof for the unchanged destination.
+    let destination_after_refault = unsafe { translated(&address_space, destination) };
+    let correct = refaulted.is_ok()
+        && source_after_refault == Some(frame)
+        && destination_after_refault == Some(frame)
+        && crate::rmap::owner_count(frame) == 2
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![1])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(frame));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared DONTUNMAP source did not refault its backing")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_mremap_installs_destination_rmap
+);
+
+/// Legacy old_len==0 shared duplication clones resident leaves instead of
+/// moving them, unlike DONTUNMAP.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
+    use crate::{
+        AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, SharedMremapMode, VirtAddr,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: fresh test-owned root is never activated by a task.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared Duplicate root allocation failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared Duplicate backing allocation failed"),
+    };
+    let source = VirtAddr::new(0x0000_4096_0000_0000);
+    let destination = VirtAddr::new(0x0000_4097_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both structural transactions and live-root ownership are
+            // held through mapping and materialization.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x1000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                    phys: alloc::vec![frame],
+                })?;
+                address_space.materialize_range(source, 0x1000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared Duplicate source materialization failed");
+    }
+    // SAFETY: wrapper supplies both transactions; root/backing remain live.
+    let duplicated = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            destination,
+            SharedMremapMode::Duplicate,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: both translations read this test's live root.
+    let source_translation = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof as the source translation.
+    let destination_translation = unsafe { translated(&address_space, destination) };
+    let correct = duplicated.is_ok()
+        && source_translation == Some(frame)
+        && destination_translation == Some(frame)
+        && crate::rmap::owner_count(frame) == 2
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![1])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(frame));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared Duplicate moved rather than cloned residency")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shared_duplicate_clones_residency);
+
 /// A relocating grow preserves the source lock mode and eagerly populates only
 /// the new destination tail.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -11970,7 +12654,19 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
     // SAFETY: AddressSpace::empty has no live page-table root, so this test
     // exercises metadata transactions only.
     let limit_result = unsafe {
-        address_space.relocate_region_fixed_limited(source, 0x1000, target, 0x2000, 0x1000, false)
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
     };
     // SAFETY: as above; the out-of-range target must be rejected before any
     // page-table operation.
@@ -11980,8 +12676,42 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
             0x1000,
             VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000),
             0x2000,
-            u64::MAX,
-            true,
+            crate::MremapLimits::UNLIMITED,
+        )
+    };
+    // AS and DATA admission are also pre-punch checks. The existing source
+    // plus target account for three pages; a one-page growth must fail against
+    // the three-page AS ceiling without retiring either target page.
+    // SAFETY: AddressSpace::empty has no live root; this is metadata-only.
+    let as_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: u64::MAX,
+                address_space_bytes: 0x3000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: true,
+            },
+        )
+    };
+    // SAFETY: same metadata-only transaction as the AS-limit check above.
+    let data_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: u64::MAX,
+                address_space_bytes: u64::MAX,
+                data_bytes: 0x1000,
+                data_max_bytes: 0x1000,
+                bypass_memlock: true,
+            },
         )
     };
     let target_preserved = address_space.lookup(target).is_some_and(|region| {
@@ -11994,8 +12724,16 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
             && region.perms.contains(RegionPerms::LOCKED)
             && region.phys == alloc::vec![source_phys]
     });
-    if limit_result == Err(AddressSpaceError::LockLimit)
-        && invalid_result == Err(AddressSpaceError::OutOfRange)
+    let early = |error| {
+        Err(crate::FixedRelocationError {
+            error,
+            target_punched: false,
+        })
+    };
+    if limit_result == early(AddressSpaceError::LockLimit)
+        && invalid_result == early(AddressSpaceError::OutOfRange)
+        && as_result == early(AddressSpaceError::MappingLimit)
+        && data_result == early(AddressSpaceError::MappingLimit)
         && source_preserved
         && target_preserved
     {
@@ -12007,6 +12745,69 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
 kernel_test_in!(
     "memory",
     smoke_memory_fixed_relocate_preflight_preserves_target
+);
+
+/// Once MAP_FIXED has retired its target, a later fallible relocation failure
+/// must report that destructive state so filesystem/SysV owner tables mirror
+/// memory instead of retaining stale backing references.
+fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000);
+    if address_space
+        .map_region(Region {
+            base: target,
+            len: 0x1000,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: source,
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("post-punch failure setup failed");
+    }
+    let impossible_len = source.as_u64() - target.as_u64();
+    let outcome = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: metadata-only AddressSpace::empty has no live root and
+            // both required structural transactions are held.
+            unsafe {
+                address_space.relocate_region_fixed_locked_limited(
+                    source,
+                    0x1000,
+                    target,
+                    impossible_len,
+                    crate::MremapLimits::UNLIMITED,
+                    false,
+                )
+            }
+        })
+    });
+    let expected = Err(crate::FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+    });
+    let source_preserved = address_space
+        .lookup(source)
+        .is_some_and(|region| region.len == 0x1000);
+    if outcome == expected && source_preserved && address_space.lookup(target).is_none() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fixed relocation did not report its destructive failure state")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_fixed_relocate_reports_post_punch_failure
 );
 
 /// A mapping at the conventional brk base is not implicitly heap-owned.  A

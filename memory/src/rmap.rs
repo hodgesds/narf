@@ -44,7 +44,23 @@ const RMAP_SHARDS: usize = 64;
 
 #[repr(align(64))]
 struct RmapShard {
-    map: IrqSafeSpinLock<Option<BTreeMap<u64, Vec<Owner>>>>,
+    map: IrqSafeSpinLock<Option<BTreeMap<u64, OwnerList>>>,
+}
+
+/// Per-frame owners plus capacity promised to an in-flight failure-atomic
+/// publisher. Ordinary map paths must leave `reserved` slots unused.
+struct OwnerList {
+    owners: Vec<Owner>,
+    reserved: usize,
+}
+
+impl OwnerList {
+    const fn new() -> Self {
+        Self {
+            owners: Vec::new(),
+            reserved: 0,
+        }
+    }
 }
 
 impl RmapShard {
@@ -75,10 +91,79 @@ pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let owner = Owner { root, va };
     let mut g = RMAP[shard(key)].map.lock();
     let map = g.get_or_insert_with(BTreeMap::new);
-    let owners = map.entry(key).or_default();
-    if !owners.contains(&owner) {
-        owners.push(owner);
+    let list = map.entry(key).or_insert_with(OwnerList::new);
+    if !list.owners.contains(&owner) {
+        // Capacity promised to a failure-atomic alias is not available to an
+        // unrelated mapping racing on the same shared frame.
+        list.owners.reserve(list.reserved.saturating_add(1));
+        list.owners.push(owner);
     }
+}
+
+/// Fallibly reserve `additional` owner slots for an already-tracked frame.
+///
+/// Shared-alias publication uses this before touching a destination PTE. Its
+/// source PTE proves the frame already has a map entry, so only the per-frame
+/// owner Vec can need capacity. The reservation is explicit in the frame's
+/// owner list: concurrent ordinary additions allocate beyond promised slots,
+/// and removal cannot retire the entry until commit or rollback consumes them.
+pub(crate) fn try_reserve_owner_slots(phys: PhysAddr, additional: usize) -> Result<(), ()> {
+    if phys.raw() == 0 || additional == 0 {
+        return Ok(());
+    }
+    let key = phys.raw();
+    let mut g = RMAP[shard(key)].map.lock();
+    let list = g.as_mut().and_then(|map| map.get_mut(&key)).ok_or(())?;
+    let promised = list.reserved.checked_add(additional).ok_or(())?;
+    list.owners.try_reserve_exact(promised).map_err(|_| ())?;
+    list.reserved = promised;
+    Ok(())
+}
+
+/// Allocation-free counterpart to [`try_reserve_owner_slots`].
+///
+/// Panics if the caller did not reserve capacity or if the frame's existing
+/// rmap authority disappeared between reservation and commit.
+pub(crate) fn add_reserved(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
+    let key = phys.raw();
+    if key == 0 {
+        return;
+    }
+    let owner = Owner { root, va };
+    let mut g = RMAP[shard(key)].map.lock();
+    let list = g
+        .as_mut()
+        .and_then(|map| map.get_mut(&key))
+        .expect("reserved rmap frame disappeared before commit");
+    assert!(
+        !list.owners.contains(&owner),
+        "reserved rmap owner already existed before commit"
+    );
+    assert!(
+        list.reserved != 0 && list.owners.len() < list.owners.capacity(),
+        "reserved rmap owner capacity was consumed before commit"
+    );
+    list.reserved -= 1;
+    list.owners.push(owner);
+}
+
+/// Release owner slots reserved by [`try_reserve_owner_slots`] when the
+/// page-table publication rolls back before [`add_reserved`].
+pub(crate) fn release_reserved_owner_slots(phys: PhysAddr, count: usize) {
+    if phys.raw() == 0 || count == 0 {
+        return;
+    }
+    let key = phys.raw();
+    let mut g = RMAP[shard(key)].map.lock();
+    let list = g
+        .as_mut()
+        .and_then(|map| map.get_mut(&key))
+        .expect("reserved rmap frame disappeared before rollback");
+    assert!(
+        list.reserved >= count,
+        "rmap rollback released more slots than it reserved"
+    );
+    list.reserved -= count;
 }
 
 /// Drop the `(root, va)` mapping of `phys`. Frees the frame's entry once its
@@ -91,9 +176,9 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let owner = Owner { root, va };
     let mut g = RMAP[shard(key)].map.lock();
     if let Some(map) = g.as_mut() {
-        if let Some(owners) = map.get_mut(&key) {
-            owners.retain(|o| *o != owner);
-            if owners.is_empty() {
+        if let Some(list) = map.get_mut(&key) {
+            list.owners.retain(|o| *o != owner);
+            if list.owners.is_empty() && list.reserved == 0 {
                 map.remove(&key);
             }
         }
@@ -112,7 +197,7 @@ pub fn contains_owner(phys: PhysAddr, root: PhysAddr, va: VirtAddr) -> bool {
         .lock()
         .as_ref()
         .and_then(|map| map.get(&key))
-        .is_some_and(|owners| owners.contains(&owner))
+        .is_some_and(|list| list.owners.contains(&owner))
 }
 
 /// Change one recorded virtual coordinate without allocating.
@@ -129,16 +214,16 @@ pub fn move_owner(phys: PhysAddr, root: PhysAddr, old_va: VirtAddr, new_va: Virt
     let old = Owner { root, va: old_va };
     let new = Owner { root, va: new_va };
     let mut g = RMAP[shard(key)].map.lock();
-    let Some(owners) = g.as_mut().and_then(|map| map.get_mut(&key)) else {
+    let Some(list) = g.as_mut().and_then(|map| map.get_mut(&key)) else {
         return false;
     };
-    let Some(old_index) = owners.iter().position(|owner| *owner == old) else {
+    let Some(old_index) = list.owners.iter().position(|owner| *owner == old) else {
         return false;
     };
-    if owners.contains(&new) {
-        owners.swap_remove(old_index);
+    if list.owners.contains(&new) {
+        list.owners.swap_remove(old_index);
     } else {
-        owners[old_index] = new;
+        list.owners[old_index] = new;
     }
     true
 }
@@ -155,7 +240,7 @@ pub fn owner_count(phys: PhysAddr) -> usize {
         .lock()
         .as_ref()
         .and_then(|m| m.get(&key))
-        .map_or(0, Vec::len)
+        .map_or(0, |list| list.owners.len())
 }
 
 /// Visit every recorded owner of `phys`. Snapshots the owner list under the
@@ -172,7 +257,7 @@ pub fn for_each_owner(phys: PhysAddr, mut f: impl FnMut(Owner)) {
         .lock()
         .as_ref()
         .and_then(|m| m.get(&key))
-        .cloned()
+        .map(|list| list.owners.clone())
         .unwrap_or_default();
     for o in owners {
         f(o);
@@ -210,7 +295,10 @@ pub fn __reset_for_test() {
 // Always compiled (not `#[cfg(test)]`) so they register into the in-kernel
 // `narf.tests` section and actually run under `cargo xtask test`.
 mod tests {
-    use super::{__reset_for_test, add, for_each_owner, move_owner, owner_count, remove, Owner};
+    use super::{
+        __reset_for_test, add, add_reserved, for_each_owner, move_owner, owner_count, remove,
+        try_reserve_owner_slots, Owner,
+    };
     use crate::{PhysAddr, VirtAddr};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -286,6 +374,32 @@ mod tests {
         }
     }
     kernel_test_in!("memory/rmap", smoke_rmap_move_owner_updates_coordinate);
+
+    fn smoke_rmap_reservation_survives_racing_add() -> TestResult {
+        __reset_for_test();
+        let phys = PhysAddr::new(0x2c_0000);
+        let root = PhysAddr::new(0x1000);
+        let source = VirtAddr::new(0x4000_0000);
+        let racing = VirtAddr::new(0x5000_0000);
+        let reserved = VirtAddr::new(0x6000_0000);
+        add(phys, root, source);
+        if try_reserve_owner_slots(phys, 1).is_err() {
+            __reset_for_test();
+            return TestResult::Fail("failed to reserve rmap owner slot");
+        }
+        // A concurrent demand completion must allocate beyond the promised
+        // slot rather than consuming it.
+        add(phys, root, racing);
+        add_reserved(phys, root, reserved);
+        let ok = owner_count(phys) == 3;
+        __reset_for_test();
+        if ok {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("ordinary rmap add consumed reserved alias capacity")
+        }
+    }
+    kernel_test_in!("memory/rmap", smoke_rmap_reservation_survives_racing_add);
 
     fn smoke_rmap_frames_independent() -> TestResult {
         __reset_for_test();

@@ -9,6 +9,7 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
         | narf_memory::AddressSpaceError::AlignmentMismatch => 22, // EINVAL
         narf_memory::AddressSpaceError::Unmapped
         | narf_memory::AddressSpaceError::LockLimit
+        | narf_memory::AddressSpaceError::MappingLimit
         | narf_memory::AddressSpaceError::StackLimit => 12, // ENOMEM
         narf_memory::AddressSpaceError::LockFailed
         | narf_memory::AddressSpaceError::AllocationFailed

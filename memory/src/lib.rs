@@ -67,8 +67,8 @@ mod tests;
 pub use address_space::{
     install_address_space_drop_hook, install_file_fault_hook, install_shared_frame_hooks,
     with_shared_mapping_transaction, AddressSpace, AddressSpaceError, BrkUpdateResult,
-    FutureLockPolicy, HugeRegion, MappingReceipt, NumaRegionSnapshot, Region, RegionPerms,
-    StackGrowthLimits,
+    FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt, MremapLimits,
+    NumaRegionSnapshot, Region, RegionPerms, SharedMremapMode, StackGrowthLimits,
 };
 
 #[cfg(target_arch = "x86_64")]

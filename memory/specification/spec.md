@@ -472,6 +472,18 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError>;
     /// Run a VMA/external-owner transaction in VMA -> owner lock order.
     pub fn with_vma_transaction<R>(&self, op: impl FnOnce() -> R) -> R;
+    /// Allocation-free exact-VMA classification while that transaction is
+    /// held; returns only Copy permissions, never proportional backing.
+    pub unsafe fn exact_region_perms_locked(/* ... */)
+        -> Option<RegionPerms>;
+    /// Allocation-free classification of a sub-VMA interval (or containing
+    /// VMA for len==0) while the same transaction is held.
+    pub unsafe fn region_perms_covering_locked(/* ... */)
+        -> Option<RegionPerms>;
+    /// Read, but do not consume, the default mmap candidate while the VMA
+    /// transaction is held. Successful publication advances the cursor.
+    pub unsafe fn mmap_cursor_candidate_locked(/* ... */)
+        -> Result<VirtAddr, AddressSpaceError>;
     /// Shared insertion/replacement variants require VMA then shared-owner
     /// transactions to remain held across the external backing snapshot.
     pub unsafe fn map_shared_region_locked_limited(/* ... */)
@@ -486,15 +498,43 @@ impl AddressSpace {
         -> Result<MappingReceipt, AddressSpaceError>;
     pub unsafe fn replace_region_locked_limited_receipt(/* ... */)
         -> Result<MappingReceipt, AddressSpaceError>;
-    /// Locked VMA resize/move admits growth before mutation. Proportional VMA
+    /// Locked VMA resize/move admits growth against an explicit MremapLimits
+    /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional VMA
     /// metadata is fallibly reserved before publication; exhaustion returns
     /// `AllocationFailed` without changing the source. Eager population occurs
     /// only after the IRQ-safe VMA transaction is released.
     pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
+    pub unsafe fn grow_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
     pub unsafe fn relocate_region_limited(/* ... */)
         -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    /// Fixed relocation reports whether target retirement committed before a
+    /// later failure, so external file/SysV ownership mirrors memory exactly.
     pub unsafe fn relocate_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn relocate_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
+    /// Create a second base-page VMA over an interval wholly contained in one
+    /// SHARED Region. Duplicate performs MEMLOCK then AS/DATA admission before
+    /// a fixed punch; DontUnmap skips MEMLOCK, admits AS/DATA after a fixed
+    /// punch, clears LOCKED|LOCK_ONFAULT on the source Region, and moves each
+    /// resident source leaf/rmap owner to the destination so the retained
+    /// source refaults its shared backing. Duplicate instead clones resident
+    /// leaves/rmap owners. Both preserve source backing and commit one external
+    /// destination retain per non-zero backing slot atomically.
+    pub enum SharedMremapMode { Duplicate, DontUnmap }
+    pub unsafe fn alias_shared_region_limited(/* ... */)
         -> Result<(), AddressSpaceError>;
+    pub unsafe fn alias_shared_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    pub unsafe fn alias_shared_region_hint_locked_limited(/* ... */)
+        -> Result<(VirtAddr, Option<(u64, u64)>), AddressSpaceError>;
+    pub unsafe fn alias_shared_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn alias_shared_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
     /// Fault-time stack growth checks all task-specific memory limits and is
     /// failure-atomic across speculative frame and PTE installation.
     pub unsafe fn try_grow_stack_limited(

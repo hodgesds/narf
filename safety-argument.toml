@@ -76,6 +76,10 @@ ref = "security-model/specification/spec.md#L75"
 argument = "Externally owned shared pages carry one registry reference per address-space alias. Handle removal prevents new aliases but defers frame reuse until every mapped alias has torn down its leaf and completed cross-CPU TLB invalidation; mapping, unmapping, MAP_FIXED replacement, fork aliasing, and migration use one shared transaction order."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "mremap source validation, Linux resource-limit admission, target classification, PTE relocation, reverse-map movement, and VMA publication remain under one address-space transaction. Fixed target retirement conditionally serializes borrowed backing before file-owner state; a typed post-punch outcome forces external owner metadata to mirror every destructive memory outcome, and no resident frame is freed until source translations have been invalidated across CPUs."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."
 
