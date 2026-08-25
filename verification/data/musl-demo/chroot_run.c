@@ -12,6 +12,10 @@
 extern char **environ;
 
 static int mount_scratch_tmpfs(const char *target, const char *options) {
+    /* Each invocation promises fresh scratch state. A prior chroot_run in the
+     * same boot may have left this target mounted; detach it first. ENOENT /
+     * EINVAL simply mean there was no earlier mount. */
+    (void)umount2(target, MNT_DETACH);
     if (mount("tmpfs", target, "tmpfs", MS_NOSUID | MS_NODEV, options) == 0)
         return 0;
     printf("tmpfs-mount-fail target=%s errno=%d\n", target, errno);
@@ -25,7 +29,10 @@ int main(int argc, char **argv) {
      * shm_open() as open("/dev/shm/<name>", ...), and stress-ng must not reuse
      * stale scratch files left in the persistent ext image. */
     if (mount_scratch_tmpfs("/mnt/tmp", "mode=1777") != 0) return 1;
-    if (mount_scratch_tmpfs("/mnt/dev/shm", "mode=1777") != 0) return 1;
+    if (mount_scratch_tmpfs("/mnt/dev/shm", "mode=1777") != 0) {
+        (void)umount2("/mnt/tmp", MNT_DETACH);
+        return 1;
+    }
     if (chroot("/mnt") != 0) { printf("chroot-fail errno=%d\n", errno); return 1; }
     if (chdir("/tmp") != 0) { printf("chdir-fail errno=%d\n", errno); return 1; }
     setenv("XDG_RUNTIME_DIR", "/tmp", 1);

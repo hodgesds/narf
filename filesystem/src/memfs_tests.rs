@@ -1101,7 +1101,7 @@ kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattrs_and_reconfigure);
 // stress-ng's chdir/dirdeep classes create thousands of entries in one
 // tmpfs directory, then read them all back and remove them. getdents64
 // drives readdir by snapshotting the tail at each cursor via
-// `enumerate_async(cursor, usize::MAX)` and serving entries positionally,
+// `enumerate_async(cursor, bounded_batch)` and serving entries positionally,
 // so this test reproduces that walk directly: it fills a directory with N
 // entries, then advances a cursor one entry at a time — requesting the
 // remaining tail on each step — and asserts every created name is

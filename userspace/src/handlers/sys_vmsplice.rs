@@ -40,16 +40,28 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
         }
     };
     let task_id = current_task_id();
-    // A pipe read end (`pipe_peek` returns Some, even empty) selects the
-    // pipe→user drain direction; anything else is the user→pipe gather.
-    let is_read_end = fd::with_table(task_id, |t| {
-        t.get(fd).map(|e| e.ops.pipe_peek(0).is_some())
-    });
-    match is_read_end {
-        Some(Some(true)) => vmsplice_from_pipe(ctx, task_id, fd, &iov, nr, flags),
-        Some(Some(false)) => vmsplice_to_pipe(ctx, task_id, fd, &iov, nr, flags),
-        // Bad fd.
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    // Resolve and clone the file object without retaining the fd-table lock
+    // across I/O or a guarded user copy.  vmsplice requires a pipe; accepting
+    // an arbitrary writable file here would violate its fd contract.
+    let ops = fd::with_table(task_id, |t| {
+        t.get(fd).map(|e| alloc::sync::Arc::clone(&e.ops))
+    })
+    .flatten();
+    let Some(ops) = ops else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        return;
+    };
+    if ops.pipe_capacity().is_none() {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF: not a pipe
+        return;
+    }
+    if let Some(read_end) = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+    {
+        vmsplice_from_pipe(ctx, read_end, &iov, nr, flags);
+    } else {
+        vmsplice_to_pipe(ctx, task_id, fd, &iov, nr, flags);
     }
 }
 
@@ -133,8 +145,7 @@ fn vmsplice_to_pipe(
 /// byte count — exactly Linux's iovec-at-a-time drain.
 fn vmsplice_from_pipe(
     ctx: &mut dyn TrapContext,
-    task_id: u64,
-    fd: u32,
+    pipe: &crate::pipe::PipeRead,
     iov_buf: &[u8],
     nr: usize,
     flags: u64,
@@ -148,17 +159,12 @@ fn vmsplice_from_pipe(
         if len == 0 {
             continue;
         }
-        // Read up to `len` from the pipe. `PipeRead::read` decides empty→
-        // WouldBlock (writer open) vs 0=EOF (writer gone) under its own lock.
-        let mut kbuf = alloc::vec![0u8; len];
-        let r: Option<Result<Option<Result<usize, narf_filesystem::FsError>>, ()>> =
-            fd::with_table(task_id, |t| {
-                let entry = t.get_mut(fd).ok_or(())?;
-                Ok(poll_blocking(entry.ops.read(0, &mut kbuf)))
-            });
-        let n = match r {
-            Some(Ok(Some(Ok(n)))) => n,
-            Some(Ok(Some(Err(narf_filesystem::FsError::WouldBlock)))) => {
+        // The pipe owns the observe/copy/consume transaction: a failed or
+        // racing user copy must not discard bytes already removed from the
+        // queue.
+        let n = match pipe.vmsplice_to_user(base, len) {
+            Ok(n) => n,
+            Err(crate::pipe::VmspliceDrainError::WouldBlock) => {
                 // Empty-but-open pipe. Before any byte is consumed the drain is
                 // idempotent, so EAGAIN (nonblock) or park+re-exec is safe.
                 if total > 0 {
@@ -174,18 +180,16 @@ fn vmsplice_from_pipe(
                 // Kernel-test context (no executor): report the 0-byte drain.
                 break;
             }
-            _ => break,
+            Err(crate::pipe::VmspliceDrainError::User(errno)) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                break;
+            }
         };
         if n == 0 {
             break; // EOF (writer gone, pipe empty)
-        }
-        // SAFETY: `base` is a user VA; copy_to_user range-validates the write.
-        if unsafe { copy_to_user(base, &kbuf[..n]) }.is_err() {
-            if total == 0 {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-                return;
-            }
-            break;
         }
         total = total.saturating_add(n);
         if n < len {

@@ -56,6 +56,11 @@ fn smoke_shmem_create_destroy_round_trip() -> TestResult {
     if create(pid_a, 0).is_ok() {
         return TestResult::Fail("0-len should reject");
     }
+    // Page-rounding must reject overflow instead of wrapping a hostile huge
+    // length into a tiny/zero allocation.
+    if create(pid_a, u64::MAX).is_ok() {
+        return TestResult::Fail("overflowing length should reject");
+    }
     if count() != 2 {
         return TestResult::Fail("count mismatch");
     }

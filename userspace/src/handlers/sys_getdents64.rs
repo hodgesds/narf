@@ -38,13 +38,15 @@ pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
     };
 
     let mut written = 0usize;
-    // The whole directory tail (everything at or after `cursor`) is
-    // snapshotted ONCE per getdents call, then served entry-by-entry from
-    // the snapshot. Two backend flavours feed it:
+    // A bounded directory batch at or after `cursor` is snapshotted ONCE per
+    // getdents call, then served entry-by-entry. Bounding is load-bearing: a
+    // caller can provide a 32-byte output buffer for a directory with millions
+    // of entries, and snapshotting the entire tail would turn that syscall into
+    // an unbounded kernel allocation. Two backend flavours feed the batch:
     //
     //   * enumerate_async: the in-memory and on-disk filesystems. A single
-    //     `enumerate_async(cursor, usize::MAX)` returns the remaining tail
-    //     in one traversal, so the listing is O(entries) for the directory.
+    //     `enumerate_async(cursor, batch_max)` returns as many entries as this
+    //     call can plausibly consume, in one traversal.
     //     Requesting one entry per call instead (`enumerate_async(cursor,
     //     1)`) makes each call re-skip `cursor` positions from the start of
     //     the backing container (a BTreeMap for tmpfs), turning a full
@@ -58,13 +60,20 @@ pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
     //     re-iter would cost O(entries²) and multiply that leak by the
     //     directory size on every ps/top refresh.
     //
-    // Either way the tail is captured once and indexed by `snapshot_pos`.
+    // At least 24 bytes are required for any linux_dirent64 record. Request one
+    // look-ahead entry beyond the maximum that can fit, and cap the batch so a
+    // huge user buffer cannot force a huge kernel-side snapshot either.
+    const SNAPSHOT_ENTRY_CAP: usize = 4096;
+    let batch_max = (out_len / 24)
+        .saturating_add(1)
+        .clamp(1, SNAPSHOT_ENTRY_CAP);
     let snapshot: alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)> =
-        match poll_blocking(dir.enumerate_async(cursor, usize::MAX)) {
+        match poll_blocking(dir.enumerate_async(cursor, batch_max)) {
             Some(Ok(v)) => v,
             Some(Err(narf_filesystem::FsError::Unsupported)) => dir
                 .iter()
                 .skip(cursor)
+                .take(batch_max)
                 .map(|e| (alloc::string::String::from(e.name), e.file_type))
                 .collect(),
             _ => alloc::vec::Vec::new(),

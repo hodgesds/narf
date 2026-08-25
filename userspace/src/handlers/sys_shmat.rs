@@ -41,7 +41,13 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     // Reserve a page-aligned VA window: the segment maps one PTE per
     // page-granular backing frame, so a sub-page `len` still consumes a
     // whole page (matching the region registered below).
-    let reserve_len = (len + 0xFFF) & !0xFFF;
+    let reserve_len = match len.checked_add(0xFFF) {
+        Some(value) => value & !0xFFF,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            return;
+        }
+    };
     let base = as_ref.reserve_mmap_va(reserve_len);
     if base == 0 {
         // mmap arena exhausted (cursor at MMAP_WINDOW_TOP) — fail closed.

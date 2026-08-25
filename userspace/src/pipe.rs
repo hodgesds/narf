@@ -125,6 +125,14 @@ pub struct PipeWrite {
     shared: Arc<PipeShared>,
 }
 
+/// Result classes needed by the read-end `vmsplice(2)` transaction.  The
+/// user-copy errno is kept intact so the syscall layer can distinguish an
+/// invalid range (`EINVAL`) from an inaccessible one (`EFAULT`).
+pub(crate) enum VmspliceDrainError {
+    WouldBlock,
+    User(u64),
+}
+
 impl core::fmt::Debug for PipeRead {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PipeRead").finish_non_exhaustive()
@@ -156,6 +164,52 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
         }),
         Arc::new(PipeWrite { shared }),
     )
+}
+
+impl PipeRead {
+    /// Copy the current pipe prefix to `dst`, consuming it only after the
+    /// guarded user copy succeeds.  Keeping the queue lock across the copy is
+    /// deliberate: another reader must not consume or reorder the prefix
+    /// between observation and commit.  A failed copy leaves every byte in
+    /// the pipe, matching Linux's pipe-to-user splice actor.
+    pub(crate) fn vmsplice_to_user(
+        &self,
+        dst: u64,
+        max: usize,
+    ) -> Result<usize, VmspliceDrainError> {
+        crate::handlers::validate_user_range(dst, max).map_err(VmspliceDrainError::User)?;
+
+        // Allocate before disabling IRQs on the queue lock.  A pipe can never
+        // supply more than its fixed capacity, even if the iovec is larger.
+        let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, PIPE_BUF_BYTES));
+        let mut q = self.shared.queue.lock();
+        let avail = q.len();
+        if avail == 0 {
+            return if self.shared.writer_closed.load(Ordering::Acquire) {
+                Ok(0)
+            } else {
+                Err(VmspliceDrainError::WouldBlock)
+            };
+        }
+        let n = core::cmp::min(max, avail);
+        staging.extend(q.iter().copied().take(n));
+
+        // SAFETY: validate_user_range accepted the entire destination above;
+        // the guarded copy converts a racing unmap/protection change to an
+        // error.  The queue is still untouched on that error path.
+        unsafe { crate::handlers::copy_to_user(dst, &staging) }
+            .map_err(VmspliceDrainError::User)?;
+        q.drain(..n);
+        let became_writable = avail == PIPE_BUF_BYTES;
+        drop(q);
+
+        if became_writable {
+            self.shared.writable_token.fetch_add(1, Ordering::Release);
+        }
+        self.shared.sync_readiness();
+        narf_net::readiness::notify(0);
+        Ok(n)
+    }
 }
 
 impl Drop for PipeRead {
@@ -333,51 +387,12 @@ impl FileOps for PipeRead {
         Some(q.iter().copied().take(n).collect())
     }
 
-    fn pipe_take(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
-        let mut q = self.shared.queue.lock();
-        let avail = q.len();
-        let n = core::cmp::min(max, avail);
-        // Drain the front `n` bytes straight into a fresh Vec (no pre-zeroed
-        // bounce): `drain(..n).collect()` builds it from the ring's two
-        // contiguous slices. This is `PipeRead::read`'s bulk drain minus the
-        // caller-supplied buffer — the `splice(2)` pipe-source fast path.
-        let out: alloc::vec::Vec<u8> = q.drain(..n).collect();
-        let became_writable = avail == PIPE_BUF_BYTES && n != 0;
-        drop(q);
-        if became_writable {
-            self.shared.writable_token.fetch_add(1, Ordering::Release);
-        }
-        if n != 0 {
-            // Room freed: republish (sets POLL_OUT, may clear POLL_IN) and
-            // bump the global notify generation so a writer parked via
-            // `park_reexecute_on_io` (armed on that generation) re-runs.
-            self.shared.sync_readiness();
-            narf_net::readiness::notify(0);
-        }
-        Some(out)
-    }
-
-    fn pipe_unread(&self, bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
-            return true;
-        }
-        let mut q = self.shared.queue.lock();
-        // Prepend in original order: push each byte to the front from the
-        // back of `bytes` so the ring's front byte is `bytes[0]` again. This
-        // returns a splice sink's unwritten tail to the source with no loss.
-        for &b in bytes.iter().rev() {
-            q.push_front(b);
-        }
-        drop(q);
-        // Data is readable again; the token/readiness bump keeps a reader
-        // parked on POLL_IN consistent (POLL_OUT may clear if now full).
-        self.shared.readable_token.fetch_add(1, Ordering::Release);
-        self.shared.sync_readiness();
-        true
-    }
-
     fn pipe_capacity(&self) -> Option<usize> {
         Some(PIPE_BUF_BYTES)
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 

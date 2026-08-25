@@ -3151,82 +3151,6 @@ fn copy_fd_to_fd(
     Some(Ok(total))
 }
 
-/// `splice(2)` fast path when the SOURCE fd is a pipe read end: drain the
-/// ring directly with `pipe_take` (no pre-zeroed 64 KiB bounce, no read-copy)
-/// and write the drained bytes to the sink `out_fd`. Same contract as
-/// `copy_fd_to_fd`: `Ok(bytes moved)`, or `Err(WouldBlock)` on an initial
-/// empty-but-open pipe so the caller can park or return EAGAIN, or `Ok(0)`
-/// for a real EOF (writer gone). The sink may be another pipe, a file, or a
-/// discard device like `/dev/null`.
-///
-/// This is the hot path for the stress-ng splice pipeline
-/// (`/dev/zero → pipe → pipe → /dev/null`) and vm-splice drain: pipe→pipe and
-/// pipe→/dev/null moves that used to memset+copy 64 KiB through a heap buffer
-/// on every call now hand the ring's own bytes to the sink write.
-fn splice_pipe_source(
-    task: u64,
-    in_fd: u32,
-    out_fd: u32,
-    count: usize,
-) -> Option<Result<usize, narf_filesystem::FsError>> {
-    /// One default pipe buffer per drain iteration; a full-pipe splice
-    /// completes in a single take+write.
-    const CHUNK: usize = 65536;
-    let mut total = 0usize;
-    while total < count {
-        let want = core::cmp::min(CHUNK, count - total);
-        // Drain up to `want` bytes straight out of the pipe ring.
-        let drained: alloc::vec::Vec<u8> = fd::with_table(task, |t| {
-            let entry = t.get_mut(in_fd)?;
-            entry.ops.pipe_take(want)
-        })
-        .flatten()
-        // pipe_take returns Some for any pipe read end; None only if the fd
-        // vanished mid-splice — treat as a hard stop.
-        .unwrap_or_default();
-        if drained.is_empty() {
-            if total > 0 {
-                break; // moved something already; a later empty is just "done".
-            }
-            // Nothing queued on the first drain: distinguish EOF (writer gone)
-            // from would-block (writer still open) the same way PipeRead::read
-            // does, so splice parks/EAGAINs instead of reporting a false EOF.
-            let writer_gone = fd::with_table(task, |t| {
-                t.get(in_fd)
-                    .map(|e| e.ops.poll_readiness() & narf_filesystem::POLL_HUP != 0)
-            });
-            return match writer_gone {
-                Some(Some(true)) => Some(Ok(0)),          // EOF
-                Some(Some(false)) => Some(Err(narf_filesystem::FsError::WouldBlock)),
-                _ => Some(Ok(0)),
-            };
-        }
-        let n = drained.len();
-        let w: usize = fd::with_table(task, |t| {
-            let entry = t.get_mut(out_fd)?;
-            let off = entry.offset;
-            let w = match poll_blocking(entry.ops.write(off, &drained)) {
-                Some(Ok(w)) => w,
-                _ => 0,
-            };
-            entry.offset = off.saturating_add(w as u64);
-            Some(w)
-        })
-        .flatten()?;
-        total += w;
-        if w < n {
-            // Sink accepted less than we drained (a pipe sink that filled).
-            // Push the undelivered tail back onto the source ring so no byte
-            // is lost — splice reports only what actually reached the sink.
-            let _ = fd::with_table(task, |t| {
-                t.get(in_fd).map(|e| e.ops.pipe_unread(&drained[w..]))
-            });
-            break;
-        }
-    }
-    Some(Ok(total))
-}
-
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
 /// Stored verbatim — NARF is single-threaded so there is no robust-list
 /// walk on thread exit, but the pointers round-trip faithfully.
@@ -7161,7 +7085,11 @@ pub(crate) fn park_reexecute_on_fd(
     }
     let task = current_task_id();
     let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
-        return false;
+        // Legacy longjmp execution has no stackful waker, but it does have the
+        // generation-guarded park path. Preserve blocking semantics there;
+        // returning false would make a blocking stream send spuriously surface
+        // EAGAIN whenever own-stack mode is disabled.
+        return park_reexecute_on_io(ctx);
     };
     match ops.arm_readiness(task, interest, &waker) {
         Some(Poll::Ready(_)) => {

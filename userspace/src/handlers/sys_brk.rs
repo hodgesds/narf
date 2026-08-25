@@ -346,4 +346,35 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_brk_single_growable_vma);
+
+    /// A user MAP_FIXED mapping at the conventional heap base is not a brk
+    /// VMA. The in-place grow optimization must reject the collision rather
+    /// than append frames to that foreign mapping and let a later brk shrink
+    /// tear it down.
+    fn smoke_brk_does_not_annex_foreign_base_vma() -> TestResult {
+        let aspace = AddressSpace::empty();
+        let base = VirtAddr::new(BRK_DEFAULT_BASE);
+        if aspace
+            .map_region(Region {
+                base,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("foreign base mapping setup failed");
+        }
+        let before = aspace.lookup(base).expect("foreign mapping disappeared");
+        let got = brk_core(&aspace, BRK_DEFAULT_BASE + 0x1000);
+        let after = aspace.lookup(base).expect("foreign mapping disappeared");
+        if got != BRK_DEFAULT_BASE || aspace.brk_top() != BRK_DEFAULT_BASE {
+            return TestResult::Fail("brk advanced across a foreign base mapping");
+        }
+        if after.len != before.len || after.perms != before.perms || after.phys != before.phys {
+            return TestResult::Fail("brk annexed or mutated a foreign base mapping");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_does_not_annex_foreign_base_vma);
 }

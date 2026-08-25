@@ -1662,9 +1662,7 @@ fn smoke_abi_fdio_splice_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_neg);
 
 /// splice(pipe → pipe) moves the queued bytes exactly once, reports the
-/// moved count, and leaves the source drained. Exercises the pipe-source
-/// fast path (`splice_pipe_source` → `pipe_take`) that replaced the 64 KiB
-/// zeroed bounce for the stress-ng `pipe → pipe → /dev/null` pipeline.
+/// moved count, and leaves the source drained.
 fn smoke_abi_fdio_splice_pipe_to_pipe() -> TestResult {
     with_setup(|| {
         let (src_rd, src_wr) = make_pipe()?;
@@ -1742,6 +1740,46 @@ fn smoke_abi_fdio_vmsplice_from_pipe() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_from_pipe);
+
+/// A failed pipe→user vmsplice must not consume the source bytes.  Linux's
+/// pipe-to-user actor advances the pipe only for bytes successfully copied;
+/// this pins the stronger all-or-nothing behavior of NARF's guarded copy.
+fn smoke_abi_fdio_vmsplice_efault_preserves_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        let src = *b"keep";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, src.as_ptr() as u64, src.len() as u64),
+        ) != Some(src.len() as i64)
+        {
+            return Err("seeding the pipe failed");
+        }
+
+        let mut bad_iov = [0u8; 16];
+        // Non-canonical on both supported architectures, so range validation
+        // fails before any user byte or pipe byte can be touched.
+        bad_iov[..8].copy_from_slice(&0x0001_0000_0000_0000u64.to_le_bytes());
+        bad_iov[8..].copy_from_slice(&(src.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, bad_iov.as_ptr() as u64, 1, 0),
+        ) != Some(-14)
+        {
+            return Err("vmsplice to an invalid destination did not return EFAULT");
+        }
+
+        let mut out = [0u8; 4];
+        match call(
+            Syscall::Read.raw(),
+            a2(rd as u64, out.as_mut_ptr() as u64, out.len() as u64),
+        ) {
+            Some(4) if out == src => Ok(()),
+            _ => Err("vmsplice EFAULT consumed or reordered pipe data"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_efault_preserves_pipe);
 
 /// The stress-ng vm-splice loop shape: vmsplice user memory INTO the pipe,
 /// splice it OUT to a sink, then vmsplice the pipe read end back to memory —

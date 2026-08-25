@@ -1146,25 +1146,6 @@ pub trait FileOps: Send + Sync {
         None
     }
 
-    /// If this file is the read end of a pipe, CONSUME (drain) up to `max`
-    /// queued bytes and return them, republishing readiness so a blocked
-    /// writer wakes. `Some(empty)` means "drained nothing right now"; `None`
-    /// means "not a pipe read end". The drained bytes come straight out of
-    /// the ring — no pre-zeroed bounce buffer — which is the `splice(2)`
-    /// pipe-source fast path (avoids `copy_fd_to_fd`'s `vec![0u8; 64K]`
-    /// memset + an extra copy per op). Default `None`.
-    fn pipe_take(&self, _max: usize) -> Option<alloc::vec::Vec<u8>> {
-        None
-    }
-
-    /// Put `bytes` back onto the FRONT of the pipe read end's ring (the tail
-    /// of a `pipe_take` that the splice sink could not accept), so no byte is
-    /// lost. Returns `true` on a pipe read end, `false` otherwise. Default
-    /// `false`.
-    fn pipe_unread(&self, _bytes: &[u8]) -> bool {
-        false
-    }
-
     /// Downcast hook. The default returns `None`; FileOps types that
     /// need to be recovered from an `Arc<dyn FileOps>` (today: the
     /// namespace-fd minted by `/proc/<pid>/ns/*`, so `setns(fd, …)` can
