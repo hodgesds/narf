@@ -1,9 +1,9 @@
 #[allow(unused_imports)]
 use super::*;
 
-const MREMAP_MAYMOVE: u32 = 1;
-const MREMAP_FIXED: u32 = 2;
-const MREMAP_DONTUNMAP: u32 = 4;
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+const MREMAP_DONTUNMAP: u64 = 4;
 const EPERM: i64 = 1;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
@@ -151,7 +151,7 @@ fn mremap_core(
     old_addr: u64,
     old_len_requested: u64,
     new_len_requested: u64,
-    flags: u32,
+    flags: u64,
     new_addr: u64,
 ) -> Result<u64, i64> {
     mremap_core_limited(
@@ -171,7 +171,7 @@ fn mremap_core_limited(
     old_addr: u64,
     old_len_requested: u64,
     new_len_requested: u64,
-    flags: u32,
+    flags: u64,
     new_addr: u64,
     limits: narf_memory::MremapLimits,
 ) -> Result<u64, i64> {
@@ -613,7 +613,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
         args.arg0,
         args.arg1,
         args.arg2,
-        args.arg3 as u32,
+        args.arg3,
         args.arg4,
         limits,
     ) {
@@ -1036,6 +1036,7 @@ mod tests {
         }
         if mremap_core(&aspace, BASE, 8192, 8192, MREMAP_FIXED, BASE + 0x20_0000) != Err(EINVAL)
             || mremap_core(&aspace, BASE, 0, 8192, MREMAP_MAYMOVE, 0) != Err(EINVAL)
+            || mremap_core(&aspace, BASE, 8192, 8192, 1u64 << 32, 0) != Err(EINVAL)
             || mremap_core(
                 &aspace,
                 BASE,
