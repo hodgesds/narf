@@ -50,6 +50,10 @@ pub fn dbg_active_perf_events() -> usize {
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
+/// Serializes the ACTIVE_PERF_EVENTS 0↔1 transition with the low-level fast
+/// gate. Registry users take the registry lock first; Drop takes only this
+/// lock, avoiding re-entrancy when a registry-held temporary Arc is last.
+static PERF_EVENT_GATE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 static PERF_LAST_SELECTED_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
 static PERF_LAST_MULTIPLEX_NS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
@@ -68,6 +72,24 @@ const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 const PENDING_SAMPLE_DEPTH: usize = 64;
 const PENDING_LOSS_BUCKETS: usize = 16;
 const PENDING_TRACE_DEPTH: usize = 64;
+
+fn publish_perf_event(registry: &mut Vec<Weak<PerfEventFile>>, file: &Arc<PerfEventFile>) {
+    let _gate = PERF_EVENT_GATE_LOCK.lock();
+    file.registered.store(true, Ordering::Release);
+    registry.push(Arc::downgrade(file));
+    if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Release) == 0 {
+        narf_lib::perf::set_enabled(true);
+    }
+}
+
+fn unpublish_perf_event(file: &PerfEventFile) {
+    let _gate = PERF_EVENT_GATE_LOCK.lock();
+    if file.registered.swap(false, Ordering::AcqRel)
+        && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel) == 1
+    {
+        narf_lib::perf::set_enabled(false);
+    }
+}
 const PENDING_TRACE_BYTES: usize = 256;
 static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
     [const { [const { PendingSample::new() }; PENDING_SAMPLE_DEPTH] }; SAMPLE_CPU_SLOTS];
@@ -2207,10 +2229,7 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
         };
         if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0 {
             event.disable();
-            event.registered.store(false, Ordering::Release);
-            if ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1 {
-                narf_lib::perf::set_enabled(false);
-            }
+            unpublish_perf_event(&event);
             return false;
         }
         if event.tracks_task(task)
@@ -3338,11 +3357,7 @@ impl Drop for PerfEventFile {
                 let _ = unsafe { counter.release() };
             }
         }
-        if self.registered.load(Ordering::Acquire)
-            && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1
-        {
-            narf_lib::perf::set_enabled(false);
-        }
+        unpublish_perf_event(self);
     }
 }
 
@@ -4256,10 +4271,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             #[cfg(target_arch = "aarch64")]
             pmu_event,
         });
-        if initially_enabled {
-            file.enable();
-        }
         let ops: Arc<dyn FileOps> = file.clone();
+        let mut registry = PERF_EVENT_REGISTRY.lock();
+        // Publish registry membership and the fast-path gate as one serialized
+        // transition. A sideband hook either sees zero events, or blocks on the
+        // registry until this event is fully enabled and group-linked.
+        publish_perf_event(&mut registry, &file);
         if let Some(leader) = &group_leader {
             if let Some(event) = leader
                 .as_any()
@@ -4268,14 +4285,10 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 event.add_group_member(&ops);
             }
         }
-        // Publish the registry entry and active gate before the fd becomes
-        // visible. CLONE_FILES peers serialize on this table lock, so none can
-        // use the new fd while sideband hooks still see the dormant fast path.
-        file.registered.store(true, Ordering::Release);
-        PERF_EVENT_REGISTRY.lock().push(Arc::downgrade(&file));
-        if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Release) == 0 {
-            narf_lib::perf::set_enabled(true);
+        if initially_enabled {
+            file.enable();
         }
+        drop(registry);
         t.open(FdEntry {
             ops,
             offset: 0,
