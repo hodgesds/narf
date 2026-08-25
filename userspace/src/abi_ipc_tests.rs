@@ -851,6 +851,156 @@ kernel_test_in!(
     smoke_abi_ipc_semctl_pid_and_waiter_state
 );
 
+/// Linux evaluates queued operations while holding the semaphore-set lock:
+/// insertion order determines scan order, but an older unsatisfied request is
+/// skipped rather than imposing head-of-line blocking. Completion is cached
+/// before either task runs again, and repeated park registration owns only one
+/// wake slot.
+fn smoke_abi_ipc_sem_queue_handoff_order_and_waker_dedupe() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountWake(AtomicU32);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        const OLDER: u64 = FAKE_TASK + 21;
+        const YOUNGER: u64 = FAKE_TASK + 22;
+        let mut minus_two = [0u8; 6];
+        minus_two[2..4].copy_from_slice(&(-2i16).to_le_bytes());
+        let mut minus_one = [0u8; 6];
+        minus_one[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        set_task(OLDER);
+        if call_raw(Syscall::Semop.raw(), a2(id, minus_two.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("older -2 operation did not queue");
+        }
+        set_task(YOUNGER);
+        if call_raw(Syscall::Semop.raw(), a2(id, minus_one.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("younger -1 operation did not queue");
+        }
+
+        let younger_wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        let younger_waker = core::task::Waker::from(Arc::clone(&younger_wakes));
+        if crate::sysvipc::register_sem_wait_waker(YOUNGER, younger_waker.clone())
+            != crate::sysvipc::SemParkState::Pending
+            || crate::sysvipc::register_sem_wait_waker(YOUNGER, younger_waker)
+                != crate::sysvipc::SemParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("queued waiter rejected durable waker registration");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("SETVAL failed to drive queued handoff");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(1)
+        {
+            return Err("scan did not skip -2 and commit younger eligible -1");
+        }
+        if younger_wakes.0.load(Ordering::Relaxed) != 1 {
+            return Err("repeated registration produced duplicate wakes");
+        }
+
+        // The user's sembuf pointer is deliberately invalid: success must be
+        // consumed from the cached terminal result, not re-imported/retried.
+        set_task(YOUNGER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("completed waiter did not consume cached success");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 2)) != Some(0) {
+            return Err("SETVAL failed to satisfy the remaining waiter");
+        }
+        set_task(OLDER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("older waiter did not receive its later handoff");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_queue_handoff_order_and_waker_dedupe
+);
+
+fn smoke_abi_ipc_sem_queue_timeout_and_undo_handoff() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        let zero_timeout = [0i64, 0i64];
+        const TIMED: u64 = FAKE_TASK + 23;
+        set_task(TIMED);
+        crate::handlers::raise_signal_pending(TIMED, 10);
+        if call(
+            Syscall::Semtimedop.raw(),
+            a3(
+                id,
+                decrement.as_ptr() as u64,
+                1,
+                zero_timeout.as_ptr() as u64,
+            ),
+        ) != Some(EAGAIN)
+        {
+            crate::handlers::clear_signal_pending(TIMED, 10);
+            set_task(FAKE_TASK);
+            return Err("expired semtimedop did not beat a simultaneous signal with EAGAIN");
+        }
+        crate::handlers::clear_signal_pending(TIMED, 10);
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(0) {
+            return Err("timed-out semaphore waiter remained linked");
+        }
+
+        const UNDO_WAITER: u64 = FAKE_TASK + 24;
+        decrement[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        set_task(UNDO_WAITER);
+        let undo_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("SEM_UNDO decrement did not queue");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0)
+        {
+            return Err("SEM_UNDO queued handoff was not committed atomically");
+        }
+        set_task(UNDO_WAITER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("SEM_UNDO waiter did not consume cached success");
+        }
+        crate::sysvipc::sem_undo_process_exit(undo_pid, UNDO_WAITER);
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("exit did not reverse the queued SEM_UNDO handoff");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_queue_timeout_and_undo_handoff
+);
+
 fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
     with_setup(|| {
         // Linux's SETVAL wrapper rejects the value before looking up semid.

@@ -378,17 +378,28 @@ interruptibly unless their blocking sembuf has `IPC_NOWAIT`; relative timed
 waits retain one absolute deadline across park/re-execution. Imported operation
 arrays and message payloads remain
 kernel-owned across that wait, so later user-memory mutation cannot alter an
-in-flight operation. `SEM_UNDO` adjustments are accumulated per process,
-atomically committed with the operation, shared by `CLONE_SYSVSEM`, cleared by
-`SETVAL`/`SETALL`, and reversed when the final sharing process exits.
+in-flight operation. Semaphore waiters are appended and evaluated in queue
+order after each relevant mutation, but an older operation that remains
+unsatisfied is skipped as on Linux. Eligible operations commit their semvals,
+`SEM_UNDO`, `sempid`, timestamp, and terminal result while the semaphore-state
+lock is still held; task wakeups occur after unlocking. Each task owns one
+replaceable durable waker, so repeated polls are deduplicated, a completion
+that precedes waker registration is observed on the registration recheck, and
+scheduler migration is transparent. Infinite waits have no polling deadline;
+timed waits return `EAGAIN`, signals return `EINTR`, and removal returns
+`EIDRM`, with the first terminal transition winning. `SEM_UNDO` adjustments are
+accumulated per process, atomically committed with the operation, shared by
+`CLONE_SYSVSEM`, cleared by `SETVAL`/`SETALL`, and reversed when the final
+sharing process exits.
 Semaphores retain Linux's per-member `sempid`: successful `semop` entries,
 including zero waits, `SETVAL`, every member of `SETALL`, and exit-time undo
 publish the responsible process, which `GETPID` translates into the querying
 task's PID namespace. `GETNCNT` and `GETZCNT` count retained operations by only
 the first blocking sembuf from their most recent atomic evaluation;
 interruption, timeout, successful retry, task exit, or set removal retires that
-waiter state. System V message send
-imports the type and payload before queue lookup and reports copy
+waiter state. The counts are exact per-set integer state updated with queue
+linkage, so reads are O(1); they are not approximate per-CPU telemetry. System V
+message send imports the type and payload before queue lookup and reports copy
 faults as `EFAULT`. Queues enforce
 Linux's default 16-KiB byte and zero-length-message count limit; full blocking
 sends park, while `IPC_NOWAIT` returns `EAGAIN`. Receive supports Linux type

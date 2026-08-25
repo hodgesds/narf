@@ -100,6 +100,11 @@ pub struct UserTaskCtx {
     /// re-polls readiness immediately instead of waiting out its wheel
     /// deadline (~100 ms for redis's serverCron). Cleared on wake.
     pub net_io_wait: AtomicBool,
+    /// Set while a System V semaphore operation is queued. The park loop
+    /// installs its current task waker in the queue record and rechecks the
+    /// terminal status before sleeping, so migration and wake-before-register
+    /// races do not require a polling deadline.
+    pub sem_wait_pending: AtomicBool,
     /// `narf_net::readiness::generation()` snapshot taken by
     /// `sys_epoll_wait`/`sys_poll` just before its final readiness
     /// check. After registering the I/O waker, the park path refreshes
@@ -453,6 +458,7 @@ impl UserTaskCtx {
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
+            sem_wait_pending: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
@@ -944,6 +950,20 @@ fn park_should_block(
                     crate::handlers::drop_signal_waker(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
+                }
+            }
+            if uc.sem_wait_pending.load(Ordering::Acquire) {
+                match crate::sysvipc::register_sem_wait_waker(task_id, waker.clone()) {
+                    crate::sysvipc::SemParkState::Pending => {}
+                    crate::sysvipc::SemParkState::Ready => {
+                        crate::handlers::drop_signal_waker(task_id);
+                        uc.sem_wait_pending.store(false, Ordering::Release);
+                        uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        return false;
+                    }
+                    crate::sysvipc::SemParkState::NotWaiting => {
+                        uc.sem_wait_pending.store(false, Ordering::Release);
+                    }
                 }
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
@@ -2044,6 +2064,30 @@ impl core::future::Future for UserTaskFuture {
                         return core::task::Poll::Pending;
                     }
                 }
+                if this.task.uctx.sem_wait_pending.load(Ordering::Acquire) {
+                    match crate::sysvipc::register_sem_wait_waker(
+                        crate::handlers::current_task_id(),
+                        cx.waker().clone(),
+                    ) {
+                        crate::sysvipc::SemParkState::Pending => {}
+                        crate::sysvipc::SemParkState::Ready => {
+                            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
+                            this.task
+                                .uctx
+                                .sem_wait_pending
+                                .store(false, Ordering::Release);
+                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            cx.waker().wake_by_ref();
+                            return core::task::Poll::Pending;
+                        }
+                        crate::sysvipc::SemParkState::NotWaiting => {
+                            this.task
+                                .uctx
+                                .sem_wait_pending
+                                .store(false, Ordering::Release);
+                        }
+                    }
+                }
                 // FUTEX_WAIT: `sys_futex` published the futex word here.
                 // Register our waker on the per-uaddr wait queue so a
                 // `FUTEX_WAKE` on that word wakes us promptly (a real blocking
@@ -2155,6 +2199,10 @@ impl core::future::Future for UserTaskFuture {
             crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            this.task
+                .uctx
+                .sem_wait_pending
+                .store(false, Ordering::Release);
             // Unqueue the futex waiter this park registered (see the own-stack
             // twin above): Linux's futex_unqueue removes it on timeout/signal
             // too, so a later FUTEX_WAKE(1) can't pop a ghost.
