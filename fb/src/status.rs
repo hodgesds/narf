@@ -158,6 +158,12 @@ pub fn paint(fb: &FbWriter) {
     let total_kb = (narf_memory::heap::capacity_bytes() / 1024) as u32;
     narf_memory::diag::set_heap_kb(used_kb, total_kb);
     let diag = narf_memory::diag::snapshot();
+    // IRQ dispatch already maintains authoritative per-vector counters.
+    // Fold them here at the panel's ~1.25 Hz refresh rate instead of making
+    // every CPU write a second pair of shared diagnostic atomics on each IRQ.
+    let irq_total = (0..narf_interrupts::NUM_VECTORS).fold(0u64, |total, vector| {
+        total.wrapping_add(narf_interrupts::fire_count(vector as u8))
+    });
 
     let panel_y = h - PANEL_HEIGHT - PANEL_PAD;
     // Panic-latched: paint the panel red. A bare-metal operator
@@ -290,20 +296,18 @@ pub fn paint(fb: &FbWriter) {
     // fault (CR2/panic).
     let diag_line = if diag.panic_latched {
         format!(
-            "PANIC: marker={:016x} phase={} irq#{}={} heap={}/{} KB",
+            "PANIC: marker={:016x} phase={} irq={} heap={}/{} KB",
             diag.panic_marker,
             diag.phase.as_str(),
-            diag.last_irq_vector,
-            diag.irq_total,
+            irq_total,
             diag.heap_used_kb,
             diag.heap_total_kb,
         )
     } else if diag.first_pf_seen {
         format!(
-            "phase={} irq#{}={} heap={}/{} KB #PF cr2={:x} rip={:x}",
+            "phase={} irq={} heap={}/{} KB #PF cr2={:x} rip={:x}",
             diag.phase.as_str(),
-            diag.last_irq_vector,
-            diag.irq_total,
+            irq_total,
             diag.heap_used_kb,
             diag.heap_total_kb,
             diag.first_pf_cr2,
@@ -311,10 +315,9 @@ pub fn paint(fb: &FbWriter) {
         )
     } else {
         format!(
-            "phase={} irq#{}={} heap={}/{} KB",
+            "phase={} irq={} heap={}/{} KB",
             diag.phase.as_str(),
-            diag.last_irq_vector,
-            diag.irq_total,
+            irq_total,
             diag.heap_used_kb,
             diag.heap_total_kb,
         )
