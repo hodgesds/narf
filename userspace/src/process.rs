@@ -213,6 +213,23 @@ pub unsafe fn load_user_process_with_root(
     // program load address so the two ranges never collide.
     const INTERP_BIAS: u64 = 0x0000_4000_0000_0000;
     let image = crate::parse_elf(bytes).map_err(LoadBytesError::Elf)?;
+    // Mirror Linux binfmt_elf's `start_data` / `end_data` bookkeeping for
+    // RLIMIT_DATA: each PT_LOAD contributes its start and file-backed end;
+    // the load bias cancels when the span is subtracted. The interpreter is
+    // intentionally excluded because Linux charges the main executable here.
+    let start_data = image
+        .segments
+        .iter()
+        .map(|segment| segment.vaddr)
+        .max()
+        .unwrap_or(0);
+    let end_data = image
+        .segments
+        .iter()
+        .map(|segment| segment.vaddr.saturating_add(segment.file_size))
+        .max()
+        .unwrap_or(0);
+    address_space.set_program_data_bytes(end_data.saturating_sub(start_data));
     let mut entry = program_entry;
     let mut interp_loaded = false;
 
@@ -405,7 +422,7 @@ pub unsafe fn load_user_process_with_root(
         stack_phys_list.push(phys);
     }
 
-    let mut stack_perms = RegionPerms::READ | RegionPerms::WRITE;
+    let mut stack_perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT;
     if let Some(flags) = image.stack_flags {
         if flags.contains(crate::SegmentFlags::EXEC) {
             stack_perms = stack_perms | RegionPerms::EXEC;
@@ -451,7 +468,7 @@ pub unsafe fn load_user_process_with_root(
         .map_region(Region {
             base: VirtAddr::new(guard_base),
             len: 0x1000,
-            perms: RegionPerms::STACK_GUARD,
+            perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![PhysAddr::new(0)],
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;

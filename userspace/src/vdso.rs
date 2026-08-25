@@ -48,7 +48,11 @@ pub const VDSO_VADDR: u64 = VDSO_MAP_BASE + 0x1000;
 /// mapping) makes the first vDSO write a fatal #PF that kills systemd PID 1 at
 /// boot. Built from raw bits so it stays `const`.
 pub(crate) const VDSO_CODE_PERMS: RegionPerms = RegionPerms(
-    RegionPerms::READ.0 | RegionPerms::WRITE.0 | RegionPerms::EXEC.0 | RegionPerms::COW.0,
+    RegionPerms::READ.0
+        | RegionPerms::WRITE.0
+        | RegionPerms::EXEC.0
+        | RegionPerms::COW.0
+        | RegionPerms::LOCK_EXEMPT.0,
 );
 
 // vvar field byte offsets (must match `struct vvar` in data/vdso/vdso.c).
@@ -147,7 +151,7 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
         .map_region(Region {
             base: VirtAddr::new(VVAR_VADDR),
             len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::SHARED,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![img.vvar_frame],
         })
         .ok()?;

@@ -33,7 +33,10 @@ pub(crate) fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
             // Without SHARED the teardown paths would `free_frame` this
             // borrowed frame on munmap/exit and return it to the buddy —
             // the same double-free class as `sys_shmem_map`.
-            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::SHARED
+                | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![narf_memory::PhysAddr::new(phys)],
         })
         .is_err()

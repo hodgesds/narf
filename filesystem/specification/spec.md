@@ -95,6 +95,14 @@ pub trait FileOps {
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
     fn disarm_readiness(&self, task_id: u64) -> bool;
+    fn tty_fg_pgrp(&self) -> Option<u64>;
+    fn tty_session(&self) -> Option<u64>;
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool;
+    fn tty_acquire_controlling(
+        &self,
+        arg: usize,
+        readable: bool,
+    ) -> Result<bool, FsError>;
 }
 
 pub enum FileType {
@@ -162,6 +170,14 @@ The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
+PTY master and slave endpoints share one locked control record containing raw
+stable kernel session and foreground-process-group identities. The filesystem
+never translates those identities into a PID namespace: the querying syscall
+does so at delivery time. `tty_acquire_controlling` serializes the cross-crate
+process/PTY transaction and publishes session plus foreground group together;
+`tty_session`, `tty_fg_pgrp`, and `set_tty_fg_pgrp` expose the raw control
+record to the Linux-compat syscall policy. Non-PTY objects retain the default
+`None`/`false` behavior.
 
 With `linux-compat`, `MqueueFs::new(ipc_namespace_id)` exposes the same live
 queue objects used by `mq_open`/`mq_unlink`/send/receive/notify/getsetattr.

@@ -123,10 +123,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // `notify_task_exited` passes `this.process.pid.raw()` (ProcessId), so the
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
-    crate::mapped_file::fork_process(
-        task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
-        child_pid.raw(),
-    );
+    crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
@@ -205,6 +202,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
+    rlimit_fork(parent_pid, child_tid.raw());
+    cap_fork(parent_pid, child_tid.raw());
     // POSIX inheritance — fd / cwd / brk / sigaction handlers are
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).

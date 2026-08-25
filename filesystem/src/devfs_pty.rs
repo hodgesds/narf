@@ -46,7 +46,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -308,6 +308,14 @@ impl Default for WinSize {
 
 // ── Pty ───────────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PtyControl {
+    /// Linux `tty->ctrl.session`; zero means no session owns the tty.
+    sid: u64,
+    /// Linux `tty->ctrl.pgrp`; zero means no foreground process group.
+    fg_pgrp: u64,
+}
+
 /// Shared state for one pseudoterminal pair.
 ///
 /// Linux ref: `drivers/tty/pty.c` `struct tty_struct` (paired)
@@ -332,13 +340,11 @@ pub struct Pty {
     #[allow(dead_code)]
     pub(crate) window: IrqSafeSpinLock<WinSize>,
 
-    /// The tty's session — Linux `tty->ctrl.session`. Installed together
-    /// with [`Self::fg_pgrp`] when a task acquires this PTY as its
-    /// controlling terminal (`TIOCSCTTY`). 0 = no session; `TIOCGSID` then
-    /// reports ENOTTY, as Linux does.
-    // Only read by the `linux-compat` ioctl path (TIOCSCTTY/TIOCGSID).
+    /// Linux's `tty->ctrl.lock` protects the session and foreground process
+    /// group as one state. Keeping both fields under one lock prevents a
+    /// concurrent reader from observing half of a `TIOCSCTTY` publication.
     #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
-    pub(crate) sid: AtomicU64,
+    ctrl: IrqSafeSpinLock<PtyControl>,
 
     /// Allocation index; becomes the `/dev/pts/<N>` name.
     pub(crate) index: u32,
@@ -362,13 +368,6 @@ pub struct Pty {
     /// Group of the slave node — `current_fsgid()` at ptmx-open time.
     pub(crate) gid: AtomicU32,
 
-    /// Wave-76: per-tty foreground process group (TIOCSPGRP/TIOCGPGRP).
-    /// Owned per pair so a write to a PTY master/slave does NOT clobber
-    /// the global console's fg_pgrp. 0 = unset; tcsetpgrp(3) installs.
-    // Only read by the `linux-compat` ioctl path (TIOCSPGRP/TIOCGPGRP); always
-    // constructed so the field is dead only when that feature is off.
-    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
-    pub(crate) fg_pgrp: AtomicU64,
     /// How many `PtySlave` handles are currently open, and whether one ever
     /// was. Together these are the HANGUP condition: a master read may only
     /// report end-of-stream once a slave has been opened and every one of
@@ -419,17 +418,28 @@ impl Pty {
             && self.slave_opens.load(Ordering::Acquire) == 0
     }
 
+    #[cfg(feature = "linux-compat")]
+    fn acquire_controlling_tty(&self, arg: usize, readable: bool) -> Result<(), FsError> {
+        // Linux maps a PTY master to its slave-side `real_tty` before job
+        // control ioctls, so both endpoints share this transaction.
+        let _txn = TIOCSCTTY_TXN.lock();
+        let hook = (*CTTY_HOOK.lock()).ok_or(FsError::Unsupported)?;
+        let tty_sid = self.ctrl.lock().sid;
+        let (sid, pgid) = hook(self.index, tty_sid, arg, readable)?;
+        *self.ctrl.lock() = PtyControl { sid, fg_pgrp: pgid };
+        Ok(())
+    }
+
     fn new(index: u32, uid: u32, gid: u32) -> Self {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
-            sid: AtomicU64::new(0),
+            ctrl: IrqSafeSpinLock::new(PtyControl::default()),
             index,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
-            fg_pgrp: AtomicU64::new(0),
             // Linux: ptmx_open() starts with the slave locked. unlockpt()
             // clears via TIOCSPTLCK(0) before the slave can be opened.
             locked: AtomicBool::new(true),
@@ -564,7 +574,7 @@ pub fn pts_indices() -> Vec<u32> {
 /// for a process whose controlling terminal is `/dev/pts/<index>`.
 pub fn pty_fg_pgrp(index: u32) -> u64 {
     pts_lookup(index)
-        .map(|p| p.fg_pgrp.load(core::sync::atomic::Ordering::Acquire))
+        .map(|p| p.ctrl.lock().fg_pgrp)
         .unwrap_or(0)
 }
 
@@ -999,7 +1009,7 @@ impl FileOps for PtyMaster {
             }
         }
         if !sigs.is_empty() {
-            let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire);
+            let pgrp = self.pty.ctrl.lock().fg_pgrp;
             for sig in sigs {
                 pty_deliver_signal(pgrp, sig);
             }
@@ -1040,6 +1050,24 @@ impl FileOps for PtyMaster {
         Some(self.pty.index)
     }
 
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        Some(self.pty.ctrl.lock().fg_pgrp)
+    }
+
+    fn tty_session(&self) -> Option<u64> {
+        Some(self.pty.ctrl.lock().sid)
+    }
+
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool {
+        self.pty.ctrl.lock().fg_pgrp = pgrp;
+        true
+    }
+
+    fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
+        self.pty.acquire_controlling_tty(arg, readable)?;
+        Ok(true)
+    }
+
     /// Wave-76: master-side ioctls.
     ///
     /// - `TIOCGPTN`     — write the slave number into *(u32*)arg
@@ -1063,7 +1091,7 @@ impl FileOps for PtyMaster {
                 Ok(0)
             }
             TIOCGPGRP => {
-                let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                let pgrp = self.pty.ctrl.lock().fg_pgrp as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
@@ -1074,7 +1102,11 @@ impl FileOps for PtyMaster {
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
                 }
-                self.pty.fg_pgrp.store(pgrp as u64, Ordering::Release);
+                self.pty.ctrl.lock().fg_pgrp = pgrp as u64;
+                Ok(0)
+            }
+            TIOCSCTTY => {
+                self.pty.acquire_controlling_tty(arg, true)?;
                 Ok(0)
             }
             TIOCGWINSZ => {
@@ -1315,7 +1347,7 @@ impl FileOps for PtySlave {
                 Ok(0)
             }
             TIOCGPGRP => {
-                let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                let pgrp = self.pty.ctrl.lock().fg_pgrp as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
@@ -1326,40 +1358,18 @@ impl FileOps for PtySlave {
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
                 }
-                self.pty.fg_pgrp.store(pgrp as u64, Ordering::Release);
+                self.pty.ctrl.lock().fg_pgrp = pgrp as u64;
                 Ok(0)
             }
             TIOCSCTTY => {
-                // Hand off to whichever crate installed the hook. The
-                // filesystem layer can't reach the per-task session
-                // table directly — userspace::handlers wires it.
-                let _ = arg;
-                // Copy the fn pointer out before calling: the hook takes
-                // userspace's own locks, and holding CTTY_HOOK across that
-                // would invert lock order.
-                let hook = *CTTY_HOOK.lock();
-                if let Some(hook) = hook {
-                    let (sid, pgid) = hook(self.pty.index);
-                    // Linux `__proc_set_tty` (drivers/tty/tty_jobctrl.c):
-                    //     tty->ctrl.pgrp    = get_pid(task_pgrp(current));
-                    //     tty->ctrl.session = get_pid(task_session(current));
-                    // Acquiring the controlling tty installs BOTH. Recording
-                    // only the ctty (what this did before) left fg_pgrp at 0,
-                    // so `tcgetpgrp()` returned 0, which never equals the
-                    // shell's own pgrp. bash's `initialize_job_control` then
-                    // loops sending itself SIGTTIN (default action: stop), so
-                    // an interactive shell on a PTY hung forever having
-                    // written not one byte — the empty `foot` window.
-                    self.pty.sid.store(sid, Ordering::Release);
-                    self.pty.fg_pgrp.store(pgid, Ordering::Release);
-                }
+                self.pty.acquire_controlling_tty(arg, true)?;
                 Ok(0)
             }
             TIOCGSID => {
                 // Linux `tiocgsid`: the session of the tty's session leader.
                 // ENOTTY while the tty has no session, matching Linux's
                 // `if (!real_tty->ctrl.session) return -ENOTTY;`.
-                let sid = self.pty.sid.load(Ordering::Acquire);
+                let sid = self.pty.ctrl.lock().sid;
                 if sid == 0 {
                     return Err(FsError::Unsupported);
                 }
@@ -1447,7 +1457,21 @@ impl FileOps for PtySlave {
 
     /// Job control: this PTY's foreground process group (0 = unset).
     fn tty_fg_pgrp(&self) -> Option<u64> {
-        Some(self.pty.fg_pgrp.load(Ordering::Acquire))
+        Some(self.pty.ctrl.lock().fg_pgrp)
+    }
+
+    fn tty_session(&self) -> Option<u64> {
+        Some(self.pty.ctrl.lock().sid)
+    }
+
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool {
+        self.pty.ctrl.lock().fg_pgrp = pgrp;
+        true
+    }
+
+    fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
+        self.pty.acquire_controlling_tty(arg, readable)?;
+        Ok(true)
     }
 
     /// Job control: TOSTOP from this PTY's termios.
@@ -1463,8 +1487,9 @@ impl FileOps for PtySlave {
 // the filesystem crate depend on userspace, we expose a function-pointer
 // hook the userspace crate installs at boot.
 
-/// Records the caller's controlling tty and reports back the caller's
-/// `(session id, process group id)` — both in the visible-pid space.
+/// Validates and records the caller's controlling tty, then reports the
+/// caller's `(session id, process group id)` in visible-pid space. `tty_sid`
+/// is the tty's current owner and `arg` is the Linux TIOCSCTTY argument.
 ///
 /// The return value is what lets `TIOCSCTTY` implement Linux's
 /// `__proc_set_tty` (drivers/tty/tty_jobctrl.c), which installs the tty's
@@ -1472,10 +1497,14 @@ impl FileOps for PtySlave {
 /// pgrp half, `tcgetpgrp()` answers 0 forever and a job-control shell's
 /// `initialize_job_control` loop never converges — see the TIOCSCTTY arm.
 #[cfg(feature = "linux-compat")]
-type CttyHook = fn(pty_index: u32) -> (u64, u64);
+type CttyHook =
+    fn(pty_index: u32, tty_sid: u64, arg: usize, readable: bool) -> Result<(u64, u64), FsError>;
 
 #[cfg(feature = "linux-compat")]
 static CTTY_HOOK: IrqSafeSpinLock<Option<CttyHook>> = IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "linux-compat")]
+static TIOCSCTTY_TXN: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 /// Install the hook called from `PtySlave::ioctl(TIOCSCTTY)`. Userspace
 /// uses this to record the caller's controlling tty.

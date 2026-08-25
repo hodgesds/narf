@@ -299,8 +299,9 @@ fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> b
             if r.is_ok() {
                 return true;
             }
+            let limits = narf_userspace::handlers::current_stack_growth_limits();
             // SAFETY: same.
-            if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
+            if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
                 return true;
             }
         }

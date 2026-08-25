@@ -4417,13 +4417,14 @@ pub fn proc_task_info(
 /// Return the full rlimit table for `pid` as `[(cur, max); 16]`.
 /// Indices follow RLIMIT_* numbering (0=CPU, 3=STACK, 7=NOFILE, …).
 pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
-    // RLIMIT_TABLE is keyed by TaskId (prlimit's self form stores under
-    // current_task_id()); resolve the outer ProcessId → TaskId.
-    let tid = proc_pid_to_tid(pid);
+    // Rows are keyed by the monotonic group-leader TaskId; /proc hands this
+    // accessor an outer ProcessId, so resolve it before entering the table.
+    let key = pid_to_task_raw(pid).unwrap_or(pid);
     let row = {
         let g = RLIMIT_TABLE.lock();
         g.as_ref()
-            .and_then(|m| m.get(&tid).copied())
+            .filter(|state| !state.reaped.contains_key(&key))
+            .and_then(|state| state.rows.get(&key).copied())
             .unwrap_or_else(default_rlimits)
     };
     let mut out = [(0u64, 0u64); 16];

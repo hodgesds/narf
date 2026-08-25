@@ -15,11 +15,12 @@
 //! this table from bookkeeping into the thing that makes `Arena::drop` sound.
 //! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_filesystem::{FileOps, MmapLifetime};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::PhysAddr;
+use narf_memory::{AddressSpaceError, MappingReceipt, PhysAddr};
 
 #[derive(Clone)]
 struct FileWriteback {
@@ -28,7 +29,6 @@ struct FileWriteback {
 }
 
 struct MappingOwner {
-    pid: u64,
     base: u64,
     len: u64,
     /// File offset of `base`. Needed by [`demand_frame`] to turn a faulting
@@ -47,7 +47,120 @@ struct MappingOwner {
     writeback: Option<FileWriteback>,
 }
 
-static MAPPING_OWNERS: IrqSafeSpinLock<Vec<MappingOwner>> = IrqSafeSpinLock::new(Vec::new());
+type MappingOwners = Arc<IrqSafeSpinLock<Vec<MappingOwner>>>;
+
+/// The global index is held only long enough to resolve one address-space
+/// bucket. Publication and faults serialize on that address space's lock, so
+/// a slow MAP_FIXED teardown cannot block unrelated processes system-wide.
+static MAPPING_OWNER_BUCKETS: IrqSafeSpinLock<BTreeMap<u64, MappingOwners>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+fn mapping_owners(address_space_id: u64) -> MappingOwners {
+    if let Some(existing) = existing_mapping_owners(address_space_id) {
+        return existing;
+    }
+    let candidate = Arc::new(IrqSafeSpinLock::new(Vec::new()));
+    let mut buckets = MAPPING_OWNER_BUCKETS.lock();
+    Arc::clone(buckets.entry(address_space_id).or_insert_with(|| candidate))
+}
+
+fn existing_mapping_owners(address_space_id: u64) -> Option<MappingOwners> {
+    MAPPING_OWNER_BUCKETS
+        .lock()
+        .get(&address_space_id)
+        .map(Arc::clone)
+}
+
+pub(crate) fn drop_address_space(address_space_id: u64) {
+    // Drop the bucket (and therefore FileOps/MmapLifetime references) after
+    // releasing the global index: destructors may allocate or take arbitrary
+    // filesystem locks.
+    let retired = MAPPING_OWNER_BUCKETS.lock().remove(&address_space_id);
+    drop(retired);
+}
+
+/// Publish a memory VMA and its external file owner as one transaction.
+///
+/// The caller holds the address space's VMA transaction (and, for SHARED
+/// mappings, memory's shared-mapping transaction). Keeping this address
+/// space's owner bucket locked across `publish` means a peer fault may observe the new VMA but
+/// cannot conclude that it has no file owner before registration completes.
+/// `finish` may materialize the receipt; on failure it must roll the memory
+/// mapping back before returning, after which this helper removes the owner.
+pub(crate) struct MappingOwnerRegistration {
+    pub(crate) base: u64,
+    pub(crate) len: u64,
+    pub(crate) file_offset: u64,
+    pub(crate) ops: Arc<dyn FileOps>,
+    pub(crate) lifetime: Option<Arc<dyn MmapLifetime>>,
+    pub(crate) writeback_phys: Option<Vec<PhysAddr>>,
+    pub(crate) replace: bool,
+}
+
+pub(crate) fn publish_current_mapping(
+    registration: MappingOwnerRegistration,
+    publish: impl FnOnce() -> Result<MappingReceipt, AddressSpaceError>,
+    finish: impl FnOnce(MappingReceipt) -> Result<(), AddressSpaceError>,
+) -> Result<MappingReceipt, AddressSpaceError> {
+    let MappingOwnerRegistration {
+        base,
+        len,
+        file_offset,
+        ops,
+        lifetime,
+        writeback_phys,
+        replace,
+    } = registration;
+    let address_space_id = current_address_space_id().ok_or(AddressSpaceError::Unmapped)?;
+    let owner_bucket = mapping_owners(address_space_id);
+    let mut owners = owner_bucket.lock();
+    let receipt = publish()?;
+    if replace {
+        punch_locked(&mut owners, base, len);
+    }
+    owners.push(MappingOwner {
+        base,
+        len,
+        file_offset,
+        ops,
+        lifetime,
+        writeback: writeback_phys.map(|phys| FileWriteback {
+            offset: file_offset,
+            phys,
+        }),
+    });
+    // Publication and owner registration are now atomic with respect to
+    // faults. Release the IRQ-safe global table before PTE materialization,
+    // which may walk many pages and must not serialize unrelated processes.
+    drop(owners);
+    if let Err(error) = finish(receipt) {
+        let mut owners = owner_bucket.lock();
+        punch_locked(&mut owners, base, len);
+        return Err(error);
+    }
+    Ok(receipt)
+}
+
+/// Publish a VMA which has no new file owner while atomically retiring any
+/// file owners covered by a successful `MAP_FIXED` replacement.
+pub(crate) fn publish_current_unowned_mapping<T: Copy>(
+    base: u64,
+    len: u64,
+    replace: bool,
+    publish: impl FnOnce() -> Result<T, AddressSpaceError>,
+    finish: impl FnOnce(T) -> Result<(), AddressSpaceError>,
+) -> Result<T, AddressSpaceError> {
+    let address_space_id = current_address_space_id().ok_or(AddressSpaceError::Unmapped)?;
+    let owner_bucket = mapping_owners(address_space_id);
+    let mut owners = owner_bucket.lock();
+    let receipt = publish()?;
+    if replace {
+        punch_locked(&mut owners, base, len);
+    }
+    drop(owners);
+    finish(receipt)?;
+    Ok(receipt)
+}
 
 /// Physical file-cache pages for generic `MAP_SHARED` fallbacks. A filesystem
 /// which cannot directly expose its own page-cache frames still needs one
@@ -70,7 +183,46 @@ struct SharedFilePage {
     clean: Vec<u8>,
 }
 
-static SHARED_FILE_PAGES: IrqSafeSpinLock<Vec<SharedFilePage>> = IrqSafeSpinLock::new(Vec::new());
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct SharedFileKey {
+    file: usize,
+    offset: u64,
+}
+
+struct SharedFilePages {
+    by_phys: BTreeMap<u64, SharedFilePage>,
+    by_file: BTreeMap<SharedFileKey, u64>,
+}
+
+impl SharedFilePages {
+    const fn new() -> Self {
+        Self {
+            by_phys: BTreeMap::new(),
+            by_file: BTreeMap::new(),
+        }
+    }
+
+    fn key(ops: &Arc<dyn FileOps>, offset: u64) -> SharedFileKey {
+        SharedFileKey {
+            file: Arc::as_ptr(ops) as *const () as usize,
+            offset,
+        }
+    }
+
+    fn remove_phys(&mut self, phys: u64) -> Option<SharedFilePage> {
+        let page = self.by_phys.remove(&phys)?;
+        let key = Self::key(&page.ops, page.offset);
+        assert_eq!(
+            self.by_file.remove(&key),
+            Some(phys),
+            "shared-file indexes diverged"
+        );
+        Some(page)
+    }
+}
+
+static SHARED_FILE_PAGES: IrqSafeSpinLock<SharedFilePages> =
+    IrqSafeSpinLock::new(SharedFilePages::new());
 
 /// Consumable reservation for the canonical pages selected by one mmap
 /// attempt. Drop is abort. A successful VMA publication calls [`Self::commit`]
@@ -89,23 +241,23 @@ impl SharedFilePublication {
         if !self.active {
             return;
         }
-        let mut free = Vec::new();
+        // Capacity is reserved before IRQs are masked. At most one page can
+        // become free for each reservation held by this publication.
+        let mut free = Vec::with_capacity(self.phys.len());
         {
             let mut pages = SHARED_FILE_PAGES.lock();
             for phys in &self.phys {
                 let page = pages
-                    .iter_mut()
-                    .find(|page| page.phys == *phys)
+                    .by_phys
+                    .get_mut(&phys.raw())
                     .expect("pending shared-file publication lost its canonical page");
                 assert!(page.pending != 0, "shared-file pending hold underflow");
                 page.pending -= 1;
-            }
-            let old = core::mem::take(&mut *pages);
-            for page in old {
                 if page.mappings == 0 && page.pending == 0 {
-                    free.push(page.phys);
-                } else {
-                    pages.push(page);
+                    let retired = pages
+                        .remove_phys(phys.raw())
+                        .expect("unreferenced shared-file page disappeared");
+                    free.push(retired.phys);
                 }
             }
         }
@@ -122,23 +274,8 @@ impl Drop for SharedFilePublication {
     }
 }
 
-fn current_pid() -> u64 {
-    let task = crate::handlers::current_task_id();
-    crate::handlers::task_to_pid_raw(task).unwrap_or(task)
-}
-
-pub(crate) fn register_current(base: u64, len: u64, offset: u64, ops: Arc<dyn FileOps>) {
-    register(current_pid(), base, len, offset, ops, None, None);
-}
-
-pub(crate) fn register_current_with_lifetime(
-    base: u64,
-    len: u64,
-    offset: u64,
-    ops: Arc<dyn FileOps>,
-    lifetime: Option<Arc<dyn MmapLifetime>>,
-) {
-    register(current_pid(), base, len, offset, ops, lifetime, None);
+fn current_address_space_id() -> Option<u64> {
+    crate::handlers::active_user_as().map(|address_space| address_space.identity())
 }
 
 /// Resolve a fault on a demand-paged `MAP_SHARED` mapping to the frame its
@@ -152,18 +289,17 @@ pub(crate) fn register_current_with_lifetime(
 ///
 /// The lock is dropped before entering the file. `FileOps::mmap_fault` may
 /// allocate and take its own locks — a BPF arena installs a kernel page-table
-/// entry inside it — and holding `MAPPING_OWNERS` across that would put this
+/// entry inside it — and holding an owner bucket across that would put this
 /// lock beneath every lock any demand-pageable file might take, on a path
 /// entered from the page-fault handler.
 pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
-    let pid = current_pid();
+    let address_space_id = current_address_space_id()?;
+    let owner_bucket = existing_mapping_owners(address_space_id)?;
     let (offset, ops) = {
-        let owners = MAPPING_OWNERS.lock();
+        let owners = owner_bucket.lock();
         let owner = owners.iter().find(|mapping| {
-            mapping.pid == pid
-                && page >= mapping.base
-                && page < mapping.base.saturating_add(mapping.len)
+            page >= mapping.base && page < mapping.base.saturating_add(mapping.len)
         })?;
         (
             owner.file_offset.checked_add(page - owner.base)?,
@@ -171,27 +307,6 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
         )
     };
     ops.mmap_fault(offset).ok()
-}
-
-/// Register a file-backed shared mapping whose frames must be written back on
-/// `fsync(2)` / `msync(2)`. Filesystems that expose their own physical cache
-/// pages continue through `register_current` above and need no copying.
-pub(crate) fn register_file_current(
-    base: u64,
-    len: u64,
-    offset: u64,
-    ops: Arc<dyn FileOps>,
-    phys: Vec<PhysAddr>,
-) {
-    register(
-        current_pid(),
-        base,
-        len,
-        offset,
-        ops,
-        None,
-        Some(FileWriteback { offset, phys }),
-    );
 }
 
 /// Publish freshly loaded fallback pages into the process-independent file
@@ -203,40 +318,67 @@ pub(crate) fn publish_shared_file_pages(
     offset: u64,
     candidates: Vec<PhysAddr>,
 ) -> (Vec<PhysAddr>, SharedFilePublication) {
-    let mut rejected = Vec::new();
-    let mut canonical = Vec::with_capacity(candidates.len());
+    // Snapshot candidate contents before entering the IRQ-safe cache lock.
+    // A candidate selected as canonical consumes its image; a losing
+    // candidate drops the unused Vec outside the critical section.
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        // SAFETY: every candidate is a freshly allocated, identity-mapped
+        // fallback page owned by this publication attempt.
+        let clean =
+            unsafe { core::slice::from_raw_parts(candidate.raw() as *const u8, 4096).to_vec() };
+        prepared.push((candidate, clean));
+    }
+    let mut rejected = Vec::with_capacity(prepared.len());
+    let mut canonical = Vec::with_capacity(prepared.len());
     {
         let mut pages = SHARED_FILE_PAGES.lock();
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            let page_offset = offset.saturating_add(index as u64 * 4096);
-            let existing = pages
-                .iter()
-                .position(|page| page.offset == page_offset && Arc::ptr_eq(&page.ops, ops));
-            let page_index = if let Some(index) = existing {
-                let phys = pages[index].phys;
+        for (index, (candidate, clean)) in prepared.into_iter().enumerate() {
+            let page_offset = offset
+                .checked_add(index as u64 * 4096)
+                .expect("validated mmap file offset overflowed");
+            let key = SharedFilePages::key(ops, page_offset);
+            let phys = if let Some(phys) = pages.by_file.get(&key).copied() {
+                let phys = PhysAddr::new(phys);
                 canonical.push(phys);
                 if candidate.raw() != phys.raw() {
                     rejected.push(candidate);
                 }
-                index
+                phys
             } else {
-                // SAFETY: `candidate` is a freshly allocated, identity-mapped
-                // fallback page which remains owned by this cache entry.
-                let clean = unsafe {
-                    core::slice::from_raw_parts(candidate.raw() as *const u8, 4096).to_vec()
-                };
-                pages.push(SharedFilePage {
-                    ops: Arc::clone(ops),
-                    offset: page_offset,
-                    phys: candidate,
-                    mappings: 0,
-                    pending: 0,
-                    clean,
-                });
+                let phys = candidate.raw();
+                assert!(
+                    pages
+                        .by_phys
+                        .insert(
+                            phys,
+                            SharedFilePage {
+                                ops: Arc::clone(ops),
+                                offset: page_offset,
+                                phys: candidate,
+                                mappings: 0,
+                                pending: 0,
+                                clean,
+                            },
+                        )
+                        .is_none(),
+                    "shared-file physical page was already indexed"
+                );
+                assert!(
+                    pages.by_file.insert(key, phys).is_none(),
+                    "shared-file key was already indexed"
+                );
                 canonical.push(candidate);
-                pages.len() - 1
+                candidate
             };
-            pages[page_index].pending = pages[page_index].pending.saturating_add(1);
+            let page = pages
+                .by_phys
+                .get_mut(&phys.raw())
+                .expect("shared-file key points to no physical page");
+            page.pending = page
+                .pending
+                .checked_add(1)
+                .expect("shared-file pending hold overflow");
         }
     }
     for phys in rejected {
@@ -256,32 +398,37 @@ pub(crate) fn publish_shared_file_pages(
 /// so the System V shared-memory registry can handle them instead.
 pub(crate) fn retain_shared_file_page(phys: u64) -> bool {
     let mut pages = SHARED_FILE_PAGES.lock();
-    let Some(page) = pages.iter_mut().find(|page| page.phys.raw() == phys) else {
+    let Some(page) = pages.by_phys.get_mut(&phys) else {
         return false;
     };
-    page.mappings = page.mappings.saturating_add(1);
+    page.mappings = page
+        .mappings
+        .checked_add(1)
+        .expect("shared-file mapping hold overflow");
     true
 }
 
 pub(crate) fn release_shared_file_page(phys: u64) -> bool {
     let page = {
         let mut pages = SHARED_FILE_PAGES.lock();
-        let Some(index) = pages.iter().position(|page| page.phys.raw() == phys) else {
+        let Some(page) = pages.by_phys.get_mut(&phys) else {
             return false;
         };
-        let page = &mut pages[index];
-        page.mappings = page.mappings.saturating_sub(1);
+        assert!(page.mappings != 0, "shared-file mapping hold underflow");
+        page.mappings -= 1;
         if page.mappings != 0 || page.pending != 0 {
             return true;
         }
-        pages.swap_remove(index)
+        pages
+            .remove_phys(phys)
+            .expect("unreferenced shared-file page disappeared")
     };
     narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
     true
 }
 
 fn register(
-    pid: u64,
+    address_space_id: u64,
     base: u64,
     len: u64,
     file_offset: u64,
@@ -289,8 +436,7 @@ fn register(
     lifetime: Option<Arc<dyn MmapLifetime>>,
     writeback: Option<FileWriteback>,
 ) {
-    MAPPING_OWNERS.lock().push(MappingOwner {
-        pid,
+    mapping_owners(address_space_id).lock().push(MappingOwner {
         base,
         len,
         file_offset,
@@ -301,28 +447,32 @@ fn register(
 }
 
 pub(crate) fn unmap_current(base: u64) {
-    let pid = current_pid();
-    MAPPING_OWNERS
-        .lock()
-        .retain(|mapping| mapping.pid != pid || mapping.base != base);
+    if let Some(owners) = current_address_space_id().and_then(existing_mapping_owners) {
+        owners.lock().retain(|mapping| mapping.base != base);
+    }
 }
 
 /// Mirror `AddressSpace::punch_fixed` splitting for owner references.
 pub(crate) fn punch_current(base: u64, len: u64) {
-    punch(current_pid(), base, len);
+    if let Some(address_space_id) = current_address_space_id() {
+        punch(address_space_id, base, len);
+    }
 }
 
-fn punch(pid: u64, base: u64, len: u64) {
+fn punch(address_space_id: u64, base: u64, len: u64) {
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return;
+    };
+    let mut owners = owner_bucket.lock();
+    punch_locked(&mut owners, base, len);
+}
+
+fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
     let Some(end) = base.checked_add(len) else {
         return;
     };
-    let mut owners = MAPPING_OWNERS.lock();
     let old = core::mem::take(&mut *owners);
     for mut mapping in old {
-        if mapping.pid != pid {
-            owners.push(mapping);
-            continue;
-        }
         let Some(mapping_end) = mapping.base.checked_add(mapping.len) else {
             continue;
         };
@@ -334,7 +484,6 @@ fn punch(pid: u64, base: u64, len: u64) {
             let original_base = mapping.base;
             let suffix = if mapping_end > end {
                 let mut suffix = MappingOwner {
-                    pid,
                     base: end,
                     len: mapping_end - end,
                     // The suffix starts `end - original_base` further into the
@@ -378,13 +527,17 @@ fn punch(pid: u64, base: u64, len: u64) {
     }
 }
 
-pub(crate) fn fork_process(parent_pid: u64, child_pid: u64) {
-    let mut owners = MAPPING_OWNERS.lock();
-    let inherited: Vec<_> = owners
+pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
+    if parent_id == child_id {
+        return;
+    }
+    let Some(parent_bucket) = existing_mapping_owners(parent_id) else {
+        return;
+    };
+    let inherited: Vec<_> = parent_bucket
+        .lock()
         .iter()
-        .filter(|mapping| mapping.pid == parent_pid)
         .map(|mapping| MappingOwner {
-            pid: child_pid,
             base: mapping.base,
             len: mapping.len,
             file_offset: mapping.file_offset,
@@ -393,19 +546,13 @@ pub(crate) fn fork_process(parent_pid: u64, child_pid: u64) {
             writeback: mapping.writeback.clone(),
         })
         .collect();
-    owners.extend(inherited);
+    mapping_owners(child_id).lock().extend(inherited);
 }
 
-pub(crate) fn process_exit(pid: u64, _tid: u64) {
-    MAPPING_OWNERS.lock().retain(|mapping| mapping.pid != pid);
-}
-
-fn owner_count(pid: u64) -> usize {
-    MAPPING_OWNERS
-        .lock()
-        .iter()
-        .filter(|mapping| mapping.pid == pid)
-        .count()
+fn owner_count(address_space_id: u64) -> usize {
+    existing_mapping_owners(address_space_id)
+        .map(|owners| owners.lock().len())
+        .unwrap_or(0)
 }
 
 /// Commit all fallback `MAP_SHARED` pages of `ops` in the current process.
@@ -413,11 +560,19 @@ fn owner_count(pid: u64) -> usize {
 /// IRQ-safe mapping lock spans filesystem I/O and an unmap racing this flush
 /// cannot free a page before its bytes have been snapshotted.
 pub(crate) fn flush_current_file(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
-    let pid = current_pid();
-    let mappings: Vec<FileWriteback> = MAPPING_OWNERS
+    // A task without an installed userspace address space cannot own any
+    // mapped-file fallback pages. `fsync` is still valid for its open file;
+    // treat the absent bucket as the same clean no-op as an empty bucket.
+    let Some(address_space_id) = current_address_space_id() else {
+        return Ok(());
+    };
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return Ok(());
+    };
+    let mappings: Vec<FileWriteback> = owner_bucket
         .lock()
         .iter()
-        .filter(|mapping| mapping.pid == pid && Arc::ptr_eq(&mapping.ops, ops))
+        .filter(|mapping| Arc::ptr_eq(&mapping.ops, ops))
         .filter_map(|mapping| mapping.writeback.clone())
         .collect();
     flush_mappings(ops, mappings)
@@ -433,11 +588,13 @@ pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), ()> {
     let Some(end) = base.checked_add(len) else {
         return Err(());
     };
-    let pid = current_pid();
-    let mappings: Vec<(Arc<dyn FileOps>, FileWriteback)> = MAPPING_OWNERS
+    let address_space_id = current_address_space_id().ok_or(())?;
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        return Ok(());
+    };
+    let mappings: Vec<(Arc<dyn FileOps>, FileWriteback)> = owner_bucket
         .lock()
         .iter()
-        .filter(|mapping| mapping.pid == pid)
         .filter(|mapping| mapping.base < end && base < mapping.base.saturating_add(mapping.len))
         .filter_map(|mapping| {
             mapping
@@ -492,9 +649,10 @@ fn snapshot_dirty_page(
     len: usize,
 ) -> Option<Vec<u8>> {
     let pages = SHARED_FILE_PAGES.lock();
-    let page = pages
-        .iter()
-        .find(|page| page.offset == offset && page.phys == phys && Arc::ptr_eq(&page.ops, ops))?;
+    let page = pages.by_phys.get(&phys.raw())?;
+    if page.offset != offset || !Arc::ptr_eq(&page.ops, ops) {
+        return None;
+    }
     // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
     // mapping release from removing and freeing the entry during this copy.
     let current = unsafe { core::slice::from_raw_parts(phys.raw() as *const u8, len) };
@@ -511,8 +669,9 @@ fn snapshot_dirty_page(
 fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
     let mut pages = SHARED_FILE_PAGES.lock();
     if let Some(page) = pages
-        .iter_mut()
-        .find(|page| page.offset == offset && page.phys == phys && Arc::ptr_eq(&page.ops, ops))
+        .by_phys
+        .get_mut(&phys.raw())
+        .filter(|page| page.offset == offset && Arc::ptr_eq(&page.ops, ops))
     {
         page.clean[..bytes.len()].copy_from_slice(bytes);
     }
@@ -566,8 +725,8 @@ mod tests {
     fn smoke_mapped_file_owner_lifecycle() -> TestResult {
         const PARENT: u64 = u64::MAX - 20;
         const CHILD: u64 = u64::MAX - 19;
-        process_exit(PARENT, PARENT);
-        process_exit(CHILD, CHILD);
+        drop_address_space(PARENT);
+        drop_address_space(CHILD);
         DROPS.store(0, Ordering::Relaxed);
         LIFETIME_DROPS.store(0, Ordering::Relaxed);
 
@@ -591,7 +750,15 @@ mod tests {
             return TestResult::Fail("mapping did not retain its file owner");
         }
 
-        fork_process(PARENT, CHILD);
+        // CLONE_VM creates another process identity but not another mm/VMA.
+        // Treating that as fork used to duplicate PID-keyed rows and let one
+        // sibling's MAP_FIXED/unmap leave the other's stale row behind.
+        fork_address_space(PARENT, PARENT);
+        if owner_count(PARENT) != 1 {
+            return TestResult::Fail("CLONE_VM duplicated an address-space owner");
+        }
+
+        fork_address_space(PARENT, CHILD);
         if owner_count(CHILD) != 1 {
             return TestResult::Fail("fork did not inherit the mapping owner");
         }
@@ -601,14 +768,14 @@ mod tests {
         if owner_count(PARENT) != 2 {
             return TestResult::Fail("MAP_FIXED punch did not split the mapping owner");
         }
-        process_exit(PARENT, PARENT);
+        drop_address_space(PARENT);
         if DROPS.load(Ordering::Relaxed) != 0
             || LIFETIME_DROPS.load(Ordering::Relaxed) != 0
             || owner_count(CHILD) != 1
         {
             return TestResult::Fail("parent exit released an inherited mapping owner");
         }
-        process_exit(CHILD, CHILD);
+        drop_address_space(CHILD);
         if DROPS.load(Ordering::Relaxed) != 1 || LIFETIME_DROPS.load(Ordering::Relaxed) != 1 {
             return TestResult::Fail("last mapping did not release all backing owners");
         }
@@ -639,10 +806,10 @@ mod tests {
         }
 
         drop(first);
-        let still_pending = SHARED_FILE_PAGES
-            .lock()
-            .iter()
-            .any(|page| page.phys == first_candidate && page.pending == 1 && page.mappings == 0);
+        let still_pending =
+            SHARED_FILE_PAGES.lock().by_phys.values().any(|page| {
+                page.phys == first_candidate && page.pending == 1 && page.mappings == 0
+            });
         if !still_pending {
             return TestResult::Fail("first abort freed a peer's pending canonical page");
         }
@@ -651,17 +818,18 @@ mod tests {
             return TestResult::Fail("pending canonical page could not become mapped");
         }
         second.commit();
-        let committed = SHARED_FILE_PAGES
-            .lock()
-            .iter()
-            .any(|page| page.phys == first_candidate && page.pending == 0 && page.mappings == 1);
+        let committed =
+            SHARED_FILE_PAGES.lock().by_phys.values().any(|page| {
+                page.phys == first_candidate && page.pending == 0 && page.mappings == 1
+            });
         if !committed {
             return TestResult::Fail("publication commit did not transfer pending hold");
         }
         if !release_shared_file_page(first_candidate.raw())
             || SHARED_FILE_PAGES
                 .lock()
-                .iter()
+                .by_phys
+                .values()
                 .any(|page| page.phys == first_candidate)
         {
             return TestResult::Fail("last mapping did not reclaim canonical page once");

@@ -49,7 +49,11 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
         let backed = matches!(
             crate::bare::reclaim_wait::demand_page(&as_arc, v),
             Ok(()) | Err(AddressSpaceError::AlignmentMismatch)
-        ) || unsafe { as_arc.try_grow_stack(v) }.is_ok();
+        ) || {
+            let limits = narf_userspace::handlers::current_stack_growth_limits();
+            // SAFETY: same active-AS/identity-map contract as below.
+            unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok()
+        };
         if !backed {
             return false;
         }
@@ -1401,8 +1405,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // region, so a non-stack user vaddr still falls through
                 // to the SEGV/panic surface.
                 if from_user || cr2_in_user_half {
+                    let limits = narf_userspace::handlers::current_stack_growth_limits();
                     // SAFETY: same identity-map argument.
-                    if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
+                    if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
                         return;
                     }
                 }

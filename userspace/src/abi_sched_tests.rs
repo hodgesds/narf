@@ -144,13 +144,9 @@ fn smoke_abi_sched_getrlimit_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_getrlimit_pos);
 
 fn smoke_abi_sched_getrlimit_null_buf_neg() -> TestResult {
-    with_setup(|| {
-        // Null out-pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT for a bad rlimit pointer.
-        match call(Syscall::Getrlimit.raw(), a1(7, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("getrlimit with null buffer should return -1"),
-        }
+    with_setup(|| match call(Syscall::Getrlimit.raw(), a1(7, 0)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("getrlimit with null buffer should return -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getrlimit_null_buf_neg);
@@ -158,16 +154,25 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getrlimit_null_buf_neg);
 fn smoke_abi_sched_getrlimit_bad_resource_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 16];
-        // resource 999 >= RLIMIT_COUNT ⇒ read_rlimit None ⇒ wire -1.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown resource.
         let args = a1(999, buf.as_mut_ptr() as u64);
         match call(Syscall::Getrlimit.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("getrlimit with bad resource should return -1"),
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("getrlimit with bad resource should return -EINVAL"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getrlimit_bad_resource_neg);
+
+fn smoke_abi_sched_getrlimit_bad_resource_precedes_bad_pointer() -> TestResult {
+    with_setup(|| match call(Syscall::Getrlimit.raw(), a1(999, 0)) {
+        Some(v) if v == EINVAL => Ok(()),
+        _ => Err("getrlimit must validate resource before copying output"),
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_getrlimit_bad_resource_precedes_bad_pointer
+);
 
 // ── setrlimit(resource, rlimit*) ────────────────────────────────────
 
@@ -199,13 +204,9 @@ fn smoke_abi_sched_setrlimit_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_setrlimit_pos);
 
 fn smoke_abi_sched_setrlimit_null_buf_neg() -> TestResult {
-    with_setup(|| {
-        // Null in-pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT for a bad rlimit pointer.
-        match call(Syscall::Setrlimit.raw(), a1(7, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("setrlimit with null buffer should return -1"),
-        }
+    with_setup(|| match call(Syscall::Setrlimit.raw(), a1(7, 0)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("setrlimit with null buffer should return -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setrlimit_null_buf_neg);
@@ -239,16 +240,51 @@ fn smoke_abi_sched_prlimit64_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_prlimit64_pos);
 
 fn smoke_abi_sched_prlimit64_bad_resource_neg() -> TestResult {
-    with_setup(|| {
-        // resource 999 >= RLIMIT_COUNT ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown resource.
-        match call(Syscall::Prlimit64.raw(), a3(0, 999, 0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("prlimit64 with bad resource should return -1"),
-        }
+    with_setup(|| match call(Syscall::Prlimit64.raw(), a3(0, 999, 0, 0)) {
+        Some(v) if v == EINVAL => Ok(()),
+        _ => Err("prlimit64 with bad resource should return -EINVAL"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_prlimit64_bad_resource_neg);
+
+fn smoke_abi_sched_setrlimit_validates_pair_and_hard_raise() -> TestResult {
+    with_setup(|| {
+        let invalid_pair = [513u64, 512u64];
+        if call(
+            Syscall::Setrlimit.raw(),
+            a1(7, invalid_pair.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("setrlimit(cur > max) should return -EINVAL");
+        }
+        let hard_raise = [1024u64, 4097u64];
+        if call(Syscall::Setrlimit.raw(), a1(7, hard_raise.as_ptr() as u64)) != Some(EPERM) {
+            return Err("unauthorized hard-limit raise should return -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setrlimit_validates_pair_and_hard_raise
+);
+
+fn smoke_abi_sched_prlimit64_error_order_and_missing_pid() -> TestResult {
+    with_setup(|| {
+        const MISSING_PID: u64 = 0x7fff_ffff;
+        if call(Syscall::Prlimit64.raw(), a3(MISSING_PID, 7, BAD_PTR, 0)) != Some(EFAULT) {
+            return Err("prlimit64 must copy new before missing-PID lookup");
+        }
+        if call(Syscall::Prlimit64.raw(), a3(MISSING_PID, 7, 0, 0)) != Some(ESRCH) {
+            return Err("prlimit64 of a nonexistent PID should return -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_prlimit64_error_order_and_missing_pid
+);
 
 // ── sched_getaffinity(pid, cpusetsize, mask*) ───────────────────────
 // Reports the task's allowed mask intersected with online CPUs.

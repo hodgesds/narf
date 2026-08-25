@@ -1,9 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `mlockall(flags)` — lock the whole address space. MCL_CURRENT pins every
-/// existing region, eagerly unless MCL_ONFAULT is present. MCL_FUTURE is
-/// accepted but future-VMA policy is not retained yet.
+/// `mlockall(flags)` — atomically replace the address space's future-lock
+/// policy and, when MCL_CURRENT is present, lock every existing ordinary VMA.
 pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
     const MCL_CURRENT: u64 = 1;
     const MCL_FUTURE: u64 = 2;
@@ -16,6 +15,11 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    let authority = current_mlock_authority();
+    if !can_do_mlock(authority) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -23,19 +27,26 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if flags & MCL_CURRENT != 0 {
-        for r in as_ref.regions_snapshot() {
-            let result = if flags & MCL_ONFAULT != 0 {
-                as_ref.mlock_range_onfault(r.base, r.len)
-            } else {
-                as_ref.mlock_range(r.base, r.len)
-            };
-            if result.is_err() {
-                // A region could not be locked (backing/OOM) → ENOMEM.
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-                return;
-            }
-        }
+    let mode = if flags & MCL_ONFAULT != 0 {
+        narf_memory::FutureLockPolicy::OnFault
+    } else {
+        narf_memory::FutureLockPolicy::Eager
+    };
+    let current = (flags & MCL_CURRENT != 0).then_some(mode);
+    let future = if flags & MCL_FUTURE != 0 {
+        mode
+    } else {
+        narf_memory::FutureLockPolicy::None
+    };
+    match as_ref.update_mlockall_limited(
+        current,
+        future,
+        authority.limit_bytes,
+        authority.bypass_limit,
+    ) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(error) => ctx.set_return(SyscallReturn::ok(
+            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
+        )),
     }
-    ctx.set_return(SyscallReturn::ok(0));
 }

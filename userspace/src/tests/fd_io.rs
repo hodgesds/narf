@@ -3582,17 +3582,38 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
     use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPTLCK};
     use narf_filesystem::FileOps;
 
+    fn ctty_task() -> u64 {
+        0x7c77
+    }
+    fn cleanup_ctty_fixture() {
+        crate::handlers::__test_reset_task_id_lookup();
+        crate::handlers::__test_ctty_reset();
+        crate::handlers::__test_pgid_reset();
+        crate::handlers::__test_sid_reset();
+    }
+
+    // Production boot installs both callbacks and process state. This direct
+    // FileOps smoke must model a detached session leader explicitly.
+    crate::install_task_id_lookup(ctty_task);
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    crate::handlers::detach_controlling_tty(ctty_task());
+    narf_filesystem::devfs_pty::set_controlling_tty_hook(crate::handlers::set_controlling_tty);
+
     let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
     let master = narf_filesystem::devfs_pty::PtyMaster::new(pty);
     let mut unlock: i32 = 0;
     if FileOps::ioctl(&master, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
         narf_filesystem::devfs_pty::ptmx_close(idx);
+        cleanup_ctty_fixture();
         return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
     }
     let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
         Some(Ok(s)) => s,
         _ => {
             narf_filesystem::devfs_pty::ptmx_close(idx);
+            cleanup_ctty_fixture();
             return TestResult::Fail("pts_open_peer refused the freshly opened master");
         }
     };
@@ -3642,6 +3663,7 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
 
     drop(slave);
     narf_filesystem::devfs_pty::ptmx_close(idx);
+    cleanup_ctty_fixture();
     match fail {
         Some(m) => TestResult::Fail(m),
         None => TestResult::Pass,
@@ -3651,6 +3673,197 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
+);
+
+/// PTY job-control ioctls are syscall policy, not merely FileOps plumbing.
+/// Pin Linux's ownership, fd-mode, endpoint and errno ordering through the
+/// real ioctl dispatch path.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{fd, syscall::__test_clear_global, FdEntry};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK};
+    use narf_filesystem::FileOps;
+
+    const OWNER: u64 = 0x7d01;
+    const OTHER: u64 = 0x7d02;
+    const ENOTTY_ERR: i64 = 25;
+    const EINVAL_ERR: i64 = 22;
+    static ACTIVE: AtomicU64 = AtomicU64::new(OWNER);
+    fn current() -> u64 {
+        ACTIVE.load(Ordering::Acquire)
+    }
+
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, value: SyscallReturn) {
+            self.ret = Some(value);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    let call = |fd: u32, cmd: u32, arg: u64| {
+        let mut ctx = Ctx {
+            args: SyscallArgs {
+                arg0: fd as u64,
+                arg1: cmd as u64,
+                arg2: arg,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+        ctx.ret.map(|ret| ret.value).unwrap_or(u64::MAX)
+    };
+
+    fd::__test_reset();
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    crate::install_task_id_lookup(current);
+    narf_filesystem::devfs_pty::set_controlling_tty_hook(crate::handlers::set_controlling_tty);
+    __test_clear_global();
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let mut unlock = 0i32;
+    if FileOps::ioctl(&master_obj, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("could not unlock PTY fixture");
+    }
+    let Some(Ok(slave_obj)) = narf_filesystem::devfs_pty::pts_open_peer(idx) else {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("could not open PTY slave fixture");
+    };
+    let master: Arc<dyn FileOps> = Arc::new(master_obj);
+    let slave: Arc<dyn FileOps> = slave_obj;
+
+    let install = |task, ops: Arc<dyn FileOps>, status_flags| {
+        fd::with_table(task, |table| {
+            table.open(FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags,
+            })
+        })
+    };
+    let Some(owner_ro) = install(OWNER, slave.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install owner PTY fd");
+    };
+    let Some(owner_wo) = install(OWNER, slave.clone(), crate::fd::O_WRONLY) else {
+        return TestResult::Fail("could not install write-only PTY fd");
+    };
+    let Some(owner_master) = install(OWNER, master.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install owner PTY master");
+    };
+    let Some(other_slave) = install(OTHER, slave.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install foreign PTY slave");
+    };
+    let Some(other_master) = install(OTHER, master, crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install foreign PTY master");
+    };
+
+    crate::handlers::detach_controlling_tty(OWNER);
+    let mut fail = None;
+    if call(owner_wo, TIOCSCTTY, 0) != (-1i64) as u64 {
+        fail = Some("write-only TIOCSCTTY did not return EPERM");
+    } else if call(owner_ro, TIOCSCTTY, 0) != 0 {
+        fail = Some("detached session leader could not acquire PTY");
+    } else if call(owner_wo, TIOCSCTTY, 0) != 0 {
+        fail = Some("idempotent TIOCSCTTY checked fd mode before same-session success");
+    }
+
+    let mut pgrp = -1i32;
+    if fail.is_none()
+        && (call(owner_ro, TIOCGPGRP, &mut pgrp as *mut i32 as u64) != 0 || pgrp as u64 != OWNER)
+    {
+        fail = Some("TIOCGPGRP did not return the owner's visible process group");
+    }
+    let mut sid = -1i32;
+    if fail.is_none()
+        && (call(owner_ro, TIOCGSID, &mut sid as *mut i32 as u64) != 0 || sid as u64 != OWNER)
+    {
+        fail = Some("TIOCGSID did not return the owner's visible session");
+    }
+
+    ACTIVE.store(OTHER, Ordering::Release);
+    if fail.is_none() && call(other_slave, TIOCGPGRP, 0) != (-ENOTTY_ERR) as u64 {
+        fail = Some("foreign slave TIOCGPGRP did not return ENOTTY before pointer access");
+    }
+    let mut master_pgrp = -1i32;
+    if fail.is_none()
+        && (call(other_master, TIOCGPGRP, &mut master_pgrp as *mut i32 as u64) != 0
+            || master_pgrp as u64 != OWNER)
+    {
+        fail = Some("PTY master did not bypass GET ownership or translate pgrp");
+    }
+    crate::handlers::detach_controlling_tty(OTHER);
+    if fail.is_none() && call(other_slave, TIOCSCTTY, 1) != (-1i64) as u64 {
+        fail = Some("unprivileged TIOCSCTTY steal did not return EPERM");
+    }
+    let mut other_group = OTHER as i32;
+    if fail.is_none()
+        && call(other_master, TIOCSPGRP, &mut other_group as *mut i32 as u64)
+            != (-ENOTTY_ERR) as u64
+    {
+        fail = Some("foreign master TIOCSPGRP did not return ENOTTY");
+    }
+
+    ACTIVE.store(OWNER, Ordering::Release);
+    let mut negative = -1i32;
+    if fail.is_none()
+        && call(owner_master, TIOCSPGRP, &mut negative as *mut i32 as u64) != (-EINVAL_ERR) as u64
+    {
+        fail = Some("negative TIOCSPGRP id did not return EINVAL");
+    }
+    let mut missing = 0x6fff_i32;
+    if fail.is_none()
+        && call(owner_master, TIOCSPGRP, &mut missing as *mut i32 as u64) != (-3i64) as u64
+    {
+        fail = Some("unknown TIOCSPGRP id did not return ESRCH");
+    }
+    let mut owner_group = OWNER as i32;
+    if fail.is_none() && call(owner_master, TIOCSPGRP, &mut owner_group as *mut i32 as u64) != 0 {
+        fail = Some("owner could not set its PTY foreground group");
+    }
+
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    fd::__test_reset();
+    crate::handlers::__test_reset_task_id_lookup();
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    __test_clear_global();
+    match fail {
+        Some(message) => TestResult::Fail(message),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_job_control_ioctl_errno_matrix
 );
 
 /// An O_NONBLOCK `read(2)` on an eventfd whose counter is 0 must return

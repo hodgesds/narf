@@ -7,8 +7,11 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
     match error {
         narf_memory::AddressSpaceError::OutOfRange
         | narf_memory::AddressSpaceError::AlignmentMismatch => 22, // EINVAL
-        narf_memory::AddressSpaceError::Unmapped => 12, // ENOMEM
+        narf_memory::AddressSpaceError::Unmapped
+        | narf_memory::AddressSpaceError::LockLimit
+        | narf_memory::AddressSpaceError::StackLimit => 12, // ENOMEM
         narf_memory::AddressSpaceError::LockFailed
+        | narf_memory::AddressSpaceError::StaleMapping
         | narf_memory::AddressSpaceError::ReclaimPressure
         | narf_memory::AddressSpaceError::NotImplemented
         | narf_memory::AddressSpaceError::Overlap
@@ -36,6 +39,11 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
 /// failure (range contains a hole, OOM, AS lookup failed).
 pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    let authority = current_mlock_authority();
+    if !can_do_mlock(authority) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -43,7 +51,12 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    match as_ref.mlock_range(VirtAddr::new(args.arg0), args.arg1) {
+    match as_ref.mlock_range_limited(
+        VirtAddr::new(args.arg0),
+        args.arg1,
+        authority.limit_bytes,
+        authority.bypass_limit,
+    ) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // Linux: EINVAL for malformed/range-overflow input, ENOMEM for a VMA
         // coverage hole, and EAGAIN when eager population cannot complete.

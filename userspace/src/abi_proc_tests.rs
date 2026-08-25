@@ -152,9 +152,10 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_getpgrp_pos);
 
 fn smoke_abi_proc_setsid_pos() -> TestResult {
     with_setup(|| {
-        // setsid makes the caller a session leader: sid = pgid = pid. The
-        // handler records both tables and returns the new sid. SID_TABLE is
-        // boot-initialised so this succeeds.
+        // Model a fork child in its parent's process group. Linux rejects a
+        // process-group leader with EPERM, so a positive fixture must not use
+        // the default pgid == pid state.
+        crate::handlers::__test_set_pgid(FAKE_TASK, FAKE_TASK + 1);
         match call(Syscall::Setsid.raw(), a0(0)) {
             Some(v) if v >= 0 => Ok(()),
             Some(_) => Err("setsid returned negative sid"),
@@ -163,6 +164,14 @@ fn smoke_abi_proc_setsid_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_setsid_pos);
+
+fn smoke_abi_proc_setsid_group_leader_eperm() -> TestResult {
+    with_setup(|| match call(Syscall::Setsid.raw(), a0(0)) {
+        Some(-1) => Ok(()),
+        _ => Err("setsid did not return EPERM for a process-group leader"),
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_setsid_group_leader_eperm);
 
 fn smoke_abi_proc_getsid_pos() -> TestResult {
     with_setup(|| {
@@ -214,6 +223,7 @@ fn smoke_abi_proc_getsid_reports_visible_pid_space() -> TestResult {
         set_task(LEADER_TID);
         crate::handlers::register_task_to_pid(LEADER_TID, LEADER_PID);
         crate::handlers::register_pid_task_mapping(LEADER_PID, LEADER_TID);
+        crate::handlers::__test_set_pgid(LEADER_TID, LEADER_TID + 1);
 
         // Become a session leader: sid == pid, recorded in TaskId space.
         if call(Syscall::Setsid.raw(), a0(0))

@@ -33,7 +33,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
             // Stage-4 first cut: writable. Future revision flips the
             // page to R-only after the kernel populates it; the user
             // ring builders read from it but don't write.
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![phys],
         })
         .is_err()

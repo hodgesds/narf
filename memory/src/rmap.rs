@@ -100,6 +100,49 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     }
 }
 
+/// Allocation-free exact-owner membership check.
+pub fn contains_owner(phys: PhysAddr, root: PhysAddr, va: VirtAddr) -> bool {
+    let key = phys.raw();
+    if key == 0 {
+        return false;
+    }
+    let owner = Owner { root, va };
+    RMAP[shard(key)]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&key))
+        .is_some_and(|owners| owners.contains(&owner))
+}
+
+/// Change one recorded virtual coordinate without allocating.
+///
+/// Address-space relocation uses this while holding its topology lock, after
+/// the destination leaf is installed and the source leaf is retired. Keeping
+/// the existing owner slot avoids entering the allocator (and therefore
+/// reclaim) while VMA/page ownership is mid-transaction.
+pub fn move_owner(phys: PhysAddr, root: PhysAddr, old_va: VirtAddr, new_va: VirtAddr) -> bool {
+    let key = phys.raw();
+    if key == 0 {
+        return false;
+    }
+    let old = Owner { root, va: old_va };
+    let new = Owner { root, va: new_va };
+    let mut g = RMAP[shard(key)].map.lock();
+    let Some(owners) = g.as_mut().and_then(|map| map.get_mut(&key)) else {
+        return false;
+    };
+    let Some(old_index) = owners.iter().position(|owner| *owner == old) else {
+        return false;
+    };
+    if owners.contains(&new) {
+        owners.swap_remove(old_index);
+    } else {
+        owners[old_index] = new;
+    }
+    true
+}
+
 /// Number of distinct mappings recorded for `phys` (`0` if untracked). Should
 /// track `cow::count(phys)` once every map path is wired.
 pub fn owner_count(phys: PhysAddr) -> usize {
@@ -167,7 +210,7 @@ pub fn __reset_for_test() {
 // Always compiled (not `#[cfg(test)]`) so they register into the in-kernel
 // `narf.tests` section and actually run under `cargo xtask test`.
 mod tests {
-    use super::{__reset_for_test, add, for_each_owner, owner_count, remove, Owner};
+    use super::{__reset_for_test, add, for_each_owner, move_owner, owner_count, remove, Owner};
     use crate::{PhysAddr, VirtAddr};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -219,6 +262,30 @@ mod tests {
         result
     }
     kernel_test_in!("memory/rmap", smoke_rmap_add_count_remove);
+
+    fn smoke_rmap_move_owner_updates_coordinate() -> TestResult {
+        __reset_for_test();
+        let phys = PhysAddr::new(0x28_0000);
+        let root = PhysAddr::new(0x1000);
+        let old = VirtAddr::new(0x4000_0000);
+        let new = VirtAddr::new(0x5000_0000);
+        add(phys, root, old);
+        let moved = move_owner(phys, root, old, new);
+        let mut saw_old = false;
+        let mut saw_new = false;
+        for_each_owner(phys, |owner| {
+            saw_old |= owner.root == root && owner.va == old;
+            saw_new |= owner.root == root && owner.va == new;
+        });
+        let result = moved && !saw_old && saw_new && owner_count(phys) == 1;
+        __reset_for_test();
+        if result {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("move_owner did not replace the old coordinate")
+        }
+    }
+    kernel_test_in!("memory/rmap", smoke_rmap_move_owner_updates_coordinate);
 
     fn smoke_rmap_frames_independent() -> TestResult {
         __reset_for_test();

@@ -16,78 +16,74 @@ use super::*;
 ///
 /// Returns the resulting break (Linux `brk` reports the break value, never an
 /// errno; glibc's wrapper detects failure by comparing against the request).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn brk_core(as_ref: &AddressSpace, new_break: u64) -> u64 {
-    // Current break, seeding the arena base on first use of this AS.
-    let mut cur = as_ref.brk_top();
-    if cur == 0 {
-        cur = BRK_DEFAULT_BASE;
-        as_ref.set_brk_top(cur);
-    }
+    brk_core_limited(
+        as_ref,
+        new_break,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        true,
+    )
+}
 
-    // Query path: arg0 == 0 just returns the current break.
-    if new_break == 0 {
-        return cur;
-    }
-
-    // Ceiling: never let the heap climb past the arena top (which keeps it below
-    // the interpreter bias and the anonymous mmap window). A request above the
-    // ceiling fails per POSIX brk's contract — return the unchanged break so
-    // glibc/musl fall back to mmap.
-    if new_break > BRK_ARENA_TOP {
-        return cur;
-    }
-
-    let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
-    let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-
-    // Shrink path: the heap is one VMA growing up from `BRK_DEFAULT_BASE`, so a
-    // shrink is a tail punch of `[new_aligned, cur_aligned)`. `punch_fixed`
-    // selects the intersecting VMA from the ordered index, tears down only that
-    // tail's PTEs, frees only its frames, truncates the heap VMA in place, and
-    // issues ONE batched cross-CPU flush — no whole-address-space snapshot. A
-    // shrink that lands inside the heap's last page (new_aligned == cur_aligned)
-    // frees nothing; the partial-page break is recorded below.
-    if new_break < cur {
-        if new_aligned < cur_aligned {
-            let _ = as_ref.punch_fixed(VirtAddr::new(new_aligned), cur_aligned - new_aligned);
+fn brk_core_limited(
+    as_ref: &AddressSpace,
+    new_break: u64,
+    data_limit_bytes: u64,
+    address_space_limit_bytes: u64,
+    memlock_limit_bytes: u64,
+    bypass_memlock_limit: bool,
+) -> u64 {
+    let mut lazy_pages = alloc::vec::Vec::new();
+    loop {
+        match as_ref.update_brk_limited(
+            VirtAddr::new(BRK_DEFAULT_BASE),
+            BRK_ARENA_TOP,
+            new_break,
+            lazy_pages,
+            data_limit_bytes,
+            address_space_limit_bytes,
+            memlock_limit_bytes,
+            bypass_memlock_limit,
+        ) {
+            narf_memory::BrkUpdateResult::Complete(value) => return value,
+            narf_memory::BrkUpdateResult::NeedPages(page_count) => {
+                // Allocate only inert lazy descriptors and do it outside the
+                // IRQ-safe VMA transaction. A CLONE_VM peer may have changed
+                // the exact delta; the next serialized attempt revalidates it.
+                let mut prepared = alloc::vec::Vec::new();
+                if prepared.try_reserve_exact(page_count).is_err() {
+                    return as_ref.brk_top().max(BRK_DEFAULT_BASE);
+                }
+                prepared.resize(page_count, narf_memory::PhysAddr::new(0));
+                lazy_pages = prepared;
+            }
         }
-        as_ref.set_brk_top(new_break);
-        return new_break;
     }
-
-    // Grow path: extend the single heap VMA with lazy zero-backed slots. Linux
-    // only extends the VMA here (unless VM_LOCKED requires population); first
-    // touch allocates through AddressSpace::demand_alloc_page with User reserve
-    // semantics. This keeps frame allocation and reclaim out of the syscall.
-    let pages = (new_aligned - cur_aligned) >> 12;
-    if pages == 0 {
-        // Within-page grow — just record the new break, no PTE work.
-        as_ref.set_brk_top(new_break);
-        return new_break;
-    }
-    let Ok(page_count) = usize::try_from(pages) else {
-        return cur;
-    };
-    let mut lazy = alloc::vec::Vec::new();
-    if lazy.try_reserve_exact(page_count).is_err() {
-        return cur;
-    }
-    lazy.resize(page_count, narf_memory::PhysAddr::new(0));
-    if as_ref
-        .brk_extend_region(VirtAddr::new(BRK_DEFAULT_BASE), cur_aligned, lazy)
-        .is_err()
-    {
-        return cur;
-    }
-
-    as_ref.set_brk_top(new_break);
-    new_break
 }
 
 pub(crate) fn sys_brk(ctx: &mut dyn TrapContext) {
     let new_break = ctx.args().arg0;
+    let authority = current_mlock_authority();
+    let task = current_task_id();
+    let defaults = default_rlimits();
+    let data_limit = read_rlimit(task, RLIMIT_DATA)
+        .unwrap_or(defaults[RLIMIT_DATA])
+        .cur;
+    let address_space_limit = read_rlimit(task, RLIMIT_AS)
+        .unwrap_or(defaults[RLIMIT_AS])
+        .cur;
     let result = match current_address_space() {
-        Some(as_ref) => brk_core(&as_ref, new_break),
+        Some(as_ref) => brk_core_limited(
+            &as_ref,
+            new_break,
+            data_limit,
+            address_space_limit,
+            authority.limit_bytes,
+            authority.bypass_limit,
+        ),
         // No address space (never happens for a real user task): report the
         // arena base so a query looks sane and a set reads as "didn't move".
         None => BRK_DEFAULT_BASE,
@@ -163,6 +159,16 @@ mod tests {
         };
         if child.brk_top() != aspace.brk_top() {
             return TestResult::Fail("fork child did not inherit the parent's break");
+        }
+        aspace.set_program_data_bytes(0x3456);
+        // SAFETY: same freshly-created, live test address space as the first
+        // fork clone above, with paging and the frame allocator initialized.
+        let child_with_data = match unsafe { aspace.clone_for_fork() } {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("second clone_for_fork failed"),
+        };
+        if child_with_data.program_data_bytes() != 0x3456 {
+            return TestResult::Fail("fork child did not inherit RLIMIT_DATA metadata");
         }
 
         // Genuine shrink: unmap regions at/above the new break, keep those below.
@@ -348,4 +354,111 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_brk_does_not_annex_foreign_base_vma);
+
+    /// Linux rejects requests below start_brk before attempting any unmap.
+    /// This prevents a malformed brk from punching unrelated lower VMAs.
+    fn smoke_brk_below_base_preserves_foreign_vma() -> TestResult {
+        let aspace = AddressSpace::empty();
+        let foreign = VirtAddr::new(BRK_DEFAULT_BASE - 0x2000);
+        if aspace
+            .map_region(Region {
+                base: foreign,
+                len: 0x2000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![narf_memory::PhysAddr::new(0); 2],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("lower foreign mapping setup failed");
+        }
+        if brk_core(&aspace, BRK_DEFAULT_BASE - 0x1000) != BRK_DEFAULT_BASE {
+            return TestResult::Fail("below-base brk did not return the old break");
+        }
+        if aspace.lookup(foreign).map(|region| region.len) != Some(0x2000) {
+            return TestResult::Fail("below-base brk punched an unrelated VMA");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_below_base_preserves_foreign_vma);
+
+    /// Failure to tear down an old heap tail must leave mm->brk unchanged.
+    fn smoke_brk_shrink_failure_rolls_back_break() -> TestResult {
+        let aspace = AddressSpace::empty();
+        let high = BRK_DEFAULT_BASE + 0x3000;
+        if brk_core(&aspace, high) != high
+            || aspace
+                .punch_fixed(VirtAddr::new(BRK_DEFAULT_BASE), 0x3000)
+                .is_err()
+        {
+            return TestResult::Fail("shrink rollback setup failed");
+        }
+        if brk_core(&aspace, BRK_DEFAULT_BASE) != high || aspace.brk_top() != high {
+            return TestResult::Fail("failed shrink published a lower break");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_shrink_failure_rolls_back_break);
+
+    /// RLIMIT_DATA is checked on the byte-precise request before page-aligning
+    /// it; RLIMIT_AS charges VMA pages but excludes NARF's synthetic guard.
+    fn smoke_brk_enforces_linux_data_and_as_limits() -> TestResult {
+        let data_as = AddressSpace::empty();
+        data_as.set_program_data_bytes(0x1800);
+        let exact = BRK_DEFAULT_BASE + 0x800;
+        if brk_core_limited(&data_as, exact, 0x2000, u64::MAX, u64::MAX, true) != exact {
+            return TestResult::Fail("exact RLIMIT_DATA boundary was rejected");
+        }
+        if brk_core_limited(
+            &data_as,
+            exact + 1,
+            0x2000,
+            u64::MAX,
+            u64::MAX,
+            true,
+        ) != exact
+            || data_as.brk_top() != exact
+        {
+            return TestResult::Fail("same-page brk escaped RLIMIT_DATA");
+        }
+
+        let as_as = AddressSpace::empty();
+        let ordinary = VirtAddr::new(AddressSpace::MMAP_CURSOR_BASE);
+        let guard = VirtAddr::new(AddressSpace::MMAP_CURSOR_BASE + 0x2000);
+        if as_as
+            .map_region(Region {
+                base: ordinary,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+            })
+            .is_err()
+            || as_as
+                .map_region(Region {
+                    base: guard,
+                    len: 0x1000,
+                    perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+                    phys: alloc::vec![narf_memory::PhysAddr::new(0)],
+                })
+                .is_err()
+        {
+            return TestResult::Fail("RLIMIT_AS setup mapping failed");
+        }
+        let one_page = BRK_DEFAULT_BASE + 0x1000;
+        if brk_core_limited(&as_as, one_page, u64::MAX, 0x2000, u64::MAX, true) != one_page {
+            return TestResult::Fail("synthetic guard was charged to RLIMIT_AS");
+        }
+        if brk_core_limited(
+            &as_as,
+            one_page + 0x1000,
+            u64::MAX,
+            0x2000,
+            u64::MAX,
+            true,
+        ) != one_page
+        {
+            return TestResult::Fail("brk growth escaped RLIMIT_AS");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_brk_enforces_linux_data_and_as_limits);
 }

@@ -831,7 +831,7 @@ unsafe fn mint_shared_ring_pair(
         .map_region(Region {
             base: VirtAddr::new(sq_vaddr),
             len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![sq_phys],
         })
         .map_err(|_| ())?;
@@ -839,7 +839,7 @@ unsafe fn mint_shared_ring_pair(
         .map_region(Region {
             base: VirtAddr::new(cq_vaddr),
             len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![cq_phys],
         })
         .map_err(|_| ())?;
@@ -993,7 +993,9 @@ fn open_impl(
     // open descriptors. Linux returns EMFILE from the fd-creating call.
     // RLIMIT_NOFILE is index 7; `.0` is the soft (current) limit.
     {
-        let nofile_cur = rlimits_of(task)[7].0;
+        let nofile_cur = read_rlimit(task, 7)
+            .map(|limit| limit.cur)
+            .unwrap_or_else(|| default_rlimits()[7].cur);
         if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
@@ -3635,6 +3637,13 @@ static CAP_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, [u64; 3]>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+fn cap_fork(parent: u64, child: u64) {
+    let mut g = CAP_TABLE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let inherited = m.get(&parent).copied().unwrap_or([0; 3]);
+    m.insert(child, inherited);
+}
+
 /// Data-element count for a capability version; None if unsupported.
 fn cap_ndata(version: u32) -> Option<usize> {
     match version {
@@ -6079,11 +6088,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // Publish inherited mapping owners before the child becomes runnable.
     // Otherwise an immediate child exit can race the late copy and leave an
     // owner reference keyed to a process that has already been reaped.
-    if !share_thread {
-        crate::mapped_file::fork_process(
-            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
-            child_visible_pid,
-        );
+    if !share_vm {
+        crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
     }
 
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
@@ -6219,6 +6225,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             }
         }
     }
+
+    // Rlimits are process/TGID state (shared by CLONE_THREAD, copied by a real
+    // process clone); capabilities remain per-thread credentials and copy in
+    // both cases.
+    rlimit_fork(parent_pid, child_tid.raw());
+    cap_fork(parent_pid, child_tid.raw());
 
     // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
     // an fd opened by any thread is visible to all, and close/dup affect all
@@ -6922,7 +6934,6 @@ pub fn wait_init() {
     #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
-    crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -7586,6 +7597,10 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     crate::pid_ns::clear_ns(tid);
                 }
                 crate::task::release_task(tid);
+                if let Some(state) = RLIMIT_TABLE.lock().as_mut() {
+                    state.rows.remove(&tid);
+                    state.reaped.insert(tid, ());
+                }
                 // Reap-time pid↔tid unbinding. PIDs are recycled
                 // (lowest-free), so a surviving PID_TO_TASK row would
                 // point the pid's NEXT owner-lookup at this dead tid —
@@ -7691,9 +7706,6 @@ fn release_task_tables(tid: u64) {
     }
     #[cfg(feature = "linux-compat")]
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = RLIMIT_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = PRCTL_TABLE.lock().as_mut() {
@@ -8584,12 +8596,40 @@ fn read_sid(target: u64) -> u64 {
         .unwrap_or(target) // default: sid == pid
 }
 
+/// Linux `session_of_pgrp`: resolve an internal process-group id to the
+/// session of one live member. The current task is checked explicitly because
+/// syscall-unit fixtures need not populate the scheduler task registry.
+fn session_of_pgrp(pgrp: u64) -> Option<u64> {
+    let current = process_state_key(current_task_id());
+    if current != 0 && read_pgid(current) == pgrp {
+        return Some(read_sid(current));
+    }
+
+    let members: alloc::vec::Vec<u64> = PGID_TABLE
+        .lock()
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(&task, &group)| (group == pgrp).then_some(task))
+                .collect()
+        })
+        .unwrap_or_default();
+    members
+        .into_iter()
+        .find(|&task| crate::task::task_get(task).is_some())
+        .map(read_sid)
+        .or_else(|| {
+            (crate::task::task_get(pgrp).is_some() && read_pgid(pgrp) == pgrp)
+                .then(|| read_sid(pgrp))
+        })
+}
+
 /// The session id of the current task, in the visible-pid space userspace
 /// sees. Backs the `TIOCGSID` console ioctl (`tcgetsid(3)`), which getty
 /// and login use to confirm they own the tty's session after `TIOCSCTTY`.
 #[cfg(feature = "linux-compat")]
 pub fn current_task_sid_user() -> u64 {
-    pgid_to_user(read_sid(current_task_id()))
+    pgid_to_user(read_sid(process_state_key(current_task_id())))
 }
 
 /// The current task's process-group id in the visible-pid space — exactly
@@ -8599,7 +8639,7 @@ pub fn current_task_sid_user() -> u64 {
 /// `pgid_to_user`.
 #[cfg(feature = "linux-compat")]
 pub fn current_task_pgid_user() -> u64 {
-    pgid_to_user(read_pgid(current_task_id()))
+    pgid_to_user(read_pgid(process_state_key(current_task_id())))
 }
 
 /// Child inherits the parent's process-group id (POSIX fork semantics).
@@ -8655,6 +8695,7 @@ pub const CTTY_DETACHED: u32 = 0xFFFF_FFFF;
 /// has no controlling terminal.
 #[cfg(feature = "linux-compat")]
 pub fn task_ctty(task: u64) -> Option<u32> {
+    let task = process_state_key(task);
     match CTTY_TABLE
         .lock()
         .as_ref()
@@ -8670,6 +8711,7 @@ pub fn task_ctty(task: u64) -> Option<u32> {
 /// `TIOCSCTTY` path (mirrors `set_controlling_tty` for PTY slaves).
 #[cfg(feature = "linux-compat")]
 pub fn set_controlling_tty_console(task: u64) {
+    let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
         m.insert(task, CTTY_CONSOLE);
     }
@@ -8682,6 +8724,7 @@ pub fn set_controlling_tty_console(task: u64) {
 /// explicit `TIOCSCTTY` re-acquires one.
 #[cfg(feature = "linux-compat")]
 pub fn detach_controlling_tty(task: u64) {
+    let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
         m.insert(task, CTTY_DETACHED);
     }
@@ -8692,6 +8735,8 @@ pub fn detach_controlling_tty(task: u64) {
 /// default for both parent and child.
 #[cfg(feature = "linux-compat")]
 pub fn ctty_fork(parent: u64, child: u64) {
+    let parent = process_state_key(parent);
+    let child = process_state_key(child);
     let raw = CTTY_TABLE
         .lock()
         .as_ref()
@@ -8718,36 +8763,69 @@ pub fn __test_ctty_reset() {
 /// `None` if the task has no controlling tty.
 #[cfg(feature = "linux-compat")]
 pub fn ctty_for(task: u64) -> Option<u32> {
+    let task = process_state_key(task);
     CTTY_TABLE
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
 }
 
-/// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can
-/// record the caller's controlling tty without depending on this crate.
+/// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can validate
+/// and record the caller's controlling tty without depending on this crate.
 ///
-/// Returns the caller's `(session id, process group id)` so the PTY can
-/// complete Linux's `__proc_set_tty`: acquiring a controlling terminal
-/// installs the tty's session AND its foreground process group. The pgrp
-/// half is what makes `tcgetpgrp()` answer truthfully, without which a
-/// job-control shell stops itself on SIGTTIN and never prints a prompt.
+/// `tty_sid` is the tty's current owning session in internal task-id space and
+/// `arg` is the Linux TIOCSCTTY argument. Linux permits acquisition only by a
+/// session leader without a controlling tty. Repeating the operation for the
+/// leader of the tty's existing session succeeds. Stealing another session's
+/// tty requires `arg == 1` and trusted `CAP_SYS_ADMIN`; NARF currently exposes
+/// no ambient trusted POSIX capability, so that branch is denied with EPERM.
+///
+/// The returned session and process-group IDs remain in task-id space. The
+/// querying syscall translates them into its caller's PID namespace, matching
+/// Linux's `pid_vnr()` at query time rather than acquisition time.
 #[cfg(feature = "linux-compat")]
-pub fn set_controlling_tty(pty_index: u32) -> (u64, u64) {
-    let task = current_task_id();
-    {
-        let mut g = CTTY_TABLE.lock();
-        if let Some(m) = g.as_mut() {
+pub fn set_controlling_tty(
+    pty_index: u32,
+    tty_sid: u64,
+    arg: usize,
+    readable: bool,
+) -> Result<(u64, u64), narf_filesystem::FsError> {
+    let task = process_state_key(current_task_id());
+    let sid = read_sid(task);
+    let pgid = read_pgid(task);
+    let session_leader = sid == task;
+
+    // Linux checks this idempotent case before rejecting a leader that
+    // already has a controlling terminal.
+    if session_leader && tty_sid == sid {
+        if let Some(m) = CTTY_TABLE.lock().as_mut() {
             m.insert(task, pty_index);
         }
+        return Ok((sid, pgid));
     }
-    // BOTH values must be in the VISIBLE-pid space, because userspace
-    // compares what tcgetpgrp() reports against its own getpgrp() — which is
-    // `pgid_to_user(read_pgid(..))`. Returning the raw task-space pgid here
-    // would reintroduce, on PTYs, exactly the divergence documented above
-    // `pgid_to_user`: a foreground leader read as "background", SIGTTIN, and
-    // a shell stopped at its first read.
-    (current_task_sid_user(), current_task_pgid_user())
+
+    if !session_leader || task_ctty(task).is_some() {
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    if tty_sid != 0 {
+        // `arg == 1` is necessary but not sufficient: Linux also requires
+        // CAP_SYS_ADMIN. The emulated capget/capset masks are explicitly not
+        // trusted authority, so no NARF caller can currently steal a tty.
+        let _ = arg;
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    // Linux performs this after the session/ownership checks. There is no
+    // authenticated CAP_SYS_ADMIN bridge to bypass FMODE_READ in NARF.
+    if !readable {
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    if let Some(m) = CTTY_TABLE.lock().as_mut() {
+        m.insert(task, pty_index);
+    }
+    Ok((sid, pgid))
 }
 
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
@@ -9094,7 +9172,7 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32)
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-// ── Per-task rlimit table ──────────────────────────────────────────
+// ── Per-process rlimit table ───────────────────────────────────────
 //
 // POSIX getrlimit / setrlimit query and update per-resource soft
 // (`rlim_cur`) and hard (`rlim_max`) limits, stored per task. Most limits
@@ -9147,43 +9225,210 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 1024,
         max: 4096,
     };
+    // Linux INIT_RLIMITS uses MLOCK_LIMIT (8 MiB) for both soft and hard
+    // RLIMIT_MEMLOCK. Keeping infinity here made all new admission paths
+    // vacuous until a process explicitly lowered its own limit.
+    t[8] = RLimitPair {
+        cur: 8 * 1024 * 1024,
+        max: 8 * 1024 * 1024,
+    };
     t
 }
 
-static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+struct RlimitState {
+    /// Rows are keyed by the monotonic thread-group leader TaskId. ProcessIds
+    /// are recycled and therefore cannot safely own lifetime-bearing state.
+    rows: BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>,
+    /// Reaped leader IDs are tombstoned so a prlimit holder that retained an
+    /// Arc<Task> across concurrent reap cannot recreate a dead process row.
+    reaped: BTreeMap<u64, ()>,
+}
+
+impl RlimitState {
+    fn new() -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            reaped: BTreeMap::new(),
+        }
+    }
+}
+
+static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<RlimitState>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn rlimit_init() {
-    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
+    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
 }
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
-    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
+    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+}
+
+/// Resolve any thread in a group to the leader's never-reused TaskId.
+fn process_state_key(task: u64) -> u64 {
+    task_to_pid_raw(task)
+        .and_then(pid_to_task_raw)
+        .unwrap_or(task)
 }
 
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     if resource >= RLIMIT_COUNT {
         return None;
     }
+    let key = process_state_key(task);
     let g = RLIMIT_TABLE.lock();
-    let m = g.as_ref()?;
-    let row = m.get(&task).copied().unwrap_or_else(default_rlimits);
+    let state = g.as_ref()?;
+    if state.reaped.contains_key(&key) {
+        return None;
+    }
+    let row = state
+        .rows
+        .get(&key)
+        .copied()
+        .unwrap_or_else(default_rlimits);
     Some(row[resource])
 }
 
-fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
+const RLIMIT_DATA: usize = 2;
+const RLIMIT_STACK: usize = 3;
+const RLIMIT_MEMLOCK: usize = 8;
+const RLIMIT_AS: usize = 9;
+
+#[derive(Copy, Clone)]
+struct MlockAuthority {
+    limit_bytes: u64,
+    bypass_limit: bool,
+}
+
+fn current_mlock_authority() -> MlockAuthority {
+    let task = current_task_id();
+    let limit_bytes = read_rlimit(task, RLIMIT_MEMLOCK)
+        .map(|limit| limit.cur)
+        .unwrap_or(0);
+    // CAP_TABLE is currently an ABI round-trip store, not trusted capability
+    // authority: capset may synthesize bits. Do not turn those emulated bits
+    // into a memory-limit bypass. Once capability-core supplies authenticated
+    // credentials this becomes its effective CAP_IPC_LOCK query.
+    MlockAuthority {
+        limit_bytes,
+        bypass_limit: false,
+    }
+}
+
+/// Current task's process-shared Linux limits for automatic stack growth in
+/// the architecture trap handlers.
+pub fn current_stack_growth_limits() -> narf_memory::StackGrowthLimits {
+    let task = current_task_id();
+    let authority = current_mlock_authority();
+    let defaults = default_rlimits();
+    narf_memory::StackGrowthLimits {
+        stack_bytes: read_rlimit(task, RLIMIT_STACK)
+            .unwrap_or(defaults[RLIMIT_STACK])
+            .cur,
+        memlock_bytes: authority.limit_bytes,
+        address_space_bytes: read_rlimit(task, RLIMIT_AS)
+            .unwrap_or(defaults[RLIMIT_AS])
+            .cur,
+        bypass_memlock: authority.bypass_limit,
+    }
+}
+
+fn can_do_mlock(authority: MlockAuthority) -> bool {
+    authority.limit_bytes != 0 || authority.bypass_limit
+}
+
+/// Atomically snapshot and optionally replace one process-shared rlimit.
+/// Validation against the previous hard limit occurs under the same table
+/// lock as publication, matching Linux's group-leader task lock and preventing
+/// two CLONE_THREAD callers from raising a hard limit through stale snapshots.
+fn update_rlimit_atomic(
+    task: u64,
+    resource: usize,
+    new_value: Option<RLimitPair>,
+) -> Result<RLimitPair, i64> {
     if resource >= RLIMIT_COUNT {
-        return false;
+        return Err(22); // EINVAL
+    }
+    let key = process_state_key(task);
+    let mut g = RLIMIT_TABLE.lock();
+    let state = g.as_mut().ok_or(22i64)?;
+    if state.reaped.contains_key(&key) {
+        return Err(3); // ESRCH
+    }
+    let row = state.rows.entry(key).or_insert_with(default_rlimits);
+    let prior = row[resource];
+    if let Some(value) = new_value {
+        if value.cur > value.max {
+            return Err(22); // EINVAL
+        }
+        if value.max > prior.max {
+            // No authenticated CAP_SYS_RESOURCE authority exists yet.
+            return Err(1); // EPERM
+        }
+        row[resource] = value;
+    }
+    Ok(prior)
+}
+
+/// Resolve Linux prlimit's pid argument to a live task. A non-container build
+/// must still reject unregistered numeric IDs rather than manufacturing a
+/// default rlimit row for a phantom process.
+struct PrlimitTarget {
+    tid: u64,
+    /// Mirrors Linux's get_task_struct reference for cross-task operations.
+    /// The exact current task cannot disappear during its own syscall, and
+    /// some kernel-test shims intentionally have no registered Task object.
+    _owner: Option<alloc::sync::Arc<crate::task::Task>>,
+}
+
+fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
+    if pid == 0 {
+        return Some(PrlimitTarget {
+            tid: caller,
+            _owner: crate::task::task_get(caller),
+        });
+    }
+    let outer = accept_pid_from(caller, pid)?;
+    let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
+    Some(PrlimitTarget {
+        tid: task,
+        _owner: Some(crate::task::task_get(task)?),
+    })
+}
+
+/// Linux permits cross-task prlimit when the caller's real uid/gid matches all
+/// of the target's real/effective/saved IDs. NARF reports saved as effective,
+/// so these are the complete representable checks. Only the exact current task
+/// bypasses them; same-thread-group membership alone does not. A future
+/// authenticated CAP_SYS_RESOURCE query can provide the namespace bypass.
+fn prlimit_permission(caller: u64, target: u64) -> bool {
+    if caller == target {
+        return true;
+    }
+    let caller_ids = read_uidgid(caller);
+    let target_ids = read_uidgid(target);
+    caller_ids.uid == target_ids.uid
+        && caller_ids.uid == target_ids.euid
+        && caller_ids.gid == target_ids.gid
+        && caller_ids.gid == target_ids.egid
+}
+
+fn rlimit_fork(parent: u64, child: u64) {
+    let parent_key = process_state_key(parent);
+    let child_key = process_state_key(child);
+    if parent_key == child_key {
+        return;
     }
     let mut g = RLIMIT_TABLE.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
-    };
-    let row = m.entry(task).or_insert_with(default_rlimits);
-    row[resource] = val;
-    true
+    let state = g.get_or_insert_with(RlimitState::new);
+    let inherited = state
+        .rows
+        .get(&parent_key)
+        .copied()
+        .unwrap_or_else(default_rlimits);
+    state.reaped.remove(&child_key);
+    state.rows.insert(child_key, inherited);
 }
 
 // ── prctl — per-task settings switchboard ──────────────────────────

@@ -313,13 +313,44 @@ impl RegionPerms {
     pub const WRITE: RegionPerms;
     pub const EXEC: RegionPerms;
     pub const LOCKED: RegionPerms;
+    /// Lazy memory locking; always accompanied by LOCKED.
+    pub const LOCK_ONFAULT: RegionPerms;
+    /// Linux VM_SPECIAL analogue; never memory-lock eligible.
+    pub const LOCK_EXEMPT: RegionPerms;
+    /// Provenance for growable user-stack fragments.
+    pub const STACK_SEGMENT: RegionPerms;
     pub const COW: RegionPerms;
+}
+
+pub enum FutureLockPolicy { None, Eager, OnFault }
+
+pub enum BrkUpdateResult {
+    Complete(u64),
+    NeedPages(usize),
+}
+
+pub struct StackGrowthLimits {
+    pub memlock_bytes: u64,
+    pub stack_bytes: u64,
+    pub address_space_bytes: u64,
+    pub bypass_memlock: bool,
 }
 
 impl AddressSpace {
     /// Allocate an architecture user root. On aarch64 this also reserves one
     /// lifetime-scoped process ASID when the hardware pool has capacity.
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// Stable, never-reused identity of this address-space incarnation.
+    /// Const-created empty address spaces allocate it lazily on first use.
+    pub fn identity(&self) -> u64;
+    /// Publish/query the main executable's immutable Linux RLIMIT_DATA charge.
+    pub fn set_program_data_bytes(&self, bytes: u64);
+    pub fn program_data_bytes(&self) -> u64;
+    /// Serialize raw-break validation, Linux resource-limit admission, heap
+    /// VMA mutation, and break publication against every CLONE_VM peer.
+    /// `NeedPages` requests allocation-free lazy descriptors outside the
+    /// IRQ-safe transaction and guarantees no state was changed.
+    pub fn update_brk_limited(/* ... */) -> BrkUpdateResult;
     /// Install this address space's architecture root for the current CPU.
     pub fn activate(&self) -> Result<(), AddressSpaceError>;
     /// One ownership-integrated same-root page-out submission.
@@ -349,6 +380,16 @@ impl AddressSpace {
         &self,
         base: VirtAddr,
         len: u64,
+    ) -> Result<(), AddressSpaceError>;
+    /// Materialize/rollback only if the receipt's address-space incarnation
+    /// and opaque publication generation still name the exact VMA.
+    /// Replacement, splitting, relocation, and use against another address
+    /// space return `StaleMapping` without touching the successor.
+    pub unsafe fn materialize_mapping(
+        &self, receipt: MappingReceipt,
+    ) -> Result<(), AddressSpaceError>;
+    pub fn rollback_mapping(
+        &self, receipt: MappingReceipt,
     ) -> Result<(), AddressSpaceError>;
     /// Install real architecture huge/block leaves and take frame ownership.
     pub unsafe fn map_huge_region(
@@ -397,6 +438,66 @@ impl AddressSpace {
     /// Unpin exactly the rounded mapped range without discarding backing.
     pub fn munlock_range(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
+    /// Address-space default inherited by newly-created ordinary VMAs.
+    pub fn future_lock_policy(&self) -> FutureLockPolicy;
+    /// Atomically replace the future policy and optionally the current mode.
+    pub fn update_mlockall(
+        &self,
+        current: Option<FutureLockPolicy>,
+        future: FutureLockPolicy,
+    ) -> Result<(), AddressSpaceError>;
+    /// Same transition with atomic RLIMIT_MEMLOCK admission.
+    pub fn update_mlockall_limited(
+        &self,
+        current: Option<FutureLockPolicy>,
+        future: FutureLockPolicy,
+        limit_bytes: u64,
+        bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Clear current and future memory locking atomically.
+    pub fn munlock_all(&self) -> Result<(), AddressSpaceError>;
+    /// Publish an ordinary VMA with atomic future-lock/rlimit admission.
+    pub fn map_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Receipt-returning variants bind deferred completion to the exact VMA
+    /// publication rather than only its reusable base/length coordinates.
+    pub fn map_region_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    /// MAP_FIXED counterpart: admission precedes target retirement.
+    pub fn replace_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Run a VMA/external-owner transaction in VMA -> owner lock order.
+    pub fn with_vma_transaction<R>(&self, op: impl FnOnce() -> R) -> R;
+    /// Shared insertion/replacement variants require VMA then shared-owner
+    /// transactions to remain held across the external backing snapshot.
+    pub unsafe fn map_shared_region_locked_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn replace_shared_region_locked_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    /// Transaction-held receipt variants let an external owner be registered
+    /// before the VMA transaction is released. FILE_DEMAND faults may observe
+    /// the VMA during this interval, but block on that owner transaction until
+    /// registration completes.
+    pub unsafe fn map_region_locked_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    pub unsafe fn replace_region_locked_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    /// Locked VMA resize/move admits growth before mutation. Eager population
+    /// occurs only after the IRQ-safe VMA transaction is released.
+    pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_region_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_region_fixed_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    /// Fault-time stack growth checks all task-specific memory limits and is
+    /// failure-atomic across speculative frame and PTE installation.
+    pub unsafe fn try_grow_stack_limited(
+        &self, fault: VirtAddr, limits: StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError>;
 }
 
 /// Install the external shared-page owner's per-alias lifetime hooks.
@@ -404,6 +505,9 @@ impl AddressSpace {
 /// replacement, and address-space teardown release only after the
 /// corresponding translations have been invalidated.
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+/// Retire upper-layer VMA ownership after the final address-space reference
+/// has invalidated all leaves and released their backing.
+pub fn install_address_space_drop_hook(drop: fn(address_space_id: u64));
 
 impl AddressSpace {
     /// Remove an exact base-page region.

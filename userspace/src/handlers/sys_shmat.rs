@@ -114,25 +114,6 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     shm_register_as_owner(as_key, lpid);
     let mapping_transaction = shm_mapping_transaction(as_key);
     let _mapping_guard = mapping_transaction.lock();
-    if flg & SHM_REMAP != 0 {
-        let Some(end) = base.checked_add(reserve_len) else {
-            shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-            return;
-        };
-        if as_ref
-            .punch_fixed(VirtAddr::new(base), reserve_len)
-            .is_err()
-        {
-            shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-            return;
-        }
-        // Linux MAP_FIXED does not restore displaced mappings if the new mmap
-        // later fails. Keep System V attachment accounting synchronized with
-        // the hole that has already been punched.
-        shm_record_fixed_punch(as_key, base, end, lpid);
-    }
 
     let mut perms = RegionPerms::READ | RegionPerms::SHARED;
     if flg & SHM_RDONLY == 0 {
@@ -141,29 +122,48 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     if flg & SHM_EXEC != 0 {
         perms = perms | RegionPerms::EXEC;
     }
-    let mapped = narf_memory::with_shared_mapping_transaction(|| {
-        let mut frames_raw = alloc::vec::Vec::new();
-        if !(vtable.frames)(handle, &mut frames_raw) {
-            return Err(narf_memory::AddressSpaceError::Unmapped);
-        }
-        let map_len = (frames_raw.len() as u64) << 12;
-        if map_len != reserve_len {
-            return Err(narf_memory::AddressSpaceError::AlignmentMismatch);
-        }
-        let phys = frames_raw
-            .into_iter()
-            .map(narf_memory::PhysAddr::new)
-            .collect();
-        // SAFETY: registry snapshot and alias insertion share one transaction.
-        unsafe {
-            as_ref.map_shared_region_locked(Region {
+    let authority = current_mlock_authority();
+    let mapped = as_ref.with_vma_transaction(|| {
+        narf_memory::with_shared_mapping_transaction(|| {
+            let mut frames_raw = alloc::vec::Vec::new();
+            if !(vtable.frames)(handle, &mut frames_raw) {
+                return Err(narf_memory::AddressSpaceError::Unmapped);
+            }
+            let map_len = (frames_raw.len() as u64) << 12;
+            if map_len != reserve_len {
+                return Err(narf_memory::AddressSpaceError::AlignmentMismatch);
+            }
+            let phys = frames_raw
+                .into_iter()
+                .map(narf_memory::PhysAddr::new)
+                .collect();
+            let region = Region {
                 base: VirtAddr::new(base),
                 len: map_len,
                 perms,
                 phys,
-            })?;
-        }
-        Ok(map_len)
+            };
+            // SAFETY: VMA -> shared-owner transactions cover the stable
+            // registry snapshot and alias publication.
+            unsafe {
+                if flg & SHM_REMAP != 0 {
+                    as_ref.replace_shared_region_locked_limited(
+                        region,
+                        false,
+                        authority.limit_bytes,
+                        authority.bypass_limit,
+                    )?;
+                } else {
+                    as_ref.map_shared_region_locked_limited(
+                        region,
+                        false,
+                        authority.limit_bytes,
+                        authority.bypass_limit,
+                    )?;
+                }
+            }
+            Ok(map_len)
+        })
     });
     let map_len = match mapped {
         Ok(map_len) => map_len,
@@ -172,12 +172,22 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64));
             return;
         }
+        Err(narf_memory::AddressSpaceError::LockLimit) => {
+            shm_cancel_attach(object);
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+            return;
+        }
         Err(_) => {
             shm_cancel_attach(object);
             ctx.set_return(SyscallReturn::ok((-12i64) as u64));
             return;
         }
     };
+    if flg & SHM_REMAP != 0 {
+        // The memory transaction has committed target replacement; keep the
+        // SysV attachment index synchronized before adding this attachment.
+        shm_record_fixed_punch(as_key, base, base + map_len, lpid);
+    }
 
     // SAFETY: the region was just registered in this live address space.
     if unsafe { as_ref.materialize_range(VirtAddr::new(base), map_len) }.is_err() {

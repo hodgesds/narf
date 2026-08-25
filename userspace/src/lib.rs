@@ -134,6 +134,12 @@ pub use fd::{FdEntry, FdTable, FD_CLOEXEC};
 pub use handlers::StatBuf;
 pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 
+/// Retire file-backed VMA ownership after memory has invalidated the last
+/// translations belonging to an address space.
+pub fn drop_mapped_file_address_space(address_space_id: u64) {
+    mapped_file::drop_address_space(address_space_id);
+}
+
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     abi_file_op_bridge, active_user_as, address_space_lookup, bootstrap_init, bootstrap_live_count,

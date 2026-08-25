@@ -440,10 +440,9 @@ fn smoke_pty_ctrl_c_raises_fg_pgrp_signal() -> TestResult {
     let master = open_ptmx();
     let idx = master.index();
     // Set this PTY's foreground process group (what tcsetpgrp installs).
-    pts_lookup(idx)
-        .expect("slave")
-        .fg_pgrp
-        .store(4242, Ordering::Release);
+    if !master.set_tty_fg_pgrp(4242) {
+        return TestResult::Fail("PTY master did not expose its shared control state");
+    }
 
     // Master writes ^C (ISIG on by default). The shared discipline must
     // raise SIGINT (2) to the fg pgrp via the hook and consume the byte.

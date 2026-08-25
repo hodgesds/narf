@@ -77,8 +77,19 @@ the mapping syscall does not walk unrelated regions or allocate resident data
 pages. Anonymous `MAP_SHARED` mappings eagerly allocate registry-owned frames,
 retain them through the VMA and any fork aliases, and immediately remove their
 internal shmem name; the last alias unmap reclaims the backing without retaining
-one public registry entry per completed mapping until process exit. `mremap(2)`
-supports no-op resize, real tail shrink, in-place lazy grow,
+one public registry entry per completed mapping until process exit.
+
+File/device mapping publication holds the address-space transaction and that
+address space's owner bucket while it atomically retires overlapping owners
+and registers the new external owner. A `FILE_DEMAND` fault that observes
+newly-published VMA metadata blocks on the same per-address-space transaction
+until the file reference is visible; unrelated address spaces do not share
+that lock. Deferred PTE
+materialization and error rollback carry an opaque memory publication receipt;
+a concurrent identical-address replacement makes the receipt stale and cannot
+be materialized, removed, or registered by the losing syscall.
+
+`mremap(2)` supports no-op resize, real tail shrink, in-place lazy grow,
 `MREMAP_MAYMOVE`, and disjoint `MREMAP_FIXED` replacement while preserving
 resident backing without copying it. The current operation requires one
 complete private base-page VMA. Shared/huge/sub-VMA moves and
@@ -89,8 +100,14 @@ Linux-compatible `brk(2)` likewise changes only the address-space break and
 its single anonymous heap VMA. Growth appends lazy zero-backed page slots and
 does not allocate, zero, or materialize resident frames in syscall context;
 first touch uses the ordinary user-reserve-aware demand-fault path. Shrink
-retires only the rounded tail, while a metadata-allocation or overlap failure
-returns the previous break as required by the Linux syscall ABI.
+retires only the rounded tail. Validation, `RLIMIT_DATA`/`RLIMIT_AS` and
+inherited-memory-lock admission, VMA mutation, and break publication share one
+address-space transaction, so CLONE_VM peers cannot publish a stale break.
+Requests below the arena base, a metadata-allocation or overlap failure, and a
+failed tail teardown return the previous break as required by the Linux syscall
+ABI. `RLIMIT_DATA` includes the main executable's file-backed data span and is
+checked against the byte-precise request before page alignment; `RLIMIT_AS`
+charges page-rounded VMA growth but not NARF's synthetic stack-guard entry.
 
 `mlock(2)` and `munlock(2)` round byte intervals outward to pages, reject a
 non-empty range containing any unmapped page, and split VMAs so LOCKED applies
@@ -104,8 +121,52 @@ returns `ENOMEM`, and eager-population failure returns `EAGAIN`.
 their ordinary first fault supplies backing that reclaim must then retain.
 `munlock` clears the marker without discarding resident contents.
 `mlockall(MCL_CURRENT|MCL_ONFAULT)` applies the same lazy pinning to existing
-VMAs. `MCL_FUTURE` is accepted for compatibility but is not yet retained as a
-policy on subsequently created VMAs.
+VMAs. `MCL_FUTURE` is address-space state shared by CLONE_VM tasks: ordinary
+new mappings and `brk` growth inherit its eager or on-fault mode, while each
+subsequent `mlockall` replaces the prior future policy. A CURRENT-only call
+therefore clears an older future policy, FUTURE-only leaves current VMA lock
+bits unchanged, and `munlockall` clears both in one address-space transaction.
+Fork children start with neither current nor future memory locks. Eager
+population performed for CURRENT or inherited FUTURE locking is best-effort
+after the lock flags are published, matching Linux; stack guards and hardware
+huge mappings are lock-exempt.
+
+The family enforces the caller's process-shared `RLIMIT_MEMLOCK` against
+virtual locked bytes, including lazy ONFAULT pages. Invalid flags precede the
+authority check; a zero limit without authenticated lock authority returns
+`EPERM`, `mlock`/CURRENT-limit excess returns `ENOMEM`, and locked `mmap` or
+`mremap` admission returns `EAGAIN` before any fixed target is replaced.
+`MAP_LOCKED` selects eager mode. Locked `brk` growth that exceeds the limit
+returns the unchanged break. Rlimits are shared by CLONE_THREAD tasks, copied
+by process fork/clone, and retired only when the process is reaped. Device/PFN
+mappings, vDSO/vvar, kernel control rings, guards, and hardware huge mappings
+are lock-exempt; inaccessible PROT_NONE reservations are not populated.
+`setrlimit` validation and replacement are one process-table transaction.
+`prlimit64` copies a proposed limit before PID/permission validation, returns
+`ESRCH` for a nonexistent target, and requires the caller's real uid+gid to
+match all representable target real/effective/saved IDs unless the target is
+the exact caller. It retains the target task through the operation and
+atomically snapshots the old value with any successful update. Automatic
+stack expansion uses the faulting task's process-shared `RLIMIT_STACK`,
+`RLIMIT_AS`, and `RLIMIT_MEMLOCK`; limit failure leaves its guard and PTEs
+unchanged and reaches userspace through the Linux stack-fault `ENOMEM`/SIGSEGV
+path.
+
+Linux job-control state is process-shared. `setsid(2)` rejects an existing
+process-group leader with `EPERM` without mutation; otherwise SID, PGID, and
+controlling-terminal detachment publish under one fixed-order transaction and
+the returned SID is translated into the caller's visible PID space. PTY
+`TIOCSCTTY` accepts either endpoint, preserves Linux's same-session idempotent
+success ordering, requires a detached session leader, applies the fd read-mode
+check after ownership checks, and publishes raw session plus foreground group
+together. PTY control IDs remain stable internal task identities and are
+translated only by the querying `TIOCGPGRP`/`TIOCGSID` syscall. A slave query
+requires that slave to be the caller's controlling tty; a master query bypasses
+that ownership check. `TIOCSPGRP` on either endpoint requires the caller to
+control the slave and distinguishes `ENOTTY`, `EFAULT`, `EINVAL`, `ESRCH`, and
+`EPERM` in Linux order. NARF has no authenticated ambient `CAP_SYS_ADMIN`
+bridge, so tty stealing and the unreadable-fd privileged bypass fail closed
+with `EPERM`; emulated capset masks and uid zero never authorize them.
 
 `mprotect(2)` requires a page-aligned address, rounds a nonzero length
 upward, and validates complete coverage across base and hardware-huge VMAs
@@ -737,11 +798,13 @@ uniprocessor target matching the calling CPU.
 
 A successful file/device-backed `MAP_SHARED` mapping retains an
 `Arc<dyn FileOps>` independently of the descriptor table. Closing the fd does
-not invalidate mapped frames. The owner reference follows process
-fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
-`munmap(2)` or process group-dead teardown. This registry lives in userspace
-compatibility code so address-space regions do not gain a filesystem
-dependency.
+not invalidate mapped frames. The owner reference is keyed by a stable
+address-space incarnation rather than PID: a real fork copies the bucket,
+`CLONE_VM` processes share it without duplication, and task migration is
+irrelevant. It mirrors `MAP_FIXED` region splitting and is released by
+`munmap(2)` or final address-space teardown after leaf invalidation. This
+registry lives in userspace compatibility code so address-space regions do not
+gain a filesystem dependency.
 
 When `FileOps::mmap_lifetime` returns a per-object owner, the same registry
 retains it beside the file reference and clones it across fork and VMA splits.

@@ -994,6 +994,27 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this fd is a tty, return the owning session id in the kernel's
+    /// stable task-id space (zero when unowned). The Linux-compat syscall
+    /// layer translates it into the querying caller's PID namespace.
+    fn tty_session(&self) -> Option<u64> {
+        None
+    }
+
+    /// Replace this tty's foreground process group using a stable task-space
+    /// id. Returns false for non-tty objects. Session/ownership validation is
+    /// performed by the Linux-compat syscall layer before this mutation.
+    fn set_tty_fg_pgrp(&self, _pgrp: u64) -> bool {
+        false
+    }
+
+    /// Apply Linux `TIOCSCTTY` policy to this PTY endpoint and install the
+    /// controlling-terminal state. `readable` is the open-file description's
+    /// FMODE_READ equivalent. `Ok(false)` means this object is not a PTY.
+    fn tty_acquire_controlling(&self, _arg: usize, _readable: bool) -> Result<bool, FsError> {
+        Ok(false)
+    }
+
     /// True when this tty has `TOSTOP` set (background writes raise
     /// SIGTTOU). Default off — background writes are allowed.
     fn tty_tostop(&self) -> bool {

@@ -7,52 +7,45 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     let resource = args.arg1 as usize;
     let new_ptr = args.arg2;
     let old_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    // pid = 0 means "self"; non-zero pids are routed to that task
-    // unconditionally (no permission check today — capabilities
-    // would gate cross-task rlimit mutation in a real model).
-    // Linux (kernel/sys.c:1751) resolves `pid` via find_task_by_vpid — a
-    // lookup in the CALLER's pid namespace. Translate the inner pid to its
-    // outer ProcessId, then to the scheduler TaskId the rlimit table keys on.
-    // Passing the raw inner pid keyed some unrelated (or a same-numbered host)
-    // task's limits. Audit finding #11.
-    let task = if pid == 0 {
-        current_task_id()
-    } else {
-        let Some(outer) = accept_pid_from(current_task_id(), pid) else {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
-            return;
-        };
-        proc_pid_to_tid(outer)
-    };
-
-    // Validate resource bound up-front so the read+write is atomic
-    // from the user's perspective.
-    if resource >= RLIMIT_COUNT {
-        ctx.set_return(fail);
-        return;
-    }
-
-    // Snapshot prior so we can write `*old` *after* the update.
-    let prior = read_rlimit(task, resource).unwrap_or_default();
-
-    if new_ptr != 0 {
+    // Linux copies the proposed value before PID lookup, permission checks, or
+    // resource validation, so an unreadable `new` pointer has EFAULT
+    // precedence over ESRCH/EPERM/EINVAL.
+    let new_value = if new_ptr != 0 {
         // Read two u64s from user buffer under the SMAP bracket.
         let mut buf = [0u8; 16];
         // SAFETY: `new_ptr` is the user new-rlimit pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, new_ptr) }.is_err() {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
         let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
         let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
-        if !write_rlimit(task, resource, RLimitPair { cur, max }) {
-            ctx.set_return(fail);
+        Some(RLimitPair { cur, max })
+    } else {
+        None
+    };
+
+    let caller = current_task_id();
+    let Some(task) = prlimit_target_task(caller, pid) else {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+        return;
+    };
+    if !prlimit_permission(caller, task.tid) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
+
+    // Snapshot/validate/publish under one process-row transaction. The prior
+    // value is what Linux copies out even when a new value is installed.
+    let prior = match update_rlimit_atomic(task.tid, resource, new_value) {
+        Ok(prior) => prior,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
-    }
+    };
     if old_ptr != 0 {
         // Write two u64s to user buffer under the SMAP bracket.
         let mut buf = [0u8; 16];
@@ -62,7 +55,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &buf) }.is_err() {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
     }
