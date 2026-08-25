@@ -2170,6 +2170,11 @@ pub(crate) fn bpf_task_fd_query(fd: u32) -> Option<(u32, u32)> {
 /// Events are owned by the monitoring process but keyed by the target task,
 /// matching the way the upstream perf CLI opens events for its stopped child.
 pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], program_path: &str) {
+    // No event can request enable-on-exec or sideband records. Avoid resolving
+    // every image mapping through VFS on the ordinary exec path.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let comm = crate::handlers::proc_comm_of(task);
     let resolved: Vec<(&crate::process::LoadedMapping, &str, u64)> = mappings
@@ -2240,6 +2245,9 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
 }
 
 pub(crate) fn on_comm(task: u64, comm: &str) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
@@ -2255,6 +2263,12 @@ pub(crate) fn on_comm(task: u64, comm: &str) {
 
 /// Publish a mapping only after its PTE materialization has committed.
 pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot: u32, flags: u32) {
+    // This hook is called after every successful mmap. With no live perf event,
+    // skip before allocating the anonymous filename, consulting the fd table,
+    // or taking the global registry lock.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     const MAP_SHARED: u32 = 0x01;
     const MAP_PRIVATE: u32 = 0x02;
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
@@ -2303,6 +2317,9 @@ pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot:
 }
 
 pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
@@ -2330,6 +2347,9 @@ pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_ti
 
 /// Stop task-targeted events when the target process becomes group-dead.
 pub(crate) fn on_process_exit(pid: u64, tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let parent_pid = crate::handlers::parent_of_get(pid).unwrap_or(0);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
@@ -2355,6 +2375,9 @@ pub(crate) fn on_process_exit(pid: u64, tid: u64) {
 }
 
 pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
