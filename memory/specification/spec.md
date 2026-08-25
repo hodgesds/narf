@@ -500,9 +500,9 @@ impl AddressSpace {
         -> Result<MappingReceipt, AddressSpaceError>;
     /// Locked VMA resize/move admits growth against an explicit MremapLimits
     /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional
-    /// backing-vector metadata is fallibly reserved before publication;
-    /// exhaustion returns `AllocationFailed` without changing the source.
-    /// Standard BTreeMap node allocation is excluded from that guarantee.
+    /// backing-vector metadata and arena-backed VMA index nodes are fallibly
+    /// reserved before publication; exhaustion returns `AllocationFailed`
+    /// without changing the source.
     /// Eager population occurs only after the IRQ-safe transaction is released.
     pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
     pub unsafe fn grow_region_locked_limited(/* ... */)
@@ -826,12 +826,18 @@ x86_64 is rejected at runtime.
   source, publishes backing ownership exactly once, invalidates source
   translations before freeing a truncated tail, and leaves the source intact
   when destination installation fails.
-- Base-page regions live in an ordered tree keyed by virtual base. The key and
-  `Region.base` remain equal after every insertion, removal, split, stack
-  growth, and relocation. Because regions never overlap, admission, point
-  lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
-  inspect only the predecessor/successor or intersecting tree range; backing
-  ownership and TLB ordering are unchanged by this metadata index invariant.
+- Base-page regions live in an arena-backed AVL tree keyed by virtual base.
+  Tree links are stable arena indices, removed slots form a non-allocating
+  intrusive free list, and `try_reserve_nodes(n)` makes the following `n`
+  distinct-key publications allocation-free. The key and `Region.base` remain
+  equal after every insertion, removal, split, stack growth, and relocation.
+  Because regions never overlap, admission, point lookup, random insertion,
+  and empty MAP_FIXED punches are O(log VMA) and inspect only the
+  predecessor/successor or intersecting tree range; ordered iteration remains
+  O(VMA). Mapping publication generations live in the same tree entry, so VMA
+  and generation publication cannot diverge through a second allocation.
+  Backing ownership and TLB ordering are unchanged by this metadata index
+  invariant.
   The periodic NUMA sampler seeks to the VMA containing or succeeding its
   page-aligned cursor and stops at the first eligible resident slot, rather
   than rescanning all preceding VMAs/pages under the IRQ-safe region lock.

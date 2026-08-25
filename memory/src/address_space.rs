@@ -20,6 +20,10 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "region_index.rs"]
+mod region_index;
+use region_index::RegionIndex;
+
 /// Serializes creation and replacement of externally-owned shared aliases.
 /// The closure must not await or enter code that can recursively map SHARED
 /// memory.
@@ -543,12 +547,11 @@ impl Default for DemandClaims {
 /// insertion are O(log VMA), while ordered iteration remains linear.
 #[derive(Clone, Debug)]
 struct RegionTable {
-    by_base: BTreeMap<u64, Region>,
+    by_base: RegionIndex<RegionEntry>,
     /// Opaque publication generation for the VMA currently rooted at each
     /// base. A syscall may leave the VMA transaction only by carrying the
     /// matching receipt; replacement/splitting assigns a fresh generation so
     /// stale materialize or rollback work cannot act on a peer's mapping.
-    mapping_ids: BTreeMap<u64, u64>,
     next_mapping_id: u64,
     /// Default locking mode for subsequently-created ordinary VMAs.
     future_lock: FutureLockPolicy,
@@ -565,6 +568,12 @@ struct RegionTable {
     /// Kept under the same lock as `Region::phys` so the two authorities can
     /// never disagree at a visible transaction boundary.
     swap_pages: BTreeMap<u64, SwapPageState>,
+}
+
+#[derive(Clone, Debug)]
+struct RegionEntry {
+    region: Region,
+    mapping_id: u64,
 }
 
 impl Default for RegionTable {
@@ -587,8 +596,7 @@ enum SwapPageState {
 impl RegionTable {
     const fn new() -> Self {
         Self {
-            by_base: BTreeMap::new(),
-            mapping_ids: BTreeMap::new(),
+            by_base: RegionIndex::new(),
             next_mapping_id: 1,
             future_lock: FutureLockPolicy::None,
             demand_pages: DemandClaims::new(),
@@ -603,49 +611,48 @@ impl RegionTable {
     }
 
     #[inline]
-    fn iter(&self) -> alloc::collections::btree_map::Values<'_, u64, Region> {
-        self.by_base.values()
+    fn iter(&self) -> impl Iterator<Item = &Region> + '_ {
+        self.by_base.iter().map(|(_, entry)| &entry.region)
     }
 
-    #[inline]
-    fn iter_mut(&mut self) -> alloc::collections::btree_map::ValuesMut<'_, u64, Region> {
-        self.by_base.values_mut()
+    fn for_each_mut(&mut self, mut visit: impl FnMut(&mut Region)) {
+        self.by_base.for_each_mut(|entry| visit(&mut entry.region));
     }
 
     #[inline]
     fn get(&self, base: u64) -> Option<&Region> {
-        self.by_base.get(&base)
+        self.by_base.get(base).map(|entry| &entry.region)
     }
 
     #[inline]
     fn get_mut(&mut self, base: u64) -> Option<&mut Region> {
-        self.by_base.get_mut(&base)
+        self.by_base.get_mut(base).map(|entry| &mut entry.region)
     }
 
     #[inline]
     fn predecessor(&self, base: u64) -> Option<&Region> {
         self.by_base
-            .range(..base)
-            .next_back()
-            .map(|(_, region)| region)
+            .predecessor(base)
+            .map(|(_, entry)| &entry.region)
     }
 
     #[inline]
     fn successor(&self, base: u64) -> Option<&Region> {
-        self.by_base.range(base..).next().map(|(_, region)| region)
+        self.by_base
+            .successor_or_equal(base)
+            .map(|(_, entry)| &entry.region)
     }
 
     fn containing(&self, address: u64) -> Option<&Region> {
         self.by_base
-            .range(..=address)
-            .next_back()
-            .map(|(_, region)| region)
+            .predecessor_or_equal(address)
+            .map(|(_, entry)| &entry.region)
             .filter(|region| address < region.base.as_u64().saturating_add(region.len))
     }
 
     fn containing_mut(&mut self, address: u64) -> Option<&mut Region> {
-        let base = *self.by_base.range(..=address).next_back()?.0;
-        let region = self.by_base.get_mut(&base)?;
+        let base = self.by_base.predecessor_or_equal(address)?.0;
+        let region = &mut self.by_base.get_mut(base)?.region;
         (address < region.base.as_u64().saturating_add(region.len)).then_some(region)
     }
 
@@ -659,12 +666,14 @@ impl RegionTable {
     fn next_numa_hint_candidate(&self, start: u64) -> Option<VirtAddr> {
         let first_base = self
             .by_base
-            .range(..=start)
-            .next_back()
-            .filter(|(_, region)| start < region.base.as_u64().saturating_add(region.len))
-            .map_or(start, |(&base, _)| base);
+            .predecessor_or_equal(start)
+            .filter(|(_, entry)| {
+                start < entry.region.base.as_u64().saturating_add(entry.region.len)
+            })
+            .map_or(start, |(base, _)| base);
 
-        for (_, region) in self.by_base.range(first_base..) {
+        for (_, entry) in self.by_base.range(first_base, u64::MAX) {
+            let region = &entry.region;
             if region.perms.contains(RegionPerms::SHARED)
                 || region.perms.contains(RegionPerms::LOCKED)
                 || region.perms.prot_only().0 == 0
@@ -695,12 +704,14 @@ impl RegionTable {
     fn next_eager_unbacked(&self, start: u64, hi: u64) -> Option<u64> {
         let first_base = self
             .by_base
-            .range(..=start)
-            .next_back()
-            .filter(|(_, region)| start < region.base.as_u64().saturating_add(region.len))
-            .map_or(start, |(&base, _)| base);
+            .predecessor_or_equal(start)
+            .filter(|(_, entry)| {
+                start < entry.region.base.as_u64().saturating_add(entry.region.len)
+            })
+            .map_or(start, |(base, _)| base);
 
-        for (_, region) in self.by_base.range(first_base..hi) {
+        for (_, entry) in self.by_base.range(first_base, hi) {
+            let region = &entry.region;
             if !region.perms.contains(RegionPerms::LOCKED)
                 || region.perms.contains(RegionPerms::LOCK_ONFAULT)
                 || region.perms.contains(RegionPerms::STACK_GUARD)
@@ -728,22 +739,41 @@ impl RegionTable {
         None
     }
 
-    fn insert(&mut self, region: Region) -> Option<Region> {
+    fn try_reserve_nodes(&mut self, additional: usize) -> Result<(), AddressSpaceError> {
+        self.by_base
+            .try_reserve_nodes(additional)
+            .map_err(|_| AddressSpaceError::AllocationFailed)
+    }
+
+    fn insert(&mut self, region: Region) -> Result<Option<Region>, AddressSpaceError> {
         let base = region.base.as_u64();
-        let replaced = self.by_base.insert(base, region);
+        if self.by_base.get(base).is_none() {
+            self.try_reserve_nodes(1)?;
+        }
+        Ok(self.insert_reserved(region))
+    }
+
+    fn insert_reserved(&mut self, region: Region) -> Option<Region> {
+        let base = region.base.as_u64();
         let id = self.next_mapping_id;
         self.next_mapping_id = self
             .next_mapping_id
             .checked_add(1)
             .expect("VMA publication generation exhausted");
-        self.mapping_ids.insert(base, id);
-        replaced
+        self.by_base
+            .insert_reserved(
+                base,
+                RegionEntry {
+                    region,
+                    mapping_id: id,
+                },
+            )
+            .map(|entry| entry.region)
     }
 
     #[inline]
     fn remove(&mut self, base: u64) -> Option<Region> {
-        let region = self.by_base.remove(&base)?;
-        self.mapping_ids.remove(&base);
+        let region = self.by_base.remove(base)?.region;
         let end = region.base.as_u64().saturating_add(region.len);
         self.demand_pages.retain_outside(region.base.as_u64(), end);
         self.cow_pages
@@ -753,23 +783,28 @@ impl RegionTable {
 
     #[inline]
     fn mapping_id(&self, base: u64) -> Option<u64> {
-        self.mapping_ids.get(&base).copied()
+        self.by_base.get(base).map(|entry| entry.mapping_id)
     }
 
     /// Assign a fresh publication generation and cancel every deferred page
     /// claim for an existing VMA whose backing identity changed in place.
     fn invalidate_mapping(&mut self, base: u64) {
-        let region = self
-            .by_base
-            .get(&base)
-            .expect("cannot invalidate a missing VMA");
-        let end = base.saturating_add(region.len);
+        let end = base.saturating_add(
+            self.by_base
+                .get(base)
+                .expect("cannot invalidate a missing VMA")
+                .region
+                .len,
+        );
         let id = self.next_mapping_id;
         self.next_mapping_id = self
             .next_mapping_id
             .checked_add(1)
             .expect("VMA publication generation exhausted");
-        self.mapping_ids.insert(base, id);
+        self.by_base
+            .get_mut(base)
+            .expect("cannot invalidate a missing VMA")
+            .mapping_id = id;
         self.demand_pages.retain_outside(base, end);
         self.cow_pages
             .retain(|&vaddr, _| vaddr < base || vaddr >= end);
@@ -778,7 +813,7 @@ impl RegionTable {
     fn has_overlap(&self, lo: u64, hi: u64) -> bool {
         self.predecessor(lo)
             .is_some_and(|region| region.base.as_u64().saturating_add(region.len) > lo)
-            || self.by_base.range(lo..hi).next().is_some()
+            || self.by_base.range(lo, hi).next().is_some()
     }
 
     fn overlapping_any(&self, lo: u64, hi: u64, predicate: impl Fn(&Region) -> bool) -> bool {
@@ -788,8 +823,8 @@ impl RegionTable {
             return true;
         }
         self.by_base
-            .range(lo..hi)
-            .any(|(_, region)| predicate(region))
+            .range(lo, hi)
+            .any(|(_, entry)| predicate(&entry.region))
     }
 
     /// Visit only VMAs intersecting `[lo, hi)`, in virtual order.
@@ -799,8 +834,8 @@ impl RegionTable {
                 visit(region);
             }
         }
-        for (_, region) in self.by_base.range(lo..hi) {
-            visit(region);
+        for (_, entry) in self.by_base.range(lo, hi) {
+            visit(&entry.region);
         }
     }
 
@@ -808,24 +843,22 @@ impl RegionTable {
     fn for_each_overlapping_mut(&mut self, lo: u64, hi: u64, mut visit: impl FnMut(&mut Region)) {
         let start = self
             .by_base
-            .range(..lo)
-            .next_back()
-            .filter(|(_, region)| region.base.as_u64().saturating_add(region.len) > lo)
-            .map_or(lo, |(&base, _)| base);
-        for (_, region) in self.by_base.range_mut(start..hi) {
-            visit(region);
-        }
+            .predecessor(lo)
+            .filter(|(_, entry)| entry.region.base.as_u64().saturating_add(entry.region.len) > lo)
+            .map_or(lo, |(base, _)| base);
+        self.by_base
+            .for_each_range_mut(start, hi, |entry| visit(&mut entry.region));
     }
 
     /// Remove and return every VMA intersecting `[lo, hi)`, in virtual order.
     fn drain_overlapping(&mut self, lo: u64, hi: u64) -> Vec<Region> {
         let mut keys = Vec::new();
-        if let Some((&base, region)) = self.by_base.range(..lo).next_back() {
-            if region.base.as_u64().saturating_add(region.len) > lo {
+        if let Some((base, entry)) = self.by_base.predecessor(lo) {
+            if entry.region.base.as_u64().saturating_add(entry.region.len) > lo {
                 keys.push(base);
             }
         }
-        keys.extend(self.by_base.range(lo..hi).map(|(&base, _)| base));
+        keys.extend(self.by_base.range(lo, hi).map(|(base, _)| base));
         keys.into_iter()
             .filter_map(|base| self.remove(base))
             .collect()
@@ -843,9 +876,8 @@ impl RegionTable {
         let mut cursor = lo;
         if let Some(region) = self
             .by_base
-            .range(..=lo)
-            .next_back()
-            .map(|(_, region)| region)
+            .predecessor_or_equal(lo)
+            .map(|(_, entry)| &entry.region)
         {
             let begin = region.base.as_u64();
             let end = begin.saturating_add(region.len);
@@ -856,7 +888,8 @@ impl RegionTable {
                 }
             }
         }
-        for (_, region) in self.by_base.range(cursor..hi) {
+        for (_, entry) in self.by_base.range(cursor, hi) {
+            let region = &entry.region;
             let begin = region.base.as_u64();
             if begin > cursor {
                 return cursor;
@@ -1270,6 +1303,11 @@ impl AddressSpace {
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
         }
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub(crate) fn __test_fail_next_region_index_reserve(&self) {
+        self.regions.lock().by_base.fail_next_reserve_for_test();
     }
 
     /// Stable identity of this address-space incarnation.
@@ -1814,7 +1852,7 @@ impl AddressSpace {
                     len: add_len,
                     perms: tail_perms,
                     phys: frames,
-                })
+                })?
                 .is_none());
         } else {
             // A later append is valid only when the heap still starts at its
@@ -1828,9 +1866,8 @@ impl AddressSpace {
             }
             let predecessor_base = regions
                 .by_base
-                .range(..grow_lo)
-                .next_back()
-                .map(|(&base, _)| base)
+                .predecessor(grow_lo)
+                .map(|(base, _)| base)
                 .ok_or(AddressSpaceError::Overlap)?;
             let predecessor = regions
                 .get(predecessor_base)
@@ -1853,7 +1890,7 @@ impl AddressSpace {
                         len: add_len,
                         perms: tail_perms,
                         phys: frames,
-                    })
+                    })?
                     .is_none());
             }
         }
@@ -2065,7 +2102,7 @@ impl AddressSpace {
         }
         let vma_guard = self.vma_transaction.lock();
         self.check_locked_mapping_limit(region.len, explicit_lock, limit_bytes, bypass_limit)?;
-        self.punch_fixed_locked(region.base, region.len)?;
+        self.punch_fixed_locked_with_shared_reserving(region.base, region.len, false, 1)?;
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
         // The authoritative pre-replacement check above remains valid while
         // `vma_guard` is held. Rechecking after the punch would use the wrong
@@ -2096,7 +2133,7 @@ impl AddressSpace {
     ) -> Result<MappingReceipt, AddressSpaceError> {
         let shared = region.perms.contains(RegionPerms::SHARED);
         self.check_locked_mapping_limit(region.len, explicit_lock, limit_bytes, bypass_limit)?;
-        self.punch_fixed_locked_with_shared(region.base, region.len, shared)?;
+        self.punch_fixed_locked_with_shared_reserving(region.base, region.len, shared, 1)?;
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
         self.map_region_inner(region, requested, None)
             .map(|(receipt, _)| receipt)
@@ -2224,10 +2261,14 @@ impl AddressSpace {
             && region.perms.prot_only().0 != 0;
         let (base, rb, rl) = (region.base, region.base.as_u64(), region.len);
         let shared = region.perms.contains(RegionPerms::SHARED);
+        // A shared mapping acquires external frame ownership below. Prepare
+        // its index slot first so an ENOMEM result cannot leak those retains.
+        // MAP_FIXED callers preserve this slot across the target punch.
+        regions.try_reserve_nodes(1)?;
         if region.perms.contains(RegionPerms::SHARED) {
             retain_shared_frames(&region);
         }
-        assert!(regions.insert(region).is_none());
+        assert!(regions.insert_reserved(region).is_none());
         let mapping_id = regions
             .mapping_id(rb)
             .expect("newly inserted VMA must have a publication generation");
@@ -2417,7 +2458,7 @@ impl AddressSpace {
             return Err(AddressSpaceError::SharedMapping);
         }
         self.check_locked_mapping_limit(region.len, explicit_lock, limit_bytes, bypass_limit)?;
-        self.punch_fixed_locked_with_shared(region.base, region.len, true)?;
+        self.punch_fixed_locked_with_shared_reserving(region.base, region.len, true, 1)?;
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
         self.map_region_inner(region, requested, None)
             .map(|(receipt, _)| receipt)
@@ -3250,15 +3291,21 @@ impl AddressSpace {
         Self::relocation_bounds(old_base, old_len, new_base, new_len).map_err(early)?;
         self.check_relocation_limits(old_base, old_len, new_len, limits)
             .map_err(early)?;
-        self.punch_fixed_locked_with_shared(new_base, new_len, shared_transaction_held)
-            .map_err(early)?;
+        self.punch_fixed_locked_with_shared_reserving(
+            new_base,
+            new_len,
+            shared_transaction_held,
+            1,
+        )
+        .map_err(early)?;
         let mut source_shrunk = false;
         let move_old_len = if old_len > new_len {
             let tail_base = VirtAddr::new(old_base.as_u64() + new_len);
-            self.punch_fixed_locked_with_shared(
+            self.punch_fixed_locked_with_shared_reserving(
                 tail_base,
                 old_len - new_len,
                 shared_transaction_held,
+                1,
             )
             .map_err(|error| FixedRelocationError {
                 error,
@@ -3463,6 +3510,13 @@ impl AddressSpace {
             perms: source.perms,
             phys: moved_phys,
         };
+        // Prepare the destination index node before any leaf or source
+        // mutation. `insert_reserved` below is therefore allocation-free.
+        regions.try_reserve_nodes(1)?;
+        let source = regions
+            .get(old_lo)
+            .filter(|region| region.len == old_len)
+            .expect("validated relocation source disappeared under region lock");
 
         if self.root.as_u64() != 0 {
             // Preinstall the complete destination while the source remains
@@ -3536,7 +3590,7 @@ impl AddressSpace {
         let source = regions
             .remove(old_lo)
             .expect("relocation source disappeared under region lock");
-        assert!(regions.insert(moved).is_none());
+        assert!(regions.insert_reserved(moved).is_none());
         drop(regions);
         drop(huge);
 
@@ -3630,6 +3684,11 @@ impl AddressSpace {
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
         lazy_source.resize(pages, PhysAddr::new(0));
 
+        // DONTUNMAP changes the source backing in place below. Prepare the
+        // destination node first so index ENOMEM leaves both VMAs untouched.
+        // A fixed wrapper preserves this slot across target retirement.
+        regions.try_reserve_nodes(1)?;
+
         let source = regions
             .get_mut(old_lo)
             .expect("DONTUNMAP source disappeared under region lock");
@@ -3690,7 +3749,7 @@ impl AddressSpace {
                 & !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0 | RegionPerms::COW.0),
         );
         regions.invalidate_mapping(old_lo);
-        assert!(regions.insert(moved).is_none());
+        assert!(regions.insert_reserved(moved).is_none());
         drop(regions);
         drop(huge);
         self.flush_region_broadcast(old_base, len >> 12);
@@ -3812,7 +3871,7 @@ impl AddressSpace {
         Self::relocation_bounds(old_base, len, new_base, len).map_err(early)?;
         self.check_dontunmap_source_locked(old_base, len)
             .map_err(early)?;
-        self.punch_fixed_locked_with_shared(new_base, len, shared_transaction_held)
+        self.punch_fixed_locked_with_shared_reserving(new_base, len, shared_transaction_held, 1)
             .map_err(early)?;
         // SAFETY: caller's transaction/root contract is forwarded; limits
         // are intentionally admitted after the target punch.
@@ -3986,10 +4045,12 @@ impl AddressSpace {
             phys: leaf_phys,
         };
 
+        regions.try_reserve_nodes(1)?;
+
         // Allocate and publish both VMA-tree nodes before changing a PTE. The
         // region lock keeps the provisional destination invisible; rollback
         // removes it without releasing backing because no retain exists yet.
-        assert!(regions.insert(alias).is_none());
+        assert!(regions.insert_reserved(alias).is_none());
 
         if self.root.as_u64() != 0 {
             // The source remains authoritative and unchanged until this sole
@@ -4204,7 +4265,7 @@ impl AddressSpace {
             self.check_shared_mremap_limits_locked(source, len, mode, limits)
                 .map_err(early)?;
         }
-        self.punch_fixed_locked_with_shared(destination, len, true)
+        self.punch_fixed_locked_with_shared_reserving(destination, len, true, 1)
             .map_err(early)?;
         let post_punch_limits = if mode == SharedMremapMode::Duplicate {
             MremapLimits::UNLIMITED
@@ -4471,6 +4532,18 @@ impl AddressSpace {
         len: u64,
         shared_transaction_held: bool,
     ) -> Result<(), AddressSpaceError> {
+        self.punch_fixed_locked_with_shared_reserving(base, len, shared_transaction_held, 0)
+    }
+
+    /// Punch while preserving allocation-free capacity for a caller's later
+    /// VMA publications in the same outer VMA transaction.
+    fn punch_fixed_locked_with_shared_reserving(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        shared_transaction_held: bool,
+        preserve_nodes: usize,
+    ) -> Result<(), AddressSpaceError> {
         if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -4606,6 +4679,11 @@ impl AddressSpace {
         shared_to_release
             .try_reserve_exact(shared_release_count)
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
+
+        // Every preserved prefix/suffix is published only after the original
+        // nodes and leaves have been retired. Prepare their arena capacity
+        // while the old topology is still authoritative.
+        regions.try_reserve_nodes(replacement_count.saturating_add(preserve_nodes))?;
 
         let copy_backing = |source: &[PhysAddr]| -> Result<Vec<PhysAddr>, AddressSpaceError> {
             let mut backing = Vec::new();
@@ -4752,7 +4830,7 @@ impl AddressSpace {
                 }
             }
             for region in kept_regions {
-                assert!(regions.insert(region).is_none());
+                assert!(regions.insert_reserved(region).is_none());
             }
         }
         drop(regions);
@@ -4937,20 +5015,19 @@ impl AddressSpace {
         // Pass 2: free the backing frames (allocation-free) and zero the
         // entries so the victim's own `Drop` teardown skips them — idempotent.
         let mut freed = 0usize;
-        for r in regions.iter_mut() {
-            if r.perms.contains(RegionPerms::SHARED) || r.perms.contains(RegionPerms::LOCKED) {
-                continue;
-            }
-            let pages = ((r.len + 0xFFF) >> 12) as usize;
-            let n = pages.min(r.phys.len());
-            crate::frame::free_phys_batch(&r.phys[..n]);
-            for p in r.phys[..n].iter_mut() {
-                if p.raw() != 0 {
-                    freed += 1;
-                    *p = PhysAddr::new(0);
+        regions.for_each_mut(|r| {
+            if !r.perms.contains(RegionPerms::SHARED) && !r.perms.contains(RegionPerms::LOCKED) {
+                let pages = ((r.len + 0xFFF) >> 12) as usize;
+                let n = pages.min(r.phys.len());
+                crate::frame::free_phys_batch(&r.phys[..n]);
+                for p in r.phys[..n].iter_mut() {
+                    if p.raw() != 0 {
+                        freed += 1;
+                        *p = PhysAddr::new(0);
+                    }
                 }
             }
-        }
+        });
         ReapOutcome::Reaped(freed)
     }
 
@@ -6339,6 +6416,12 @@ impl AddressSpace {
         };
         // SAFETY: forwarded frame-allocation and kernel-alias contract.
         let new_phys = unsafe { Self::allocate_stack_frames(plan.npages) }?;
+        let mut guard_phys = Vec::new();
+        if guard_phys.try_reserve_exact(1).is_err() {
+            Self::free_stack_frames(new_phys);
+            return Err(AddressSpaceError::AllocationFailed);
+        }
+        guard_phys.push(crate::PhysAddr::new(0));
 
         // A CLONE_VM peer may have changed the stack while allocation ran.
         // Revalidate the complete plan before touching a PTE; a mismatch owns
@@ -6352,6 +6435,16 @@ impl AddressSpace {
         let current = Self::stack_growth_plan(&regions, huge_bytes, v_page, limits);
         if current != Ok(plan) {
             let error = current.err().unwrap_or(AddressSpaceError::Unmapped);
+            drop(regions);
+            drop(huge);
+            drop(_vma_guard);
+            Self::free_stack_frames(new_phys);
+            return Err(error);
+        }
+
+        // The grown stack and replacement guard are committed only after PTE
+        // installation, so prepare both index nodes before that first leaf.
+        if let Err(error) = regions.try_reserve_nodes(2) {
             drop(regions);
             drop(huge);
             drop(_vma_guard);
@@ -6387,7 +6480,7 @@ impl AddressSpace {
             .remove(plan.guard_base)
             .expect("stack guard disappeared under region lock");
         assert!(regions
-            .insert(Region {
+            .insert_reserved(Region {
                 base: VirtAddr::new(plan.v_page),
                 len: plan.npages * 0x1000,
                 perms: plan.grown_perms,
@@ -6395,11 +6488,11 @@ impl AddressSpace {
             })
             .is_none());
         assert!(regions
-            .insert(Region {
+            .insert_reserved(Region {
                 base: VirtAddr::new(plan.new_guard_base),
                 len: 0x1000,
                 perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: alloc::vec![crate::PhysAddr::new(0)],
+                phys: guard_phys,
             })
             .is_none());
         Ok(())
@@ -6435,6 +6528,12 @@ impl AddressSpace {
         };
         // SAFETY: forwarded frame-allocation and kernel-alias contract.
         let new_phys = unsafe { Self::allocate_stack_frames(plan.npages) }?;
+        let mut guard_phys = Vec::new();
+        if guard_phys.try_reserve_exact(1).is_err() {
+            Self::free_stack_frames(new_phys);
+            return Err(AddressSpaceError::AllocationFailed);
+        }
+        guard_phys.push(crate::PhysAddr::new(0));
 
         let _vma_guard = self.vma_transaction.lock();
         let huge = self.huge_regions.lock();
@@ -6445,6 +6544,14 @@ impl AddressSpace {
         let current = Self::stack_growth_plan(&regions, huge_bytes, v_page, limits);
         if current != Ok(plan) {
             let error = current.err().unwrap_or(AddressSpaceError::Unmapped);
+            drop(regions);
+            drop(huge);
+            drop(_vma_guard);
+            Self::free_stack_frames(new_phys);
+            return Err(error);
+        }
+
+        if let Err(error) = regions.try_reserve_nodes(2) {
             drop(regions);
             drop(huge);
             drop(_vma_guard);
@@ -6478,7 +6585,7 @@ impl AddressSpace {
             .remove(plan.guard_base)
             .expect("stack guard disappeared under region lock");
         assert!(regions
-            .insert(Region {
+            .insert_reserved(Region {
                 base: VirtAddr::new(plan.v_page),
                 len: plan.npages * 0x1000,
                 perms: plan.grown_perms,
@@ -6487,11 +6594,11 @@ impl AddressSpace {
             .is_none());
 
         assert!(regions
-            .insert(Region {
+            .insert_reserved(Region {
                 base: VirtAddr::new(plan.new_guard_base),
                 len: 0x1000,
                 perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: alloc::vec![crate::PhysAddr::new(0)],
+                phys: guard_phys,
             })
             .is_none());
         Ok(())
@@ -6558,13 +6665,27 @@ impl AddressSpace {
         hi: u64,
         flag: RegionPerms,
         set: bool,
-    ) {
+    ) -> Result<(), AddressSpaceError> {
+        let mut additional_nodes = 0usize;
+        regions.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            let exempt = (region.perms.contains(RegionPerms::LOCK_EXEMPT)
+                || region.perms.contains(RegionPerms::STACK_GUARD))
+                && (flag == RegionPerms::LOCKED || flag == RegionPerms::LOCK_ONFAULT);
+            if !exempt && region.perms.contains(flag) != set {
+                additional_nodes =
+                    additional_nodes.saturating_add(usize::from(rb < lo) + usize::from(re > hi));
+            }
+        });
+        regions.try_reserve_nodes(additional_nodes)?;
+
         // Drain only the tree entries that intersect the request. Tiny
         // mlock/munlock calls therefore touch O(log VMA + intersections)
         // metadata rather than rebuilding a process-wide list.
         let originals = regions.drain_overlapping(lo, hi);
         if originals.is_empty() {
-            return;
+            return Ok(());
         }
         let mut rebuilt = Vec::with_capacity(originals.len() + 2);
         for region in originals {
@@ -6630,8 +6751,9 @@ impl AddressSpace {
             }
         }
         for region in rebuilt {
-            assert!(regions.insert(region).is_none());
+            assert!(regions.insert_reserved(region).is_none());
         }
+        Ok(())
     }
 
     /// Linux accepts an unaligned mlock address and rounds the complete byte
@@ -6696,15 +6818,15 @@ impl AddressSpace {
             regions.future_lock = future;
             if let Some(mode) = current {
                 let bits = mode.region_bits().0;
-                for region in regions.iter_mut() {
+                regions.for_each_mut(|region| {
                     if region.perms.contains(RegionPerms::STACK_GUARD)
                         || region.perms.contains(RegionPerms::LOCK_EXEMPT)
                     {
-                        continue;
+                        return;
                     }
                     region.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
                     region.perms.0 |= bits;
-                }
+                });
             }
             drop(regions);
             drop(huge);
@@ -6722,9 +6844,9 @@ impl AddressSpace {
         let _vma_guard = self.vma_transaction.lock();
         let mut regions = self.regions.lock();
         regions.future_lock = FutureLockPolicy::None;
-        for region in regions.iter_mut() {
+        regions.for_each_mut(|region| {
             region.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
-        }
+        });
         Ok(())
     }
 
@@ -6799,8 +6921,8 @@ impl AddressSpace {
             // not roll it back when population later fails. Publishing the
             // flag in this coverage-validation transaction also avoids a
             // reclaim window between validation and the first allocation.
-            Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, true);
-            Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCK_ONFAULT, false);
+            Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, true)?;
+            Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCK_ONFAULT, false)?;
             if covered_hi < hi {
                 return Err(AddressSpaceError::Unmapped);
             }
@@ -6878,14 +7000,14 @@ impl AddressSpace {
             }
         }
         let covered_hi = Self::mappings_covered_prefix_end(&huge, &regions, lo, hi);
-        Self::set_region_flag_range(&mut regions, lo, covered_hi, RegionPerms::LOCKED, true);
+        Self::set_region_flag_range(&mut regions, lo, covered_hi, RegionPerms::LOCKED, true)?;
         Self::set_region_flag_range(
             &mut regions,
             lo,
             covered_hi,
             RegionPerms::LOCK_ONFAULT,
             true,
-        );
+        )?;
         if covered_hi < hi {
             return Err(AddressSpaceError::Unmapped);
         }
@@ -6904,8 +7026,8 @@ impl AddressSpace {
         let huge = self.huge_regions.lock();
         let mut g = self.regions.lock();
         let covered_hi = Self::mappings_covered_prefix_end(&huge, &g, lo, hi);
-        Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCK_ONFAULT, false);
-        Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, false);
+        Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCK_ONFAULT, false)?;
+        Self::set_region_flag_range(&mut g, lo, covered_hi, RegionPerms::LOCKED, false)?;
         if covered_hi < hi {
             return Err(AddressSpaceError::Unmapped);
         }
@@ -7258,6 +7380,14 @@ impl AddressSpace {
         {
             return Err(AddressSpaceError::NotImplemented);
         }
+        let mut additional_nodes = 0usize;
+        g.for_each_overlapping(lo, hi, |region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            additional_nodes =
+                additional_nodes.saturating_add(usize::from(rb < lo) + usize::from(re > hi));
+        });
+        g.try_reserve_nodes(additional_nodes)?;
         let touched: Vec<Region> = {
             // Drain only the entries intersecting [lo, hi), split them, and
             // reinsert their disjoint fragments under the same lock.
@@ -7322,7 +7452,7 @@ impl AddressSpace {
                 }
             }
             for region in new_list {
-                assert!(g.insert(region).is_none());
+                assert!(g.insert_reserved(region).is_none());
             }
             hits
         };
@@ -8154,7 +8284,7 @@ impl AddressSpace {
                 // silently replace preserved contents with demand-zero.
                 return Err(AddressSpaceError::NotImplemented);
             }
-            for r in g.iter_mut() {
+            g.for_each_mut(|r| {
                 // MAP_SHARED regions (POSIX shm AND borrowed device
                 // frames — framebuffers, DRM dumb buffers) are genuinely
                 // shared across fork: parent and child map the SAME
@@ -8165,7 +8295,7 @@ impl AddressSpace {
                 // and stripping WRITE would silently fault the writer
                 // into a private copy that never reaches the device.
                 if r.perms.contains(RegionPerms::SHARED) {
-                    continue;
+                    return;
                 }
                 // Private region: bump the COW refcount on every backing
                 // frame, then mark the region so both ASes start shared pages
@@ -8181,7 +8311,7 @@ impl AddressSpace {
                 // the matching dec_ref(0) on teardown risked free_frame(0) /
                 // frame-0 reuse — corruption surfacing far away.
                 r.perms = r.perms | RegionPerms::COW;
-            }
+            });
             // Group all resident private backing by refcount shard and take
             // each touched lock once. Keep this inside the region transaction:
             // moving it below the lock would let munmap free a source before
@@ -8463,11 +8593,7 @@ impl AddressSpace {
         let mut regions = self.regions.lock();
         let v = page_va.as_u64();
         let region = regions
-            .iter_mut()
-            .find(|r| {
-                let base = r.base.as_u64();
-                v >= base && v < base + r.len
-            })
+            .containing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
         if region.perms.contains(RegionPerms::SHARED) {
             return Err(AddressSpaceError::SharedMapping);
@@ -8935,7 +9061,7 @@ impl AddressSpace {
         }
         .or_else(|| {
             let regions = self.regions.lock();
-            regions.iter().find_map(|region| {
+            let source = regions.iter().find_map(|region| {
                 let base = region.base.as_u64();
                 if v < base || v >= base.saturating_add(region.len) {
                     return None;
@@ -8947,7 +9073,8 @@ impl AddressSpace {
                     // SAFETY: non-zero backing entries name live frames.
                     Some(unsafe { crate::frame::narf_phys_node(phys.raw()) })
                 }
-            })
+            });
+            source
         })
         .ok_or(AddressSpaceError::Unmapped)?;
 
@@ -9711,12 +9838,15 @@ fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
 fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
     let mut table = RegionTable::new();
     let mut add = |base: u64, perms: RegionPerms, phys: Vec<PhysAddr>| {
-        table.insert(Region {
-            base: VirtAddr::new(base),
-            len: phys.len() as u64 * 4096,
-            perms,
-            phys,
-        });
+        assert!(table
+            .insert(Region {
+                base: VirtAddr::new(base),
+                len: phys.len() as u64 * 4096,
+                perms,
+                phys,
+            })
+            .expect("test RegionIndex reservation")
+            .is_none());
     };
     add(
         0x1000,
