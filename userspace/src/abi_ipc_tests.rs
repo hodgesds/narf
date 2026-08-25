@@ -1750,6 +1750,112 @@ kernel_test_in!(
     smoke_abi_ipc_msgrcv_blocking_retry
 );
 
+/// Message waits retain queue transitions across the publication-to-waker
+/// window and own only one scheduler wake slot. Queue removal publishes EIDRM
+/// through that same record before the queue becomes unresolvable.
+fn smoke_abi_ipc_msg_wait_waker_handoff_and_rmid() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountWake(AtomicU32);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    with_setup(|| {
+        const RECEIVER: u64 = FAKE_TASK + 31;
+        const SENDER: u64 = FAKE_TASK + 32;
+        let id = make_msgq()?;
+        let mut out = [0u8; 9];
+        let recv_args = SyscallArgs {
+            arg0: id,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+
+        set_task(RECEIVER);
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("message receiver did not publish its blocked wait");
+        }
+        let wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        let waker = core::task::Waker::from(Arc::clone(&wakes));
+        if crate::sysvipc::register_msg_wait_waker(RECEIVER, waker.clone())
+            != crate::sysvipc::MsgParkState::Pending
+            || crate::sysvipc::register_msg_wait_waker(RECEIVER, waker)
+                != crate::sysvipc::MsgParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("message wait rejected durable waker registration");
+        }
+
+        set_task(SENDER);
+        let mut msg = [0u8; 9];
+        msg[..8].copy_from_slice(&5i64.to_ne_bytes());
+        msg[8] = b'x';
+        if call(Syscall::Msgsnd.raw(), a3(id, msg.as_ptr() as u64, 1, 0)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("sender failed to publish receiver readiness");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 1 {
+            set_task(FAKE_TASK);
+            return Err("message transition produced a lost or duplicate wake");
+        }
+        // `ready` is retained after the waker is consumed. A poll that races
+        // after publication must re-execute immediately rather than sleep.
+        let late = core::task::Waker::from(Arc::new(CountWake(AtomicU32::new(0))));
+        if crate::sysvipc::register_msg_wait_waker(RECEIVER, late)
+            != crate::sysvipc::MsgParkState::Ready
+        {
+            set_task(FAKE_TASK);
+            return Err("message readiness was lost before late waker registration");
+        }
+        set_task(RECEIVER);
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value as i64 != 1 || out[8] != b'x' {
+            set_task(FAKE_TASK);
+            return Err("awakened message receiver did not consume the publication");
+        }
+
+        // A second empty receive is linked before RMID. The removal and EIDRM
+        // publication are one state transaction, including the late-register
+        // case where no waker existed at removal time.
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("second message receive did not block");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("message queue removal failed");
+        }
+        let removed = core::task::Waker::from(Arc::new(CountWake(AtomicU32::new(0))));
+        if crate::sysvipc::register_msg_wait_waker(RECEIVER, removed)
+            != crate::sysvipc::MsgParkState::Ready
+        {
+            return Err("RMID terminal state was not retained for late registration");
+        }
+        set_task(RECEIVER);
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value as i64 != EIDRM {
+            set_task(FAKE_TASK);
+            return Err("RMID waiter observed EINVAL instead of EIDRM");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msg_wait_waker_handoff_and_rmid
+);
+
 fn smoke_abi_ipc_msgrcv_negative_selects_lowest_type() -> TestResult {
     with_setup(|| {
         let id = make_msgq()?;

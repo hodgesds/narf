@@ -418,7 +418,14 @@ Normal receives select and unlink the exact record in one locked queue
 transaction before copying the type and payload to userspace in Linux order;
 an ordinary `EFAULT` therefore consumes the selected message, while `MSG_COPY`
 retains it.
-Queue removal wakes staged semaphore, sender, and receiver waits with `EIDRM`.
+Message queues and their sender/receiver wait records share one publication
+transaction: an operation is linked before its observed condition can change,
+and removal publishes `EIDRM` before the id disappears. Queue changes retain a
+recheck edge beside one replaceable task waker, so completion before waker
+registration, repeated polls, and scheduler migration are lossless without the
+generic 1-ms I/O polling deadline; wakers fire only after the state lock is
+released. Queue removal wakes staged semaphore, sender, and receiver waits with
+`EIDRM`.
 Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
 `IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;
 owner, creator, mode, supplementary-group, queue-limit, metadata timestamp,

@@ -373,14 +373,18 @@ struct IpcWait {
     ipc_ns: u64,
     id: u64,
     errno: i64,
+    /// A queue transition made this operation worth re-evaluating.  This is
+    /// retained until the syscall re-executes, closing notify-before-waker-
+    /// registration without a polling deadline.
+    ready: bool,
+    /// The task's current scheduler waker. Replaced on repeated polls and
+    /// always fired after dropping the message-state lock.
+    waker: Option<Waker>,
     data: WaitData,
 }
 
-static IPC_WAITS: IrqSafeSpinLock<Option<BTreeMap<u64, IpcWait>>> = IrqSafeSpinLock::new(None);
-
 fn with_waits<R>(f: impl FnOnce(&mut BTreeMap<u64, IpcWait>) -> R) -> R {
-    let mut waits = IPC_WAITS.lock();
-    f(waits.get_or_insert_with(BTreeMap::new))
+    with_msg_state(|state| f(&mut state.waits))
 }
 
 fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
@@ -390,6 +394,8 @@ fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
             ipc_ns,
             id,
             errno: 0,
+            ready: false,
+            waker: None,
             data: WaitData::None,
         });
     });
@@ -402,6 +408,8 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
             ipc_ns,
             id,
             errno: 0,
+            ready: false,
+            waker: None,
             data: WaitData::MsgSend {
                 mtype,
                 payload,
@@ -429,7 +437,7 @@ fn copy_staged_sem_wait(
 
 fn staged_msg_send_wait(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>, u64)> {
     with_waits(|waits| {
-        let wait = waits.get(&task)?;
+        let wait = waits.get_mut(&task)?;
         if wait.kind != WaitKind::MsgSend
             || wait.ipc_ns != ipc_ns
             || wait.id != id
@@ -437,6 +445,7 @@ fn staged_msg_send_wait(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>
         {
             return None;
         }
+        wait.ready = false;
         match &wait.data {
             WaitData::MsgSend {
                 mtype,
@@ -448,15 +457,102 @@ fn staged_msg_send_wait(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MsgParkState {
+    NotWaiting,
+    Pending,
+    Ready,
+}
+
+/// Install one durable scheduler waker for a blocked message operation. A
+/// queue transition or terminal error that won before registration is returned
+/// as `Ready`, so the caller re-executes instead of sleeping for a timer poll.
+pub(crate) fn register_msg_wait_waker(task: u64, waker: Waker) -> MsgParkState {
+    let mut incoming = Some(waker);
+    let (state, replaced) = with_waits(|waits| match waits.get_mut(&task) {
+        Some(wait) if wait.errno != 0 || wait.ready => (MsgParkState::Ready, None),
+        Some(wait) => {
+            if wait
+                .waker
+                .as_ref()
+                .is_some_and(|old| old.will_wake(incoming.as_ref().expect("incoming waker")))
+            {
+                (MsgParkState::Pending, None)
+            } else {
+                (
+                    MsgParkState::Pending,
+                    core::mem::replace(&mut wait.waker, incoming.take()),
+                )
+            }
+        }
+        None => (MsgParkState::NotWaiting, None),
+    });
+    // Waker drops may release the final scheduler Arc; never do so under the
+    // IRQ-safe message-state lock.
+    drop(replaced);
+    drop(incoming);
+    state
+}
+
+fn notify_msg_waiters(state: &mut MsgState, kind: WaitKind, object: IpcObjectKey) {
+    for wait in state.waits.values_mut() {
+        if wait.kind == kind && (wait.ipc_ns, wait.id) == object && wait.errno == 0 {
+            wait.ready = true;
+        }
+    }
+}
+
+/// Error observed when a blocked message operation loses the queue lookup
+/// race against IPC_RMID.  The queue and terminal wait record live under the
+/// same lock, so checking both in one transaction preserves EIDRM even when
+/// removal occurs after the syscall's initial fast-path error check.
+fn missing_msg_queue_errno(
+    state: &MsgState,
+    task: u64,
+    kind: WaitKind,
+    object: IpcObjectKey,
+) -> i64 {
+    state
+        .waits
+        .get(&task)
+        .filter(|wait| wait.kind == kind && (wait.ipc_ns, wait.id) == object && wait.errno != 0)
+        .map_or(EINVAL, |wait| wait.errno)
+}
+
+/// Fire all message wakers whose condition changed. Taking one waker per lock
+/// acquisition keeps wake/drop paths outside the IRQ-disabled critical section
+/// without allocating a temporary wake vector.
+fn drain_msg_wakes() {
+    loop {
+        let waker = with_waits(|waits| {
+            waits
+                .values_mut()
+                .find(|wait| {
+                    wait.kind != WaitKind::Sem
+                        && (wait.errno != 0 || wait.ready)
+                        && wait.waker.is_some()
+                })
+                .and_then(|wait| wait.waker.take())
+        });
+        match waker {
+            Some(waker) => waker.wake(),
+            None => break,
+        }
+    }
+}
+
 fn clear_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
-    with_waits(|waits| {
+    let removed = with_waits(|waits| {
         if waits
             .get(&task)
             .is_some_and(|wait| wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id)
         {
-            waits.remove(&task);
+            waits.remove(&task)
+        } else {
+            None
         }
     });
+    drop(removed);
 }
 
 fn wait_active(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> bool {
@@ -468,32 +564,20 @@ fn wait_active(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> bool {
 }
 
 fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i64> {
-    with_waits(|waits| match waits.get(&task) {
+    let (errno, removed) = with_waits(|waits| match waits.get(&task) {
         Some(wait)
             if wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id && wait.errno != 0 =>
         {
             let errno = wait.errno;
-            waits.remove(&task);
-            Some(errno)
+            (Some(errno), waits.remove(&task))
         }
         Some(wait) if wait.kind != kind || wait.ipc_ns != ipc_ns || wait.id != id => {
-            waits.remove(&task);
-            None
+            (None, waits.remove(&task))
         }
-        _ => None,
-    })
-}
-
-fn mark_waiters_error(kind: WaitKind, ipc_ns: u64, id: u64, errno: i64) {
-    debug_assert!(kind != WaitKind::Sem);
-    with_waits(|waits| {
-        for wait in waits.values_mut() {
-            if wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id {
-                wait.errno = errno;
-            }
-        }
+        _ => (None, None),
     });
-    narf_net::readiness::notify(0);
+    drop(removed);
+    errno
 }
 
 #[doc(hidden)]
@@ -581,9 +665,8 @@ fn ensure_sem_undo_observer() {
 }
 
 fn ipc_thread_exit(_pid: u64, tid: u64) {
-    with_waits(|waits| {
-        waits.remove(&tid);
-    });
+    let removed = with_waits(|waits| waits.remove(&tid));
+    drop(removed);
     with_sem_state(|state| unlink_sem_wait(state, tid));
 }
 
@@ -1073,6 +1156,42 @@ fn park_sem_wait(ctx: &mut dyn TrapContext, timeout: Option<(i64, i64)>) -> SemP
         }
     }
     SemParkResult::Unavailable
+}
+
+/// Park a System V message sender/receiver on its durable wait record and
+/// re-execute the syscall after a targeted queue transition. Unlike the legacy
+/// generic I/O bridge this has no 1 ms polling deadline: registration rechecks
+/// `ready`/`errno` under the same lock that publishes queue mutations.
+fn park_msg_wait(ctx: &mut dyn TrapContext) -> bool {
+    if let (Some(user_task), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        const SYSCALL_INSN_LEN: u64 = 2;
+        #[cfg(target_arch = "aarch64")]
+        const SYSCALL_INSN_LEN: u64 = 4;
+        ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+        // SAFETY: current_user_task returns the live context for this trap.
+        let user = unsafe { &*user_task };
+        user.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+        user.futex_uaddr.store(0, Ordering::Release);
+        user.net_io_wait.store(false, Ordering::Release);
+        user.sem_wait_pending.store(false, Ordering::Release);
+        user.msg_wait_pending.store(true, Ordering::Release);
+        // SAFETY: the live UserTaskCtx is exclusively prepared for the same
+        // scheduler handoff used by semaphore waits and generic I/O waits.
+        unsafe {
+            ctx.save_user_state(user.state.get() as *mut u8);
+            *user.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                crate::handlers::own_stack_block(ctx);
+                return true;
+            }
+            hook(user_task);
+        }
+    }
+    false
 }
 
 /// `semget(key, nsems, semflg)`.
@@ -1835,7 +1954,13 @@ struct QueuedMessage {
     payload: Vec<u8>,
 }
 
-static MSGS: IrqSafeSpinLock<Option<BTreeMap<IpcObjectKey, MsgQueue>>> = IrqSafeSpinLock::new(None);
+#[derive(Default)]
+struct MsgState {
+    queues: BTreeMap<IpcObjectKey, MsgQueue>,
+    waits: BTreeMap<u64, IpcWait>,
+}
+
+static MSG_STATE: IrqSafeSpinLock<Option<MsgState>> = IrqSafeSpinLock::new(None);
 #[cfg(not(feature = "container"))]
 static MSG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MSG_MAX_BYTES: usize = 8192;
@@ -1844,9 +1969,13 @@ const MSG_NOERROR: i64 = 0o10000;
 const MSG_EXCEPT: i64 = 0o20000;
 const MSG_COPY: i64 = 0o40000;
 
+fn with_msg_state<R>(f: impl FnOnce(&mut MsgState) -> R) -> R {
+    let mut state = MSG_STATE.lock();
+    f(state.get_or_insert_with(MsgState::default))
+}
+
 fn with_msgs<R>(f: impl FnOnce(&mut BTreeMap<IpcObjectKey, MsgQueue>) -> R) -> R {
-    let mut g = MSGS.lock();
-    f(g.get_or_insert_with(BTreeMap::new))
+    with_msg_state(|state| f(&mut state.queues))
 }
 
 /// `msgget(key, msgflg)`.
@@ -1978,26 +2107,58 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
     };
     let msgsz = payload.len();
     let mut pending_payload = Some(payload);
-    let r: Result<bool, i64> = with_msgs(|m| {
-        let q = m.get_mut(&object).ok_or(EINVAL)?;
-        if !ipc_allowed(
-            caller_uid,
-            caller_gid,
-            &caller_groups,
-            q.uid,
-            q.gid,
-            q.cuid,
-            q.cgid,
-            q.mode,
-            0o2,
-        ) {
-            return Err(EACCES);
-        }
-        if msgsz.saturating_add(q.current_bytes) > q.max_bytes
-            || q.msgs.len().saturating_add(1) > q.max_bytes
-        {
+    let r: Result<bool, i64> = with_msg_state(|state| {
+        let fits = {
+            let Some(q) = state.queues.get_mut(&object) else {
+                return Err(missing_msg_queue_errno(
+                    state,
+                    task,
+                    WaitKind::MsgSend,
+                    object,
+                ));
+            };
+            if !ipc_allowed(
+                caller_uid,
+                caller_gid,
+                &caller_groups,
+                q.uid,
+                q.gid,
+                q.cuid,
+                q.cgid,
+                q.mode,
+                0o2,
+            ) {
+                return Err(EACCES);
+            }
+            msgsz.saturating_add(q.current_bytes) <= q.max_bytes
+                && q.msgs.len().saturating_add(1) <= q.max_bytes
+        };
+        if !fits {
+            if msgflg & IPC_NOWAIT as u64 == 0 {
+                state.waits.entry(task).or_insert_with(|| IpcWait {
+                    kind: WaitKind::MsgSend,
+                    ipc_ns,
+                    id: msqid,
+                    errno: 0,
+                    ready: false,
+                    waker: None,
+                    data: WaitData::MsgSend {
+                        mtype,
+                        payload: pending_payload.take().expect("blocked SysV message"),
+                        msgflg,
+                    },
+                });
+            }
             return Ok(false);
         }
+        let Some(q) = state.queues.get_mut(&object) else {
+            return Err(missing_msg_queue_errno(
+                state,
+                task,
+                WaitKind::MsgSend,
+                object,
+            ));
+        };
         q.msgs.try_reserve(1).map_err(|_| ENOMEM)?;
         q.msgs.push_back(QueuedMessage {
             mtype,
@@ -2006,11 +2167,13 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         q.current_bytes += msgsz;
         q.stime = now_seconds();
         q.last_send_pid = pid as i32;
+        notify_msg_waiters(state, WaitKind::MsgRecv, object);
         Ok(true)
     });
     match r {
         Ok(true) => {
             clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
+            drain_msg_wakes();
             narf_net::readiness::notify(0);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -2019,25 +2182,14 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
             ctx.set_return(err(EAGAIN));
         }
         Ok(false) => {
-            if crate::handlers::has_interrupting_signal(task) {
+            if let Some(errno) = take_wait_error(task, WaitKind::MsgSend, ipc_ns, msqid) {
+                ctx.set_return(err(errno));
+            } else if crate::handlers::has_interrupting_signal(task) {
                 clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
                 ctx.set_return(err(EINTR));
-            } else {
-                begin_msg_send_wait(
-                    task,
-                    ipc_ns,
-                    msqid,
-                    mtype,
-                    pending_payload.take().expect("blocked SysV message"),
-                    msgflg,
-                );
-                if !with_msgs(|queues| queues.contains_key(&object)) {
-                    clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
-                    ctx.set_return(err(EIDRM));
-                } else if !crate::handlers::park_reexecute_on_io(ctx) {
-                    clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
-                    ctx.set_return(err(EAGAIN));
-                }
+            } else if !park_msg_wait(ctx) {
+                clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
+                ctx.set_return(err(EAGAIN));
             }
         }
         Err(e) => {
@@ -2105,8 +2257,15 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
     // ownership of the payload here so ordinary receives need no heap copy.
     // MSG_COPY is deliberately non-destructive and therefore retains one
     // fallibly allocated snapshot outside the queue lock.
-    let picked = with_msgs(|m| {
-        let q = m.get_mut(&object).ok_or(EINVAL)?;
+    let picked = with_msg_state(|state| {
+        let Some(q) = state.queues.get_mut(&object) else {
+            return Err(missing_msg_queue_errno(
+                state,
+                task,
+                WaitKind::MsgRecv,
+                object,
+            ));
+        };
         if !ipc_allowed(
             caller_uid,
             caller_gid,
@@ -2146,7 +2305,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                     }
             })
         };
-        match idx {
+        let selected: Option<(i64, Vec<u8>)> = match idx {
             Some(i) => {
                 let msg = &q.msgs[i];
                 if msg.payload.len() > msgsz && flg & MSG_NOERROR == 0 {
@@ -2167,10 +2326,40 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                 q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
                 q.rtime = now_seconds();
                 q.last_recv_pid = pid as i32;
-                Ok(Some((msg.mtype, msg.payload)))
+                Some((msg.mtype, msg.payload))
             }
-            None => Ok(None),
+            None => None,
+        };
+        if selected.is_some() {
+            if flg & MSG_COPY == 0 {
+                notify_msg_waiters(state, WaitKind::MsgSend, object);
+            }
+        } else if flg & IPC_NOWAIT as i64 == 0 {
+            match state.waits.entry(task) {
+                alloc::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(IpcWait {
+                        kind: WaitKind::MsgRecv,
+                        ipc_ns,
+                        id: msqid,
+                        errno: 0,
+                        ready: false,
+                        waker: None,
+                        data: WaitData::None,
+                    });
+                }
+                alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let wait = entry.get_mut();
+                    if wait.kind == WaitKind::MsgRecv
+                        && wait.ipc_ns == ipc_ns
+                        && wait.id == msqid
+                        && wait.errno == 0
+                    {
+                        wait.ready = false;
+                    }
+                }
+            }
         }
+        Ok(selected)
     });
     let (mtype, payload) = match picked {
         Ok(Some(msg)) => msg,
@@ -2178,24 +2367,16 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             if flg & IPC_NOWAIT as i64 != 0 {
                 clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
                 ctx.set_return(err(ENOMSG));
+            } else if let Some(errno) = take_wait_error(task, WaitKind::MsgRecv, ipc_ns, msqid) {
+                ctx.set_return(err(errno));
             } else if crate::handlers::has_interrupting_signal(task) {
                 clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
                 ctx.set_return(err(EINTR));
             } else {
-                begin_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                let exists = with_msgs(|queues| queues.contains_key(&object));
-                match exists {
-                    false => {
-                        clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                        ctx.set_return(err(EIDRM));
-                    }
-                    true if !crate::handlers::park_reexecute_on_io(ctx) => {
-                        // Kernel-test contexts cannot sleep. Leave the receive
-                        // staged rather than returning IPC_NOWAIT's ENOMSG; a
-                        // later invocation retries after a sender publishes.
-                    }
-                    true => {}
-                }
+                // Kernel-test contexts cannot sleep. Leave the receive staged
+                // rather than returning IPC_NOWAIT's ENOMSG; a later invocation
+                // retries after a sender publishes.
+                let _ = park_msg_wait(ctx);
             }
             return;
         }
@@ -2208,6 +2389,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
     if flg & MSG_COPY == 0 {
         // As in Linux, publish freed queue capacity after unlocking and before
         // the potentially faulting userspace copy.
+        drain_msg_wakes();
         narf_net::readiness::notify(0);
     }
     let copied_len = core::cmp::min(payload.len(), msgsz);
@@ -2251,18 +2433,26 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
         IPC_RMID => {
-            let removed = with_msgs(|m| {
-                let q = m.get(&object).ok_or(EINVAL)?;
+            let removed = with_msg_state(|state| {
+                let q = state.queues.get(&object).ok_or(EINVAL)?;
                 if !ipc_owner(caller_uid, q.uid, q.cuid) {
                     return Err(EPERM);
                 }
-                m.remove(&object);
-                Ok(())
+                let queue = state.queues.remove(&object).ok_or(EINVAL)?;
+                for wait in state.waits.values_mut() {
+                    if wait.kind != WaitKind::Sem && (wait.ipc_ns, wait.id) == object {
+                        wait.errno = EIDRM;
+                    }
+                }
+                Ok(queue)
             });
             match removed {
-                Ok(()) => {
-                    mark_waiters_error(WaitKind::MsgSend, ipc_ns, msqid, EIDRM);
-                    mark_waiters_error(WaitKind::MsgRecv, ipc_ns, msqid, EIDRM);
+                Ok(queue) => {
+                    // Queue payload destruction and task wakeups can release
+                    // allocator/scheduler state; perform both after unlocking.
+                    drop(queue);
+                    drain_msg_wakes();
+                    narf_net::readiness::notify(0);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
                 Err(e) => ctx.set_return(err(e)),
@@ -2378,19 +2568,23 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let result = with_msgs(|m| {
-                let q = m.get_mut(&object).ok_or(EINVAL)?;
-                if !ipc_owner(caller_uid, q.uid, q.cuid) {
-                    return Err(EPERM);
+            let result = with_msg_state(|state| {
+                {
+                    let q = state.queues.get_mut(&object).ok_or(EINVAL)?;
+                    if !ipc_owner(caller_uid, q.uid, q.cuid) {
+                        return Err(EPERM);
+                    }
+                    if new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0 {
+                        return Err(EPERM);
+                    }
+                    q.uid = new_uid;
+                    q.gid = new_gid;
+                    q.mode = new_mode;
+                    q.max_bytes = usize::try_from(new_max).map_err(|_| EINVAL)?;
+                    q.ctime = now_seconds();
                 }
-                if new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0 {
-                    return Err(EPERM);
-                }
-                q.uid = new_uid;
-                q.gid = new_gid;
-                q.mode = new_mode;
-                q.max_bytes = usize::try_from(new_max).map_err(|_| EINVAL)?;
-                q.ctime = now_seconds();
+                notify_msg_waiters(state, WaitKind::MsgRecv, object);
+                notify_msg_waiters(state, WaitKind::MsgSend, object);
                 Ok(())
             });
             match result {
@@ -2400,6 +2594,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     // sentinel to userspace. A readiness bump retries both
                     // receivers (including stricter permissions) and senders
                     // that may now fit under a larger qbytes.
+                    drain_msg_wakes();
                     narf_net::readiness::notify(0);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
@@ -2428,13 +2623,16 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
         }
     });
     drain_sem_wakes();
-    with_msgs(|queues| queues.retain(|(namespace, _), _| *namespace != ipc_ns));
-    with_waits(|waits| {
-        for wait in waits.values_mut() {
+    with_msg_state(|state| {
+        state
+            .queues
+            .retain(|(namespace, _), _| *namespace != ipc_ns);
+        for wait in state.waits.values_mut() {
             if wait.ipc_ns == ipc_ns {
                 wait.errno = EIDRM;
             }
         }
     });
+    drain_msg_wakes();
     narf_net::readiness::notify(0);
 }
