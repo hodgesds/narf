@@ -118,10 +118,13 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 return;
             }
-            // Park on net-I/O readiness (a reader's drain wakes the writer
-            // promptly, ~1ms backstop) and RE-EXECUTE this write on resume.
-            // See `park_reexecute_on_io`.
-            if park_reexecute_on_io(ctx) {
+            // Arm the descriptor's durable readiness before parking so a
+            // pipe/FIFO drain wakes this writer without a global waiter scan.
+            if park_reexecute_on_fd(
+                ctx,
+                ops.as_ref(),
+                narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+            ) {
                 return;
             }
             // No executor (kernel-test context): fall back to a 0-byte write.

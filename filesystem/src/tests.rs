@@ -898,6 +898,32 @@ fn smoke_filesystem_fifo_peer_counts() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_fifo_peer_counts);
 
+/// Blocking open remembers a counterpart that opened and closed before the
+/// waiter ran. A level-only peer count loses this edge and can strand forever.
+fn smoke_filesystem_fifo_transient_peer_is_durable() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::FileOps;
+
+    let node = FifoNode::new(0x4001, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4001, 0o666, 0, 0, true, false);
+    if reader.peer_ready_or_seen() {
+        return TestResult::Fail("reader observed a writer before one opened");
+    }
+    {
+        let _writer =
+            crate::fifo::FifoHandle::open(shared.clone(), 0x4001, 0o666, 0, 0, false, true);
+    }
+    if !reader.peer_ready_or_seen() {
+        return TestResult::Fail("transient writer edge was lost after close");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_fifo_transient_peer_is_durable
+);
+
 /// Every in-memory directory must carry a unique, stable, nonzero inode so
 /// it is distinguishable from its parent. systemd's `rm_rf` refuses to
 /// descend when a directory and its parent share `(st_dev, st_ino)` (its

@@ -92,7 +92,11 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
                         ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                         return;
                     }
-                    if park_reexecute_on_io(ctx) {
+                    if park_reexecute_on_fd(
+                        ctx,
+                        ops.as_ref(),
+                        narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+                    ) {
                         return;
                     }
                 }

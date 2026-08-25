@@ -61,15 +61,14 @@ pub(crate) fn sys_vmsplice(ctx: &mut dyn TrapContext) {
     {
         vmsplice_from_pipe(ctx, read_end, &iov, nr, flags);
     } else {
-        vmsplice_to_pipe(ctx, task_id, fd, &iov, nr, flags);
+        vmsplice_to_pipe(ctx, ops.as_ref(), &iov, nr, flags);
     }
 }
 
 /// Gather user memory described by `iov` INTO the pipe write end `fd`.
 fn vmsplice_to_pipe(
     ctx: &mut dyn TrapContext,
-    task_id: u64,
-    fd: u32,
+    ops: &dyn narf_filesystem::FileOps,
     iov_buf: &[u8],
     nr: usize,
     flags: u64,
@@ -80,17 +79,18 @@ fn vmsplice_to_pipe(
     // wait_for_space), and parking here — before a single byte is written —
     // keeps the re-executed syscall idempotent (nothing has been consumed).
     // `SPLICE_F_NONBLOCK` short-circuits to -EAGAIN instead.
-    let pipe_full = fd::with_table(task_id, |t| {
-        t.get(fd).map(|e| {
-            e.ops.poll_readiness() & narf_filesystem::POLL_OUT == 0 && e.ops.write_should_block()
-        })
-    });
-    if let Some(Some(true)) = pipe_full {
+    let pipe_full =
+        ops.poll_readiness() & narf_filesystem::POLL_OUT == 0 && ops.write_should_block();
+    if pipe_full {
         if flags & SPLICE_F_NONBLOCK != 0 {
             ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
             return;
         }
-        if park_reexecute_on_io(ctx) {
+        if park_reexecute_on_fd(
+            ctx,
+            ops,
+            narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+        ) {
             return;
         }
         // Kernel-test context (no executor): fall through to a best-effort copy.
@@ -114,14 +114,10 @@ fn vmsplice_to_pipe(
                 break;
             }
         };
-        let w = fd::with_table(task_id, |t| {
-            let entry = t.get_mut(fd).ok_or(())?;
-            poll_blocking(entry.ops.write(0, &kbuf))
-                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-                .map_err(|_| ())
-        });
+        let w = poll_blocking(ops.write(0, &kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match w {
-            Some(Ok(n)) => {
+            Ok(n) => {
                 total = total.saturating_add(n);
                 if n < len {
                     break;
@@ -174,7 +170,11 @@ fn vmsplice_from_pipe(
                     ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                     return;
                 }
-                if park_reexecute_on_io(ctx) {
+                if park_reexecute_on_fd(
+                    ctx,
+                    pipe,
+                    narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                ) {
                     return;
                 }
                 // Kernel-test context (no executor): report the 0-byte drain.

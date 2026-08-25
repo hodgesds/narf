@@ -211,13 +211,14 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         Some(Ok((0, true, _))) => {
-            // Empty pipe, writer still open: park on net-I/O readiness (a
-            // peer's `write` → `notify(0)` wakes this read promptly, the
-            // ~1ms deadline is a backstop) and RE-EXECUTE the read on
-            // resume, so the read blocks until data arrives or the last
-            // writer closes rather than handing userspace a 0 it would
-            // mis-read as end-of-file. See `park_reexecute_on_io`.
-            if park_reexecute_on_io(ctx) {
+            // Arm this descriptor's durable readiness before parking. Pipes
+            // and FIFOs then wake only tasks waiting on this object; legacy
+            // descriptors retain the generation-guarded fallback.
+            if park_reexecute_on_fd(
+                ctx,
+                ops.as_ref(),
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+            ) {
                 return;
             }
             // No executor (kernel-test context): fall back to a 0 read.

@@ -38,6 +38,10 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     };
     let in_is_pipe = in_ops.stat().mode.file_type == narf_filesystem::FileType::Fifo;
     let out_is_pipe = out_ops.stat().mode.file_type == narf_filesystem::FileType::Fifo;
+    if fd_in == fd_out {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     if !in_is_pipe && !out_is_pipe {
         // fs/splice.c::__do_splice → -EINVAL when neither side is a pipe.
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
@@ -75,7 +79,11 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
             return;
         }
-        if park_reexecute_on_io(ctx) {
+        if park_reexecute_on_fd(
+            ctx,
+            out_ops.as_ref(),
+            narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+        ) {
             return;
         }
         // Kernel-test context: fall through and report the 0-byte copy.
@@ -87,7 +95,9 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     // explicit reservation/commit protocol before it can replace this path.
     let outcome = copy_fd_to_fd(task, fd_in, fd_out, off_in_ptr, off_out_ptr, len);
     match outcome {
-        Some(Err(narf_filesystem::FsError::WouldBlock))
+        Some(Err(CopyFdError::Fs(
+            narf_filesystem::FsError::WouldBlock,
+        )))
             if len > 0 && (in_is_pipe || out_is_pipe) =>
         {
             // Empty source or full sink with no progress consumes nothing, so
@@ -97,12 +107,28 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 return;
             }
-            if park_reexecute_on_io(ctx) {
+            let (wait_ops, interest) = if in_is_pipe
+                && in_ops.poll_readiness()
+                    & (narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP)
+                    == 0
+            {
+                (
+                    in_ops.as_ref(),
+                    narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                )
+            } else {
+                (
+                    out_ops.as_ref(),
+                    narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+                )
+            };
+            if park_reexecute_on_fd(ctx, wait_ops, interest) {
                 return;
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
         Some(Ok(total)) => ctx.set_return(SyscallReturn::ok(total as u64)),
+        Some(Err(CopyFdError::Fault)) => ctx.set_return(SyscallReturn::ok((-14i64) as u64)),
         Some(Err(_)) | None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
 }

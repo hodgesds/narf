@@ -1578,21 +1578,15 @@ fn open_fifo(
 /// the peer is present, else parks again on the ~1ms backstop.
 fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     let task = current_task_id();
-    // Read the handle's direction + peer counts through its shared buffer.
+    // The handle retains the counterpart edge observed before it published
+    // itself, so a peer open+close is not lost merely because its level is
+    // already clear when this task runs again.
     let ready = fd::with_table(task, |t| {
         t.get(fd).and_then(|e| {
-            let am = e.status_flags & crate::fd::O_ACCMODE;
-            e.ops.fifo_shared().map(|shared| {
-                // The pending open was, by construction, a single-direction
-                // blocking open: O_RDONLY waits for a writer, O_WRONLY for a
-                // reader. Its own handle is counted in exactly one of the peer
-                // totals, so "peer present" is "the OTHER side has >= 1".
-                if am == crate::fd::O_WRONLY {
-                    shared.reader_count() > 0
-                } else {
-                    shared.writer_count() > 0
-                }
-            })
+            e.ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+                .map(narf_filesystem::fifo::FifoHandle::peer_ready_or_seen)
         })
     })
     .flatten()
@@ -1618,7 +1612,43 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
 /// timer wheel remains only a ~1ms lost-wake backstop. Falls back to returning
 /// the fd in a non-executor (kernel-test) context.
 fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
-    if park_reexecute_on_io(ctx) {
+    let task = current_task_id();
+    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    if let Some(ops) = ops {
+        if let Some(handle) = ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+        {
+            if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
+                match handle.arm_peer(task, &waker) {
+                    Poll::Ready(()) => {
+                        if let Some(uctx) = crate::user_task::current_user_task() {
+                            // SAFETY: live per-task ctx; single-threaded syscall.
+                            unsafe {
+                                (*uctx).fifo_open_pending_fd.store(
+                                    0,
+                                    core::sync::atomic::Ordering::Release,
+                                );
+                            }
+                        }
+                        ctx.set_return(SyscallReturn::ok(fd as u64));
+                        return;
+                    }
+                    Poll::Pending => {
+                        let parked = park_reexecute_on_io(ctx);
+                        handle.disarm_peer(task);
+                        if parked {
+                            return;
+                        }
+                    }
+                }
+            } else if park_reexecute_on_io(ctx) {
+                return;
+            }
+        } else if park_reexecute_on_io(ctx) {
+            return;
+        }
+    } else if park_reexecute_on_io(ctx) {
         return;
     }
     // No executor (kernel-test): can't park; hand back the fd so the round
@@ -3055,6 +3085,11 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
 /// pread-style offset pointer (read from, updated, and the fd's own
 /// offset is left untouched); zero uses and advances the fd offset.
 /// Returns the bytes copied, or `None` on a bad fd / fault.
+enum CopyFdError {
+    Fs(narf_filesystem::FsError),
+    Fault,
+}
+
 fn copy_fd_to_fd(
     task: u64,
     in_fd: u32,
@@ -3062,12 +3097,15 @@ fn copy_fd_to_fd(
     in_off_ptr: u64,
     out_off_ptr: u64,
     count: usize,
-) -> Option<Result<usize, narf_filesystem::FsError>> {
+) -> Option<Result<usize, CopyFdError>> {
     let use_off_ptr = in_off_ptr != 0;
     let mut in_off: u64 = if use_off_ptr {
         // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
         // range-validates the 8-byte read.
-        let b = unsafe { copy_from_user_vec(in_off_ptr, 8) }.ok()?;
+        let b = match unsafe { copy_from_user_vec(in_off_ptr, 8) } {
+            Ok(bytes) => bytes,
+            Err(_) => return Some(Err(CopyFdError::Fault)),
+        };
         u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     } else {
         0
@@ -3075,11 +3113,37 @@ fn copy_fd_to_fd(
     let use_out_off_ptr = out_off_ptr != 0;
     let mut out_off: u64 = if use_out_off_ptr {
         // SAFETY: same guarded `off_t*` input contract as `in_off_ptr`.
-        let b = unsafe { copy_from_user_vec(out_off_ptr, 8) }.ok()?;
+        let b = match unsafe { copy_from_user_vec(out_off_ptr, 8) } {
+            Ok(bytes) => bytes,
+            Err(_) => return Some(Err(CopyFdError::Fault)),
+        };
         u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     } else {
         0
     };
+
+    // Snapshot the file objects and implicit positions, then drop the fd-table
+    // lock before any FileOps poll. A genuinely asynchronous filesystem may
+    // park in poll_blocking; doing that under the IRQ-disabling table lock
+    // deadlocks its completion path and every CLONE_FILES peer.
+    let snapshot = fd::with_table(task, |t| {
+        let input = t.get(in_fd)?;
+        let output = t.get(out_fd)?;
+        Some((
+            input.ops.clone(),
+            output.ops.clone(),
+            input.offset,
+            output.offset,
+        ))
+    })
+    .flatten()?;
+    let (input_ops, output_ops, input_offset, output_offset) = snapshot;
+    if !use_off_ptr {
+        in_off = input_offset;
+    }
+    if !use_out_off_ptr {
+        out_off = output_offset;
+    }
 
     let mut total = 0usize;
     // Transfer granularity for splice/sendfile/copy_file_range. Sized to a
@@ -3089,81 +3153,81 @@ fn copy_fd_to_fd(
     const CHUNK: usize = 65536;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let step = fd::with_table(task, |t| {
-            let (input, output) = t.get_pair_mut(in_fd, out_fd)?;
-            let input_ops = input.ops.clone();
-            let output_ops = output.ops.clone();
-            let step_out_off = if use_out_off_ptr {
-                out_off
-            } else {
-                output.offset
-            };
-
-            let moved = if let Some(pipe_in) = input_ops
+        let step_out_off = out_off;
+        let moved = if let Some(pipe_in) = input_ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        {
+            if let Some(pipe_out) = output_ops
                 .as_any()
-                .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
             {
-                if let Some(pipe_out) = output_ops
-                    .as_any()
-                    .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
-                {
-                    pipe_in.splice_to_pipe(pipe_out, want)
-                } else {
-                    pipe_in.splice_to_sink(want, |bytes| {
-                        // The source queue is locked until the accepted prefix
-                        // is committed. Never park an executor task while an
-                        // IRQ-disabling pipe lock is held.
-                        poll_once(output_ops.write(step_out_off, bytes))
-                            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
-                    })
-                }
+                pipe_in.splice_to_pipe(pipe_out, want)
             } else {
-                let result = (|| {
-                    let input_off = if use_off_ptr { in_off } else { input.offset };
-                    let mut kbuf = alloc::vec![0u8; want];
-                    let n = poll_blocking(input_ops.read(input_off, &mut kbuf))
-                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))?;
-                    kbuf.truncate(n);
-                    if n == 0 {
-                        return Ok(None);
+                pipe_in.splice_to_sink(want, |bytes| {
+                    // The source queue is locked until the accepted prefix is
+                    // committed. Never park while its IRQ-safe lock is held.
+                    poll_once(output_ops.write(step_out_off, bytes))
+                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+                })
+            }
+        } else {
+            let mut kbuf = alloc::vec![0u8; want];
+            let n = match poll_blocking(input_ops.read(in_off, &mut kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            {
+                Ok(n) => n,
+                Err(error) => {
+                    if total == 0 {
+                        return Some(Err(CopyFdError::Fs(error)));
                     }
-                    let written = poll_blocking(output_ops.write(step_out_off, &kbuf))
-                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))?;
-                    if written > n {
-                        return Err(narf_filesystem::FsError::InvalidData);
-                    }
-                    Ok(Some(written))
-                })();
-                match result {
-                    Ok(Some(written)) => Ok(written),
-                    Ok(None) => return Some(Ok((0, true))),
-                    Err(error) => Err(error),
+                    break;
                 }
             };
+            kbuf.truncate(n);
+            if n == 0 {
+                break;
+            }
+            match poll_blocking(output_ops.write(step_out_off, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            {
+                Ok(written) if written <= n => Ok(written),
+                Ok(_) => Err(narf_filesystem::FsError::InvalidData),
+                Err(error) => Err(error),
+            }
+        };
 
-            match moved {
-                Ok(written) => {
-                    if !use_off_ptr {
-                        input.offset = input.offset.saturating_add(written as u64);
-                    }
-                    if !use_out_off_ptr {
-                        output.offset = step_out_off.saturating_add(written as u64);
-                    }
-                    Some(Ok((written, false)))
-                }
-                Err(error) => Some(Err(error)),
-            }
-        })
-        .flatten()?;
-        let (moved, eof) = match step {
-            Ok(step) => step,
+        let moved = match moved {
+            Ok(moved) => moved,
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                return Some(Err(narf_filesystem::FsError::WouldBlock));
+                return Some(Err(CopyFdError::Fs(
+                    narf_filesystem::FsError::WouldBlock,
+                )));
             }
+            Err(error) if total == 0 => return Some(Err(CopyFdError::Fs(error))),
             Err(_) => break,
         };
-        if eof {
-            break;
+
+        // Commit implicit file positions only after the sink accepted the
+        // prefix. This lock section contains no FileOps call and cannot park.
+        if !use_off_ptr || !use_out_off_ptr {
+            let _ = fd::with_table(task, |t| {
+                if in_fd == out_fd {
+                    let entry = t.get_mut(in_fd)?;
+                    // Linux's two local positions advance by the same accepted
+                    // byte count and are copied back to one f_pos, not summed.
+                    entry.offset = entry.offset.saturating_add(moved as u64);
+                } else {
+                    let (input, output) = t.get_pair_mut(in_fd, out_fd)?;
+                    if !use_off_ptr {
+                        input.offset = input.offset.saturating_add(moved as u64);
+                    }
+                    if !use_out_off_ptr {
+                        output.offset = output.offset.saturating_add(moved as u64);
+                    }
+                }
+                Some(())
+            });
         }
         total += moved;
         in_off = in_off.saturating_add(moved as u64);
@@ -3176,12 +3240,16 @@ fn copy_fd_to_fd(
     if use_off_ptr {
         // SAFETY: `in_off_ptr` is the user `off_t*` (non-zero); copy_to_user
         // range-validates the 8-byte write-back of the advanced offset.
-        let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
+        if unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) }.is_err() {
+            return Some(Err(CopyFdError::Fault));
+        }
     }
     if use_out_off_ptr {
         // SAFETY: `out_off_ptr` was range-validated by the initial guarded
         // read; a racing unmap is still caught by the guarded write-back.
-        let _ = unsafe { copy_to_user(out_off_ptr, &out_off.to_ne_bytes()) };
+        if unsafe { copy_to_user(out_off_ptr, &out_off.to_ne_bytes()) }.is_err() {
+            return Some(Err(CopyFdError::Fault));
+        }
     }
     Some(Ok(total))
 }

@@ -30,6 +30,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::task::{Poll, Waker};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -46,6 +47,7 @@ const FIFO_BUF_BYTES: usize = 65536;
 /// this many bytes are atomic — `fs/pipe.c::pipe_write` writes nothing
 /// rather than splitting them across a partial buffer.
 const PIPE_BUF: usize = 4096;
+const PEER_PRESENT: u32 = 1;
 
 /// The shared, mutable state of a named pipe: the byte queue plus live
 /// reader/writer OPEN counts. Both counts are the per-open population of
@@ -60,6 +62,15 @@ pub struct FifoShared {
     readers: AtomicU32,
     /// Number of write-capable handles currently open (O_WRONLY + O_RDWR).
     writers: AtomicU32,
+    /// Combined readiness for every directional handle on this FIFO. Waiters
+    /// arm only the bits their handle can consume, so one shared cell mirrors
+    /// Linux's one wait-queue pair per pipe inode without a global wake scan.
+    readiness: narf_lib::readiness::Readiness,
+    /// Direction-specific presence cells for blocking-open rendezvous. A
+    /// separate cell per direction gives each waiter an independent edge
+    /// sequence, so an open+close that completes before it runs is durable.
+    reader_presence: narf_lib::readiness::Readiness,
+    writer_presence: narf_lib::readiness::Readiness,
 }
 
 impl FifoShared {
@@ -68,7 +79,40 @@ impl FifoShared {
             queue: IrqSafeSpinLock::new(VecDeque::with_capacity(FIFO_BUF_BYTES)),
             readers: AtomicU32::new(0),
             writers: AtomicU32::new(0),
+            readiness: narf_lib::readiness::Readiness::new(POLL_OUT | POLL_HUP | POLL_ERR),
+            reader_presence: narf_lib::readiness::Readiness::new(0),
+            writer_presence: narf_lib::readiness::Readiness::new(0),
         }
+    }
+
+    fn sync_readiness(&self) {
+        let q = self.queue.lock();
+        let mut mask = 0;
+        if !q.is_empty() {
+            mask |= POLL_IN;
+        }
+        if q.len() < FIFO_BUF_BYTES {
+            mask |= POLL_OUT;
+        }
+        if self.writers.load(Ordering::Acquire) == 0 {
+            mask |= POLL_HUP;
+        }
+        if self.readers.load(Ordering::Acquire) == 0 {
+            mask |= POLL_ERR;
+        }
+        drop(q);
+        self.readiness
+            .set(mask, (POLL_IN | POLL_OUT | POLL_HUP | POLL_ERR) & !mask);
+        let readers = self.readers.load(Ordering::Acquire);
+        let writers = self.writers.load(Ordering::Acquire);
+        self.reader_presence.set(
+            if readers != 0 { PEER_PRESENT } else { 0 },
+            if readers == 0 { PEER_PRESENT } else { 0 },
+        );
+        self.writer_presence.set(
+            if writers != 0 { PEER_PRESENT } else { 0 },
+            if writers == 0 { PEER_PRESENT } else { 0 },
+        );
     }
 
     /// Live count of write-capable openers — a reader at an empty buffer
@@ -199,6 +243,10 @@ pub struct FifoHandle {
     gid: u32,
     can_read: bool,
     can_write: bool,
+    /// Counterpart-presence edge observed before this handle published its own
+    /// direction. A changed edge completes a blocking open even if the peer
+    /// opened and closed before this task was scheduled.
+    peer_seq_at_open: u64,
 }
 
 impl core::fmt::Debug for FifoHandle {
@@ -262,12 +310,20 @@ impl FifoHandle {
         can_read: bool,
         can_write: bool,
     ) -> Self {
+        let peer_seq_at_open = if can_read && !can_write {
+            shared.writer_presence.seq()
+        } else if can_write && !can_read {
+            shared.reader_presence.seq()
+        } else {
+            0
+        };
         if can_read {
             shared.readers.fetch_add(1, Ordering::AcqRel);
         }
         if can_write {
             shared.writers.fetch_add(1, Ordering::AcqRel);
         }
+        shared.sync_readiness();
         FifoHandle {
             shared,
             _inode_owner: inode_owner,
@@ -277,6 +333,7 @@ impl FifoHandle {
             gid,
             can_read,
             can_write,
+            peer_seq_at_open,
         }
     }
 
@@ -284,6 +341,50 @@ impl FifoHandle {
     /// peer rendezvous in `sys_open` to poll the peer counts.
     pub fn shared(&self) -> &Arc<FifoShared> {
         &self.shared
+    }
+
+    fn peer_cell(&self) -> Option<&narf_lib::readiness::Readiness> {
+        if self.can_read && !self.can_write {
+            Some(&self.shared.writer_presence)
+        } else if self.can_write && !self.can_read {
+            Some(&self.shared.reader_presence)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a blocking single-direction open has observed its counterpart,
+    /// either as a current level or as a transient open+close edge.
+    pub fn peer_ready_or_seen(&self) -> bool {
+        self.peer_cell().is_none_or(|cell| {
+            cell.mask() & PEER_PRESENT != 0 || cell.seq() != self.peer_seq_at_open
+        })
+    }
+
+    /// Atomically arm a blocking-open waiter on counterpart presence. The
+    /// post-arm edge recheck closes a transient peer race that level alone
+    /// cannot represent.
+    pub fn arm_peer(&self, task_id: u64, waker: &Waker) -> Poll<()> {
+        let Some(cell) = self.peer_cell() else {
+            return Poll::Ready(());
+        };
+        if self.peer_ready_or_seen() {
+            return Poll::Ready(());
+        }
+        match cell.arm(task_id, PEER_PRESENT, waker) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending if cell.seq() != self.peer_seq_at_open => {
+                cell.disarm(task_id);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub fn disarm_peer(&self, task_id: u64) {
+        if let Some(cell) = self.peer_cell() {
+            cell.disarm(task_id);
+        }
     }
 }
 
@@ -298,6 +399,7 @@ impl Drop for FifoHandle {
         if self.can_write {
             self.shared.writers.fetch_sub(1, Ordering::AcqRel);
         }
+        self.shared.sync_readiness();
     }
 }
 
@@ -329,10 +431,11 @@ impl FileOps for FifoHandle {
                 };
             }
             let n = core::cmp::min(buf.len(), avail);
-            for slot in buf.iter_mut().take(n) {
-                // pop_front cannot fail: avail > 0 above.
-                *slot = q.pop_front().unwrap();
+            for (slot, byte) in buf.iter_mut().zip(q.drain(..n)) {
+                *slot = byte;
             }
+            drop(q);
+            self.shared.sync_readiness();
             Ok(n)
         })
     }
@@ -360,8 +463,10 @@ impl FileOps for FifoHandle {
                 return Ok(0);
             }
             let n = core::cmp::min(buf.len(), room);
-            for &b in buf.iter().take(n) {
-                q.push_back(b);
+            q.extend(buf[..n].iter().copied());
+            drop(q);
+            if n != 0 {
+                self.shared.sync_readiness();
             }
             Ok(n)
         })
@@ -409,6 +514,14 @@ impl FileOps for FifoHandle {
             }
         }
         mask
+    }
+
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.shared.readiness)
     }
 
     fn write_should_block(&self) -> bool {

@@ -91,6 +91,10 @@ pub trait FileOps {
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
+    fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
+        -> Option<Poll<u32>>;
+    fn disarm_readiness(&self, task_id: u64) -> bool;
 }
 
 pub enum FileType {
@@ -126,6 +130,12 @@ calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master
 and `/dev/fuse` returns a fresh FUSE daemon connection. The stable `/dev/fuse`
 clone node is mode 0666 so unprivileged filesystem and desktop-portal daemons
 can open it, matching Linux distribution tmpfiles/udev policy.
+
+Named FIFO handles share durable data-readiness state and direction-specific
+peer-presence cells. `FifoHandle::arm_peer`/`disarm_peer` key waiters by task;
+the handle snapshots the counterpart edge before publishing its own open count,
+so a peer that opens and closes before the waiter runs still completes the
+blocking `open`. Data reads/writes arm the ordinary per-file readiness cell.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
