@@ -1759,7 +1759,6 @@ kernel_test_in!(
 
 fn smoke_tlb_shootdown_local_only() -> TestResult {
     use crate::tlb_shootdown;
-    tlb_shootdown::__reset_for_test();
     let before = tlb_shootdown::shootdown_count();
     tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::full());
     tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::for_tag(7));
@@ -5392,8 +5391,7 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_counter_monotonic() -> TestResult {
-    use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest, __reset_for_test};
-    __reset_for_test();
+    use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest};
     let base = shootdown_count();
     shootdown(ShootdownRequest::full());
     shootdown(ShootdownRequest::for_tag(1));

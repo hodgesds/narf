@@ -643,3 +643,7 @@ argument = "Anonymous demand allocation reports reserve pressure only after canc
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The page-fault backpressure path allocates no memory and performs only a bounded fixed-table scan before switching out. It clears the per-CPU mempolicy publication before parking, invokes no wake callback while holding a waiter lock, and retries demand allocation at most once. Missing stackful context, full waiter capacity, non-pressure errors, and a second zero-progress failure all fail closed without sleeping or spinning, so trap progress cannot depend on an unbounded reclaim loop."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "TLB-shootdown verification no longer clears live SMP residency, idle, deferred-flush, or topology publication while scheduler CPUs may be active. Production residency filtering and the idle-to-busy debt handshake retain their sequentially consistent publication order; state-parameterized helpers expose that exact mechanism to isolated test atomics without granting new mapping authority or changing invalidation scope. The remaining live integration checks use monotonic counter deltas and a reserved tracked bucket, so they cannot erase another CPU's obligation or create a missed invalidation window."

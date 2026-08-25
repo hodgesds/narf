@@ -254,17 +254,22 @@ pub fn mark_idle(cpu: u32) {
 /// called *before* the new task's CR3 is loaded so the shootdown
 /// path doesn't elide an IPI to a CPU that's just become reachable.
 pub fn mark_busy(cpu: u32) {
-    if (cpu as usize) < MAX_CPUS {
-        let bit = 1u64 << cpu;
-        // Clear IDLE before claiming the deferred bit. The sender publishes a
-        // deferred bit and then rechecks IDLE; therefore a race is covered by
-        // either this local flush or a normal IPI rendezvous.
-        IDLE_MASK.fetch_and(!bit, Ordering::SeqCst);
-        if DEFERRED_FULL_FLUSH.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
-            apply_lazy_local_full();
-            LAZY_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
+    if (cpu as usize) < MAX_CPUS && take_deferred_on_busy(cpu, &IDLE_MASK, &DEFERRED_FULL_FLUSH) {
+        apply_lazy_local_full();
+        LAZY_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Clear one CPU's idle publication and atomically claim any deferred debt.
+/// Keeping the ordering in a state-parameterized helper lets kernel tests
+/// exercise the race protocol without rewriting live scheduler state.
+fn take_deferred_on_busy(cpu: u32, idle: &AtomicU64, deferred: &AtomicU64) -> bool {
+    let bit = 1u64 << cpu;
+    // Clear IDLE before claiming the deferred bit. The sender publishes a
+    // deferred bit and then rechecks IDLE; therefore a race is covered by
+    // either this local flush or a normal IPI rendezvous.
+    idle.fetch_and(!bit, Ordering::SeqCst);
+    deferred.fetch_and(!bit, Ordering::SeqCst) & bit != 0
 }
 
 /// Snapshot of the idle-mask.
@@ -290,17 +295,33 @@ fn residency_target_mask(req: ShootdownRequest) -> u64 {
 
     if let Some(tag) = req.tag {
         let bucket_bit = 1u64 << pcid_bucket(tag);
-        if TRACKED_BUCKETS.load(Ordering::Acquire) & bucket_bit != 0 {
+        let tracked = TRACKED_BUCKETS.load(Ordering::Acquire);
+        if tracked & bucket_bit != 0 {
             let mut residency = 0u64;
             for (cpu, slot) in ACTIVE_AS.iter().enumerate().take(MAX_CPUS) {
                 if slot.load(Ordering::Acquire) & bucket_bit != 0 {
                     residency |= 1u64 << (cpu & 63);
                 }
             }
-            targets &= residency;
+            targets = filter_residency_targets(req, targets, tracked, residency);
         }
     }
     targets
+}
+
+/// Apply the tracked-bucket residency filter to an already-bounded CPU mask.
+/// `residency` is the CPU mask for `req`'s bucket. This pure seam is also used
+/// by tests so they never need to clear live per-CPU residency publication.
+fn filter_residency_targets(
+    req: ShootdownRequest,
+    candidates: u64,
+    tracked: u64,
+    residency: u64,
+) -> u64 {
+    match req.tag {
+        Some(tag) if tracked & (1u64 << pcid_bucket(tag)) != 0 => candidates & residency,
+        _ => candidates,
+    }
 }
 
 /// Compute the peer-CPU IPI target mask for `req`. Algorithm:
@@ -414,16 +435,7 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
 
     let candidates = residency_target_mask(residency);
     #[cfg(target_arch = "x86_64")]
-    let targets = {
-        let idle = IDLE_MASK.load(Ordering::SeqCst);
-        let deferred = candidates & idle;
-        if deferred != 0 {
-            DEFERRED_FULL_FLUSH.fetch_or(deferred, Ordering::SeqCst);
-        }
-        // Recheck after publishing deferred work. If a CPU raced busy before
-        // observing its bit, it appears here and receives the ordinary IPI.
-        candidates & !IDLE_MASK.load(Ordering::SeqCst)
-    };
+    let targets = defer_idle_targets(candidates, &IDLE_MASK, &DEFERRED_FULL_FLUSH);
     #[cfg(not(target_arch = "x86_64"))]
     let targets = candidates;
     if targets == 0 {
@@ -433,6 +445,19 @@ fn dispatch_remote(payload: ShootdownRequest, residency: ShootdownRequest) {
     FILTERED_TARGETS.fetch_add(targets.count_ones() as u64, Ordering::Relaxed);
     IPI_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed);
     ipi_fanout(payload, targets);
+}
+
+/// Publish full-flush debt for currently idle candidates, then recheck the
+/// idle mask. A CPU racing busy either claims the debt or remains in the
+/// returned IPI mask.
+#[cfg(target_arch = "x86_64")]
+fn defer_idle_targets(candidates: u64, idle: &AtomicU64, deferred: &AtomicU64) -> u64 {
+    let idle_snapshot = idle.load(Ordering::SeqCst);
+    let debt = candidates & idle_snapshot;
+    if debt != 0 {
+        deferred.fetch_or(debt, Ordering::SeqCst);
+    }
+    candidates & !idle.load(Ordering::SeqCst)
 }
 
 #[inline]
@@ -555,58 +580,23 @@ fn apply_local(req: ShootdownRequest) {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_local(_req: ShootdownRequest) {}
 
-#[doc(hidden)]
-pub fn __reset_for_test() {
-    SHOOTDOWN_COUNT.store(0, Ordering::Release);
-    LOCAL_ONLY_COUNT.store(0, Ordering::Release);
-    IPI_FANOUT_COUNT.store(0, Ordering::Release);
-    BROADCAST_BUDGET.store(0, Ordering::Release);
-    FILTERED_TARGETS.store(0, Ordering::Release);
-    for cell in ACTIVE_AS.iter() {
-        cell.store(0, Ordering::Release);
-    }
-    TRACKED_BUCKETS.store(0, Ordering::Release);
-    IDLE_MASK.store(0, Ordering::Release);
-    DEFERRED_FULL_FLUSH.store(0, Ordering::Release);
-    LAZY_FLUSH_COUNT.store(0, Ordering::Release);
-}
-
 // ── Tests ────────────────────────────────────────────────────────
 //
 // Kernel-runner-visible tests (registered via `kernel_test_in!`).
-// These run inside the live kernel binary, so they share global
-// state with whatever else has touched the bitmap -- every test
-// calls `__reset_for_test` first.
+// These run inside the live SMP kernel. They must never reset ACTIVE_AS,
+// TRACKED_BUCKETS, IDLE_MASK, or deferred debt: doing so can erase a live
+// scheduler publication and turn a test fixture into a missed shootdown.
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_tlb_shootdown_empty_bitmap_broadcasts() -> TestResult {
-    // Pre-scheduler boot: no CPU has populated its ACTIVE_AS bitmap.
-    // A tag-scoped shootdown's target mask must be exactly the
-    // "all online minus self" set -- the filter does NOT activate
-    // until at least one CPU has reported residency.
-    __reset_for_test();
+    // Model pre-scheduler boot without clearing the live kernel's publication
+    // state. An untracked bucket must retain every candidate even when its
+    // residency mask is empty.
     let req = ShootdownRequest::for_va(7, 0x1000);
-    let mask = shootdown_target_mask(req);
-    // In the test environment we're single-CPU (BSP), so the mask
-    // collapses to zero by virtue of `online & !self`. The shape
-    // we check is that an empty active-AS bitmap doesn't *increase*
-    // the broadcast scope, i.e. mask is a subset of online & !self,
-    // and that shootdown counts the request as "no peers" rather
-    // than panicking.
-    let online = narf_lib::smp::online_bitmap();
-    let self_cpu = narf_lib::percpu::current_cpu();
-    let self_bit = 1u64 << (self_cpu & 63);
-    if mask & !(online & !self_bit) != 0 {
-        return TestResult::Fail("empty bitmap broadened the target mask");
-    }
-    // Confirm shootdown itself works end-to-end without crashing
-    // and bumps the counter exactly once.
-    let before = shootdown_count();
-    shootdown(req);
-    let after = shootdown_count();
-    if after - before != 1 {
-        return TestResult::Fail("shootdown_count did not advance");
+    let candidates = 0xA5A5_5A5A_F0F0_0F0Fu64;
+    if filter_residency_targets(req, candidates, 0, 0) != candidates {
+        return TestResult::Fail("untracked empty bucket did not broadcast");
     }
     TestResult::Pass
 }
@@ -616,40 +606,20 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_active_as_filter_skips_unaffected() -> TestResult {
-    let _topology = narf_lib::smp::__reset_for_test_scoped();
-    // Use IDs outside the live 16-CPU QEMU topology so scheduler idle-state
-    // publication by a genuine AP cannot perturb this structural mask test.
     const CPU_A: u32 = 62;
     const CPU_B: u32 = 63;
-    narf_lib::smp::__test_fake_online(CPU_A);
-    narf_lib::smp::__test_fake_online(CPU_B);
-    __reset_for_test();
-    // CPU A advertises PCID 7 (bucket 7).
-    set_active_as(CPU_A, 7);
-    // CPU B advertises PCID 5 (bucket 5).
-    set_active_as(CPU_B, 5);
-    // Sanity: bitmap accessors reflect what we just published.
-    if active_as_bitmap(CPU_A) & (1u64 << 7) == 0 {
-        return TestResult::Fail("CPU A didn't latch PCID 7 bucket");
-    }
-    if active_as_bitmap(CPU_B) & (1u64 << 5) == 0 {
-        return TestResult::Fail("CPU B didn't latch PCID 5 bucket");
-    }
-    // CPU A's PCID-7 residency must not leak into bucket 5.
-    if active_as_bitmap(CPU_A) & (1u64 << 5) != 0 {
-        return TestResult::Fail("CPU A falsely advertises bucket 5");
-    }
-    let mask = residency_target_mask(ShootdownRequest::for_va(5, 0x4000));
+    let candidates = (1u64 << CPU_A) | (1u64 << CPU_B);
+    let tracked = (1u64 << 5) | (1u64 << 7);
+    let residency = 1u64 << CPU_B;
+    let mask = filter_residency_targets(
+        ShootdownRequest::for_va(5, 0x4000),
+        candidates,
+        tracked,
+        residency,
+    );
     if mask & (1u64 << CPU_A) != 0 || mask & (1u64 << CPU_B) == 0 {
         return TestResult::Fail("tracked bucket did not select exact resident peer");
     }
-    // Filter consistency: clearing CPU B must drop its bucket-5
-    // residency.
-    clear_active_as(CPU_B, 5);
-    if active_as_bitmap(CPU_B) & (1u64 << 5) != 0 {
-        return TestResult::Fail("clear_active_as didn't take effect");
-    }
-    __reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!(
@@ -659,40 +629,37 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_tlb_shootdown_tracked_empty_and_idle_defer() -> TestResult {
-    let _topology = narf_lib::smp::__reset_for_test_scoped();
     const PEER_CPU: u32 = 63;
-    narf_lib::smp::__test_fake_online(PEER_CPU);
-    __reset_for_test();
-
     let peer = 1u64 << PEER_CPU;
     // An unrelated tracked bucket must not disable bootstrap broadcast for a
     // bucket whose loads have never been published.
-    set_active_as(PEER_CPU, 0);
-    if residency_target_mask(ShootdownRequest::for_va(7, 0x4000)) & peer == 0 {
+    let tracked = 1u64;
+    if filter_residency_targets(ShootdownRequest::for_va(7, 0x4000), peer, tracked, 0) & peer == 0 {
         return TestResult::Fail("unrelated tracking suppressed bootstrap broadcast");
     }
 
     // Once PCID 0 is tracked, clearing its only resident makes an empty mask
     // authoritative rather than falling back to all peers.
-    clear_active_as(PEER_CPU, 0);
-    if residency_target_mask(ShootdownRequest::for_va(0, 0x4000)) & peer != 0 {
+    if filter_residency_targets(ShootdownRequest::for_va(0, 0x4000), peer, tracked, 0) & peer != 0 {
         return TestResult::Fail("tracked empty bucket fell back to broadcast");
     }
 
-    // An idle resident does not receive an IPI; it owes one full local flush
-    // that mark_busy must discharge before its next context load.
-    set_active_as(PEER_CPU, 0);
-    mark_idle(PEER_CPU);
-    let before = lazy_flush_count();
-    shootdown_remote(ShootdownRequest::for_range(0, 0x8000, 4));
-    if deferred_flush_mask() & peer == 0 {
+    // Exercise the sender/waker handshake on local atomics. Tests must not
+    // forge a live CPU id then call mark_busy for it from the BSP: the flush
+    // is CPU-local, so that old fixture proved the wrong processor flushed.
+    let idle = AtomicU64::new(peer);
+    let deferred = AtomicU64::new(0);
+    if defer_idle_targets(peer, &idle, &deferred) != 0
+        || deferred.load(Ordering::Acquire) & peer == 0
+    {
         return TestResult::Fail("idle target did not acquire deferred flush debt");
     }
-    mark_busy(PEER_CPU);
-    if deferred_flush_mask() & peer != 0 || lazy_flush_count() != before + 1 {
+    if !take_deferred_on_busy(PEER_CPU, &idle, &deferred)
+        || idle.load(Ordering::Acquire) & peer != 0
+        || deferred.load(Ordering::Acquire) & peer != 0
+    {
         return TestResult::Fail("mark_busy did not discharge deferred flush debt");
     }
-    __reset_for_test();
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -742,7 +709,6 @@ fn smoke_tlb_shootdown_batched_range_encodes_one_request() -> TestResult {
     // The whole point of batching: N-page invalidation produces a
     // *single* ShootdownRequest (and therefore a single IPI fan-out
     // call), not N requests.
-    __reset_for_test();
     let before = shootdown_count();
     shootdown_range(
         /* pcid */ 9, /* va */ 0x10_0000, /* pages */ 16,
@@ -766,19 +732,24 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_idle_mask_round_trip() -> TestResult {
-    // Stay outside the live QEMU topology: a real AP may concurrently publish
-    // its scheduler idle state and race this structural bitmap assertion.
-    const TEST_CPU: u32 = (MAX_CPUS - 1) as u32;
-    __reset_for_test();
-    if idle_mask() != 0 {
-        return TestResult::Fail("idle_mask not zero after reset");
+    // Exercise the calling CPU: mark_busy's deferred flush is local and must
+    // never be invoked for a made-up peer from this CPU. Evaluate both states
+    // before returning so even a failed assertion leaves this CPU busy.
+    let cpu = narf_lib::percpu::current_cpu() as u32;
+    let bit = 1u64 << cpu;
+    mark_busy(cpu);
+    let initially_busy = idle_mask() & bit == 0;
+    mark_idle(cpu);
+    let became_idle = idle_mask() & bit != 0;
+    mark_busy(cpu);
+    let became_busy = idle_mask() & bit == 0;
+    if !initially_busy {
+        return TestResult::Fail("mark_busy did not establish the initial busy state");
     }
-    mark_idle(TEST_CPU);
-    if idle_mask() & (1u64 << TEST_CPU) == 0 {
+    if !became_idle {
         return TestResult::Fail("mark_idle didn't set bit");
     }
-    mark_busy(TEST_CPU);
-    if idle_mask() & (1u64 << TEST_CPU) != 0 {
+    if !became_busy {
         return TestResult::Fail("mark_busy didn't clear bit");
     }
     TestResult::Pass
@@ -790,38 +761,26 @@ kernel_test_in!(
 
 fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
     // The IPI-reduction headline: when no peer CPU holds an
-    // affected mapping, every shootdown collapses to a local
-    // INVPCID and shows up as a +1 in local_only_count with a
-    // 0-bit in FILTERED_TARGETS. Force the online-CPU bitmap to
-    // a single CPU for the test so the filter has a non-trivial
-    // input to work with — the test runs after AP bring-up, where
-    // online_bitmap() returns multiple bits and an empty ACTIVE_AS
-    // would otherwise leave peers in the target set.
-    let online_before = narf_lib::smp::online_bitmap();
-    let count_before = narf_lib::smp::cpu_count();
-    narf_lib::smp::__reset_for_test();
-    __reset_for_test();
+    // affected mapping, every shootdown collapses to a local INVPCID and
+    // shows up as a +1 in local_only_count. Bucket 63 is unused by production
+    // (process roots publish PCID 0); marking it tracked is monotonic and safe
+    // because any future load must publish residency before its context load.
+    const TEST_TAG: u16 = 63;
+    let bucket = 1u64 << pcid_bucket(TEST_TAG);
+    TRACKED_BUCKETS.fetch_or(bucket, Ordering::Release);
+    if ACTIVE_AS
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) & bucket != 0)
+    {
+        return TestResult::Skip("test PCID bucket is live");
+    }
     let before_local = local_only_count();
     let before_targets = filtered_targets();
-    shootdown(ShootdownRequest::for_va(7, 0x4000));
-    shootdown(ShootdownRequest::for_tag(11));
-    shootdown_range(3, 0x8000, 4);
+    shootdown(ShootdownRequest::for_va(TEST_TAG, 0x4000));
+    shootdown(ShootdownRequest::for_tag(TEST_TAG));
+    shootdown_range(TEST_TAG, 0x8000, 4);
     let after_local = local_only_count();
     let after_targets = filtered_targets();
-    // Restore the real SMP topology so downstream tests see the
-    // live CPU set.
-    narf_lib::smp::set_cpu_count(count_before);
-    for bit in 0..64u32 {
-        if (online_before >> bit) & 1 != 0 {
-            // SAFETY: restoring the topology snapshot captured at
-            // the top of the test; identity remains the same CPU
-            // we observed online a few instructions ago.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_lib::smp::mark_online(bit);
-            }
-        }
-    }
     if after_local - before_local != 3 {
         return TestResult::Fail("local_only_count didn't advance by 3");
     }
