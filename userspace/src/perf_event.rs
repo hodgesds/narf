@@ -4196,7 +4196,6 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let cloexec = (flags & 8) != 0; // PERF_FLAG_FD_CLOEXEC
     let install_flags = if cloexec { fd::FD_CLOEXEC } else { 0 };
 
-    let mut opened_file = None;
     let fd_num_opt = fd::with_table(task, |t| {
         // A group member is scheduled only through its leader even when its
         // own disabled bit is clear (the upstream CLI relies on this).
@@ -4269,26 +4268,23 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 event.add_group_member(&ops);
             }
         }
-        let result = t.open(FdEntry {
+        // Publish the registry entry and active gate before the fd becomes
+        // visible. CLONE_FILES peers serialize on this table lock, so none can
+        // use the new fd while sideband hooks still see the dormant fast path.
+        file.registered.store(true, Ordering::Release);
+        PERF_EVENT_REGISTRY.lock().push(Arc::downgrade(&file));
+        if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Release) == 0 {
+            narf_lib::perf::set_enabled(true);
+        }
+        t.open(FdEntry {
             ops,
             offset: 0,
             flags: install_flags,
             status_flags: 0,
-        });
-        opened_file = Some(file);
-        result
+        })
     });
 
     if let Some(fd_num) = fd_num_opt {
-        // Mark registration before publishing the global enabled bit. The fd table
-        // owns another Arc, so this file remains alive after `opened_file` drops.
-        if let Some(file) = opened_file {
-            file.registered.store(true, Ordering::Release);
-            PERF_EVENT_REGISTRY.lock().push(Arc::downgrade(&file));
-        }
-        if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Relaxed) == 0 {
-            narf_lib::perf::set_enabled(true);
-        }
         ctx.set_return(SyscallReturn::ok(fd_num as u64));
     } else {
         // No fd table exists for the current task, so the closure never took
