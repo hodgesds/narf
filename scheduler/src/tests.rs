@@ -590,10 +590,10 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
 
     // This test commandeers CPU 1 as a FAKE idle-halted AP
     // (`__test_fake_online` + `__test_set_cpu_halted`) and asserts against
-    // the GLOBAL resched counters. Both only hold when no REAL AP is live:
+    // the aggregate resched counters. Both only hold when no REAL AP is live:
     // at SMP>1 CPU 1 is a genuine core that manages its own `CPU_HALTED`
-    // bit and issues its own reschedules, and every other AP bumps the
-    // shared `RESCHED_SENT`/`SKIP` counters concurrently — so the faked
+    // bit and issues its own reschedules, and every other AP advances its
+    // per-CPU resched counters concurrently — so the aggregate
     // state and the counter deltas are both polluted (the negative
     // "running target sent no IPI" assertion false-fails). The kick logic
     // itself is exercised for real by the condbcast/futex_contend cases at
@@ -601,7 +601,7 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
     // deterministically, which is only possible at SMP=1.
     if narf_lib::smp::online_count() > 1 {
         return TestResult::Skip(
-            "needs SMP=1 — a live AP pollutes CPU_HALTED[1] and the global resched counters",
+            "needs SMP=1 — a live AP pollutes CPU_HALTED[1] and the aggregate resched counters",
         );
     }
     // The online bitmap alone is NOT a sound guard: it is fakeable test

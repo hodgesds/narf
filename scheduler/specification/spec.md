@@ -119,6 +119,8 @@ enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
+Forward-progress and remote-reschedule telemetry is cache-line-isolated per CPU
+on update and aggregated across CPUs only for watchdog or test snapshots.
 Ordinary background task polls deliberately do not advance it: scheduler churn
 must not hide a foreground task that has stopped making useful progress.
 The three `dbg_*` functions are bounded, read-only fatal-watchdog snapshots.

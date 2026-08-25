@@ -625,19 +625,43 @@ fn arm_idle_backstop_ms(ms: u64) {
     arm_scheduler_deadline(deadline);
 }
 
-/// Reschedule the owner of a just-woken task: if it lives on a DIFFERENT
-/// CPU that is currently halted, IPI that CPU so it re-runs its round
-/// now. Same-CPU or running-CPU wakes need nothing (the run loop's
-/// pre-halt scan catches them). Dekker fence pairs with the idle side.
-/// Diagnostic counters for the cross-core wake path (read by the stall
-/// watchdog). `SENT` = resched IPIs actually fired (target was halted);
-/// `SKIP` = cross-core wakes where the target was NOT halted so no IPI was
-/// sent (relied on the target's pre-halt re-scan). A wedge with SENT≈0 ⇒
-/// wakes race the halt (Dekker miss); SENT≫0 but the AP stays halted ⇒ the
-/// IPI is sent but doesn't wake it (delivery/handler issue).
-static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
-static RESCHED_SKIP: AtomicU64 = AtomicU64::new(0);
-static FORWARD_PROGRESS: AtomicU64 = AtomicU64::new(0);
+/// Cache-line-isolated read-only telemetry written by the executing CPU.
+/// Watchdog and test readers aggregate all CPUs only when they need a snapshot,
+/// keeping remote-wake and bounded-completion paths off shared counter lines.
+#[repr(C, align(64))]
+struct SchedulerTelemetry {
+    resched_sent: AtomicU64,
+    resched_skip: AtomicU64,
+    forward_progress: AtomicU64,
+    _pad: [u8; 40],
+}
+
+impl SchedulerTelemetry {
+    const fn new() -> Self {
+        Self {
+            resched_sent: AtomicU64::new(0),
+            resched_skip: AtomicU64::new(0),
+            forward_progress: AtomicU64::new(0),
+            _pad: [0; 40],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SchedulerTelemetry>() == 64);
+
+static SCHEDULER_TELEMETRY: [SchedulerTelemetry; narf_lib::percpu::MAX_CPUS] =
+    [const { SchedulerTelemetry::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn local_scheduler_telemetry() -> &'static SchedulerTelemetry {
+    &SCHEDULER_TELEMETRY[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+fn sum_scheduler_telemetry(select: fn(&SchedulerTelemetry) -> &AtomicU64) -> u64 {
+    SCHEDULER_TELEMETRY.iter().fold(0u64, |total, cpu| {
+        total.wrapping_add(select(cpu).load(Ordering::Relaxed))
+    })
+}
 
 /// Publish a completed unit of kernel work to fatal-path watchdogs.
 ///
@@ -646,19 +670,21 @@ static FORWARD_PROGRESS: AtomicU64 = AtomicU64::new(0);
 /// bounded completions so watchdogs distinguish that work from a true stall.
 #[inline]
 pub fn note_forward_progress() {
-    FORWARD_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    local_scheduler_telemetry()
+        .forward_progress
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
 pub fn forward_progress_count() -> u64 {
-    FORWARD_PROGRESS.load(Ordering::Relaxed)
+    sum_scheduler_telemetry(|cpu| &cpu.forward_progress)
 }
 
 /// `(resched_ipis_sent, cross_core_wakes_skipped_not_halted)`.
 pub fn dbg_resched_counts() -> (u64, u64) {
     (
-        RESCHED_SENT.load(Ordering::Relaxed),
-        RESCHED_SKIP.load(Ordering::Relaxed),
+        sum_scheduler_telemetry(|cpu| &cpu.resched_sent),
+        sum_scheduler_telemetry(|cpu| &cpu.resched_skip),
     )
 }
 
@@ -682,10 +708,14 @@ fn resched_remote(target_cpu: u32) {
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
     if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
-        RESCHED_SKIP.fetch_add(1, Ordering::Relaxed);
+        local_scheduler_telemetry()
+            .resched_skip
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    RESCHED_SENT.fetch_add(1, Ordering::Relaxed);
+    local_scheduler_telemetry()
+        .resched_sent
+        .fetch_add(1, Ordering::Relaxed);
     let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` was set by `set_resched_ipi_hook` from a `fn(u32)`.
