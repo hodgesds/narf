@@ -23,7 +23,11 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
@@ -79,14 +83,26 @@ impl core::fmt::Debug for Entry {
 }
 
 // Keep entries indirect: stressors can have thousands of live SysV segments,
-// and a Vec<Entry> growth otherwise requires one high-order contiguous kernel
-// heap allocation (160 KiB at 2,048 entries). The pointer vector's growth is
-// ten times smaller while each entry remains a small independent allocation.
-// `clippy::vec_box` flags the Box as redundant, but the indirection is the
-// whole point here — it is what keeps the vector's backing small.
+// while each entry remains a small independent allocation.  The secondary
+// indexes keep handle, backing-frame, owner-exit, and SHM_LOCK-accounting
+// operations from scanning every live and IPC_RMID-retained segment.
 #[allow(clippy::vec_box)]
-static REGISTRY: IrqSafeSpinLock<Vec<Box<Entry>>> = IrqSafeSpinLock::new(Vec::new());
+#[derive(Default)]
+struct Registry {
+    entries: BTreeMap<u64, Box<Entry>>,
+    frames: BTreeMap<u64, (u64, usize)>,
+    owners: BTreeMap<u64, BTreeSet<u64>>,
+    locked_bytes: BTreeMap<(u64, u32), u64>,
+    live: usize,
+}
+
+static REGISTRY: IrqSafeSpinLock<Option<Registry>> = IrqSafeSpinLock::new(None);
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    let mut registry = REGISTRY.lock();
+    f(registry.get_or_insert_with(Registry::default))
+}
 
 /// Allocate a fresh shared-memory region of `len` bytes (rounded
 /// up to a page). Returns the new handle id (>0).
@@ -123,7 +139,7 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         frames.push(phys);
     }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    REGISTRY.lock().push(Box::new(Entry {
+    let entry = Box::new(Entry {
         handle,
         pid,
         frames,
@@ -131,7 +147,21 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         len: len_pg,
         locked_user: None,
         removed: false,
-    }));
+    });
+    with_registry(|registry| {
+        for (page, phys) in entry.frames.iter().copied().enumerate() {
+            assert!(
+                registry.frames.insert(phys, (handle, page)).is_none(),
+                "shmem frame already indexed"
+            );
+        }
+        registry.owners.entry(pid).or_default().insert(handle);
+        registry.live = registry.live.checked_add(1).expect("shmem live overflow");
+        assert!(
+            registry.entries.insert(handle, entry).is_none(),
+            "duplicate shmem handle"
+        );
+    });
     Ok(handle)
 }
 
@@ -141,7 +171,7 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
 /// bad handle or out-of-range offset.
 pub fn phys_at(handle: u64, byte_offset: u64) -> Option<u64> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
+    let e = g.as_ref()?.entries.get(&handle).filter(|e| !e.removed)?;
     if byte_offset >= e.len {
         return None;
     }
@@ -173,7 +203,7 @@ pub struct SgEntry {
 /// - `(frame1, 7000 - 3996 = 3004)`
 pub fn sg_iter(handle: u64, byte_offset: u64, byte_len: u64) -> Option<SgIter> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
+    let e = g.as_ref()?.entries.get(&handle).filter(|e| !e.removed)?;
     let end = byte_offset.checked_add(byte_len)?;
     if end > e.len {
         return None;
@@ -218,7 +248,7 @@ impl Iterator for SgIter {
 /// that installs the user-VA mapping.
 pub fn frames_of(handle: u64) -> Option<Vec<PhysAddr>> {
     let g = REGISTRY.lock();
-    let e = g.iter().find(|e| e.handle == handle && !e.removed)?;
+    let e = g.as_ref()?.entries.get(&handle).filter(|e| !e.removed)?;
     Some(e.frames.iter().copied().map(PhysAddr::new).collect())
 }
 
@@ -226,8 +256,10 @@ pub fn frames_of(handle: u64) -> Option<Vec<PhysAddr>> {
 pub fn len_of(handle: u64) -> Option<u64> {
     REGISTRY
         .lock()
-        .iter()
-        .find(|e| e.handle == handle && !e.removed)
+        .as_ref()?
+        .entries
+        .get(&handle)
+        .filter(|e| !e.removed)
         .map(|e| e.len)
 }
 
@@ -235,8 +267,10 @@ pub fn len_of(handle: u64) -> Option<u64> {
 pub fn pid_of(handle: u64) -> Option<u64> {
     REGISTRY
         .lock()
-        .iter()
-        .find(|e| e.handle == handle && !e.removed)
+        .as_ref()?
+        .entries
+        .get(&handle)
+        .filter(|e| !e.removed)
         .map(|e| e.pid)
 }
 
@@ -248,20 +282,43 @@ fn free_phys_frames(frames: Vec<u64>) {
 
 /// Reclaim unreferenced pages of a removed entry. Returns frames that must be
 /// freed after the registry lock is released.
-// The `Box` indirection is deliberate (see `REGISTRY`) — keeps the vector small.
-#[allow(clippy::vec_box)]
-fn reap_removed_entry(registry: &mut Vec<Box<Entry>>, idx: usize) -> Vec<u64> {
+fn reap_removed_entry(registry: &mut Registry, handle: u64) -> Vec<u64> {
     let mut reclaim = Vec::new();
-    if !registry[idx].removed {
-        return reclaim;
-    }
-    for page in 0..registry[idx].frames.len() {
-        if registry[idx].frames[page] != 0 && registry[idx].refs[page] == 0 {
-            reclaim.push(core::mem::take(&mut registry[idx].frames[page]));
+    let fully_reaped = {
+        let Some(entry) = registry.entries.get_mut(&handle) else {
+            return reclaim;
+        };
+        if !entry.removed {
+            return reclaim;
         }
+        for page in 0..entry.frames.len() {
+            if entry.frames[page] != 0 && entry.refs[page] == 0 {
+                reclaim.push(core::mem::take(&mut entry.frames[page]));
+            }
+        }
+        entry.frames.iter().all(|phys| *phys == 0)
+    };
+    for phys in &reclaim {
+        let removed = registry.frames.remove(phys);
+        debug_assert!(removed.is_some(), "reclaimed shmem frame was not indexed");
     }
-    if registry[idx].frames.iter().all(|phys| *phys == 0) {
-        registry.remove(idx);
+    if fully_reaped {
+        let entry = registry
+            .entries
+            .remove(&handle)
+            .expect("reaped shmem entry disappeared");
+        if let Some(user) = entry.locked_user {
+            let charge = registry
+                .locked_bytes
+                .get_mut(&user)
+                .expect("locked shmem entry had no user charge");
+            *charge = charge
+                .checked_sub(entry.len)
+                .expect("shmem lock charge underflow");
+            if *charge == 0 {
+                registry.locked_bytes.remove(&user);
+            }
+        }
     }
     reclaim
 }
@@ -269,13 +326,22 @@ fn reap_removed_entry(registry: &mut Vec<Box<Entry>>, idx: usize) -> Vec<u64> {
 /// Remove a region's public handle. Unmapped pages are reclaimed immediately;
 /// pages in existing mappings remain alive until their last alias disappears.
 pub fn destroy(handle: u64) -> bool {
-    let mut g = REGISTRY.lock();
-    let Some(idx) = g.iter().position(|e| e.handle == handle && !e.removed) else {
+    let reclaim = with_registry(|registry| {
+        let entry = registry.entries.get_mut(&handle).filter(|e| !e.removed)?;
+        let pid = entry.pid;
+        entry.removed = true;
+        registry.live = registry.live.checked_sub(1).expect("shmem live underflow");
+        if let Some(handles) = registry.owners.get_mut(&pid) {
+            handles.remove(&handle);
+            if handles.is_empty() {
+                registry.owners.remove(&pid);
+            }
+        }
+        Some(reap_removed_entry(registry, handle))
+    });
+    let Some(reclaim) = reclaim else {
         return false;
     };
-    g[idx].removed = true;
-    let reclaim = reap_removed_entry(&mut g, idx);
-    drop(g);
     free_phys_frames(reclaim);
     true
 }
@@ -283,37 +349,29 @@ pub fn destroy(handle: u64) -> bool {
 /// Destroy every region owned by `pid`. Called from the process-
 /// exit observer wired in `register_initcalls`.
 pub fn destroy_all_for_pid(pid: u64) -> u32 {
-    let mut g = REGISTRY.lock();
-    let mut removed = 0u32;
-    let mut reclaim = Vec::new();
-    let mut idx = 0;
-    while idx < g.len() {
-        if g[idx].pid == pid && !g[idx].removed {
-            let handle = g[idx].handle;
-            g[idx].removed = true;
-            removed += 1;
-            reclaim.extend(reap_removed_entry(&mut g, idx));
-            // `reap_removed_entry` swap-shifts the following entry into this
-            // slot when no aliases remain. Revisit that replacement instead
-            // of advancing past it.
-            if g.get(idx).is_none_or(|entry| entry.handle != handle) {
-                continue;
-            }
+    let (removed, reclaim) = with_registry(|registry| {
+        let handles = registry.owners.remove(&pid).unwrap_or_default();
+        let removed = u32::try_from(handles.len()).unwrap_or(u32::MAX);
+        let mut reclaim = Vec::new();
+        for handle in handles {
+            let entry = registry
+                .entries
+                .get_mut(&handle)
+                .expect("shmem owner index named a missing entry");
+            debug_assert!(!entry.removed);
+            entry.removed = true;
+            registry.live = registry.live.checked_sub(1).expect("shmem live underflow");
+            reclaim.extend(reap_removed_entry(registry, handle));
         }
-        idx += 1;
-    }
-    drop(g);
+        (removed, reclaim)
+    });
     free_phys_frames(reclaim);
     removed
 }
 
 /// Number of live regions — for diagnostics + tests.
 pub fn count() -> usize {
-    REGISTRY
-        .lock()
-        .iter()
-        .filter(|entry| !entry.removed)
-        .count()
+    REGISTRY.lock().as_ref().map_or(0, |registry| registry.live)
 }
 
 #[doc(hidden)]
@@ -321,8 +379,10 @@ pub fn __reset_for_test() {
     let frames = {
         let mut registry = REGISTRY.lock();
         core::mem::take(&mut *registry)
+            .unwrap_or_default()
+            .entries
             .into_iter()
-            .flat_map(|entry| entry.frames)
+            .flat_map(|(_, entry)| entry.frames)
             .filter(|phys| *phys != 0)
             .collect()
     };
@@ -360,53 +420,52 @@ fn vt_max_len() -> u64 {
 }
 
 fn vt_retain_frame(phys: u64) {
-    let mut registry = REGISTRY.lock();
-    if let Some((entry, page)) = registry.iter_mut().find_map(|entry| {
-        entry
-            .frames
-            .iter()
-            .position(|candidate| *candidate == phys)
-            .map(|page| (entry, page))
-    }) {
+    with_registry(|registry| {
+        let Some(&(handle, page)) = registry.frames.get(&phys) else {
+            return;
+        };
+        let entry = registry
+            .entries
+            .get_mut(&handle)
+            .expect("shmem frame index named a missing entry");
         entry.refs[page] = entry.refs[page]
             .checked_add(1)
             .expect("shmem mapping reference overflow");
-    }
+    });
 }
 
 fn vt_release_frame(phys: u64) {
-    let mut registry = REGISTRY.lock();
-    let Some((idx, page)) = registry.iter().enumerate().find_map(|(idx, entry)| {
-        entry
-            .frames
-            .iter()
-            .position(|candidate| *candidate == phys)
-            .map(|page| (idx, page))
-    }) else {
-        return;
-    };
-    assert!(
-        registry[idx].refs[page] > 0,
-        "shmem mapping reference underflow"
-    );
-    registry[idx].refs[page] -= 1;
-    let reclaim = reap_removed_entry(&mut registry, idx);
-    drop(registry);
+    let reclaim = with_registry(|registry| {
+        let Some(&(handle, page)) = registry.frames.get(&phys) else {
+            return Vec::new();
+        };
+        let entry = registry
+            .entries
+            .get_mut(&handle)
+            .expect("shmem frame index named a missing entry");
+        assert!(entry.refs[page] > 0, "shmem mapping reference underflow");
+        entry.refs[page] -= 1;
+        reap_removed_entry(registry, handle)
+    });
     free_phys_frames(reclaim);
 }
 
 fn vt_owns_frame(phys: u64) -> bool {
     REGISTRY
         .lock()
-        .iter()
-        .any(|entry| entry.frames.contains(&phys))
+        .as_ref()
+        .is_some_and(|registry| registry.frames.contains_key(&phys))
 }
 
 fn vt_frame_locked(phys: u64) -> bool {
     REGISTRY
         .lock()
-        .iter()
-        .any(|entry| entry.locked_user.is_some() && entry.frames.contains(&phys))
+        .as_ref()
+        .and_then(|registry| {
+            let (handle, _) = registry.frames.get(&phys)?;
+            registry.entries.get(handle)
+        })
+        .is_some_and(|entry| entry.locked_user.is_some())
 }
 
 fn vt_lock(
@@ -417,51 +476,74 @@ fn vt_lock(
     bypass: bool,
 ) -> Result<(), narf_userspace::handlers::ShmemLockError> {
     use narf_userspace::handlers::ShmemLockError;
-    let mut registry = REGISTRY.lock();
-    let Some(index) = registry
-        .iter()
-        .position(|entry| entry.handle == handle && !entry.removed)
-    else {
-        return Err(ShmemLockError::NotFound);
-    };
-    if registry[index].locked_user.is_some() {
-        return Ok(());
-    }
-    let user = (user_ns, uid);
-    let charged = registry
-        .iter()
-        .filter(|entry| entry.locked_user == Some(user))
-        .fold(0u64, |total, entry| total.saturating_add(entry.len));
-    if !bypass && charged.saturating_add(registry[index].len) > limit {
-        return Err(ShmemLockError::Limit);
-    }
-    registry[index].locked_user = Some(user);
-    Ok(())
+    with_registry(|registry| {
+        let Some(entry) = registry.entries.get(&handle).filter(|e| !e.removed) else {
+            return Err(ShmemLockError::NotFound);
+        };
+        if entry.locked_user.is_some() {
+            return Ok(());
+        }
+        let user = (user_ns, uid);
+        let len = entry.len;
+        let charged = registry.locked_bytes.get(&user).copied().unwrap_or(0);
+        if !bypass && charged.saturating_add(len) > limit {
+            return Err(ShmemLockError::Limit);
+        }
+        registry
+            .entries
+            .get_mut(&handle)
+            .expect("checked shmem entry disappeared")
+            .locked_user = Some(user);
+        registry
+            .locked_bytes
+            .insert(user, charged.saturating_add(len));
+        Ok(())
+    })
 }
 
 fn vt_unlock(handle: u64) -> bool {
-    let mut registry = REGISTRY.lock();
-    let Some(entry) = registry
-        .iter_mut()
-        .find(|entry| entry.handle == handle && !entry.removed)
-    else {
-        return false;
-    };
-    entry.locked_user = None;
-    true
+    with_registry(|registry| {
+        let Some(entry) = registry.entries.get_mut(&handle).filter(|e| !e.removed) else {
+            return false;
+        };
+        let len = entry.len;
+        let Some(user) = entry.locked_user.take() else {
+            return true;
+        };
+        let charge = registry
+            .locked_bytes
+            .get_mut(&user)
+            .expect("locked shmem entry had no user charge");
+        *charge = charge
+            .checked_sub(len)
+            .expect("shmem lock charge underflow");
+        if *charge == 0 {
+            registry.locked_bytes.remove(&user);
+        }
+        true
+    })
 }
 
 fn vt_replace_frame(old_phys: u64, new_phys: u64) -> bool {
-    let mut registry = REGISTRY.lock();
-    let Some(slot) = registry
-        .iter_mut()
-        .flat_map(|entry| entry.frames.iter_mut())
-        .find(|phys| **phys == old_phys)
-    else {
-        return false;
-    };
-    *slot = new_phys;
-    true
+    with_registry(|registry| {
+        let Some((handle, page)) = registry.frames.remove(&old_phys) else {
+            return false;
+        };
+        let slot = registry
+            .entries
+            .get_mut(&handle)
+            .expect("shmem frame index named a missing entry")
+            .frames
+            .get_mut(page)
+            .expect("shmem frame index named a missing page");
+        debug_assert_eq!(*slot, old_phys);
+        *slot = new_phys;
+        assert!(
+            registry.frames.insert(new_phys, (handle, page)).is_none(),
+            "replacement shmem frame already indexed"
+        );
+        true
+    })
 }
 
 fn vt_create(pid: u64, len: u64) -> u64 {

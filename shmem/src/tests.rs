@@ -304,6 +304,33 @@ fn smoke_shmem_lock_state_tracks_backing_frames() -> TestResult {
 }
 kernel_test_in!("shmem", smoke_shmem_lock_state_tracks_backing_frames);
 
+fn smoke_shmem_removed_lock_charge_survives_alias() -> TestResult {
+    use crate::{__reset_for_test, create, destroy, frames_of, syscall_vtable};
+    __reset_for_test();
+    let vtable = syscall_vtable();
+    let first = create(8003, 4096).expect("first backing");
+    let first_phys = frames_of(first).expect("first frames")[0].raw();
+    (vtable.retain_frame)(first_phys);
+    if (vtable.lock)(first, 9, 1001, 4096, false).is_err() || !destroy(first) {
+        return TestResult::Fail("setup removed locked alias");
+    }
+
+    let second = create(8003, 4096).expect("second backing");
+    if (vtable.lock)(second, 9, 1001, 4096, false)
+        != Err(narf_userspace::handlers::ShmemLockError::Limit)
+    {
+        return TestResult::Fail("IPC_RMID released a live alias's lock charge");
+    }
+    (vtable.release_frame)(first_phys);
+    if (vtable.lock)(second, 9, 1001, 4096, false).is_err() {
+        return TestResult::Fail("final alias release retained the lock charge");
+    }
+    let _ = destroy(second);
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_removed_lock_charge_survives_alias);
+
 fn smoke_shmem_handle_id_monotonic() -> TestResult {
     // create() hands out monotonically-increasing handle ids; the
     // counter survives destroy().
