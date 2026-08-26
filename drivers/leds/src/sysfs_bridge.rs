@@ -44,7 +44,6 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 

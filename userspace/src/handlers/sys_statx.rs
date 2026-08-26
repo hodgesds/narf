@@ -4,7 +4,6 @@ use super::*;
 /// `include/uapi/linux/stat.h`: `STATX__RESERVED 0x80000000U` — held back for
 /// a future `struct statx` field. `do_statx` rejects it so that a binary
 /// built against a newer header cannot silently get a short answer.
-#[cfg(feature = "linux-compat")]
 const STATX_RESERVED: u32 = 0x8000_0000;
 
 /// `fs/stat.c::SYSCALL_DEFINE5(statx)` and the two helpers it dispatches to
@@ -49,7 +48,6 @@ const STATX_RESERVED: u32 = 0x8000_0000;
 /// `:`-separated list, a config-file cascade (`/etc/x` then `~/.x`), and
 /// every "create it if it is not there" path. Those all key on ENOENT and
 /// treat EPERM as a hard, reportable error.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     use linux_compat::*;
     let args = *ctx.args();

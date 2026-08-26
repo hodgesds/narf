@@ -3,7 +3,6 @@
 //! The file syscalls musl/busybox lean on hardest. Linux-shaped ones take
 //! a NUL-terminated path; a few remain NARF-native `(ptr, len)` (flagged
 //! // LINUX-GAP). Uses the shared harness + a MemFs scratch mount.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

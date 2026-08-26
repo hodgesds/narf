@@ -109,7 +109,6 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         };
         match poll_blocking(file.set_owners(uid, gid)) {
             Some(Ok(())) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_attrib(&path, file.as_dir().is_some());
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -133,7 +132,6 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         };
         match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
             Some(Ok(())) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_attrib(&path, true);
                 ctx.set_return(SyscallReturn::ok(0));
             }

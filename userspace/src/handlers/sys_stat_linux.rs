@@ -17,7 +17,6 @@ use super::*;
 /// as EPERM — which is what a shell's PATH search over `:`-separated
 /// candidates depends on, since it must keep walking on ENOENT and stop on a
 /// real permission failure.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`.

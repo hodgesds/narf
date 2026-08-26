@@ -13,7 +13,6 @@
 //! inode. The fd-keyed `f*xattr` family keys on an `anon_inode:[Type]`
 //! placeholder derived from the fd's `FileOps` type, so an open MemFs fd is
 //! enough to reach the success path.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

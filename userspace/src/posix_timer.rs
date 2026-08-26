@@ -8,12 +8,6 @@
 //! bit into the per-task `SIGNAL_PENDING` bitmap via the same path
 //! `kill(2)` uses, so the next return-to-user picks the signal up
 //! through the existing Wave-51/55 delivery hook.
-//!
-//! Gated under `#[cfg(feature = "linux-compat")]`. The kernel core
-//! pays nothing when the feature is off.
-//!
-//! The `linux-compat` gate lives on the `pub mod posix_timer;` line in
-//! `lib.rs`; no inner `#![cfg]` here (it would duplicate that gate).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;

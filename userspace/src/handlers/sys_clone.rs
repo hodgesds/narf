@@ -5,7 +5,6 @@ use super::*;
 /// `CLONE_PIDFD` it is the pidfd output pointer (and Linux rejects combining
 /// that flag with `CLONE_PARENT_SETTID`). Keep this conversion separate so the
 /// register ABI cannot silently drop the pointer while adapting to clone3.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn legacy_clone_pidfd_ptr(flags: u64, parent_tid: u64) -> u64 {
     if flags & CLONE_PIDFD != 0 {
         parent_tid
@@ -23,10 +22,7 @@ pub(crate) fn legacy_clone_pidfd_ptr(flags: u64, parent_tid: u64) -> u64 {
 /// `CloneArgs` with `stack_size = 0` so `do_clone3`'s
 /// `rsp = stack + stack_size` arithmetic recovers the original
 /// top.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ca = CloneArgs {
@@ -77,10 +73,7 @@ pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
 /// Linux `clone(2)` — same semantics as `clone3(2)` but the
 /// arguments are passed in registers. Falls back to ENOSYS
 /// on unsupported / non-linux-compat builds.
-#[cfg(any(
-    not(feature = "linux-compat"),
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
     // Not implemented on this build config → ENOSYS.
     ctx.set_return(SyscallReturn::ok((-38i64) as u64));

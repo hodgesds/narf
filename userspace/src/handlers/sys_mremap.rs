@@ -32,7 +32,6 @@ fn mremap_memory_errno(error: narf_memory::AddressSpaceError) -> i64 {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_mremap_prepare_error(
     error: ShmMremapPrepareError,
 ) -> narf_memory::AddressSpaceError {
@@ -82,7 +81,6 @@ unsafe fn publish_shared_mremap_alias_locked(
         return Err(early(narf_memory::AddressSpaceError::Overlap));
     }
 
-    #[cfg(feature = "linux-compat")]
     let shm_plan = {
         let task = current_task_id();
         let lpid = task_to_pid_raw(task).unwrap_or(task);
@@ -131,7 +129,6 @@ unsafe fn publish_shared_mremap_alias_locked(
         },
     );
 
-    #[cfg(feature = "linux-compat")]
     match &result {
         Ok(_) => shm_plan.commit(fixed),
         Err(failure) => shm_plan.abort(failure.target_punched),
@@ -158,7 +155,6 @@ unsafe fn publish_shared_mremap_relocation_locked(
         source_shrunk: false,
     };
 
-    #[cfg(feature = "linux-compat")]
     let shm_plan = {
         let task = current_task_id();
         let lpid = task_to_pid_raw(task).unwrap_or(task);
@@ -210,7 +206,6 @@ unsafe fn publish_shared_mremap_relocation_locked(
         },
     );
 
-    #[cfg(feature = "linux-compat")]
     match &result {
         Ok(_) => shm_plan.commit_relocation(old_addr, old_len, fixed),
         Err(failure) => shm_plan.abort_relocation(
@@ -295,17 +290,11 @@ fn mremap_core_limited(
         // SysV uses its own per-AS owner table. Only a fixed move can retire a
         // SysV target, so keep its global registry entirely off the common
         // no-op/shrink/grow path.
-        #[cfg(feature = "linux-compat")]
         let task = current_task_id();
-        #[cfg(feature = "linux-compat")]
         let lpid = task_to_pid_raw(task).unwrap_or(task);
-        #[cfg(feature = "linux-compat")]
         let as_key = shm_as_key_ref(as_ref);
-        #[cfg(feature = "linux-compat")]
         shm_register_as_owner(as_key, lpid);
-        #[cfg(feature = "linux-compat")]
         let shm_transaction = shm_mapping_transaction(as_key);
-        #[cfg(feature = "linux-compat")]
         let _shm_guard = shm_transaction.lock();
 
         // SAFETY: mremap_core holds an Arc-owned live address space; both
@@ -444,7 +433,6 @@ fn mremap_core_limited(
             };
             result
             .map_err(|failure| {
-                #[cfg(feature = "linux-compat")]
                 if failure.target_punched {
                     shm_record_fixed_punch(as_key, new_addr, new_addr + new_len, lpid);
                 }
@@ -453,7 +441,6 @@ fn mremap_core_limited(
         });
         match moved {
             Ok(eager_range) => {
-                #[cfg(feature = "linux-compat")]
                 if !shared_owner_managed {
                     shm_record_fixed_punch(as_key, new_addr, new_addr + new_len, lpid);
                 }
@@ -468,17 +455,11 @@ fn mremap_core_limited(
     // transaction to preserve the global SysV -> VMA -> shared-owner order.
     // Taking this per-AS transaction for the private path is harmless and
     // avoids a classification race before the VMA lock is held.
-    #[cfg(feature = "linux-compat")]
     let task = current_task_id();
-    #[cfg(feature = "linux-compat")]
     let lpid = task_to_pid_raw(task).unwrap_or(task);
-    #[cfg(feature = "linux-compat")]
     let as_key = shm_as_key_ref(as_ref);
-    #[cfg(feature = "linux-compat")]
     shm_register_as_owner(as_key, lpid);
-    #[cfg(feature = "linux-compat")]
     let shm_transaction = shm_mapping_transaction(as_key);
-    #[cfg(feature = "linux-compat")]
     let _shm_guard = shm_transaction.lock();
 
     let moved = as_ref.with_vma_transaction(|| {
@@ -524,7 +505,6 @@ fn mremap_core_limited(
                 }
                 if new_len < old_len {
                     let tail = old_addr + new_len;
-                    #[cfg(feature = "linux-compat")]
                     let shm_plan = {
                         // SAFETY: the per-AS SysV mapping transaction and VMA
                         // transaction are held through plan consumption.
@@ -557,7 +537,6 @@ fn mremap_core_limited(
                             },
                         )
                     });
-                    #[cfg(feature = "linux-compat")]
                     if result.is_ok() {
                         shm_plan.commit_punch();
                     }

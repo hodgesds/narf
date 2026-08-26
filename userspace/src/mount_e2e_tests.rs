@@ -15,8 +15,6 @@
 //! Linux refs: fs/namespace.c:do_mount / SyS_umount / SyS_chroot /
 //! SyS_pivot_root.
 
-#![cfg(feature = "linux-compat")]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};

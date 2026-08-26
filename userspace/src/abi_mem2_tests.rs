@@ -13,7 +13,6 @@
 //! takes the `None` arm. Every test below is therefore chosen to land on
 //! a branch that fires BEFORE the AS lookup (validation / side-table /
 //! out-pointer writeback) so the asserted return is genuinely reachable.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ── Mlockall (151) — unknown flag bits ───────────────────────────────

@@ -138,13 +138,8 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     // Re-root under the task's chroot (if any) so a chrooted process —
     // e.g. a container — resolves paths against the chrooted rootfs, not
     // the host root. No-op for tasks without a chroot.
-    #[cfg(feature = "linux-compat")]
     {
         apply_chroot(&normalized)
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        normalized
     }
 }
 
@@ -700,13 +695,11 @@ impl narf_filesystem::FileOps for DirFdFile {
 /// identity while dispatching operations to the caller's current controlling
 /// terminal. The wrapper preserves that path metadata and forwards tty I/O,
 /// readiness, and job-control state to the selected console or PTY slave.
-#[cfg(feature = "linux-compat")]
 struct CurrentTtyFile {
     inner: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
     inode: u64,
 }
 
-#[cfg(feature = "linux-compat")]
 impl narf_filesystem::FileOps for CurrentTtyFile {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.read(offset, buf)
@@ -1188,10 +1181,7 @@ fn do_execve_resolved(
     // CLONE_VFORK release: this child is now replacing its image, so it no
     // longer needs the shared address space — wake a parent suspended in
     // do_clone3's vfork park. (Load succeeded above, so the exec is committed.)
-    #[cfg(all(
-        feature = "linux-compat",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     vfork_child_release(task_to_pid_raw(task).unwrap_or(task));
 
     // POSIX execve: reset caught signal handlers to SIG_DFL — their code
@@ -1212,7 +1202,6 @@ fn do_execve_resolved(
         m.remove(&task);
     }
     // clear_child_tid tracking is a linux-compat-only path.
-    #[cfg(feature = "linux-compat")]
     let _ = take_clear_child_tid(task);
     // FD_CLOEXEC sweep: close every fd marked close-on-exec (Linux
     // does this in the exec path). Without it, O_CLOEXEC fds leak
@@ -1229,7 +1218,6 @@ fn do_execve_resolved(
     }
     // Commit perf enable_on_exec and PERF_RECORD_COMM only after both the new
     // image and its Linux comm name have been published.
-    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_exec(task, &new_proc.loaded_mappings, &cur_path);
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
@@ -1314,7 +1302,6 @@ fn do_execve_resolved(
         // (if Step 5 displaced one) is dead to this task. Release both local
         // refs now — after activate(), so teardown of a last-ref pre-exec AS
         // never races the CR3 it used to back.
-        #[cfg(feature = "linux-compat")]
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(new_as);
         drop(prev_slot_as);
@@ -1377,7 +1364,6 @@ fn do_execve_resolved(
         // every heap-owning local by hand first. (`req` was consumed into
         // `pending_exec`; the ExecRequest itself is freed by the poll that
         // applies it.)
-        #[cfg(feature = "linux-compat")]
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(argv_refs);
         drop(envp_refs);
@@ -2441,7 +2427,7 @@ pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
 // and resolve it to a TaskId.
 
 /// `/proc/<pid>/ns/<flavour>` readlink text, e.g. "uts:[42]".
-#[cfg(all(feature = "container", feature = "linux-compat"))]
+#[cfg(feature = "container")]
 pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
     use narf_filesystem::procfs::ns_tag;
     let task = pid_to_task_raw(pid).unwrap_or(pid);
@@ -2465,7 +2451,6 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 /// task used to make procfs render the backing paths directly (for example
 /// `/mnt/sys/kernel/debug` to PID 1 rooted at `/mnt`), so systemd could not
 /// find the mount it had just created when it rescanned mountinfo.
-#[cfg(feature = "linux-compat")]
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));
@@ -2494,7 +2479,6 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
 /// Current mount-table generation in the named task's mount namespace. Procfs
 /// uses this to expose Linux's `POLLPRI` edge on an open mountinfo file after
 /// attach, detach, or move operations.
-#[cfg(feature = "linux-compat")]
 pub fn proc_ns_mountinfo_generation(pid: u64) -> u64 {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     mount_namespace_of(task)
@@ -2503,7 +2487,7 @@ pub fn proc_ns_mountinfo_generation(pid: u64) -> u64 {
 }
 
 /// `/proc/<pid>/{uid,gid}_map` render.
-#[cfg(all(feature = "container", feature = "linux-compat"))]
+#[cfg(feature = "container")]
 pub fn proc_ns_idmap_render(pid: u64, is_uid: bool) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     Some(crate::namespaces::current_user_ns(task).render_map(is_uid))
@@ -2511,7 +2495,7 @@ pub fn proc_ns_idmap_render(pid: u64, is_uid: bool) -> Option<alloc::string::Str
 
 /// `/proc/<pid>/{uid,gid}_map` write — parses the Linux triple lines
 /// `inner outer count` and applies them under the one-shot rule.
-#[cfg(all(feature = "container", feature = "linux-compat"))]
+#[cfg(feature = "container")]
 pub fn proc_ns_idmap_write(
     pid: u64,
     is_uid: bool,
@@ -2575,13 +2559,11 @@ pub fn proc_ns_idmap_write(
 // Stored under linux-compat because chroot(2) is the entry point;
 // pivot_root reuses the same slot.
 
-#[cfg(feature = "linux-compat")]
 static ROOT_DIR_TABLE: TaskMapTable<alloc::string::String> =
     [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
 /// Diagnostic: read the chroot prefix for `task`, or `None` if the
 /// task sees the global root. Used by tests + procfs.
-#[cfg(feature = "linux-compat")]
 pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
     task_map_get(&ROOT_DIR_TABLE, task)
 }
@@ -2592,7 +2574,6 @@ pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
 /// mounted distro root from its first interpreter and pathname lookup.  It is
 /// the same per-task root state `chroot(2)` installs, but does not require a
 /// temporary userspace launcher to perform that syscall.
-#[cfg(feature = "linux-compat")]
 pub fn install_root_dir(task: u64, root: &str) -> bool {
     if !root.starts_with('/') {
         return false;
@@ -2603,19 +2584,13 @@ pub fn install_root_dir(task: u64, root: &str) -> bool {
     true
 }
 
-#[cfg(not(feature = "linux-compat"))]
-pub fn install_root_dir(_task: u64, _root: &str) -> bool {
-    false
-}
 
 /// fork(2) inheritance — child inherits parent's chroot.
-#[cfg(feature = "linux-compat")]
 pub fn root_dir_fork(parent: u64, child: u64) {
     task_map_fork(&ROOT_DIR_TABLE, parent, child);
 }
 
 /// Test hook — drop every per-task entry.
-#[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_root_dir_reset() {
     task_map_init(&ROOT_DIR_TABLE);
@@ -2625,7 +2600,6 @@ pub fn __test_root_dir_reset() {
 /// paths get the chroot prefix prepended; relative paths pass
 /// through unchanged. Joining strips a leading `/` from `path` so
 /// the result has no double-slash.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     let task = current_task_id();
     let prefix = match task_map_get(&ROOT_DIR_TABLE, task) {
@@ -2645,11 +2619,6 @@ pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     out
 }
 
-#[cfg(not(feature = "linux-compat"))]
-#[inline]
-pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
-    alloc::string::String::from(path)
-}
 
 // ── Wave-71: chroot(2) ────────────────────────────────────────────
 
@@ -3921,15 +3890,9 @@ pub fn proc_cwd_path(pid: u64) -> Option<alloc::string::String> {
 /// back to `/`) when the task never chroot'd or the build has no
 /// linux-compat chroot support.
 pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
-    #[cfg(feature = "linux-compat")]
     {
         let tid = proc_pid_to_tid(pid);
         task_map_get(&ROOT_DIR_TABLE, tid)
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = pid;
-        None
     }
 }
 
@@ -4183,7 +4146,6 @@ pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
 }
 
 /// /proc/[pid]/* metadata accessor.
-#[cfg(feature = "linux-compat")]
 pub fn proc_task_info(
     pid: u64,
     query: narf_filesystem::procfs::TaskInfoQuery,
@@ -4336,7 +4298,6 @@ pub fn proc_task_info(
     // the setsid-detached state; the fg pgrp is TASK-space, rendered in the
     // reader's namespace like pgrp/session. No ctty → tty_nr 0, tpgid -1
     // (Linux). Linux dev_t = (major << 8) | minor: console (5,1); pts/N (136,N).
-    #[cfg(feature = "linux-compat")]
     let (tty_nr, tpgid): (u64, i64) = match task_ctty(tid) {
         None => (0, -1),
         Some(ctty) => {
@@ -4352,8 +4313,6 @@ pub fn proc_task_info(
             (tty_nr, tpgid)
         }
     };
-    #[cfg(not(feature = "linux-compat"))]
-    let (tty_nr, tpgid): (u64, i64) = (0, -1);
     // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
     // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
@@ -4519,7 +4478,6 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     // systemd execs its executor via `execve("/proc/self/fd/N")`, so an empty
     // resolution turned every service spawn into EBADF (project_pidns_flow_model).
     let tid = proc_pid_to_tid(pid);
-    #[cfg(feature = "linux-compat")]
     if let Some(path) = crate::mqueue::fd_path(tid, n) {
         // Validate that the slot still exists before trusting the separately
         // maintained fd→path table (fd numbers may be closed and reused).
@@ -4536,7 +4494,6 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     .flatten()
 }
 
-#[cfg(feature = "linux-compat")]
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
     let tid = proc_pid_to_tid(pid);
     let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
@@ -4566,7 +4523,6 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
 /// misroutes a lookup whenever it numerically collides with another process's
 /// PID (as systemd's forked mount helpers routinely do).
 pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::String> {
-    #[cfg(feature = "linux-compat")]
     if let Some(p) = crate::mqueue::fd_path(task, n) {
         return Some(strip_chroot_prefix(task, &p));
     }
@@ -4583,7 +4539,6 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
 /// path as the (possibly chrooted) task sees it. No-op for un-chrooted
 /// tasks. Used so `/proc/<pid>/fd/<n>` and similar surfaces report paths a
 /// chrooted process can actually re-open.
-#[cfg(feature = "linux-compat")]
 fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
     if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, task) {
         if prefix != "/" {
@@ -4750,7 +4705,6 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
 /// `None` to proceed with the I/O. The fd's tty identity / fg pgrp / TOSTOP
 /// are read in one short fd-table borrow; signal delivery happens after it
 /// is released (no fd-table reentrancy).
-#[cfg(feature = "linux-compat")]
 fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
     let (tty_id, fg, tostop) = crate::fd::with_table(task, |t| {
         t.get(fd).and_then(|e| {
@@ -4846,7 +4800,6 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// interrupts disabled from the trap handler. The raised signal is then
 /// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
-    #[cfg(feature = "linux-compat")]
     {
         let now = narf_scheduler::narf_time::monotonic_ns();
         // Scan EVERY armed ITIMER_REAL slot, not just the interrupted task's.
@@ -6236,7 +6189,6 @@ pub(crate) fn default_signal_delivery_restricted(
         return false;
     }
     let signum = sig_from_bit(deliverable);
-    #[cfg(feature = "linux-compat")]
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
         return true;
     }
@@ -6512,7 +6464,6 @@ pub fn default_sync_signal_delivery(
         Some(s) => s,
         None => return false,
     };
-    #[cfg(feature = "linux-compat")]
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
         return true;
     }
@@ -6567,7 +6518,6 @@ pub fn default_sync_signal_delivery(
                 // (0x4000_0000_0000) or the mmap DSO arena (0x4080_.. up).
                 let rsp = ctx.user_rsp();
                 let _ = writeln!(narf_console::Writer, "  user-rsp={:x}", rsp);
-                #[cfg(feature = "linux-compat")]
                 {
                     if let Some(info) =
                         proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
@@ -6590,7 +6540,6 @@ pub fn default_sync_signal_delivery(
                 // permission-derivation bug (the mmap-scalability materializer
                 // regressed). A w=false region is a genuine PROT_READ mapping
                 // the task wrongly wrote to. This single line disambiguates.
-                #[cfg(feature = "linux-compat")]
                 {
                     if let Some(pinfo) =
                         proc_task_info(pid, narf_filesystem::procfs::TaskInfoQuery::Vmas)
@@ -7727,16 +7676,13 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 // Same shape as the EpollFile / SocketFile / TimerFd Arc maps: a raw-
 // pointer-keyed Arc map lets us recover the concrete type from the
 // `dyn FileOps` we stored in the fd table.
-#[cfg(feature = "linux-compat")]
 static SIGNALFD_ARCS: ArcShardTable<crate::linux_compat::SignalFdFile> =
     [const { ArcShard::new() }; ARC_SHARDS];
 
-#[cfg(feature = "linux-compat")]
 fn signalfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::SignalFdFile>) {
     arc_shard_register(&SIGNALFD_ARCS, arc);
 }
 
-#[cfg(feature = "linux-compat")]
 pub(crate) fn signalfd_arc_from_fd(
     task: u64,
     fd: u32,
@@ -7907,7 +7853,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
     table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
-    #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Madvise, "madvise", RawFnHandler(sys_madvise));
     // Batch 18: AS-wide locking, secret memory, NUMA placement.
     table.install_raw(Syscall::Mlockall, "mlockall", RawFnHandler(sys_mlockall));
@@ -7985,9 +7930,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
     table.install_raw(Syscall::Setns, "setns", RawFnHandler(sys_setns));
-    #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Chroot, "chroot", RawFnHandler(sys_chroot));
-    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::PivotRoot,
         "pivot_root",
@@ -8099,7 +8042,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "timerfd_settime",
         RawFnHandler(sys_timerfd_settime),
     );
-    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::TimerfdGettime,
         "timerfd_gettime",
@@ -8152,7 +8094,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Gettid, "gettid", RawFnHandler(sys_gettid));
     table.install_raw(Syscall::Clone, "clone", RawFnHandler(sys_clone));
     table.install_raw(Syscall::Fork, "fork", RawFnHandler(sys_fork));
-    #[cfg(feature = "linux-compat")]
     {
         table.install_raw(Syscall::Clone3, "clone3", RawFnHandler(sys_clone3));
         table.install_raw(
@@ -8208,11 +8149,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         // The self-contained sysvipc module supersedes the id-by-key
         // semget/msgget in any linux-compat build; only register the
         // container-namespace versions when linux-compat is absent.
-        #[cfg(not(feature = "linux-compat"))]
-        {
-            table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
-            table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
-        }
     }
     table.install_raw(Syscall::Getrlimit, "getrlimit", RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit, "setrlimit", RawFnHandler(sys_setrlimit));
@@ -8282,7 +8218,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "clock_settime",
         RawFnHandler(sys_clock_settime),
     );
-    #[cfg(feature = "linux-compat")]
     {
         table.install_raw(
             Syscall::Gettimeofday,
@@ -8306,7 +8241,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             RawFnHandler(sys_ioprio_get),
         );
     }
-    #[cfg(feature = "linux-compat")]
     {
         // Wave-73: POSIX per-process timers + clock_nanosleep.
         table.install_raw(
@@ -8633,13 +8567,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Dup3, "dup3", RawFnHandler(sys_dup3));
     table.install_raw(Syscall::Fcntl, "fcntl", RawFnHandler(sys_fcntl));
     table.install_raw(Syscall::Ioctl, "ioctl", RawFnHandler(sys_ioctl));
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
-        table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
-        table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
-    }
-    #[cfg(feature = "linux-compat")]
     {
         table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat_linux));
         table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_lstat_linux));
@@ -8675,19 +8602,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_faccessat));
     table.install_raw(Syscall::Openat, "openat", RawFnHandler(sys_openat));
-    #[cfg(not(feature = "linux-compat"))]
-    table.install_raw(
-        Syscall::Newfstatat,
-        "newfstatat",
-        RawFnHandler(sys_newfstatat),
-    );
-    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::Newfstatat,
         "newfstatat",
         RawFnHandler(sys_newfstatat_linux),
     );
-    #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Statx, "statx", RawFnHandler(sys_statx));
     table.install_raw(Syscall::Unlinkat, "unlinkat", RawFnHandler(sys_unlinkat));
     table.install_raw(Syscall::Mkdirat, "mkdirat", RawFnHandler(sys_mkdirat));
@@ -8978,7 +8897,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "epoll_pwait2",
         RawFnHandler(crate::epoll::sys_epoll_pwait2),
     );
-    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::PerfEventOpen,
         "perf_event_open",

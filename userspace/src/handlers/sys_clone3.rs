@@ -1,10 +1,7 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uargs = args.arg0;
@@ -123,10 +120,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     do_clone3(ctx, ca, false);
 }
 
-#[cfg(all(
-    feature = "linux-compat",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     // Not implemented on this arch → ENOSYS (glibc's clone3→clone fallback keys on it).
     ctx.set_return(SyscallReturn::ok((-38i64) as u64));

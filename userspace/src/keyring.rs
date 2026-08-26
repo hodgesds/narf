@@ -24,8 +24,6 @@
 //! This is a compatibility shim (it lets systemd's `setup_keyring()`
 //! succeed), not a security boundary: there is no per-key access control and
 //! the store is process-global.
-//!
-//! Gated under `#[cfg(feature = "linux-compat")]` via `lib.rs`.
 
 use alloc::collections::BTreeMap;
 use alloc::format;

@@ -418,13 +418,8 @@ pub fn gen_uevent_seqnum() -> String {
 pub fn coldplug() -> usize {
     // The sysfs device tree only exists under `linux-compat`; without it
     // there are no kobjects to enumerate, so no ADD uevents are emitted.
-    #[cfg(feature = "linux-compat")]
     {
         crate::sysfs::coldplug()
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        0
     }
 }
 

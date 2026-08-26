@@ -663,7 +663,6 @@ kernel_test_in!(
     smoke_lifecycle_rmmod_blocks_on_refcount
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_proc_modules_format() -> TestResult {
     crate::registry::__reset_for_test();
     crate::symbols::__reset_for_test();
@@ -679,10 +678,8 @@ fn smoke_proc_modules_format() -> TestResult {
         TestResult::Fail("/proc/modules line missing fields")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("modules/procfs", smoke_proc_modules_format);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_refcnt_reads_count() -> TestResult {
     crate::registry::__reset_for_test();
     crate::symbols::__reset_for_test();
@@ -701,10 +698,8 @@ fn smoke_sysfs_refcnt_reads_count() -> TestResult {
         TestResult::Fail("/sys refcnt didn't reflect counter")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("modules/sysfs", smoke_sysfs_refcnt_reads_count);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_param_sysfs_rw_round_trip() -> TestResult {
     crate::registry::__reset_for_test();
     crate::symbols::__reset_for_test();
@@ -729,7 +724,6 @@ fn smoke_param_sysfs_rw_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("modules/params", smoke_param_sysfs_rw_round_trip);
 
 fn smoke_two_modules_dep_refcount() -> TestResult {

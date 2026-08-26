@@ -71,23 +71,19 @@ pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
-#[cfg(feature = "linux-compat")]
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;
 pub mod fuse;
 pub mod fuse_conn;
 pub mod memfs;
-#[cfg(feature = "linux-compat")]
 pub mod mqueuefs;
 pub mod ntty;
 pub mod overlayfs;
 pub mod page_cache;
-#[cfg(feature = "linux-compat")]
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs;
 pub mod uevent;
 
@@ -97,7 +93,6 @@ mod devfs_pty_tests;
 mod e2e_tests;
 mod fs_mount_e2e_tests;
 mod memfs_tests;
-#[cfg(feature = "linux-compat")]
 mod mqueuefs_tests;
 mod page_cache_tests;
 mod procsys_e2e_tests;
@@ -114,7 +109,6 @@ pub use devfs::{
     unregister_tpm, DevFs,
 };
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
-#[cfg(feature = "linux-compat")]
 pub use efivarfs::EfivarFs;
 pub use fs_registry::{lookup_fstype, register_fstype, FsBuilder};
 pub use fuse::{
@@ -125,11 +119,9 @@ pub use memfs::{
     new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
     MemFs, RamFs, RamFsOptions, TmpFs, TmpFsOptions,
 };
-#[cfg(feature = "linux-compat")]
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
 pub use overlayfs::{OverlayFs, OPAQUE_MARKER, WHITEOUT_PREFIX};
 pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
-#[cfg(feature = "linux-compat")]
 pub use sysfs::{
     class_device_register, class_register, get_or_create_child, get_root,
     install_net_snapshot_hook, kobject_add_attr, kobject_add_bin_attr, kobject_add_uevent_attr,
@@ -3693,7 +3685,6 @@ pub fn register_initcalls() {
     // /proc — synthetic per-process and system-wide read-only views.
     // /sys — kobject hierarchy; replaces the old empty MemFs stub with
     //         the real SysFs and pre-populates block/net/kernel subtrees.
-    #[cfg(feature = "linux-compat")]
     narf_init::register(Stage::Fs, "procfs-mount", || {
         let auth = bootstrap_mount_authority();
         let _ = registry().mount(&auth, "/proc", procfs::ProcFs);
@@ -3727,7 +3718,7 @@ pub fn register_initcalls() {
 
     // /proc/pressure/{cpu,memory,io} — system-wide PSI. Needs procfs
     // (linux-compat) to register.
-    #[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+    #[cfg(feature = "cgroup-psi")]
     narf_init::register(Stage::Fs, "proc-pressure", || {
         use cgroupfs::psi::Resource;
         procfs::register_proc(
@@ -3748,11 +3739,11 @@ pub fn register_initcalls() {
 
 /// `/proc/pressure/<axis>` backing — system-wide PSI, delegating to the
 /// cgroup PSI renderer.
-#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+#[cfg(feature = "cgroup-psi")]
 #[derive(Debug)]
 struct PressureFile(cgroupfs::psi::Resource);
 
-#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+#[cfg(feature = "cgroup-psi")]
 impl procfs::ProcFile for PressureFile {
     fn read(&self) -> alloc::vec::Vec<u8> {
         cgroupfs::psi::proc_pressure(self.0)

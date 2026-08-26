@@ -40,7 +40,6 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     match poll_blocking(endpoint.ops.truncate(len)) {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_modify_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(0));
         }

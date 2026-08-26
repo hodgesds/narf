@@ -2,7 +2,6 @@
 //!
 //! Shares the harness in [`crate::abi_test_support`]; see that module for
 //! the rationale. Other categories live in `abi_<cat>_tests.rs`.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

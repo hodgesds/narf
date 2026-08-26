@@ -134,7 +134,6 @@ fn encode_shm_stat(snapshot: ShmStatSnapshot) -> [u8; SHMID64_SIZE] {
 /// the read-only IPC_STAT/SHM_STAT path goes through `ipcperms()` and can
 /// answer -EACCES, so a caller that sees EACCES from IPC_RMID learns that
 /// the emulation, not the segment, is wrong.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let signed_shmid = a.arg0 as u32 as i32;

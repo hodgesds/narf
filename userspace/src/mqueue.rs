@@ -12,9 +12,6 @@
 //! inotify_event` records; the syscall handlers call the `notify_*`
 //! entry points here after a successful filesystem mutation, which fan
 //! the matching events out to every watching instance for read(2)/poll.
-//!
-//! Gated under `#[cfg(feature = "linux-compat")]` via the `pub mod`
-//! line in `lib.rs`.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};

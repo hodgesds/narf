@@ -1,4 +1,3 @@
-#![cfg(feature = "linux-compat")]
 //! End-to-end smokes for `/proc/sys/*` write-propagation.
 //!
 //! Each smoke follows the full path:
@@ -39,13 +38,9 @@ use core::sync::atomic::Ordering;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-#[cfg(feature = "linux-compat")]
 use crate::procfs::sys_kernel;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::sys_net;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::sys_vm;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::FsError;
 
@@ -53,7 +48,6 @@ use crate::FsError;
 
 /// Read the value from a procfs sysctl path under "sys/".
 /// Returns the trimmed text content (strips trailing newline).
-#[cfg(feature = "linux-compat")]
 fn sysctl_read(components: &[&str]) -> Option<String> {
     match lookup_registry(components) {
         Some(ProcNodeSnapshot::File(f)) => {
@@ -67,7 +61,6 @@ fn sysctl_read(components: &[&str]) -> Option<String> {
 }
 
 /// Write a value to a procfs sysctl path under "sys/".
-#[cfg(feature = "linux-compat")]
 fn sysctl_write(components: &[&str], val: &[u8]) -> Option<Result<usize, FsError>> {
     match lookup_registry(components) {
         Some(ProcNodeSnapshot::File(f)) => Some(f.write(val)),
@@ -84,7 +77,6 @@ fn sysctl_write(components: &[&str], val: &[u8]) -> Option<Result<usize, FsError
 // Linux ref: kernel/sys.c sethostname() → uts_ns->name.nodename
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_hostname_write_propagates() -> TestResult {
     sys_kernel::register_all();
 
@@ -100,7 +92,6 @@ fn e2e_kernel_hostname_write_propagates() -> TestResult {
         _ => TestResult::Fail("kernel/hostname write did not propagate: read-back mismatch"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/kernel", e2e_kernel_hostname_write_propagates);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -110,7 +101,6 @@ kernel_test_in!("procsys_e2e/kernel", e2e_kernel_hostname_write_propagates);
 // Linux ref: net/ipv4/devinet.c IPV4_DEVCONF_ALL, ipv4_forward_change()
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_net_ip_forward_propagates_to_accessor() -> TestResult {
     sys_net::register_all();
     sys_net::IP_FORWARD.store(0, Ordering::Relaxed);
@@ -137,7 +127,6 @@ fn e2e_net_ip_forward_propagates_to_accessor() -> TestResult {
         _ => TestResult::Fail("net/ipv4/ip_forward read-back did not return '1'"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/net", e2e_net_ip_forward_propagates_to_accessor);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +137,6 @@ kernel_test_in!("procsys_e2e/net", e2e_net_ip_forward_propagates_to_accessor);
 // Linux ref: net/ipv4/tcp_cong.c tcp_set_default_congestion_control()
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_tcp_congestion_control_reno_propagates() -> TestResult {
     sys_net::register_all();
 
@@ -188,7 +176,6 @@ kernel_test_in!(
 // Linux ref: net/ipv4/sysctl_net_ipv4.c tcp_timestamps
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_tcp_timestamps_0_propagates_to_option_defaults() -> TestResult {
     sys_net::register_all();
     sys_net::TCP_TIMESTAMPS.store(1, Ordering::Relaxed);
@@ -228,7 +215,6 @@ kernel_test_in!(
 // Linux ref: net/ipv4/sysctl_net_ipv4.c tcp_sack
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_tcp_sack_0_propagates_to_option_defaults() -> TestResult {
     sys_net::register_all();
     sys_net::TCP_SACK.store(1, Ordering::Relaxed);
@@ -268,7 +254,6 @@ kernel_test_in!(
 // Linux ref: net/ipv4/sysctl_net_ipv4.c tcp_window_scaling
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_tcp_window_scaling_0_propagates_to_option_defaults() -> TestResult {
     sys_net::register_all();
     sys_net::TCP_WSCALE.store(1, Ordering::Relaxed);
@@ -308,7 +293,6 @@ kernel_test_in!(
 // Linux ref: net/ipv4/inet_connection_sock.c inet_get_local_port_range()
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_ip_local_port_range_propagates_to_accessor() -> TestResult {
     sys_net::register_all();
     sys_net::PORT_RANGE_LO.store(32768, Ordering::Relaxed);
@@ -346,7 +330,6 @@ kernel_test_in!(
 // Linux ref: net/ipv6/addrconf.c addrconf_sysctl IPV6_DEVCONF_FORWARDING
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_ipv6_forwarding_propagates_to_accessor() -> TestResult {
     sys_net::register_all();
     sys_net::IPV6_FORWARDING.store(0, Ordering::Relaxed);
@@ -387,7 +370,6 @@ kernel_test_in!(
 // Linux ref: mm/vmscan.c vm_swappiness (sysctl_vm_swappiness)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_vm_swappiness_write_100_stores_atomic() -> TestResult {
     sys_vm::register_all();
 
@@ -407,7 +389,6 @@ fn e2e_vm_swappiness_write_100_stores_atomic() -> TestResult {
         _ => TestResult::Fail("vm/swappiness read-back after write '100' did not return '100'"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/vm", e2e_vm_swappiness_write_100_stores_atomic);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -417,7 +398,6 @@ kernel_test_in!("procsys_e2e/vm", e2e_vm_swappiness_write_100_stores_atomic);
 // Linux ref: kernel/pid.c pid_max (PIDNS_ADDING_PIDS)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_pid_max_write_16384() -> TestResult {
     sys_kernel::register_all();
 
@@ -437,7 +417,6 @@ fn e2e_kernel_pid_max_write_16384() -> TestResult {
         _ => TestResult::Fail("kernel/pid_max read-back after write '16384' mismatch"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/kernel", e2e_kernel_pid_max_write_16384);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -447,7 +426,6 @@ kernel_test_in!("procsys_e2e/kernel", e2e_kernel_pid_max_write_16384);
 // Linux ref: kernel/sysctl.c kern_table[], utsname()->sysname
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_ostype_reads_narf() -> TestResult {
     sys_kernel::register_all();
 
@@ -461,7 +439,6 @@ fn e2e_kernel_ostype_reads_narf() -> TestResult {
         None => TestResult::Fail("kernel/ostype not found in registry"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/kernel", e2e_kernel_ostype_reads_narf);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -472,7 +449,6 @@ kernel_test_in!("procsys_e2e/kernel", e2e_kernel_ostype_reads_narf);
 // Linux ref: kernel/kmod.c modprobe_path[] (default "/sbin/modprobe")
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_modprobe_returns_empty_stub() -> TestResult {
     sys_kernel::register_all();
 
@@ -487,7 +463,6 @@ fn e2e_kernel_modprobe_returns_empty_stub() -> TestResult {
         None => TestResult::Fail("kernel/modprobe not found in registry"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/kernel", e2e_kernel_modprobe_returns_empty_stub);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -497,7 +472,6 @@ kernel_test_in!("procsys_e2e/kernel", e2e_kernel_modprobe_returns_empty_stub);
 // Linux ref: mm/mmap.c randomize_va_space, valid range [0,2]
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_randomize_va_space_3_returns_invalid_data() -> TestResult {
     sys_kernel::register_all();
 
@@ -524,7 +498,6 @@ kernel_test_in!(
 // Linux ref: net/ipv4/tcp_cong.c tcp_set_congestion_control() -ENOENT
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_tcp_congestion_control_bogus_returns_invalid_data() -> TestResult {
     sys_net::register_all();
 
@@ -553,7 +526,6 @@ kernel_test_in!(
 // Linux ref: mm/vmscan.c, swappiness range 0..200 (Linux 5.8+)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_vm_swappiness_201_returns_invalid_data() -> TestResult {
     sys_vm::register_all();
 
@@ -568,7 +540,6 @@ fn e2e_vm_swappiness_201_returns_invalid_data() -> TestResult {
         None => TestResult::Fail("vm/swappiness not found in registry"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/vm", e2e_vm_swappiness_201_returns_invalid_data);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -578,7 +549,6 @@ kernel_test_in!("procsys_e2e/vm", e2e_vm_swappiness_201_returns_invalid_data);
 // Linux ref: kernel/pid.c, pid_max bounded to [1, PID_MAX_LIMIT=4194304]
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_pid_max_negative_returns_invalid_data() -> TestResult {
     sys_kernel::register_all();
 
@@ -606,7 +576,6 @@ kernel_test_in!(
 // Linux ref: kernel/sysctl.c dmesg_restrict, kernel/printk/printk.c
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn e2e_kernel_dmesg_restrict_write_returns_readonly() -> TestResult {
     sys_kernel::register_all();
 
@@ -644,11 +613,8 @@ kernel_test_in!(
 // tooling (ps, top, free, systemd, mount) depends on.
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 use crate::procfs::{poll_once, ProcRoot};
-#[cfg(feature = "linux-compat")]
 use crate::{DirOps, FileType, Mode};
-#[cfg(feature = "linux-compat")]
 use alloc::vec::Vec;
 
 /// Resolve `name` under `/proc` via `ProcRoot::lookup` and read the whole
@@ -656,7 +622,6 @@ use alloc::vec::Vec;
 /// procfs futures complete on the first poll). Returns `None` if the node
 /// does not resolve, read errors, a poll goes pending, or the bytes are
 /// not valid UTF-8.
-#[cfg(feature = "linux-compat")]
 fn read_root_file(name: &str) -> Option<String> {
     use alloc::sync::Arc;
     let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
@@ -684,7 +649,6 @@ fn read_root_file(name: &str) -> Option<String> {
 
 /// `/proc/meminfo` has `MemTotal:`/`MemFree:` lines whose value column is a
 /// numeric kB count. `free`, systemd, and every memory probe parse these.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_meminfo_memtotal_memfree_numeric_kb() -> TestResult {
     let body = match read_root_file("meminfo") {
         Some(s) => s,
@@ -713,7 +677,6 @@ fn e2e_global_meminfo_memtotal_memfree_numeric_kb() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_meminfo_memtotal_memfree_numeric_kb
@@ -725,7 +688,6 @@ kernel_test_in!(
 /// jiffy columns (user nice system idle iowait irq softirq steal guest
 /// gnice), and carries the `intr`/`ctxt`/`btime`/`processes` summary lines
 /// that vmstat/top parse.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_stat_cpu_aggregate_and_summary_lines() -> TestResult {
     let body = match read_root_file("stat") {
         Some(s) => s,
@@ -750,7 +712,6 @@ fn e2e_global_stat_cpu_aggregate_and_summary_lines() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_stat_cpu_aggregate_and_summary_lines
@@ -760,7 +721,6 @@ kernel_test_in!(
 
 /// `/proc/uptime` is two space-separated floats (uptime, idle), each with a
 /// decimal point. `uptime(1)` and `procps` split on whitespace.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_uptime_two_floats() -> TestResult {
     let body = match read_root_file("uptime") {
         Some(s) => s,
@@ -779,14 +739,12 @@ fn e2e_global_uptime_two_floats() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_uptime_two_floats);
 
 // ── /proc/loadavg ────────────────────────────────────────────────────────────
 
 /// `/proc/loadavg` is the Linux 5-field shape: three x.xx EWMA floats, a
 /// `running/total` token, and a last-pid integer.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_loadavg_five_field_shape() -> TestResult {
     let body = match read_root_file("loadavg") {
         Some(s) => s,
@@ -815,14 +773,12 @@ fn e2e_global_loadavg_five_field_shape() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_loadavg_five_field_shape);
 
 // ── /proc/filesystems ────────────────────────────────────────────────────────
 
 /// `/proc/filesystems` lists registered fs-type tokens and uses Linux's
 /// `nodev` prefix for filesystems that do not require a block device.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_filesystems_lists_known_types() -> TestResult {
     let body = match read_root_file("filesystems") {
         Some(s) => s,
@@ -866,7 +822,6 @@ fn e2e_global_filesystems_lists_known_types() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_filesystems_lists_known_types
@@ -876,7 +831,6 @@ kernel_test_in!(
 
 /// Each `/proc/mounts` line is the fstab-shaped 6-column record
 /// `dev mountpoint fstype opts 0 0` that `mount`, `df`, and libmount parse.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_mounts_six_column_shape() -> TestResult {
     let body = match read_root_file("mounts") {
         Some(s) => s,
@@ -909,14 +863,12 @@ fn e2e_global_mounts_six_column_shape() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_mounts_six_column_shape);
 
 // ── /proc/cpuinfo ────────────────────────────────────────────────────────────
 
 /// `/proc/cpuinfo` records begin with a `processor\t: <n>` line and carry a
 /// `model name` field — the two lines lscpu / hwloc / build probes read.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_cpuinfo_processor_and_model_name() -> TestResult {
     let body = match read_root_file("cpuinfo") {
         Some(s) => s,
@@ -935,7 +887,6 @@ fn e2e_global_cpuinfo_processor_and_model_name() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_cpuinfo_processor_and_model_name
@@ -944,7 +895,6 @@ kernel_test_in!(
 // ── /proc/version ────────────────────────────────────────────────────────────
 
 /// `/proc/version` is a single line naming the kernel ("NARF kernel ...").
-#[cfg(feature = "linux-compat")]
 fn e2e_global_version_single_kernel_line() -> TestResult {
     let body = match read_root_file("version") {
         Some(s) => s,
@@ -959,14 +909,12 @@ fn e2e_global_version_single_kernel_line() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_version_single_kernel_line);
 
 // ── /proc/cmdline ────────────────────────────────────────────────────────────
 
 /// `/proc/cmdline` is a single newline-terminated line — the boot command
 /// line systemd and dracut parse.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_cmdline_single_line() -> TestResult {
     let body = match read_root_file("cmdline") {
         Some(s) => s,
@@ -981,7 +929,6 @@ fn e2e_global_cmdline_single_line() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_cmdline_single_line);
 
 // ── /proc/self ───────────────────────────────────────────────────────────────
@@ -989,7 +936,6 @@ kernel_test_in!("procsys_e2e/global", e2e_global_cmdline_single_line);
 /// `/proc/self` stats as a symlink whose readlink text is the caller's pid.
 /// With no current-pid hook installed in the test harness the hook falls
 /// back to pid 0, so the target must be the decimal string of `current_pid`.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_self_is_symlink_to_pid() -> TestResult {
     use alloc::string::ToString;
     use alloc::sync::Arc;
@@ -1015,7 +961,6 @@ fn e2e_global_self_is_symlink_to_pid() -> TestResult {
         _ => TestResult::Fail("/proc/self target is not the caller's pid"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_self_is_symlink_to_pid);
 
 // ── /proc/pressure/{cpu,memory,io} ───────────────────────────────────────────
@@ -1023,7 +968,6 @@ kernel_test_in!("procsys_e2e/global", e2e_global_self_is_symlink_to_pid);
 /// The PSI files resolve through `/proc/pressure` and read back the
 /// `some avg10=... avg60=... avg300=... total=...` shape; `cpu` has only a
 /// `some` line while `memory`/`io` add a `full` line.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_pressure_psi_shape() -> TestResult {
     use alloc::sync::Arc;
     let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
@@ -1076,14 +1020,12 @@ fn e2e_global_pressure_psi_shape() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_pressure_psi_shape);
 
 // ── /proc/sys/kernel/seccomp/actions_avail ───────────────────────────────────
 
 /// `/proc/sys/kernel/seccomp/actions_avail` lists the seccomp filter action
 /// tokens libseccomp probes; the `allow` and `errno` actions must be present.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_seccomp_actions_avail_lists_actions() -> TestResult {
     sys_kernel::register_all();
     let body = match sysctl_read(&["sys", "kernel", "seccomp", "actions_avail"]) {
@@ -1107,7 +1049,6 @@ fn e2e_global_seccomp_actions_avail_lists_actions() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_seccomp_actions_avail_lists_actions
@@ -1118,7 +1059,6 @@ kernel_test_in!(
 /// The kernel identity sysctls read as their documented constants:
 /// ostype "NARF", non-empty osrelease, default hostname "narf", and a
 /// numeric pid_max within the Linux PID_MAX_LIMIT.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_sys_kernel_identity_keys() -> TestResult {
     sys_kernel::register_all();
 
@@ -1142,7 +1082,6 @@ fn e2e_global_sys_kernel_identity_keys() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_sys_kernel_identity_keys);
 
 // ── /proc/sys/vm + /proc/sys/fs known keys ───────────────────────────────────
@@ -1150,7 +1089,6 @@ kernel_test_in!("procsys_e2e/global", e2e_global_sys_kernel_identity_keys);
 /// Representative `/proc/sys/vm/*` and `/proc/sys/fs/*` keys resolve and
 /// read as integers: vm.swappiness (0..=200), vm.overcommit_memory, and
 /// fs.file-max.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_sys_vm_fs_known_keys_numeric() -> TestResult {
     sys_vm::register_all();
     crate::procfs::sys_fs::register_all();
@@ -1173,7 +1111,6 @@ fn e2e_global_sys_vm_fs_known_keys_numeric() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "procsys_e2e/global",
     e2e_global_sys_vm_fs_known_keys_numeric
@@ -1184,7 +1121,6 @@ kernel_test_in!(
 /// A flat global file (`meminfo`) stats as a regular file, `self` as a
 /// symlink, and `pressure` as a directory — the node-type distinctions
 /// `resolve_async` and readdir rely on.
-#[cfg(feature = "linux-compat")]
 fn e2e_global_node_types_file_symlink_dir() -> TestResult {
     use alloc::sync::Arc;
     let root: Arc<dyn DirOps> = Arc::new(ProcRoot);
@@ -1211,5 +1147,4 @@ fn e2e_global_node_types_file_symlink_dir() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("procsys_e2e/global", e2e_global_node_types_file_symlink_dir);

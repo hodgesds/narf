@@ -16,7 +16,6 @@
 //!   * The `narf_shmem` syscall vtable is installed by a `Stage::Subsys`
 //!     initcall before the test phase runs, so `shmem_create` / `shmget`
 //!     reach real frame backing.
-#![cfg(feature = "linux-compat")]
 #![allow(dead_code)] // errno/flag reference table + harness helpers
 
 use crate::abi_test_support::*;

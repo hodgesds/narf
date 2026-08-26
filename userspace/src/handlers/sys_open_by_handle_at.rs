@@ -2,7 +2,6 @@
 use super::*;
 
 /// `open_by_handle_at(mount_fd, handle, flags)`.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     const EINVAL: i64 = 22;
     const ESTALE: i64 = 116;

@@ -53,9 +53,7 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::devfs::DevFs;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::sys_kernel;
-#[cfg(feature = "linux-compat")]
 use crate::procfs::{lookup_registry, ProcNodeSnapshot};
 use crate::FsInstance as _;
 
@@ -329,7 +327,6 @@ kernel_test_in!(
 // Smoke 9 — /proc/sys/kernel/random/entropy_avail is readable, ends with '\n'
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_rand_entropy_avail_readable_newline() -> TestResult {
     sys_kernel::register_all();
     let f = match lookup_registry(&["sys", "kernel", "random", "entropy_avail"]) {
@@ -352,7 +349,6 @@ fn smoke_rand_entropy_avail_readable_newline() -> TestResult {
         Err(_) => TestResult::Fail("entropy_avail value does not parse as u64"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "filesystem/random_e2e",
     smoke_rand_entropy_avail_readable_newline
@@ -362,7 +358,6 @@ kernel_test_in!(
 // Smoke 10 — /proc/sys/kernel/random/uuid matches RFC-4122 v4 format
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_rand_uuid_format() -> TestResult {
     sys_kernel::register_all();
     let f = match lookup_registry(&["sys", "kernel", "random", "uuid"]) {
@@ -410,14 +405,12 @@ fn smoke_rand_uuid_format() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/random_e2e", smoke_rand_uuid_format);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Smoke 11 — /proc/sys/kernel/random/boot_id is stable across reads
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_rand_boot_id_stable() -> TestResult {
     sys_kernel::register_all();
     let f = match lookup_registry(&["sys", "kernel", "random", "boot_id"]) {
@@ -437,7 +430,6 @@ fn smoke_rand_boot_id_stable() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/random_e2e", smoke_rand_boot_id_stable);
 
 // ═══════════════════════════════════════════════════════════════════════════

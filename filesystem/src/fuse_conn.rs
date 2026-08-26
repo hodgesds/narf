@@ -68,7 +68,6 @@ pub struct FuseRequestContext {
 pub type FuseRequestContextProvider = fn() -> FuseRequestContext;
 
 static REQUEST_CONTEXT_PROVIDER: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "linux-compat")]
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 const FUSE_DEFAULT_MAX_BACKGROUND: u32 = 12;
 const FUSE_DEFAULT_CONGESTION_THRESHOLD: u32 = FUSE_DEFAULT_MAX_BACKGROUND * 3 / 4;
@@ -104,9 +103,7 @@ pub fn __test_reset_request_context_provider() {
 /// - `connected`: cleared when the daemon closes `/dev/fuse` so parked
 ///   callers can fail with `ENOTCONN`/`Unsupported` instead of hanging.
 pub struct FuseConnection {
-    #[cfg(feature = "linux-compat")]
     connection_id: u64,
-    #[cfg(feature = "linux-compat")]
     sysfs_registered: AtomicBool,
     pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
     background_deferred: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
@@ -159,9 +156,7 @@ impl Default for FuseConnection {
 impl FuseConnection {
     pub fn new() -> Self {
         FuseConnection {
-            #[cfg(feature = "linux-compat")]
             connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
-            #[cfg(feature = "linux-compat")]
             sysfs_registered: AtomicBool::new(false),
             pending: IrqSafeSpinLock::new(VecDeque::new()),
             background_deferred: IrqSafeSpinLock::new(VecDeque::new()),
@@ -243,7 +238,6 @@ impl FuseConnection {
         self.set_max_background(max_background);
     }
 
-    #[cfg(feature = "linux-compat")]
     pub fn connection_id(&self) -> u64 {
         self.connection_id
     }
@@ -263,7 +257,6 @@ impl FuseConnection {
         threshold != 0 && self.background_requests() >= threshold as usize
     }
 
-    #[cfg(feature = "linux-compat")]
     fn ensure_sysfs(self: &Arc<Self>) {
         if self.sysfs_registered.swap(true, Ordering::AcqRel) {
             return;
@@ -324,11 +317,6 @@ impl FuseConnection {
                 Ok(())
             },
         );
-    }
-
-    #[cfg(not(feature = "linux-compat"))]
-    fn ensure_sysfs(self: &Arc<Self>) {
-        let _ = self;
     }
 
     fn is_fresh_endpoint(&self) -> bool {
@@ -901,7 +889,6 @@ impl FuseConnection {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn parse_connection_limit(data: &[u8]) -> Result<u32, FsError> {
     let value = core::str::from_utf8(data)
         .map_err(|_| FsError::InvalidData)?
@@ -2541,7 +2528,6 @@ impl FuseFs {
 
 impl Drop for FuseConnection {
     fn drop(&mut self) {
-        #[cfg(feature = "linux-compat")]
         {
             if !self.sysfs_registered.load(Ordering::Acquire) {
                 return;

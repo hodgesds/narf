@@ -1,5 +1,4 @@
 //! Linux syscall ABI conformance — socket group.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ── Linux socket constants (subset the NARF handlers understand) ──

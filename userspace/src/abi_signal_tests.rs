@@ -1,5 +1,4 @@
 //! Linux syscall ABI conformance — signal group.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ── Kill ────────────────────────────────────────────────────────────

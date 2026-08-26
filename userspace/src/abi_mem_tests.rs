@@ -1,5 +1,4 @@
 //! Linux syscall ABI conformance — mem group.
-#![cfg(feature = "linux-compat")]
 use alloc::sync::Arc;
 
 use narf_lib::sync::IrqSafeSpinLock;

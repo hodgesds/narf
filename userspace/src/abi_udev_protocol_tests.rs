@@ -23,7 +23,7 @@
 //! `find_task_by_vpid` (the pid is the CALLER's namespace view, exactly like
 //! kill(2)); net/core/scm.c credential translation into the receiver's pid
 //! namespace (an unmapped sender reads as pid 0, never as someone else).
-#![cfg(all(feature = "linux-compat", feature = "container"))]
+#![cfg(feature = "container")]
 use crate::abi_test_support::*;
 
 const SOCK_DGRAM: u64 = 2;

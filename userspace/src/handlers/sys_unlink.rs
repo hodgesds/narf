@@ -38,7 +38,6 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     });
     match outcome {
         Some(Some(Ok(()))) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_delete(path, false);
             ctx.set_return(SyscallReturn::ok(0));
         }

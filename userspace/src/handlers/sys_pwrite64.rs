@@ -104,7 +104,6 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         }
     }
 
-    #[cfg(feature = "linux-compat")]
     if total != 0 {
         crate::mqueue::notify_modify_fd(task, fd);
     }

@@ -5,7 +5,6 @@
 //! positioned/vectored I/O, cross-process VM copy, ptrace, the batched
 //! socket syscalls, the bootstrap/ring-kick ring machinery, and
 //! firmware-install. Shares the harness in [`crate::abi_test_support`].
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

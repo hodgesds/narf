@@ -749,7 +749,7 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fcntl_flags_round_trip);
 
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fcntl_status_flags() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -866,10 +866,10 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fcntl_status_flags);
 
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     use crate::fd::locks;
     locks::__test_reset();
@@ -926,7 +926,7 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     locks::__test_reset();
     TestResult::Pass
 }
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fcntl_setlk_conflict);
 
 #[cfg(target_arch = "x86_64")]
@@ -2458,7 +2458,6 @@ kernel_test_in!(
     smoke_userspace_init_per_task_state_is_idempotent
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2614,10 +2613,8 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_memfd_seal_write_rejects_write);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
     use crate::linux_compat::{F_SEAL_SEAL, F_SEAL_WRITE, MFD_ALLOW_SEALING};
     use crate::{
@@ -2708,7 +2705,6 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_memfd_seal_seal_blocks_further_seals
@@ -2720,7 +2716,6 @@ kernel_test_in!(
 // linux-compat. These four smokes confirm the wire shape, mask=0
 // semantics, AT_EMPTY_PATH, and the linux_compat::Stat field offsets.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2852,13 +2847,11 @@ fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_statx_known_file_reports_mode_size
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2993,13 +2986,11 @@ fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_statx_mask_zero_still_fills_basic_fields
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3161,10 +3152,8 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_statx_at_empty_path_uses_dirfd);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_statx_device_node_reports_rdev() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3338,10 +3327,8 @@ fn smoke_userspace_statx_device_node_reports_rdev() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_statx_device_node_reports_rdev);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
     // Compile-time check that linux_compat::Stat field offsets match
     // the Linux x86_64 ABI (man 2 stat).
@@ -3389,7 +3376,6 @@ fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
 
 /// A process whose stdout IS the PTY slave must have its writes readable on
@@ -3410,7 +3396,6 @@ kernel_test_in!("userspace", smoke_userspace_linux_stat_layout_offsets);
 /// master. Both directions are asserted — slave→master is the shell's
 /// output, master→slave its input — because a terminal needs both and only
 /// one of them is the reported symptom.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
     // Kernel-test fixture: stack buffers stand in for user pointers, so the
     // production `validate_user_range` predicate needs the scoped opt-in.
@@ -3555,7 +3540,6 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
         None => TestResult::Pass,
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_pty_slave_as_stdout_reaches_master
@@ -3589,7 +3573,6 @@ kernel_test_in!(
 /// The assertion is deliberately the shell's own convergence condition
 /// (`tcgetpgrp(slave) == getpgrp()`), not "fg_pgrp is nonzero" — a nonzero
 /// but wrong pgrp hangs bash exactly as hard as a zero one.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
     let _kbuf = crate::handlers::kernel_buffers_guard();
     use alloc::sync::Arc;
@@ -3683,7 +3666,6 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
         None => TestResult::Pass,
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
@@ -3692,7 +3674,6 @@ kernel_test_in!(
 /// PTY job-control ioctls are syscall policy, not merely FileOps plumbing.
 /// Pin Linux's ownership, fd-mode, endpoint and errno ordering through the
 /// real ioctl dispatch path.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
     let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{fd, syscall::__test_clear_global, FdEntry};
@@ -3875,7 +3856,6 @@ fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
         None => TestResult::Pass,
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_pty_job_control_ioctl_errno_matrix

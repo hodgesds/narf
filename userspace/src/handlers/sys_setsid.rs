@@ -18,7 +18,6 @@ pub(crate) fn sys_setsid(ctx: &mut dyn TrapContext) {
     // process transition. The fixed lock order is PGID -> SID -> CTTY.
     let mut sids = SID_TABLE.lock();
     let sid_rows = sids.get_or_insert_with(BTreeMap::new);
-    #[cfg(feature = "linux-compat")]
     let mut cttys = CTTY_TABLE.lock();
 
     pgid_rows.insert(task, task);
@@ -28,7 +27,6 @@ pub(crate) fn sys_setsid(ctx: &mut dyn TrapContext) {
     // DETACHED (not absent) — absent means "the boot-console default", so
     // a leader that detached must be distinguishable from one that never
     // touched its ctty. The next TIOCSCTTY installs a real one.
-    #[cfg(feature = "linux-compat")]
     {
         cttys
             .get_or_insert_with(BTreeMap::new)

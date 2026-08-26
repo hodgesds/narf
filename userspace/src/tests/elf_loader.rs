@@ -7,7 +7,7 @@ use super::*;
 // 257's sd-executor spawn execve("/proc/self/fd/<N>") after opening the
 // binary O_PATH; execve must recognize that path and resolve the fd. Only a
 // bare fd (no trailing sub-path) under /proc/self/fd or /proc/<pid>/fd counts.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_parse_proc_self_fd() -> TestResult {
     use crate::handlers::parse_proc_self_fd as p;
     if p("/proc/self/fd/3") != Some(3) {
@@ -27,7 +27,7 @@ fn smoke_userspace_parse_proc_self_fd() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_parse_proc_self_fd);
 
 #[cfg(target_arch = "x86_64")]

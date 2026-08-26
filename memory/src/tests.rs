@@ -6134,7 +6134,6 @@ fn smoke_memory_address_space_batched_swap_lifecycle() -> TestResult {
         return TestResult::Fail("mlock swap cleanup failed");
     }
 
-    #[cfg(feature = "linux-compat")]
     {
         // MADV_DONTNEED has the opposite contract: retire the stable swap
         // entry so the next touch is anonymous zero-fill.
@@ -9320,10 +9319,7 @@ kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
 // 3. `madvise_dontneed` releases backed frames + zeros the per-page
 //    phys list so the next access takes the demand-paging path.
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_mprotect_splits_region() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9408,19 +9404,13 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         TestResult::Fail("split layout / perms / phys did not match expectation")
     }
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
 
 /// Rewriting permissions on a lazy mapping must leave its zero backing
 /// sentinel unmapped.  In particular, the aarch64 rewrite path once omitted
 /// the `phys == 0` guard and installed a user leaf for physical address zero.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_mprotect_keeps_lazy_page_unmapped() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9462,19 +9452,13 @@ fn smoke_memory_mprotect_keeps_lazy_page_unmapped() -> TestResult {
         TestResult::Fail("mprotect changed lazy backing metadata")
     }
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_mprotect_keeps_lazy_page_unmapped);
 
 /// Linux rounds a non-zero length upward but refuses to partially protect a
 /// range containing a hole. Validate the whole interval before splitting any
 /// VMA; zero length remains a no-op even for a W|X-shaped request.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_mprotect_hole_is_atomic_and_len_rounds() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9533,16 +9517,13 @@ fn smoke_memory_mprotect_hole_is_atomic_and_len_rounds() -> TestResult {
         TestResult::Fail("zero-length mprotect was not a no-op")
     }
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "memory",
     smoke_memory_mprotect_hole_is_atomic_and_len_rounds
 );
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
@@ -9578,10 +9559,10 @@ fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
         Err(_) => TestResult::Fail("wrong error for WRITE|EXEC"),
     }
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mprotect_rejects_write_exec);
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9635,7 +9616,7 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
         TestResult::Fail("madvise didn't zero per-page phys slot")
     }
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
 
 /// MADV_DONTNEED over a MULTI-PAGE range with an interior unfaulted hole must
@@ -9644,10 +9625,7 @@ kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
 /// per-region range unmap (one root lock + one upper-level walk for the whole
 /// intersection) rather than the single-page helper, so a regression in the
 /// range teardown that dropped or double-counted a page would surface here.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9701,10 +9679,7 @@ fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult 
         TestResult::Fail("range madvise left a resident slot or resized the region")
     }
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "memory",
     smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole
@@ -9764,10 +9739,7 @@ kernel_test_in!("memory", smoke_memory_user_page_writable_gates_readonly);
 
 /// MADV_DONTNEED reports an unmapped hole without releasing either mapped
 /// island, and rounds a one-byte request over its containing page.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -9807,10 +9779,7 @@ fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
         TestResult::Fail("rounded/zero-length madvise semantics were wrong")
     }
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_madvise_hole_is_atomic_and_len_rounds);
 
 /// Residency sampling walks a VMA once, preserves lazy-page state, rounds the
@@ -11378,7 +11347,7 @@ kernel_test_in!("memory", smoke_memory_mlock_unmapped_is_rejected);
 /// that, because the obvious simplification (`perms: prot`) reads as
 /// correct and silently drops LOCKED. The hugetlb path in the same
 /// function *does* use bare `prot`; see the `// LINUX-GAP` note there.
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_memory_mlock_survives_mprotect() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
@@ -11433,7 +11402,7 @@ fn smoke_memory_mlock_survives_mprotect() -> TestResult {
         None => TestResult::Fail("region vanished across mprotect"),
     }
 }
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);
 
 /// A mixed huge/base-page mprotect must reserve every base-page split node
@@ -11442,7 +11411,6 @@ kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);
 /// the huge middle, just as the ordinary 4 KiB path does.
 #[cfg(all(
     any(target_arch = "x86_64", target_arch = "aarch64"),
-    feature = "linux-compat",
     feature = "kernel-test"
 ))]
 fn smoke_memory_mprotect_mixed_huge_index_oom_is_preflight() -> TestResult {
@@ -11556,7 +11524,6 @@ fn smoke_memory_mprotect_mixed_huge_index_oom_is_preflight() -> TestResult {
 }
 #[cfg(all(
     any(target_arch = "x86_64", target_arch = "aarch64"),
-    feature = "linux-compat",
     feature = "kernel-test"
 ))]
 kernel_test_in!(

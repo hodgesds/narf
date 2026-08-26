@@ -1188,7 +1188,6 @@ impl FileOps for DevConsole {
     /// mode. `TCSETS*` round-trips the caller's termios (so a program
     /// can switch raw/cooked); `TIOCGWINSZ` reports the window size.
     /// Other requests fall through to `-ENOTTY`.
-    #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
             read_user_i32, read_user_termios, read_user_termios2, read_user_winsize,

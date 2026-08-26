@@ -4849,7 +4849,6 @@ fn smoke_fs_fuse_destroy_after_init() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_fs_fuse_destroy_after_init);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
     use crate::fuse_conn::DevFuse;
 
@@ -4897,7 +4896,6 @@ fn smoke_fs_fuse_sysfs_connection_controls() -> TestResult {
         _ => TestResult::Fail("FUSE sysfs abort did not disconnect"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_fs_fuse_sysfs_connection_controls);
 
 /// Test-only unmount helper for the FUSE e2e mounts.
@@ -5721,7 +5719,6 @@ kernel_test_in!("filesystem", smoke_overlay_copy_up_metadata);
 // supervisor memory, so the SMAP bracket permits access here).
 
 /// Resolve a fresh `/dev/tty1` FileOps (a `DevConsole`) for ioctl tests.
-#[cfg(feature = "linux-compat")]
 fn open_dev_tty1_for_test() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
     use crate::{bootstrap_mount_authority, registry, DevFs};
     let auth = bootstrap_mount_authority();
@@ -5737,7 +5734,6 @@ fn open_dev_tty1_for_test() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
 // /dev/tty1 exists and is the singleton console tty (same tty id as
 // /dev/console) — getty@tty1 opens it. Also exercises TIOCGWINSZ + the
 // TIOCSWINSZ→TIOCGWINSZ round-trip glibc's `TIOCGWINSZ`/`resize` use.
-#[cfg(feature = "linux-compat")]
 fn smoke_devfs_tty1_is_console_and_winsize_roundtrip() -> TestResult {
     use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
     crate::console_tty::__test_reset_cooked();
@@ -5770,7 +5766,6 @@ fn smoke_devfs_tty1_is_console_and_winsize_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "filesystem",
     smoke_devfs_tty1_is_console_and_winsize_roundtrip
@@ -5778,7 +5773,6 @@ kernel_test_in!(
 
 // TIOCSPGRP → TIOCGPGRP round-trip on /dev/console: getty sets the
 // foreground pgrp for the login session; login reads it back.
-#[cfg(feature = "linux-compat")]
 fn smoke_devfs_console_fg_pgrp_roundtrip() -> TestResult {
     use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
     crate::console_tty::__test_reset_cooked();
@@ -5805,7 +5799,6 @@ fn smoke_devfs_console_fg_pgrp_roundtrip() -> TestResult {
     crate::console_tty::__test_reset_cooked();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_devfs_console_fg_pgrp_roundtrip);
 
 // The VT / keyboard probes agetty fires must degrade gracefully: KDGKBMODE
@@ -5814,7 +5807,6 @@ kernel_test_in!("filesystem", smoke_devfs_console_fg_pgrp_roundtrip);
 // back to serial mode instead of aborting on a bare failure; TCFLSH/TCSBRK
 // succeed as no-ops. None of these may be a bare error the caller can't
 // interpret.
-#[cfg(feature = "linux-compat")]
 fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
     use crate::devfs_pty::{
         KDGETMODE, KDGKBMODE, TCFLSH, TCSBRK, VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY,
@@ -5856,7 +5848,6 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);
 
 /// An empty `/dev/uinput` read must NOT report end-of-file.

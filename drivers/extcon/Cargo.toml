@@ -19,7 +19,6 @@ narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]
-linux-compat = ["narf-filesystem/linux-compat"]
 # Gating so `#[cfg(feature = "kernel-test")]` inside src/ doesn't
 # trigger the unexpected_cfgs lint. The test harness enables this.
 kernel-test = []

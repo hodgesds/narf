@@ -427,7 +427,6 @@ fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_console_ctrlc_signals_foreground_pgrp);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -565,7 +564,6 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_tty_background_read_raises_sigttin);
 
 // ── Wave 39: end-to-end `echo hello world` golden path ────────────────────
@@ -1333,7 +1331,6 @@ kernel_test_in!("userspace", smoke_console_ioctl_kdsigaccept_ok);
 // drives the session transition, then pokes the hook directly and reads the
 // process table via `ctty_for(task)`.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     use crate::handlers::{
         __test_ctty_reset, __test_pgid_reset, __test_set_pgid, __test_sid_reset, ctty_for,
@@ -1411,7 +1408,6 @@ fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_ctty_hook_roundtrip_and_setsid_clears
@@ -1423,7 +1419,6 @@ kernel_test_in!(
 // CONSOLE and TIOCGSID (`current_task_sid_user`) reports the new session.
 // `detach_controlling_tty` (TIOCNOTTY) then drops it again. This is the
 // exact sequence agetty runs: setsid → open(/dev/tty1) → TIOCSCTTY.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
     use crate::handlers::{
         __test_ctty_reset, __test_pgid_reset, __test_set_pgid, __test_sid_reset, current_task_id,
@@ -1518,7 +1513,6 @@ fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_console_ctty_acquire_release_and_sid

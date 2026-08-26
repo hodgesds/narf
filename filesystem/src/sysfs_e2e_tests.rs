@@ -1,4 +1,3 @@
-#![cfg(feature = "linux-compat")]
 //! Wave-19 sysfs/devfs bridge end-to-end smokes.
 //!
 //! Each smoke walks the full path:
@@ -47,7 +46,6 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-#[cfg(feature = "linux-compat")]
 use crate::sysfs::{
     __reset_for_test as sysfs_reset, class_device_register, class_register, coldplug,
     get_or_create_child, kobject_add_attr, kobject_add_uevent_attr, kobject_add_writable_attr,
@@ -82,7 +80,6 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 }
 
 /// Read an attribute via `kobject.attr_show`, stripping the trailing `'\n'`.
-#[cfg(feature = "linux-compat")]
 fn attr_show_trimmed(kobj: &Kobject, name: &str) -> Option<String> {
     kobj.attr_show(name)
         .map(|s| s.trim_end_matches('\n').to_string())
@@ -97,7 +94,6 @@ fn attr_show_trimmed(kobj: &Kobject, name: &str) -> Option<String> {
 //   /sys/class/hwmon/hwmonX/tempN_input   — temperature in milli-°C
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_hwmon_k10temp_e2e() -> TestResult {
     sysfs_reset();
 
@@ -174,7 +170,6 @@ fn smoke_hwmon_k10temp_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/hwmon", smoke_hwmon_k10temp_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,7 +180,6 @@ kernel_test_in!("sysfs_e2e/hwmon", smoke_hwmon_k10temp_e2e);
 //   /sys/class/backlight/X/max_brightness   ro
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_backlight_brightness_e2e() -> TestResult {
     sysfs_reset();
 
@@ -254,7 +248,6 @@ fn smoke_backlight_brightness_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/backlight", smoke_backlight_brightness_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -265,7 +258,6 @@ kernel_test_in!("sysfs_e2e/backlight", smoke_backlight_brightness_e2e);
 //   /sys/class/leds/X/brightness rw
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_leds_trigger_e2e() -> TestResult {
     sysfs_reset();
 
@@ -346,7 +338,6 @@ fn smoke_leds_trigger_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/leds", smoke_leds_trigger_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -411,7 +402,6 @@ impl FileOps for FakeTpmFileOps {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn smoke_tpm_devfs_roundtrip() -> TestResult {
     // Canned 12-byte response: TPM_ST_NO_SESSIONS, size=12, RC_SUCCESS, 2 body bytes.
     let canned: Vec<u8> = vec![
@@ -482,7 +472,6 @@ fn smoke_tpm_devfs_roundtrip() -> TestResult {
     crate::devfs::unregister_tpm();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/tpm_devfs", smoke_tpm_devfs_roundtrip);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -494,7 +483,6 @@ kernel_test_in!("sysfs_e2e/tpm_devfs", smoke_tpm_devfs_roundtrip);
 //   /sys/class/tpm/tpm0/pcrs
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_tpm_sysfs_attrs() -> TestResult {
     sysfs_reset();
 
@@ -556,7 +544,6 @@ fn smoke_tpm_sysfs_attrs() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/tpm_sysfs", smoke_tpm_sysfs_attrs);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -568,7 +555,6 @@ kernel_test_in!("sysfs_e2e/tpm_sysfs", smoke_tpm_sysfs_attrs);
 //   /sys/class/thermal/thermal_zoneX/trip_point_0_temp
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_thermal_zone_e2e() -> TestResult {
     sysfs_reset();
 
@@ -621,7 +607,6 @@ fn smoke_thermal_zone_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/thermal", smoke_thermal_zone_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -634,7 +619,6 @@ kernel_test_in!("sysfs_e2e/thermal", smoke_thermal_zone_e2e);
 //   /sys/class/power_supply/AC/online              — "1" / "0"
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_power_supply_battery_and_ac() -> TestResult {
     sysfs_reset();
 
@@ -715,7 +699,6 @@ fn smoke_power_supply_battery_and_ac() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/power_supply", smoke_power_supply_battery_and_ac);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -732,7 +715,6 @@ kernel_test_in!("sysfs_e2e/power_supply", smoke_power_supply_battery_and_ac);
 //   /sys/class/watchdog/watchdog0/timeout   — seconds (rw)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_watchdog_sysfs_kobject_e2e() -> TestResult {
     sysfs_reset();
 
@@ -851,7 +833,6 @@ fn smoke_watchdog_sysfs_kobject_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/watchdog", smoke_watchdog_sysfs_kobject_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -861,7 +842,6 @@ kernel_test_in!("sysfs_e2e/watchdog", smoke_watchdog_sysfs_kobject_e2e);
 //   /sys/class/extcon/extconX/state  — "CABLE=0\n" or "CABLE=1\n" per cable
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_extcon_state_change_e2e() -> TestResult {
     sysfs_reset();
 
@@ -915,7 +895,6 @@ fn smoke_extcon_state_change_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/extcon", smoke_extcon_state_change_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -926,7 +905,6 @@ kernel_test_in!("sysfs_e2e/extcon", smoke_extcon_state_change_e2e);
 //   /sys/class/typec/portX/data_role    — "host" / "device" / "dual"
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_typec_orientation_and_role_e2e() -> TestResult {
     sysfs_reset();
 
@@ -993,7 +971,6 @@ fn smoke_typec_orientation_and_role_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/typec", smoke_typec_orientation_and_role_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1008,7 +985,6 @@ kernel_test_in!("sysfs_e2e/typec", smoke_typec_orientation_and_role_e2e);
 // [0x66,0x55,0x44,0x33,0x22,0x11].
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_bluetooth_hci_sysfs_e2e() -> TestResult {
     sysfs_reset();
 
@@ -1051,7 +1027,6 @@ fn smoke_bluetooth_hci_sysfs_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/bluetooth", smoke_bluetooth_hci_sysfs_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1120,7 +1095,6 @@ impl FileOps for DevNullStub {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sound_sysfs_and_devfs_hook_e2e() -> TestResult {
     sysfs_reset();
 
@@ -1206,7 +1180,6 @@ fn smoke_sound_sysfs_and_devfs_hook_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/sound", smoke_sound_sysfs_and_devfs_hook_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1215,7 +1188,6 @@ kernel_test_in!("sysfs_e2e/sound", smoke_sound_sysfs_and_devfs_hook_e2e);
 // Linux ref: Documentation/ABI/testing/sysfs-class-drm
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_e2e() -> TestResult {
     sysfs_reset();
 
@@ -1236,7 +1208,6 @@ fn smoke_drm_sysfs_e2e() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/drm", smoke_drm_sysfs_e2e);
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1254,7 +1225,6 @@ kernel_test_in!("sysfs_e2e/drm", smoke_drm_sysfs_e2e);
 //             /sys/devices/... (mirrors how populate_input_class wires the
 //             class dir to the /sys/devices topology) ──────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_class_lists_members_and_symlink() -> TestResult {
     sysfs_reset();
 
@@ -1311,14 +1281,12 @@ fn smoke_core_class_lists_members_and_symlink() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/core", smoke_core_class_lists_members_and_symlink);
 
 // ── Core 2 — a device's `uevent` attr renders KEY=value lines, and writing
 //             "add" re-triggers a uevent (seqnum bumps). This is the coldplug
 //             `echo add > uevent` store path (kobject_add_uevent_attr). ─────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_uevent_attr_render_and_store_triggers() -> TestResult {
     sysfs_reset();
     crate::uevent::__reset_for_test();
@@ -1385,7 +1353,6 @@ fn smoke_core_uevent_attr_render_and_store_triggers() -> TestResult {
     crate::uevent::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "sysfs_e2e/core",
     smoke_core_uevent_attr_render_and_store_triggers
@@ -1395,7 +1362,6 @@ kernel_test_in!(
 //             register_char_dev_link installs /sys/dev/char/MAJOR:MINOR
 //             pointing at the class dir (udev by-devnum lookup). ───────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_dev_attr_and_char_devnum_link() -> TestResult {
     sysfs_reset();
 
@@ -1440,13 +1406,11 @@ fn smoke_core_dev_attr_and_char_devnum_link() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/core", smoke_core_dev_attr_and_char_devnum_link);
 
 // ── Core 4 — /sys/kernel/uevent_seqnum reads a monotonically-increasing
 //             number, and /sys/kernel exposes the known THP knobs. ─────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_kernel_uevent_seqnum_monotonic() -> TestResult {
     sysfs_reset();
     crate::uevent::__reset_for_test();
@@ -1511,14 +1475,12 @@ fn smoke_core_kernel_uevent_seqnum_monotonic() -> TestResult {
     crate::uevent::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/core", smoke_core_kernel_uevent_seqnum_monotonic);
 
 // ── Core 5 — attribute read/write round-trip on a writable attr, and a
 //             read-only attr rejects writes (attr_store → None, surfaced as
 //             ReadOnly by SysAttrFile::write). ─────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_rw_roundtrip_and_ro_rejects_write() -> TestResult {
     sysfs_reset();
 
@@ -1594,7 +1556,6 @@ fn smoke_core_rw_roundtrip_and_ro_rejects_write() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "sysfs_e2e/core",
     smoke_core_rw_roundtrip_and_ro_rejects_write
@@ -1603,7 +1564,6 @@ kernel_test_in!(
 // ── Core 6 — SysKobjDir enumeration returns children + attrs + symlinks with
 //             the right FileType, and a missing attr resolves to NotFound. ──
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_dir_enumeration_and_missing_notfound() -> TestResult {
     sysfs_reset();
 
@@ -1662,7 +1622,6 @@ fn smoke_core_dir_enumeration_and_missing_notfound() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "sysfs_e2e/core",
     smoke_core_dir_enumeration_and_missing_notfound
@@ -1672,7 +1631,6 @@ kernel_test_in!(
 //             /sys/class/net/<if> symlink yields a SysSymlinkFile whose read
 //             returns the /sys/devices target verbatim (readlink shape). ───
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_symlink_resolution_via_vfs() -> TestResult {
     sysfs_reset();
 
@@ -1725,13 +1683,11 @@ fn smoke_core_symlink_resolution_via_vfs() -> TestResult {
     sysfs_reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/core", smoke_core_symlink_resolution_via_vfs);
 
 // ── Core 8 — coldplug() broadcasts an ADD per device kobject (one carrying a
 //             `uevent` attr), matching `udevadm trigger --action=add`. ──────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_core_coldplug_emits_add_per_device() -> TestResult {
     sysfs_reset();
     crate::uevent::__reset_for_test();
@@ -1780,5 +1736,4 @@ fn smoke_core_coldplug_emits_add_per_device() -> TestResult {
     crate::uevent::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/core", smoke_core_coldplug_emits_add_per_device);

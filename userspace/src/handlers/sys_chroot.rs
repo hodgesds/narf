@@ -24,7 +24,6 @@ use super::*;
 /// Note the lookup uses AT_FDCWD, so a RELATIVE target is legal and joins
 /// the caller's cwd (`chroot("rootfs")` is a normal thing to write). This
 /// handler used to reject any path not starting with '/' outright.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux `chroot(const char *path)` passes a single NUL-terminated

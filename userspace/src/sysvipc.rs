@@ -1,17 +1,13 @@
 //! System V IPC — semaphores (`sem*`) and message queues (`msg*`).
 //!
-//! Self-contained side-table implementations that work in any
-//! `linux-compat` build (independent of the container IPC-namespace
-//! infrastructure, which provides only the id-by-key `*get` surface).
-//! Shared memory (`shm*`) lives separately since it needs address-space
-//! frame mapping.
+//! Self-contained side-table implementations (independent of the container
+//! IPC-namespace infrastructure, which provides only the id-by-key `*get`
+//! surface). Shared memory (`shm*`) lives separately since it needs
+//! address-space frame mapping.
 //!
 //! Blocking semaphore operations and message receives use the userspace
 //! executor's interruptible I/O park/re-execute bridge.  `IPC_NOWAIT`
 //! retains Linux's immediate `EAGAIN`/`ENOMSG` behavior.
-//!
-//! Gated under `#[cfg(feature = "linux-compat")]` via the `pub mod`
-//! line in `lib.rs`.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;

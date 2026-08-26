@@ -7,7 +7,6 @@
 //! family is the immediate argument-validation + table-bookkeeping path;
 //! the success path that spawns a real child task is unreachable here and
 //! is exercised only with its error/stub return.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

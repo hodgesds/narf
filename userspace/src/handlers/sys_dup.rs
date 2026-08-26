@@ -20,7 +20,6 @@ pub(crate) fn sys_dup(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table_alloc(task, |t| t.duplicate(oldfd, 0, 0));
     match outcome {
         Some(Ok(new_fd)) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::duplicate_fd_path(task, oldfd, new_fd);
             ctx.set_return(SyscallReturn::ok(new_fd as u64));
         }

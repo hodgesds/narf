@@ -18,7 +18,7 @@ narf-capabilities = { path = "../capabilities" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
-default = ["linux-compat"]
+default = []
 
 # Test-only path counters used by the distributed kernel smoke suite.
 kernel-test = []
@@ -27,7 +27,6 @@ kernel-test = []
 # Enabled by default so modern allocators (jemalloc, mimalloc) and JIT
 # engines (V8) see the standard kernel behaviour rather than the
 # NARF-native subset.
-linux-compat = []
 
 # Per-namespace address-space tagging.  Orthogonal to linux-compat.
 container = []

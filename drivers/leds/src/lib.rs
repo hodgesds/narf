@@ -52,7 +52,6 @@ pub mod leds_input_num;
 pub mod leds_input_scroll;
 pub mod leds_pwm;
 pub mod multicolor;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 pub mod triggers;
 pub mod worker;
@@ -94,7 +93,6 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Device, "leds/sysfs", || {
-        #[cfg(feature = "linux-compat")]
         sysfs_bridge::populate_leds_class();
         InitResult::Ok
     });

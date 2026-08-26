@@ -25,7 +25,6 @@ pub(crate) fn sys_sysinfo(ctx: &mut dyn TrapContext) {
     // fixed point — busybox uptime reads sysinfo(2), not the proc file,
     // and previously showed a flat 0.00. procfs (and its EWMA) only
     // exists under linux-compat; other builds keep zeroed loads.
-    #[cfg(feature = "linux-compat")]
     {
         let (l1, l5, l15) = narf_filesystem::procfs::loadavg_sysinfo_fixed16();
         si[8..16].copy_from_slice(&l1.to_ne_bytes());

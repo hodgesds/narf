@@ -31,7 +31,6 @@ pub mod jc42;
 pub mod k10temp;
 pub mod nct6775;
 pub mod registry;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 
 mod tests;
@@ -99,7 +98,6 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.
-    #[cfg(feature = "linux-compat")]
     narf_init::register(Stage::Late, "hwmon-sysfs-bridge", || {
         sysfs_bridge::populate_hwmon_class();
         InitResult::Ok

@@ -24,7 +24,6 @@ narf-firmware-smbios = { path = "../../firmware/smbios" }
 narf-aml          = { path = "../../aml" }
 
 [features]
-linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

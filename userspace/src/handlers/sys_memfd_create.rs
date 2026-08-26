@@ -16,7 +16,6 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     // is indistinguishable from the seal-permission failure this same
     // syscall's descriptors can produce later.
     let task = current_task_id();
-    #[cfg(feature = "linux-compat")]
     {
         let mfd = crate::linux_compat::MemFdFile::new(_flags);
         memfd_arc_register(&mfd);
@@ -29,21 +28,6 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
                 // Linux memfd_create(2) always returns an O_RDWR fd. glibc/musl
                 // fdopen(fd, "w+") reads F_GETFL and rejects the fd with EINVAL if
                 // the access mode isn't read+write (systemd's serialization memfd).
-                status_flags: crate::fd::O_RDWR,
-            });
-        match fd {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
-        }
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let ops = narf_filesystem::new_anon_memfile();
-        let fd = fd::install(task, crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: 0,
-                // Linux memfd_create(2) always returns an O_RDWR fd (see above).
                 status_flags: crate::fd::O_RDWR,
             });
         match fd {

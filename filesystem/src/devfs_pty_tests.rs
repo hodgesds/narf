@@ -480,7 +480,6 @@ kernel_test_in!("filesystem/pty", smoke_pty_ctrl_c_raises_fg_pgrp_signal);
 // On the kernel-test path the "user pointer" is just a kernel-owned
 // scratch slot; `copy_in`/`copy_out` reduce to plain ptr ops.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_master_tiocgptn_returns_index() -> TestResult {
     use crate::devfs_pty::TIOCGPTN;
     __reset_for_test();
@@ -496,10 +495,8 @@ fn smoke_pty_master_tiocgptn_returns_index() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_master_tiocgptn_returns_index);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
     use crate::devfs_pty::TIOCSPTLCK;
     __reset_for_test();
@@ -541,13 +538,11 @@ fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "filesystem/pty",
     smoke_pty_slave_locked_until_tiocsptlck_clear
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
     use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
     __reset_for_test();
@@ -571,12 +566,10 @@ fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_per_tty_fg_pgrp_isolated);
 
 // Master fg_pgrp and slave fg_pgrp share the *same* `Pty.fg_pgrp` slot.
 // Setting from the master must be visible from the slave (and vice versa).
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_master_slave_share_fg_pgrp() -> TestResult {
     use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
     __reset_for_test();
@@ -608,11 +601,9 @@ fn smoke_pty_master_slave_share_fg_pgrp() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_master_slave_share_fg_pgrp);
 
 // TIOCGPTPEER routes via `pts_open_peer`. Lock must gate the peer open.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_gptpeer_respects_lock() -> TestResult {
     use crate::devfs_pty::{pts_open_peer, TIOCSPTLCK};
     __reset_for_test();
@@ -632,13 +623,11 @@ fn smoke_pty_gptpeer_respects_lock() -> TestResult {
         _ => TestResult::Fail("unlocked PTY refused pts_open_peer"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_gptpeer_respects_lock);
 
 // `DevPtmx` is the clone node at `/dev/pts/ptmx` (the root `/dev/ptmx`
 // path is a symlink to it). `sys_open` uses `open_instance()` to allocate
 // the pair; keep the legacy marker pinned until all out-of-tree users migrate.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
     use crate::devfs_pty::DevPtmx;
     let p = DevPtmx;
@@ -655,12 +644,10 @@ fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_devptmx_is_ptmx_clone);
 
 /// Linux exposes `/dev/ptmx` as the relative symlink `pts/ptmx`, while the
 /// mounted devpts instance owns the clone device and shares the live PTY table.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_linux_devpts_mount_shape() -> TestResult {
     use crate::devfs::{linux_makedev, DevFs};
     use crate::devfs_pty::DevPtsFs;
@@ -700,13 +687,11 @@ fn smoke_pty_linux_devpts_mount_shape() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_linux_devpts_mount_shape);
 
 // TIOCGWINSZ / TIOCSWINSZ round-trip on a master fd. The window
 // state is per-pair (master + slave share one `WinSize` slot), so
 // a set via the master must be visible through the same master.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_winsize_round_trip() -> TestResult {
     use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
     __reset_for_test();
@@ -727,14 +712,12 @@ fn smoke_pty_winsize_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_winsize_round_trip);
 
 // Master and slave share one window-size slot. A TIOCSWINSZ on the
 // master must be visible through TIOCGWINSZ on the slave (and vice
 // versa) — `stty rows N cols M` typically writes via the master fd
 // while the child reads via the slave.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_winsize_shared_master_slave() -> TestResult {
     use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
     __reset_for_test();
@@ -761,12 +744,10 @@ fn smoke_pty_winsize_shared_master_slave() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_winsize_shared_master_slave);
 
 // FIONREAD on a master fd reports the count of slave-written bytes
 // available to read. On a slave fd, it reports master-written bytes.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_fionread_reports_ring_depth() -> TestResult {
     use crate::devfs_pty::FIONREAD;
     __reset_for_test();
@@ -796,7 +777,6 @@ fn smoke_pty_fionread_reports_ring_depth() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_fionread_reports_ring_depth);
 
 // TCGETS on master/slave must not error — musl's `isatty(3)` /
@@ -804,7 +784,6 @@ kernel_test_in!("filesystem/pty", smoke_pty_fionread_reports_ring_depth);
 // fields), so returning `Ok(0)` with zeroed termios memory is
 // enough for `pty_smoke` and `script(1)`-style programs to see
 // the fd as a tty.
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_tcgets_ok_on_both_ends() -> TestResult {
     use crate::devfs_pty::TCGETS;
     __reset_for_test();
@@ -824,14 +803,12 @@ fn smoke_pty_tcgets_ok_on_both_ends() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_tcgets_ok_on_both_ends);
 
 // poll_readiness — master sees POLLIN only when the slave has
 // written bytes; slave sees POLLIN only when the master has
 // written bytes. POLLOUT is always set (the rings have a fixed
 // 4 KiB capacity but never report blocking writes in v1).
-#[cfg(feature = "linux-compat")]
 fn smoke_pty_poll_readiness_tracks_ring_depth() -> TestResult {
     __reset_for_test();
     let master = open_ptmx();
@@ -871,7 +848,6 @@ fn smoke_pty_poll_readiness_tracks_ring_depth() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_poll_readiness_tracks_ring_depth);
 
 /// An EMPTY master read must say "would block", never end-of-file.

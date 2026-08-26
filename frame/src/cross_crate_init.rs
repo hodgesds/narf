@@ -29,27 +29,20 @@ pub fn install_all_hooks() {
     #[cfg(feature = "cgroup")]
     narf_scheduler::install_process_task_resolver(narf_userspace::handlers::pid_to_task_raw);
     install_console_signal_hook();
-    #[cfg(feature = "linux-compat")]
     install_proc_hooks();
-    #[cfg(feature = "linux-compat")]
     install_proc_ext_hooks();
-    #[cfg(feature = "linux-compat")]
     install_proc_path_hooks();
-    #[cfg(feature = "linux-compat")]
     install_proc_write_hooks();
     install_net_stack();
-    #[cfg(feature = "linux-compat")]
     install_procfs_net_hooks();
-    #[cfg(feature = "linux-compat")]
     install_proc_mountinfo_hook();
-    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    #[cfg(feature = "container")]
     install_ns_proc_hooks();
 }
 
 /// Mount namespaces back Linux service sandboxing even when the broader
 /// container feature is disabled. Their `/proc/self/mountinfo` view must
 /// therefore be wired independently of the container-only namespace hooks.
-#[cfg(feature = "linux-compat")]
 fn install_proc_mountinfo_hook() {
     narf_filesystem::procfs::install_mountinfo_hook(narf_userspace::handlers::proc_ns_mountinfo);
     narf_filesystem::procfs::install_mountinfo_generation_hook(
@@ -70,7 +63,6 @@ fn install_proc_mountinfo_hook() {
 /// exposes the namespace generation as POLLPRI; the scheduler must be kicked
 /// so systemd's libmount monitor drains that edge before it observes SIGCHLD
 /// from the successful mount helper.
-#[cfg(feature = "linux-compat")]
 fn wake_mountinfo_waiters() {
     narf_net::readiness::notify(0);
 }
@@ -79,7 +71,7 @@ fn wake_mountinfo_waiters() {
 /// gid_map, and the per-ns mountinfo view reach the userspace
 /// namespace tables. Gated on container (the source of the state)
 /// AND linux-compat (where the procfs nodes live).
-#[cfg(all(feature = "linux-compat", feature = "container"))]
+#[cfg(feature = "container")]
 fn install_ns_proc_hooks() {
     narf_filesystem::procfs::install_ns_proc_hooks(
         narf_userspace::handlers::proc_ns_readlink,
@@ -110,7 +102,6 @@ fn install_console_signal_hook() {
     narf_filesystem::devfs_pty::install_pty_creds_hook(narf_userspace::handlers::pty_open_fs_ids);
 }
 
-#[cfg(feature = "linux-compat")]
 fn install_proc_hooks() {
     // /proc per-pid hooks — exposes the live scheduler task list
     // and per-task metadata to /proc/[pid]/* and /proc/self/*.
@@ -129,7 +120,6 @@ fn install_proc_hooks() {
     );
 }
 
-#[cfg(feature = "linux-compat")]
 fn install_proc_ext_hooks() {
     // Extended /proc/[pid]/* read hooks: fd, rlimits, nice, environ, auxv.
     narf_filesystem::procfs::install_proc_ext_hooks(
@@ -146,7 +136,6 @@ fn install_proc_ext_hooks() {
     narf_filesystem::procfs::set_fd_pidfd_pid_hook(narf_userspace::handlers::proc_fd_pidfd_pid);
 }
 
-#[cfg(feature = "linux-compat")]
 fn install_proc_path_hooks() {
     // /proc/[pid]/{exe,cwd,root} magic-link targets: exec'd image path
     // (published by sys_execve), per-task cwd, and the chroot prefix.
@@ -157,7 +146,6 @@ fn install_proc_path_hooks() {
     );
 }
 
-#[cfg(feature = "linux-compat")]
 fn install_proc_write_hooks() {
     // Writable per-pid procfs hooks: comm, oom_score_adj, coredump_filter.
     narf_filesystem::procfs::install_proc_write_hooks(
@@ -239,7 +227,6 @@ fn install_net_stack() {
 // per crate) and the FS surface (a single SnapshotXxx wire-format
 // type per file). Tiny adapter fns convert one to the other.
 
-#[cfg(feature = "linux-compat")]
 fn install_procfs_net_hooks() {
     use narf_filesystem::procfs::net as pn;
 
@@ -264,7 +251,6 @@ fn install_procfs_net_hooks() {
     pn::register_all();
 }
 
-#[cfg(feature = "linux-compat")]
 #[cfg(feature = "container")]
 fn current_net_ns_id() -> u64 {
     let task = narf_userspace::handlers::current_task_id();
@@ -273,13 +259,11 @@ fn current_net_ns_id() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(feature = "linux-compat")]
 #[cfg(not(feature = "container"))]
 fn current_net_ns_id() -> u64 {
     0
 }
 
-#[cfg(feature = "linux-compat")]
 fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
     narf_net::tcp::core::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -299,7 +283,6 @@ fn tcp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::TcbSnapshot> {
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnapshot> {
     narf_net::udp_sock::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -317,7 +300,6 @@ fn udp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::UdpSocketSnaps
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnapshot> {
     narf_net::raw_sock::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -334,7 +316,6 @@ fn raw_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RawSocketSnaps
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
     narf_net::arp_cache::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -347,7 +328,6 @@ fn arp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ArpSnapshot> {
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapshot> {
     narf_net::route::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -367,7 +347,6 @@ fn route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::RouteSnapsho
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IfaceCounterSnapshot> {
     narf_net::iface::snapshot_counters_in(current_net_ns_id())
         .into_iter()
@@ -393,7 +372,6 @@ fn iface_counters_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ifa
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn ipv6_ifaddr_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6IfAddrSnapshot> {
     narf_net::ipv6::addrs::snapshot()
         .into_iter()
@@ -408,7 +386,6 @@ fn ipv6_ifaddr_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6If
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6RouteSnapshot> {
     narf_net::ipv6::route::snapshot()
         .into_iter()
@@ -427,7 +404,6 @@ fn ipv6_route_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Ipv6Rou
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::ConntrackSnapshot> {
     narf_net::netfilter::conntrack::snapshot_in(current_net_ns_id())
         .into_iter()
@@ -452,7 +428,6 @@ fn conntrack_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Conntrac
         .collect()
 }
 
-#[cfg(feature = "linux-compat")]
 fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
     // SNMP counters live in atomic globals across the net stack;
     // until those land in narf_net, surface a baseline MIB with
@@ -468,7 +443,6 @@ fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn igmp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IgmpSnapshot> {
     // IGMP membership tracking lives in pkt_dhcp / dhcp paths and
     // isn't centralised yet. Return empty — the header line still
@@ -476,25 +450,21 @@ fn igmp_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::IgmpSnapshot>
     alloc::vec::Vec::new()
 }
 
-#[cfg(feature = "linux-compat")]
 fn igmp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Igmp6Snapshot> {
     // MLD membership: same status as IGMP — empty until centralised.
     alloc::vec::Vec::new()
 }
 
-#[cfg(feature = "linux-compat")]
 fn tcp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Tcb6Snapshot> {
     // IPv6 TCP sockets ride the same tcp::core table today; the
     // stack maps IPv4 + IPv6 onto separate TCBs once that lands.
     alloc::vec::Vec::new()
 }
 
-#[cfg(feature = "linux-compat")]
 fn udp6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Udp6SocketSnapshot> {
     alloc::vec::Vec::new()
 }
 
-#[cfg(feature = "linux-compat")]
 fn raw6_adapter() -> alloc::vec::Vec<narf_filesystem::procfs::net::Raw6SocketSnapshot> {
     alloc::vec::Vec::new()
 }

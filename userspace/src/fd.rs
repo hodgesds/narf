@@ -1224,7 +1224,6 @@ impl FileOps for ConsoleFile {
                 // Needed after setsid() (which detaches): a getty/login that
                 // claims the console as its session's ctty records it here so
                 // the job-control SIGTTIN/SIGTTOU check recognises it.
-                #[cfg(feature = "linux-compat")]
                 crate::handlers::set_controlling_tty_console(crate::handlers::current_task_id());
                 Ok(0)
             }
@@ -1232,11 +1231,9 @@ impl FileOps for ConsoleFile {
                 // Give up the controlling terminal (tcsetsid teardown /
                 // login's pre-claim reset). Mark the caller detached so a
                 // later open/TIOCSCTTY re-acquires cleanly.
-                #[cfg(feature = "linux-compat")]
                 crate::handlers::detach_controlling_tty(crate::handlers::current_task_id());
                 Ok(0)
             }
-            #[cfg(feature = "linux-compat")]
             TIOCGSID => {
                 // tcgetsid(3): session id of the tty's session. NARF's
                 // console is the session leader's ctty, so report the
@@ -1532,7 +1529,6 @@ pub fn detach(task_id: u64) {
     // (release_task_tables runs after and finds the table already
     // drained), so the immediate wake must fire from here or a waiter
     // blocked on a dead holder only gets its 1 ms backstop.
-    #[cfg(feature = "linux-compat")]
     for key in locks::release_owner(task_id) {
         for (waiter, w) in locks::drain_waiters(key) {
             crate::handlers::wake_one(waiter, w);
@@ -1567,7 +1563,6 @@ pub fn live_task_count() -> usize {
 // EAGAIN on conflict just like F_SETLK. A follow-up wave will add
 // the per-inode wait queue.
 
-#[cfg(feature = "linux-compat")]
 pub mod locks {
     use super::*;
 

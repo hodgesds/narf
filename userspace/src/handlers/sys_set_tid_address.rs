@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let tidptr = args.arg0;

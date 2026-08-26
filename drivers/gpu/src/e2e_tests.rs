@@ -871,7 +871,6 @@ kernel_test_in!("drivers/gpu/e2e", smoke_drm_registry_register_one_card);
 // The card lives there (not directly under /sys/class/drm); `/sys/class/drm/*`
 // is a symlink into it. get_child() walks real children only (not symlinks),
 // so tests navigate the /sys/devices tree the compositor's udev lookup lands on.
-#[cfg(feature = "linux-compat")]
 fn drm_device_node(name: &str) -> Option<alloc::sync::Arc<narf_filesystem::sysfs::Kobject>> {
     narf_filesystem::sysfs::sysfs_root()
         .get_child("devices")
@@ -883,7 +882,6 @@ fn drm_device_node(name: &str) -> Option<alloc::sync::Arc<narf_filesystem::sysfs
 // The `/sys/class/drm/<name>` symlink must exist and point into /sys/devices —
 // this is what makes systemd's `sd_device_new_from_syspath` resolve the card's
 // devnum. Returns true iff the class dir carries the symlink.
-#[cfg(feature = "linux-compat")]
 fn drm_class_symlink_ok(name: &str) -> bool {
     narf_filesystem::sysfs::sysfs_root()
         .get_child("class")
@@ -895,7 +893,6 @@ fn drm_class_symlink_ok(name: &str) -> bool {
 
 // ── Smoke 12: /sys/class/drm/card0/name → "card0\n" ─────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_name_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -930,12 +927,10 @@ fn smoke_drm_sysfs_name_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_name_attr);
 
 // ── Smoke 13: /sys/class/drm/card0/dev → "226:0\n" ───────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_dev_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -966,12 +961,10 @@ fn smoke_drm_sysfs_dev_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_dev_attr);
 
 // ── Smoke 14: /sys/class/drm/card0/device/vendor → "0x1002\n" ────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1023,12 +1016,10 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_vendor_attr);
 
 // ── Smoke 15: /sys/class/drm/card0/device/device → "0x1636\n" for Renoir ─
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1080,7 +1071,6 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_id_attr);
 
 // ── Smoke 15b: renderD<N> needs its OWN `device` link, same as card<N> ────
@@ -1113,7 +1103,6 @@ kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_id_attr);
 /// equal, so if the two minors named different PCI addresses they would stay
 /// two separate single-node devices and the render bit would still be
 /// missing. Hence the equality assertion below rather than a shape check.
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_render_node_device_link_matches_card() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1182,7 +1171,6 @@ fn smoke_drm_render_node_device_link_matches_card() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_render_node_device_link_matches_card
@@ -1216,7 +1204,6 @@ kernel_test_in!(
 /// Format mirrors a real Linux PCI uevent (verified against
 /// /sys/dev/char/226:128/device/uevent on an amdgpu host). Only
 /// PCI_SLOT_NAME is load-bearing for libdrm; the rest is parity for udev.
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_pci_node_uevent_has_slot_name() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1294,12 +1281,10 @@ fn smoke_drm_pci_node_uevent_has_slot_name() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_pci_node_uevent_has_slot_name);
 
 // ── Smoke 16: vbios_version attr readable ─────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1331,12 +1316,10 @@ fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_vbios_version_attr);
 
 // ── Smoke 17: renderD128/dev → "226:128\n" ────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1370,12 +1353,10 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_render_node_dev_attr);
 
 // ── Smoke 17b: completed DRM projection is boot-replayable ───────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::{sysfs, uevent};
@@ -1420,7 +1401,6 @@ fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_sysfs_adds_enter_boot_udev_replay
@@ -1674,7 +1654,6 @@ extern crate alloc;
 // Linux ref: `sd_device_get_device_id` / `device_set_devnum` in
 // src/libsystemd/sd-device/sd-device.c.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_add_carries_devnum_naming_the_udev_db_file() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::{sysfs, uevent};
@@ -1743,7 +1722,6 @@ fn smoke_drm_add_carries_devnum_naming_the_udev_db_file() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_add_carries_devnum_naming_the_udev_db_file
@@ -1761,7 +1739,6 @@ kernel_test_in!(
 // "Failed to open /dev/dri/card0 device (Invalid argument)" and exits — no
 // compositor ever reaches the GPU. libdrm only ever *follows* 226:N as an
 // intermediate component, so this NoFollow-final path was never covered.
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_sys_dev_char_symlink_resolves_nofollow() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::{sysfs, FsInstance};
@@ -1819,7 +1796,6 @@ fn smoke_drm_sys_dev_char_symlink_resolves_nofollow() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/gpu/e2e",
     smoke_drm_sys_dev_char_symlink_resolves_nofollow

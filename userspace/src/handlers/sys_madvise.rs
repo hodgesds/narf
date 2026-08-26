@@ -34,7 +34,6 @@ use super::*;
 ///
 /// Returns `Ok(0)` on success or no-op-advice; `InvalidOp` if the task has no
 /// address space (unreachable for a real user task).
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let base = VirtAddr::new(args.arg0);

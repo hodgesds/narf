@@ -3,8 +3,6 @@
 //! Covers perf_event_open parameter validation, CPU checking,
 //! task checks, and configuration validation.
 
-#![cfg(feature = "linux-compat")]
-
 use crate::abi_test_support::*;
 use narf_linux_perf_uapi::{
     PerfEventAttr, PERF_ATTR_FLAG_BPF_EVENT, PERF_ATTR_FLAG_EXCLUDE_KERNEL,

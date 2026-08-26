@@ -9,7 +9,6 @@ use super::*;
 ///
 /// LIVE handler for `Syscall::Lstat` under `linux-compat`; it replaces the
 /// NARF-shape [`sys_stat`] that `install_core_syscalls` puts there first.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_lstat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int lstat(const char *pathname, struct stat *statbuf)`.

@@ -706,7 +706,6 @@ pub fn init_per_task_state() {
     wait_init();
     pkey_init();
     narf_filesystem::fuse_conn::install_request_context_provider(fuse_request_context);
-    #[cfg(feature = "linux-compat")]
     {
         ctty_init();
         // Wave-76: route PtySlave::ioctl(TIOCSCTTY) into our per-task
@@ -936,8 +935,6 @@ fn open_impl(
     mnt_len: usize,
     create_mode: u32,
 ) {
-    #[cfg(not(feature = "linux-compat"))]
-    let _ = create_mode;
     // FIFO open-peer rendezvous re-entry: a blocking FIFO `open()` installed
     // its fd and parked waiting for the peer direction (see `open_fifo`); the
     // park RIP-rewound and re-executed this syscall. Resume the peer-check for
@@ -1026,7 +1023,6 @@ fn open_impl(
                 });
             match new_fd {
                 Some(n) => {
-                    #[cfg(feature = "linux-compat")]
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
@@ -1122,7 +1118,6 @@ fn open_impl(
                     });
                 match new_fd {
                     Some(n) => {
-                        #[cfg(feature = "linux-compat")]
                         crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                         ctx.set_return(SyscallReturn::ok(n as u64));
                     }
@@ -1196,7 +1191,6 @@ fn open_impl(
                 Some(n) => {
                     // Record the backing path so /proc/<pid>/fd/<n> readlinks
                     // to it (musl realpath, lsof, opendir-on-fd). See fd_path_of.
-                    #[cfg(feature = "linux-compat")]
                     crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                     ctx.set_return(SyscallReturn::ok(n as u64));
                 }
@@ -1210,7 +1204,6 @@ fn open_impl(
     // creation, route through the parent directory's `create()`. The
     // explicit-mount form is rare on the create path and not yet
     // wired; absolute paths are the supported entry.
-    #[cfg(feature = "linux-compat")]
     let mut created = false;
     let ops = match ops {
         Some(o) => o,
@@ -1221,7 +1214,6 @@ fn open_impl(
                 .map(|(parent, leaf)| poll_blocking(parent.create(&leaf)))
             {
                 Some(Some(Ok(o))) => {
-                    #[cfg(feature = "linux-compat")]
                     {
                         created = true;
                     }
@@ -1273,7 +1265,6 @@ fn open_impl(
         }
     };
 
-    #[cfg(feature = "linux-compat")]
     if created {
         let accessor = current_accessor(task);
         let _ = poll_blocking(ops.set_owners(accessor.uid, accessor.gid));
@@ -1306,7 +1297,6 @@ fn open_impl(
             });
         match new_fd {
             Some(n) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::register_fd_path(task, n, path, current_mount_id_at(path));
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
@@ -1319,7 +1309,6 @@ fn open_impl(
     // for the system console. Preserve O_PATH's side-effect-free path inode
     // above; a real open selects the console or live PTY slave recorded by
     // TIOCSCTTY. A session with no controlling terminal gets Linux ENXIO.
-    #[cfg(feature = "linux-compat")]
     let ops = if mnt_len == 0 && path == apply_chroot("/dev/tty") {
         let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
             Some(CTTY_CONSOLE) => ops.clone(),
@@ -1387,7 +1376,6 @@ fn open_impl(
 
     // Landlock: a self-restricted task's open must be permitted by its
     // active rulesets, else EACCES.
-    #[cfg(feature = "linux-compat")]
     if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
         ctx.set_return(denied);
         return;
@@ -1454,7 +1442,6 @@ fn open_impl(
     };
     // inotify: record the fd's path (so a later write can fire IN_MODIFY)
     // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
-    #[cfg(feature = "linux-compat")]
     {
         crate::mqueue::register_fd_path(task, new_fd, path, current_mount_id_at(path));
         if created {
@@ -1553,7 +1540,6 @@ fn open_fifo(
         || (can_read && shared.writer_count() > 0)
         || (can_write && shared.reader_count() > 0);
     if peer_ready {
-        #[cfg(feature = "linux-compat")]
         crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
         return;
@@ -1676,7 +1662,6 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
 /// to object-fd publication. Linux removes the event even when copy_to_user
 /// faults, but reserves and installs the embedded fd only after all event data
 /// copied successfully; an EFAULT must not leak a reachable descriptor.
-#[cfg(feature = "linux-compat")]
 fn fanotify_read_to_user(
     task: u64,
     gid: u64,
@@ -1760,7 +1745,6 @@ fn fanotify_read_to_user(
 /// event and reserved its embedded fd number, preserving Linux's event
 /// consumption ordering. Publication still happens only after the guarded
 /// copy succeeds.
-#[cfg(feature = "linux-compat")]
 fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
     if len == 0 {
         return Ok(());
@@ -1791,7 +1775,6 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
     Err(EFAULT)
 }
 
-#[cfg(feature = "linux-compat")]
 fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
     let root_rel = narf_filesystem::registry()
         .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
@@ -1800,7 +1783,6 @@ fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps
 }
 
 /// Resolve `abs` and install a fresh read fd for open_by_handle_at.
-#[cfg(feature = "linux-compat")]
 fn fanotify_open_object(task: u64, abs: &str) -> i32 {
     let Some(ops) = fanotify_resolve_object(abs) else {
         return -1;
@@ -1825,7 +1807,6 @@ fn fanotify_open_object(task: u64, abs: &str) -> i32 {
 // handle that round-trips through both syscalls. `handle_type` carries a
 // NARF marker so a foreign handle is rejected with ESTALE.
 
-#[cfg(feature = "linux-compat")]
 const NARF_HANDLE_TYPE: i32 = 0x4e41; // "NA"
 
 // ── Dup family + fcntl ─────────────────────────────────────────────
@@ -1849,7 +1830,6 @@ const F_SETFL: u64 = 4;
 const F_GETLK: u64 = 5;
 const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
-#[cfg(feature = "linux-compat")]
 const F_DUPFD_CLOEXEC: u64 = 1030;
 /// Linux fcntl `F_ADD_SEALS` (1033) — add seal bits to a memfd.
 const F_ADD_SEALS: u64 = 1033;
@@ -1860,11 +1840,9 @@ const F_GET_SEALS: u64 = 1034;
 const EAGAIN_CODE: u64 = 11;
 /// Linux EPERM (1) — returned as the value of the failed syscall
 /// (sign-flipped at libc; we follow the existing -1 convention).
-#[cfg(feature = "linux-compat")]
 const _EPERM: u64 = 1;
 
 /// Wire-stable `struct flock` (Linux x86_64 / aarch64 layout).
-#[cfg(feature = "linux-compat")]
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug)]
 struct UFlock {
@@ -1877,7 +1855,6 @@ struct UFlock {
     _pad2: [u8; 4],
 }
 
-#[cfg(feature = "linux-compat")]
 fn flock_size() -> usize {
     core::mem::size_of::<UFlock>()
 }
@@ -1885,7 +1862,6 @@ fn flock_size() -> usize {
 /// Clear the current task's F_SETLKW park routing (uctx.flock_key).
 /// Every fcntl lock-path exit calls this so a stale key can't make a
 /// later unrelated park register on the flock waiter queue.
-#[cfg(feature = "linux-compat")]
 fn clear_flock_routing() {
     if let Some(u) = crate::user_task::current_user_task() {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx.
@@ -2213,7 +2189,6 @@ pub(crate) fn create_unix_socket_node(path: &str) {
 // pay the size cost of the layout assertion or pull in the
 // Linux-shaped constants.
 
-#[cfg(feature = "linux-compat")]
 pub mod linux_compat {
     //! Linux x86_64 ABI shapes for stat / statx. Layout-checked
     //! against the upstream uapi at compile time via const asserts.
@@ -2322,7 +2297,6 @@ pub mod linux_compat {
 
 // Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
 // Same conventions as sys_statx (uid/gid/atime not tracked).
-#[cfg(feature = "linux-compat")]
 fn linux_stat_from_fs(
     s: narf_filesystem::Stat,
     uid: u32,
@@ -2379,7 +2353,6 @@ fn linux_stat_from_fs(
 /// Shared body for the Linux path-stat family. `follow_final` selects
 /// whether a trailing symlink is followed (plain `stat`/`fstatat`) or
 /// stat'd as the link itself (`lstat` / `fstatat(AT_SYMLINK_NOFOLLOW)`).
-#[cfg(feature = "linux-compat")]
 fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, follow_final: bool) {
     // The previous shape matched NARF's `(path_ptr, path_len, out_ptr)`
     // triplet which is unreachable from musl: musl passes the statbuf in
@@ -2405,7 +2378,6 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 /// Write a Linux `struct stat` for a path in the caller's visible namespace.
 /// `raw` may be absolute or relative to the caller's cwd; callers of
 /// `newfstatat(2)` first join its relative pathname to the supplied dirfd.
-#[cfg(feature = "linux-compat")]
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
     let out_ptr = out_arg as *mut linux_compat::Stat;
     if out_ptr.is_null() {
@@ -2493,16 +2465,13 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
 // rely on the surface alone.
 
 // ── Wave-70 MemFdFile side table ───────────────────────────────────
-#[cfg(feature = "linux-compat")]
 static MEMFD_ARCS: ArcShardTable<crate::linux_compat::MemFdFile> =
     [const { ArcShard::new() }; ARC_SHARDS];
 
-#[cfg(feature = "linux-compat")]
 fn memfd_arc_register(arc: &alloc::sync::Arc<crate::linux_compat::MemFdFile>) {
     arc_shard_register(&MEMFD_ARCS, arc);
 }
 
-#[cfg(feature = "linux-compat")]
 pub(crate) fn memfd_arc_from_fd(
     task: u64,
     fd: u32,
@@ -2898,7 +2867,6 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         );
         match outcome {
             Some(Some(Ok(()))) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_create(&new_path, false);
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -2922,7 +2890,6 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         });
     match outcome {
         Some(Some(Ok(()))) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_create(&new_path, false);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -2974,7 +2941,6 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     };
     match poll_blocking(dir.link_node(&new_leaf, node)) {
         Some(Ok(())) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_create(new_path, false);
             0
         }
@@ -4421,7 +4387,6 @@ pub fn numa_balance_tick() {
     // This is the existing cross-architecture user-mode timer hook. Keep perf
     // multiplexing ahead of NUMA's optional per-task state lookup so tasks
     // without automatic NUMA balancing still rotate oversubscribed counters.
-    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_multiplex_tick(current_task_id());
 
     const SCAN_TICKS: u16 = 256;
@@ -4967,7 +4932,6 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         }
     }
 
-    #[cfg(feature = "linux-compat")]
     if is_write && total != 0 {
         crate::mqueue::notify_modify_fd(task, fd);
     }
@@ -5223,7 +5187,6 @@ fn mprotect_core(
     // Wave-66: the linux-compat `mprotect_range` rejects W|X and splits a
     // region cleanly when the request covers only a slice; the legacy
     // `change_perms_range` is whole-region only.
-    #[cfg(feature = "linux-compat")]
     {
         // W^X. `CapKind::Jit` gates the **RW → RX flip** — the transition
         // `wx.rs` has described as the JIT exception since it was written —
@@ -5274,11 +5237,6 @@ fn mprotect_core(
                 as_ref.mprotect_range(base, len, perms).map_err(|_| 12)
             }
         }
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        // Whole-region perm change failure (unmapped range) → ENOMEM.
-        as_ref.change_perms_range(base, len, perms).map_err(|_| 12)
     }
 }
 
@@ -5539,7 +5497,6 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 //
 // set_tid_address(tidptr) sets the calling task's CLOSE_CHILD_CLEARTID
 // slot in the same per-task table; returns the caller's TID.
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_VM: u64 = 0x0000_0100;
 /// `CLONE_VFORK`: the parent is suspended until the child `execve`s or exits.
@@ -5548,25 +5505,21 @@ const CLONE_VM: u64 = 0x0000_0100;
 /// the parent MUST NOT resume — and thus must not mutate/free that shared AS
 /// (e.g. munmap the child's stack) — until the child releases the mm. Linux
 /// keeps the parent in TASK_KILLABLE across this window.
-#[cfg(feature = "linux-compat")]
 const CLONE_VFORK: u64 = 0x0000_4000;
 /// `CLONE_PIDFD`: mint a pidfd on the child, installed in the PARENT's fd
 /// table (the child does not inherit it — Linux allocates it after
 /// `copy_files`), number written through `clone_args.pidfd`. glibc's
 /// `pidfd_spawn` — the ONLY executor-spawn path systemd 258 uses — sets it.
-#[cfg(feature = "linux-compat")]
 const CLONE_PIDFD: u64 = 0x0000_1000;
 /// `CLONE_CLEAR_SIGHAND` (clone3-only): the child starts with every signal
 /// disposition SIG_DFL instead of a copy of the parent's table. glibc's
 /// `posix_spawn`/`pidfd_spawn` passes it unconditionally (2.38+).
-#[cfg(feature = "linux-compat")]
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 /// `CLONE_INTO_CGROUP` (clone3-only): `clone_args.cgroup` is an O_PATH
 /// directory fd on cgroupfs; the child starts life in that cgroup instead
 /// of inheriting the parent's. glibc `posix_spawn` with
 /// `POSIX_SPAWN_SETCGROUP` (systemd's per-service spawn) sets it.
 /// Consumed only under the `cgroup` feature (accepted-and-inherit otherwise).
-#[cfg(feature = "linux-compat")]
 #[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
@@ -5581,7 +5534,7 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// `cgroup_of(child_pid)` — and hence `/proc/<child_pid>/cgroup` — reflects the
 /// placement, which is how PID 1 attributes a service's sd_notify(READY=1)
 /// datagram back to its unit (`manager_get_unit_by_pidref_cgroup`).
-#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
+#[cfg(feature = "cgroup")]
 fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
     let full = match crate::mqueue::fd_path(parent_task, cgroup_fd) {
         Some(f) => f,
@@ -5643,36 +5596,27 @@ pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
 
 /// Test seam for [`place_clone_into_cgroup`] — exercises the clone3
 /// CLONE_INTO_CGROUP placement without spawning a real user task.
-#[cfg(all(feature = "cgroup", feature = "linux-compat"))]
+#[cfg(feature = "cgroup")]
 #[doc(hidden)]
 pub fn place_clone_into_cgroup_for_test(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
     place_clone_into_cgroup(parent_task, cgroup_fd, child_pid)
 }
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FILES: u64 = 0x0000_0400;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SIGHAND: u64 = 0x0000_0800;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_THREAD: u64 = 0x0001_0000;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SYSVSEM: u64 = 0x0004_0000;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SETTLS: u64 = 0x0008_0000;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
@@ -5701,13 +5645,11 @@ struct ClearChildTidEntry {
     futex_namespace: u64,
 }
 
-#[cfg(feature = "linux-compat")]
 static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ClearChildTidEntry>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the clear_child_tid table. Called once at boot
 /// alongside the other per-task state tables; idempotent.
-#[cfg(feature = "linux-compat")]
 pub fn clear_child_tid_init() {
     let mut g = CLEAR_CHILD_TID.lock();
     if g.is_none() {
@@ -5715,7 +5657,6 @@ pub fn clear_child_tid_init() {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
     let (as_root, futex_namespace) = current_address_space()
         .map(|space| (space.root, futex_namespace_for_address_space(&space)))
@@ -5723,7 +5664,6 @@ fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
     set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace);
 }
 
-#[cfg(feature = "linux-compat")]
 fn set_clear_child_tid_with_as(
     task_id_raw: u64,
     uaddr: u64,
@@ -5750,7 +5690,6 @@ fn set_clear_child_tid_with_as(
     }
 }
 
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
     let mut g = CLEAR_CHILD_TID.lock();
@@ -5761,7 +5700,6 @@ fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
 /// namespace and no AS root (the exit path then skips the word write but still
 /// fires the wake), modelling a real thread whose private namespace is a live
 /// AddressSpace Arc pointer (always nonzero in production).
-#[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_namespace: u64) {
     set_clear_child_tid_with_as(
@@ -5775,7 +5713,6 @@ pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_nam
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
 /// without consuming it. Returns just the uaddr; AS root is
 /// internal bookkeeping.
-#[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_peek_clear_child_tid(task_id_raw: u64) -> Option<u64> {
     let g = CLEAR_CHILD_TID.lock();
@@ -5784,7 +5721,6 @@ pub fn __test_peek_clear_child_tid(task_id_raw: u64) -> Option<u64> {
 }
 
 /// Force-clear the entire clear_child_tid table for test isolation.
-#[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_reset_clear_child_tid() {
     *CLEAR_CHILD_TID.lock() = Some(BTreeMap::new());
@@ -5805,10 +5741,7 @@ pub fn __test_reset_clear_child_tid() {
 /// trap-exit path restored the kernel address-space context before reaching us;
 /// we don't want to switch user roots again
 /// just for one qword write).
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // The clear_child_tid table is keyed by TaskId (= tid_raw),
     // NOT by visible pid. For CLONE_THREAD children, pid_raw is
@@ -5888,10 +5821,7 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     }
 }
 
-#[cfg(all(
-    feature = "linux-compat",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn fire_clear_child_tid_on_exit(_pid_raw: u64, _tid_raw: u64) {
     // Other arches do not yet have a user-task clone path.
 }
@@ -5900,7 +5830,6 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, _tid_raw: u64) {
 /// exiting thread — pthread_join waits on the per-`tid` clear_child_tid
 /// futex). Idempotent and safe to call before `clear_child_tid_init`
 /// (the observer no-ops on an unpopulated table).
-#[cfg(feature = "linux-compat")]
 pub fn install_clear_child_tid_observer() {
     crate::user_task::register_thread_exit_observer(fire_clear_child_tid_on_exit);
 }
@@ -5908,7 +5837,6 @@ pub fn install_clear_child_tid_observer() {
 /// Linux `struct clone_args` — uapi shape from <linux/sched.h>.
 /// All fields are u64 on the wire; the kernel reads only the
 /// subset we honour.
-#[cfg(feature = "linux-compat")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
@@ -5932,7 +5860,6 @@ struct CloneArgs {
     cgroup: u64,
 }
 
-#[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
 
@@ -5945,27 +5872,18 @@ const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
 // cannot resume and mutate the shared address space (e.g. munmap the child's
 // stack) out from under a still-running CLONE_VM child — the race that SIGSEGV'd
 // every glibc `posix_spawn` service child under systemd.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static VFORK_WAIT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn vfork_wait_register(child_pid: u64, parent_task: u64) {
     let mut g = VFORK_WAIT.lock();
     g.get_or_insert_with(BTreeMap::new)
         .insert(child_pid, parent_task);
 }
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn vfork_is_pending(child_pid: u64) -> bool {
     VFORK_WAIT
         .lock()
@@ -5976,10 +5894,7 @@ pub(crate) fn vfork_is_pending(child_pid: u64) -> bool {
 /// Called from the child's `execve` and exit paths: if this child had a vfork
 /// parent parked on it, drop the entry and wake the parent. `child_pid` is the
 /// child's visible pid. Idempotent (only the first exec/exit releases).
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn vfork_child_release(child_pid: u64) {
     let parent = {
         let mut g = VFORK_WAIT.lock();
@@ -5990,10 +5905,7 @@ pub(crate) fn vfork_child_release(child_pid: u64) {
     }
 }
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn current_user_tls_base() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     let value = {
@@ -6022,10 +5934,7 @@ fn current_user_tls_base() -> Option<u64> {
 
 /// Validate the Linux-visible clone contract before allocating or publishing
 /// any child state. The returned value is a positive errno number.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     const EINVAL: u64 = 22;
     const CLONE_DETACHED: u64 = 0x0040_0000;
@@ -6105,10 +6014,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     Ok(())
 }
 
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     use crate::process::DEFAULT_USER_STACK_BYTES;
     let flags = ca.flags;
@@ -6281,7 +6187,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     } else {
         crate::alloc_pid().raw()
     };
-    #[cfg(feature = "linux-compat")]
     if !share_thread {
         crate::sysvipc::clone_sem_undo(
             task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
@@ -6491,7 +6396,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     } else {
         crate::fd::fork(parent_pid, child_tid.raw());
     }
-    #[cfg(feature = "linux-compat")]
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
 
     // CLONE_PIDFD: install the pidfd in the PARENT's table only, AFTER the
@@ -6525,7 +6429,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // first console read; a job-control shell moves it out via setpgid.
     pgid_fork(parent_pid, child_tid.raw());
     sid_fork(parent_pid, child_tid.raw());
-    #[cfg(feature = "linux-compat")]
     ctty_fork(parent_pid, child_tid.raw());
 
     if !share_fs {
@@ -6719,7 +6622,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // This is the publication point for the child. Everything keyed by its
     // TaskId, including the copied fd table used by the immediate executor
     // fexecve, has been installed above.
-    #[cfg(feature = "linux-compat")]
     if !share_thread {
         shm_fork_process(&parent_as, &child_as, child_visible_pid, share_vm);
     }
@@ -6921,10 +6823,7 @@ pub fn is_task_stopped(task: u64) -> bool {
         .as_ref()
         .map(|m| m.contains_key(&task))
         .unwrap_or(false);
-    #[cfg(feature = "linux-compat")]
     let ptrace_stopped = crate::ptrace::is_task_ptrace_stopped(task);
-    #[cfg(not(feature = "linux-compat"))]
-    let ptrace_stopped = false;
     job_stopped || ptrace_stopped
 }
 
@@ -6949,13 +6848,8 @@ const CONTINUED_WSTATUS: i32 = 0xffff;
 
 #[inline]
 fn get_wait_recipient(child_pid: u64) -> Option<u64> {
-    #[cfg(feature = "linux-compat")]
     {
         crate::ptrace::get_wait_recipient(child_pid)
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        parent_of_get(child_pid)
     }
 }
 
@@ -7020,13 +6914,8 @@ fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option
         }
         // A ptrace-stop is reported to the tracer's wait4 unconditionally;
         // a job-control stop of a non-traced child needs WUNTRACED.
-        #[cfg(feature = "linux-compat")]
         {
             want_stop || crate::ptrace::is_ptrace_stop_recipient(parent, p)
-        }
-        #[cfg(not(feature = "linux-compat"))]
-        {
-            want_stop
         }
     })?;
     let (pid, w, _) = q.remove(idx);
@@ -7154,7 +7043,6 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
-    #[cfg(feature = "linux-compat")]
     crate::ptrace::ptrace_init();
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
@@ -7166,7 +7054,6 @@ pub fn wait_init() {
     // orphanize its children. Both key on `tid`; the reap below keys on
     // `pid`, so they're independent of ordering.
     crate::user_task::register_thread_exit_observer(on_thread_exit);
-    #[cfg(feature = "linux-compat")]
     // Perf snapshots final user + kernel software-clock time before the master
     // table sweep removes TASK_KERN_NS. Register it ahead of that sweep; the
     // retired total then remains readable after every inherited task exits.
@@ -7177,9 +7064,7 @@ pub fn wait_init() {
     // orphaned. Gated on `group_dead` so a multi-threaded exit_group
     // reaps the pid exactly once (was per-thread → double `release_pid`,
     // the OCI teardown #UD).
-    #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
-    #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
@@ -7206,7 +7091,6 @@ pub fn wait_init() {
     // the exit observer reads them on thread exit and fires the
     // pthread_join futex wake. Gated so a no-linux-compat build
     // doesn't carry the observer.
-    #[cfg(feature = "linux-compat")]
     {
         clear_child_tid_init();
         install_clear_child_tid_observer();
@@ -7293,10 +7177,7 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     // in do_clone3's vfork park — otherwise the parent waits forever. `task` is
     // the visible pid here (every caller passes a pid). Idempotent with the
     // execve release. No-op when the pid isn't a vfork child.
-    #[cfg(all(
-        feature = "linux-compat",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     vfork_child_release(task);
     let mut g = PENDING_TERMINATION.lock();
     if let Some(m) = g.as_mut() {
@@ -7952,7 +7833,6 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SID_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
-    #[cfg(feature = "linux-compat")]
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
@@ -7974,7 +7854,6 @@ fn release_task_tables(tid: u64) {
 
     // Filesystem view.
     task_map_remove(&CWD_TABLE, tid);
-    #[cfg(feature = "linux-compat")]
     task_map_remove(&ROOT_DIR_TABLE, tid);
     if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
         m.remove(&tid);
@@ -8017,7 +7896,6 @@ fn release_task_tables(tid: u64) {
     // pass is the backstop for any path that tears down tables without
     // detaching fds. Also retire this task's own waiter entries (it
     // may die while parked on someone else's lock).
-    #[cfg(feature = "linux-compat")]
     {
         for key in crate::fd::locks::release_owner(tid) {
             for (waiter, w) in crate::fd::locks::drain_waiters(key) {
@@ -8064,7 +7942,6 @@ fn release_task_tables(tid: u64) {
 
     // Timers: a post-mortem expiry must not raise a phantom signal.
     // POSIX timers only exist in the linux-compat build.
-    #[cfg(feature = "linux-compat")]
     crate::posix_timer::release_task_timers(tid);
 
     // Linux kernel-AIO contexts: drop any io_setup'd contexts the task
@@ -8338,13 +8215,8 @@ fn has_living_child(parent: u64, want: i64, want_pgid: u64) -> bool {
     if is_parent {
         return true;
     }
-    #[cfg(feature = "linux-compat")]
     {
         crate::ptrace::is_tracer_of_any(parent, want)
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        false
     }
 }
 
@@ -8599,7 +8471,6 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     let _ = child_tid;
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
-    #[cfg(feature = "linux-compat")]
     crate::ptrace::release_process(child_pid);
 
     // Wave-61: notify any pidfd_open()'d watchers that the target
@@ -8875,7 +8746,6 @@ fn session_of_pgrp(pgrp: u64) -> Option<u64> {
 /// The session id of the current task, in the visible-pid space userspace
 /// sees. Backs the `TIOCGSID` console ioctl (`tcgetsid(3)`), which getty
 /// and login use to confirm they own the tty's session after `TIOCSCTTY`.
-#[cfg(feature = "linux-compat")]
 pub fn current_task_sid_user() -> u64 {
     pgid_to_user(read_sid(process_state_key(current_task_id())))
 }
@@ -8885,7 +8755,6 @@ pub fn current_task_sid_user() -> u64 {
 /// [`current_task_pgid`], for any value handed to userspace or compared
 /// against a userspace-supplied pgrp; see the number-space note above
 /// `pgid_to_user`.
-#[cfg(feature = "linux-compat")]
 pub fn current_task_pgid_user() -> u64 {
     pgid_to_user(read_pgid(process_state_key(current_task_id())))
 }
@@ -8919,7 +8788,6 @@ pub fn sid_fork(parent: u64, child: u64) {
 // the slave's session; that wiring is deferred — the slot is read
 // only by the controlling-tty smoke test for now.
 
-#[cfg(feature = "linux-compat")]
 static CTTY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -8927,13 +8795,11 @@ static CTTY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
 /// `narf_filesystem::TTY_ID_CONSOLE` so a task's ctty value can be
 /// compared directly against a FileOps `tty_id()`. PTY entries store the
 /// small `/dev/pts/<N>` index, which never collides with this.
-#[cfg(feature = "linux-compat")]
 pub const CTTY_CONSOLE: u32 = narf_filesystem::TTY_ID_CONSOLE;
 
 /// CTTY_TABLE sentinel: explicitly no controlling tty (a session leader
 /// detached via setsid). Distinct from an absent entry, which means "the
 /// boot-console default".
-#[cfg(feature = "linux-compat")]
 pub const CTTY_DETACHED: u32 = 0xFFFF_FFFF;
 
 /// The controlling terminal of `task`, resolved against the boot default:
@@ -8941,7 +8807,6 @@ pub const CTTY_DETACHED: u32 = 0xFFFF_FFFF;
 /// `CTTY_DETACHED` → none (setsid'd, not yet re-acquired); `CTTY_CONSOLE`
 /// → the console; any other value → that PTY index. `None` means the task
 /// has no controlling terminal.
-#[cfg(feature = "linux-compat")]
 pub fn task_ctty(task: u64) -> Option<u32> {
     let task = process_state_key(task);
     match CTTY_TABLE
@@ -8957,7 +8822,6 @@ pub fn task_ctty(task: u64) -> Option<u32> {
 
 /// Record the boot console as `task`'s controlling terminal — the console
 /// `TIOCSCTTY` path (mirrors `set_controlling_tty` for PTY slaves).
-#[cfg(feature = "linux-compat")]
 pub fn set_controlling_tty_console(task: u64) {
     let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
@@ -8970,7 +8834,6 @@ pub fn set_controlling_tty_console(task: u64) {
 /// default) so `task_ctty` resolves to "no controlling terminal", matching
 /// what `setsid()` does. A subsequent `open` without `O_NOCTTY` or an
 /// explicit `TIOCSCTTY` re-acquires one.
-#[cfg(feature = "linux-compat")]
 pub fn detach_controlling_tty(task: u64) {
     let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
@@ -8981,7 +8844,6 @@ pub fn detach_controlling_tty(task: u64) {
 /// Child inherits the parent's controlling terminal (POSIX fork). Only an
 /// explicit entry needs copying — absence already resolves to the console
 /// default for both parent and child.
-#[cfg(feature = "linux-compat")]
 pub fn ctty_fork(parent: u64, child: u64) {
     let parent = process_state_key(parent);
     let child = process_state_key(child);
@@ -8996,12 +8858,10 @@ pub fn ctty_fork(parent: u64, child: u64) {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 pub fn ctty_init() {
     *CTTY_TABLE.lock() = Some(BTreeMap::new());
 }
 
-#[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_ctty_reset() {
     *CTTY_TABLE.lock() = Some(BTreeMap::new());
@@ -9009,7 +8869,6 @@ pub fn __test_ctty_reset() {
 
 /// Look up the controlling tty for `task`. Returns the PTY index or
 /// `None` if the task has no controlling tty.
-#[cfg(feature = "linux-compat")]
 pub fn ctty_for(task: u64) -> Option<u32> {
     let task = process_state_key(task);
     CTTY_TABLE
@@ -9031,7 +8890,6 @@ pub fn ctty_for(task: u64) -> Option<u32> {
 /// The returned session and process-group IDs remain in task-id space. The
 /// querying syscall translates them into its caller's PID namespace, matching
 /// Linux's `pid_vnr()` at query time rather than acquisition time.
-#[cfg(feature = "linux-compat")]
 pub fn set_controlling_tty(
     pty_index: u32,
     tty_sid: u64,
@@ -9078,19 +8936,16 @@ pub fn set_controlling_tty(
 
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
 /// console as the calling task's controlling terminal.
-#[cfg(feature = "linux-compat")]
 fn console_tiocsctty() {
     set_controlling_tty_console(current_task_id());
 }
 
 /// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.
-#[cfg(feature = "linux-compat")]
 fn console_tiocnotty() {
     detach_controlling_tty(current_task_id());
 }
 
 /// `TIOCGSID`-on-console hook: the caller's session id (visible-pid space).
-#[cfg(feature = "linux-compat")]
 fn console_tiocgsid() -> u64 {
     current_task_sid_user()
 }
@@ -9182,7 +9037,6 @@ pub(crate) fn task_may_use_bpf() -> bool {
 
 /// Filesystem identity used when creating Linux-visible inodes outside the
 /// generic open path (notably POSIX message queues).
-#[cfg(feature = "linux-compat")]
 pub(crate) fn current_fs_ids() -> (u32, u32) {
     let ids = read_uidgid(current_task_id());
     (ids.fsuid, ids.fsgid)
@@ -9889,7 +9743,6 @@ pub fn __test_umask_reset() {
 }
 
 /// Current task's file-creation mask, including Linux's default 0022.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn current_umask() -> u32 {
     UMASK_TABLE
         .lock()
@@ -10034,7 +9887,6 @@ fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::I
 // the other — genuine sharing, exactly like Linux. Supersedes the
 // container id-by-key `shmget` in a linux-compat build.
 
-#[cfg(feature = "linux-compat")]
 struct ShmSegment {
     handle: u64,
     key: u32,
@@ -10063,7 +9915,6 @@ struct ShmSegment {
     removed: bool,
 }
 
-#[cfg(feature = "linux-compat")]
 #[derive(Clone)]
 struct ShmAttachment {
     ipc_ns: u64,
@@ -10079,7 +9930,6 @@ struct ShmAttachment {
     pending_mremap: Option<u64>,
 }
 
-#[cfg(feature = "linux-compat")]
 type ShmAttachmentKey = (u64, u64); // (address-space incarnation, detach base)
 
 /// Sorted attachment index with fallible preparation for insertion.
@@ -10091,13 +9941,11 @@ type ShmAttachmentKey = (u64, u64); // (address-space incarnation, detach base)
 /// the outer key slot and inner attachment slot before mutation. Insertion and
 /// removal shift O(n) records, which is acceptable for low-frequency SysV
 /// topology changes and does not affect normal `shmdt` lookup complexity.
-#[cfg(feature = "linux-compat")]
 #[derive(Default)]
 struct ShmAttachmentRegistry {
     entries: alloc::vec::Vec<(ShmAttachmentKey, alloc::vec::Vec<ShmAttachment>)>,
 }
 
-#[cfg(feature = "linux-compat")]
 impl ShmAttachmentRegistry {
     fn new() -> Self {
         Self::default()
@@ -10210,72 +10058,50 @@ impl ShmAttachmentRegistry {
             .retain_mut(|(key, entries)| keep(key, entries));
     }
 }
-#[cfg(feature = "linux-compat")]
 type ShmAddressSpaceOwners =
     alloc::collections::BTreeMap<u64, alloc::collections::BTreeSet<u64>>;
-#[cfg(feature = "linux-compat")]
 type ShmObjectKey = (u64, u64); // (IPC namespace id, namespace-local shmid)
 
-#[cfg(feature = "linux-compat")]
 static SHM_SEGMENTS: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<ShmObjectKey, ShmSegment>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
-#[cfg(feature = "linux-compat")]
 static SHM_ATTACHMENTS: narf_lib::sync::IrqSafeSpinLock<
     Option<ShmAttachmentRegistry>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
-#[cfg(feature = "linux-compat")]
 static SHM_AS_OWNERS: narf_lib::sync::IrqSafeSpinLock<
     Option<ShmAddressSpaceOwners>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
-#[cfg(feature = "linux-compat")]
 type ShmMappingTransactions = alloc::collections::BTreeMap<
     u64,
     alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>>,
 >;
-#[cfg(feature = "linux-compat")]
 static SHM_MAPPING_TRANSACTIONS: narf_lib::sync::IrqSafeSpinLock<
     Option<ShmMappingTransactions>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
-#[cfg(feature = "linux-compat")]
 static SHM_NEXT_MREMAP_PREPARATION: AtomicU64 = AtomicU64::new(1);
-#[cfg(all(feature = "linux-compat", not(feature = "container")))]
+#[cfg(not(feature = "container"))]
 static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(feature = "linux-compat")]
 const IPC_CREAT: u64 = 0o1000;
-#[cfg(feature = "linux-compat")]
 const IPC_EXCL: u64 = 0o2000;
-#[cfg(feature = "linux-compat")]
 const IPC_RMID: u64 = 0;
-#[cfg(feature = "linux-compat")]
 const IPC_SET: u64 = 1;
-#[cfg(feature = "linux-compat")]
 const IPC_STAT: u64 = 2;
-#[cfg(feature = "linux-compat")]
 const IPC_INFO: u64 = 3;
-#[cfg(feature = "linux-compat")]
 const SHM_RDONLY: u64 = 0o10000;
-#[cfg(feature = "linux-compat")]
 const SHM_RND: u64 = 0o20000;
-#[cfg(feature = "linux-compat")]
 const SHM_REMAP: u64 = 0o40000;
-#[cfg(feature = "linux-compat")]
 const SHM_EXEC: u64 = 0o100000;
-#[cfg(feature = "linux-compat")]
 const SHMLBA: u64 = 4096;
 
-#[cfg(feature = "linux-compat")]
 fn shm_now_seconds() -> i64 {
     narf_scheduler::narf_time::now_wall().secs
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_as_key(as_ref: &Arc<AddressSpace>) -> u64 {
     shm_as_key_ref(as_ref)
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_as_key_ref(as_ref: &AddressSpace) -> u64 {
     let root = as_ref.root.as_u64();
     if root != 0 {
@@ -10285,17 +10111,16 @@ fn shm_as_key_ref(as_ref: &AddressSpace) -> u64 {
     }
 }
 
-#[cfg(all(feature = "linux-compat", feature = "container"))]
+#[cfg(feature = "container")]
 fn current_shm_ipc_ns() -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
     crate::namespaces::current_ipc_namespace(current_task_id())
 }
 
-#[cfg(all(feature = "linux-compat", not(feature = "container")))]
+#[cfg(not(feature = "container"))]
 fn current_shm_ipc_ns_id() -> u64 {
     0
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_register_as_owner(as_key: u64, pid: u64) {
     SHM_AS_OWNERS
         .lock()
@@ -10305,7 +10130,6 @@ fn shm_register_as_owner(as_key: u64, pid: u64) {
         .insert(pid);
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_mapping_transaction(
     as_key: u64,
 ) -> alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>> {
@@ -10321,7 +10145,6 @@ fn shm_mapping_transaction(
 /// additional logical attachment for every inherited mapping; `CLONE_VM`
 /// merely adds another process owner of the same mm and does not change
 /// `shm_nattch`.
-#[cfg(feature = "linux-compat")]
 fn shm_fork_process(
     parent_as: &Arc<AddressSpace>,
     child_as: &Arc<AddressSpace>,
@@ -10379,7 +10202,6 @@ fn shm_fork_process(
 
 /// Process-exit half of Linux `exit_shm`: only the final process sharing an
 /// address space closes its inherited logical attachments.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
     let closing_keys = {
         let mut owners = SHM_AS_OWNERS.lock();
@@ -10461,7 +10283,6 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     // Linux ipcperms collapses owner/group/other request bits into one rwx
     // mask before comparing it with the caller-selected permission class.
@@ -10485,7 +10306,6 @@ fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     granted & request == request
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_ipc_owner(seg: &ShmSegment) -> bool {
     let uid = current_ucred().uid;
     uid == 0 || uid == seg.uid || uid == seg.cuid
@@ -10493,7 +10313,6 @@ fn shm_ipc_owner(seg: &ShmSegment) -> bool {
 
 /// Drop an in-progress attach reservation. If `IPC_RMID` raced the mapping,
 /// the final reservation owns destruction of the now-unreachable backing.
-#[cfg(feature = "linux-compat")]
 fn shm_cancel_attach(object: ShmObjectKey) {
     let destroy = {
         let mut segments = SHM_SEGMENTS.lock();
@@ -10516,7 +10335,6 @@ fn shm_cancel_attach(object: ShmObjectKey) {
 }
 
 /// A registry-side failure while preparing a shared `mremap` alias.
-#[cfg(feature = "linux-compat")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShmMremapPrepareError {
     InvalidRange,
@@ -10536,7 +10354,6 @@ pub(crate) enum ShmMremapPrepareError {
 /// The caller must keep `shm_mapping_transaction(as_key)` locked from prepare
 /// through commit/abort. Dropping this value rolls back only the hidden SysV
 /// destination; use [`Self::abort`] when memory already punched a fixed target.
-#[cfg(feature = "linux-compat")]
 #[must_use = "dropping the preparation rolls back its pending SysV alias"]
 pub(crate) struct PreparedShmMremapAlias {
     as_key: u64,
@@ -10549,7 +10366,6 @@ pub(crate) struct PreparedShmMremapAlias {
     destroy_after_punch: alloc::vec::Vec<u64>,
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_attachment_covers(attachment: &ShmAttachment, lo: u64, hi: u64) -> bool {
     let mut cursor = lo;
     for &(base, len) in &attachment.fragments {
@@ -10568,7 +10384,6 @@ fn shm_attachment_covers(attachment: &ShmAttachment, lo: u64, hi: u64) -> bool {
     false
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_attachment_intersects(attachment: &ShmAttachment, lo: u64, hi: u64) -> bool {
     attachment.fragments.iter().any(|&(base, len)| {
         let end = base.saturating_add(len);
@@ -10579,7 +10394,6 @@ fn shm_attachment_intersects(attachment: &ShmAttachment, lo: u64, hi: u64) -> bo
 /// Reserve every Vec growth needed to clip the fixed target in place. The
 /// address-space mapping transaction makes these capacities stable until the
 /// prepared operation commits or aborts.
-#[cfg(feature = "linux-compat")]
 fn shm_prepare_punch_capacity(
     as_key: u64,
     ranges: &[(u64, u64)],
@@ -10628,7 +10442,6 @@ fn shm_prepare_punch_capacity(
     Ok(destroy)
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_prepare_fixed_punch_capacity(
     as_key: u64,
     lo: u64,
@@ -10637,7 +10450,6 @@ fn shm_prepare_fixed_punch_capacity(
     shm_prepare_punch_capacity(as_key, &[(lo, hi)])
 }
 
-#[cfg(feature = "linux-compat")]
 fn shm_clip_attachment_prepared(attachment: &mut ShmAttachment, lo: u64, hi: u64) {
     let mut index = 0usize;
     while index < attachment.fragments.len() {
@@ -10673,7 +10485,6 @@ fn shm_clip_attachment_prepared(attachment: &mut ShmAttachment, lo: u64, hi: u64
 /// or dropped. `old_base..old_base+len` and `new_base..new_base+len` must name
 /// the already-validated source and prospective destination of the same memory
 /// transaction.
-#[cfg(feature = "linux-compat")]
 pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
     as_key: u64,
     old_base: u64,
@@ -10692,7 +10503,6 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
 /// Prepare the owner transfer for an ordinary nonzero shared move. The hidden
 /// destination is published only on success; failure methods can commit the
 /// fixed-target punch and Linux's separately observable source-tail shrink.
-#[cfg(feature = "linux-compat")]
 pub(crate) unsafe fn shm_prepare_mremap_shared_relocation_locked(
     as_key: u64,
     old_base: u64,
@@ -10713,7 +10523,6 @@ pub(crate) unsafe fn shm_prepare_mremap_shared_relocation_locked(
 ///
 /// # Safety
 /// The caller holds `shm_mapping_transaction(as_key)` through plan commit/drop.
-#[cfg(feature = "linux-compat")]
 pub(crate) unsafe fn shm_prepare_mremap_punch_locked(
     as_key: u64,
     base: u64,
@@ -10737,7 +10546,6 @@ pub(crate) unsafe fn shm_prepare_mremap_punch_locked(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "linux-compat")]
 unsafe fn shm_prepare_mremap_shared_destination_locked(
     as_key: u64,
     old_base: u64,
@@ -10866,7 +10674,6 @@ unsafe fn shm_prepare_mremap_shared_destination_locked(
     })
 }
 
-#[cfg(feature = "linux-compat")]
 impl PreparedShmMremapAlias {
     fn remove_pending(&mut self) {
         let Some((token, _)) = self.pending.take() else {
@@ -11031,7 +10838,6 @@ impl PreparedShmMremapAlias {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 impl Drop for PreparedShmMremapAlias {
     fn drop(&mut self) {
         self.remove_pending();
@@ -11041,7 +10847,6 @@ impl Drop for PreparedShmMremapAlias {
 /// Account for mappings displaced by `SHM_REMAP`. Fully covered logical
 /// attachments detach; partially covered ones retain the surviving fragments
 /// so a later `shmdt(original_base)` still finds and removes them.
-#[cfg(feature = "linux-compat")]
 fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
     let mut detached_ids = alloc::vec::Vec::new();
     {
@@ -11113,7 +10918,6 @@ fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 mod shm_mremap_registry_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -11437,7 +11241,7 @@ mod shm_mremap_registry_tests {
 /// Final `ipc_namespace` teardown removes every public id immediately. SHM
 /// mappings survive exactly as Linux VMAs do; their namespace-qualified
 /// attachment records retain the backing until final detach/process exit.
-#[cfg(all(feature = "linux-compat", feature = "container"))]
+#[cfg(feature = "container")]
 pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
     let mut destroy = alloc::vec::Vec::new();
     {

@@ -41,7 +41,6 @@ pub mod laptop_state;
 pub mod psci;
 pub mod suspend;
 pub mod syscall;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 pub mod system;
 pub mod thermal;
@@ -298,7 +297,6 @@ pub fn register_initcalls() {
     // fully populated before we register sysfs nodes.
     // Linux ref: power_supply_class.c:power_supply_add_attrs (6.9 line 483)
     //            thermal_sysfs.c:thermal_zone_device_register (6.9 line 344)
-    #[cfg(feature = "linux-compat")]
     narf_init::register(Stage::Late, "power-sysfs-bridge", || {
         sysfs_bridge::populate_power_supply_and_thermal();
         InitResult::Ok

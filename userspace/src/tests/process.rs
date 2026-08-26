@@ -82,7 +82,7 @@ kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 // clone(CLONE_NEWNS|SIGCHLD), rather than calling unshare() in the child.
 // Mount namespaces are part of the base Linux-compat surface, so that must
 // create a snapshot even when the optional container bundle is disabled.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_newns_snapshots_mount_namespace() -> TestResult {
     const PARENT: u64 = 0xC10E_0001;
     const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -172,7 +172,7 @@ fn smoke_userspace_clone_newns_snapshots_mount_namespace() -> TestResult {
         TestResult::Fail("clone(CLONE_NEWNS) inherited instead of snapshotting mount namespace")
     }
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_clone_newns_snapshots_mount_namespace
@@ -237,10 +237,7 @@ kernel_test_in!(
 // parent's `while vfork_is_pending` park loop terminates. `vfork_child_release`
 // also fires `wake_signal`, which is a no-op here (no live task ctx for the
 // synthetic parent id) — this exercises the entry lifecycle in isolation.
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
     let child = 0xF001u64; // arbitrary synthetic child pid (unused by any task)
     crate::handlers::vfork_wait_register(child, 0xF002);
@@ -258,10 +255,7 @@ fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(all(
-    feature = "linux-compat",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "userspace",
     smoke_userspace_vfork_wait_release_clears_pending
@@ -615,7 +609,7 @@ kernel_test_in!("userspace", smoke_userspace_dup_clones_fd);
 
 // ── Wave-68 fcntl extensions: dup/CLOEXEC, status flags, locks ─────
 
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -726,7 +720,7 @@ fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_fcntl_dupfd_cloexec);
 
 #[cfg(target_arch = "x86_64")]
@@ -1173,7 +1167,6 @@ kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_table);
 // identities used by Linux *at syscalls. systemd opens a mount parent in PID 1
 // then its mount helper calls mkdirat(parent_fd, leaf, ...); losing this
 // metadata turned the valid inherited O_PATH fd into EBADF.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
     const PARENT: u64 = 0xF001;
     const CHILD: u64 = 0xF002;
@@ -1190,14 +1183,12 @@ fn smoke_userspace_fork_inherits_fd_path_identity() -> TestResult {
         TestResult::Fail("fork lost the inherited fd path identity")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_path_identity);
 
 // Procfs APIs address an fd by Linux PID, but syscall handlers already have a
 // scheduler TaskId. These number spaces may collide: resolving a TaskId via
 // the PID map can select another process's fd table. The TaskId-specific path
 // lookup must always keep the calling task's descriptor identity.
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
     const TASK: u64 = 0xF101;
     const OTHER_TASK: u64 = 0xF102;
@@ -1214,7 +1205,6 @@ fn smoke_userspace_fd_path_task_lookup_avoids_pid_collision() -> TestResult {
         TestResult::Fail("TaskId fd lookup followed a colliding PID mapping")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_fd_path_task_lookup_avoids_pid_collision

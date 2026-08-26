@@ -53,7 +53,6 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
                 // set_times is lenient — unsupported FileOps → 0.
                 let _ = o.set_times(at, mt);
                 // inotify: a timestamp change is IN_ATTRIB on the fd's file.
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_attrib_fd(task, fd);
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -86,7 +85,6 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
     let path = resolve_cwd_path(task, &eff);
     let r = set_path_times(&path, at, mt);
     // inotify: a successful timestamp change is IN_ATTRIB on the path.
-    #[cfg(feature = "linux-compat")]
     if r == 0 {
         let is_dir = resolve_dir_absolute(&path).is_some();
         crate::mqueue::notify_attrib(&path, is_dir);

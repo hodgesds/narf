@@ -6,7 +6,6 @@
 //! Every test calls [`call`] / [`call_raw`] against `kernel_syscall_entry`
 //! with a crafted [`AbiCtx`], so the groups are deterministic and immune
 //! to the executor (no user mode, no scheduler).
-#![cfg(feature = "linux-compat")]
 #![allow(dead_code)] // errno/flag reference table + harness helpers
 
 use core::sync::atomic::{AtomicU64, Ordering};

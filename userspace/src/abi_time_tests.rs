@@ -1,5 +1,4 @@
 //! Linux syscall ABI conformance — time group.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // Clock ids used across the time syscalls (mirrors the kernel-side

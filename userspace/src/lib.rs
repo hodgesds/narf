@@ -41,11 +41,9 @@ extern crate alloc;
 
 #[cfg(feature = "container")]
 pub mod container;
-#[cfg(feature = "linux-compat")]
 pub mod linux_compat;
 
 pub mod anon_reclaim;
-#[cfg(feature = "linux-compat")]
 pub(crate) mod bpf_iter;
 pub mod coredump;
 pub mod elf;
@@ -56,38 +54,29 @@ pub mod handlers;
 pub mod init;
 pub mod interp;
 pub mod io_mux;
-#[cfg(feature = "linux-compat")]
 pub mod keyring;
-#[cfg(feature = "linux-compat")]
 pub mod landlock;
 pub mod loader;
-#[cfg(feature = "linux-compat")]
 pub mod lsm;
 mod mapped_file;
 pub mod migrate;
-#[cfg(feature = "linux-compat")]
 pub mod mount_api;
-#[cfg(feature = "linux-compat")]
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;
 pub mod oom;
-#[cfg(feature = "linux-compat")]
 pub mod perf_event;
 #[cfg(feature = "container")]
 pub mod pid_ns;
 pub mod pidfd;
 pub mod pipe;
 pub mod poll;
-#[cfg(feature = "linux-compat")]
 pub mod posix_timer;
 pub mod process;
-#[cfg(feature = "linux-compat")]
 pub mod ptrace;
 pub mod select;
 pub mod socket;
 pub mod syscall;
-#[cfg(feature = "linux-compat")]
 pub mod sysvipc;
 pub mod task;
 #[cfg(target_arch = "x86_64")]
