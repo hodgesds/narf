@@ -1,22 +1,57 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `setgroups(size, list)` — replace the caller's supplementary group list.
+/// `kernel/groups.c::SYSCALL_DEFINE2(setgroups)` — replace the caller's
+/// supplementary group list.
+///
+/// ```text
+/// if (!may_setgroups())               return -EPERM;
+/// if ((unsigned)gidsetsize > NGROUPS_MAX)  return -EINVAL;
+/// group_info = groups_alloc(gidsetsize);
+/// if (!group_info)                    return -ENOMEM;
+/// retval = groups_from_user(group_info, grouplist);   /* -EFAULT / -EINVAL */
+/// ```
+///
+/// and, per entry, `kernel/groups.c::groups_from_user()`:
+///
+/// ```text
+/// if (get_user(gid, grouplist+i))     return -EFAULT;
+/// kgid = make_kgid(user_ns, gid);
+/// if (!gid_valid(kgid))               return -EINVAL;
+/// ```
+///
+/// `gidsetsize` is a signed `int` that Linux compares as `unsigned`, which
+/// is what makes a negative size EINVAL. Reading the raw 64-bit register
+/// got the negative case right only by accident and got the positive case
+/// wrong: a caller whose upper register half held junk (a value like
+/// `1 << 32`) had its perfectly legal `setgroups(0, NULL)` rejected.
+///
+/// The EINVAL for an unmapped gid is the one a container runtime reads: it
+/// means "that gid has no mapping in your user namespace", i.e. fix the
+/// gid_map, as distinct from the EPERM that means "you may not call this
+/// at all".
 pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
-    const NGROUPS_MAX: usize = 65_536;
+    const ENOMEM: i64 = 12;
+    const NGROUPS_MAX: u32 = 65_536;
     let args = *ctx.args();
-    let size = args.arg0 as usize;
+    // `int gidsetsize`, compared as `unsigned` — a negative size becomes a
+    // huge unsigned and trips the bound.
+    let size = args.arg0 as i32 as u32;
     let list = args.arg1;
     if size > NGROUPS_MAX {
         ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
         return;
     }
+    let size = size as usize;
     if size == 0 {
+        // `groups_from_user` copies nothing, so `grouplist` is never read.
         let ok = write_groups(current_task_id(), alloc::vec::Vec::new());
         ctx.set_return(if ok {
             SyscallReturn::ok(0)
         } else {
-            SyscallReturn::ok((-1i64) as u64)
+            // Linux's only remaining failure here is the credential
+            // allocation, which is -ENOMEM.
+            SyscallReturn::ok((-ENOMEM) as u64)
         });
         return;
     }
@@ -47,6 +82,6 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     ctx.set_return(if ok {
         SyscallReturn::ok(0)
     } else {
-        SyscallReturn::ok((-1i64) as u64)
+        SyscallReturn::ok((-ENOMEM) as u64)
     });
 }

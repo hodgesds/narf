@@ -37,10 +37,19 @@ int main(void) {
         w("cap-fail: perm-mismatch\n"); return 1;
     }
 
-    // An unsupported version must fail and rewrite the header to V3.
+    // An unsupported version rewrites the header to V3. With a NULL data
+    // pointer that is a VERSION PROBE and it SUCCEEDS:
+    //
+    //   ret = cap_validate_magic(header, &tocopy);
+    //   if ((dataptr == NULL) || (ret != 0))
+    //           return ((dataptr == NULL) && (ret == -EINVAL)) ? 0 : ret;
+    //
+    // libcap's cap_get_proc() relies on this to discover the kernel's
+    // capability version before it allocates; a failure here would make it
+    // give up rather than retry at the reported version.
     struct cap_header bad = { 0xdeadbeefu, 0 };
-    if (syscall(SYS_capget, &bad, (void *)0) == 0) {
-        w("cap-fail: badver-accepted\n"); return 1;
+    if (syscall(SYS_capget, &bad, (void *)0) != 0) {
+        w("cap-fail: badver-probe-rejected\n"); return 1;
     }
     if (bad.version != CAP_V3) { w("cap-fail: badver-norewrite\n"); return 1; }
 

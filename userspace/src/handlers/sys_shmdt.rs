@@ -3,15 +3,39 @@ use super::*;
 
 /// `shmdt(shmaddr)` — detach the logical System V attachment whose original
 /// attach address is exactly `shmaddr`.
+///
+/// `ipc/shm.c::ksys_shmdt` has exactly one failure code, and it is reached
+/// two ways:
+///
+/// ```text
+///   int retval = -EINVAL;
+///   if (addr & ~PAGE_MASK) return retval;
+///   ...
+///   for_each_vma(vmi, vma) {
+///       if ((vma->vm_ops == &shm_vm_ops) &&
+///           (vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
+///               ... retval = 0; break;
+///       }
+///   }
+///   return retval;
+/// ```
+///
+/// `retval` only ever leaves as 0 or -EINVAL: a misaligned address and an
+/// address that names no SysV attachment are indistinguishable to the
+/// caller, and detaching a segment that was already IPC_RMID'd is a plain
+/// success, not -EIDRM. Every failure exit below therefore reports -EINVAL
+/// deliberately — none of them is a stand-in for an unwritten errno.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
+    // `shmaddr` is a `char __user *`, so unlike shmid/shmflg it really is the
+    // whole register.
     let addr = ctx.args().arg0;
     if addr & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let Some(as_ref) = current_address_space() else {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     };
     let as_key = shm_as_key(&as_ref);

@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{AddressSpace, RegionPerms};
+use narf_memory::{AddressSpace, RegionPerms, VirtAddr};
 
 use crate::abi_test_support::*;
 
@@ -904,3 +904,692 @@ fn smoke_abi_mem_pkey_mprotect_no_as_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_pkey_mprotect_no_as_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// Errno-conformance audit — mm family.
+//
+// Every case below pins one arm whose code was previously wrong (bare
+// -1/EPERM, a blanket EINVAL, or an error where Linux succeeds), plus the
+// positive path that must keep working so a later tightening cannot turn a
+// working call into an error. Kernel references are in the handler doc
+// comments; the function named in each comment is the one that decides the
+// value.
+// ════════════════════════════════════════════════════════════════════
+
+const PROT_READ: u64 = 0x1;
+const PROT_WRITE: u64 = 0x2;
+const PROT_SEM: u64 = 0x8;
+const PROT_GROWSDOWN: u64 = 0x0100_0000;
+const PROT_GROWSUP: u64 = 0x0200_0000;
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_HUGETLB: u64 = 0x0004_0000;
+const MAP_FIXED_NOREPLACE: u64 = 0x0010_0000;
+
+/// A canonical-but-unmappable user pointer: bit 48 set, 49..63 clear, so
+/// `validate_user_range` rejects it without ever dereferencing it.
+const NON_CANONICAL: u64 = 0x0001_0000_0000_0000;
+
+/// The last page of the 64-bit address space: `addr + PAGE_ALIGN(len)` wraps.
+const WRAPPING_BASE: u64 = 0xFFFF_FFFF_FFFF_F000;
+
+fn mmap_args(hint: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0: hint,
+        arg1: len,
+        arg2: prot,
+        arg3: flags,
+        arg4: fd,
+        arg5: offset,
+    }
+}
+
+// ── MProtect (10) — do_mprotect_pkey argument contract ───────────────
+
+/// `do_mprotect_pkey`: `if (!len) return 0;` — a zero-length mprotect is a
+/// success and never consults a VMA, so it must not fall through to the
+/// "no intersecting region" ENOMEM.
+fn smoke_abi_mem_mprotect_zero_length_is_success_pos() -> TestResult {
+    with_setup(
+        || match call(Syscall::MProtect.raw(), a2(0x1000, 0, PROT_READ)) {
+            Some(0) => Ok(()),
+            Some(_) => Err("mprotect(len == 0) must return 0, not an errno"),
+            None => Err("mprotect(len == 0) must be Ok(0)"),
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mprotect_zero_length_is_success_pos
+);
+
+/// `do_mprotect_pkey`: `if (start & ~PAGE_MASK) return -EINVAL;` — a
+/// malformed address is the caller's arithmetic bug, not a missing mapping.
+fn smoke_abi_mem_mprotect_unaligned_start_einval_pos() -> TestResult {
+    with_setup(
+        || match call(Syscall::MProtect.raw(), a2(0x1001, 0x1000, PROT_READ)) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(v) if v == ENOMEM => Err("mprotect(unaligned) is EINVAL, not ENOMEM"),
+            _ => Err("mprotect with a misaligned start must be -EINVAL"),
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mprotect_unaligned_start_einval_pos
+);
+
+/// `do_mprotect_pkey`: `arch_validate_prot` rejects any bit outside
+/// READ|WRITE|EXEC|SEM, and PROT_GROWSDOWN|PROT_GROWSUP together are the
+/// explicit "can't be both" EINVAL. Both used to be accepted and ignored.
+fn smoke_abi_mem_mprotect_rejects_undefined_prot_bits_pos() -> TestResult {
+    with_setup(|| {
+        // An undefined prot bit: honouring only the low three bits would give
+        // the caller a protection it did not ask for, silently.
+        match call(
+            Syscall::MProtect.raw(),
+            a2(0x1000, 0x1000, PROT_READ | 0x100),
+        ) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("mprotect with an undefined prot bit must be -EINVAL"),
+        }
+        // "can't be both" — checked before the address is even looked at.
+        let both = PROT_READ | PROT_GROWSDOWN | PROT_GROWSUP;
+        match call(Syscall::MProtect.raw(), a2(0x1000, 0x1000, both)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("mprotect(PROT_GROWSDOWN|PROT_GROWSUP) must be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mprotect_rejects_undefined_prot_bits_pos
+);
+
+/// `do_mprotect_pkey`: `end = start + len; if (end <= start) return -ENOMEM;`
+/// — a wrapped range is ENOMEM, distinct from the EINVAL arms above.
+fn smoke_abi_mem_mprotect_wrapped_range_enomem_pos() -> TestResult {
+    with_setup(|| {
+        match call(
+            Syscall::MProtect.raw(),
+            a2(WRAPPING_BASE, 0x2000, PROT_READ),
+        ) {
+            Some(v) if v == ENOMEM => Ok(()),
+            Some(v) if v == EINVAL => Err("mprotect(wrapped range) is ENOMEM, not EINVAL"),
+            _ => Err("mprotect over a wrapped range must be -ENOMEM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mprotect_wrapped_range_enomem_pos
+);
+
+/// Positive path: the new pre-checks must not reject a well-formed request.
+/// PROT_SEM is accepted-and-ignored by Linux, so it stays a success here.
+fn smoke_abi_mem_mprotect_live_mapping_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0300_0000;
+            let map = mmap_args(
+                BASE,
+                0x2000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            if call(Syscall::Mmap.raw(), map) != Some(BASE as i64) {
+                return Err("setup: fixed anonymous mapping failed");
+            }
+            if call(
+                Syscall::MProtect.raw(),
+                a2(BASE, 0x2000, PROT_READ | PROT_SEM),
+            ) != Some(0)
+            {
+                return Err("mprotect(PROT_READ|PROT_SEM) over a live mapping must succeed");
+            }
+            if !as_ref
+                .lookup(VirtAddr::new(BASE))
+                .is_some_and(|region| region.perms.contains(RegionPerms::READ))
+            {
+                return Err("mprotect reported success without applying READ");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mprotect_live_mapping_pos);
+
+// ── Madvise (28) — madvise_should_skip ───────────────────────────────
+
+/// `madvise_should_skip`: `if (start + PAGE_ALIGN(len_in) == start) { *err = 0; }`
+/// — an empty purge is a success. jemalloc emits these constantly; ENOMEM
+/// would read as "the arena was unmapped underneath me".
+fn smoke_abi_mem_madvise_zero_length_is_success_pos() -> TestResult {
+    with_setup(|| {
+        const MADV_DONTNEED: u64 = 4;
+        match call(Syscall::Madvise.raw(), a2(0x1000, 0, MADV_DONTNEED)) {
+            Some(0) => Ok(()),
+            Some(_) => Err("madvise(len == 0) must return 0"),
+            None => Err("madvise(len == 0) must be Ok(0), not InvalidOp"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_madvise_zero_length_is_success_pos
+);
+
+/// `is_valid_madvise`: `if (!PAGE_ALIGNED(start)) return false;` → EINVAL,
+/// decided before any address space is consulted.
+fn smoke_abi_mem_madvise_unaligned_start_einval_pos() -> TestResult {
+    with_setup(|| {
+        const MADV_DONTNEED: u64 = 4;
+        match call(Syscall::Madvise.raw(), a2(0x1001, 0x1000, MADV_DONTNEED)) {
+            Some(v) if v == EINVAL => Ok(()),
+            None => Err("madvise(unaligned) must be a reachable -EINVAL, not InvalidOp"),
+            _ => Err("madvise with a misaligned start must be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_madvise_unaligned_start_einval_pos
+);
+
+/// `madvise_behavior_valid`: an unknown `advice` is EINVAL, and it is the
+/// FIRST thing checked — before the alignment of `start`.
+fn smoke_abi_mem_madvise_unknown_advice_einval_pos() -> TestResult {
+    with_setup(|| match call(Syscall::Madvise.raw(), a2(0x1001, 0, 4242)) {
+        Some(v) if v == EINVAL => Ok(()),
+        Some(0) => Err("an unknown madvise advice must not report success"),
+        _ => Err("madvise with an unknown advice must be -EINVAL"),
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_madvise_unknown_advice_einval_pos
+);
+
+// ── Msync (26) — the end == start success arm ────────────────────────
+
+/// `SYSCALL_DEFINE3(msync)`: `error = 0; if (end == start) goto out;` — taken
+/// before `find_vma`, so an empty flush succeeds even over unmapped memory.
+fn smoke_abi_mem_msync_zero_length_is_success_pos() -> TestResult {
+    with_setup(|| match call(Syscall::Msync.raw(), a2(0x1000, 0, 0)) {
+        Some(0) => Ok(()),
+        Some(v) if v == ENOMEM => Err("msync(len == 0) is 0, not ENOMEM"),
+        _ => Err("msync with a zero length must return 0"),
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_msync_zero_length_is_success_pos
+);
+
+// ── Mincore (27) — access_ok(vec) precedes the walk ──────────────────
+
+/// `SYSCALL_DEFINE3(mincore)`: `if (!access_ok(vec, pages)) return -EFAULT;`
+/// runs before `do_mincore`, so a bad output buffer wins over an unmapped
+/// range. Callers use mincore's ENOMEM as the authoritative "not mapped".
+fn smoke_abi_mem_mincore_bad_vec_efault_precedes_walk_pos() -> TestResult {
+    with_setup(|| {
+        let args = a3(0x1000, 0x1000, NON_CANONICAL, 0);
+        match call(Syscall::Mincore.raw(), args) {
+            Some(v) if v == EFAULT => Ok(()),
+            Some(v) if v == ENOMEM => Err("mincore(bad vec) is EFAULT, not ENOMEM"),
+            None => Err("mincore(bad vec) must be a reachable -EFAULT"),
+            _ => Err("mincore with an unwritable vec must be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mincore_bad_vec_efault_precedes_walk_pos
+);
+
+// ── MLock (149) / MUnlock (150) / Mlock2 (325) ───────────────────────
+
+/// `apply_vma_lock_flags`: `if (end == start) return 0;` for all three.
+fn smoke_abi_mem_mlock_family_zero_length_is_success_pos() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::MLock.raw(), a1(0x1000, 0)) != Some(0) {
+            return Err("mlock(len == 0) must return 0");
+        }
+        if call(Syscall::MUnlock.raw(), a1(0x1000, 0)) != Some(0) {
+            return Err("munlock(len == 0) must return 0");
+        }
+        if call(Syscall::Mlock2.raw(), a3(0x1000, 0, 0, 0)) != Some(0) {
+            return Err("mlock2(len == 0) must return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mlock_family_zero_length_is_success_pos
+);
+
+/// `apply_vma_lock_flags`: `end = start + len; if (end < start) return -EINVAL;`
+/// — the only EINVAL in the family, and it must not be confused with the
+/// ENOMEM a real coverage hole produces.
+fn smoke_abi_mem_mlock_wrapped_range_einval_pos() -> TestResult {
+    with_setup(
+        || match call(Syscall::MLock.raw(), a1(WRAPPING_BASE, 0x2000)) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(v) if v == EPERM => Err("mlock(wrapped) must not be EPERM with a default limit"),
+            _ => Err("mlock over a wrapped range must be -EINVAL"),
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mlock_wrapped_range_einval_pos);
+
+/// `do_mlock`: `len = PAGE_ALIGN(len + offset_in_page(start)); start &= PAGE_MASK;`
+/// — mlock locks the pages *containing* the request. Every secret-memory
+/// user (libsodium, gnupg, OpenSSL) passes a `malloc`'d pointer here; an
+/// alignment EINVAL makes them give up on locking key material entirely.
+fn smoke_abi_mem_mlock_rounds_an_unaligned_address_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0400_0000;
+            let map = mmap_args(
+                BASE,
+                0x2000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            if call(Syscall::Mmap.raw(), map) != Some(BASE as i64) {
+                return Err("setup: fixed anonymous mapping failed");
+            }
+            // A pointer one byte into the first page, one page long: Linux
+            // rounds down to BASE and up to one page.
+            if call(Syscall::MLock.raw(), a1(BASE + 1, 0x1000)) != Some(0) {
+                return Err("mlock of a misaligned buffer must round, not EINVAL");
+            }
+            if !as_ref
+                .lookup(VirtAddr::new(BASE))
+                .is_some_and(|region| region.perms.contains(RegionPerms::LOCKED))
+            {
+                return Err("mlock reported success without locking the containing page");
+            }
+            if call(Syscall::MUnlock.raw(), a1(BASE + 1, 0x1000)) != Some(0) {
+                return Err("munlock must accept the same misaligned pointer mlock did");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mlock_rounds_an_unaligned_address_pos
+);
+
+// ── Mlockall (151) — `int flags`, not `unsigned long` ────────────────
+
+/// `SYSCALL_DEFINE1(mlockall, int, flags)`: only the low 32 bits are the
+/// request. Reading the whole register turned a valid MCL_FUTURE into
+/// "unknown MCL_ flags" (EINVAL) whenever the high half held junk.
+fn smoke_abi_mem_mlockall_flags_are_32_bit_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|_| {
+            const MCL_FUTURE: u64 = 2;
+            let with_junk_high_half = 0xDEAD_BEEF_0000_0000u64 | MCL_FUTURE;
+            match call(Syscall::Mlockall.raw(), a0(with_junk_high_half)) {
+                Some(0) => {}
+                Some(v) if v == EINVAL => {
+                    return Err("mlockall must ignore the high 32 bits of `int flags`")
+                }
+                _ => return Err("mlockall(MCL_FUTURE) must succeed"),
+            }
+            if call(Syscall::Munlockall.raw(), a0(0)) != Some(0) {
+                return Err("munlockall must clear the future policy");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mlockall_flags_are_32_bit_pos);
+
+// ── Mmap (9) — do_mmap's MAP_TYPE switch and MAP_FIXED_NOREPLACE ─────
+
+/// `do_mmap`: both `switch (flags & MAP_TYPE)` arms end in
+/// `default: return -EINVAL`. A request with no type bit at all is the
+/// classic `mmap(NULL, n, prot, MAP_ANONYMOUS, -1, 0)` typo, which used to
+/// produce a working private mapping here and a hard EINVAL on Linux.
+fn smoke_abi_mem_mmap_requires_a_map_type_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|_| {
+            let no_type = mmap_args(
+                0,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), no_type) {
+                Some(v) if v == EINVAL => {}
+                Some(v) if v > 0 => return Err("mmap without a MAP_TYPE must not map anything"),
+                _ => return Err("mmap without a MAP_TYPE must be -EINVAL"),
+            }
+            // The positive counterpart: adding the type bit maps normally.
+            let private = mmap_args(
+                0,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), private) {
+                Some(v) if v > 0 => Ok(()),
+                _ => Err("MAP_PRIVATE|MAP_ANONYMOUS must still map"),
+            }
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mmap_requires_a_map_type_pos);
+
+/// `do_mmap`: MAP_FIXED_NOREPLACE forces MAP_FIXED, then
+/// `if (find_vma_intersection(mm, addr, addr + len)) return -EEXIST;`.
+/// Ignoring the flag made a "claim this base without clobbering anyone"
+/// request destroy the very mapping it was probing for.
+fn smoke_abi_mem_mmap_fixed_noreplace_eexist_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0500_0000;
+            const FREE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0600_0000;
+            let occupy = mmap_args(
+                BASE,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            if call(Syscall::Mmap.raw(), occupy) != Some(BASE as i64) {
+                return Err("setup: could not occupy the base");
+            }
+            let noreplace = mmap_args(
+                BASE,
+                0x1000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED_NOREPLACE | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), noreplace) {
+                Some(v) if v == EEXIST => {}
+                Some(v) if v == BASE as i64 => {
+                    return Err("MAP_FIXED_NOREPLACE replaced an existing mapping")
+                }
+                _ => return Err("MAP_FIXED_NOREPLACE over a live mapping must be -EEXIST"),
+            }
+            if !as_ref
+                .lookup(VirtAddr::new(BASE))
+                .is_some_and(|region| region.perms.contains(RegionPerms::WRITE))
+            {
+                return Err("the refused MAP_FIXED_NOREPLACE still disturbed the old mapping");
+            }
+            // Positive: at a free base the flag still implies MAP_FIXED, so
+            // the requested address is the one returned.
+            let free = mmap_args(
+                FREE,
+                0x1000,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED_NOREPLACE | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), free) {
+                Some(v) if v == FREE as i64 => Ok(()),
+                _ => Err("MAP_FIXED_NOREPLACE at a free base must map exactly there"),
+            }
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mmap_fixed_noreplace_eexist_pos);
+
+/// `__get_unmapped_area`: `if (addr > TASK_SIZE - len) return -ENOMEM;`
+/// comes BEFORE `if (offset_in_page(addr)) return -EINVAL;`. A MAP_FIXED
+/// probe walking candidate bases upward reads ENOMEM as "past the end, stop"
+/// and EINVAL as "my arithmetic is broken, abort".
+fn smoke_abi_mem_mmap_fixed_range_enomem_precedes_align_einval_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|_| {
+            // Both wrong at once: above the user half AND misaligned.
+            let beyond = mmap_args(
+                AddressSpace::USER_HALF_END | 1,
+                0x1000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), beyond) {
+                Some(v) if v == ENOMEM => {}
+                Some(v) if v == EINVAL => {
+                    return Err("MAP_FIXED out of range is ENOMEM; the range test wins")
+                }
+                _ => return Err("MAP_FIXED beyond the user half must be -ENOMEM"),
+            }
+            // In range but misaligned is still EINVAL.
+            let misaligned = mmap_args(
+                AddressSpace::MMAP_CURSOR_BASE + 0x0700_0001,
+                0x1000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                (-1i64) as u64,
+                0,
+            );
+            match call(Syscall::Mmap.raw(), misaligned) {
+                Some(v) if v == EINVAL => Ok(()),
+                _ => Err("an in-range misaligned MAP_FIXED must be -EINVAL"),
+            }
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mmap_fixed_range_enomem_precedes_align_einval_pos
+);
+
+/// `ksys_mmap_pgoff`: for a file that is not hugetlbfs,
+/// `else if (unlikely(flags & MAP_HUGETLB)) { retval = -EINVAL; goto out_fput; }`.
+/// ENODEV would say "this file cannot be mapped at all" and make a caller
+/// abandon the file instead of retrying without MAP_HUGETLB.
+fn smoke_abi_mem_mmap_hugetlb_on_a_plain_file_einval_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|_| {
+            let name = b"abi-hugetlb\0";
+            let fd = match call(
+                Syscall::MemfdCreate.raw(),
+                a3(name.as_ptr() as u64, 0, 0, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("setup: memfd_create failed"),
+            };
+            let huge = mmap_args(0, 0x1000, PROT_READ, MAP_PRIVATE | MAP_HUGETLB, fd, 0);
+            match call(Syscall::Mmap.raw(), huge) {
+                Some(v) if v == EINVAL => {}
+                Some(v) if v == ENODEV => {
+                    return Err("MAP_HUGETLB on a non-hugetlbfs file is EINVAL, not ENODEV")
+                }
+                _ => return Err("MAP_HUGETLB on a plain file must be -EINVAL"),
+            }
+            // Positive: the same fd maps fine without MAP_HUGETLB.
+            let plain = mmap_args(0, 0x1000, PROT_READ, MAP_PRIVATE, fd, 0);
+            match call(Syscall::Mmap.raw(), plain) {
+                Some(v) if v > 0 => Ok(()),
+                _ => Err("a plain MAP_PRIVATE file mapping must still succeed"),
+            }
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mmap_hugetlb_on_a_plain_file_einval_pos
+);
+
+/// `ksys_mmap_pgoff`: `file = fget(fd); if (!file) return -EBADF;` — and
+/// `fget` masks out FMODE_PATH, so an O_PATH descriptor is EBADF for mmap.
+fn smoke_abi_mem_mmap_o_path_fd_ebadf_pos() -> TestResult {
+    with_memfs("/abimm", "abimm", &[("f", b"hello")], || {
+        with_mem_test_as(|_| {
+            let path = b"/abimm/f\0";
+            let fd = match call_open(path.as_ptr() as u64, crate::fd::O_PATH as u64) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("setup: O_PATH open failed"),
+            };
+            let args = mmap_args(0, 0x1000, PROT_READ, MAP_PRIVATE, fd, 0);
+            match call(Syscall::Mmap.raw(), args) {
+                Some(v) if v == EBADF => {}
+                Some(v) if v > 0 => return Err("mmap must not map an O_PATH descriptor"),
+                _ => return Err("mmap of an O_PATH fd must be -EBADF"),
+            }
+            // Positive: a real O_RDONLY handle on the same file maps.
+            let readable = match call_open(path.as_ptr() as u64, crate::fd::O_RDONLY as u64) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("setup: O_RDONLY open failed"),
+            };
+            let args = mmap_args(0, 0x1000, PROT_READ, MAP_PRIVATE, readable, 0);
+            match call(Syscall::Mmap.raw(), args) {
+                Some(v) if v > 0 => Ok(()),
+                _ => Err("mmap of an ordinary readable fd must succeed"),
+            }
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mmap_o_path_fd_ebadf_pos);
+
+// ── Munmap (11) — do_vmi_munmap ──────────────────────────────────────
+
+/// `do_vmi_munmap`: `vma = vma_find(vmi, end); if (!vma) return 0;` — a
+/// well-formed unmap of a range that holds no VMA is a success. `free()`
+/// double-unmapping a trimmed arena depends on it.
+fn smoke_abi_mem_munmap_unmapped_range_is_success_pos() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|_| {
+            const FREE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0800_0000;
+            match call(Syscall::Munmap.raw(), a1(FREE, 0x1000)) {
+                Some(0) => {}
+                Some(v) if v == ENOMEM => {
+                    return Err("munmap of an unmapped range is 0, not ENOMEM")
+                }
+                _ => return Err("munmap of a well-formed unmapped range must return 0"),
+            }
+            // The malformed arms stay EINVAL, which is what tells a caller its
+            // own bookkeeping — not the kernel's memory — is the problem.
+            match call(Syscall::Munmap.raw(), a1(FREE + 1, 0x1000)) {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("munmap with a misaligned start must be -EINVAL"),
+            }
+            match call(Syscall::Munmap.raw(), a1(FREE, 0)) {
+                Some(v) if v == EINVAL => Ok(()),
+                _ => Err("munmap with a zero length must be -EINVAL"),
+            }
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_munmap_unmapped_range_is_success_pos
+);
+
+// ── MovePages (279) / MigratePages (256) — ESRCH vs EPERM ────────────
+
+/// `find_mm_struct`: `task = find_get_task_by_vpid(pid); if (!task) return
+/// ERR_PTR(-ESRCH);` — only a task that exists but fails `ptrace_may_access`
+/// is EPERM. `numactl`/`migratepages` race process exit constantly and need
+/// ESRCH to mean "skip this pid" rather than "you lack CAP_SYS_NICE".
+fn smoke_abi_mem_move_pages_unknown_pid_esrch_pos() -> TestResult {
+    with_setup(|| {
+        const DEAD_PID: u64 = 0x7FFF_F000;
+        let args = SyscallArgs {
+            arg0: DEAD_PID,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        match call(Syscall::MovePages.raw(), args) {
+            Some(v) if v == ESRCH => Ok(()),
+            Some(v) if v == EPERM => Err("move_pages on a dead pid is ESRCH, not EPERM"),
+            _ => Err("move_pages with an unknown pid must be -ESRCH"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_move_pages_unknown_pid_esrch_pos
+);
+
+/// `kernel_migrate_pages` runs both `get_nodes()` calls BEFORE
+/// `find_task_by_vpid`, so a malformed node mask beats a stale pid; and an
+/// unresolvable pid is ESRCH.
+fn smoke_abi_mem_migrate_pages_nodemask_precedes_pid_pos() -> TestResult {
+    with_setup(|| {
+        const DEAD_PID: u64 = 0x7FFF_F001;
+        // maxnode == 0 with null masks: get_nodes fails first, whoever the
+        // pid names.
+        match call(Syscall::MigratePages.raw(), a3(DEAD_PID, 0, 0, 0)) {
+            Some(v) if v == EINVAL => {}
+            Some(v) if v == ESRCH || v == EPERM => {
+                return Err("migrate_pages validates the node masks before the pid")
+            }
+            _ => return Err("migrate_pages with maxnode == 0 must be -EINVAL"),
+        }
+        // Well-formed masks, unresolvable pid → ESRCH.
+        let mask = 1u64;
+        let args = a3(
+            DEAD_PID,
+            1,
+            &mask as *const u64 as u64,
+            &mask as *const u64 as u64,
+        );
+        match call(Syscall::MigratePages.raw(), args) {
+            Some(v) if v == ESRCH => Ok(()),
+            Some(v) if v == EPERM => Err("migrate_pages on a dead pid is ESRCH, not EPERM"),
+            _ => Err("migrate_pages with an unknown pid must be -ESRCH"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_migrate_pages_nodemask_precedes_pid_pos
+);
+
+// ── Mbind (237) — get_nodes runs before do_mbind's flag check ────────
+
+/// `kernel_mbind` calls `get_nodes(&nodes, nmask, maxnode)` before entering
+/// `do_mbind`, where `flags & ~MPOL_MF_VALID` is rejected. So an unreadable
+/// node mask reports EFAULT even when `flags` is also junk — EINVAL there
+/// makes a caller conclude the *policy* is unsupported and disable NUMA
+/// binding rather than fix the pointer it passed.
+fn smoke_abi_mem_mbind_nodemask_efault_precedes_flag_einval_pos() -> TestResult {
+    with_setup(|| {
+        let args = SyscallArgs {
+            arg0: 0x1000,
+            arg1: 0x1000,
+            arg2: 2, // MPOL_BIND
+            arg3: NON_CANONICAL,
+            arg4: 0,
+            arg5: 1 << 3, // not in MPOL_MF_VALID
+        };
+        match call(Syscall::Mbind.raw(), args) {
+            Some(v) if v == EFAULT => Ok(()),
+            Some(v) if v == EINVAL => Err("mbind reads the node mask before judging flags"),
+            _ => Err("mbind with an unreadable node mask must be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mbind_nodemask_efault_precedes_flag_einval_pos
+);

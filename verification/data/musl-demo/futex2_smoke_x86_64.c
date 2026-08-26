@@ -34,6 +34,11 @@
 // on); the kernel-side handlers don't enforce it, but real callers pass it.
 #define FUTEX2_SIZE_U32 0x02
 
+/* `kernel/futex/futex.h::futex_validate_input` rejects any bit above the
+   futex width: for FUTEX2_SIZE_U32 that is 32 bits, so "every bit" is
+   0xffffffff and ~0UL is -EINVAL. */
+#define FUTEX2_MASK_ANY 0xffffffffUL
+
 struct futex_waitv {
     uint64_t val;
     uint64_t uaddr;
@@ -47,18 +52,18 @@ int main(void) {
     uint32_t f = 0xAAAA;
 
     // ── futex_wait fast path: value already differs ⇒ EAGAIN, no park ──
-    long r = syscall(SYS_futex_wait, &f, 0xBBBBUL, ~0UL,
+    long r = syscall(SYS_futex_wait, &f, 0xBBBBUL, FUTEX2_MASK_ANY,
                      (long)FUTEX2_SIZE_U32, (void *)0, 0L);
     if (r != -1 || errno != EAGAIN) { w("futex2-fail: wait-eagain\n"); return 1; }
 
     // ── futex_wait real path: value matches ⇒ task parks (bounded yield)
     //    and resumes with 0. Proves the cooperative wait actually runs. ──
-    r = syscall(SYS_futex_wait, &f, 0xAAAAUL, ~0UL,
+    r = syscall(SYS_futex_wait, &f, 0xAAAAUL, FUTEX2_MASK_ANY,
                 (long)FUTEX2_SIZE_U32, (void *)0, 0L);
     if (r != 0) { w("futex2-fail: wait-park\n"); return 1; }
 
     // ── futex_wake: release waiters on the word (bumps the wake counter) ──
-    r = syscall(SYS_futex_wake, &f, ~0UL, 1L, (long)FUTEX2_SIZE_U32);
+    r = syscall(SYS_futex_wake, &f, FUTEX2_MASK_ANY, 1L, (long)FUTEX2_SIZE_U32);
     if (r != 1) { w("futex2-fail: wake\n"); return 1; }
 
     // ── futex_waitv: a word whose value already moved is reported by index ──
@@ -69,10 +74,23 @@ int main(void) {
     r = syscall(SYS_futex_waitv, &wv, 1UL, 0UL, (void *)0, 0L);
     if (r != 0) { w("futex2-fail: waitv\n"); return 1; }
 
-    // ── futex_requeue: [src,dst] pair; wakes the source, reports nr_wake ──
+    // ── futex_requeue: [src,dst] pair. The source entry's `val` is a
+    //    COMPARE operand — SYSCALL_DEFINE4(futex_requeue) does
+    //    `cmpval = futexes[0].w.val` and hands it to futex_requeue(), which
+    //    reports -EAGAIN when *uaddr1 has moved since the caller read it.
+    //    A mismatching value must therefore FAIL, not requeue. ──
     uint32_t g = 0x1234;
-    struct futex_waitv pair[2] = {
+    struct futex_waitv stale[2] = {
         { .val = 0, .uaddr = (uint64_t)(uintptr_t)&f, .flags = FUTEX2_SIZE_U32 },
+        { .val = 0, .uaddr = (uint64_t)(uintptr_t)&g, .flags = FUTEX2_SIZE_U32 },
+    };
+    r = syscall(SYS_futex_requeue, stale, 0L, 1L /*nr_wake*/, 0L /*nr_requeue*/);
+    if (r != -1 || errno != EAGAIN) { w("futex2-fail: requeue-eagain\n"); return 1; }
+
+    //    With the CURRENT value of *uaddr1 the compare passes and the
+    //    requeue proceeds, reporting the number woken.
+    struct futex_waitv pair[2] = {
+        { .val = 0xAAAA, .uaddr = (uint64_t)(uintptr_t)&f, .flags = FUTEX2_SIZE_U32 },
         { .val = 0, .uaddr = (uint64_t)(uintptr_t)&g, .flags = FUTEX2_SIZE_U32 },
     };
     r = syscall(SYS_futex_requeue, pair, 0L, 1L /*nr_wake*/, 0L /*nr_requeue*/);

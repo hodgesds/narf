@@ -490,17 +490,54 @@ fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
 kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_neg);
 
 // ════════════════════════════════════════════════════════════════════
-// futex(2) — sys_futex(uaddr, op, val, timeout)
+// futex(2) — sys_futex(uaddr, op, val, timeout, uaddr2, val3)
 //
-// FUTEX_WAKE (op=1) bumps the per-uaddr counter and wakes up to `val`
-// parked waiters, returning the count woken (0 here). An unknown op
-// returns the -1 sentinel.
+// kernel/futex/syscalls.c::do_futex. The errno is the whole interface
+// here: EAGAIN says "the word moved, re-read it", ETIMEDOUT says "the
+// deadline won", EINVAL says "this request is malformed", ENOSYS says
+// "fall back to the older op". The bare -1 sentinel arrived at libc as
+// EPERM, which no mutex/condvar fast path has a rule for.
+//
+// Order matters as much as the value: Linux decodes the timespec in the
+// syscall wrapper (EFAULT/EINVAL), then rejects FUTEX_CLOCK_REALTIME on
+// a non-absolute op (ENOSYS), then an empty bitset (EINVAL), and only
+// then keys the address (EINVAL misaligned / EFAULT unreadable) and
+// compares the word (EAGAIN).
 // ════════════════════════════════════════════════════════════════════
 
-const FUTEX_WAKE: u64 = 1;
 const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_CMP_REQUEUE: u64 = 4;
 const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE: u64 = 0x80;
+const FUTEX_CLOCK_REALTIME: u64 = 0x100;
+const FUTEX_BITSET_MATCH_ANY: u64 = 0xffff_ffff;
+// futex2 `flags`: FUTEX2_SIZE_U32 is the only access width Linux
+// implements (`futex_flags_valid`), FUTEX2_PRIVATE aliases
+// FUTEX_PRIVATE_FLAG, and 0x10 is outside FUTEX2_VALID_MASK (0x8f).
+const FUTEX2_SIZE_U32: u64 = 0x02;
+const FUTEX2_SIZE_U64: u64 = 0x03;
+const FUTEX2_BAD_BIT: u64 = 0x10;
+// Not in the shared errno table.
+const ETIMEDOUT: i64 = -110;
+// A canonical-hole pointer: 8-byte aligned (so it clears the futex
+// alignment gate) but unmapped, which is what makes it an EFAULT probe.
+const FUTEX_BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
+fn futex6(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> Option<i64> {
+    call(
+        Syscall::Futex.raw(),
+        SyscallArgs {
+            arg0: uaddr,
+            arg1: op,
+            arg2: val,
+            arg3: timeout,
+            arg4: uaddr2,
+            arg5: val3,
+        },
+    )
+}
 
 fn smoke_abi_async_futex_pos() -> TestResult {
     with_setup(|| {
@@ -540,19 +577,47 @@ fn smoke_abi_async_futex_timespec_timeout() -> TestResult {
             0,
             expired.as_ptr() as u64,
         );
-        if call(Syscall::Futex.raw(), args) != Some(-110) {
+        if call(Syscall::Futex.raw(), args) != Some(ETIMEDOUT) {
             return Err("FUTEX_WAIT did not parse an expired relative timespec");
         }
 
         let invalid = [0i64, 1_000_000_000i64];
-        let args = a3(
+        if futex6(
             &word as *const u32 as u64,
             FUTEX_WAIT_BITSET | FUTEX_PRIVATE,
             0,
             invalid.as_ptr() as u64,
-        );
-        if call(Syscall::Futex.raw(), args) != Some(-22) {
+            0,
+            FUTEX_BITSET_MATCH_ANY,
+        ) != Some(EINVAL)
+        {
             return Err("FUTEX_WAIT_BITSET accepted an invalid timespec");
+        }
+        // The timespec is decoded in SYSCALL_DEFINE6(futex), BEFORE
+        // do_futex sees the op: an invalid timespec beats the -ENOSYS
+        // that FUTEX_CLOCK_REALTIME|FUTEX_WAIT would otherwise get.
+        if futex6(
+            &word as *const u32 as u64,
+            FUTEX_WAIT | FUTEX_CLOCK_REALTIME,
+            0,
+            invalid.as_ptr() as u64,
+            0,
+            0,
+        ) != Some(EINVAL)
+        {
+            return Err("a bad timespec must outrank the CLOCK_REALTIME -ENOSYS");
+        }
+        // A faulting timespec pointer is -EFAULT, not -EINVAL.
+        if futex6(
+            &word as *const u32 as u64,
+            FUTEX_WAIT | FUTEX_PRIVATE,
+            0,
+            FUTEX_BAD_PTR,
+            0,
+            0,
+        ) != Some(EFAULT)
+        {
+            return Err("FUTEX_WAIT with a faulting timespec must return -EFAULT");
         }
         Ok(())
     })
@@ -562,29 +627,201 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_timespec_timeout);
 fn smoke_abi_async_futex_neg() -> TestResult {
     with_setup(|| {
         let word: u32 = 0;
-        // An unrecognized futex op (99) falls to the catch-all error.
-        // LINUX-GAP: Linux returns -ENOSYS/-EINVAL; NARF returns -1.
+        // `do_futex` falls off the end of its switch with -ENOSYS. That is
+        // the word a libc probe looks for before falling back to an older
+        // op; as EPERM it read as "you are not allowed to lock".
         let args = a3(&word as *const u32 as u64, 99, 0, 0);
         match call(Syscall::Futex.raw(), args) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("futex(unknown op) must fail"),
+            Some(v) if v == ENOSYS => Ok(()),
+            _ => Err("futex(unknown op) must return -ENOSYS"),
         }
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_neg);
 
+fn smoke_abi_async_futex_clockrt_enosys() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        // do_futex: `if (flags & FLAGS_CLOCKRT) { if (cmd != FUTEX_WAIT_BITSET
+        // && cmd != FUTEX_WAIT_REQUEUE_PI && cmd != FUTEX_LOCK_PI2)
+        // return -ENOSYS; }` — the bit is only defined for the ops that take
+        // an ABSOLUTE deadline.
+        if futex6(p, FUTEX_WAKE | FUTEX_CLOCK_REALTIME, 1, 0, 0, 0) != Some(ENOSYS) {
+            return Err("FUTEX_WAKE|FUTEX_CLOCK_REALTIME must return -ENOSYS");
+        }
+        if futex6(p, FUTEX_WAIT | FUTEX_CLOCK_REALTIME, 0, 0, 0, 0) != Some(ENOSYS) {
+            return Err("FUTEX_WAIT|FUTEX_CLOCK_REALTIME must return -ENOSYS");
+        }
+        // FUTEX_WAIT_BITSET is on the allowed list, so the bit must NOT
+        // turn a legitimate call into ENOSYS: it falls through to the
+        // stale-value EAGAIN instead.
+        let stale: u32 = 7;
+        if futex6(
+            &stale as *const u32 as u64,
+            FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME,
+            1,
+            0,
+            0,
+            FUTEX_BITSET_MATCH_ANY,
+        ) != Some(EAGAIN)
+        {
+            return Err("FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME must still be honoured");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_clockrt_enosys);
+
+fn smoke_abi_async_futex_bitset_zero_einval() -> TestResult {
+    with_setup(|| {
+        // `futex_wake()` and `__futex_wait()` both open with
+        // `if (!bitset) return -EINVAL;` — BEFORE get_futex_key, so the
+        // empty bitset outranks even a stale word value.
+        let stale: u32 = 7;
+        let p = &stale as *const u32 as u64;
+        if futex6(p, FUTEX_WAIT_BITSET, 1, 0, 0, 0) != Some(EINVAL) {
+            return Err("FUTEX_WAIT_BITSET with an empty bitset must return -EINVAL");
+        }
+        if futex6(p, FUTEX_WAKE_BITSET, 1, 0, 0, 0) != Some(EINVAL) {
+            return Err("FUTEX_WAKE_BITSET with an empty bitset must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_futex_bitset_zero_einval
+);
+
+fn smoke_abi_async_futex_bitset_match_any_pos() -> TestResult {
+    with_setup(|| {
+        // The positive side of the bitset gate: FUTEX_BITSET_MATCH_ANY (what
+        // glibc and musl actually pass) must sail through to the normal
+        // wake/compare paths.
+        let stale: u32 = 7;
+        let p = &stale as *const u32 as u64;
+        if futex6(p, FUTEX_WAKE_BITSET, 1, 0, 0, FUTEX_BITSET_MATCH_ANY) != Some(0) {
+            return Err("FUTEX_WAKE_BITSET with MATCH_ANY should wake 0 and succeed");
+        }
+        if futex6(p, FUTEX_WAIT_BITSET, 1, 0, 0, FUTEX_BITSET_MATCH_ANY) != Some(EAGAIN) {
+            return Err("FUTEX_WAIT_BITSET with MATCH_ANY should reach the stale-value EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_futex_bitset_match_any_pos
+);
+
+fn smoke_abi_async_futex_misaligned_einval() -> TestResult {
+    with_setup(|| {
+        // get_futex_key(): "The futex address must be naturally aligned" —
+        // `if (unlikely((address % size) != 0)) return -EINVAL;`, checked
+        // BEFORE access_ok's -EFAULT. A caller whose lock struct is laid
+        // out wrong must be able to tell that apart from a vanished page.
+        let word: u32 = 0;
+        let skewed = (&word as *const u32 as u64) + 1;
+        if futex6(skewed, FUTEX_WAKE, 1, 0, 0, 0) != Some(EINVAL) {
+            return Err("FUTEX_WAKE on a misaligned word must return -EINVAL");
+        }
+        if futex6(skewed, FUTEX_WAIT, 0, 0, 0, 0) != Some(EINVAL) {
+            return Err("FUTEX_WAIT on a misaligned word must return -EINVAL");
+        }
+        let dst: u32 = 0;
+        if futex6(
+            skewed,
+            FUTEX_CMP_REQUEUE,
+            0,
+            0,
+            &dst as *const u32 as u64,
+            0,
+        ) != Some(EINVAL)
+        {
+            return Err("FUTEX_CMP_REQUEUE on a misaligned source must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_misaligned_einval);
+
+fn smoke_abi_async_futex_wait_fault_efault() -> TestResult {
+    with_setup(|| {
+        // futex_wait_setup() re-reads the word with get_user() and returns
+        // its -EFAULT. A caller whose lock page was reclaimed can fault it
+        // back in and retry; EPERM told it to give up instead.
+        if futex6(FUTEX_BAD_PTR, FUTEX_WAIT, 0, 0, 0, 0) != Some(EFAULT) {
+            return Err("FUTEX_WAIT on an unreadable word must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_fault_efault);
+
+fn smoke_abi_async_futex_requeue_negative_einval() -> TestResult {
+    with_setup(|| {
+        // futex_requeue(): `if (nr_wake < 0 || nr_requeue < 0) return -EINVAL;`
+        // — both counts are `int`, and it is the first thing checked.
+        let src: u32 = 0;
+        let dst: u32 = 0;
+        let sp = &src as *const u32 as u64;
+        let dp = &dst as *const u32 as u64;
+        let neg = (-1i32) as u32 as u64;
+        if futex6(sp, FUTEX_CMP_REQUEUE, neg, 0, dp, 0) != Some(EINVAL) {
+            return Err("FUTEX_CMP_REQUEUE with nr_wake<0 must return -EINVAL");
+        }
+        if futex6(sp, FUTEX_CMP_REQUEUE, 0, neg, dp, 0) != Some(EINVAL) {
+            return Err("FUTEX_CMP_REQUEUE with nr_requeue<0 must return -EINVAL");
+        }
+        // Positive control: legal counts still reach the *uaddr == val3
+        // compare and succeed.
+        if futex6(sp, FUTEX_CMP_REQUEUE, 1, 1, dp, 0) != Some(0) {
+            return Err("FUTEX_CMP_REQUEUE with legal counts should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_futex_requeue_negative_einval
+);
+
+fn smoke_abi_async_futex_op_upper_bits_pos() -> TestResult {
+    with_setup(|| {
+        // Linux declares the op as `int`, so only the low 32 bits reach
+        // do_futex. A caller that left junk in the upper half of the
+        // register (a sign-extended int in a hand-written stub) must still
+        // get FUTEX_WAKE, not the unknown-op -ENOSYS.
+        let word: u32 = 0;
+        let op = 0xFFFF_FFFF_0000_0000u64 | FUTEX_WAKE;
+        match futex6(&word as *const u32 as u64, op, 1, 0, 0, 0) {
+            Some(0) => Ok(()),
+            _ => Err("futex op must be decoded from its low 32 bits only"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_op_upper_bits_pos);
+
 // ════════════════════════════════════════════════════════════════════
 // futex_wake(2) [futex2] — sys_futex_wake(uaddr, mask, nr, flags)
 //
-// Bumps the counter, fires up to `nr` waiters, returns `nr`. uaddr==0 is
-// a no-op returning 0 (no error path — the "negative" is this no-op).
+// kernel/futex/syscalls.c::SYSCALL_DEFINE4(futex_wake): flags outside
+// FUTEX2_VALID_MASK → EINVAL, an access width other than FUTEX2_SIZE_U32
+// → EINVAL, an empty mask → EINVAL, a misaligned uaddr → EINVAL, and
+// `nr == 0` → 0 (FLAGS_STRICT makes it a legal no-op).
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_futex_wake_pos() -> TestResult {
     with_setup(|| {
         let word: u32 = 0;
-        // futex_wake(&word, mask=~0, nr=1) → reports nr (1) released.
-        let args = a3(&word as *const u32 as u64, u64::MAX, 1, 0);
+        // futex_wake(&word, mask=MATCH_ANY, nr=1, FUTEX2_SIZE_U32) → 1.
+        let args = a3(
+            &word as *const u32 as u64,
+            FUTEX_BITSET_MATCH_ANY,
+            1,
+            FUTEX2_SIZE_U32,
+        );
         match call(Syscall::FutexWake.raw(), args) {
             Some(1) => Ok(()),
             _ => Err("futex_wake(nr=1) should return 1"),
@@ -595,8 +832,8 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_pos);
 
 fn smoke_abi_async_futex_wake_null() -> TestResult {
     with_setup(|| {
-        // futex_wake(NULL, ..): null uaddr is a no-op → 0 (no error path).
-        let args = a3(0, u64::MAX, 5, 0);
+        // futex_wake(NULL, ..): a valid-but-empty key wakes nobody → 0.
+        let args = a3(0, FUTEX_BITSET_MATCH_ANY, 5, FUTEX2_SIZE_U32);
         match call(Syscall::FutexWake.raw(), args) {
             Some(0) => Ok(()),
             _ => Err("futex_wake(NULL) should return 0"),
@@ -605,23 +842,109 @@ fn smoke_abi_async_futex_wake_null() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_null);
 
+fn smoke_abi_async_futex_wake_zero_nr_pos() -> TestResult {
+    with_setup(|| {
+        // `if ((flags & FLAGS_STRICT) && !nr_wake) return 0;` — futex2 sets
+        // FLAGS_STRICT, so a zero count is a success, not an error.
+        let word: u32 = 0;
+        let args = a3(
+            &word as *const u32 as u64,
+            FUTEX_BITSET_MATCH_ANY,
+            0,
+            FUTEX2_SIZE_U32,
+        );
+        match call(Syscall::FutexWake.raw(), args) {
+            Some(0) => Ok(()),
+            _ => Err("futex_wake(nr=0) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_zero_nr_pos);
+
+fn smoke_abi_async_futex_wake_neg() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        // A flag bit outside FUTEX2_VALID_MASK (0x8f).
+        if call(
+            Syscall::FutexWake.raw(),
+            a3(p, FUTEX_BITSET_MATCH_ANY, 1, FUTEX2_BAD_BIT),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_wake with an unknown flag bit must return -EINVAL");
+        }
+        // futex_flags_valid(): "Only 32bit futexes are implemented". A
+        // silently-accepted 64-bit width would compare half a word.
+        if call(
+            Syscall::FutexWake.raw(),
+            a3(p, FUTEX_BITSET_MATCH_ANY, 1, FUTEX2_SIZE_U64),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_wake with FUTEX2_SIZE_U64 must return -EINVAL");
+        }
+        // futex_wake(): `if (!bitset) return -EINVAL;`
+        if call(Syscall::FutexWake.raw(), a3(p, 0, 1, FUTEX2_SIZE_U32)) != Some(EINVAL) {
+            return Err("futex_wake with an empty mask must return -EINVAL");
+        }
+        // get_futex_key(): misaligned is EINVAL, not EFAULT.
+        if call(
+            Syscall::FutexWake.raw(),
+            a3(p + 1, FUTEX_BITSET_MATCH_ANY, 1, FUTEX2_SIZE_U32),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_wake on a misaligned word must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_neg);
+
 // ════════════════════════════════════════════════════════════════════
-// futex_wait(2) [futex2] — sys_futex_wait(uaddr, val, mask, flags, ...)
+// futex_wait(2) [futex2] — sys_futex_wait(uaddr, val, mask, flags,
+// timeout, clockid)
 //
-// Value-checked: *uaddr != val → -EAGAIN immediately. uaddr==0 is a
-// permitted immediate spurious wake → 0. With a live mismatch we get the
-// EAGAIN error; the harness has no task to park, so the match-and-park
-// branch falls through to a synchronous 0.
+// kernel/futex/syscalls.c::SYSCALL_DEFINE6(futex_wait), in order: flags
+// → futex_validate_input(val) → futex2_setup_timeout (bad clockid
+// EINVAL, then the timespec) → empty mask EINVAL → alignment EINVAL →
+// fault EFAULT → stale value EAGAIN.
 // ════════════════════════════════════════════════════════════════════
+
+fn futex2_wait(uaddr: u64, val: u64, mask: u64, flags: u64, to: u64, clk: u64) -> Option<i64> {
+    call(
+        Syscall::FutexWait.raw(),
+        SyscallArgs {
+            arg0: uaddr,
+            arg1: val,
+            arg2: mask,
+            arg3: flags,
+            arg4: to,
+            arg5: clk,
+        },
+    )
+}
 
 fn smoke_abi_async_futex_wait_pos() -> TestResult {
     with_setup(|| {
         // futex_wait(NULL, 0): null uaddr → immediate spurious wake (0).
-        let args = a1(0, 0);
-        match call(Syscall::FutexWait.raw(), args) {
-            Some(0) => Ok(()),
-            _ => Err("futex_wait(NULL) should return 0"),
+        if futex2_wait(0, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(0) {
+            return Err("futex_wait(NULL) should return 0");
         }
+        // A matching value parks; the harness has no task to park, so the
+        // match branch falls through to a synchronous 0. This is the
+        // positive control for every EINVAL gate above it.
+        let word: u32 = 0xAAAA;
+        if futex2_wait(
+            &word as *const u32 as u64,
+            0xAAAA,
+            FUTEX_BITSET_MATCH_ANY,
+            FUTEX2_SIZE_U32,
+            0,
+            0,
+        ) != Some(0)
+        {
+            return Err("futex_wait on a matching value should park (0)");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_pos);
@@ -629,35 +952,118 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_pos);
 fn smoke_abi_async_futex_wait_neg() -> TestResult {
     with_setup(|| {
         let word: u32 = 7;
-        // futex_wait(&word, val=1) where *word(7) != 1 → -EAGAIN.
-        let args = a1(&word as *const u32 as u64, 1);
-        match call(Syscall::FutexWait.raw(), args) {
-            Some(v) if v == EAGAIN => Ok(()),
-            _ => Err("futex_wait on a stale value must return -EAGAIN"),
+        let p = &word as *const u32 as u64;
+        // futex_wait(&word, val=1) where *word(7) != 1 → -EAGAIN. This is
+        // the retry signal a pthread mutex fast path branches on.
+        if futex2_wait(p, 1, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(EAGAIN) {
+            return Err("futex_wait on a stale value must return -EAGAIN");
         }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_neg);
+
+fn smoke_abi_async_futex_wait_flags_neg() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 7;
+        let p = &word as *const u32 as u64;
+        if futex2_wait(p, 1, FUTEX_BITSET_MATCH_ANY, FUTEX2_BAD_BIT, 0, 0) != Some(EINVAL) {
+            return Err("futex_wait with an unknown flag bit must return -EINVAL");
+        }
+        if futex2_wait(p, 1, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U64, 0, 0) != Some(EINVAL) {
+            return Err("futex_wait with FUTEX2_SIZE_U64 must return -EINVAL");
+        }
+        // futex_validate_input(): an expected value wider than the futex
+        // word can never compare equal — parking on it would strand the
+        // caller forever, so Linux refuses it.
+        if futex2_wait(p, 1u64 << 32, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(EINVAL)
+        {
+            return Err("futex_wait with a >32-bit val must return -EINVAL");
+        }
+        // futex2_setup_timeout() checks the clock id BEFORE reading the
+        // timespec, so a bogus clockid is EINVAL even with a good pointer.
+        let ts = [1i64, 0i64];
+        if futex2_wait(
+            p,
+            1,
+            FUTEX_BITSET_MATCH_ANY,
+            FUTEX2_SIZE_U32,
+            ts.as_ptr() as u64,
+            99,
+        ) != Some(EINVAL)
+        {
+            return Err("futex_wait with a bad clockid must return -EINVAL");
+        }
+        // …and a faulting timespec with a good clockid is EFAULT.
+        if futex2_wait(
+            p,
+            1,
+            FUTEX_BITSET_MATCH_ANY,
+            FUTEX2_SIZE_U32,
+            FUTEX_BAD_PTR,
+            0,
+        ) != Some(EFAULT)
+        {
+            return Err("futex_wait with a faulting timespec must return -EFAULT");
+        }
+        // __futex_wait(): `if (!bitset) return -EINVAL;` outranks the
+        // stale-value EAGAIN this call would otherwise get.
+        if futex2_wait(p, 1, 0, FUTEX2_SIZE_U32, 0, 0) != Some(EINVAL) {
+            return Err("futex_wait with an empty mask must return -EINVAL");
+        }
+        // …and the alignment gate outranks it too.
+        if futex2_wait(p + 1, 1, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(EINVAL) {
+            return Err("futex_wait on a misaligned word must return -EINVAL");
+        }
+        // An already-expired absolute deadline is -ETIMEDOUT, not a park.
+        if futex2_wait(
+            p,
+            7,
+            FUTEX_BITSET_MATCH_ANY,
+            FUTEX2_SIZE_U32,
+            [0i64, 0i64].as_ptr() as u64,
+            1,
+        ) != Some(ETIMEDOUT)
+        {
+            return Err("futex_wait with an expired deadline must return -ETIMEDOUT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wait_flags_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // futex_requeue(2) [futex2] — sys_futex_requeue(waiters, flags, nr_wake,
 // nr_requeue)
 //
-// `waiters` points at two `struct futex_waitv` (24B each); entry[0] is the
-// source to wake. Always reports `nr_wake` (no error path — even a null
-// `waiters` returns nr_wake), so both tests assert the count back.
+// `waiters` points at two `struct futex_waitv` (24B each): [0] source,
+// [1] destination. kernel/futex/syscalls.c::SYSCALL_DEFINE4(futex_requeue)
+// rejects a non-zero syscall-level `flags`, a null array, a malformed
+// entry, mismatched entry flags, and a negative count — each -EINVAL —
+// before it wakes anything.
 // ════════════════════════════════════════════════════════════════════
+
+/// Build a two-entry `futex_waitv` array: `{ u64 val; u64 uaddr; u32
+/// flags; u32 __reserved; }`.
+fn waitv_pair(src: u64, dst: u64, src_flags: u64, dst_flags: u64) -> [u8; 48] {
+    let mut w = [0u8; 48];
+    w[8..16].copy_from_slice(&src.to_ne_bytes());
+    w[16..20].copy_from_slice(&(src_flags as u32).to_ne_bytes());
+    w[32..40].copy_from_slice(&dst.to_ne_bytes());
+    w[40..44].copy_from_slice(&(dst_flags as u32).to_ne_bytes());
+    w
+}
 
 fn smoke_abi_async_futex_requeue_pos() -> TestResult {
     with_setup(|| {
-        // Two futex_waitv entries (48 bytes). entry[0]: { val, uaddr, flags, _r }.
         let src: u32 = 0;
         let dst: u32 = 0;
-        let mut waitv = [0u8; 48];
-        // entry[0].uaddr at offset 8.
-        waitv[8..16].copy_from_slice(&(&src as *const u32 as u64).to_ne_bytes());
-        // entry[1].uaddr at offset 24+8 = 32.
-        waitv[32..40].copy_from_slice(&(&dst as *const u32 as u64).to_ne_bytes());
+        let waitv = waitv_pair(
+            &src as *const u32 as u64,
+            &dst as *const u32 as u64,
+            FUTEX2_SIZE_U32,
+            FUTEX2_SIZE_U32,
+        );
         // futex_requeue(waiters, flags=0, nr_wake=1, nr_requeue=0) → 1.
         let args = a3(waitv.as_ptr() as u64, 0, 1, 0);
         match call(Syscall::FutexRequeue.raw(), args) {
@@ -670,53 +1076,250 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_pos);
 
 fn smoke_abi_async_futex_requeue_null() -> TestResult {
     with_setup(|| {
-        // futex_requeue(NULL, 0, 2, 0): null waiters is tolerated and still
-        // reports nr_wake (no error path in the counter model).
+        // `if (!waiters) return -EINVAL;` — a null array is malformed, not
+        // a no-op that still claims nr_wake waiters were released. musl's
+        // pthread_cond_broadcast reads a non-error as "handoff done" and
+        // leaves the next waiter parked forever.
         let args = a3(0, 0, 2, 0);
         match call(Syscall::FutexRequeue.raw(), args) {
-            Some(2) => Ok(()),
-            _ => Err("futex_requeue(NULL) should return nr_wake"),
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("futex_requeue(NULL) must return -EINVAL"),
         }
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_null);
 
+fn smoke_abi_async_futex_requeue_neg() -> TestResult {
+    with_setup(|| {
+        let src: u32 = 0;
+        let dst: u32 = 0;
+        let sp = &src as *const u32 as u64;
+        let dp = &dst as *const u32 as u64;
+        let ok = waitv_pair(sp, dp, FUTEX2_SIZE_U32, FUTEX2_SIZE_U32);
+        // "This syscall supports no flags for now": `if (flags) return -EINVAL;`
+        if call(Syscall::FutexRequeue.raw(), a3(ok.as_ptr() as u64, 1, 1, 0)) != Some(EINVAL) {
+            return Err("futex_requeue with a non-zero flags word must return -EINVAL");
+        }
+        // futex_parse_waitv(): a faulting array is -EFAULT.
+        if call(Syscall::FutexRequeue.raw(), a3(FUTEX_BAD_PTR, 0, 1, 0)) != Some(EFAULT) {
+            return Err("futex_requeue with a faulting array must return -EFAULT");
+        }
+        // futex_parse_waitv(): per-entry flags are validated too.
+        let bad_entry = waitv_pair(sp, dp, FUTEX2_BAD_BIT, FUTEX2_BAD_BIT);
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(bad_entry.as_ptr() as u64, 0, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_requeue with a bad entry flag must return -EINVAL");
+        }
+        // "For now mandate both flags are identical".
+        let mismatch = waitv_pair(sp, dp, FUTEX2_SIZE_U32, FUTEX2_SIZE_U32 | 0x80);
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(mismatch.as_ptr() as u64, 0, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_requeue with mismatched entry flags must return -EINVAL");
+        }
+        // `__reserved` must be zero — it is how futex2 grows.
+        let mut reserved = ok;
+        reserved[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(reserved.as_ptr() as u64, 0, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_requeue with a non-zero __reserved must return -EINVAL");
+        }
+        // futex_requeue(): `if (nr_wake < 0 || nr_requeue < 0) return -EINVAL;`
+        let neg = (-1i32) as u32 as u64;
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(ok.as_ptr() as u64, 0, neg, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_requeue with nr_wake<0 must return -EINVAL");
+        }
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(ok.as_ptr() as u64, 0, 1, neg),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_requeue with nr_requeue<0 must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_neg);
+
 // ════════════════════════════════════════════════════════════════════
 // futex_waitv(2) [futex2] — sys_futex_waitv(waiters, nr, flags, timeout,
 // clockid)
 //
-// nr==0 / waiters==0 / nr>128 → -EINVAL. A word whose live value already
-// differs from its expected `val` returns that entry's index immediately.
+// kernel/futex/syscalls.c::SYSCALL_DEFINE5(futex_waitv): non-zero flags,
+// nr==0, nr>FUTEX_WAITV_MAX, or a null array → EINVAL; then the timeout;
+// then futex_parse_waitv validates EVERY entry (-EFAULT on a faulting
+// array, -EINVAL on a malformed one) BEFORE any word is read.
 // ════════════════════════════════════════════════════════════════════
+
+/// One `struct futex_waitv` entry.
+fn waitv_one(val: u64, uaddr: u64, flags: u64) -> [u8; 24] {
+    let mut w = [0u8; 24];
+    w[0..8].copy_from_slice(&val.to_ne_bytes());
+    w[8..16].copy_from_slice(&uaddr.to_ne_bytes());
+    w[16..20].copy_from_slice(&(flags as u32).to_ne_bytes());
+    w
+}
 
 fn smoke_abi_async_futex_waitv_pos() -> TestResult {
     with_setup(|| {
         // One futex_waitv entry whose expected val(1) != live *uaddr(0):
         // futex_waitv reports index 0 (this word is "already woken").
         let word: u32 = 0;
-        let mut waitv = [0u8; 24];
-        waitv[0..8].copy_from_slice(&(1u64).to_ne_bytes()); // val
-        waitv[8..16].copy_from_slice(&(&word as *const u32 as u64).to_ne_bytes()); // uaddr
-        let args = a2(waitv.as_ptr() as u64, 1, 0);
-        match call(Syscall::FutexWaitv.raw(), args) {
-            Some(0) => Ok(()),
-            _ => Err("futex_waitv with a moved word should return index 0"),
+        let p = &word as *const u32 as u64;
+        let waitv = waitv_one(1, p, FUTEX2_SIZE_U32);
+        if call(Syscall::FutexWaitv.raw(), a2(waitv.as_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("futex_waitv with a moved word should return index 0");
         }
+        // Every word matching parks (0 in the harness) — the positive
+        // control for the validation gates below.
+        let matching = waitv_one(0, p, FUTEX2_SIZE_U32);
+        if call(
+            Syscall::FutexWaitv.raw(),
+            a2(matching.as_ptr() as u64, 1, 0),
+        ) != Some(0)
+        {
+            return Err("futex_waitv on a matching word should park (0)");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_waitv_pos);
 
 fn smoke_abi_async_futex_waitv_neg() -> TestResult {
     with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        let ok = waitv_one(1, p, FUTEX2_SIZE_U32);
         // futex_waitv(NULL, 0, ..): nr==0 (and null waiters) → -EINVAL.
-        let args = a2(0, 0, 0);
-        match call(Syscall::FutexWaitv.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("futex_waitv(nr=0) must return -EINVAL"),
+        if call(Syscall::FutexWaitv.raw(), a2(0, 0, 0)) != Some(EINVAL) {
+            return Err("futex_waitv(nr=0) must return -EINVAL");
         }
+        // `if (nr_futexes > FUTEX_WAITV_MAX)` → -EINVAL.
+        if call(Syscall::FutexWaitv.raw(), a2(ok.as_ptr() as u64, 129, 0)) != Some(EINVAL) {
+            return Err("futex_waitv(nr>128) must return -EINVAL");
+        }
+        // "This syscall supports no flags for now" — a flags word that is
+        // accepted and then ignored is the silent-divergence case.
+        if call(Syscall::FutexWaitv.raw(), a2(ok.as_ptr() as u64, 1, 1)) != Some(EINVAL) {
+            return Err("futex_waitv with a non-zero flags word must return -EINVAL");
+        }
+        // futex_parse_waitv(): a faulting array is -EFAULT, NOT -EINVAL —
+        // the caller has to know whether to fix its pointer or its layout.
+        if call(Syscall::FutexWaitv.raw(), a2(FUTEX_BAD_PTR, 1, 0)) != Some(EFAULT) {
+            return Err("futex_waitv with a faulting array must return -EFAULT");
+        }
+        // Per-entry flags and __reserved.
+        let bad_flags = waitv_one(1, p, FUTEX2_SIZE_U64);
+        if call(
+            Syscall::FutexWaitv.raw(),
+            a2(bad_flags.as_ptr() as u64, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_waitv with FUTEX2_SIZE_U64 must return -EINVAL");
+        }
+        let mut reserved = ok;
+        reserved[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        if call(
+            Syscall::FutexWaitv.raw(),
+            a2(reserved.as_ptr() as u64, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("futex_waitv with a non-zero __reserved must return -EINVAL");
+        }
+        // Every entry is validated before ANY word is compared: entry 0
+        // has already moved, but the malformed entry 1 still wins.
+        let mut two = [0u8; 48];
+        two[..24].copy_from_slice(&ok);
+        two[24..].copy_from_slice(&waitv_one(0, p, FUTEX2_BAD_BIT));
+        if call(Syscall::FutexWaitv.raw(), a2(two.as_ptr() as u64, 2, 0)) != Some(EINVAL) {
+            return Err("futex_waitv must validate every entry before reading any word");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_waitv_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// set_robust_list(2) / get_robust_list(2) — kernel/futex/syscalls.c
+//
+// The round-trip is covered in abi_sched_tests.rs; these cover the two
+// errno arms. set_robust_list's length is the ABI-version handshake:
+// `if (unlikely(len != sizeof(*head))) return -EINVAL;`. get_robust_list
+// writes the LENGTH first and treats that write's failure as fatal:
+// `if (put_user(sizeof(*head), len_ptr)) return -EFAULT;`.
+// ════════════════════════════════════════════════════════════════════
+
+const ROBUST_LIST_HEAD_SIZE: u64 = 24;
+
+fn smoke_abi_async_set_robust_list_len_neg() -> TestResult {
+    with_setup(|| {
+        // A length other than sizeof(struct robust_list_head) means the
+        // caller's layout disagrees with the kernel's. Accepting it makes
+        // the exit-time walk read futex_offset from the wrong offset and
+        // mark the wrong words FUTEX_OWNER_DIED — silent corruption.
+        for len in [0u64, 16, 23, 25, 32] {
+            if call(Syscall::SetRobustList.raw(), a1(0xCAFE_1000, len)) != Some(EINVAL) {
+                return Err("set_robust_list with a mismatched len must return -EINVAL");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_set_robust_list_len_neg);
+
+fn smoke_abi_async_get_robust_list_len_pos() -> TestResult {
+    with_setup(|| {
+        if call(
+            Syscall::SetRobustList.raw(),
+            a1(0xCAFE_1000, ROBUST_LIST_HEAD_SIZE),
+        ) != Some(0)
+        {
+            return Err("set_robust_list(len=24) should return 0");
+        }
+        let mut head = [0u8; 8];
+        let mut len = [0u8; 8];
+        let args = a3(0, head.as_mut_ptr() as u64, len.as_mut_ptr() as u64, 0);
+        if call(Syscall::GetRobustList.raw(), args) != Some(0) {
+            return Err("get_robust_list should return 0");
+        }
+        if u64::from_ne_bytes(head) != 0xCAFE_1000 {
+            return Err("get_robust_list did not read back the registered head");
+        }
+        // Linux always reports sizeof(*head), never a stored length.
+        if u64::from_ne_bytes(len) != ROBUST_LIST_HEAD_SIZE {
+            return Err("get_robust_list must report sizeof(struct robust_list_head)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_get_robust_list_len_pos);
+
+fn smoke_abi_async_get_robust_list_len_neg() -> TestResult {
+    with_setup(|| {
+        // The len write comes FIRST and its failure is fatal. Swallowing it
+        // reported success with `len` never written, and the caller then
+        // walked the robust list with an uninitialised stride.
+        let mut head = [0u8; 8];
+        let args = a3(0, head.as_mut_ptr() as u64, FUTEX_BAD_PTR, 0);
+        match call(Syscall::GetRobustList.raw(), args) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("get_robust_list with a faulting len pointer must return -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_get_robust_list_len_neg);
 
 // ════════════════════════════════════════════════════════════════════
 // inotify_init1(2) — sys_inotify_init1(flags)

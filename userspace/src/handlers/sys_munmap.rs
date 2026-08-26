@@ -4,27 +4,56 @@ use super::*;
 /// Remove the page-aligned range requested by `munmap(2)` while preserving
 /// any prefix and suffix of an overlapping VMA.
 ///
-/// Linux requires an aligned address and a non-zero length, but rounds the
-/// length up to a page.  `AddressSpace::punch_fixed` already provides the
-/// required split + PTE teardown + frame-release transaction used by
-/// `MAP_FIXED`; sharing that primitive keeps the two overlapping-unmap paths
-/// identical.
-fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u64, ()> {
+/// `mm/vma.c::do_vmi_munmap` is the whole argument contract:
+///
+/// ```text
+///     if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
+///             return -EINVAL;
+///     end = start + PAGE_ALIGN(len);
+///     if (end == start)
+///             return -EINVAL;
+///     vma = vma_find(vmi, end);
+///     if (!vma)
+///             return 0;                       /* nothing there: success */
+///     return do_vmi_align_munmap(...);        /* -ENOMEM if a split fails */
+/// ```
+///
+/// Two distinct codes, and they say different things. **EINVAL** is "your
+/// arguments are malformed" — a caller (glibc's `free`, a JIT releasing a code
+/// slab) can only fix that by changing the address or length it computed.
+/// **ENOMEM** is "the unmap itself could not be carried out": splitting a VMA
+/// in the middle needs a new VMA, so a partial unmap can fail on memory
+/// pressure or at `max_map_count` even though the arguments are perfect. A
+/// caller that sees EINVAL there concludes its bookkeeping is corrupt and
+/// aborts; ENOMEM tells it to drop other mappings and retry.
+///
+/// `AddressSpace::punch_fixed` already provides the required split + PTE
+/// teardown + frame-release transaction used by `MAP_FIXED`; sharing that
+/// primitive keeps the two overlapping-unmap paths identical, and it already
+/// reports Ok for a range that contains no VMA at all — Linux's "return 0".
+///
+/// Returns the rounded length on success, or the POSIX-positive errno.
+fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u64, i64> {
+    const EINVAL: i64 = 22;
+    const ENOMEM: i64 = 12;
     if base & 0xFFF != 0 || requested_len == 0 {
-        return Err(());
+        return Err(EINVAL);
     }
     let len = requested_len
         .checked_add(0xFFF)
         .map(|value| value & !0xFFF)
         .filter(|&value| value != 0)
-        .ok_or(())?;
-    let end = base.checked_add(len).ok_or(())?;
+        .ok_or(EINVAL)?;
+    let end = base.checked_add(len).ok_or(EINVAL)?;
     if end > AddressSpace::USER_HALF_END {
-        return Err(());
+        return Err(EINVAL);
     }
+    // Everything past here is the teardown transaction, not the arguments:
+    // an allocation failure while splitting, or a backing shape NARF cannot
+    // split yet, is a resource failure and must not masquerade as EINVAL.
     as_ref
         .punch_fixed(VirtAddr::new(base), len)
-        .map_err(|_| ())?;
+        .map_err(|_| ENOMEM)?;
     Ok(len)
 }
 
@@ -79,7 +108,9 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Err(()) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+        // EINVAL for a malformed range, ENOMEM when the teardown itself
+        // could not be completed.
+        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
     }
 }
 
@@ -187,8 +218,5 @@ mod tests {
         TestResult::Pass
     }
     #[cfg(feature = "linux-compat")]
-    kernel_test_in!(
-        "userspace",
-        smoke_sysv_mapping_transaction_is_shared_per_mm
-    );
+    kernel_test_in!("userspace", smoke_sysv_mapping_transaction_is_shared_per_mm);
 }

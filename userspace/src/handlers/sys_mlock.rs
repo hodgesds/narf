@@ -23,22 +23,70 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
     }
 }
 
-/// `mprotect(base, len, prot)` — change permissions on every
-/// region in the calling task's AS that intersects `[base,
-/// base + len)`. Walks the region table, mutates `Region.perms`,
-/// then re-installs the affected pages' PTEs with the new flag
-/// set via `AddressSpace::change_perms_range`.
+/// The `start`/`len` normalization every mlock-family syscall performs before
+/// it touches a VMA. `mm/mlock.c` does it identically in `do_mlock` (mlock,
+/// mlock2) and in `SYSCALL_DEFINE2(munlock)`:
 ///
-/// `prot` follows the POSIX bit layout we pin in `narf-libc`:
-///   - bit 0 = PROT_READ
-///   - bit 1 = PROT_WRITE
-///   - bit 2 = PROT_EXEC
+/// ```text
+///     len = PAGE_ALIGN(len + (offset_in_page(start)));
+///     start &= PAGE_MASK;
+/// ```
 ///
-/// Returns Ok(0) on success, InvalidOp on bad AS or no
-/// intersecting regions.
+/// then `apply_vma_lock_flags` decides the two degenerate cases:
+///
+/// ```text
+///     end = start + len;
+///     if (end < start)  return -EINVAL;
+///     if (end == start) return 0;
+/// ```
+///
+/// So **mlock does not require a page-aligned address**: it locks the pages
+/// containing `[start, start+len)`. That is not a nicety — it is how every
+/// real caller uses it. gnupg/libsodium/OpenSSL mlock a secret buffer returned
+/// by `malloc`, which is 16-byte aligned at best; a strict-alignment EINVAL
+/// there makes the library conclude the platform forbids locking and fall back
+/// to leaving key material swappable. Passing the raw address through to
+/// `mlock_range_limited` produced exactly that (`AlignmentMismatch` → EINVAL).
+///
+/// Returns `Some(rounded_len)` to proceed with, or `None`/`Err(errno)` for the
+/// two arms Linux answers without consulting the address space.
+pub(super) fn mlock_align_range(start: u64, len: u64) -> Result<Option<(u64, u64)>, i64> {
+    let offset = start & 0xFFF;
+    // Linux computes this in wrapping unsigned arithmetic and lets the
+    // `end < start` test below catch the overflow, so mirror that exactly
+    // rather than inventing an earlier errno.
+    let len = len.wrapping_add(offset).wrapping_add(0xFFF) & !0xFFF;
+    let start = start & !0xFFF;
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Err(22); // EINVAL
+    }
+    if end == start {
+        return Ok(None); // success, nothing to lock
+    }
+    Ok(Some((start, len)))
+}
+
 /// `mlock(addr, len)` — force-back lazy pages + set LOCKED flag.
-/// arg0 = base, arg1 = len. Ok(0) on success, InvalidOp on
-/// failure (range contains a hole, OOM, AS lookup failed).
+///
+/// `mm/mlock.c::do_mlock`:
+///
+/// ```text
+///     if (!can_do_mlock())          return -EPERM;
+///     len = PAGE_ALIGN(len + (offset_in_page(start)));
+///     start &= PAGE_MASK;
+///     ... if over RLIMIT_MEMLOCK and !CAP_IPC_LOCK: error stays -ENOMEM
+///     error = apply_vma_lock_flags(start, len, flags);   /* -ENOMEM on a gap */
+///     error = __mm_populate(start, len, 0);
+///     if (error) return __mlock_posix_error_return(error); /* -ENOMEM => -EAGAIN */
+/// ```
+///
+/// The three failures are genuinely different instructions to the caller:
+/// **EPERM** = this process may never lock memory (raise RLIMIT_MEMLOCK or
+/// grant CAP_IPC_LOCK); **ENOMEM** = the range has a hole or the limit is too
+/// small (lock less); **EAGAIN** = transient population failure (retry). A
+/// secret-memory allocator that sees EPERM stops trying for the lifetime of
+/// the process, which is the wrong response to a transient EAGAIN.
 pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let authority = current_mlock_authority();
@@ -46,6 +94,17 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         return;
     }
+    let (start, len) = match mlock_align_range(args.arg0, args.arg1) {
+        Ok(Some(range)) => range,
+        Ok(None) => {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -54,8 +113,8 @@ pub(crate) fn sys_mlock(ctx: &mut dyn TrapContext) {
         }
     };
     match as_ref.mlock_range_limited(
-        VirtAddr::new(args.arg0),
-        args.arg1,
+        VirtAddr::new(start),
+        len,
         authority.limit_bytes,
         authority.bypass_limit,
     ) {

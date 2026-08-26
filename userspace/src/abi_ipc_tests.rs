@@ -43,6 +43,10 @@ const SHM_STAT: u64 = 13;
 const SHM_INFO: u64 = 14;
 const SHM_STAT_ANY: u64 = 15;
 const SHM_LOCKED: u32 = 0o2000;
+// shmget-only shmflg bits (include/uapi/linux/shm.h). SHM_HUGETLB shares its
+// value with IPC_NOWAIT, which shmget never consults.
+const SHM_HUGETLB: u64 = 0o4000;
+const SHM_NORESERVE: u64 = 0o10000;
 const SETVAL: u64 = 16;
 const SETALL: u64 = 17;
 const GETPID: u64 = 11;
@@ -3258,6 +3262,63 @@ fn smoke_abi_ipc_shmget_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmget_neg);
 
+// `ipc/shm.c::newseg` inspects SHM_HUGETLB only on the create path, after the
+// size EINVAL and both namespace ENOSPC gates:
+//     if (shmflg & SHM_HUGETLB) {
+//             hs = hstate_sizelog((shmflg >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK);
+//             if (!hs) { error = -EINVAL; goto no_file; }
+// NARF has no huge-page backing, so it takes the !hs arm the way a kernel
+// built without CONFIG_HUGETLB_PAGE does. Silently returning a 4 KiB-backed
+// segment instead would leave a caller that asked for huge pages with no
+// error and no huge pages.
+fn smoke_abi_ipc_shmget_hugetlb_and_flag_width() -> TestResult {
+    with_setup(|| {
+        const HUGE_KEY: u64 = 0x51_2001;
+
+        if call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | SHM_HUGETLB)) != Some(EINVAL) {
+            return Err("shmget SHM_HUGETLB must be EINVAL, not a silent 4 KiB segment");
+        }
+        // The flag lives in newseg, so ipcget_public's ENOENT for a missing
+        // key still outranks it — order, not just value.
+        if call(Syscall::Shmget.raw(), a2(HUGE_KEY, 4096, SHM_HUGETLB)) != Some(ENOENT) {
+            return Err("SHM_HUGETLB must not preempt ipcget_public's ENOENT");
+        }
+
+        // Positive paths that must stay open. SHM_NORESERVE only steers
+        // Linux's accounting, so it is accepted-and-ignored on both sides.
+        let id = call(
+            Syscall::Shmget.raw(),
+            a2(HUGE_KEY, 4096, IPC_CREAT | SHM_NORESERVE | 0o600),
+        )
+        .filter(|id| *id > 0)
+        .ok_or("SHM_NORESERVE create was rejected")? as u64;
+        // An existing key resolves through ipc_findkey and never reaches
+        // newseg, so SHM_HUGETLB on a lookup still returns the id.
+        if call(
+            Syscall::Shmget.raw(),
+            a2(HUGE_KEY, 4096, SHM_HUGETLB | 0o600),
+        ) != Some(id as i64)
+        {
+            return Err("SHM_HUGETLB on an existing-key lookup must return the id");
+        }
+        // shmflg is a C int. Junk above bit 31 in the argument register is
+        // not part of it and must not reach any flag test.
+        if call(
+            Syscall::Shmget.raw(),
+            a2(HUGE_KEY, 4096, (1u64 << 40) | 0o600),
+        ) != Some(id as i64)
+        {
+            return Err("shmget honoured shmflg bits above the 32-bit int");
+        }
+
+        if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("hugetlb/flag-width test cleanup failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmget_hugetlb_and_flag_width);
+
 /// Real SysV objects are scoped by the current IPC namespace. Namespace
 /// inheritance shares all three tables by reference, while CLONE_NEWIPC's
 /// fresh namespace may reuse the same numeric ids without aliasing them.
@@ -3719,7 +3780,7 @@ fn smoke_abi_ipc_shmctl_exact_order_permissions_and_set() -> TestResult {
         let non_owner_set = call(Syscall::Shmctl.raw(), a2(id, IPC_SET, set.as_ptr() as u64));
         let non_owner_rmid = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
         let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
-        if non_owner_set != Some(-1) || non_owner_rmid != Some(-1) {
+        if non_owner_set != Some(EPERM) || non_owner_rmid != Some(EPERM) {
             return Err("non-owner shmctl mutation was not EPERM");
         }
         let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
@@ -3893,6 +3954,108 @@ fn smoke_abi_ipc_shmat_permission_denied_before_as() -> TestResult {
 kernel_test_in!(
     "syscall_abi/shmat",
     smoke_abi_ipc_shmat_permission_denied_before_as
+);
+
+// shmctl's three refusals are not interchangeable, and which one wins is
+// decided by different kernel helpers:
+//   * ipc/util.c::ipcctl_obtain_check  -> -EINVAL (no such id) then -EPERM
+//     (not uid/cuid, no CAP_SYS_ADMIN) for IPC_SET / IPC_RMID;
+//   * ipc/shm.c::shmctl_do_lock        -> the same ladder for SHM_LOCK /
+//     SHM_UNLOCK, gated on CAP_IPC_LOCK;
+//   * ipc/util.c::ipcperms             -> -EACCES, reached only by the
+//     read-only IPC_STAT / SHM_STAT family.
+// So a world-readable, world-writable segment still refuses a foreign
+// IPC_RMID with -EPERM: the mutating commands never look at the mode bits.
+// An ipcrm-style reaper depends on exactly this — -EINVAL means "already
+// gone, keep going", -EPERM means "someone else's, report it".
+fn smoke_abi_ipc_shmctl_eperm_vs_eacces_vs_einval() -> TestResult {
+    with_setup(|| {
+        // Mode 0o666: every permission bit granted to every class.
+        let open_id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o666))
+            .filter(|id| *id > 0)
+            .ok_or("setup: world-accessible shmget failed")? as u64;
+        // Mode 0o600: readable by the owner only.
+        let closed_id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+            .filter(|id| *id > 0)
+            .ok_or("setup: owner-only shmget failed")? as u64;
+
+        let mut stat = [0u8; 112];
+        let mut set = [0u8; 112];
+        set[20..24].copy_from_slice(&0o666u32.to_ne_bytes());
+
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("failed to install non-owner test credentials");
+        }
+        // ipcperms grants the read, so IPC_STAT succeeds ...
+        let open_stat = call(
+            Syscall::Shmctl.raw(),
+            a2(open_id, IPC_STAT, stat.as_mut_ptr() as u64),
+        );
+        // ... while every mutating command still answers EPERM, because
+        // ipcctl_obtain_check / shmctl_do_lock consult ownership only.
+        let open_set = call(
+            Syscall::Shmctl.raw(),
+            a2(open_id, IPC_SET, set.as_ptr() as u64),
+        );
+        let open_rmid = call(Syscall::Shmctl.raw(), a2(open_id, IPC_RMID, 0));
+        let open_lock = call(Syscall::Shmctl.raw(), a2(open_id, SHM_LOCK, 0));
+        let open_unlock = call(Syscall::Shmctl.raw(), a2(open_id, SHM_UNLOCK, 0));
+        // The owner-only segment is where EACCES lives.
+        let closed_stat = call(
+            Syscall::Shmctl.raw(),
+            a2(closed_id, IPC_STAT, stat.as_mut_ptr() as u64),
+        );
+        let closed_rmid = call(Syscall::Shmctl.raw(), a2(closed_id, IPC_RMID, 0));
+        // ksys_shmctl screens the ints before it dispatches, so a negative
+        // shmid outranks an unknown command, and an unknown command outranks
+        // the lookup. IPC_64 is not stripped by the native entry point.
+        let neg_id = call(Syscall::Shmctl.raw(), a2(u64::from(u32::MAX), 0x7f, 0));
+        let unknown_cmd = call(Syscall::Shmctl.raw(), a2(open_id, 0x7f, 0));
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+
+        if open_stat != Some(0) {
+            return Err("mode 0o666 IPC_STAT was refused although ipcperms grants read");
+        }
+        if open_set != Some(EPERM)
+            || open_rmid != Some(EPERM)
+            || open_lock != Some(EPERM)
+            || open_unlock != Some(EPERM)
+        {
+            return Err("mode 0o666 mutation by a non-owner was not EPERM");
+        }
+        if closed_stat != Some(EACCES) {
+            return Err("mode 0o600 IPC_STAT by a non-owner was not EACCES");
+        }
+        if closed_rmid != Some(EPERM) {
+            return Err("IPC_RMID by a non-owner reported the mode bits, not ownership");
+        }
+        if neg_id != Some(EINVAL) || unknown_cmd != Some(EINVAL) {
+            return Err("shmctl argument/command screening did not precede the lookup");
+        }
+
+        // Back as the owner: the first IPC_RMID succeeds, and the second one
+        // is EINVAL — ipc_rmid unpublishes the id, so a repeat reap looks
+        // like "never existed", not EIDRM and not EPERM.
+        if call(Syscall::Shmctl.raw(), a2(open_id, IPC_RMID, 0)) != Some(0)
+            || call(Syscall::Shmctl.raw(), a2(closed_id, IPC_RMID, 0)) != Some(0)
+        {
+            return Err("owner IPC_RMID failed");
+        }
+        if call(Syscall::Shmctl.raw(), a2(open_id, IPC_RMID, 0)) != Some(EINVAL)
+            || call(
+                Syscall::Shmctl.raw(),
+                a2(open_id, IPC_STAT, stat.as_mut_ptr() as u64),
+            ) != Some(EINVAL)
+            || call(Syscall::Shmctl.raw(), a2(open_id, SHM_LOCK, 0)) != Some(EINVAL)
+        {
+            return Err("a reaped shmid must be EINVAL for every shmctl command");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_shmctl_eperm_vs_eacces_vs_einval
 );
 
 // #33: shmctl(IPC_STAT) fills shm_cpid (creator) at offset 80, translated into

@@ -969,7 +969,9 @@ pub fn sys_epoll_pwait2(ctx: &mut dyn TrapContext) {
                 ms.min(i32::MAX as u64) as i32
             }
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // `SYSCALL_DEFINE6(epoll_pwait2)`:
+                // `if (get_timespec64(&ts, timeout)) return -EFAULT;`
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                 return;
             }
         }
@@ -997,15 +999,34 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
     let events_ptr = args.arg1 as *mut u8;
-    let maxevents = args.arg2 as usize;
+    let maxevents = args.arg2 as u32 as i32 as i64;
     let timeout_ms = timeout_override.unwrap_or(args.arg3 as i32);
     let sigmask_ptr = args.arg4;
     let sigsetsize = args.arg5;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    const EBADF: SyscallReturn = SyscallReturn::ok((-9i64) as u64);
+    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
+    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
+    // `fs/eventpoll.c`: `EP_MAX_EVENTS = INT_MAX / sizeof(struct epoll_event)`.
+    const EP_MAX_EVENTS: i64 = i32::MAX as i64 / EPOLL_EVENT_SIZE as i64;
     let task = current_task_id();
 
+    // `SYSCALL_DEFINE6(epoll_pwait)` runs `set_user_sigmask` BEFORE
+    // `do_epoll_wait`, so a malformed sigmask outranks even a closed epfd:
+    //
+    //     if (!umask)                          return 0;
+    //     if (sigsetsize != sizeof(sigset_t))  return -EINVAL;
+    //     if (copy_from_user(...))             return -EFAULT;
+    //
+    // The old code gated on `sigsetsize == 8` and silently IGNORED any other
+    // size — so a caller passing the wrong sigset width had its mask quietly
+    // not applied and still got its events, which is the worst outcome: the
+    // signal it was blocking could be delivered inside the wait.
     let mut old_mask = None;
-    if is_pwait && sigmask_ptr != 0 && sigsetsize == 8 {
+    if is_pwait && sigmask_ptr != 0 {
+        if sigsetsize != 8 {
+            ctx.set_return(EINVAL);
+            return;
+        }
         let mut buf = [0u8; 8];
         // SAFETY: sigsetsize == 8 checked above; copy_from_user range-validates
         // `sigmask_ptr` and SMAP-brackets the read into `buf`.
@@ -1013,18 +1034,30 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
             let mask = u64::from_ne_bytes(buf); // user sigset_t == NARF N-1 layout
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {
-            ctx.set_return(fail);
+            ctx.set_return(EFAULT);
             return;
         }
     }
 
-    if events_ptr.is_null() || maxevents == 0 {
+    // Everything below is `do_epoll_wait` order, which is NOT the order this
+    // handler used to apply:
+    //
+    //     CLASS(fd, f)(epfd); if (fd_empty(f)) return -EBADF;
+    //     ep_check_params():
+    //         maxevents <= 0 || maxevents > EP_MAX_EVENTS -> -EINVAL
+    //         !access_ok(evs, maxevents * sizeof(ev))     -> -EFAULT
+    //         !is_file_epoll(file)                        -> -EINVAL
+    //
+    // The descriptor is resolved FIRST, and the buffer and count are separate
+    // answers. The old code tested `events_ptr.is_null() || maxevents == 0`
+    // ahead of the fd lookup and collapsed all four into one `-1`, so an event
+    // loop that closed its epfd saw "Operation not permitted" rather than the
+    // EBADF that tells it to rebuild the loop.
+    let restore = |task: u64, old_mask: Option<u64>| {
         if let Some(old) = old_mask {
             crate::handlers::set_signal_mask_for_task(task, old);
         }
-        ctx.set_return(fail);
-        return;
-    }
+    };
 
     // Resolve through the fd table (NOT a creating-thread registry) so a
     // CLONE_FILES sibling, a dup'd fd, or a fork-inherited epfd all wait
@@ -1032,20 +1065,29 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     let ops = match epoll_ops(task, epfd) {
         Some(o) => o,
         None => {
-            if let Some(old) = old_mask {
-                crate::handlers::set_signal_mask_for_task(task, old);
-            }
-            ctx.set_return(fail);
+            restore(task, old_mask);
+            ctx.set_return(EBADF);
             return;
         }
     };
+    // `maxevents` is an `int`; the register's upper half is not part of it.
+    if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
+        restore(task, old_mask);
+        ctx.set_return(EINVAL);
+        return;
+    }
+    // access_ok over the WHOLE output array, before any of it is written.
+    let span = (maxevents as usize).saturating_mul(EPOLL_EVENT_SIZE);
+    if crate::handlers::validate_user_range(events_ptr as u64, span).is_err() {
+        restore(task, old_mask);
+        ctx.set_return(EFAULT);
+        return;
+    }
     let instance = match as_epoll(&ops) {
         Some(i) => i,
         None => {
-            if let Some(old) = old_mask {
-                crate::handlers::set_signal_mask_for_task(task, old);
-            }
-            ctx.set_return(fail); // not an epoll fd (Linux: EINVAL)
+            restore(task, old_mask);
+            ctx.set_return(EINVAL); // not an epoll fd
             return;
         }
     };
@@ -1118,7 +1160,9 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     };
 
     loop {
-        let ready = instance.collect_ready(task, maxevents);
+        // `maxevents` is validated as a positive `int` above, so the cast
+        // back to a count cannot truncate or go negative.
+        let ready = instance.collect_ready(task, maxevents as usize);
         let n = ready.len();
         if n > 0 {
             if let Some(uctx_ptr) = uctx_opt {
@@ -1139,10 +1183,10 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 )
                 .is_err()
                 {
-                    if let Some(old) = old_mask {
-                        crate::handlers::set_signal_mask_for_task(task, old);
-                    }
-                    ctx.set_return(fail);
+                    restore(task, old_mask);
+                    // The array was access_ok'd above; a fault here is a
+                    // racing unmap, and `ep_send_events` reports it as -EFAULT.
+                    ctx.set_return(EFAULT);
                     return;
                 }
             }

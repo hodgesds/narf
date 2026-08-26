@@ -2267,3 +2267,210 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_open_and_dup_agree_on_emfile
 );
+
+// ── epoll_wait / epoll_pwait / epoll_pwait2 ────────────────────────
+//
+// `fs/eventpoll.c::do_epoll_wait` fixes the order these are answered in:
+//
+//     CLASS(fd, f)(epfd); if (fd_empty(f)) return -EBADF;
+//     ep_check_params():
+//         maxevents <= 0 || maxevents > EP_MAX_EVENTS -> -EINVAL
+//         !access_ok(evs, maxevents * sizeof(ev))     -> -EFAULT
+//         !is_file_epoll(file)                        -> -EINVAL
+//
+// and `SYSCALL_DEFINE6(epoll_pwait)` runs `set_user_sigmask` ahead of all of
+// it. The handler used to collapse every one of these into the `-1` sentinel
+// and test the buffer BEFORE the descriptor.
+
+fn smoke_abi_ioerrno_epoll_wait_bad_epfd() -> TestResult {
+    with_setup(|| {
+        let mut evs = [0u8; 64];
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(4242, evs.as_mut_ptr() as u64, 4, 0),
+            ),
+            EBADF,
+            "epoll_wait on a closed epfd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_wait_bad_epfd);
+
+fn smoke_abi_ioerrno_epoll_wait_bad_epfd_outranks_bad_maxevents() -> TestResult {
+    with_setup(|| {
+        let mut evs = [0u8; 64];
+        // `do_epoll_wait` resolves the descriptor before `ep_check_params`,
+        // so a closed epfd wins even though maxevents is also invalid.
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(4242, evs.as_mut_ptr() as u64, 0, 0),
+            ),
+            EBADF,
+            "epoll_wait must report -EBADF before it validates maxevents",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_wait_bad_epfd_outranks_bad_maxevents
+);
+
+fn smoke_abi_ioerrno_epoll_wait_maxevents() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        let mut evs = [0u8; 64];
+        let buf = evs.as_mut_ptr() as u64;
+        // `maxevents <= 0` — zero and negative are the same answer.
+        expect(
+            call(Syscall::EpollWait.raw(), a3(ep as u64, buf, 0, 0)),
+            EINVAL,
+            "epoll_wait with maxevents == 0 must be -EINVAL",
+        )?;
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(ep as u64, buf, u32::MAX as u64, 0),
+            ),
+            EINVAL,
+            "epoll_wait with a negative maxevents must be -EINVAL",
+        )?;
+        // `maxevents > EP_MAX_EVENTS` (INT_MAX / sizeof(struct epoll_event)).
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(ep as u64, buf, i32::MAX as u64, 0),
+            ),
+            EINVAL,
+            "epoll_wait above EP_MAX_EVENTS must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_wait_maxevents);
+
+fn smoke_abi_ioerrno_epoll_wait_maxevents_outranks_efault() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        // `ep_check_params` tests the count before `access_ok`, so a bad
+        // maxevents wins over an unmapped output array.
+        expect(
+            call(Syscall::EpollWait.raw(), a3(ep as u64, BAD_PTR, 0, 0)),
+            EINVAL,
+            "epoll_wait must validate maxevents before the output buffer",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_wait_maxevents_outranks_efault
+);
+
+fn smoke_abi_ioerrno_epoll_wait_efault() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        expect(
+            call(Syscall::EpollWait.raw(), a3(ep as u64, BAD_PTR, 4, 0)),
+            EFAULT,
+            "epoll_wait into an unmapped array must be -EFAULT",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_wait_efault);
+
+fn smoke_abi_ioerrno_epoll_wait_not_an_epoll() -> TestResult {
+    with_setup(|| {
+        let (rd, _wr) = make_pipe()?;
+        let mut evs = [0u8; 64];
+        // The descriptor resolves and the params are fine, so this reaches
+        // `!is_file_epoll(file)` — -EINVAL, not -EBADF.
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(rd as u64, evs.as_mut_ptr() as u64, 4, 0),
+            ),
+            EINVAL,
+            "epoll_wait on a non-epoll fd must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_wait_not_an_epoll);
+
+fn smoke_abi_ioerrno_epoll_wait_empty_set_times_out() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        let mut evs = [0u8; 64];
+        // The positive path the checks above must not break: a valid wait on
+        // an empty interest list with a zero timeout reports no events.
+        expect(
+            call(
+                Syscall::EpollWait.raw(),
+                a3(ep as u64, evs.as_mut_ptr() as u64, 4, 0),
+            ),
+            0,
+            "epoll_wait with a zero timeout must return 0, not an error",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_wait_empty_set_times_out
+);
+
+fn smoke_abi_ioerrno_epoll_pwait_bad_sigsetsize() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        let mut evs = [0u8; 64];
+        let mask = [0u8; 8];
+        // `set_user_sigmask`: `if (sigsetsize != sizeof(sigset_t)) return
+        // -EINVAL;`, and it runs BEFORE do_epoll_wait — so this beats even a
+        // closed epfd. Silently ignoring the wrong size (the old behaviour)
+        // left the caller's mask unapplied while the wait still succeeded,
+        // so the signal it was blocking could be delivered inside the wait.
+        let r = call_raw(
+            Syscall::EpollPwait.raw(),
+            SyscallArgs {
+                arg0: ep as u64,
+                arg1: evs.as_mut_ptr() as u64,
+                arg2: 4,
+                arg3: 0,
+                arg4: mask.as_ptr() as u64,
+                arg5: 4, // not sizeof(sigset_t)
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EINVAL,
+            "epoll_pwait with a wrong sigsetsize must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_pwait_bad_sigsetsize);
+
+fn smoke_abi_ioerrno_epoll_pwait2_faulting_timespec() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        let mut evs = [0u8; 64];
+        // `if (get_timespec64(&ts, timeout)) return -EFAULT;`
+        let r = call_raw(
+            Syscall::EpollPwait2.raw(),
+            SyscallArgs {
+                arg0: ep as u64,
+                arg1: evs.as_mut_ptr() as u64,
+                arg2: 4,
+                arg3: BAD_PTR,
+                arg4: 0,
+                arg5: 0,
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EFAULT,
+            "epoll_pwait2 with an unmapped timespec must be -EFAULT",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_pwait2_faulting_timespec
+);

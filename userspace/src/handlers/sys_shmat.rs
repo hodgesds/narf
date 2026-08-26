@@ -6,6 +6,35 @@ use super::*;
 /// Validation follows Linux `ipc/shm.c::do_shmat`: signed-id and address
 /// shape first, access permission next, then overlap/replacement and mapping.
 /// Unknown `shmflg` bits are ignored by Linux and therefore by NARF.
+///
+/// ```text
+///   err = -EINVAL;
+///   if (shmid < 0) goto out;
+///   if (addr) { ... if (!addr && (shmflg & SHM_REMAP)) goto out;
+///                   else if (addr & ~PAGE_MASK) goto out; }
+///   else if ((shmflg & SHM_REMAP)) goto out;
+///   ...
+///   shp = shm_obtain_object_check(ns, shmid);      /* -EINVAL */
+///   err = -EACCES;
+///   if (ipcperms(ns, &shp->shm_perm, acc_mode)) goto out_unlock;
+///   ...
+///   if (addr && !(shmflg & SHM_REMAP)) {
+///       err = -EINVAL;
+///       if (addr + size < addr) goto invalid;
+///       if (find_vma_intersection(mm, addr, addr + size)) goto invalid;
+///   }
+/// ```
+///
+/// -EINVAL and -EACCES are the two answers a caller can act on and they must
+/// not be merged: a client that attaches a well-known segment retries or
+/// re-creates on -EINVAL (the segment went away or the id is stale) but must
+/// stop on -EACCES (the segment is there and the credentials are wrong).
+/// Note that a segment already IPC_RMID'd but still attached elsewhere is
+/// -EINVAL, not -EIDRM: `ipc_rmid()` unpublishes the id from the IDR
+/// immediately, so `shm_obtain_object_check()` never finds it. The -EIDRM
+/// arm in `do_shmat` only fires when RMID lands between the RCU lookup and
+/// `ipc_lock_object()`, a window that does not exist here because the
+/// segment table lock covers lookup and reservation together.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
@@ -22,7 +51,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let object = (ipc_ns, shmid);
 
     if signed_shmid < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     if base != 0 {
@@ -53,11 +82,11 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
             .and_then(|map| map.get_mut(&object))
             .filter(|seg| !seg.removed)
         else {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
             return;
         };
         if !shm_ipc_allowed(seg, request) {
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
             return;
         }
         // Reserve backing lifetime against a racing IPC_RMID.

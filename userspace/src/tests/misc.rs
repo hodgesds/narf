@@ -1385,14 +1385,17 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
     if !matches!(call(0x80), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         return TestResult::Fail("FUTEX_WAIT_PRIVATE did not return 0");
     }
-    // Unsupported op → -1.
+    // `kernel/futex/syscalls.c::do_futex` falls off its switch to
+    // `return -ENOSYS;` for an op it does not implement — the errno that
+    // tells a caller "this kernel lacks the operation", which is what glibc
+    // uses to pick a fallback path. The `-1` sentinel said EPERM instead.
     let r = call(99);
     let unknown_rejected = matches!(
         r,
-        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-38i64) as u64,
     );
     if !unknown_rejected {
-        return TestResult::Fail("futex(99) was not rejected");
+        return TestResult::Fail("futex(99) must return -ENOSYS");
     }
 
     __test_clear_global();
@@ -2176,7 +2179,10 @@ fn smoke_userspace_futex_wake_op_rmw() -> TestResult {
     let uaddr2 = &mut word as *mut u32 as u64;
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 0xF00D,  // uaddr — used only as a wait-queue key (no memory access)
+            // uaddr — only a wait-queue key here (no memory access), but it
+            // must still be naturally aligned: `get_futex_key` rejects
+            // `(address % size) != 0` with -EINVAL. 0xF00D was not.
+            arg0: 0xF00C,
             arg1: 5,       // FUTEX_WAKE_OP
             arg2: 1,       // nr_wake
             arg3: 1,       // nr_wake2
@@ -2811,12 +2817,19 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
         let mut sq = user_ends.sq_prod;
         let mut cq = user_ends.cq_drain;
 
-        // Mmap(hint=0, len=0x1000, flags=0).
+        // Mmap(hint=0, len=0x1000, prot=0, flags=MAP_PRIVATE|MAP_ANONYMOUS,
+        // fd=-1). The flags and fd words are now load-bearing: `do_mmap`'s
+        // `switch (flags & MAP_TYPE)` ends in `default: return -EINVAL;`, so a
+        // zero flag word has no mapping type and is rejected. This fixture
+        // left both slots at 0 and only passed by accident — flags 0 fell
+        // through to "private" and fd 0 mapped whatever stdin happened to be.
         let mut sub = Submission::noop(Tag::new(0x20));
         sub.op = OpCode::Mmap;
         sub.inline[0] = 0;
         sub.inline[1] = 0x1000;
         sub.inline[2] = 0;
+        sub.inline[3] = 0x22; // MAP_PRIVATE | MAP_ANONYMOUS
+        sub.inline[4] = !0u64; // fd = -1
         sq.send(sub).await.unwrap();
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok || comp.result[0] == 0 {
