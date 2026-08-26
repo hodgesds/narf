@@ -499,14 +499,15 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     install_task_id_lookup(task_lookup);
 
     let task = FAKE_TASK.load(Ordering::Relaxed);
-    let original = fd::with_table(task, |t| {
-        t.open(FdEntry {
+    let original = fd::install(
+        task,
+        FdEntry {
             ops: Arc::new(StubFile),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .expect("with_table");
     if original != 3 {
         return TestResult::Fail("expected first user fd to be 3");
@@ -651,14 +652,15 @@ fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
     fd::__test_reset();
     install_task_id_lookup(t);
     let task = TASK.load(Ordering::Relaxed);
-    let src = fd::with_table(task, |x| {
-        x.open(FdEntry {
+    let src = fd::install(
+        task,
+        FdEntry {
             ops: Arc::new(S),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .expect("table");
 
     __test_clear_global();

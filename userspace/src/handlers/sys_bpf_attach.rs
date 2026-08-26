@@ -429,8 +429,7 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
     };
 
     let ops: Arc<dyn narf_filesystem::FileOps> = Arc::new(LinkFile::new(bpf_link));
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops,
             offset: 0,
             // As for program and map fds: Linux's `bpf_link_new_fd` passes
@@ -439,8 +438,7 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
             // only when its last fd closes.
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         // `with_table` yields `None` when the calling task has no fd table at
         // all, so the closure never ran and `ops` is dropped here — which runs
@@ -455,14 +453,12 @@ pub(crate) fn bpf_link_create(attr_uptr: u64, size: usize) -> i64 {
 /// errno. Shared by the link and iterator create paths; `O_CLOEXEC` because a
 /// leaked bpf object fd is a leaked capability (Linux does the same).
 fn open_cloexec_fd(ops: Arc<dyn narf_filesystem::FileOps>) -> i64 {
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }

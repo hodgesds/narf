@@ -115,6 +115,11 @@ pub fn setup() {
     crate::pid_ns::__test_reset();
     __test_clear_global();
     fd::__test_reset();
+    // The descriptor-allocation bound is a global hook; a case that lowered
+    // RLIMIT_NOFILE must not leave the next one bounded by it. `setup` then
+    // reinstalls it via `init_per_task_state` below, so every test still sees
+    // real enforcement against the default 1024 limit.
+    fd::__test_clear_nofile_limit_lookup();
     install_task_id_lookup(task_lookup);
     // The no-AS baseline this harness promises is established above, by the
     // save-clear-restore of `address_space_lookup()`. An earlier version of this
@@ -143,6 +148,7 @@ pub fn setup() {
 }
 
 pub fn teardown() {
+    fd::__test_clear_nofile_limit_lookup();
     crate::handlers::__test_mount_namespaces_reset();
     crate::handlers::__test_root_dir_reset();
     #[cfg(feature = "container")]

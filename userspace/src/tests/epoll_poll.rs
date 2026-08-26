@@ -3049,7 +3049,7 @@ fn smoke_epoll_dup_fd_aliases_same_instance() -> TestResult {
     let r = call(
         Syscall::EpollCtl,
         SyscallArgs {
-            arg0: dupfd as u64, // ctl via the DUP
+            arg0: dupfd.expect("fixture fd") as u64, // ctl via the DUP
             arg1: crate::epoll::EPOLL_CTL_ADD as u64,
             arg2: watched as u64,
             arg3: ev.as_ptr() as u64,
@@ -3246,14 +3246,15 @@ fn smoke_epoll_fd_forwards_nested_timerfd_poll_deadline() -> TestResult {
     let tfd_ops = crate::io_mux::TimerFd::new();
     let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(500_000_000);
     tfd_ops.arm(deadline, 0);
-    let tfd = crate::fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let tfd = crate::fd::install(
+        task,
+        crate::fd::FdEntry {
             ops: tfd_ops,
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .unwrap();
 
     let mut ev = [0u8; 12];
@@ -3762,14 +3763,15 @@ fn smoke_epoll_maxevents_does_not_ack_undisclosed_source() -> TestResult {
         let mut sources = alloc::vec::Vec::new();
         for userdata in [0x31u64, 0x32u64] {
             let source = Arc::new(AckClearsReadyFile(AtomicU32::new(narf_filesystem::POLL_IN)));
-            let fd = crate::fd::with_table(task, |table| {
-                table.open(crate::fd::FdEntry {
+            let fd = crate::fd::install(
+                task,
+                crate::fd::FdEntry {
                     ops: source.clone(),
                     offset: 0,
                     flags: 0,
                     status_flags: 0,
-                })
-            })
+                },
+            )
             .ok_or("fd table unavailable")?;
             sources.push(source);
 
@@ -4211,7 +4213,7 @@ fn smoke_poll_watchdog_oracle_matches_poll_scan() -> TestResult {
             flags: 0,
             status_flags: 0,
         });
-        (a, b)
+        (a.expect("fixture fd"), b.expect("fixture fd"))
     })
     .unwrap();
 
@@ -4334,14 +4336,15 @@ fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
     const TID: u64 = 0xFACE_D0D2;
     let task = crate::task::Task::new_registered(TID, TID);
 
-    let fd = match crate::fd::with_table(TID, |t| {
-        t.open(crate::fd::FdEntry {
+    let fd = match crate::fd::install(
+        TID,
+        crate::fd::FdEntry {
             ops: Arc::new(NeverReadable),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    }) {
+        },
+    ) {
         Some(fd) => fd,
         None => {
             crate::task::release_task(TID);

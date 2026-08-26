@@ -1136,7 +1136,7 @@ fn smoke_stack_admin_delegates_only_to_current_route_socket() -> TestResult {
             flags: 0,
             status_flags: 0,
         });
-        (route_fd, inet_fd)
+        (route_fd.expect("fixture fd"), inet_fd.expect("fixture fd"))
     })
     .expect("current task fd table");
 

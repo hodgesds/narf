@@ -18,8 +18,7 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
         memfd_arc_register(&mfd);
         let cloexec = (_flags & crate::linux_compat::MFD_CLOEXEC) != 0;
         let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let fd = fd::install(task, crate::fd::FdEntry {
                 ops: mfd,
                 offset: 0,
                 flags: install_flags,
@@ -27,8 +26,7 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
                 // fdopen(fd, "w+") reads F_GETFL and rejects the fd with EINVAL if
                 // the access mode isn't read+write (systemd's serialization memfd).
                 status_flags: crate::fd::O_RDWR,
-            })
-        });
+            });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(fail),
@@ -37,15 +35,13 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     #[cfg(not(feature = "linux-compat"))]
     {
         let ops = narf_filesystem::new_anon_memfile();
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let fd = fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 // Linux memfd_create(2) always returns an O_RDWR fd (see above).
                 status_flags: crate::fd::O_RDWR,
-            })
-        });
+            });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(fail),

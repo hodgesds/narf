@@ -794,14 +794,12 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
 #[doc(hidden)]
 pub fn __test_open_dir_fd(task: u64, path: &str) -> Option<u32> {
     let dirops = resolve_dir_absolute(path)?;
-    fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    fd::install(task, crate::fd::FdEntry {
             ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
             offset: 0,
             flags: 0,
             status_flags: 0,
         })
-    })
 }
 
 // ── Brk — per-task heap break ──────────────────────────────────────
@@ -7140,14 +7138,12 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     );
                 }
             }
-            let new_fd = match fd::with_table(task, |t| {
-                t.open(crate::fd::FdEntry {
+            let new_fd = match fd::install(task, crate::fd::FdEntry {
                     ops: socket,
                     offset: 0,
                     flags: fd_flags,
                     status_flags,
-                })
-            }) {
+                }) {
                 Some(n) => n,
                 None => {
                     ctx.set_return(fail);
@@ -7366,14 +7362,21 @@ fn install_recv_ancillary(
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
     for passed in fds.into_iter().take(rights_to_install) {
-        if let Some(newfd) = fd::with_table(task, |t| {
+        // `scm_detach_fds` stops installing once `get_unused_fd_flags` fails
+        // and reports the shortfall as MSG_CTRUNC rather than failing the
+        // whole recvmsg — the payload was already delivered. A receiver at
+        // its RLIMIT_NOFILE therefore sees a truncated control message, which
+        // is the documented signal to close descriptors and retry.
+        if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
                 passed.ops,
                 passed.description,
                 passed.status_flags,
                 if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
             )
-        }) {
+        })
+        .flatten()
+        {
             new_fds.push(newfd as i32);
         } else {
             truncated = true;

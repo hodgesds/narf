@@ -6205,7 +6205,11 @@ fn smoke_fdtable_concurrent_open_close_per_task() -> TestResult {
             };
             // Open into THIS task's per-task table (keyed by
             // self.task_id, not the executor's current task id).
-            let fd = fd::with_table(self.task_id, |t| t.open(entry));
+            // `open` is bounded by the task's RLIMIT_NOFILE now, so it can
+            // report exhaustion. This benchmark closes every descriptor it
+            // opens, so hitting the limit means a leak in the loop itself —
+            // count it as lost rather than silently ending the run.
+            let fd = fd::install(self.task_id, entry);
             let fd = match fd {
                 Some(f) => f,
                 None => {

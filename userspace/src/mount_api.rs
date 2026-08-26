@@ -334,14 +334,15 @@ impl FileOps for MountObjectFile {
 
 fn install_fd(file: Arc<dyn FileOps>, cloexec: bool) -> Option<u32> {
     let flags = if cloexec { fd::FD_CLOEXEC } else { 0 };
-    fd::with_table(current_task_id(), |t| {
-        t.open(fd::FdEntry {
+    fd::install(
+        current_task_id(),
+        fd::FdEntry {
             ops: file,
             offset: 0,
             flags,
             status_flags: 0,
-        })
-    })
+        },
+    )
 }
 
 fn validate_open_tree_flags(flags: u64) -> Result<(), i64> {

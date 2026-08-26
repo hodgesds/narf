@@ -672,8 +672,21 @@ pub fn bootstrap_init() {
 /// The fd table store needs no counterpart here — its shards are
 /// const-initialised and materialise a task's table on first touch
 /// (see `crate::fd::with_table`).
+/// The `end` argument `fs/file.c::alloc_fd` measures descriptor allocation
+/// against: a task's RLIMIT_NOFILE soft limit, or the boot default before the
+/// task has rlimits of its own.
+fn task_nofile_limit(task: u64) -> u64 {
+    read_rlimit(task, RLIMIT_NOFILE_RESOURCE)
+        .map(|limit| limit.cur)
+        .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur)
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
+    // Publish the descriptor-allocation bound to the fd table. Until this is
+    // installed every table is unbounded, which is what the boot path needs
+    // while it seeds stdio into tables whose tasks do not exist yet.
+    crate::fd::install_nofile_limit_lookup(task_nofile_limit);
     cwd_init();
     sigaction_init();
     signal_init();
@@ -989,18 +1002,14 @@ fn open_impl(
     };
     let path: &str = &path_owned;
 
-    // RLIMIT_NOFILE enforcement: a task may not exceed its soft limit of
-    // open descriptors. Linux returns EMFILE from the fd-creating call.
-    // RLIMIT_NOFILE is index 7; `.0` is the soft (current) limit.
-    {
-        let nofile_cur = read_rlimit(task, 7)
-            .map(|limit| limit.cur)
-            .unwrap_or_else(|| default_rlimits()[7].cur);
-        if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
-            return;
-        }
-    }
+    // RLIMIT_NOFILE is enforced by the fd table itself now, so every
+    // allocation site reports -EMFILE the same way. The pre-check that used
+    // to live here counted OPEN descriptors, but `alloc_fd` bounds the
+    // descriptor NUMBER: `if (fd >= end) error = -EMFILE`. With a sparse
+    // table the two disagree — a task holding fds 0-2 and 900 is nowhere near
+    // its 1024 limit by count, yet Linux lets it keep opening until the
+    // lowest free number reaches 1024, and this check would have stopped it
+    // at an unrelated point. Positional is the rule; the table applies it.
 
     // Following a proc namespace magic link yields an nsfs-like fd whose
     // held namespace can be consumed by setns(2). O_PATH|O_NOFOLLOW must
@@ -1009,14 +1018,12 @@ fn open_impl(
     if mnt_len == 0 && flags & 0o400000 == 0 {
         if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
             let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
-            let new_fd = fd::with_table(task, |table| {
-                table.open(crate::fd::FdEntry {
+            let new_fd = fd::install(task, crate::fd::FdEntry {
                     ops,
                     offset: 0,
                     flags: 0,
                     status_flags: open_status_flags,
-                })
-            });
+                });
             match new_fd {
                 Some(n) => {
                     #[cfg(feature = "linux-compat")]
@@ -1056,14 +1063,12 @@ fn open_impl(
                         return;
                     }
                 };
-                let new_fd = fd::with_table(task, |t| {
-                    t.open(crate::fd::FdEntry {
+                let new_fd = fd::install(task, crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
                         flags: 0,
                         status_flags: open_status_flags,
-                    })
-                });
+                    });
                 match new_fd {
                     Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
                     None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
@@ -1109,14 +1114,12 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
                     return;
                 }
-                let new_fd = fd::with_table(task, |t| {
-                    t.open(crate::fd::FdEntry {
+                let new_fd = fd::install(task, crate::fd::FdEntry {
                         ops: lops,
                         offset: 0,
                         flags: 0,
                         status_flags: open_status_flags,
-                    })
-                });
+                    });
                 match new_fd {
                     Some(n) => {
                         #[cfg(feature = "linux-compat")]
@@ -1183,14 +1186,12 @@ fn open_impl(
         .unwrap_or(false);
     if (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
-            let new_fd = fd::with_table(task, |t| {
-                t.open(crate::fd::FdEntry {
+            let new_fd = fd::install(task, crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
                     flags: 0,
                     status_flags: open_status_flags,
-                })
-            });
+                });
             match new_fd {
                 Some(n) => {
                     // Record the backing path so /proc/<pid>/fd/<n> readlinks
@@ -1297,14 +1298,12 @@ fn open_impl(
         } else {
             ops
         };
-        let new_fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let new_fd = fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags: open_status_flags,
-            })
-        });
+            });
         match new_fd {
             Some(n) => {
                 #[cfg(feature = "linux-compat")]
@@ -1441,14 +1440,12 @@ fn open_impl(
         return;
     }
 
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
             status_flags: open_status_flags,
-        })
-    }) {
+        }) {
         Some(n) => n,
         None => {
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
@@ -1526,14 +1523,12 @@ fn open_fifo(
         can_write,
     )) as Arc<dyn narf_filesystem::FileOps>;
     let status_flags = access_mode as u32 | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: handle,
             offset: 0,
             flags: 0,
             status_flags,
-        })
-    }) {
+        }) {
         Some(n) => n,
         None => {
             ctx.set_return(SyscallReturn::ok(!0u64));
@@ -1695,8 +1690,15 @@ fn fanotify_read_to_user(
         fd_count += usize::from(ops.is_some());
         resolved.push((ops, mask, pid));
     }
-    let reserved = fd::with_table(task, |table| table.reserve_fds(fd_count)).unwrap_or_default();
+    // Reserving the batch is `get_unused_fd_flags` repeated: if the task's
+    // RLIMIT_NOFILE cannot cover every object in this drain, the read fails
+    // -EMFILE and the queue keeps its events, rather than delivering metadata
+    // that names descriptors which were never installed.
+    let Some(reserved) = fd::with_table_alloc(task, |table| table.reserve_fds(fd_count)).flatten() else {
+        return Err(24); // -EMFILE
+    };
     if reserved.len() != fd_count {
+        let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
         return Err(EFAULT);
     }
     let mut reserved_iter = reserved.iter().copied();
@@ -1798,14 +1800,12 @@ fn fanotify_open_object(task: u64, abs: &str) -> i32 {
     let Some(ops) = fanotify_resolve_object(abs) else {
         return -1;
     };
-    match fd::with_table(task, |t| {
-        t.open(fd::FdEntry {
+    match fd::install(task, fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
             status_flags: crate::fd::O_RDONLY,
-        })
-    }) {
+        }) {
         Some(n) => n as i32,
         None => -1,
     }
@@ -6425,14 +6425,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     if let Some(st) = pidfd_state {
         let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
             alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(st));
-        let newfd = fd::with_table(parent_pid, |t| {
-            t.open(crate::fd::FdEntry {
+        let newfd = fd::install(parent_pid, crate::fd::FdEntry {
                 ops: file,
                 offset: 0,
                 flags: crate::fd::FD_CLOEXEC,
                 status_flags: 0,
-            })
-        });
+            });
         if let Some(n) = newfd {
             let fd_bytes = (n as i32).to_ne_bytes();
             // SAFETY: `ca.pidfd` is the user out-pointer (non-zero, checked at
@@ -9364,6 +9362,11 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32)
 //   RLIMIT_AS      = INFINITY
 
 const RLIMIT_COUNT: usize = 16;
+
+/// `RLIMIT_NOFILE` — the resource index the descriptor-allocation bound comes
+/// from. Named because it is consulted from several syscalls that each used a
+/// bare `7`.
+const RLIMIT_NOFILE_RESOURCE: usize = 7;
 
 /// Wire-shape pair: rlim_cur followed by rlim_max. Matches the
 /// glibc layout the libc shim already exposes.

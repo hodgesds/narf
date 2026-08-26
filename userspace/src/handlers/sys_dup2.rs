@@ -19,6 +19,21 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    // `ksys_dup3`: `if (newfd >= rlimit(RLIMIT_NOFILE)) return -EBADF;`, and
+    // the -EMFILE that `expand_files` would raise for the same slot is
+    // deliberately remapped to -EBADF too (`if (err == -EMFILE) goto Ebadf;`).
+    // dup2/dup3 name an exact descriptor, so an out-of-range target is a bad
+    // descriptor argument rather than exhaustion — unlike dup(2), which asks
+    // for any free slot and does report -EMFILE.
+    {
+        let nofile = read_rlimit(task, RLIMIT_NOFILE_RESOURCE)
+            .map(|limit| limit.cur)
+            .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur);
+        if u64::from(newfd) >= nofile {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    }
     // Replacing the target slot installs another reference to oldfd's shared
     // open-file description; descriptor flags start clear.
     let outcome = fd::with_table(task, |t| t.duplicate_to(oldfd, newfd, 0));

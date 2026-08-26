@@ -736,14 +736,15 @@ fn smoke_abi_fsx_mount_fuse_publishes_without_init_reply() -> TestResult {
     with_setup(|| {
         let dev = narf_filesystem::fuse_conn::DevFuse::open_new();
         let task = crate::handlers::current_task_id();
-        let fd = crate::fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let fd = crate::fd::install(
+            task,
+            crate::fd::FdEntry {
                 ops: dev.clone(),
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
-        })
+            },
+        )
         .ok_or("could not install a /dev/fuse fd for the mount")?;
 
         let source = b"/dev/fuse\0";

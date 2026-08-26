@@ -4316,7 +4316,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         })
     });
 
-    if let Some(fd_num) = fd_num_opt {
+    if let Some(fd_num) = fd_num_opt.flatten() {
         ctx.set_return(SyscallReturn::ok(fd_num as u64));
     } else {
         // No fd table exists for the current task, so the closure never took

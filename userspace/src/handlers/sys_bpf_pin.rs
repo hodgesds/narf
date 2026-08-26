@@ -317,16 +317,14 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
 
     // A *new fd holding its own reference*: the object now survives this fd's
     // close only if the pin (or another fd) still holds it.
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops: obj,
             offset: 0,
             // As `bpf_prog_new_fd` / `bpf_map_new_fd`: `O_CLOEXEC`, because a
             // leaked bpf fd is a leaked capability.
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }
