@@ -1075,6 +1075,103 @@ kernel_test_in!(
     smoke_abi_ipc_sem_queue_handoff_order_and_waker_dedupe
 );
 
+/// A single value transition can complete several semaphore operations.  The
+/// allocation-free wake queue must preserve the set's handoff order rather
+/// than the task-id order used by the global registration index.
+fn smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    struct OrderedWake {
+        marker: u64,
+        order: Arc<AtomicU64>,
+    }
+
+    impl OrderedWake {
+        fn record(&self) {
+            self.order
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old * 10 + self.marker)
+                })
+                .expect("infallible wake-order update");
+        }
+    }
+
+    impl Wake for OrderedWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        // Deliberately reverse task-id order so a scan of the global sorted
+        // waiter index would produce 21 instead of the required FIFO 12.
+        const FIRST: u64 = FAKE_TASK + 32;
+        const SECOND: u64 = FAKE_TASK + 31;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        set_task(FIRST);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("first batch waiter did not queue");
+        }
+        set_task(SECOND);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("second batch waiter did not queue");
+        }
+
+        let order = Arc::new(AtomicU64::new(0));
+        let first_waker = core::task::Waker::from(Arc::new(OrderedWake {
+            marker: 1,
+            order: Arc::clone(&order),
+        }));
+        let second_waker = core::task::Waker::from(Arc::new(OrderedWake {
+            marker: 2,
+            order: Arc::clone(&order),
+        }));
+        if crate::sysvipc::register_sem_wait_waker(FIRST, first_waker)
+            != crate::sysvipc::SemParkState::Pending
+            || crate::sysvipc::register_sem_wait_waker(SECOND, second_waker)
+                != crate::sysvipc::SemParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("batch waiters rejected durable waker registration");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 2)) != Some(0) {
+            return Err("SETVAL failed to complete the waiter batch");
+        }
+        if order.load(Ordering::Relaxed) != 12 {
+            return Err("batched semaphore wakes did not preserve handoff order");
+        }
+
+        for task in [FIRST, SECOND] {
+            set_task(task);
+            if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+                set_task(FAKE_TASK);
+                return Err("batched waiter did not consume cached success");
+            }
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("batched semaphore operations were not committed atomically");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order
+);
+
 fn smoke_abi_ipc_sem_queue_timeout_and_undo_handoff() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
