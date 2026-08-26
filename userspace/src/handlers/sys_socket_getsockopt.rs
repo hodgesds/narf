@@ -10,11 +10,13 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     let name = args.arg2 as u32;
     let val_ptr = args.arg3;
     let len_ptr = args.arg4;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux __sys_getsockopt: sockfd_lookup_light → -EBADF / -ENOTSOCK, then
+    // -EFAULT for a faulting optval/optlen, then the option handler's errno
+    // (-ENOPROTOOPT for an unknown option, -EINVAL, …).
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -50,7 +52,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         };
         if copy_len > 0 {
             if validate_user_range(val_ptr, copy_len).is_err() {
-                ctx.set_return(fail);
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                 return;
             }
             let mut buf = alloc::vec![0u8; copy_len];
@@ -66,8 +68,18 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    if val_ptr == 0 || in_len == 0 {
-        ctx.set_return(fail);
+    if val_ptr == 0 {
+        // Linux: the option handler copies the value into optval; a NULL buffer
+        // faults → -EFAULT.
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        return;
+    }
+    if in_len == 0 {
+        // LINUX-GAP: an int option in sk_getsockopt clamps `len = min(len,
+        // sizeof(int))`, copies 0 bytes and returns 0 for optlen==0; NARF's
+        // generic getsockopt can't satisfy an unsized query, so it rejects.
+        // -EINVAL (optlen too small to hold the value) is the closest errno.
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     // Optional Unix-peer metadata needs a typed "protocol option unavailable"
@@ -86,7 +98,7 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     // Validate the output range before allocating — prevents OOM from a
     // user-supplied in_len larger than MAX_USER_COPY.
     if validate_user_range(val_ptr, in_len).is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     let mut buf = alloc::vec![0u8; in_len];
@@ -162,6 +174,6 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }

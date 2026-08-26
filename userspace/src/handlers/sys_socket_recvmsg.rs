@@ -7,16 +7,17 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
     let fd = args.arg0 as u32;
     let msg_ptr = args.arg1;
     let flags = args.arg2 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux __sys_recvmsg: sockfd_lookup_light → -EBADF / -ENOTSOCK, then
+    // ___sys_recvmsg's copy_msghdr_from_user faults on a NULL/bad msg → -EFAULT.
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
     if msg_ptr == 0 {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     // read_user_u64/u32 use SMAP bracket internally.
@@ -165,6 +166,6 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }
