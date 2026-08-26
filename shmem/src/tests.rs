@@ -264,6 +264,73 @@ fn smoke_shmem_unknown_handle_accessors_return_none() -> TestResult {
 }
 kernel_test_in!("shmem", smoke_shmem_unknown_handle_accessors_return_none);
 
+fn smoke_shmem_lock_state_tracks_backing_frames() -> TestResult {
+    use crate::{__reset_for_test, create, destroy, frames_of, syscall_vtable};
+    __reset_for_test();
+    let handle = create(8000, 4096).expect("create locked backing");
+    let phys = frames_of(handle).expect("locked backing frames")[0].raw();
+    let vtable = syscall_vtable();
+    if (vtable.frame_locked)(phys) {
+        let _ = destroy(handle);
+        return TestResult::Fail("fresh shmem backing started locked");
+    }
+    if (vtable.lock)(handle, 7, 1000, 4096, false).is_err() || !(vtable.frame_locked)(phys) {
+        let _ = destroy(handle);
+        return TestResult::Fail("SHM_LOCK state did not reach the backing frame");
+    }
+    if !(vtable.unlock)(handle) || (vtable.frame_locked)(phys) {
+        let _ = destroy(handle);
+        return TestResult::Fail("SHM_UNLOCK state did not leave the backing frame");
+    }
+    if (vtable.lock)(handle, 7, 1000, 4096, false).is_err() {
+        let _ = destroy(handle);
+        return TestResult::Fail("first per-user SHM_LOCK charge failed");
+    }
+    let second = create(8000, 4096).expect("second locked backing");
+    if (vtable.lock)(second, 7, 1000, 4096, false)
+        != Err(narf_userspace::handlers::ShmemLockError::Limit)
+    {
+        let _ = destroy(handle);
+        let _ = destroy(second);
+        return TestResult::Fail("per-user SHM_LOCK accounting exceeded its limit");
+    }
+    let _ = destroy(handle);
+    if (vtable.lock)(second, 7, 1000, 4096, false).is_err() {
+        let _ = destroy(second);
+        return TestResult::Fail("destroy did not release the SHM_LOCK user charge");
+    }
+    let _ = destroy(second);
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_lock_state_tracks_backing_frames);
+
+fn smoke_shmem_removed_lock_charge_survives_alias() -> TestResult {
+    use crate::{__reset_for_test, create, destroy, frames_of, syscall_vtable};
+    __reset_for_test();
+    let vtable = syscall_vtable();
+    let first = create(8003, 4096).expect("first backing");
+    let first_phys = frames_of(first).expect("first frames")[0].raw();
+    (vtable.retain_frame)(first_phys);
+    if (vtable.lock)(first, 9, 1001, 4096, false).is_err() || !destroy(first) {
+        return TestResult::Fail("setup removed locked alias");
+    }
+
+    let second = create(8003, 4096).expect("second backing");
+    if (vtable.lock)(second, 9, 1001, 4096, false)
+        != Err(narf_userspace::handlers::ShmemLockError::Limit)
+    {
+        return TestResult::Fail("IPC_RMID released a live alias's lock charge");
+    }
+    (vtable.release_frame)(first_phys);
+    if (vtable.lock)(second, 9, 1001, 4096, false).is_err() {
+        return TestResult::Fail("final alias release retained the lock charge");
+    }
+    let _ = destroy(second);
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("shmem", smoke_shmem_removed_lock_charge_survives_alias);
+
 fn smoke_shmem_handle_id_monotonic() -> TestResult {
     // create() hands out monotonically-increasing handle ids; the
     // counter survives destroy().
