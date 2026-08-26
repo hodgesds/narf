@@ -8,7 +8,11 @@ pub(crate) fn sys_readlink(ctx: &mut dyn TrapContext) {
     // NARF-native shape used arg1 as path_len.
     let path_ptr = args.arg0;
     let buf_ptr = args.arg1 as *mut u8;
-    let buf_len = args.arg2 as usize;
+    // `SYSCALL_DEFINE4(readlinkat, ..., int, bufsiz)` — the size is a
+    // 32-bit signed int, so the upper half of the register is not part of
+    // it and a negative value must stay negative for the -EINVAL gate in
+    // `do_readlinkat`.
+    let buf_len = args.arg2 as u32 as i32 as i64;
     let raw = match copy_user_cstr(path_ptr, 4096) {
         Some(s) => s,
         None => {

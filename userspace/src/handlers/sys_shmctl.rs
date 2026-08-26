@@ -52,7 +52,21 @@ fn shm_ids_from_user(uid: u32, gid: u32) -> Result<(u32, u32), ()> {
     Ok((uid, gid))
 }
 
-type ShmStatSnapshot = (u32, u32, u32, u32, u32, u32, u64, i64, i64, i64, u64, u64, u64);
+type ShmStatSnapshot = (
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u64,
+    i64,
+    i64,
+    i64,
+    u64,
+    u64,
+    u64,
+);
 
 fn encode_shm_stat(snapshot: ShmStatSnapshot) -> [u8; SHMID64_SIZE] {
     let (uid, gid) = shm_ids_to_user(snapshot.1, snapshot.2);
@@ -83,13 +97,53 @@ fn encode_shm_stat(snapshot: ShmStatSnapshot) -> [u8; SHMID64_SIZE] {
 }
 
 /// `shmctl(shmid, cmd, buf)` for the native 64-bit Linux ABI.
+///
+/// `ipc/shm.c::ksys_shmctl` screens both `int` arguments before it looks at
+/// `cmd`, then dispatches; the mutating commands resolve the id through
+/// `ipc/util.c::ipcctl_obtain_check`, and the locking commands run their own
+/// privilege ladder in `ipc/shm.c::shmctl_do_lock`:
+///
+/// ```text
+///   ksys_shmctl:  if (cmd < 0 || shmid < 0) return -EINVAL;
+///                 switch (cmd) { ...  default: return -EINVAL; }
+///
+///   ipcctl_obtain_check:                    /* IPC_SET, IPC_RMID */
+///     int err = -EPERM;
+///     ipcp = ipc_obtain_object_check(ids, id);   /* -EINVAL: no such id */
+///     if (uid_eq(euid, ipcp->cuid) || uid_eq(euid, ipcp->uid) ||
+///         ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+///             return ipcp;                       /* successful lookup */
+///     return ERR_PTR(err);                       /* -EPERM */
+///
+///   shmctl_do_lock:                              /* SHM_LOCK, SHM_UNLOCK */
+///     if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+///         if (!uid_eq(euid, shp->shm_perm.uid) &&
+///             !uid_eq(euid, shp->shm_perm.cuid))         { err = -EPERM; }
+///         if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) { err = -EPERM; }
+///     }
+/// ```
+///
+/// The four refusals below are the one place in this family where a bare
+/// `-1` is already the right wire value — Linux genuinely answers -EPERM —
+/// so they are spelled out rather than left looking like the unset sentinel.
+/// The distinction is load-bearing for cleanup tools: `ipcrm`-style callers
+/// branch three ways on IPC_RMID, where -EINVAL means the segment is already
+/// gone (nothing to do, keep going), -EPERM means it exists but belongs to
+/// somebody else (report it), and -EACCES cannot occur at all because
+/// IPC_RMID/IPC_SET/SHM_LOCK consult ownership, never the mode bits. Only
+/// the read-only IPC_STAT/SHM_STAT path goes through `ipcperms()` and can
+/// answer -EACCES, so a caller that sees EACCES from IPC_RMID learns that
+/// the emulation, not the segment, is wrong.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let signed_shmid = a.arg0 as u32 as i32;
     let signed_cmd = a.arg1 as u32 as i32;
+    // `if (cmd < 0 || shmid < 0) return -EINVAL;` — both are C ints, so this
+    // screens the low 32 bits of each register, not the whole thing, and it
+    // runs ahead of the dispatch: a negative shmid outranks an unknown cmd.
     if signed_shmid < 0 || signed_cmd < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let shmid = signed_shmid as u32 as u64;
@@ -144,20 +198,20 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                     .fold(
                         (0u32, 0u64, 0u64, 0u64),
                         |(ids, pages, rss, max_id), ((_, id), seg)| {
-                        (
-                            ids.saturating_add(u32::from(!seg.removed)),
-                            pages.saturating_add(seg.len.div_ceil(4096)),
-                            rss.saturating_add(if seg.removed {
-                                0
-                            } else {
-                                seg.len.div_ceil(4096)
-                            }),
-                            if seg.removed {
-                                max_id
-                            } else {
-                                core::cmp::max(max_id, *id)
-                            },
-                        )
+                            (
+                                ids.saturating_add(u32::from(!seg.removed)),
+                                pages.saturating_add(seg.len.div_ceil(4096)),
+                                rss.saturating_add(if seg.removed {
+                                    0
+                                } else {
+                                    seg.len.div_ceil(4096)
+                                }),
+                                if seg.removed {
+                                    max_id
+                                } else {
+                                    core::cmp::max(max_id, *id)
+                                },
+                            )
                         },
                     )
             };
@@ -165,8 +219,8 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             shm_put_u32(&mut out, 0, used_ids);
             shm_put_u64(&mut out, 8, total_pages);
             shm_put_u64(&mut out, 16, resident_pages); // live backing is resident
-            // shm_swp, swap_attempts, and swap_successes remain zero.
-            // SAFETY: Linux snapshots namespace usage before copyout.
+                                                       // shm_swp, swap_attempts, and swap_successes remain zero.
+                                                       // SAFETY: Linux snapshots namespace usage before copyout.
             if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             } else {
@@ -183,11 +237,17 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                     .and_then(|map| map.get(&object))
                     .filter(|seg| !seg.removed)
                 else {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                     return;
                 };
+                // `err = -EACCES; if (ipcperms(ns, &shp->shm_perm, S_IRUGO))`.
+                // This is the only shmctl command family that consults the
+                // mode bits, hence the only one that can answer -EACCES; the
+                // reader learns "the segment exists but is not yours to read"
+                // rather than the -EPERM the mutating commands use for "not
+                // yours to change". SHM_STAT_ANY deliberately skips it.
                 if cmd != SHM_STAT_ANY && !shm_ipc_allowed(seg, 0o4) {
-                    ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                    ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
                     return;
                 }
                 (
@@ -235,17 +295,23 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 .and_then(|map| map.get_mut(&object))
                 .filter(|seg| !seg.removed)
             else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                // ipc_obtain_object_check: the id names nothing (IPC_RMID
+                // unpublishes the id, so a reaped segment lands here too).
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                 return;
             };
             if !shm_ipc_owner(seg) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // ipcctl_obtain_check's pre-seeded err: not owner, not
+                // creator, no CAP_SYS_ADMIN. Ownership, not the mode bits.
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
                 return;
             }
+            // ipc_update_perm rejects ids the caller's user namespace cannot
+            // express, and it does so *after* the ownership check above.
             let (uid, gid) = match shm_ids_from_user(uid, gid) {
                 Ok(ids) => ids,
                 Err(()) => {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                     return;
                 }
             };
@@ -263,20 +329,27 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 .and_then(|map| map.get_mut(&object))
                 .filter(|seg| !seg.removed)
             else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                // shm_obtain_object_check failed.
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                 return;
             };
             if !shm_ipc_owner(seg) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // Neither CAP_IPC_LOCK nor uid/cuid: -EPERM, never -EACCES.
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
                 return;
             }
             let privileged = current_ucred().uid == 0;
+            // `cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)`. A zero memlock
+            // limit is an authority failure, not an accounting one, so it is
+            // -EPERM here and -ENOMEM further down once shmem_lock charges a
+            // non-zero limit — callers back off on one and give up on the
+            // other.
             if cmd == SHM_LOCK && !privileged && !can_do_mlock(authority) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
                 return;
             }
             let Some(vtable) = shmem_vtable() else {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                 return;
             };
             let locked = cmd == SHM_LOCK;
@@ -321,11 +394,14 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 let mut segments = SHM_SEGMENTS.lock();
                 let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
                 let Some(seg) = map.get_mut(&object).filter(|seg| !seg.removed) else {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    // Already reaped, or never existed: `ipc_rmid()` drops the
+                    // id from the IDR immediately, so a second IPC_RMID sees
+                    // -EINVAL rather than -EIDRM even while attachments live.
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                     return;
                 };
                 if !shm_ipc_owner(seg) {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
                     return;
                 }
                 seg.removed = true;
@@ -343,6 +419,9 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        // ksys_shmctl's `default:`. The native entry point does *not* strip
+        // IPC_64, so `IPC_STAT | IPC_64` is an unknown command here exactly
+        // as it is on Linux; only the ipc(2) multiplexer parses that tag.
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL
     }
 }

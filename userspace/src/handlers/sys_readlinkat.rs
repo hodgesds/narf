@@ -8,7 +8,11 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let buf_ptr = args.arg2 as *mut u8;
-    let buf_len = args.arg3 as usize;
+    // `SYSCALL_DEFINE4(readlinkat, ..., int, bufsiz)` — the size is a
+    // 32-bit signed int, so the upper half of the register is not part of
+    // it and a negative value must stay negative for the -EINVAL gate in
+    // `do_readlinkat`.
+    let buf_len = args.arg3 as u32 as i32 as i64;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {

@@ -1,15 +1,52 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Ops NARF does not implement but that Linux's `do_futex` still
+/// recognises. They are named here only for the two checks that run
+/// BEFORE the dispatch switch — which ops carry a `struct timespec *`
+/// (`futex_cmd_has_timeout`) and which may carry `FUTEX_CLOCK_REALTIME`.
+/// Getting those sets wrong changes the errno an unimplemented op
+/// reports, which is what a libc feature probe reads.
+const FUTEX_LOCK_PI: u64 = 6;
+const FUTEX_WAIT_REQUEUE_PI: u64 = 11;
+const FUTEX_LOCK_PI2: u64 = 13;
+
+/// `kernel/futex/syscalls.c::SYSCALL_DEFINE6(futex)` → `do_futex()`.
+///
+/// The errno a futex op returns is not advisory — glibc's and musl's
+/// mutex/condvar fast paths branch on it. `EAGAIN` means "the word moved
+/// under me, re-read it and retry", `ETIMEDOUT` means "the deadline won",
+/// `EINVAL` means "this call is malformed, stop", and `ENOSYS` means
+/// "fall back to the older op". Reporting the bare `-1` sentinel makes
+/// every one of them arrive as `EPERM`, which no locking fast path knows
+/// how to interpret — it does not slow locking down, it breaks it.
+///
+/// Order of the pre-dispatch checks, exactly as Linux stages them:
+///   1. `SYSCALL_DEFINE6(futex)` decodes `utime` for the ops that take a
+///      timeout, so `-EFAULT`/`-EINVAL` from a bad timespec beats
+///      everything `do_futex` would say about the op itself.
+///   2. `do_futex`: `if (flags & FLAGS_CLOCKRT) { if (cmd != ...) return
+///      -ENOSYS; }` — `FUTEX_CLOCK_REALTIME` is only defined for the ops
+///      that take an ABSOLUTE deadline.
+///   3. the dispatch switch; anything unrecognised falls out the bottom
+///      as `return -ENOSYS`.
 pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
+    const EAGAIN: i64 = 11;
+    const EFAULT: i64 = 14;
+    const EINVAL: i64 = 22;
+    const ENOSYS: i64 = 38;
+    const ETIMEDOUT: i64 = 110;
     let args = *ctx.args();
     let uaddr = args.arg0;
-    let raw_op = args.arg1;
+    // Linux declares the op as `int`, so only the low 32 bits ever reach
+    // `do_futex`. Masking the full 64-bit register instead would turn a
+    // caller that left junk in the upper half (a sign-extended `int` in a
+    // hand-written stub is the usual source) into an unrecognised op.
+    let raw_op = args.arg1 as u32 as u64;
     let namespace = futex_namespace((raw_op & FUTEX_PRIVATE) != 0);
     let key = futex_key(namespace, uaddr);
-    let op = raw_op & FUTEX_OP_MASK;
+    let cmd = raw_op & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     // Start each futex op from clean park state so a stale `futex_uaddr` left
     // by a prior wait (e.g. a wake that cleared only the deadline) can't make
     // the poll routine re-register on the old word.
@@ -20,21 +57,82 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             (*uctx).futex_namespace.store(0, Ordering::Release);
         }
     }
+    // Step 1: the timespec is decoded in the syscall wrapper, before
+    // `do_futex` sees the op. `futex_init_timeout` treats FUTEX_WAIT's
+    // timespec as a RELATIVE duration and every other timeout-carrying
+    // op's as an ABSOLUTE deadline; `timespec64_valid` rejects a negative
+    // `tv_sec` or an out-of-range `tv_nsec` with -EINVAL, and a faulting
+    // `utime` is -EFAULT.
+    let realtime = (raw_op & FUTEX_CLOCK_REALTIME) != 0;
+    let has_timeout = matches!(
+        cmd,
+        FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_REQUEUE_PI
+    );
+    let deadline = if has_timeout && args.arg3 != 0 {
+        match futex_timeout_deadline(args.arg3, cmd != FUTEX_WAIT, realtime) {
+            Ok(d) => d,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    // Step 2: `FUTEX_CLOCK_REALTIME` on an op that has no absolute
+    // deadline to reinterpret is -ENOSYS, NOT a silently ignored bit.
+    // glibc probes exactly this: `futex_abstimed_wait` issues
+    // FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME and treats ENOSYS as "this
+    // kernel is too old, convert to a relative FUTEX_WAIT instead". A
+    // kernel that accepts the bit everywhere hides the probe; one that
+    // answers EPERM makes the probe look like a permission failure.
+    if realtime
+        && !matches!(
+            cmd,
+            FUTEX_WAIT_BITSET | FUTEX_LOCK_PI2 | FUTEX_WAIT_REQUEUE_PI
+        )
+    {
+        ctx.set_return(SyscallReturn::ok((-ENOSYS) as u64));
+        return;
+    }
+    // `futex_wake()` and `__futex_wait()` both open with
+    // `if (!bitset) return -EINVAL;` — BEFORE `get_futex_key`, so an empty
+    // bitset outranks a misaligned address and a stale value alike. Only
+    // the _BITSET ops read `val3`: `do_futex` overwrites it with
+    // FUTEX_BITSET_MATCH_ANY for plain FUTEX_WAIT/FUTEX_WAKE, which is why
+    // those must not be checked (their arg5 is whatever the caller left in
+    // r9 for a 4-argument syscall stub).
+    if matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET) && args.arg5 as u32 == 0 {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    // `get_futex_key()`: "The futex address must be naturally aligned" —
+    // `if (unlikely((address % size) != 0)) return -EINVAL;`, and only
+    // then `if (!access_ok(...)) return -EFAULT;`. So a misaligned word is
+    // EINVAL, never EFAULT: a caller that mis-lays out its lock struct
+    // must be able to tell "your pointer is skewed" (a bug it has to fix)
+    // apart from "that page went away" (which a retry can resolve).
+    let aligned = |p: u64| p % 4 == 0;
     // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
     // queue (the bitmask only narrows WHICH wakes match; a superset wake is
     // safe and musl/glibc pass MATCH_ANY). Its timeout remains distinct:
     // WAIT_BITSET takes an absolute deadline while WAIT takes a relative
-    // duration, as decoded below.
-    let wait_bitset = op == FUTEX_WAIT_BITSET;
-    let op = if wait_bitset {
+    // duration, as decoded above.
+    let op = if cmd == FUTEX_WAIT_BITSET {
         FUTEX_WAIT
-    } else if op == FUTEX_WAKE_BITSET {
+    } else if cmd == FUTEX_WAKE_BITSET {
         FUTEX_WAKE
     } else {
-        op
+        cmd
     };
     match op {
         FUTEX_WAKE_OP => {
+            // `futex_wake_op` keys BOTH words, so either one being skewed
+            // is -EINVAL before any of the RMW work happens.
+            if !aligned(uaddr) || !aligned(args.arg4) {
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                return;
+            }
             let r = futex_wake_op(
                 namespace,
                 uaddr,
@@ -47,18 +145,23 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         }
         FUTEX_WAIT => {
             // REAL blocking futex. Sample *uaddr; if it already differs from
-            // `val`, the wait condition no longer holds — return 0 (caller's
-            // fast path observes the change). Else register on the per-uaddr
-            // wait queue and PARK until a `FUTEX_WAKE` on this word fires our
-            // waker (or, with a timeout, until it expires) — NOT a fixed
-            // nanosleep. The poll routine (`UserTaskFuture::poll`) does the
-            // actual waker registration (it owns `cx.waker()`); here we just
-            // publish the uaddr + a wake-counter snapshot for its lost-wakeup
-            // guard and hand control back via the yield hook. On resume the
-            // user reads RAX=0 and musl's recheck loop re-evaluates the word.
-            //
+            // `val`, the wait condition no longer holds — return -EAGAIN
+            // (Linux `futex_wait_setup`: `if (uval != val) return
+            // -EWOULDBLOCK;`). Else register on the per-uaddr wait queue and
+            // PARK until a `FUTEX_WAKE` on this word fires our waker (or,
+            // with a timeout, until it expires) — NOT a fixed nanosleep. The
+            // poll routine (`UserTaskFuture::poll`) does the actual waker
+            // registration (it owns `cx.waker()`); here we just publish the
+            // uaddr + a wake-counter snapshot for its lost-wakeup guard and
+            // hand control back via the yield hook. On resume the user reads
+            // RAX=0 and musl's recheck loop re-evaluates the word.
+            if !aligned(uaddr) {
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                return;
+            }
             // Null uaddr: no wait queue — immediate (POSIX-permitted) spurious
             // wake so wake-path smokes run without a backing mapping.
+            // LINUX-GAP: Linux would fault the read and answer -EFAULT.
             if uaddr == 0 {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
@@ -78,7 +181,11 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             }) {
                 Some(x) => x,
                 None => {
-                    ctx.set_return(fail);
+                    // `futex_wait_setup` retries the read outside the hash
+                    // bucket via `get_user`, and reports its failure as
+                    // -EFAULT. A caller whose lock page was reclaimed can
+                    // fault it back in and retry; -EPERM told it to give up.
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                     return;
                 }
             };
@@ -87,7 +194,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                 // EAGAIN. Returning success here makes pthread state machines
                 // treat a wait that never happened as an actual wake, which
                 // can lose the subsequent handoff.
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64));
+                ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
                 return;
             }
             // Deadline: a real timeout when one was supplied (wakes at the
@@ -95,20 +202,9 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // (`u64::MAX`) — the poll routine parks on the timer wheel with a
             // one-tick fallback as a lost-wake safety net, but the primary
             // wake is the registered futex waker.
-            let deadline = match futex_timeout_deadline(
-                args.arg3,
-                wait_bitset,
-                (raw_op & FUTEX_CLOCK_REALTIME) != 0,
-            ) {
-                Ok(None) => u64::MAX,
-                Ok(Some(deadline)) => deadline,
-                Err(errno) => {
-                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
-                    return;
-                }
-            };
+            let deadline = deadline.unwrap_or(u64::MAX);
             if deadline <= narf_scheduler::narf_time::monotonic_ns() {
-                ctx.set_return(SyscallReturn::ok((-110i64) as u64)); // ETIMEDOUT
+                ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
                 return;
             }
             if let (Some(uctx), Some(hook)) = (
@@ -147,6 +243,10 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // waiters' wakers. Returns the number actually woken (Linux
             // contract). A waiter not yet registered when we fire is caught
             // by the gen guard on its next poll.
+            if !aligned(uaddr) {
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                return;
+            }
             futex_bump_counter_key(key);
             let woken = futex_wake_waiters_key(key, val);
             ctx.set_return(SyscallReturn::ok(woken as u64));
@@ -157,9 +257,21 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // onto uaddr2. CMP_REQUEUE first requires `*uaddr == val3`
             // (-EAGAIN otherwise; Linux futex(2)). Linux returns the count
             // WOKEN for REQUEUE, woken + requeued for CMP_REQUEUE.
-            const EAGAIN: i64 = 11;
-            const EFAULT: i64 = 14;
+            //
+            // `futex_requeue()` order: the two counts, then key1, then
+            // key2, then the compare. Both counts are `int`, and a
+            // negative one is -EINVAL up front — a caller that passed
+            // INT_MAX+1 through an `unsigned` variable must learn that the
+            // request was malformed, not watch it silently wake everybody.
             let uaddr2 = args.arg4;
+            if (args.arg2 as i32) < 0 || (args.arg3 as i32) < 0 {
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                return;
+            }
+            if !aligned(uaddr) || !aligned(uaddr2) {
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                return;
+            }
             if uaddr2 == 0 {
                 ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                 return;
@@ -202,6 +314,11 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             };
             ctx.set_return(SyscallReturn::ok(r as u64));
         }
-        _ => ctx.set_return(fail),
+        // `do_futex` falls off the end of its switch with `return -ENOSYS`
+        // — that includes the PI ops NARF does not implement. ENOSYS is
+        // the word libc probes look for when they decide to fall back to
+        // an older op; the bare -1 sentinel reached them as EPERM, which
+        // reads as "you are not allowed to lock", not "try another way".
+        _ => ctx.set_return(SyscallReturn::ok((-ENOSYS) as u64)),
     }
 }

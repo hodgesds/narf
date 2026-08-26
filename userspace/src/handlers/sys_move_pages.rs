@@ -73,29 +73,51 @@ fn migrate_registry_shared_page(
 /// `move_pages(pid, count, pages, nodes, status, flags)` — query or move
 /// pages across NUMA nodes. A null `nodes` array is the Linux query form:
 /// each status entry reports the SRAT node backing that virtual page.
+///
+/// `mm/migrate.c::kernel_move_pages`, then `find_mm_struct`:
+///
+/// ```text
+///     if (flags & ~(MPOL_MF_MOVE|MPOL_MF_MOVE_ALL))        return -EINVAL;
+///     if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE)) return -EPERM;
+///     mm = find_mm_struct(pid, &task_nodes);
+///         if (!pid) return current->mm;
+///         task = find_get_task_by_vpid(pid);
+///         if (!task)                          return ERR_PTR(-ESRCH);
+///         if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS))
+///                                             mm = ERR_PTR(-EPERM);
+///     ... then do_pages_move()/do_pages_stat() read `pages`/`status`  /* -EFAULT */
+/// ```
+///
+/// Two things follow that this handler used to get wrong.
+///
+/// **ESRCH vs EPERM for an unresolvable pid.** `numactl`, `migratepages`, and
+/// every NUMA autobalancer scanning `/proc` hit dead pids constantly; ESRCH is
+/// "skip it", EPERM is "you lack CAP_SYS_NICE" and aborts the sweep.
+///
+/// **The target task is resolved before the page/status arrays are touched**,
+/// so a stale pid beats a null `pages` pointer. Checking the pointers first
+/// answered EFAULT for a request Linux answers ESRCH.
+///
+/// `flags` is an `int`: only the low 32 bits are the caller's request, so a
+/// caller whose libc wrapper leaves junk in the high half of `r9` must not be
+/// told its flags are invalid.
 pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let count = a.arg1 as usize;
     let pages_ptr = a.arg2;
     let nodes_ptr = a.arg3;
     let status_ptr = a.arg4;
-    let flags = a.arg5;
-    const MPOL_MF_MOVE: u64 = 1 << 1;
-    const MPOL_MF_MOVE_ALL: u64 = 1 << 2;
+    let flags = a.arg5 as u32;
+    const MPOL_MF_MOVE: u32 = 1 << 1;
+    const MPOL_MF_MOVE_ALL: u32 = 1 << 2;
+    // LINUX-GAP: Linux has no cap on `count` (it chunks the arrays); NARF
+    // bounds it so one call cannot ask for an unbounded kernel allocation.
     if count > (1 << 20) || flags & !(MPOL_MF_MOVE | MPOL_MF_MOVE_ALL) != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
     if flags & MPOL_MF_MOVE_ALL != 0 {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: no root/ambient privilege.
-        return;
-    }
-    if count == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if pages_ptr == 0 || status_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
         return;
     }
     let task = current_task_id();
@@ -107,11 +129,35 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
     if a.arg0 != 0 {
         match accept_pid_from(task, a.arg0) {
             Some(outer) if outer == task || outer == visible_pid => {}
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: foreign process.
+            // The pid did not resolve in the caller's namespace at all.
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+            // It resolved to some outer id: ESRCH only if no task answers to
+            // it (find_task_by_vpid returned NULL), otherwise the
+            // ptrace_may_access denial, which is EPERM. Same existence probe
+            // sys_sched_getaffinity uses.
+            //
+            // LINUX-GAP: NARF cannot address a foreign mm here, so every live
+            // task other than the caller is refused rather than credential-
+            // checked; Linux would let a privileged caller through.
+            Some(outer) => {
+                let live = pid_to_task_raw(outer).is_some()
+                    || narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).is_some();
+                let errno: i64 = if live { 1 } else { 3 }; // EPERM : ESRCH
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
                 return;
             }
         }
+    }
+    if count == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if pages_ptr == 0 || status_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
     }
     let Some(as_ref) = current_address_space() else {
         ctx.set_return(SyscallReturn::invalid_op());

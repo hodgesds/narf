@@ -1,14 +1,54 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `include/uapi/linux/shm.h`: shmget-only flag bit, distinct from the
+/// shmat-side SHM_* values already shared by the handler module.
+#[cfg(feature = "linux-compat")]
+const SHM_HUGETLB: u64 = 0o4000;
+
 /// `shmget(key, size, shmflg)` — create or look up a shared segment with
 /// real frame backing.
+///
+/// `ipc/shm.c::ksys_shmget` hands straight to `ipc/util.c::ipcget`, which
+/// splits on IPC_PRIVATE and fixes the order in which the lookup path's three
+/// failures win:
+///
+/// ```text
+///   ipcget_public:
+///     ipcp = ipc_findkey(ids, key);
+///     if (ipcp == NULL) { if (!(flg & IPC_CREAT)) err = -ENOENT;
+///                         else err = ops->getnew(ns, params); }
+///     else { if (flg & IPC_CREAT && flg & IPC_EXCL) err = -EEXIST;
+///            else { err = shm_more_checks(ipcp, params);   /* -EINVAL */
+///                   if (!err) err = ipc_check_perms(...);  /* -EACCES */ } }
+///
+///   newseg:                                       /* the IPC_CREAT path */
+///     if (size < SHMMIN || size > ns->shm_ctlmax)      return -EINVAL;
+///     if (numpages << PAGE_SHIFT < size)               return -ENOSPC;
+///     if (ns->shm_tot + numpages > ns->shm_ctlall)     return -ENOSPC;
+///     shp = kmalloc_obj(*shp, ...); if (!shp)          return -ENOMEM;
+///     if (shmflg & SHM_HUGETLB) {
+///         hs = hstate_sizelog((shmflg >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK);
+///         if (!hs) { error = -EINVAL; goto no_file; }
+///         ...
+///     }
+/// ```
+///
+/// Each of those four codes tells a caller something different and they are
+/// not substitutable: -ENOENT means "create it"; -EEXIST means "somebody beat
+/// me to it, drop IPC_EXCL and re-open"; -EINVAL on a found key means "the
+/// segment is smaller than I need, the two sides disagree about the layout";
+/// -EACCES means "it is there but not mine". A launcher that retries on
+/// -EEXIST would spin forever on a mis-reported -ENOENT.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
+    // key_t and shmflg are C ints; only `size` is a full-width size_t. Taking
+    // the whole register for shmflg would let junk in the upper half of a
+    // caller-saved argument slot reach the flag tests below.
     let key = a.arg0 as u32;
     let size = a.arg1;
-    let flg = a.arg2;
+    let flg = a.arg2 as u32 as u64;
     #[cfg(feature = "container")]
     let ipc_namespace = current_shm_ipc_ns();
     #[cfg(feature = "container")]
@@ -73,6 +113,20 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
     let shmall = SHMMNI as u64 * shmmax / 4096;
     if used_pages.saturating_add(requested_pages) > shmall || live_ids >= SHMMNI {
         ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // ENOSPC
+        return;
+    }
+    // `newseg`'s hugetlb branch, in Linux's order: after the size -EINVAL and
+    // both namespace -ENOSPC gates, before the backing file is set up. NARF
+    // has no huge-page backing, so it takes the `!hs` arm the way a kernel
+    // built without CONFIG_HUGETLB_PAGE does (`hstate_sizelog()` returns NULL
+    // there) and reports -EINVAL. Accepting the flag and quietly handing back
+    // a 4 KiB-backed segment is the worse divergence: a caller that asked for
+    // huge pages to bound its TLB footprint gets no error and no huge pages,
+    // and only discovers it as a performance mystery. Note this is reached
+    // only on the create path — Linux never inspects SHM_HUGETLB when
+    // `ipc_findkey` resolves an existing key.
+    if flg & SHM_HUGETLB != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
     // SysV segments belong to the IPC namespace, not to the creating

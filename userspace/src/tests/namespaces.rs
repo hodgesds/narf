@@ -480,12 +480,17 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
+    // A name that does not fit is -ENAMETOOLONG, which is what POSIX
+    // specifies and what glibc's uname-based gethostname reports. The `-1`
+    // sentinel this pinned reached userspace as EPERM — a privilege error for
+    // what is purely a buffer-size problem the caller can fix by retrying
+    // larger.
     let too_small_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-36i64) as u64,
     );
     if !too_small_rejected {
-        return TestResult::Fail("gethostname did not reject small buf");
+        return TestResult::Fail("gethostname with a small buf must return -ENAMETOOLONG");
     }
 
     crate::handlers::__test_hostname_reset();

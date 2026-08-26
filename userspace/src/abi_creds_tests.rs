@@ -386,11 +386,13 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_getresuid_pos);
 
 fn smoke_abi_creds_getresuid_neg() -> TestResult {
     with_setup(|| {
-        // First slot is a bad (non-canonical) pointer ⇒ copy_to_user fails
-        // ⇒ Ok(-1).
+        // `kernel/sys.c::SYSCALL_DEFINE3(getresuid)` is three chained `put_user`s
+        // and returns their result, so an unwritable out-pointer is -EFAULT.
+        // The `-1` sentinel said EPERM, which for a credential QUERY reads as
+        // "you may not ask" rather than "your pointer is bad".
         let r = call(Syscall::Getresuid.raw(), a2(BAD_PTR, 0, 0)).ok_or("getresuid not Ok")?;
-        if r != -1 {
-            return Err("getresuid(bad ptr) expected -1");
+        if r != EFAULT {
+            return Err("getresuid(bad ptr) must return -EFAULT");
         }
         Ok(())
     })
@@ -421,9 +423,11 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_getresgid_pos);
 
 fn smoke_abi_creds_getresgid_neg() -> TestResult {
     with_setup(|| {
+        // As `getresuid` above: `SYSCALL_DEFINE3(getresgid)` returns its
+        // `put_user` result, so an unwritable out-pointer is -EFAULT.
         let r = call(Syscall::Getresgid.raw(), a2(BAD_PTR, 0, 0)).ok_or("getresgid not Ok")?;
-        if r != -1 {
-            return Err("getresgid(bad ptr) expected -1");
+        if r != EFAULT {
+            return Err("getresgid(bad ptr) must return -EFAULT");
         }
         Ok(())
     })
@@ -514,6 +518,153 @@ fn smoke_abi_creds_setgroups_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_setgroups_neg);
 
+// ── getgroups / setgroups: argument width ────────────────────────────
+// `kernel/groups.c` declares `gidsetsize` as a signed `int` in both
+// calls. getgroups rejects a negative one outright; setgroups compares
+// it as `unsigned` against NGROUPS_MAX, which is what makes a negative
+// size EINVAL there. Either way only 32 bits are significant.
+
+fn smoke_abi_creds_getgroups_negative_size_neg() -> TestResult {
+    with_setup(|| {
+        let input = [10u32, 20];
+        if call(
+            Syscall::Setgroups.raw(),
+            a1(input.len() as u64, input.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setgroups setup failed");
+        }
+        // `if (gidsetsize < 0) return -EINVAL;` is the FIRST check. Reading
+        // the argument as a 64-bit register turned this into an enormous
+        // "size" that sailed past the `i > gidsetsize` bound and wrote the
+        // whole list into a buffer the caller never sized.
+        let mut out = [0u32; 4];
+        let p = out.as_mut_ptr() as u64;
+        if call(Syscall::Getgroups.raw(), a1((-1i32) as u32 as u64, p)) != Some(EINVAL) {
+            return Err("getgroups(-1, buf) must return -EINVAL");
+        }
+        if call(Syscall::Getgroups.raw(), a1(i32::MIN as u32 as u64, p)) != Some(EINVAL) {
+            return Err("getgroups(INT_MIN, buf) must return -EINVAL");
+        }
+        // Positive control: a roomy buffer still round-trips.
+        if call(Syscall::Getgroups.raw(), a1(4, p)) != Some(2) || out[..2] != input {
+            return Err("getgroups with a roomy buffer should still succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_getgroups_negative_size_neg);
+
+fn smoke_abi_creds_getgroups_empty_list_pos() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Setgroups.raw(), a1(0, NULL_PTR)) != Some(0) {
+            return Err("setgroups(0,NULL) setup failed");
+        }
+        // `groups_to_user()` copies exactly `ngroups` entries, so with no
+        // supplementary groups it never dereferences `grouplist` — this is
+        // a successful 0, not EFAULT.
+        if call(Syscall::Getgroups.raw(), a1(4, NULL_PTR)) != Some(0) {
+            return Err("getgroups(4,NULL) with an empty list should return 0");
+        }
+        if call(Syscall::Getgroups.raw(), a1(4, BAD_PTR)) != Some(0) {
+            return Err("getgroups(4,badptr) with an empty list should return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_getgroups_empty_list_pos);
+
+fn smoke_abi_creds_setgroups_size_width_pos() -> TestResult {
+    with_setup(|| {
+        // `(unsigned)gidsetsize > NGROUPS_MAX` reads 32 bits. A caller with
+        // junk in the upper half of the register asked for setgroups(0),
+        // and Linux honours it; the 64-bit read rejected it as EINVAL.
+        if call(Syscall::Setgroups.raw(), a1(1u64 << 32, NULL_PTR)) != Some(0) {
+            return Err("setgroups(0 with junk upper bits) should succeed");
+        }
+        if call(Syscall::Getgroups.raw(), a1(0, NULL_PTR)) != Some(0) {
+            return Err("setgroups should have cleared the group list");
+        }
+        // A negative size is still EINVAL (it compares as a huge unsigned).
+        if call(Syscall::Setgroups.raw(), a1((-1i32) as u32 as u64, BAD_PTR)) != Some(EINVAL) {
+            return Err("setgroups(-1) must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_setgroups_size_width_pos);
+
+// ── capset / capget: version handshake vs. EPERM vs. EFAULT ──────────
+// `kernel/capability.c`. EPERM is a LEGITIMATE answer from capset ("you
+// asked about another process"), so it must not double as the generic
+// failure value — and the version check runs BEFORE the data pointer is
+// touched, so a caller with a stale header learns that first and gets the
+// supported version written back.
+
+const CAP_VERSION_3: u32 = 0x2008_0522;
+
+fn smoke_abi_creds_capset_version_before_data_neg() -> TestResult {
+    with_setup(|| {
+        // `cap_validate_magic()` runs first: a bad version is -EINVAL with
+        // the header rewritten, even though `datap` is NULL and would
+        // otherwise be -EFAULT.
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        if call(Syscall::Capset.raw(), a1(hdr.as_mut_ptr() as u64, NULL_PTR)) != Some(EINVAL) {
+            return Err("capset(bad version, NULL data) must return -EINVAL, not -EFAULT");
+        }
+        if u32::from_le_bytes(hdr[..4].try_into().unwrap()) != CAP_VERSION_3 {
+            return Err("capset must write the supported version back into the header");
+        }
+        // With a good version, a null/faulting data pointer is -EFAULT.
+        hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+        if call(Syscall::Capset.raw(), a1(hdr.as_mut_ptr() as u64, NULL_PTR)) != Some(EFAULT) {
+            return Err("capset(v3, NULL data) must return -EFAULT");
+        }
+        if call(Syscall::Capset.raw(), a1(hdr.as_mut_ptr() as u64, BAD_PTR)) != Some(EFAULT) {
+            return Err("capset(v3, bad data) must return -EFAULT");
+        }
+        // …and a null header is -EFAULT before anything else.
+        if call(Syscall::Capset.raw(), a1(NULL_PTR, NULL_PTR)) != Some(EFAULT) {
+            return Err("capset(NULL header) must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_capset_version_before_data_neg
+);
+
+fn smoke_abi_creds_capget_negative_pid_neg() -> TestResult {
+    with_setup(|| {
+        // `if (pid < 0) return -EINVAL;` — the header pid is a signed
+        // `int`, and a negative one is malformed, not "some other task".
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+        hdr[4..].copy_from_slice(&(-1i32).to_le_bytes());
+        let mut data = [0u8; 24];
+        if call(
+            Syscall::Capget.raw(),
+            a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("capget with a negative header pid must return -EINVAL");
+        }
+        // Positive control: pid 0 (self) still round-trips.
+        hdr[4..].copy_from_slice(&0i32.to_le_bytes());
+        if call(
+            Syscall::Capget.raw(),
+            a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("capget(pid=0) should return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_capget_negative_pid_neg);
+
 // ── gethostname ──────────────────────────────────────────────────────
 // arg0 = buf, arg1 = len. Success ⇒ Ok(hostname byte length). buf==0 or
 // len==0 ⇒ Ok(-1); buf too small for name+NUL ⇒ Ok(-1).
@@ -539,18 +690,34 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_gethostname_pos);
 
 fn smoke_abi_creds_gethostname_neg() -> TestResult {
     with_setup(|| {
-        // len == 0 ⇒ Ok(-1) (the explicit early-out). LINUX-GAP: Linux
-        // returns -EINVAL/-ENAMETOOLONG, NARF returns the bare -1 shape.
+        // `kernel/sys.c::SYSCALL_DEFINE2(gethostname)` — a buffer with no
+        // room for name+NUL is -ENAMETOOLONG (the errno POSIX specifies,
+        // and the one glibc's uname()-based gethostname raises). As the
+        // bare -1 it reached libc as EPERM, so a caller running the
+        // standard grow-the-buffer-and-retry loop gave up instead of
+        // retrying with a bigger buffer.
         let mut buf = [0u8; 16];
         let p = buf.as_mut_ptr() as u64;
         let r = call(Syscall::GetHostname.raw(), a1(p, 0)).ok_or("gethostname not Ok")?;
-        if r != -1 {
-            return Err("gethostname(buf,0) expected -1");
+        if r != ENAMETOOLONG {
+            return Err("gethostname(buf,0) expected -ENAMETOOLONG");
         }
-        // NULL buffer ⇒ also -1.
-        let r2 = call(Syscall::GetHostname.raw(), a1(NULL_PTR, 16)).ok_or("gethostname not Ok")?;
-        if r2 != -1 {
-            return Err("gethostname(NULL,16) expected -1");
+        // `if (len < 0) return -EINVAL;` — and `len` is a signed `int`.
+        // Read as a 64-bit register, -1 became a colossal length that
+        // passed the fits-in-the-buffer test and wrote past the array.
+        let neg = call(Syscall::GetHostname.raw(), a1(p, (-1i32) as u32 as u64))
+            .ok_or("gethostname not Ok")?;
+        if neg != EINVAL {
+            return Err("gethostname(buf,-1) expected -EINVAL");
+        }
+        // A destination the copy cannot reach is -EFAULT.
+        let r2 = call(Syscall::GetHostname.raw(), a1(NULL_PTR, 64)).ok_or("gethostname not Ok")?;
+        if r2 != EFAULT {
+            return Err("gethostname(NULL,64) expected -EFAULT");
+        }
+        let r3 = call(Syscall::GetHostname.raw(), a1(BAD_PTR, 64)).ok_or("gethostname not Ok")?;
+        if r3 != EFAULT {
+            return Err("gethostname(BAD_PTR,64) expected -EFAULT");
         }
         Ok(())
     })

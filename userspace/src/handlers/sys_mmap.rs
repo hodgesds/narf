@@ -32,10 +32,25 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     const MAP_FIXED: u32 = 0x10;
     const MAP_ANONYMOUS: u32 = 0x20;
     const MAP_SHARED: u32 = 0x01;
+    const MAP_PRIVATE: u32 = 0x02;
+    const MAP_TYPE: u32 = 0x0f;
+    const MAP_SHARED_VALIDATE: u32 = 0x03;
     const MAP_LOCKED: u32 = 0x2000;
     const MAP_HUGETLB: u32 = 0x0004_0000;
+    const MAP_FIXED_NOREPLACE: u32 = 0x0010_0000;
     const MAP_HUGE_SHIFT: u32 = 26;
     const MAP_HUGE_MASK: u32 = 0x3f;
+    // do_mmap: "force arch specific MAP_FIXED handling in get_unmapped_area".
+    // MAP_FIXED_NOREPLACE is MAP_FIXED plus "fail instead of replacing"; used
+    // to be ignored outright here, so a loader asking for an exact base got a
+    // *different* base back with a success return, and — worse — a plain
+    // MAP_FIXED_NOREPLACE at an occupied address silently destroyed the
+    // mapping it was explicitly asking not to touch.
+    let flags = if flags & MAP_FIXED_NOREPLACE != 0 {
+        flags | MAP_FIXED
+    } else {
+        flags
+    };
     let anonymous = flags & MAP_ANONYMOUS != 0;
 
     // Both x86_64 and AArch64 reject a non-page-aligned byte offset in the
@@ -55,13 +70,42 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // ksys_mmap_pgoff resolves a non-anonymous fd before huge-flag and
     // do_mmap length/address validation. Thus EBADF wins over a zero length or
     // malformed MAP_FIXED address (but not over the arch offset check above).
-    if !anonymous
-        && (fd < 0
-            || fd::with_table(current_task_id(), |table| table.get(fd as u32).is_some())
-                != Some(true))
-    {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
-        return;
+    //
+    //     file = fget(fd);
+    //     if (!file) return -EBADF;
+    //
+    // `fget` masks out FMODE_PATH, so an O_PATH descriptor is "not a file" for
+    // mmap and reports EBADF — not EACCES/EINVAL. A caller that opened O_PATH
+    // to inspect a path and then tried to map it must be told the descriptor
+    // is unusable, which is what sends it back through a real open(2).
+    if !anonymous {
+        // `fget` returns NULL both for an unopened slot and for an O_PATH
+        // description (its FMODE_PATH is masked out), so both are EBADF.
+        let open_and_mappable = fd >= 0
+            && fd::with_table(current_task_id(), |table| {
+                table.get(fd as u32).is_some()
+                    && table
+                        .status_flags(fd as u32)
+                        .is_none_or(|status| status & crate::fd::O_PATH == 0)
+            }) == Some(true);
+        if !open_and_mappable {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            return;
+        }
+        // ksys_mmap_pgoff, immediately after fget:
+        //
+        //     if (is_file_hugepages(file)) { ... }
+        //     else if (unlikely(flags & MAP_HUGETLB)) { retval = -EINVAL; goto out_fput; }
+        //
+        // NARF has no hugetlbfs, so every fd takes the else branch. EINVAL
+        // ("MAP_HUGETLB needs an anonymous mapping or a hugetlbfs file") is a
+        // fixable-argument answer; the ENODEV this used to return means "the
+        // filesystem cannot be mapped at all" and makes a caller give up on
+        // the file rather than retry without MAP_HUGETLB.
+        if flags & MAP_HUGETLB != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
     }
 
     let huge_size = if flags & MAP_HUGETLB != 0 {
@@ -94,25 +138,37 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     };
 
+    // do_mmap's `if ((pgoff + (len >> PAGE_SHIFT)) < pgoff) return -EOVERFLOW;`
+    // has no reachable counterpart on this entry point: both x86_64 and
+    // AArch64 reach mmap through the byte-offset wrapper, which derives
+    // `pgoff = off >> PAGE_SHIFT` and so caps it at 2^52. The sum with
+    // `len >> PAGE_SHIFT` (also <= 2^52) cannot wrap an unsigned long. Only
+    // the raw-pgoff entry points (mmap2/mmap_pgoff) can reach it, and NARF
+    // exposes none.
+
     // Semantic failures must precede MAP_FIXED replacement: an invalid new
     // mapping never destroys the old one on Linux.
+    //
+    // LINUX-GAP: Linux serves MAP_SHARED|MAP_HUGETLB from hugetlbfs and
+    // succeeds; NARF has no shared huge backing, so it refuses explicitly.
     if huge_size.is_some() && flags & MAP_SHARED != 0 {
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
         return;
     }
-    if huge_size.is_some() && flags & MAP_ANONYMOUS == 0 && fd >= 0 {
-        ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // ENODEV
-        return;
-    }
 
-    // __get_unmapped_area rejects fixed misalignment with EINVAL, range
-    // overflow with ENOMEM, then security_mmap_addr applies the low-address
-    // policy. NARF's USER_FIXED_FLOOR is that policy boundary.
+    // __get_unmapped_area, in this order:
+    //
+    //     if (addr > TASK_SIZE - len)  return -ENOMEM;
+    //     if (offset_in_page(addr))    return -EINVAL;
+    //     error = security_mmap_addr(addr);   /* cap_mmap_addr => -EPERM */
+    //
+    // The range test wins over the alignment test. That is not cosmetic: a
+    // MAP_FIXED probe that walks candidate bases upward (JITs and sandboxes
+    // that place a fixed-address arena do exactly this) uses ENOMEM as "past
+    // the end, stop walking" and EINVAL as "my alignment arithmetic is
+    // broken, abort". Reporting EINVAL for a well-formed base that merely sat
+    // above the user half turned the first into the second.
     if flags & MAP_FIXED != 0 {
-        if hint & (page_size - 1) != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-            return;
-        }
         let fixed_in_range = hint
             .checked_add(len)
             .map(|end| end <= AddressSpace::USER_HALF_END)
@@ -121,8 +177,37 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
             return;
         }
+        if hint & (page_size - 1) != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+        // security_mmap_addr -> cap_mmap_addr: below mmap_min_addr this needs
+        // CAP_SYS_RAWIO, and the denial is EPERM. NARF's USER_FIXED_FLOOR is
+        // that policy boundary.
         if hint < AddressSpace::USER_FIXED_FLOOR {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            return;
+        }
+        //     if (flags & MAP_FIXED_NOREPLACE) {
+        //             if (find_vma_intersection(mm, addr, addr + len))
+        //                     return -EEXIST;
+        //     }
+        //
+        // EEXIST is the whole point of the flag: ld.so and the Go/Rust runtime
+        // reservation code use it to claim a specific base *without* the
+        // destructive replacement MAP_FIXED implies, and treat EEXIST as
+        // "someone else owns that base, pick another". Ignoring it made the
+        // probe destroy the mapping it was probing for.
+        //
+        // LINUX-GAP: perms_intersecting reports ordinary VMAs only, so a
+        // MAP_FIXED_NOREPLACE landing on an existing hugetlb mapping is not
+        // detected and still replaces it.
+        if flags & MAP_FIXED_NOREPLACE != 0
+            && !as_ref
+                .perms_intersecting(VirtAddr::new(hint), len)
+                .is_empty()
+        {
+            ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
             return;
         }
     }
@@ -130,6 +215,24 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let explicit_lock = flags & MAP_LOCKED != 0;
     if explicit_lock && !can_do_mlock(mlock_authority) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
+    // do_mmap's `switch (flags & MAP_TYPE)` — for both the file and the
+    // anonymous arm — ends in `default: return -EINVAL`. Only MAP_SHARED(1),
+    // MAP_PRIVATE(2) and MAP_SHARED_VALIDATE(3) are mapping types; anything
+    // else (including *no* type bit at all, the classic
+    // `mmap(NULL, n, prot, MAP_ANONYMOUS, -1, 0)` typo) is rejected.
+    //
+    // NARF used to treat every unrecognised type as private, so that typo
+    // produced a working private mapping here and a hard EINVAL on Linux —
+    // the divergence only shows up when the code is finally run on Linux.
+    //
+    // LINUX-GAP: MAP_DROPPABLE (MAP_TYPE 0x08) is a valid type on 64-bit
+    // Linux; NARF has no droppable backing, so it lands in this EINVAL rather
+    // than silently behaving like an ordinary private mapping.
+    let map_type = flags & MAP_TYPE;
+    if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
 
@@ -146,8 +249,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         shm_register_as_owner(as_key, lpid);
     }
     #[cfg(feature = "linux-compat")]
-    let shm_transaction =
-        (flags & MAP_FIXED != 0).then(|| shm_mapping_transaction(as_key));
+    let shm_transaction = (flags & MAP_FIXED != 0).then(|| shm_mapping_transaction(as_key));
     #[cfg(feature = "linux-compat")]
     let _shm_guard = shm_transaction
         .as_ref()
@@ -295,11 +397,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     .map(|&p| narf_memory::PhysAddr::new(p))
                     .collect();
                 let region = Region {
-                        base: VirtAddr::new(base),
-                        len,
-                        perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
-                        phys,
-                    };
+                    base: VirtAddr::new(base),
+                    len,
+                    perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
+                    phys,
+                };
                 let mapped = as_ref.with_vma_transaction(|| {
                     narf_memory::with_shared_mapping_transaction(|| {
                         crate::mapped_file::publish_current_mapping(
@@ -343,9 +445,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     Err(error) => {
                                         // SAFETY: VMA -> shared transactions
                                         // remain held by the enclosing scopes.
-                                        let _ = unsafe {
-                                            as_ref.rollback_mapping_locked(receipt)
-                                        };
+                                        let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
                                         Err(error)
                                     }
                                 }
@@ -387,18 +487,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // page-table slots.
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
                 let region = Region {
-                        base: VirtAddr::new(base),
-                        len,
-                        // SHARED: the frames belong to the file, so teardown
-                        // clears PTEs and frees nothing. FILE_DEMAND: an
-                        // unbacked slot means "ask the file", not "allocate an
-                        // anonymous zero page".
-                        perms: perms
-                            | RegionPerms::SHARED
-                            | RegionPerms::FILE_DEMAND
-                            | RegionPerms::LOCK_EXEMPT,
-                        phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
-                    };
+                    base: VirtAddr::new(base),
+                    len,
+                    // SHARED: the frames belong to the file, so teardown
+                    // clears PTEs and frees nothing. FILE_DEMAND: an
+                    // unbacked slot means "ask the file", not "allocate an
+                    // anonymous zero page".
+                    perms: perms
+                        | RegionPerms::SHARED
+                        | RegionPerms::FILE_DEMAND
+                        | RegionPerms::LOCK_EXEMPT,
+                    phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
+                };
                 let mapped = as_ref.with_vma_transaction(|| {
                     narf_memory::with_shared_mapping_transaction(|| {
                         crate::mapped_file::publish_current_mapping(
@@ -531,9 +631,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     Err(error) => {
                                         // SAFETY: both structural
                                         // transactions remain held.
-                                        let _ = unsafe {
-                                            as_ref.rollback_mapping_locked(receipt)
-                                        };
+                                        let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
                                         Err(error)
                                     }
                                 }
@@ -553,15 +651,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         return;
                     }
                     #[cfg(feature = "linux-compat")]
-                    crate::perf_event::on_mmap(
-                        current_task_id(),
-                        -1,
-                        base,
-                        len,
-                        0,
-                        prot,
-                        flags,
-                    );
+                    crate::perf_event::on_mmap(current_task_id(), -1, base, len, 0, prot, flags);
                     ctx.set_return(SyscallReturn::ok(base));
                     return;
                 }
@@ -703,19 +793,19 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     }
     let writeback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
     let region = Region {
-            base: VirtAddr::new(base),
-            len,
-            // Generic MAP_SHARED file mappings borrow a frame from the
-            // userspace file-page cache. RegionPerms::SHARED lets multiple
-            // VMAs alias one page and delegates lifetime to the cache through
-            // memory's shared-frame hooks.
-            perms: if shared_file_ops.is_some() {
-                perms | RegionPerms::SHARED
-            } else {
-                perms
-            },
-            phys: phys_list,
-        };
+        base: VirtAddr::new(base),
+        len,
+        // Generic MAP_SHARED file mappings borrow a frame from the
+        // userspace file-page cache. RegionPerms::SHARED lets multiple
+        // VMAs alias one page and delegates lifetime to the cache through
+        // memory's shared-frame hooks.
+        perms: if shared_file_ops.is_some() {
+            perms | RegionPerms::SHARED
+        } else {
+            perms
+        },
+        phys: phys_list,
+    };
     let map_result = if let Some(ops) = shared_file_ops.as_ref() {
         as_ref.with_vma_transaction(|| {
             narf_memory::with_shared_mapping_transaction(|| {
@@ -1242,12 +1332,15 @@ mod tests {
             bytes: IrqSafeSpinLock::new(vec![0; 4096]),
             writes: AtomicUsize::new(0),
         });
-        let fd = crate::fd::install(TASK, crate::fd::FdEntry {
+        let fd = crate::fd::install(
+            TASK,
+            crate::fd::FdEntry {
                 ops: Arc::clone(&file) as Arc<dyn FileOps>,
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
+            },
+        )
         .unwrap_or(u32::MAX);
         if fd == u32::MAX {
             return TestResult::Fail("could not install test file fd");
@@ -1406,12 +1499,15 @@ mod tests {
     }
 
     fn install_fd(ops: Arc<dyn FileOps>) -> Option<u32> {
-        crate::fd::install(ARENA_TASK, crate::fd::FdEntry {
+        crate::fd::install(
+            ARENA_TASK,
+            crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
+            },
+        )
     }
 
     fn mmap_shared(fd: u32, len: u64) -> Option<u64> {

@@ -2029,21 +2029,49 @@ const AT_REMOVEDIR: u64 = 0x200;
 /// filesystems without device-node support; everything else is a regular file
 /// (see `sys_mknodat` docs). Never returns a bare -1 for a supported node type.
 fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
-    let fail = SyscallReturn::ok((-1i64) as u64);
     const S_IFMT: u64 = 0o170000;
-    const S_IFDIR: u64 = 0o040000;
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
     const S_IFIFO: u64 = 0o010000;
+    // `fs/namei.c::may_mknod` screens the node type BEFORE `filename_create`
+    // looks the path up, so a mode mknod cannot create outranks a bad path:
+    //
+    //     case S_IFREG: case S_IFCHR: case S_IFBLK:
+    //     case S_IFIFO: case S_IFSOCK: case 0:  return 0;
+    //     case S_IFDIR:                         return -EPERM;
+    //     default:                              return -EINVAL;
+    //
+    // A directory is EPERM — mkdir(2) is the only way to make one, and glibc
+    // relies on that to decide whether to fall back. NARF used to accept
+    // S_IFDIR here and create the directory, which is a NARF-only extension
+    // no portable caller can use, and reported every other malformed mode as
+    // the `-1` sentinel (EPERM) — colliding with the one mode that really is
+    // EPERM and hiding the EINVAL that says "this node type does not exist".
+    {
+        const S_IFREG: u64 = 0o100000;
+        const S_IFCHR_M: u64 = 0o020000;
+        const S_IFBLK_M: u64 = 0o060000;
+        const S_IFIFO_M: u64 = 0o010000;
+        const S_IFSOCK: u64 = 0o140000;
+        const S_IFDIR_M: u64 = 0o040000;
+        match mode & S_IFMT {
+            0 | S_IFREG | S_IFCHR_M | S_IFBLK_M | S_IFIFO_M | S_IFSOCK => {}
+            S_IFDIR_M => return SyscallReturn::ok((-1i64) as u64), // -EPERM
+            _ => return SyscallReturn::ok((-22i64) as u64),        // -EINVAL
+        }
+    }
     let path = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
-        None => return fail,
+        // `getname()` — an unreadable path is -EFAULT.
+        None => return SyscallReturn::ok((-14i64) as u64),
     };
     let path = resolve_cwd_path(current_task_id(), &path);
     let path_ref = {
         let t = path.trim_end_matches('/');
         if t.is_empty() {
-            return fail;
+            // No LOOKUP_EMPTY on this path, so `getname()` rejects "" with
+            // -ENOENT rather than the sentinel's EPERM.
+            return SyscallReturn::ok((-2i64) as u64);
         }
         t
     };
@@ -2065,15 +2093,8 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-17i64) as u64); // -EEXIST
         }
     }
-    // A directory carries its permission bits on the DirOps side; `mkdir` has
-    // no FileOps handle to persist a mode through here.
-    if fmt == S_IFDIR {
-        return if poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true) {
-            SyscallReturn::ok(0)
-        } else {
-            fail
-        };
-    }
+    // S_IFDIR never reaches here: `may_mknod` rejected it with -EPERM above,
+    // as Linux does. mkdir(2) is the only way to create a directory.
     // The created node handle, so the requested mode can be persisted below.
     let node: Option<Arc<dyn narf_filesystem::FileOps>> = if fmt == S_IFCHR || fmt == S_IFBLK {
         // A char/block device node (udev coldplug creating /dev/<name>). Route
@@ -2118,7 +2139,12 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
             let _ = poll_blocking(n.set_perms((mode & 0o777) as u16));
             SyscallReturn::ok(0)
         }
-        None => fail,
+        // The parent resolved and the type is one mknod can make, so a failure
+        // to create the node is the filesystem's own — `vfs_mknod` surfaces
+        // that rather than a blanket error. The sentinel reached userspace as
+        // EPERM, colliding with the one genuine EPERM this syscall has
+        // (S_IFDIR, screened above).
+        None => SyscallReturn::ok((-5i64) as u64), // -EIO
     }
 }
 
@@ -2911,7 +2937,14 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
             ctx.set_return(SyscallReturn::ok((-122i64) as u64))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+        // `fs/namei.c::vfs_link` surfaces the filesystem's own error rather
+        // than a blanket one; the `-1` sentinel here reached userspace as
+        // EPERM, which link(2) also returns legitimately (a directory source,
+        // or an immutable inode), so a caller could not tell the two apart.
+        Some(Some(Err(error))) => {
+            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64))
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
     }
 }
 
@@ -2972,13 +3005,21 @@ fn readlink_impl(
     ctx: &mut dyn TrapContext,
     raw: alloc::string::String,
     buf_ptr: *mut u8,
-    buf_len: usize,
+    buf_len: i64,
 ) {
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if buf_ptr.is_null() || buf_len == 0 {
-        ctx.set_return(fail);
+    // `fs/stat.c::do_readlinkat` opens with `if (bufsiz <= 0) return -EINVAL;`
+    // — BEFORE the path is looked up, so a bad size outranks a missing file.
+    // A null destination is NOT rejected here: Linux only discovers it when
+    // `vfs_readlink` copies out, which is -EFAULT. Collapsing the two into one
+    // `-1` told a caller "Operation not permitted" for what is either a
+    // malformed size or a bad pointer — and sd-device's `chase_symlinks`
+    // branches on exactly this errno (`if (errno != EINVAL) return 0;`), so
+    // the wrong one aborts a device walk instead of continuing it.
+    if buf_len <= 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
+    let buf_len = buf_len as usize;
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
     let path = resolve_cwd_path(current_task_id(), &raw);
@@ -3045,15 +3086,23 @@ fn readlink_impl(
     let mut staging = alloc::vec![0u8; buf_len];
     let n = match poll_blocking(file.read(0, &mut staging)) {
         Some(Ok(n)) => n,
-        _ => {
-            ctx.set_return(fail);
+        // The node resolved and IS a symlink, so a failure to read its target
+        // is the filesystem's own error, not a caller mistake.
+        Some(Err(error)) => {
+            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+            return;
+        }
+        None => {
+            ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // -EIO
             return;
         }
     };
-    // Copy result into user buffer under SMAP bracket.
-    // SAFETY: buf_ptr is a user VA validated above; n <= buf_len.
+    // Copy result into user buffer under SMAP bracket. This is where Linux
+    // discovers a null or unmapped destination — `vfs_readlink`'s copy_to_user
+    // — so it is -EFAULT, reached only after the size and the symlink checks.
+    // SAFETY: buf_ptr is a user VA; copy_to_user range-validates it; n <= buf_len.
     if unsafe { copy_to_user(buf_ptr as u64, &staging[..n]) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(n as u64));
@@ -9363,7 +9412,12 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32)
             // SAFETY: `p` is a user `uid_t*`/`gid_t*` out-pointer;
             // copy_to_user range-validates the 4-byte write.
             if unsafe { copy_to_user(p, &buf) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // `kernel/sys.c::SYSCALL_DEFINE3(getresuid)` is three chained
+                // `put_user`s and returns their result, so an unwritable
+                // out-pointer is -EFAULT. The sentinel said EPERM, which for
+                // a credential query reads as "you may not ask" rather than
+                // "your pointer is bad".
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                 return;
             }
         }

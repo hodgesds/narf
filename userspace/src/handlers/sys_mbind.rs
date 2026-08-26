@@ -4,6 +4,29 @@ use super::*;
 /// `mbind(addr, len, mode, nodemask, maxnode, flags)` — bind a range to
 /// a NUMA policy. Stored per (task, range); the fault path consults it
 /// via `resolve_policy` so the binding is enforced on demand-fault.
+///
+/// `mm/mempolicy.c::kernel_mbind` runs the mode check, then reads the node
+/// mask, and only then enters `do_mbind` where the flag word is judged:
+///
+/// ```text
+///     err = sanitize_mpol_flags(&lmode, &mode_flags);   /* -EINVAL */
+///     if (err) return err;
+///     err = get_nodes(&nodes, nmask, maxnode);          /* -EINVAL / -EFAULT */
+///     if (err) return err;
+///     return do_mbind(...):
+///         if (flags & ~(unsigned long)MPOL_MF_VALID)          return -EINVAL;
+///         if ((flags & MPOL_MF_MOVE_ALL) && !capable(CAP_SYS_NICE)) return -EPERM;
+///         if (start & ~PAGE_MASK)                             return -EINVAL;
+///         len = PAGE_ALIGN(len); end = start + len;
+///         if (end < start)                                    return -EINVAL;
+///         if (end == start)                                   return 0;
+/// ```
+///
+/// So a bad `nodemask` **pointer** beats a bad flag word: `mbind` with an
+/// unreadable mask reports EFAULT even when `flags` is also junk. A caller
+/// that gets EINVAL where Linux gives EFAULT concludes its *policy* is
+/// unsupported and permanently disables NUMA binding, rather than fixing the
+/// pointer it passed. Reading the mask before judging `flags` restores that.
 pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let addr = a.arg0;
@@ -17,14 +40,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
-    if a.arg5 & !MPOL_MF_VALID != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-        return;
-    }
-    if a.arg5 & MPOL_MF_MOVE_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: no ambient CAP_SYS_NICE.
-        return;
-    }
+    // get_nodes() — before do_mbind's flag validation, so EFAULT wins.
     let nodemask = if a.arg3 != 0 {
         let mut bytes = [0u8; 8];
         // SAFETY: copy_from_user validates the one-word nodemask.
@@ -36,6 +52,14 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
     } else {
         0
     };
+    if a.arg5 & !MPOL_MF_VALID != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if a.arg5 & MPOL_MF_MOVE_ALL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM: no ambient CAP_SYS_NICE.
+        return;
+    }
     if !mpol_policy_shape_valid(mode, nodemask) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
