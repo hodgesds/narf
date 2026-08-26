@@ -55,6 +55,7 @@ const SEM_STAT_ANY: u64 = 20;
 const MSG_STAT: u64 = 11;
 const MSG_INFO: u64 = 12;
 const MSG_STAT_ANY: u64 = 13;
+const IPCMNI_IDX_MASK: u64 = (1 << 15) - 1;
 const E2BIG: i64 = -7;
 const EFBIG: i64 = -27;
 const ENOMSG: i64 = -42;
@@ -493,7 +494,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_notify_signal_once);
 fn make_semset(nsems: u64) -> Result<u64, &'static str> {
     // key = IPC_PRIVATE (0) always allocates a fresh set.
     match call(Syscall::Semget.raw(), a2(0, nsems, IPC_CREAT)) {
-        Some(id) if id > 0 => Ok(id as u64),
+        Some(id) if id >= 0 => Ok(id as u64),
         _ => Err("setup: semget IPC_PRIVATE failed"),
     }
 }
@@ -502,10 +503,10 @@ fn make_semset(nsems: u64) -> Result<u64, &'static str> {
 
 fn smoke_abi_ipc_semget_pos() -> TestResult {
     with_setup(|| {
-        // IPC_PRIVATE, 2 sems, create → new id > 0.
+        // IPC_PRIVATE, 2 sems, create → a non-negative Linux SysV id.
         match call(Syscall::Semget.raw(), a2(0, 2, IPC_CREAT)) {
-            Some(id) if id > 0 => Ok(()),
-            _ => Err("semget IPC_PRIVATE should return a positive id"),
+            Some(id) if id >= 0 => Ok(()),
+            _ => Err("semget IPC_PRIVATE should return a non-negative id"),
         }
     })
 }
@@ -1310,7 +1311,8 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
             Syscall::Semctl.raw(),
             a3(id, 0, IPC_INFO, info.as_mut_ptr() as u64),
         );
-        if ipc_info.value < id
+        let index = id & IPCMNI_IDX_MASK;
+        if ipc_info.value < index
             || read_i32(&info, 0) != 1_024_000_000
             || read_i32(&info, 4) != 32_000
             || read_i32(&info, 8) != 1_024_000_000
@@ -1330,14 +1332,14 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
             Syscall::Semctl.raw(),
             a3(id, 0, SEM_INFO, info.as_mut_ptr() as u64),
         );
-        if sem_info.value < id || read_i32(&info, 28) < 1 || read_i32(&info, 36) < 2 {
+        if sem_info.value < index || read_i32(&info, 28) < 1 || read_i32(&info, 36) < 2 {
             return Err("semctl SEM_INFO did not aggregate live sets and semaphores");
         }
 
         let mut stat = [0u8; STAT_SIZE];
         if call(
             Syscall::Semctl.raw(),
-            a3(id, 0, SEM_STAT, stat.as_mut_ptr() as u64),
+            a3(index, 0, SEM_STAT, stat.as_mut_ptr() as u64),
         ) != Some(id as i64)
         {
             return Err("semctl SEM_STAT did not return the indexed set's full id");
@@ -1345,7 +1347,7 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         if call(Syscall::Semctl.raw(), a3(987_654, 0, SEM_STAT, BAD_PTR)) != Some(EINVAL) {
             return Err("semctl SEM_STAT must resolve its index before copyout");
         }
-        if call(Syscall::Semctl.raw(), a3(id, 0, SEM_STAT, BAD_PTR)) != Some(EFAULT) {
+        if call(Syscall::Semctl.raw(), a3(index, 0, SEM_STAT, BAD_PTR)) != Some(EFAULT) {
             return Err("semctl SEM_STAT bad output must return EFAULT after lookup");
         }
         if call(
@@ -1360,14 +1362,14 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         crate::handlers::__test_set_fsids(task, 1000, 1000);
         if call(
             Syscall::Semctl.raw(),
-            a3(id, 0, SEM_STAT, stat.as_mut_ptr() as u64),
+            a3(index, 0, SEM_STAT, stat.as_mut_ptr() as u64),
         ) != Some(EACCES)
         {
             return Err("SEM_STAT must enforce read permission");
         }
         if call(
             Syscall::Semctl.raw(),
-            a3(id, 0, SEM_STAT_ANY, stat.as_mut_ptr() as u64),
+            a3(index, 0, SEM_STAT_ANY, stat.as_mut_ptr() as u64),
         ) != Some(id as i64)
         {
             return Err("SEM_STAT_ANY must bypass ordinary read permission");
@@ -1383,6 +1385,23 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         );
         if (read_i32(&info, 28), read_i32(&info, 36)) != usage_before {
             return Err("semctl IPC_RMID did not restore exact namespace usage");
+        }
+        let replacement = make_semset(1)?;
+        if replacement & IPCMNI_IDX_MASK != index || replacement == id {
+            return Err("semget did not reuse the freed slot with a new sequence id");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_STAT, BAD_PTR)) != Some(EINVAL) {
+            return Err("stale semaphore sequence id must return EINVAL before copyout");
+        }
+        if call(
+            Syscall::Semctl.raw(),
+            a3(index, 0, SEM_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(replacement as i64)
+        {
+            return Err("SEM_STAT slot lookup did not return the replacement full id");
+        }
+        if call(Syscall::Semctl.raw(), a3(replacement, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("replacement semaphore cleanup failed");
         }
         Ok(())
     })
@@ -1541,7 +1560,7 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_wait_restart_classification);
 /// msgget a private queue; return the id.
 fn make_msgq() -> Result<u64, &'static str> {
     match call(Syscall::Msgget.raw(), a1(0, IPC_CREAT)) {
-        Some(id) if id > 0 => Ok(id as u64),
+        Some(id) if id >= 0 => Ok(id as u64),
         _ => Err("setup: msgget IPC_PRIVATE failed"),
     }
 }
@@ -1550,10 +1569,10 @@ fn make_msgq() -> Result<u64, &'static str> {
 
 fn smoke_abi_ipc_msgget_pos() -> TestResult {
     with_setup(|| {
-        // msgget(key=IPC_PRIVATE, msgflg=IPC_CREAT) → new id > 0.
+        // msgget(key=IPC_PRIVATE, msgflg=IPC_CREAT) → a non-negative SysV id.
         match call(Syscall::Msgget.raw(), a1(0, IPC_CREAT)) {
-            Some(id) if id > 0 => Ok(()),
-            _ => Err("msgget IPC_PRIVATE should return a positive id"),
+            Some(id) if id >= 0 => Ok(()),
+            _ => Err("msgget IPC_PRIVATE should return a non-negative id"),
         }
     })
 }
@@ -2309,7 +2328,8 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
             Syscall::Msgctl.raw(),
             a2(id, IPC_INFO, info.as_mut_ptr() as u64),
         );
-        if ipc_info.value < id
+        let index = id & IPCMNI_IDX_MASK;
+        if ipc_info.value < index
             || read_i32(&info, 0) != 512_000
             || read_i32(&info, 4) != 16_384
             || read_i32(&info, 8) != 8_192
@@ -2327,7 +2347,7 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
             Syscall::Msgctl.raw(),
             a2(id, MSG_INFO, info.as_mut_ptr() as u64),
         );
-        if msg_info.value < id
+        if msg_info.value < index
             || read_i32(&info, 0) < 1
             || read_i32(&info, 4) < 1
             || read_i32(&info, 24) < 1
@@ -2338,7 +2358,7 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         let mut stat = [0u8; 120];
         if call(
             Syscall::Msgctl.raw(),
-            a2(id, MSG_STAT, stat.as_mut_ptr() as u64),
+            a2(index, MSG_STAT, stat.as_mut_ptr() as u64),
         ) != Some(id as i64)
             || u64::from_ne_bytes(stat[72..80].try_into().unwrap()) != 1
             || u64::from_ne_bytes(stat[80..88].try_into().unwrap()) != 1
@@ -2348,7 +2368,7 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         stat.fill(0);
         if call(
             Syscall::Msgctl.raw(),
-            a2(id, MSG_STAT_ANY, stat.as_mut_ptr() as u64),
+            a2(index, MSG_STAT_ANY, stat.as_mut_ptr() as u64),
         ) != Some(id as i64)
         {
             return Err("msgctl MSG_STAT_ANY did not return the full queue id");
@@ -2356,7 +2376,7 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         if call(Syscall::Msgctl.raw(), a2(987_654, MSG_STAT, BAD_PTR)) != Some(EINVAL) {
             return Err("msgctl MSG_STAT must resolve its index before copyout");
         }
-        if call(Syscall::Msgctl.raw(), a2(id, MSG_STAT, BAD_PTR)) != Some(EFAULT) {
+        if call(Syscall::Msgctl.raw(), a2(index, MSG_STAT, BAD_PTR)) != Some(EFAULT) {
             return Err("msgctl MSG_STAT bad output must return EFAULT after lookup");
         }
         if call(
@@ -2376,6 +2396,23 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         );
         if (read_i32(&info, 0), read_i32(&info, 4), read_i32(&info, 24)) != usage_before {
             return Err("msgctl IPC_RMID did not restore exact namespace usage");
+        }
+        let replacement = make_msgq()?;
+        if replacement & IPCMNI_IDX_MASK != index || replacement == id {
+            return Err("msgget did not reuse the freed slot with a new sequence id");
+        }
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_STAT, BAD_PTR)) != Some(EINVAL) {
+            return Err("stale message sequence id must return EINVAL before copyout");
+        }
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(index, MSG_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(replacement as i64)
+        {
+            return Err("MSG_STAT slot lookup did not return the replacement full id");
+        }
+        if call(Syscall::Msgctl.raw(), a2(replacement, IPC_RMID, 0)) != Some(0) {
+            return Err("replacement message queue cleanup failed");
         }
         Ok(())
     })

@@ -13,11 +13,11 @@
 //! Gated under `#[cfg(feature = "linux-compat")]` via the `pub mod`
 //! line in `lib.rs`.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 #[cfg(feature = "kernel-test")]
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -48,6 +48,86 @@ fn err(e: i64) -> SyscallReturn {
 type IpcObjectKey = (u64, u64); // (IPC namespace id, namespace-local object id)
 type IpcLookupKey = (u64, u32); // (IPC namespace id, user-supplied key)
 
+// Linux's default SysV IPC identifier layout (`ipc/util.h`): bits 0..14
+// select an IDR slot and bits 15..30 carry a sequence number. Keeping the
+// sequence in the public id makes a removed id fail with EINVAL after its slot
+// is reused instead of silently naming the replacement object.
+const IPCMNI_SHIFT: u32 = 15;
+const IPCMNI: u32 = 1 << IPCMNI_SHIFT;
+const IPCMNI_IDX_MASK: u32 = IPCMNI - 1;
+const IPCID_SEQ_MAX: u32 = i32::MAX as u32 >> IPCMNI_SHIFT;
+
+#[derive(Default)]
+struct IpcIdTable {
+    /// Full sequence-bearing id by Linux-visible slot index.
+    slots: BTreeMap<u32, u64>,
+    /// Removed holes below `next_unused`; tail holes are collapsed instead.
+    free: BTreeSet<u32>,
+    next_unused: u32,
+    last_idx: Option<u32>,
+    sequence: u32,
+}
+
+impl IpcIdTable {
+    fn allocate(&mut self, limit: usize) -> Result<u64, i64> {
+        let limit = u32::try_from(limit.min(IPCMNI as usize)).unwrap_or(IPCMNI);
+        let idx = if self.next_unused < limit {
+            let idx = self.next_unused;
+            self.next_unused += 1;
+            idx
+        } else {
+            let idx = self.free.range(..limit).next().copied().ok_or(ENOSPC)?;
+            assert!(self.free.remove(&idx), "missing free SysV IPC slot");
+            idx
+        };
+
+        // This is Linux's sequence rule: advance only when allocation cycles
+        // to an index no greater than the previous allocation.
+        if self.last_idx.is_some_and(|last_idx| idx <= last_idx) {
+            self.sequence += 1;
+            if self.sequence >= IPCID_SEQ_MAX {
+                self.sequence = 0;
+            }
+        }
+        self.last_idx = Some(idx);
+        let id = u64::from((self.sequence << IPCMNI_SHIFT) | idx);
+        assert!(
+            self.slots.insert(idx, id).is_none(),
+            "occupied SysV IPC slot"
+        );
+        Ok(id)
+    }
+
+    fn release(&mut self, id: u64) {
+        let idx = id as u32 & IPCMNI_IDX_MASK;
+        assert_eq!(
+            self.slots.remove(&idx),
+            Some(id),
+            "SysV IPC id table diverged"
+        );
+        assert!(self.free.insert(idx), "duplicate free SysV IPC slot");
+
+        // Avoid retaining one BTree node for every formerly occupied tail
+        // slot. Each slot is collapsed at most once between allocations.
+        while self.next_unused != 0 {
+            let tail = self.next_unused - 1;
+            if self.slots.contains_key(&tail) {
+                break;
+            }
+            self.free.remove(&tail);
+            self.next_unused = tail;
+        }
+    }
+
+    fn full_id_at(&self, index: u64) -> Option<u64> {
+        self.slots.get(&(index as u32 & IPCMNI_IDX_MASK)).copied()
+    }
+
+    fn max_index(&self) -> u64 {
+        self.slots.keys().next_back().copied().map_or(0, u64::from)
+    }
+}
+
 #[cfg(feature = "container")]
 fn current_ipc_namespace_id() -> u64 {
     crate::namespaces::current_ipc_namespace(crate::handlers::current_task_id()).id()
@@ -56,30 +136,6 @@ fn current_ipc_namespace_id() -> u64 {
 #[cfg(not(feature = "container"))]
 fn current_ipc_namespace_id() -> u64 {
     0
-}
-
-#[cfg(feature = "container")]
-fn alloc_sem_id() -> u64 {
-    u64::from(
-        crate::namespaces::current_ipc_namespace(crate::handlers::current_task_id()).alloc_sem_id(),
-    )
-}
-
-#[cfg(not(feature = "container"))]
-fn alloc_sem_id() -> u64 {
-    SEM_NEXT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-#[cfg(feature = "container")]
-fn alloc_msg_id() -> u64 {
-    u64::from(
-        crate::namespaces::current_ipc_namespace(crate::handlers::current_task_id()).alloc_msg_id(),
-    )
-}
-
-#[cfg(not(feature = "container"))]
-fn alloc_msg_id() -> u64 {
-    MSG_NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 const IPC_CREAT: u64 = 0o1000;
@@ -206,8 +262,6 @@ struct SemSet {
     zcnt: Vec<usize>,
 }
 
-#[cfg(not(feature = "container"))]
-static SEM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 type SemUndoKey = (u64, u64, u64, usize);
 type SemUndoTable = Vec<(SemUndoKey, i32)>;
 
@@ -240,6 +294,7 @@ struct SemUsage {
 #[derive(Default)]
 struct SemState {
     sets: BTreeMap<IpcObjectKey, SemSet>,
+    ids: BTreeMap<u64, IpcIdTable>,
     /// Linux keeps a per-namespace key index rather than walking every set.
     /// IPC_PRIVATE is deliberately absent because it never names an object.
     key_ids: BTreeMap<IpcLookupKey, u64>,
@@ -1444,7 +1499,7 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
         pids.resize(nsems, 0);
         ncnt.resize(nsems, 0);
         zcnt.resize(nsems, 0);
-        let id = alloc_sem_id();
+        let id = state.ids.entry(ipc_ns).or_default().allocate(semmni())?;
         state.sets.insert(
             (ipc_ns, id),
             SemSet {
@@ -1815,11 +1870,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
         IPC_INFO | SEM_INFO => {
             let (usage, max_index) = with_sem_state(|state| {
                 let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
-                let max_index = state
-                    .sets
-                    .range((ipc_ns, 0)..=(ipc_ns, u64::MAX))
-                    .next_back()
-                    .map_or(0, |((_, id), _)| *id);
+                let max_index = state.ids.get(&ipc_ns).map_or(0, IpcIdTable::max_index);
                 (usage, max_index)
             });
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
@@ -1854,6 +1905,11 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                     return Err(EPERM);
                 }
                 let set = state.sets.remove(&object).ok_or(EINVAL)?;
+                state
+                    .ids
+                    .get_mut(&ipc_ns)
+                    .expect("SysV semaphore id table missing")
+                    .release(semid);
                 if set.key as u64 != IPC_PRIVATE {
                     assert_eq!(
                         state.key_ids.remove(&(ipc_ns, set.key)),
@@ -1898,8 +1954,17 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
-            let snapshot = with_sems(|m| {
-                let set = m.get(&object).ok_or(EINVAL)?;
+            let snapshot = with_sem_state(|state| {
+                let returned_id = if cmd == IPC_STAT {
+                    semid
+                } else {
+                    state
+                        .ids
+                        .get(&ipc_ns)
+                        .and_then(|ids| ids.full_id_at(semid))
+                        .ok_or(EINVAL)?
+                };
+                let set = state.sets.get(&(ipc_ns, returned_id)).ok_or(EINVAL)?;
                 if cmd != SEM_STAT_ANY
                     && !ipc_allowed(
                         caller_uid,
@@ -1915,9 +1980,9 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 {
                     return Err(EACCES);
                 }
-                Ok(sem_stat_snapshot(set))
+                Ok((returned_id, sem_stat_snapshot(set)))
             });
-            let snapshot = match snapshot {
+            let (returned_id, snapshot) = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
                     ctx.set_return(err(e));
@@ -1930,7 +1995,11 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             if unsafe { crate::handlers::copy_to_user(arg, &out) }.is_err() {
                 ctx.set_return(err(EFAULT));
             } else {
-                ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT { 0 } else { semid }));
+                ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT {
+                    0
+                } else {
+                    returned_id
+                }));
             }
         }
         IPC_SET => {
@@ -2214,6 +2283,7 @@ struct MsgUsage {
 #[derive(Default)]
 struct MsgState {
     queues: BTreeMap<IpcObjectKey, MsgQueue>,
+    ids: BTreeMap<u64, IpcIdTable>,
     /// Per-namespace key lookup; IPC_PRIVATE queues are intentionally absent.
     key_ids: BTreeMap<IpcLookupKey, u64>,
     /// Exact per-namespace limit/MSG_INFO counters.
@@ -2222,8 +2292,6 @@ struct MsgState {
 }
 
 static MSG_STATE: IrqSafeSpinLock<Option<MsgState>> = IrqSafeSpinLock::new(None);
-#[cfg(not(feature = "container"))]
-static MSG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MSG_MAX_BYTES: usize = 8192;
 const MSG_DEFAULT_QUEUE_BYTES: usize = 16384;
 const MSG_MAX_QUEUES: usize = 32_000;
@@ -2315,7 +2383,11 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
         if usage.queue_count >= msg_max_queues() {
             return Err(ENOSPC);
         }
-        let id = alloc_msg_id();
+        let id = state
+            .ids
+            .entry(ipc_ns)
+            .or_default()
+            .allocate(msg_max_queues())?;
         state.queues.insert(
             (ipc_ns, id),
             MsgQueue {
@@ -2767,11 +2839,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
         IPC_INFO | MSG_INFO => {
             let (usage, max_index) = with_msg_state(|state| {
                 let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
-                let max_index = state
-                    .queues
-                    .range((ipc_ns, 0)..=(ipc_ns, u64::MAX))
-                    .next_back()
-                    .map_or(0, |((_, id), _)| *id);
+                let max_index = state.ids.get(&ipc_ns).map_or(0, IpcIdTable::max_index);
                 (usage, max_index)
             });
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
@@ -2805,6 +2873,11 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     return Err(EPERM);
                 }
                 let queue = state.queues.remove(&object).ok_or(EINVAL)?;
+                state
+                    .ids
+                    .get_mut(&ipc_ns)
+                    .expect("SysV message id table missing")
+                    .release(msqid);
                 if queue.key as u64 != IPC_PRIVATE {
                     assert_eq!(
                         state.key_ids.remove(&(ipc_ns, queue.key)),
@@ -2854,8 +2927,17 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
-            let snapshot = with_msgs(|m| {
-                let q = m.get(&object).ok_or(EINVAL)?;
+            let snapshot = with_msg_state(|state| {
+                let returned_id = if cmd == IPC_STAT {
+                    msqid
+                } else {
+                    state
+                        .ids
+                        .get(&ipc_ns)
+                        .and_then(|ids| ids.full_id_at(msqid))
+                        .ok_or(EINVAL)?
+                };
+                let q = state.queues.get(&(ipc_ns, returned_id)).ok_or(EINVAL)?;
                 if cmd != MSG_STAT_ANY
                     && !ipc_allowed(
                         caller_uid,
@@ -2872,7 +2954,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     return Err(EACCES);
                 }
                 Ok((
-                    msqid,
+                    returned_id,
                     q.key,
                     q.uid,
                     q.gid,
@@ -3021,6 +3103,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
 pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
     with_sem_state(|state| {
         state.sets.retain(|(namespace, _), _| *namespace != ipc_ns);
+        state.ids.remove(&ipc_ns);
         state
             .key_ids
             .retain(|(namespace, _), _| *namespace != ipc_ns);
@@ -3039,6 +3122,7 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
         state
             .queues
             .retain(|(namespace, _), _| *namespace != ipc_ns);
+        state.ids.remove(&ipc_ns);
         state
             .key_ids
             .retain(|(namespace, _), _| *namespace != ipc_ns);
