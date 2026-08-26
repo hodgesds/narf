@@ -7049,6 +7049,8 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Grow a stack after admitting the expansion against Linux task limits.
+    ///
     /// # Safety
     /// - The low-memory identity map must be live (used to zero the fresh
     ///   frame).
@@ -7056,11 +7058,6 @@ impl AddressSpace {
     ///   active on this CPU.
     /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
-    /// Grow a stack after admitting the expansion against Linux task limits.
-    ///
-    /// # Safety
-    /// Same live-root, kernel-alias, and allocator requirements as
-    /// [`Self::try_grow_stack`].
     pub unsafe fn try_grow_stack_limited(
         &self,
         vaddr: VirtAddr,

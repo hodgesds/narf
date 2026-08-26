@@ -721,7 +721,7 @@ fn smoke_abi_fsx_mount_string_efault_neg() -> TestResult {
         // NULL with no error, and MS_REMOUNT / propagation calls rely on it.
         let null_source = SyscallArgs {
             arg0: 0,
-            arg1: b"/abi-mnt-nullsrc\0".as_ptr() as u64,
+            arg1: c"/abi-mnt-nullsrc".as_ptr() as u64,
             arg2: fstype.as_ptr() as u64,
             arg3: 0,
             arg4: 0,
@@ -754,7 +754,7 @@ fn smoke_abi_fsx_mount_flag_validation() -> TestResult {
         // MS_NOUSER is kernel-internal: userspace may not request it.
         let nouser = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: b"/abi-mnt-nouser\0".as_ptr() as u64,
+            arg1: c"/abi-mnt-nouser".as_ptr() as u64,
             arg2: fstype.as_ptr() as u64,
             arg3: MS_NOUSER,
             arg4: 0,
@@ -767,7 +767,7 @@ fn smoke_abi_fsx_mount_flag_validation() -> TestResult {
         // The legacy magic is discarded, so the same call succeeds.
         let magic = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: b"/abi-mnt-magic\0".as_ptr() as u64,
+            arg1: c"/abi-mnt-magic".as_ptr() as u64,
             arg2: fstype.as_ptr() as u64,
             arg3: MS_MGC_VAL | MS_RDONLY,
             arg4: 0,
@@ -800,9 +800,9 @@ fn smoke_abi_fsx_mount_accepted_flags_pos() -> TestResult {
         const MS_RELATIME: u64 = 1 << 21;
 
         let ok = SyscallArgs {
-            arg0: b"none\0".as_ptr() as u64,
-            arg1: b"/abi-mnt-flags\0".as_ptr() as u64,
-            arg2: b"tmpfs\0".as_ptr() as u64,
+            arg0: c"none".as_ptr() as u64,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
             arg3: MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
             arg4: 0,
             ..Default::default()
@@ -814,7 +814,7 @@ fn smoke_abi_fsx_mount_accepted_flags_pos() -> TestResult {
         // is mounted. NARF models every mount as private, so this is 0.
         let prop = SyscallArgs {
             arg0: 0,
-            arg1: b"/abi-mnt-flags\0".as_ptr() as u64,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
             arg2: 0,
             arg3: MS_SLAVE | MS_REC,
             arg4: 0,
