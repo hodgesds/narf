@@ -8,6 +8,7 @@ use super::*;
 ///   - the value is `nice_to_rlimit(nice) = 20 - nice`, so nice -20..=19 maps
 ///     to the wire range 40..=1 (never negative, so it can't be mistaken for
 ///     an errno — glibc recovers the nice with `20 - ret`).
+///
 /// LINUX-GAP: PRIO_PGRP/PRIO_USER (group/user queries) are unimplemented (also
 /// -EINVAL here).
 pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {

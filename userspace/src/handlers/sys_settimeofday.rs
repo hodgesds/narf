@@ -9,6 +9,7 @@ use super::*;
 ///   - a faulting `tv` → -EFAULT,
 ///   - `timeval_valid` (`tv_sec < 0` or `tv_usec` outside `[0, USEC_PER_SEC)`)
 ///     → -EINVAL.
+///
 /// LINUX-GAP: `security_settime64` rejects a caller without CAP_SYS_TIME with
 /// -EPERM before any of this; NARF does not model that capability here and
 /// lets any task set the clock.

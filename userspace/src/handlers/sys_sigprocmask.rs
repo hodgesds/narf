@@ -11,6 +11,7 @@ use super::*;
 ///      `how` — an invalid `how` is -EINVAL (from `sigprocmask`) and, like a
 ///      faulting `nset`, must leave `*oset` UNWRITTEN,
 ///   4. if `oset`: copy the snapshot out (-EFAULT on fault).
+///
 /// `how` is only inspected when `nset != NULL` — `rt_sigprocmask(garbage, NULL,
 /// oset, 8)` is a pure query and returns 0, matching Linux.
 pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {

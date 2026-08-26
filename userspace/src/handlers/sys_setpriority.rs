@@ -6,6 +6,7 @@ use super::*;
 ///   - `which` outside `[PRIO_PROCESS, PRIO_USER]` → -EINVAL,
 ///   - `niceval` is CLAMPED to `[MIN_NICE(-20), MAX_NICE(19)]`, never rejected,
 ///   - the target pid is resolved in the caller's pid ns; not found → -ESRCH.
+///
 /// LINUX-GAP: PRIO_PGRP/PRIO_USER (group/user renice) are unimplemented (also
 /// -EINVAL here), and set_one_prio's permission checks (-EPERM for a foreign
 /// uid, -EACCES for lowering nice without CAP_SYS_NICE) are not modelled.

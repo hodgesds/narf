@@ -7049,27 +7049,10 @@ fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::S
     arc_shard_get(&SOCKET_ARCS, raw as usize)
 }
 
-fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
-    if ptr == 0 || !(2..=110).contains(&len) {
-        return None;
-    }
-    // Copy the whole sockaddr struct into a kernel buffer under SMAP bracket,
-    // then parse it — no raw volatile access after this point.
-    let total = len as usize;
-    let mut buf = alloc::vec![0u8; total];
-    // SAFETY: ptr validated (non-null, reasonable length) above.
-    unsafe { copy_from_user(&mut buf, ptr) }.ok()?;
-    // Family is the first u16 (little-endian on x86_64).
-    let family = u16::from_le_bytes([buf[0], buf[1]]);
-    let body = buf[2..].to_vec();
-    Some(crate::socket::SockAddr { family, body })
-}
-
-/// Import a MANDATORY user sockaddr for bind/connect without collapsing
-/// Linux's two `move_addr_to_kernel` errors: an `addrlen` outside
+/// Import a MANDATORY user sockaddr for bind/connect, distinguishing Linux's
+/// two `move_addr_to_kernel` errors: an `addrlen` outside
 /// `[0, sizeof(sockaddr_storage)]` (or too short to hold `sa_family_t`) is
-/// -EINVAL, and a faulting copy is -EFAULT. `copy_user_addr` predates exact
-/// errno reporting and folds both to `None`.
+/// -EINVAL, and a faulting copy is -EFAULT.
 fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAddr, i64> {
     let len = raw_len as i32;
     // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.

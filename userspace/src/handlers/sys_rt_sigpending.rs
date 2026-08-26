@@ -29,6 +29,9 @@ pub(crate) fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     // write_unaligned to the user pointer #PF's under SMAP). Copy exactly
     // `sigsetsize` low bytes, as Linux does (NULL/faulting → -EFAULT).
     let user_bits = (pending & mask).to_ne_bytes();
+    // SAFETY: `set_out` is the user sigset pointer; copy_to_user range-validates
+    // it and SMAP-brackets the `sigsetsize`-byte write (a NULL/faulting pointer
+    // fails the validation and is reported as -EFAULT below).
     if unsafe { copy_to_user(set_out, &user_bits[..sigsetsize]) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;

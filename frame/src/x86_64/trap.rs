@@ -2033,12 +2033,16 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             // non-queued signals, so writing 0 there is harmless.
             info[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
             // SAFETY: each source is a live kernel object; destinations are
-            // within the preflighted frame. The guarded copy catches a racing
-            // permission/unmap fault and leaves the trap frame unredirected.
-            if unsafe { !signal_copy_to_user(new_rsp, &fallback_return) }
-                || unsafe { !signal_copy_to_user(siginfo_vaddr, &info) }
-                || unsafe { !signal_copy_to_user(uctx_vaddr, &uctx) }
-            {
+            // within the preflighted frame. Each guarded copy catches a racing
+            // permission/unmap fault and leaves the trap frame unredirected;
+            // `&&` short-circuits at the first failure exactly as the previous
+            // `||` chain of negations did.
+            let delivered = unsafe {
+                signal_copy_to_user(new_rsp, &fallback_return)
+                    && signal_copy_to_user(siginfo_vaddr, &info)
+                    && signal_copy_to_user(uctx_vaddr, &uctx)
+            };
+            if !delivered {
                 return false;
             }
 
@@ -2100,10 +2104,13 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             // SAFETY: see SA_SIGINFO branch. Guard both copies so a sibling's
             // racing VMA mutation cannot turn signal delivery into a kernel
             // fault. A partial frame is harmless because the caller applies
-            // the signal's default action on `false`.
-            if unsafe { !signal_copy_to_user(new_rsp, &fallback_return) }
-                || unsafe { !signal_copy_to_user(ctx_vaddr, &ctx) }
-            {
+            // the signal's default action on `false`; `&&` short-circuits at
+            // the first failure exactly as the previous `||` chain did.
+            let delivered = unsafe {
+                signal_copy_to_user(new_rsp, &fallback_return)
+                    && signal_copy_to_user(ctx_vaddr, &ctx)
+            };
+            if !delivered {
                 return false;
             }
 

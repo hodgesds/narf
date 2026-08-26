@@ -5,6 +5,7 @@ use super::*;
 ///   - `len < 0 || len > __NEW_UTS_LEN(64)` → -EINVAL (a NARF `usize` len can't
 ///     be negative; `len == 0` is legal and sets an empty hostname),
 ///   - a faulting `name` → -EFAULT.
+///
 /// LINUX-GAP: a caller without CAP_SYS_ADMIN in the UTS user-ns is -EPERM
 /// before either check; NARF does not model that capability here.
 pub(crate) fn sys_sethostname(ctx: &mut dyn TrapContext) {
