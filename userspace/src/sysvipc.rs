@@ -314,7 +314,6 @@ struct SemUsage {
     sem_count: usize,
 }
 
-#[derive(Default)]
 struct SemState {
     /// Namespace registry only.  Semaphore values and metadata live behind
     /// each set's own lock, matching Linux's `sem_array` locking boundary.
@@ -333,6 +332,24 @@ struct SemState {
     /// This mirrors Linux's deduplicated wake_q and avoids repeated full scans.
     wake_head: Option<u64>,
     wake_tail: Option<u64>,
+}
+
+impl Default for SemState {
+    fn default() -> Self {
+        Self {
+            sets: BTreeMap::new(),
+            ids: BTreeMap::new(),
+            key_ids: BTreeMap::new(),
+            usage: BTreeMap::new(),
+            // The scheduler admits at most this many user tasks, so a
+            // semaphore wait record cannot legitimately exceed this bound.
+            // Reserve it once at namespace-state creation instead of making
+            // a blocking syscall grow the registry while holding SEMS.
+            waits: Vec::with_capacity(narf_scheduler::MAX_USER_TASKS),
+            wake_head: None,
+            wake_tail: None,
+        }
+    }
 }
 
 static SEMS: IrqSafeSpinLock<Option<SemState>> = IrqSafeSpinLock::new(None);
