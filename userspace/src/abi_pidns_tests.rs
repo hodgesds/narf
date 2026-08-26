@@ -1027,10 +1027,11 @@ fn smoke_abi_pidns_setpriority_resolves_in_caller_pid_ns() -> TestResult {
             if call(Syscall::Setpriority.raw(), a2(PRIO_PROCESS, 2, 5)) != Some(0) {
                 return Err("setpriority(PRIO_PROCESS, inner 2, 5) did not succeed");
             }
-            // Worker reads its own nice (self arm, who == 0).
+            // Worker reads its own nice (self arm, who == 0). nice 5 →
+            // getpriority 20 - 5 == 15; the caller's default nice 0 → 20.
             set_task(WORKER_TASK);
             match call(Syscall::Getpriority.raw(), a1(PRIO_PROCESS, 0)) {
-                Some(25) => Ok(()),
+                Some(15) => Ok(()),
                 Some(20) => Err("setpriority ignored `who` and reniced the caller, not the worker — accept_pid_from resolution missing"),
                 _ => Err("getpriority returned an unexpected value for the worker"),
             }
@@ -1050,7 +1051,8 @@ kernel_test_in!(
 //
 // Same discarded `who` on the read side. Seed the worker's own nice (7), then
 // have the manager read it by inner pid 2: the fix resolves to the worker
-// (getpriority 27), the discard reads the caller's own nice (default 20).
+// (getpriority 20 - 7 == 13), the discard reads the caller's own nice
+// (default 0 → 20).
 fn smoke_abi_pidns_getpriority_resolves_in_caller_pid_ns() -> TestResult {
     with_setup(|| {
         const MANAGER_TASK: u64 = 0xB410;
@@ -1071,7 +1073,7 @@ fn smoke_abi_pidns_getpriority_resolves_in_caller_pid_ns() -> TestResult {
             }
             set_task(MANAGER_TASK);
             match call(Syscall::Getpriority.raw(), a1(PRIO_PROCESS, 2)) {
-                Some(27) => Ok(()),
+                Some(13) => Ok(()),
                 Some(20) => Err("getpriority ignored `who` and read the caller's own nice, not the worker's — accept_pid_from resolution missing"),
                 _ => Err("getpriority returned an unexpected value"),
             }

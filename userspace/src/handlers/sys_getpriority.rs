@@ -1,13 +1,21 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `getpriority(which, who)` — Linux `SYSCALL_DEFINE2(getpriority)`
+/// (kernel/sys.c):
+///   - `which` outside `[PRIO_PROCESS, PRIO_USER]` → -EINVAL,
+///   - the target pid is resolved in the caller's pid ns; not found → -ESRCH,
+///   - the value is `nice_to_rlimit(nice) = 20 - nice`, so nice -20..=19 maps
+///     to the wire range 40..=1 (never negative, so it can't be mistaken for
+///     an errno — glibc recovers the nice with `20 - ret`).
+/// LINUX-GAP: PRIO_PGRP/PRIO_USER (group/user queries) are unimplemented (also
+/// -EINVAL here).
 pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let which = args.arg0 as i64;
     let who = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     if which != PRIO_PROCESS_VAL {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     // PRIO_PROCESS `who` is a pid in the CALLER's pid namespace (Linux
@@ -24,10 +32,8 @@ pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
         proc_pid_to_tid(outer)
     };
     let nice = read_nice(task);
-    // Linux convention: getpriority returns the value pre-shifted
-    // by +20 so a -20..=19 nice maps to 0..=39 on the wire — the
-    // user-side libc subtracts 20 to recover the signed value.
-    // Errors then surface as the wire -1 distinct from a value of 19.
-    let shifted = (nice + 20) as u64;
-    ctx.set_return(SyscallReturn::ok(shifted));
+    // Linux nice_to_rlimit: the wire value is `20 - nice` (a -20..=19 nice maps
+    // to 40..=1), matching what glibc's getpriority() unwraps with `20 - ret`.
+    let wire = (20 - nice) as u64;
+    ctx.set_return(SyscallReturn::ok(wire));
 }
