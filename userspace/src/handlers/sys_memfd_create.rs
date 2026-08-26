@@ -10,7 +10,11 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     // for every musl caller (foot/kwin put flags in rsi=arg1), so F_ADD_SEALS
     // then returned -EPERM and Wayland SHM-buffer sealing failed.
     let _flags = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // `mm/memfd.c::SYSCALL_DEFINE2(memfd_create)` publishes the file with
+    // `get_unused_fd_flags`, so a table at RLIMIT_NOFILE is -EMFILE. The
+    // `-1` sentinel these arms inherited reached userspace as EPERM, which
+    // is indistinguishable from the seal-permission failure this same
+    // syscall's descriptors can produce later.
     let task = current_task_id();
     #[cfg(feature = "linux-compat")]
     {
@@ -29,7 +33,7 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
             });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
+            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }
     }
     #[cfg(not(feature = "linux-compat"))]
@@ -44,7 +48,7 @@ pub(crate) fn sys_memfd_create(ctx: &mut dyn TrapContext) {
             });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
+            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }
     }
 }

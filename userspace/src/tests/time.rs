@@ -422,7 +422,10 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
         return TestResult::Fail("clock_gettime did not reflect the new wall offset");
     }
 
-    // CLOCK_MONOTONIC (1) is not settable — expect -1.
+    // CLOCK_MONOTONIC (1) is not settable. `kernel/time/posix-timers.c::
+    // SYSCALL_DEFINE2(clock_settime)` answers `!kc || !kc->clock_set` with
+    // -EINVAL; this pinned the -1 sentinel (EPERM) until the time-syscall
+    // errno pass corrected the handler.
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: 1,
@@ -434,7 +437,7 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
     kernel_syscall_entry(Syscall::ClockSetTime.raw(), &mut ctx);
     let mono_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-22i64) as u64,
     );
     if !mono_rejected {
         return TestResult::Fail("clock_settime(MONOTONIC) was not rejected");

@@ -15,6 +15,16 @@ use super::*;
 ///
 /// AT_EMPTY_PATH (an empty path naming the dirfd itself) is handled by
 /// resolving the descriptor's own path.
+///
+/// SHADOWED under `linux-compat`: `install_core_syscalls` re-installs
+/// [`sys_newfstatat_linux`] over `Syscall::Newfstatat`, so this body is only
+/// reachable in the non-`linux-compat` build.
+///
+/// `fs/stat.c::SYSCALL_DEFINE4(newfstatat)` → `vfs_fstatat` → `cp_new_stat`
+/// resolves the path BEFORE copying, so a bad `statbuf` cannot pre-empt the
+/// lookup's -EBADF/-ENOTDIR/-ENOENT; the null-buffer check therefore lives in
+/// [`stat_absolute`], after resolution. It used to sit first here and answer
+/// the bare -1, i.e. EPERM.
 pub(crate) fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int fstatat(int dirfd, const char *pathname,
@@ -23,11 +33,6 @@ pub(crate) fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg1;
     let out_ptr = args.arg2 as *mut StatBuf;
     let _flags = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
-        return;
-    }
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {

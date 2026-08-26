@@ -88,14 +88,20 @@ kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_name_roundtrip);
 
 fn smoke_abi_proc2_prctl_set_name_null() -> TestResult {
     with_setup(|| {
-        // PR_SET_NAME with a NULL arg pointer takes the `arg_a == 0 → fail`
-        // arm, returning the -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT for a NULL name pointer; NARF
-        // returns the bare -1 sentinel.
+        // PR_SET_NAME with a NULL arg pointer is a failed
+        // `strncpy_from_user`, which `kernel/sys.c` reports as -EFAULT:
+        //
+        //     if (strncpy_from_user(comm, (char __user *)arg2,
+        //                           sizeof(me->comm) - 1) < 0)
+        //             return -EFAULT;
+        //
+        // This used to return the bare -1 sentinel = EPERM, telling a
+        // caller its process was forbidden to rename itself rather than
+        // that it had passed a bad buffer.
         const PR_SET_NAME: u64 = 15;
         match call(Syscall::Prctl.raw(), a1(PR_SET_NAME, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("PR_SET_NAME(NULL) did not return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("PR_SET_NAME(NULL) did not return -EFAULT"),
         }
     })
 }
@@ -103,14 +109,15 @@ kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_set_name_null);
 
 fn smoke_abi_proc2_prctl_get_name_null() -> TestResult {
     with_setup(|| {
-        // PR_GET_NAME with a NULL out pointer takes its own `arg_a == 0 →
-        // fail` arm, returning the -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT for a NULL name buffer; NARF
-        // returns the bare -1 sentinel.
+        // PR_GET_NAME with a NULL out pointer is a failed
+        // `copy_to_user`, which `kernel/sys.c` reports as -EFAULT:
+        //
+        //     if (copy_to_user((char __user *)arg2, comm, sizeof(comm)))
+        //             return -EFAULT;
         const PR_GET_NAME: u64 = 16;
         match call(Syscall::Prctl.raw(), a1(PR_GET_NAME, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("PR_GET_NAME(NULL) did not return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("PR_GET_NAME(NULL) did not return -EFAULT"),
         }
     })
 }
@@ -1536,4 +1543,664 @@ fn smoke_abi_proc2_kill_broadcast_respects_pid_ns_visibility() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_kill_broadcast_respects_pid_ns_visibility
+);
+
+// ── ptrace(2) — the errno dialect ─────────────────────────────────
+//
+// `kernel/ptrace.c::SYSCALL_DEFINE4(ptrace)` fixes the order in which
+// ptrace's errors are decided:
+//
+//     child = find_get_task_by_vpid(pid);
+//     if (!child) { ret = -ESRCH; goto out; }
+//     if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
+//             ret = ptrace_attach(child, request, addr, data);
+//             goto out_put_task_struct;
+//     }
+//     ret = ptrace_check_attach(child, request == PTRACE_KILL ||
+//                               request == PTRACE_INTERRUPT);
+//     if (ret < 0) goto out_put_task_struct;
+//     ret = arch_ptrace(child, request, addr, data);
+//
+// so "not my tracee" (ESRCH, from ptrace_check_attach) outranks every
+// per-request error, and inside arch_ptrace/ptrace_request the failure
+// errno is EIO — `int ret = -EIO;` — not EINVAL. EPERM is left to
+// ptrace_attach/ptrace_traceme alone.
+//
+// Every arm below used to answer with the bare -1 sentinel (= EPERM) or
+// with ENOSYS.
+
+/// EIO — ptrace's dialect for a bad request code, a bad USER-area
+/// offset, an unreadable tracee word, or an invalid resume signal.
+/// Not in the shared errno table, so it lives here.
+const EIO: i64 = -5;
+
+const PTRACE_PEEKDATA: u64 = 2;
+const PTRACE_PEEKUSER: u64 = 3;
+const PTRACE_POKEUSER: u64 = 6;
+const PTRACE_CONT: u64 = 7;
+const PTRACE_KILL_REQ: u64 = 8;
+const PTRACE_GETREGS: u64 = 12;
+const PTRACE_ATTACH_REQ: u64 = 16;
+const PTRACE_DETACH: u64 = 17;
+const PTRACE_SETOPTIONS: u64 = 0x4200;
+const PTRACE_GETREGSET: u64 = 0x4204;
+const PTRACE_O_TRACESYSGOOD: u64 = 1;
+const NT_PRSTATUS: u64 = 1;
+
+/// A registered task FAKE_TASK can legitimately trace. Distinct from the
+/// pid-namespace fixtures above so the two never collide.
+const TRACEE_PID: u64 = 0xB500;
+
+/// Reset the ptrace registry, register [`TRACEE_PID`] as a real task and
+/// make FAKE_TASK its tracer through an actual PTRACE_ATTACH, so the
+/// tests below start from the state `ptrace_check_attach` accepts.
+fn ptrace_fixture() -> Result<(), &'static str> {
+    crate::ptrace::ptrace_init();
+    crate::task::release_task(TRACEE_PID);
+    let _ = crate::task::Task::new_registered(TRACEE_PID, TRACEE_PID);
+    crate::handlers::register_task_to_pid(TRACEE_PID, TRACEE_PID);
+    crate::handlers::register_pid_task_mapping(TRACEE_PID, TRACEE_PID);
+    match call(
+        Syscall::Ptrace.raw(),
+        a3(PTRACE_ATTACH_REQ, TRACEE_PID, 0, 0),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("ptrace fixture: PTRACE_ATTACH did not succeed"),
+    }
+}
+
+fn ptrace_fixture_teardown() {
+    crate::ptrace::ptrace_init();
+    crate::task::release_task(TRACEE_PID);
+}
+
+// A request aimed at a process the caller does not trace is ESRCH for
+// EVERY request, because ptrace_check_attach runs before arch_ptrace.
+fn smoke_abi_proc2_ptrace_not_tracer_is_esrch() -> TestResult {
+    with_setup(|| {
+        crate::ptrace::ptrace_init();
+        // 0xB5FF is a pid nobody traces. Linux: child->ptrace is 0, so
+        // ptrace_check_attach returns -ESRCH and arch_ptrace is never
+        // reached. EPERM (the old -1) makes strace/gdb report a fatal
+        // "Operation not permitted" instead of reaping a tracee that
+        // raced them to exit.
+        const STRANGER: u64 = 0xB5FF;
+        for (req, what) in [
+            (PTRACE_PEEKDATA, "PEEKDATA"),
+            (PTRACE_GETREGS, "GETREGS"),
+            (PTRACE_SETOPTIONS, "SETOPTIONS"),
+            (PTRACE_CONT, "CONT"),
+            (PTRACE_DETACH, "DETACH"),
+            (PTRACE_PEEKUSER, "PEEKUSER"),
+            (PTRACE_POKEUSER, "POKEUSER"),
+            (PTRACE_GETREGSET, "GETREGSET"),
+            (PTRACE_KILL_REQ, "KILL"),
+        ] {
+            let _ = what;
+            if call(Syscall::Ptrace.raw(), a3(req, STRANGER, 0, 0)) != Some(ESRCH) {
+                return Err("ptrace on a process the caller does not trace must be -ESRCH");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_not_tracer_is_esrch);
+
+// PTRACE_ATTACH is one of the two requests that really do report EPERM,
+// and the pid lookup still precedes it.
+fn smoke_abi_proc2_ptrace_attach_self_is_eperm() -> TestResult {
+    with_setup(|| {
+        crate::ptrace::ptrace_init();
+        // `kernel/ptrace.c::ptrace_attach`:
+        //     if (same_thread_group(task, current))
+        //             return -EPERM;
+        // Tracing yourself is forbidden, not malformed — this arm used to
+        // return EINVAL, which a self-trace probe reads as "I built the
+        // request wrong" rather than "not allowed".
+        if call(
+            Syscall::Ptrace.raw(),
+            a3(PTRACE_ATTACH_REQ, FAKE_TASK, 0, 0),
+        ) != Some(EPERM)
+        {
+            return Err("PTRACE_ATTACH of self must be -EPERM");
+        }
+        // ORDER: `find_get_task_by_vpid` runs before ptrace_attach, so a
+        // pid that does not exist is ESRCH even though it is also not
+        // attachable.
+        if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH_REQ, 0xB5FE, 0, 0)) != Some(ESRCH) {
+            return Err("PTRACE_ATTACH of a nonexistent pid must be -ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_attach_self_is_eperm);
+
+// An unrecognised request is EIO (ptrace_request's `int ret = -EIO;`),
+// but only once check_attach has been satisfied.
+fn smoke_abi_proc2_ptrace_unknown_request_is_eio() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // Not a ptrace request code at all. Linux falls through
+            // arch_ptrace → ptrace_request → `default: break;` with ret
+            // still -EIO. ENOSYS (the old answer) reads as "ptrace(2) is
+            // not implemented", which makes a tracer probing for an
+            // optional request disable tracing altogether.
+            if call(Syscall::Ptrace.raw(), a3(0x7777, TRACEE_PID, 0, 0)) != Some(EIO) {
+                return Err("an unknown ptrace request on a real tracee must be -EIO");
+            }
+            // ORDER: the same unknown request aimed at a process we do
+            // NOT trace is ESRCH — check_attach wins over EIO.
+            if call(Syscall::Ptrace.raw(), a3(0x7777, 0xB5FF, 0, 0)) != Some(ESRCH) {
+                return Err("an unknown ptrace request on a stranger must be -ESRCH, not -EIO");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_unknown_request_is_eio);
+
+// PTRACE_SETOPTIONS validates the option bitset; silently storing
+// unknown bits told a feature probe the option was supported.
+fn smoke_abi_proc2_ptrace_setoptions_rejects_unknown_bits() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // Positive path first, so a later tightening cannot quietly
+            // turn the one option NARF implements into an error.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_SETOPTIONS, TRACEE_PID, 0, PTRACE_O_TRACESYSGOOD),
+            ) != Some(0)
+            {
+                return Err("PTRACE_SETOPTIONS(PTRACE_O_TRACESYSGOOD) must succeed");
+            }
+            // PTRACE_O_EXITKILL (1<<20) is inside PTRACE_O_MASK, so Linux
+            // accepts it even though nothing acts on it here.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_SETOPTIONS, TRACEE_PID, 0, 1 << 20),
+            ) != Some(0)
+            {
+                return Err("PTRACE_SETOPTIONS(PTRACE_O_EXITKILL) must be accepted");
+            }
+            // `kernel/ptrace.c::check_ptrace_options`:
+            //     if (data & ~(unsigned long)PTRACE_O_MASK)
+            //             return -EINVAL;
+            // Bit 30 is outside PTRACE_O_MASK.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_SETOPTIONS, TRACEE_PID, 0, 1 << 30),
+            ) != Some(EINVAL)
+            {
+                return Err("PTRACE_SETOPTIONS with an unknown option bit must be -EINVAL");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_setoptions_rejects_unknown_bits
+);
+
+// PTRACE_CONT's `data` is the signal to deliver on resume;
+// ptrace_resume rejects an invalid one with EIO *before* waking the
+// tracee, so the tracer must be able to tell the resume did not happen.
+fn smoke_abi_proc2_ptrace_cont_bad_signal_is_eio() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // `kernel/ptrace.c::ptrace_resume`:
+            //     if (!valid_signal(data))
+            //             return -EIO;
+            // valid_signal() is `sig <= _NSIG`, and _NSIG is 64.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 65)) != Some(EIO) {
+                return Err("PTRACE_CONT with signal 65 must be -EIO");
+            }
+            // Positive paths: 0 (deliver nothing) and the _NSIG boundary.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 0)) != Some(0) {
+                return Err("PTRACE_CONT with no signal must succeed");
+            }
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 64)) != Some(0) {
+                return Err("PTRACE_CONT with signal 64 (_NSIG) must succeed");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_cont_bad_signal_is_eio);
+
+// PTRACE_DETACH's signal argument is `unsigned int` in
+// `ptrace_detach(struct task_struct *child, unsigned int data)` — the
+// WIDTH is observable, because only the low 32 bits are validated.
+fn smoke_abi_proc2_ptrace_detach_signal_width_and_eio() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // Invalid signal → EIO, and the tracee stays attached.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_DETACH, TRACEE_PID, 0, 65)) != Some(EIO) {
+                return Err("PTRACE_DETACH with signal 65 must be -EIO");
+            }
+            // 0x1_0000_0000 truncates to 0 through the `unsigned int`
+            // parameter, so Linux detaches with "no signal" rather than
+            // failing. Validating the full 64-bit register would reject
+            // it — a divergence a 32-bit-ish caller would hit.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_DETACH, TRACEE_PID, 0, 1u64 << 32),
+            ) != Some(0)
+            {
+                return Err("PTRACE_DETACH must truncate its signal argument to 32 bits");
+            }
+            // Detached: the relationship is gone, so a second DETACH is
+            // ESRCH (check_attach), not EPERM.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_DETACH, TRACEE_PID, 0, 0)) != Some(ESRCH) {
+                return Err("PTRACE_DETACH of an already-detached tracee must be -ESRCH");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_detach_signal_width_and_eio
+);
+
+// PEEKUSER/POKEUSER take a USER-area byte OFFSET, not a pointer, so a
+// bad one is EIO, not EFAULT — and arch_ptrace checks it before it
+// touches the tracee's saved registers.
+fn smoke_abi_proc2_ptrace_peekuser_offset_is_eio() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // `arch/x86/kernel/ptrace.c::arch_ptrace`, PTRACE_PEEKUSR:
+            //     ret = -EIO;
+            //     if ((addr & (sizeof(data) - 1)) ||
+            //         addr >= sizeof(struct user))
+            //             break;
+            // Misaligned offset.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_PEEKUSER, TRACEE_PID, 4, 0)) != Some(EIO) {
+                return Err("PTRACE_PEEKUSER at a misaligned offset must be -EIO");
+            }
+            // Offset past the end of the USER area.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_PEEKUSER, TRACEE_PID, 8192, 0),
+            ) != Some(EIO)
+            {
+                return Err("PTRACE_PEEKUSER past the USER area must be -EIO");
+            }
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_POKEUSER, TRACEE_PID, 4, 0)) != Some(EIO) {
+                return Err("PTRACE_POKEUSER at a misaligned offset must be -EIO");
+            }
+            // Positive path: offset 0 is a real register on every arch
+            // NARF builds for, so POKE then PEEK must round-trip and
+            // must NOT look like an errno.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_POKEUSER, TRACEE_PID, 0, 0x1234),
+            ) != Some(0)
+            {
+                return Err("PTRACE_POKEUSER at offset 0 must succeed");
+            }
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_PEEKUSER, TRACEE_PID, 0, 0)) != Some(0x1234) {
+                return Err("PTRACE_PEEKUSER did not read back the poked register");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_peekuser_offset_is_eio);
+
+// PTRACE_GETREGSET reads the caller's iovec BEFORE it validates the
+// regset id, and the id itself is only 32 bits wide.
+fn smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // `kernel/ptrace.c::ptrace_request`, PTRACE_GETREGSET:
+            //     if (!access_ok(uiov, sizeof(*uiov)))  return -EFAULT;
+            //     if (__get_user(kiov.iov_base, ...) ||
+            //         __get_user(kiov.iov_len, ...))    return -EFAULT;
+            //     ret = ptrace_regset(child, request, addr, &kiov);
+            // ORDER: a NULL iovec faults first, even though the regset id
+            // (0x999) is also bogus. Checking the id first reported EINVAL
+            // and hid the caller's bad pointer.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_GETREGSET, TRACEE_PID, 0x999, 0),
+            ) != Some(EFAULT)
+            {
+                return Err("PTRACE_GETREGSET with a NULL iovec must be -EFAULT, not -EINVAL");
+            }
+            // With a readable iovec the bogus regset id is EINVAL
+            // (`ptrace_regset`: `if (!regset || ...) return -EINVAL;`).
+            let mut regs = [0u8; 512];
+            let mut iov = [regs.as_mut_ptr() as u64, regs.len() as u64];
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(PTRACE_GETREGSET, TRACEE_PID, 0x999, iov.as_mut_ptr() as u64),
+            ) != Some(EINVAL)
+            {
+                return Err("PTRACE_GETREGSET with an unknown regset id must be -EINVAL");
+            }
+            // WIDTH: `ptrace_regset(..., unsigned int type, ...)` only
+            // looks at the low 32 bits, so NT_PRSTATUS with junk in the
+            // high half still resolves — and this is the positive path.
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(
+                    PTRACE_GETREGSET,
+                    TRACEE_PID,
+                    (1u64 << 32) | NT_PRSTATUS,
+                    iov.as_mut_ptr() as u64,
+                ),
+            ) != Some(0)
+            {
+                return Err("PTRACE_GETREGSET must take the regset id as 32 bits wide");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset
+);
+
+// PTRACE_KILL still runs ptrace_check_attach — `ignore_state` only
+// waives the "must be stopped" half, not the "must be my tracee" half.
+fn smoke_abi_proc2_ptrace_kill_requires_tracer() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            // Positive path: our own tracee can be killed.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_KILL_REQ, TRACEE_PID, 0, 0)) != Some(0) {
+                return Err("PTRACE_KILL of our own tracee must succeed");
+            }
+            // A stranger's pid is ESRCH. This arm had no ownership check
+            // at all and reported success, so ptrace(2) was a way to
+            // SIGKILL any pid in the system.
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_KILL_REQ, 0xB5FF, 0, 0)) != Some(ESRCH) {
+                return Err("PTRACE_KILL of a process we do not trace must be -ESRCH");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_ptrace_kill_requires_tracer);
+
+// ── prctl(2) — pointer arms are EFAULT, values are validated ──────
+//
+// `kernel/sys.c::SYSCALL_DEFINE5(prctl, int, option, unsigned long,
+// arg2, ...)`. Every option that takes a user pointer reports a bad one
+// through put_user/copy_to_user, i.e. EFAULT; the handler used to answer
+// the bare -1 sentinel, which is EPERM.
+
+fn smoke_abi_proc2_prctl_pointer_arms_are_efault() -> TestResult {
+    with_setup(|| {
+        const PR_GET_PDEATHSIG: u64 = 2;
+        const PR_GET_CHILD_SUBREAPER: u64 = 37;
+        const PR_SET_PDEATHSIG: u64 = 1;
+        const PR_GET_TSC: u64 = 25;
+
+        // `kernel/sys.c`: `error = put_user(me->pdeath_signal,
+        // (int __user *)arg2);` — a NULL out pointer is EFAULT, not
+        // EPERM. A caller that gets EPERM here concludes it may not read
+        // its own parent-death signal and stops asking.
+        for (op, what) in [
+            (PR_GET_PDEATHSIG, "PR_GET_PDEATHSIG"),
+            (PR_GET_CHILD_SUBREAPER, "PR_GET_CHILD_SUBREAPER"),
+            // `arch/x86/kernel/process.c::get_tsc_mode` IS a put_user, so
+            // Linux has no "no pointer given" shortcut: NULL is EFAULT.
+            // This arm used to return 0 without writing anything, leaving
+            // the caller to read its uninitialised variable as the answer.
+            (PR_GET_TSC, "PR_GET_TSC"),
+        ] {
+            let _ = what;
+            if call(Syscall::Prctl.raw(), a1(op, 0)) != Some(EFAULT) {
+                return Err("a prctl GET with a NULL out pointer must return -EFAULT");
+            }
+        }
+
+        // Positive paths: a real buffer round-trips and returns 0.
+        let mut out = [0u8; 4];
+        if call(Syscall::Prctl.raw(), a1(PR_SET_PDEATHSIG, 9)) != Some(0) {
+            return Err("PR_SET_PDEATHSIG(SIGKILL) must succeed");
+        }
+        if call(
+            Syscall::Prctl.raw(),
+            a1(PR_GET_PDEATHSIG, out.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("PR_GET_PDEATHSIG with a real buffer must succeed");
+        }
+        if i32::from_ne_bytes(out) != 9 {
+            return Err("PR_GET_PDEATHSIG did not read back the signal that was set");
+        }
+        if call(
+            Syscall::Prctl.raw(),
+            a1(PR_GET_TSC, out.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("PR_GET_TSC with a real buffer must succeed");
+        }
+        if i32::from_ne_bytes(out) != 1 {
+            return Err("PR_GET_TSC must still report rdtsc enabled");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_pointer_arms_are_efault);
+
+// `int option` — Linux dispatches on the low 32 bits of the option
+// register. Matching the full 64-bit value sent an option with junk in
+// its high half to the unknown-option arm.
+fn smoke_abi_proc2_prctl_option_is_32_bits() -> TestResult {
+    with_setup(|| {
+        const PR_SET_DUMPABLE: u64 = 4;
+        const PR_GET_DUMPABLE: u64 = 3;
+        if call(Syscall::Prctl.raw(), a1((1u64 << 32) | PR_SET_DUMPABLE, 1)) != Some(0) {
+            return Err("prctl must dispatch on the low 32 bits of its option (int option)");
+        }
+        if call(Syscall::Prctl.raw(), a0((1u64 << 32) | PR_GET_DUMPABLE)) != Some(1) {
+            return Err("PR_GET_DUMPABLE with a wide option did not read back 1");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_option_is_32_bits);
+
+// PR_SET_DUMPABLE only accepts SUID_DUMP_DISABLE (0) and SUID_DUMP_USER
+// (1); SUID_DUMP_ROOT (2) is kernel-internal and prctl refuses it.
+fn smoke_abi_proc2_prctl_dumpable_rejects_root_mode() -> TestResult {
+    with_setup(|| {
+        const PR_SET_DUMPABLE: u64 = 4;
+        const PR_GET_DUMPABLE: u64 = 3;
+        // `kernel/sys.c`:
+        //     if (arg2 != SUID_DUMP_DISABLE && arg2 != SUID_DUMP_USER) {
+        //             error = -EINVAL;
+        //             break;
+        //     }
+        // Folding every non-zero value to "dumpable" told a caller asking
+        // for the root-only dump mode that it had got it.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_DUMPABLE, 2)) != Some(EINVAL) {
+            return Err("PR_SET_DUMPABLE(SUID_DUMP_ROOT) must be -EINVAL");
+        }
+        // Positive paths: both legal values still work and round-trip.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_DUMPABLE, 0)) != Some(0)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_DUMPABLE)) != Some(0)
+        {
+            return Err("PR_SET_DUMPABLE(0) must succeed and read back 0");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_DUMPABLE, 1)) != Some(0)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_DUMPABLE)) != Some(1)
+        {
+            return Err("PR_SET_DUMPABLE(1) must succeed and read back 1");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_prctl_dumpable_rejects_root_mode
+);
+
+// no_new_privs is one-way in Linux — there is deliberately no way to
+// clear it, or a sandboxed child could re-enable setuid execs.
+fn smoke_abi_proc2_prctl_no_new_privs_is_one_way() -> TestResult {
+    with_setup(|| {
+        const PR_SET_NO_NEW_PRIVS: u64 = 38;
+        const PR_GET_NO_NEW_PRIVS: u64 = 39;
+        // `kernel/sys.c`:
+        //     if (arg2 != 1 || arg3 || arg4 || arg5)
+        //             return -EINVAL;
+        //     task_set_no_new_privs(current);
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NO_NEW_PRIVS, 1)) != Some(0) {
+            return Err("PR_SET_NO_NEW_PRIVS(1) must succeed");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NO_NEW_PRIVS, 0)) != Some(EINVAL) {
+            return Err("PR_SET_NO_NEW_PRIVS(0) must be -EINVAL — the flag cannot be cleared");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NO_NEW_PRIVS, 2)) != Some(EINVAL) {
+            return Err("PR_SET_NO_NEW_PRIVS(2) must be -EINVAL — only 1 is accepted");
+        }
+        // The rejected clear must not have taken effect.
+        if call(Syscall::Prctl.raw(), a0(PR_GET_NO_NEW_PRIVS)) != Some(1) {
+            return Err("a rejected PR_SET_NO_NEW_PRIVS(0) still cleared the flag");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_no_new_privs_is_one_way);
+
+// PR_SET_SECUREBITS is handled by the LSM hook, and its "unsupported
+// bits" arm returns EPERM — one of the few prctl options where EPERM is
+// the CORRECT answer rather than the sentinel.
+fn smoke_abi_proc2_prctl_securebits_unsupported_bits_is_eperm() -> TestResult {
+    with_setup(|| {
+        const PR_SET_SECUREBITS: u64 = 28;
+        const PR_GET_SECUREBITS: u64 = 27;
+        // `security/commoncap.c::cap_task_prctl`, case PR_SET_SECUREBITS,
+        // condition [3] "no setting of unsupported bits":
+        //     || (arg2 & ~(SECURE_ALL_LOCKS | SECURE_ALL_BITS))
+        //             return -EPERM;
+        // SECURE_ALL_BITS is bits 0/2/4/6 and SECURE_ALL_LOCKS those
+        // shifted left one, so the union is exactly 0xFF. libcap reads
+        // EINVAL as "this kernel predates that securebit" and EPERM as
+        // "you lack CAP_SETPCAP"; the second is the truthful answer.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, 1 << 20)) != Some(EPERM) {
+            return Err("PR_SET_SECUREBITS with bits outside the mask must be -EPERM");
+        }
+        // Positive path: an in-mask value is stored and reads back.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, 0x2F)) != Some(0) {
+            return Err("PR_SET_SECUREBITS with in-mask bits must succeed");
+        }
+        if call(Syscall::Prctl.raw(), a0(PR_GET_SECUREBITS)) != Some(0x2F) {
+            return Err("PR_GET_SECUREBITS did not read back the stored securebits");
+        }
+        // Leave the task as we found it for the rest of the group.
+        let _ = call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, 0));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_prctl_securebits_unsupported_bits_is_eperm
+);
+
+// PR_SET_TSC and PR_SET_SECCOMP both have closed value sets; accepting
+// anything outside them is the silent kind of divergence, because the
+// caller is told a mode it asked for is in force.
+fn smoke_abi_proc2_prctl_closed_value_sets_are_einval() -> TestResult {
+    with_setup(|| {
+        const PR_SET_TSC: u64 = 26;
+        const PR_GET_SECCOMP: u64 = 21;
+        const PR_SET_SECCOMP: u64 = 22;
+        // `arch/x86/kernel/process.c::set_tsc_mode`: PR_TSC_ENABLE (1) and
+        // PR_TSC_SIGSEGV (2) only, `else return -EINVAL;`.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 0)) != Some(EINVAL) {
+            return Err("PR_SET_TSC(0) must be -EINVAL");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 3)) != Some(EINVAL) {
+            return Err("PR_SET_TSC(3) must be -EINVAL");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 1)) != Some(0)
+            || call(Syscall::Prctl.raw(), a1(PR_SET_TSC, 2)) != Some(0)
+        {
+            return Err("PR_SET_TSC must accept PR_TSC_ENABLE and PR_TSC_SIGSEGV");
+        }
+        // `kernel/seccomp.c::prctl_set_seccomp`: SECCOMP_MODE_STRICT (1)
+        // and SECCOMP_MODE_FILTER (2) only, `default: return -EINVAL;`.
+        // Mode 0 (DISABLED) is a state, not a request — there is no way
+        // back out of seccomp.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 0)) != Some(EINVAL) {
+            return Err("PR_SET_SECCOMP(SECCOMP_MODE_DISABLED) must be -EINVAL");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 3)) != Some(EINVAL) {
+            return Err("PR_SET_SECCOMP(3) must be -EINVAL");
+        }
+        // Positive paths: PR_GET_SECCOMP must report the mode actually
+        // requested, not a folded-to-FILTER stand-in.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 1)) != Some(0)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(1)
+        {
+            return Err("PR_SET_SECCOMP(STRICT) must be readable back as mode 1");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 2)) != Some(0)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(2)
+        {
+            return Err("PR_SET_SECCOMP(FILTER) must be readable back as mode 2");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_prctl_closed_value_sets_are_einval
+);
+
+// PTRACE_TRACEME is the other place EPERM is the honest answer.
+fn smoke_abi_proc2_ptrace_traceme_second_call_is_eperm() -> TestResult {
+    with_setup(|| {
+        crate::ptrace::ptrace_init();
+        const PTRACE_TRACEME: u64 = 0;
+        // TRACEME resolves the caller's parent, so give it one.
+        crate::handlers::__test_inject_parent_of(FAKE_TASK, 7);
+        let result = (|| {
+            // Positive path.
+            if call(Syscall::Ptrace.raw(), a0(PTRACE_TRACEME)) != Some(0) {
+                return Err("PTRACE_TRACEME with a parent must succeed");
+            }
+            // `kernel/ptrace.c::ptrace_traceme` opens with
+            // `int ret = -EPERM;` and only `if (!current->ptrace)` clears
+            // it — one tracer per process, and a second TRACEME is a
+            // genuine permission failure rather than a sentinel.
+            if call(Syscall::Ptrace.raw(), a0(PTRACE_TRACEME)) != Some(EPERM) {
+                return Err("a second PTRACE_TRACEME must be -EPERM");
+            }
+            Ok(())
+        })();
+        crate::ptrace::ptrace_init();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_traceme_second_call_is_eperm
 );

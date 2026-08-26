@@ -40,6 +40,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 const ENOENT: i64 = 2;
 const E2BIG: i64 = 7;
 const EBADF: i64 = 9;
+const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
@@ -508,7 +509,13 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
     });
     match install_fd(Arc::new(FsContextFile { id }), a.arg1 & FSOPEN_CLOEXEC != 0) {
         Some(n) => ctx.set_return(ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        None => {
+            // `fs/namespace.c` and `fs/fsopen.c` publish these descriptors with
+            // `FD_PREPARE`, i.e. `get_unused_fd_flags`: a table at
+            // RLIMIT_NOFILE is -EMFILE. -EBADF here would blame the caller's
+            // fd arguments, which had already resolved successfully.
+            ctx.set_return(err(EMFILE));
+        }
     }
 }
 
@@ -639,7 +646,13 @@ pub fn sys_fsmount(ctx: &mut dyn TrapContext) {
         a.arg1 & FSMOUNT_CLOEXEC != 0,
     ) {
         Some(n) => ctx.set_return(ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        None => {
+            // `fs/namespace.c` and `fs/fsopen.c` publish these descriptors with
+            // `FD_PREPARE`, i.e. `get_unused_fd_flags`: a table at
+            // RLIMIT_NOFILE is -EMFILE. -EBADF here would blame the caller's
+            // fd arguments, which had already resolved successfully.
+            ctx.set_return(err(EMFILE));
+        }
     }
 }
 
@@ -749,7 +762,13 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
                 a.arg2 & OPEN_TREE_CLOEXEC != 0,
             ) {
                 Some(n) => ctx.set_return(ok(n as u64)),
-                None => ctx.set_return(err(EBADF)),
+                None => {
+                    // `fs/namespace.c` and `fs/fsopen.c` publish these descriptors with
+                    // `FD_PREPARE`, i.e. `get_unused_fd_flags`: a table at
+                    // RLIMIT_NOFILE is -EMFILE. -EBADF here would blame the caller's
+                    // fd arguments, which had already resolved successfully.
+                    ctx.set_return(err(EMFILE));
+                }
             }
             return;
         }
@@ -841,7 +860,7 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
         Some(n) => ctx.set_return(ok(n as u64)),
         None => {
             with_mounts(|mounts| mounts.remove(&mid));
-            ctx.set_return(err(EBADF));
+            ctx.set_return(err(EMFILE));
         }
     }
 }
@@ -917,7 +936,13 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
     });
     match install_fd(Arc::new(FsContextFile { id }), a.arg2 & FSOPEN_CLOEXEC != 0) {
         Some(n) => ctx.set_return(ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        None => {
+            // `fs/namespace.c` and `fs/fsopen.c` publish these descriptors with
+            // `FD_PREPARE`, i.e. `get_unused_fd_flags`: a table at
+            // RLIMIT_NOFILE is -EMFILE. -EBADF here would blame the caller's
+            // fd arguments, which had already resolved successfully.
+            ctx.set_return(err(EMFILE));
+        }
     }
 }
 

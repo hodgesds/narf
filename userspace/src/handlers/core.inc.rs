@@ -1531,7 +1531,12 @@ fn open_fifo(
         }) {
         Some(n) => n,
         None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
+            // `fs/namei.c::do_open` allocates the descriptor with
+            // `get_unused_fd_flags`, so a table at RLIMIT_NOFILE is -EMFILE.
+            // `!0u64` is the `-1` sentinel in disguise and reached userspace
+            // as EPERM — which for a FIFO open reads as "you may not open
+            // this pipe", a permission problem the caller cannot retry.
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };
@@ -6265,6 +6270,29 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
     }
 
+    // CLONE_PIDFD: Linux allocates the parent's descriptor inside
+    // `copy_process` —
+    //
+    //     retval = pidfd_prepare(pid, flags | PIDFD_STALE, &pidfile);
+    //     if (retval < 0)
+    //             goto bad_fork_free_pid;
+    //
+    // so an exhausted table fails the WHOLE clone and no child is created.
+    // NARF installs the descriptor at the end, long past the point this
+    // handler can still bail, and the old code simply skipped the install on
+    // failure: the caller got a child it had no pidfd for and no error saying
+    // why — a process it cannot wait on and cannot explain. Check here, while
+    // returning is still possible.
+    //
+    // LINUX-GAP: this is a probe, not a reservation, so a CLONE_FILES sibling
+    // allocating in the window between here and the install below can still
+    // reach that silent skip. Closing it needs the descriptor reserved this
+    // early and released on every other early return in this handler, which
+    // is a larger change than this one.
+    if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 && !crate::fd::has_free_descriptor(parent_pid) {
+        ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+        return;
+    }
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
     // `pidfd::notify_exit` only flips entries that already exist in the
     // table — under SMP (or an exec-then-crash child) the child can exit

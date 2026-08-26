@@ -38,6 +38,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 // ── errno (negated-long convention) ─────────────────────────────────
 const EINVAL: i64 = 22;
 const EBADF: i64 = 9;
+const EMFILE: i64 = 24;
 const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
 
@@ -192,7 +193,12 @@ pub fn sys_landlock_create_ruleset(ctx: &mut dyn TrapContext) {
         },
     ) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        None => {
+            // `security/landlock/syscalls.c` publishes the ruleset with
+            // `anon_inode_getfd`, whose descriptor comes from
+            // `get_unused_fd_flags`: a full table is -EMFILE.
+            ctx.set_return(err(EMFILE));
+        }
     }
 }
 

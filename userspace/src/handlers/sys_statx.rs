@@ -1,6 +1,54 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `include/uapi/linux/stat.h`: `STATX__RESERVED 0x80000000U` — held back for
+/// a future `struct statx` field. `do_statx` rejects it so that a binary
+/// built against a newer header cannot silently get a short answer.
+#[cfg(feature = "linux-compat")]
+const STATX_RESERVED: u32 = 0x8000_0000;
+
+/// `fs/stat.c::SYSCALL_DEFINE5(statx)` and the two helpers it dispatches to
+/// fix both the errnos and the order they are decided in:
+///
+/// ```text
+///     CLASS(filename_maybe_null, name)(filename, flags);
+///     if (!name && dfd >= 0)
+///             return do_statx_fd(dfd, flags & ~AT_NO_AUTOMOUNT, mask, buffer);
+///     return do_statx(dfd, name, flags, mask, buffer);
+///
+/// int do_statx(...)                             /* and do_statx_fd, identically */
+/// {
+///         if (mask & STATX__RESERVED)                        return -EINVAL;
+///         if ((flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE) return -EINVAL;
+///         error = vfs_statx(dfd, filename, flags, &stat, mask);
+///         if (error) return error;
+///         return cp_statx(&stat, buffer);        /* copy_to_user → -EFAULT */
+/// }
+///
+/// static int vfs_statx(...)
+/// {
+///         if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
+///                       AT_STATX_SYNC_TYPE))                 return -EINVAL;
+///         error = filename_lookup(dfd, filename, lookup_flags, &path, NULL);
+///         ...
+/// }
+/// ```
+///
+/// So: the mask and sync-type checks come first — a reserved mask bit beats
+/// ENOENT on a missing path, and beats EFAULT on the pathname pointer too,
+/// because `getname()`'s error is only surfaced later by `filename_lookup`.
+/// The destination buffer is inspected last, in `cp_statx`. And the
+/// descriptor branch (`do_statx_fd` → `vfs_statx_fd`) never reaches
+/// `vfs_statx`, so it does NOT validate `flags` at all — only the fd's
+/// existence, as -EBADF.
+///
+/// Getting the numbers right matters most on the lookup arm: musl and glibc
+/// implement `stat()`/`lstat()`/`fstatat()` on top of `statx` where it is
+/// available, so a bare -1 here surfaces as errno 1 = EPERM for every
+/// "does this file exist?" probe in userspace — PATH search over a
+/// `:`-separated list, a config-file cascade (`/etc/x` then `~/.x`), and
+/// every "create it if it is not there" path. Those all key on ENOENT and
+/// treat EPERM as a hard, reportable error.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     use linux_compat::*;
@@ -8,44 +56,49 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // Linux ABI: `int statx(int dirfd, const char *path, int flags,
     // unsigned int mask, struct statx *buf)`. arg2/3/4/5 shift left
     // by one slot now that arg2 is `flags` (not the old NARF-native
-    // `path_len`).
+    // `path_len`). Widths match the kernel prototype: `int dfd`,
+    // `unsigned flags`, `unsigned int mask`.
     let dirfd = args.arg0 as i32;
     let path_uptr = args.arg1;
     let flags = args.arg2 as u32;
     let mask = args.arg3 as u32;
     let out_ptr = args.arg4 as *mut Statx;
-    let _ = mask;
 
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
+    // do_statx / do_statx_fd, before anything is resolved.
+    if mask & STATX_RESERVED != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    // AT_STATX_SYNC_TYPE is a 2-bit field; asking for FORCE_SYNC and
+    // DONT_SYNC at once is contradictory, and only that combination is
+    // rejected (each bit on its own is a legal sync mode).
+    if flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
 
     // AT_EMPTY_PATH + empty path string → operate on dirfd directly.
     // We can detect "empty path" cheaply by reading just the first
-    // byte; if it's NUL, no need to call copy_user_cstr.
-    let mut first = [0u8; 1];
-    // SAFETY: `path_uptr` is the user path pointer; copy_from_user range-validates
-    // it and SMAP-brackets the 1-byte read into `first`.
+    // byte; if it's NUL, no need to call copy_user_cstr. `getname_maybe_null`
+    // also maps a NULL `filename` under AT_EMPTY_PATH to "empty".
     let empty = (flags & AT_EMPTY_PATH) != 0
-        // SAFETY: Valid memory or trusted environment
-        && unsafe { copy_from_user(&mut first, path_uptr) }.is_ok()
-        && first[0] == 0;
+        && (path_uptr == 0 || {
+            let mut first = [0u8; 1];
+            // SAFETY: `path_uptr` is the user path pointer; copy_from_user
+            // range-validates it and SMAP-brackets the 1-byte read into `first`.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { copy_from_user(&mut first, path_uptr) }.is_ok() && first[0] == 0
+        });
 
     // Resolve to a FileOps. Three cases:
-    //   1. empty + dirfd >= 0       → look up fd
-    //   2. path absolute            → registry walk (dirfd ignored
-    //                                  beyond requiring AT_FDCWD or
-    //                                  a real fd; NARF has no per-
-    //                                  task cwd so non-AT_FDCWD
-    //                                  relative paths fail)
-    //   3. otherwise                → fail
-    let (fs_stat, mnt_id, is_mount_root) = if empty {
-        if dirfd < 0 {
-            ctx.set_return(fail);
-            return;
-        }
+    //   1. empty + dirfd >= 0       → do_statx_fd: look up the fd, -EBADF if
+    //                                  the table does not hold it. No flag
+    //                                  validation on this branch.
+    //   2. empty + dirfd == AT_FDCWD → LOOKUP_EMPTY resolves "" against the
+    //                                  cwd; any other negative dirfd is
+    //                                  -EBADF from path_init's fdget.
+    //   3. otherwise                → vfs_statx: validate `flags`, then walk.
+    let (fs_stat, mnt_id, is_mount_root) = if empty && dirfd >= 0 {
         let task = current_task_id();
         let st = fd::with_table(task, |t| {
             t.get(dirfd as u32).map(|e| {
@@ -54,6 +107,12 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             })
         })
         .flatten();
+        let Some(st) = st else {
+            // vfs_statx_fd's `fd_empty(f)` arm. A closed descriptor is EBADF,
+            // never ENOENT: the caller asked about an fd, not a name.
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        };
         // The mount id of the mount this fd resides on. systemd's
         // path_is_root_at / fds_inode_and_mount_same compare STATX_MNT_ID to
         // distinguish a bind/pivoted root from the real root; absent it,
@@ -62,15 +121,46 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // An O_PATH fd does not currently retain a mount-root marker.  Its
         // mount identity remains available, while pathname statx below
         // carries STATX_ATTR_MOUNT_ROOT for systemd's mount-point probe.
-        (st, crate::mqueue::fd_mount_id(task, dirfd as u32), false)
+        (
+            Some(st),
+            crate::mqueue::fd_mount_id(task, dirfd as u32),
+            false,
+        )
     } else {
-        let raw = match copy_user_cstr(path_uptr, 4096) {
-            Some(s) => s,
-            None => {
-                ctx.set_return(fail);
+        // vfs_statx's flag gate. It precedes filename_lookup, so an unknown
+        // flag bit outranks a missing path.
+        const ALLOWED_FLAGS: u32 =
+            AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
+        if flags & !ALLOWED_FLAGS != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            return;
+        }
+        const AT_FDCWD_I32: i32 = AT_FDCWD;
+        let raw = if empty {
+            // Reached only for a negative dirfd (the >= 0 case is above).
+            if dirfd != AT_FDCWD_I32 {
+                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
                 return;
             }
+            // LOOKUP_EMPTY against AT_FDCWD == the cwd itself.
+            alloc::string::String::from(".")
+        } else {
+            match copy_user_cstr(path_uptr, 4096) {
+                Some(s) => s,
+                None => {
+                    // LINUX-GAP: `getname()` reports -ENAMETOOLONG for a
+                    // pathname >= PATH_MAX with no NUL and -EFAULT for an
+                    // unreadable one; copy_user_cstr collapses both to `None`.
+                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                    return;
+                }
+            }
         };
+        if raw.is_empty() {
+            // A non-AT_EMPTY_PATH empty name never resolves.
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
         // Honour a real directory fd (same shape as sys_readlinkat):
         // resolve a relative path against the directory backing `dirfd`.
         // systemd's chase() walks a path one component at a time via
@@ -78,8 +168,13 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         // STATX_TYPE); without this branch every such lookup resolved
         // against the CWD instead and ENOENT'd (exec_setup_credentials'
         // mount-ns child → journald 243/EXIT_CREDENTIALS).
-        const AT_FDCWD_I32: i32 = -100;
-        let effective = if raw.starts_with('/') || dirfd == AT_FDCWD_I32 || dirfd < 0 {
+        let relative = !raw.starts_with('/');
+        if relative && dirfd < 0 && dirfd != AT_FDCWD_I32 {
+            // path_init's `fdget(nd->dfd)` on a bogus anchor.
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+        let effective = if !relative || dirfd == AT_FDCWD_I32 {
             raw
         } else {
             match fd_path_for_task(current_task_id(), dirfd as u32) {
@@ -108,6 +203,9 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             // existence (e.g. libwayland's wl_socket_lock, which only
             // proceeds when stat() of the socket path returns ENOENT) need
             // the real errno.
+            // LINUX-GAP: filename_lookup also yields -ENOTDIR, -ELOOP and
+            // -EACCES here; the dir-aware resolver returns a bare `None`
+            // with no failure reason, so they collapse into -ENOENT.
             ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
             return;
         }
@@ -140,6 +238,16 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // STATX_BASIC_STATS = type|mode|nlink|uid|gid|atime|mtime|
     // ctime|ino|size|blocks. We fill type/mode/nlink/ino/size/
     // blocks/mtime/ctime; uid/gid/atime aren't tracked.
+    //
+    // LINUX-GAP: past the STATX__RESERVED rejection above, `mask` is
+    // advisory here — the handler computes the same fields whatever is
+    // requested and reports them all in stx_mask. Linux permits returning
+    // MORE than was asked for (and systemd relies on that for STATX_MNT_ID,
+    // below), but it also clears result_mask bits it could not fill, whereas
+    // NARF has no source for STATX_BTIME / STATX_ATIME / STATX_DIOALIGN and
+    // simply never advertises them. A caller asking only for STATX_BTIME
+    // therefore gets a successful statx with that bit clear rather than an
+    // error — which is legal, just less informative than Linux.
     let filled = STATX_TYPE
         | STATX_MODE
         | STATX_NLINK
@@ -197,6 +305,12 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         ..Default::default()
     };
 
+    // cp_statx's arm: the destination is inspected only now, after the mask,
+    // the flags and the lookup have all been accepted.
+    if out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        return;
+    }
     // SAFETY: Statx is repr(C) POD; bytes are valid for read.
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
@@ -208,7 +322,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

@@ -11,6 +11,9 @@ const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
 
+/// SIGALRM — `timer_create`'s default signo when `sigevent` is NULL.
+const SIGALRM_SIGNO: i32 = 14;
+
 // ── sysinfo(buf) ──────────────────────────────────────────────────────
 // buf==0 → ok(-EFAULT); a valid 112-byte buffer → ok(0).
 
@@ -429,39 +432,206 @@ fn smoke_abi_time_nanosleep_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_nanosleep_neg);
 
-// ── timer_create(clockid, sigevent, timerid) ──────────────────────────
-// Valid clock + NULL sigevent (SIGEV_SIGNAL/SIGALRM default) + out → ok(0).
-// Unknown clockid → ok(-1).
+// ═════════════════════════════════════════════════════════════════════
+// POSIX interval timers — `kernel/time/posix-timers.c`, `itimer.c`
+// ═════════════════════════════════════════════════════════════════════
+//
+// Every handler in `posix_timer.rs` used to answer a bare `-1`, which a
+// libc stub turns into errno 1 = EPERM. These smokes pin the errnos
+// Linux actually returns AND the order the checks run in, because Linux
+// fixes which error wins when several apply — a faulting `sigevent`
+// beats a bad clockid in `timer_create`, but a stale timerid beats a
+// faulting output buffer in `timer_gettime`.
+//
+// Clock ids `timer_create` classifies (`posix_clocks[]`). 4/5/6 are in
+// the table but carry no `.timer_create` → EOPNOTSUPP; 10 is a hole in
+// the table and >= 12 is past its end → EINVAL.
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_BOOTTIME: u64 = 7;
+const CLOCK_TABLE_HOLE: u64 = 10;
 
+// `sigev_notify` values. THREAD_ID is a modifier ORed onto SIGEV_SIGNAL,
+// which is how glibc implements SIGEV_THREAD.
+const SIGEV_SIGNAL: i32 = 0;
+const SIGEV_NONE: i32 = 1;
+const SIGEV_THREAD_ID: i32 = 4;
+/// glibc's SIGRTMIN. `timer_create` must accept it: glibc's SIGEV_THREAD
+/// timers ask for exactly this signo.
+const SIGRTMIN: i32 = 34;
+
+/// A pointer that is non-NULL and guaranteed to fail `validate_user_range`
+/// (the range end overflows), so the handler must report EFAULT.
+const FAULTING: u64 = u64::MAX;
+
+/// Build the 16 bytes of `struct sigevent` the handler reads:
+/// `sigev_value` (8 B) then `sigev_signo` (4 B) then `sigev_notify` (4 B).
+fn sigevent(signo: i32, notify: i32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[8..12].copy_from_slice(&signo.to_le_bytes());
+    b[12..16].copy_from_slice(&notify.to_le_bytes());
+    b
+}
+
+// ── timer_create(clockid, sigevent, timerid) ──────────────────────────
+
+/// Positive paths, so a later tightening of the error arms cannot
+/// silently turn a working `timer_create` into a failure: every clock
+/// NARF can actually arm, the NULL-sigevent default (SIGEV_SIGNAL +
+/// SIGALRM), and the sigevent shapes glibc/musl really emit.
 fn smoke_abi_time_timer_create_pos() -> TestResult {
     with_setup(|| {
         let mut id = [0u64; 1];
-        match call(
-            Syscall::TimerCreate.raw(),
-            a2(CLOCK_MONOTONIC, 0, id.as_mut_ptr() as u64),
-        ) {
-            Some(0) => Ok(()),
-            _ => Err("timer_create(MONOTONIC, NULL, out) should return 0"),
+        let out = id.as_mut_ptr() as u64;
+        for clk in [CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME] {
+            if call(Syscall::TimerCreate.raw(), a2(clk, 0, out)) != Some(0) {
+                return Err("timer_create(<armable clock>, NULL, out) should return 0");
+            }
         }
+        // `clockid_t` is `int`: only the low 32 bits reach the kernel, so
+        // garbage in the upper half still names CLOCK_MONOTONIC.
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2((1u64 << 32) | CLOCK_MONOTONIC, 0, out),
+        ) != Some(0)
+        {
+            return Err("timer_create must truncate clockid to 32 bits");
+        }
+        // Explicit sigevents. SIGRTMIN matters: glibc's SIGEV_THREAD
+        // rewrites to SIGEV_SIGNAL|SIGEV_THREAD_ID with signo=SIGRTMIN,
+        // and the old `signum >= 32` cap rejected every one of them.
+        for ev in [
+            sigevent(SIGALRM_SIGNO, SIGEV_SIGNAL),
+            sigevent(SIGRTMIN, SIGEV_SIGNAL),
+            sigevent(SIGRTMIN, SIGEV_SIGNAL | SIGEV_THREAD_ID),
+            sigevent(0, SIGEV_NONE),
+        ] {
+            if call(
+                Syscall::TimerCreate.raw(),
+                a2(CLOCK_MONOTONIC, ev.as_ptr() as u64, out),
+            ) != Some(0)
+            {
+                return Err("timer_create with a valid sigevent should return 0");
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_create_pos);
 
-fn smoke_abi_time_timer_create_neg() -> TestResult {
+/// `do_timer_create`: `if (!kc) return -EINVAL;` for a clockid that is not
+/// in `posix_clocks[]` at all.
+fn smoke_abi_time_timer_create_unknown_clock_einval() -> TestResult {
     with_setup(|| {
         let mut id = [0u64; 1];
-        // Unknown clockid → -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(
-            Syscall::TimerCreate.raw(),
-            a2(99, 0, id.as_mut_ptr() as u64),
-        ) {
-            Some(-1) => Ok(()),
-            _ => Err("timer_create on an unknown clockid should return -1"),
+        let out = id.as_mut_ptr() as u64;
+        for clk in [99, CLOCK_TABLE_HOLE, 12] {
+            if call(Syscall::TimerCreate.raw(), a2(clk, 0, out)) != Some(EINVAL) {
+                return Err("timer_create on a clockid outside posix_clocks[] should be -EINVAL");
+            }
         }
+        Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_time_timer_create_neg);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_create_unknown_clock_einval
+);
+
+/// `do_timer_create`: `if (!kc->timer_create) return -EOPNOTSUPP;`.
+/// CLOCK_MONOTONIC_RAW and the _COARSE clocks are real clocks with no
+/// timer support — NARF used to *accept* MONOTONIC_RAW and hand back a
+/// timer Linux would have refused. The CPU-time clocks are a documented
+/// NARF gap reported with the same "clock exists, timers do not" errno.
+fn smoke_abi_time_timer_create_no_timer_clock_eopnotsupp() -> TestResult {
+    with_setup(|| {
+        let mut id = [0u64; 1];
+        let out = id.as_mut_ptr() as u64;
+        for clk in [
+            CLOCK_MONOTONIC_RAW,
+            CLOCK_REALTIME_COARSE,
+            CLOCK_MONOTONIC_COARSE,
+            CLOCK_PROCESS_CPUTIME_ID,
+            CLOCK_THREAD_CPUTIME_ID,
+        ] {
+            if call(Syscall::TimerCreate.raw(), a2(clk, 0, out)) != Some(EOPNOTSUPP) {
+                return Err("timer_create on a clock with no timer support should be -EOPNOTSUPP");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_create_no_timer_clock_eopnotsupp
+);
+
+/// ORDER: `sys_timer_create` copies the sigevent in the syscall wrapper,
+/// *before* `do_timer_create` looks at the clockid. So a faulting
+/// sigevent wins over a bad clock (EFAULT, not EINVAL) — while the
+/// output pointer is not touched until the very end and loses to both.
+fn smoke_abi_time_timer_create_order() -> TestResult {
+    with_setup(|| {
+        let mut id = [0u64; 1];
+        let out = id.as_mut_ptr() as u64;
+        // Faulting sigevent + unknown clock → the sigevent copy wins.
+        if call(Syscall::TimerCreate.raw(), a2(99, FAULTING, out)) != Some(EFAULT) {
+            return Err("timer_create(bad clock, faulting evp, _) should be -EFAULT");
+        }
+        // Bad clock + NULL out → the clock check wins.
+        if call(Syscall::TimerCreate.raw(), a2(99, 0, 0)) != Some(EINVAL) {
+            return Err("timer_create(bad clock, NULL, NULL) should be -EINVAL");
+        }
+        // Bad sigevent + NULL out → the sigevent check wins.
+        let ev = sigevent(0, SIGEV_SIGNAL);
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2(CLOCK_MONOTONIC, ev.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("timer_create(_, bad sigevent, NULL) should be -EINVAL");
+        }
+        // Everything else valid → the output copy is what fails.
+        for bad_out in [0, FAULTING] {
+            if call(Syscall::TimerCreate.raw(), a2(CLOCK_MONOTONIC, 0, bad_out)) != Some(EFAULT) {
+                return Err("timer_create(_, _, unwritable out) should be -EFAULT");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timer_create_order);
+
+/// `good_sigevent()`: `sigev_signo <= 0 || sigev_signo > SIGRTMAX(64)`
+/// and any `sigev_notify` outside its switch → -EINVAL.
+fn smoke_abi_time_timer_create_bad_sigevent_einval() -> TestResult {
+    with_setup(|| {
+        let mut id = [0u64; 1];
+        let out = id.as_mut_ptr() as u64;
+        let bad = [
+            sigevent(0, SIGEV_SIGNAL),  // signo == 0
+            sigevent(-1, SIGEV_SIGNAL), // signo < 0
+            sigevent(65, SIGEV_SIGNAL), // signo > SIGRTMAX
+            sigevent(SIGRTMIN, 3),      // notify not in the switch
+            sigevent(SIGRTMIN, 5),      // SIGEV_NONE|THREAD_ID: not a case
+            sigevent(SIGRTMIN, 6),      // SIGEV_THREAD|THREAD_ID: not a case
+            sigevent(SIGRTMIN, 99),     // garbage
+        ];
+        for ev in bad {
+            if call(
+                Syscall::TimerCreate.raw(),
+                a2(CLOCK_MONOTONIC, ev.as_ptr() as u64, out),
+            ) != Some(EINVAL)
+            {
+                return Err("timer_create with a rejected sigevent should be -EINVAL");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_create_bad_sigevent_einval
+);
 
 // Helper: create a POSIX timer and return its id, or Err.
 fn make_timer() -> Result<u64, &'static str> {
@@ -475,40 +645,164 @@ fn make_timer() -> Result<u64, &'static str> {
     }
 }
 
+// Helper: a timerid that named a real timer and no longer does.
+fn stale_timer() -> Result<u64, &'static str> {
+    let id = make_timer()?;
+    match call(Syscall::TimerDelete.raw(), a0(id)) {
+        Some(0) => Ok(id),
+        _ => Err("timer_delete setup failed"),
+    }
+}
+
 // ── timer_settime(timerid, flags, new, old) ───────────────────────────
-// A live timer + valid itimerspec → ok(0). NULL new → ok(-1).
 
 fn smoke_abi_time_timer_settime_pos() -> TestResult {
     with_setup(|| {
         let id = make_timer()?;
         // itimerspec = { interval{0,0}, value{1,0} } (16 i64-bytes each).
         let new: [i64; 4] = [0, 0, 1, 0];
-        match call(
+        let mut old = [0i64; 4];
+        if call(
             Syscall::TimerSettime.raw(),
             a3(id, 0, new.as_ptr() as u64, 0),
-        ) {
-            Some(0) => Ok(()),
-            _ => Err("timer_settime on a live timer should return 0"),
+        ) != Some(0)
+        {
+            return Err("timer_settime on a live timer should return 0");
         }
+        // With an old-value buffer, and with TIMER_ABSTIME set.
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, 0, new.as_ptr() as u64, old.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("timer_settime with an old-value buffer should return 0");
+        }
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, 1, new.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("timer_settime(TIMER_ABSTIME) should return 0");
+        }
+        // Linux never validates `flags`: `common_timer_set` only tests
+        // TIMER_ABSTIME and ignores every other bit. Unknown bits must
+        // NOT start failing.
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, 0xF0, new.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("timer_settime must ignore unknown flag bits, like Linux");
+        }
+        // Disarm.
+        let off: [i64; 4] = [0, 0, 0, 0];
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, 0, off.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("timer_settime disarm should return 0");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_settime_pos);
 
-fn smoke_abi_time_timer_settime_neg() -> TestResult {
+/// `sys_timer_settime`: `if (!new_setting) return -EINVAL;` — Linux
+/// rejects the missing argument *before* trying to read it, so this is
+/// EINVAL and NOT EFAULT. That distinction is the whole point: EFAULT
+/// sends a caller inspecting its memory map for a pointer it never
+/// passed.
+fn smoke_abi_time_timer_settime_null_new_einval() -> TestResult {
     with_setup(|| {
         let id = make_timer()?;
-        // NULL new value → -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
-        match call(Syscall::TimerSettime.raw(), a3(id, 0, 0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("timer_settime(_, _, NULL, _) should return -1"),
+        if call(Syscall::TimerSettime.raw(), a3(id, 0, 0, 0)) != Some(EINVAL) {
+            return Err("timer_settime(_, _, NULL, _) should be -EINVAL, not -EFAULT");
         }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timer_settime_null_new_einval);
+
+/// ORDER + errnos for the remaining arms: the `new` copy (EFAULT) runs
+/// before the timer lookup (EINVAL), and `timespec64_valid` (EINVAL)
+/// runs before it too.
+fn smoke_abi_time_timer_settime_neg() -> TestResult {
+    with_setup(|| {
+        let live = make_timer()?;
+        let stale = stale_timer()?;
+        let new: [i64; 4] = [0, 0, 1, 0];
+        // Faulting `new` beats a stale timerid.
+        if call(Syscall::TimerSettime.raw(), a3(stale, 0, FAULTING, 0)) != Some(EFAULT) {
+            return Err("timer_settime(stale, _, faulting new, _) should be -EFAULT");
+        }
+        // `timespec64_valid`: tv_nsec must be < NSEC_PER_SEC, tv_sec >= 0.
+        for bad in [
+            [0i64, 1_000_000_000, 1, 0], // it_interval.tv_nsec too large
+            [0, 0, 1, -1],               // it_value.tv_nsec negative
+            [0, 0, -1, 0],               // it_value.tv_sec negative
+        ] {
+            if call(
+                Syscall::TimerSettime.raw(),
+                a3(live, 0, bad.as_ptr() as u64, 0),
+            ) != Some(EINVAL)
+            {
+                return Err("timer_settime with an invalid timespec should be -EINVAL");
+            }
+        }
+        // A timerid that no longer names a timer.
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(stale, 0, new.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("timer_settime on a deleted timer should be -EINVAL");
+        }
+        // `lock_timer`: `if ((unsigned long long)timer_id > INT_MAX) return NULL;`
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(0x8000_0000, 0, new.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("timer_settime with a timerid > INT_MAX should be -EINVAL");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_settime_neg);
 
+/// `sys_timer_settime` reports a failed `put_itimerspec64` as EFAULT
+/// *after* the timer has been armed — the arm is not rolled back. The old
+/// handler swallowed the error and returned 0, which left the caller
+/// reading its own uninitialised buffer as the previous setting.
+fn smoke_abi_time_timer_settime_faulting_old_efault() -> TestResult {
+    with_setup(|| {
+        let id = make_timer()?;
+        let new: [i64; 4] = [0, 0, 100, 0];
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, 0, new.as_ptr() as u64, FAULTING),
+        ) != Some(EFAULT)
+        {
+            return Err("timer_settime with a faulting old-value buffer should be -EFAULT");
+        }
+        // ... and the timer really is armed despite the EFAULT.
+        let mut cur = [0i64; 4];
+        if call(Syscall::TimerGettime.raw(), a1(id, cur.as_mut_ptr() as u64)) != Some(0) {
+            return Err("timer_gettime after the EFAULT should still work");
+        }
+        if cur[2] == 0 && cur[3] == 0 {
+            return Err("timer_settime must arm the timer even when the old-value copy faults");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_settime_faulting_old_efault
+);
+
 // ── timer_gettime(timerid, cur) ───────────────────────────────────────
-// A live timer + valid out → ok(0). An unknown timerid → ok(-1).
 
 fn smoke_abi_time_timer_gettime_pos() -> TestResult {
     with_setup(|| {
@@ -522,24 +816,31 @@ fn smoke_abi_time_timer_gettime_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_gettime_pos);
 
+/// `sys_timer_gettime` runs `do_timer_gettime` (EINVAL on a lookup miss)
+/// FIRST and only copies out on success — so a stale timerid beats an
+/// unwritable buffer, the opposite of `timer_create`'s ordering.
 fn smoke_abi_time_timer_gettime_neg() -> TestResult {
     with_setup(|| {
-        let mut cur = [0i64; 4];
-        // Timer id 0xdead was never created → -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(
-            Syscall::TimerGettime.raw(),
-            a1(0xdead, cur.as_mut_ptr() as u64),
-        ) {
-            Some(-1) => Ok(()),
-            _ => Err("timer_gettime on an unknown id should return -1"),
+        let live = make_timer()?;
+        let stale = stale_timer()?;
+        // Never created, deleted, and past INT_MAX — all -EINVAL.
+        for id in [0xdead, stale, 0x8000_0000] {
+            if call(Syscall::TimerGettime.raw(), a1(id, 0)) != Some(EINVAL) {
+                return Err("timer_gettime on an unknown id should be -EINVAL, even with NULL out");
+            }
         }
+        // A live timer with an unwritable buffer is the EFAULT case.
+        for out in [0, FAULTING] {
+            if call(Syscall::TimerGettime.raw(), a1(live, out)) != Some(EFAULT) {
+                return Err("timer_gettime(live, unwritable out) should be -EFAULT");
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_gettime_neg);
 
 // ── timer_delete(timerid) ─────────────────────────────────────────────
-// Deleting a live timer → ok(0). An unknown timerid → ok(-1).
 
 fn smoke_abi_time_timer_delete_pos() -> TestResult {
     with_setup(|| {
@@ -552,68 +853,153 @@ fn smoke_abi_time_timer_delete_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_delete_pos);
 
+/// `sys_timer_delete`'s only failure is `scoped_timer_get_or_fail` =
+/// -EINVAL. Reaching it by racing a sibling's delete is normal, and as
+/// EPERM the caller could not tell "already gone" from "the sandbox took
+/// my timers".
 fn smoke_abi_time_timer_delete_neg() -> TestResult {
     with_setup(|| {
-        // Never-created id → -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(Syscall::TimerDelete.raw(), a0(0xdead)) {
-            Some(-1) => Ok(()),
-            _ => Err("timer_delete on an unknown id should return -1"),
+        let id = make_timer()?;
+        if call(Syscall::TimerDelete.raw(), a0(id)) != Some(0) {
+            return Err("timer_delete setup failed");
         }
+        // Double delete, never-created, and past INT_MAX.
+        for bad in [id, 0xdead, 0x8000_0000] {
+            if call(Syscall::TimerDelete.raw(), a0(bad)) != Some(EINVAL) {
+                return Err("timer_delete on an unknown id should be -EINVAL");
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_delete_neg);
 
 // ── setitimer(which, new, old) ────────────────────────────────────────
-// which<=ITIMER_PROF + valid itimerval → ok(0). which>2 → ok(-1).
 
+/// Positive paths, including the two Linux accepts that NARF used to
+/// reject: a NULL `value` (the documented "misfeature" that means
+/// disarm) and a `which` whose upper 32 register bits are garbage.
 fn smoke_abi_time_setitimer_pos() -> TestResult {
     with_setup(|| {
         // ITIMER_REAL (0); itimerval = { interval{0,0}, value{0,0} } (disarm).
         let new: [i64; 4] = [0, 0, 0, 0];
-        match call(Syscall::Setitimer.raw(), a2(0, new.as_ptr() as u64, 0)) {
-            Some(0) => Ok(()),
-            _ => Err("setitimer(ITIMER_REAL, valid, NULL) should return 0"),
+        let mut old = [0i64; 4];
+        for which in [0, 1, 2] {
+            if call(Syscall::Setitimer.raw(), a2(which, new.as_ptr() as u64, 0)) != Some(0) {
+                return Err("setitimer(<valid which>, valid, NULL) should return 0");
+            }
         }
+        if call(
+            Syscall::Setitimer.raw(),
+            a2(0, new.as_ptr() as u64, old.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setitimer with an old-value buffer should return 0");
+        }
+        // `int which`: the upper half of the register is not part of it.
+        if call(
+            Syscall::Setitimer.raw(),
+            a2(1u64 << 32, new.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("setitimer must truncate `which` to 32 bits");
+        }
+        // `if (value) {...} else { memset(&set_buffer, 0, ...); }` — a NULL
+        // new value is ACCEPTED and disarms. Rejecting it left the
+        // caller's timer armed while it believed it had cleared it.
+        if call(Syscall::Setitimer.raw(), a2(0, 0, old.as_mut_ptr() as u64)) != Some(0) {
+            return Err("setitimer(_, NULL, old) is accepted by Linux and must return 0");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_setitimer_pos);
 
+/// `do_setitimer`'s `switch (which) { ... default: return -EINVAL; }`,
+/// and `get_itimerval`'s EFAULT/EINVAL — which run FIRST, so a faulting
+/// value beats a bad `which`.
 fn smoke_abi_time_setitimer_neg() -> TestResult {
     with_setup(|| {
         let new: [i64; 4] = [0, 0, 0, 0];
-        // which=5 is past ITIMER_PROF(2) → -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(Syscall::Setitimer.raw(), a2(5, new.as_ptr() as u64, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("setitimer on an invalid `which` should return -1"),
+        // which=5 is past ITIMER_PROF(2).
+        if call(Syscall::Setitimer.raw(), a2(5, new.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("setitimer on an invalid `which` should be -EINVAL");
         }
+        // Negative `which` sign-extends to a huge u64 but is still just
+        // an out-of-range int.
+        if call(
+            Syscall::Setitimer.raw(),
+            a2(u64::MAX, new.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("setitimer(-1, _, _) should be -EINVAL");
+        }
+        // ORDER: the value is parsed before `which` is looked at.
+        if call(Syscall::Setitimer.raw(), a2(5, FAULTING, 0)) != Some(EFAULT) {
+            return Err("setitimer(bad which, faulting value, _) should be -EFAULT");
+        }
+        // `timeval_valid`: tv_usec must be < USEC_PER_SEC, tv_sec >= 0.
+        for bad in [
+            [0i64, 1_000_000, 0, 0], // it_interval.tv_usec too large
+            [0, 0, 0, -1],           // it_value.tv_usec negative
+            [0, 0, -1, 0],           // it_value.tv_sec negative
+        ] {
+            if call(Syscall::Setitimer.raw(), a2(0, bad.as_ptr() as u64, 0)) != Some(EINVAL) {
+                return Err("setitimer with an invalid timeval should be -EINVAL");
+            }
+        }
+        // `if (put_itimerval(ovalue, &get_buffer)) return -EFAULT;` — the
+        // new value is still installed, only the report is lost.
+        if call(
+            Syscall::Setitimer.raw(),
+            a2(0, new.as_ptr() as u64, FAULTING),
+        ) != Some(EFAULT)
+        {
+            return Err("setitimer with a faulting old-value buffer should be -EFAULT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_setitimer_neg);
 
 // ── getitimer(which, cur) ─────────────────────────────────────────────
-// which<=ITIMER_PROF + valid out → ok(0). out==0 → ok(-1).
 
 fn smoke_abi_time_getitimer_pos() -> TestResult {
     with_setup(|| {
         let mut cur = [0i64; 4];
-        match call(Syscall::Getitimer.raw(), a1(0, cur.as_mut_ptr() as u64)) {
-            Some(0) => Ok(()),
-            _ => Err("getitimer(ITIMER_REAL, buf) should return 0"),
+        let out = cur.as_mut_ptr() as u64;
+        for which in [0, 1, 2] {
+            if call(Syscall::Getitimer.raw(), a1(which, out)) != Some(0) {
+                return Err("getitimer(<valid which>, buf) should return 0");
+            }
         }
+        // `int which` — truncate, do not read the whole register.
+        if call(Syscall::Getitimer.raw(), a1(1u64 << 32, out)) != Some(0) {
+            return Err("getitimer must truncate `which` to 32 bits");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_getitimer_pos);
 
+/// `sys_getitimer` runs `do_getitimer` (EINVAL) before `put_itimerval`
+/// (EFAULT), so a bad `which` wins over an unwritable buffer.
 fn smoke_abi_time_getitimer_neg() -> TestResult {
     with_setup(|| {
-        // NULL out → -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
-        match call(Syscall::Getitimer.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("getitimer(_, NULL) should return -1"),
+        // Bad `which` + NULL out → the `which` check wins.
+        if call(Syscall::Getitimer.raw(), a1(99, 0)) != Some(EINVAL) {
+            return Err("getitimer(bad which, NULL) should be -EINVAL");
         }
+        if call(Syscall::Getitimer.raw(), a1(u64::MAX, 0)) != Some(EINVAL) {
+            return Err("getitimer(-1, NULL) should be -EINVAL");
+        }
+        // Valid `which` + unwritable buffer → EFAULT.
+        for out in [0, FAULTING] {
+            if call(Syscall::Getitimer.raw(), a1(0, out)) != Some(EFAULT) {
+                return Err("getitimer(ITIMER_REAL, unwritable out) should be -EFAULT");
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_getitimer_neg);
@@ -648,6 +1034,30 @@ fn smoke_abi_time_alarm_replace() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_alarm_replace);
+
+/// `SYSCALL_DEFINE1(alarm, unsigned int, seconds)` — the argument is 32
+/// bits. Reading the whole register turned `alarm(1 << 32)` into a
+/// ~136-year timer where Linux truncates to 0 and CANCELS the alarm; a
+/// watchdog handed a computed 64-bit value would simply never fire.
+fn smoke_abi_time_alarm_truncates_to_u32() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Alarm.raw(), a0(100)).is_none() {
+            return Err("alarm(100) should succeed");
+        }
+        // 1<<32 truncates to 0 seconds → this is a cancel, and it reports
+        // the ~100 s still on the previous alarm.
+        match call(Syscall::Alarm.raw(), a0(1u64 << 32)) {
+            Some(v) if v >= 1 => {}
+            _ => return Err("alarm(1<<32) should behave as alarm(0) and report the remainder"),
+        }
+        // Truly cancelled: nothing left to report.
+        match call(Syscall::Alarm.raw(), a0(0)) {
+            Some(0) => Ok(()),
+            _ => Err("alarm(1<<32) must have disarmed the alarm"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_alarm_truncates_to_u32);
 
 // ── timerfd_create(clockid, flags) ────────────────────────────────────
 // Returns a fresh fd (>= 0). The fd table is always present in the

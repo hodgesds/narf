@@ -7176,6 +7176,14 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 }) {
                 Some(n) => n,
                 None => {
+                    // `net/socket.c::__sys_accept4_file`:
+                    // `newfd = get_unused_fd_flags(flags);
+                    //  if (unlikely(newfd < 0)) return newfd;`
+                    // -EMFILE, and it matters more here than almost anywhere:
+                    // an accept loop at its descriptor limit must shed the
+                    // connection and keep serving, which is what EMFILE tells
+                    // it to do. EPERM reads as a permission fault and takes
+                    // the server down instead.
                     ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                     return;
                 }

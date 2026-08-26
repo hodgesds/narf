@@ -1448,11 +1448,14 @@ fn smoke_userspace_sigaltstack_rejects_too_small() -> TestResult {
     let r = ctx.ret.unwrap_or(SyscallReturn::invalid_op());
     __test_clear_global();
     crate::handlers::__test_signal_reset();
-    // -1 (0xFFFF_FFFF_FFFF_FFFF) on rejection.
-    if r.status == SyscallReturn::OK && r.value == (-1i64 as u64) {
+    // `kernel/signal.c::do_sigaltstack` answers `ss_size < MINSIGSTKSZ` with
+    // -ENOMEM ("the stack is too small"), not the -1 sentinel this pinned —
+    // EPERM would have told the caller it lacked privilege to set a stack at
+    // all, which is not a thing sigaltstack checks.
+    if r.status == SyscallReturn::OK && r.value == (-12i64 as u64) {
         TestResult::Pass
     } else {
-        TestResult::Fail("undersized altstack should be rejected")
+        TestResult::Fail("undersized altstack should be rejected with -ENOMEM")
     }
 }
 kernel_test_in!("userspace", smoke_userspace_sigaltstack_rejects_too_small);
@@ -2936,8 +2939,11 @@ fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
     __test_clear_global();
 
     match ctx4.ret {
-        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -1 => TestResult::Pass,
-        _ => TestResult::Fail("timer_gettime after delete did not return -1"),
+        // `lock_timer` fails the id lookup for a deleted timer, so
+        // `sys_timer_gettime` returns -EINVAL. This asserted the `-1` sentinel
+        // (EPERM) before the POSIX-timer errno sweep.
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -22 => TestResult::Pass,
+        _ => TestResult::Fail("timer_gettime after delete did not return -EINVAL"),
     }
 }
 #[cfg(feature = "linux-compat")]

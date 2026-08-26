@@ -1,16 +1,82 @@
 #[allow(unused_imports)]
 use super::*;
 
+const EPERM: i64 = 1;
+const ENOENT: i64 = 2;
+const EBUSY: i64 = 16;
+const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
+
+#[inline]
+fn fail(errno: i64) -> SyscallReturn {
+    SyscallReturn::ok((-errno) as u64)
+}
+
+/// Map an `FsError` out of the mount registry's `unmount` onto the errno
+/// `fs/namespace.c::do_umount` would report. `NotFound` is handled by the
+/// caller, which has the path in hand and can tell "no such file" (-ENOENT)
+/// from "not a mount point" (-EINVAL) apart.
+fn umount_errno(e: narf_filesystem::FsError) -> i64 {
+    use narf_filesystem::FsError;
+    match e {
+        FsError::Busy => EBUSY,             // propagate_mount_busy() → -EBUSY
+        FsError::PermissionDenied => EPERM, // a revoked mount handle
+        FsError::OperationNotPermitted => EPERM,
+        _ => EINVAL,
+    }
+}
+
+/// `fs/namespace.c::ksys_umount` / `can_umount` / `do_umount`, in the order
+/// the kernel applies them:
+///
+/// ```text
+///   // basic validity checks done first
+///   if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+///           return -EINVAL;
+///   ret = user_path_at(AT_FDCWD, name, lookup_flags, &path);   /* -EFAULT/-ENOENT */
+///   ...
+///   can_umount():  if (!may_mount())      return -EPERM;
+///                  if (!path_mounted(path)) return -EINVAL;
+///   do_umount():   if (flags & MNT_EXPIRE) {
+///                          if (... || flags & (MNT_FORCE | MNT_DETACH))
+///                                  return -EINVAL;
+///                  ...
+///                  retval = -EBUSY;
+/// ```
+///
+/// The order is load-bearing, not decoration: the flag word is validated
+/// BEFORE the path is even looked at, so `umount2("/gone", 0xdead)` is
+/// EINVAL and not ENOENT; and the path lookup runs BEFORE the mount checks,
+/// so a path that names nothing is ENOENT while a path that exists but
+/// carries no mount is EINVAL.
+///
+/// Every one of these was the bare `-1` sentinel = EPERM, which is the worst
+/// possible answer here because EPERM is *also* what an unprivileged umount
+/// legitimately returns. A teardown loop (systemd's `umount_recursive`, which
+/// walks /proc/self/mountinfo and retries) cannot distinguish "not mine to
+/// unmount, skip it" from "already gone, drop it from the list" from "still
+/// busy, come back later", so it either spins or aborts the unit.
 pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fail = SyscallReturn::ok(!0u64);
+    // `int flags` — the upper 32 bits of the register are not part of the
+    // argument, so they must not be mistaken for unknown flag bits.
+    let flags = args.arg1 as u32 as u64;
+
+    // "basic validity checks done first": an unknown flag bit is -EINVAL
+    // before the target string is read, let alone resolved.
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+        ctx.set_return(fail(EINVAL));
+        return;
+    }
+
     // Linux `umount2(2)`: (const char *target, int flags). `target` is a
     // NUL-terminated path; there is no length arg. (Was NARF-native
     // (ptr, len, flags), which mis-read a musl caller's flags as the length.)
     let target_raw = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // `user_path_at` on an unreadable name → -EFAULT.
+            ctx.set_return(fail(EFAULT));
             return;
         }
     };
@@ -33,12 +99,11 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
             t
         }
     };
-    let flags = args.arg1;
-    // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
-    // but the registry doesn't yet track in-flight refs against a
-    // mount, so the pop-by-path is unconditional. The flag word is
-    // recorded for diagnostic symmetry only.
-    let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
+    // We accept MNT_FORCE / MNT_DETACH / UMOUNT_NOFOLLOW but the registry
+    // doesn't yet track in-flight refs against a mount, so the pop-by-path
+    // is unconditional. The flag word is recorded for diagnostic symmetry
+    // only. (MNT_EXPIRE's conflict check is enforced below.)
+    let _ = flags & (MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW);
 
     // Protect the core API pseudo-filesystems from destructive unmount ONLY in
     // the GLOBAL registry. NARF has no mount stacking: the global /proc, /sys,
@@ -71,6 +136,29 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `can_umount`'s `path_mounted()` test, split out ahead of the pop so the
+    // two halves of the registry's single `NotFound` can be told apart the way
+    // Linux tells them apart: the path lookup fails first (-ENOENT), and only
+    // a path that DOES resolve reaches the "not a mount point" -EINVAL.
+    if !current_mount_list().iter().any(|m| m == &target) {
+        let errno = if stat_path_dir_aware(target.as_str()).is_some() {
+            EINVAL
+        } else {
+            ENOENT
+        };
+        ctx.set_return(fail(errno));
+        return;
+    }
+
+    // `do_umount`: MNT_EXPIRE is mutually exclusive with MNT_FORCE and
+    // MNT_DETACH. Checked here, after the mount is resolved, because Linux
+    // checks it there — a nonexistent path with this flag pair is still
+    // -ENOENT.
+    if flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0 {
+        ctx.set_return(fail(EINVAL));
+        return;
+    }
+
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
@@ -83,13 +171,13 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     } else {
         narf_filesystem::registry().unmount(&handle, target.as_str())
     };
-    // Linux `umount2(2)` reports failure (EINVAL for "not a mount point",
-    // ENOENT for a missing path) rather than silently succeeding — swallowing
-    // the error hid real unmount failures and broke conformance. A real mount
-    // (including the old root systemd detaches after pivot_root) unmounts and
-    // returns 0; a non-mount path returns the -1 sentinel.
+    // A real mount (including the old root systemd detaches after pivot_root)
+    // unmounts and returns 0. A racing unmount that emptied the slot between
+    // the check above and here lands on `NotFound` → -EINVAL, Linux's answer
+    // for "the path is no longer a mount point".
     match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_) => ctx.set_return(fail),
+        Err(narf_filesystem::FsError::NotFound) => ctx.set_return(fail(EINVAL)),
+        Err(e) => ctx.set_return(fail(umount_errno(e))),
     }
 }
