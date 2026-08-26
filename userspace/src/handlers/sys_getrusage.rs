@@ -5,16 +5,25 @@ pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let who = args.arg0 as i64;
     let out = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out == 0 {
-        ctx.set_return(fail);
+    // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
+    // accumulated reaped-children CPU time; RUSAGE_THREAD (1) → per-thread,
+    // which NARF folds onto SELF. (Previously this returned monotonic uptime
+    // for every `who`, so every process looked like it had burned the whole
+    // machine's wall-clock as user time.)
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    // Linux SYSCALL_DEFINE2(getrusage): an unknown `who` is -EINVAL, checked
+    // BEFORE `ru` is touched (so a bad `who` beats a NULL ru); the copy-out —
+    // including a NULL/faulting ru — is -EFAULT.
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
-    // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
-    // accumulated reaped-children CPU time. (Previously this returned
-    // monotonic uptime for every `who`, so every process looked like it
-    // had burned the whole machine's wall-clock as user time.)
-    const RUSAGE_CHILDREN: i64 = -1;
+    if out == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        return;
+    }
     let task = current_task_id();
     let ns: u64 = if who == RUSAGE_CHILDREN {
         child_cpu_time_ns_of(task)
@@ -54,7 +63,7 @@ pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
                                                             // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
                                                             // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

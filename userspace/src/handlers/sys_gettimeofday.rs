@@ -18,8 +18,9 @@ pub(crate) fn sys_gettimeofday(ctx: &mut dyn TrapContext) {
         kbuf[8..].copy_from_slice(&usec.to_ne_bytes());
         // SAFETY: `tv_ptr` is the user timeval pointer (non-zero, checked above);
         // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
+        // Linux `SYSCALL_DEFINE2(gettimeofday)`: a faulting put_user is -EFAULT.
         if unsafe { copy_to_user(tv_ptr, &kbuf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     }

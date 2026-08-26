@@ -106,8 +106,7 @@ kernel_test_in!("syscall_abi", smoke_abi_time_times_pos);
 
 fn smoke_abi_time_times_null_ok() -> TestResult {
     with_setup(|| {
-        // out_ptr==0 skips the copy and still returns the tick count;
-        // there is no easily-reachable error path for times() here.
+        // out_ptr==0 skips the copy and still returns the tick count.
         match call(Syscall::Times.raw(), a0(0)) {
             Some(v) if v >= 0 => Ok(()),
             _ => Err("times(NULL) should still return a tick count"),
@@ -115,6 +114,18 @@ fn smoke_abi_time_times_null_ok() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_times_null_ok);
+
+fn smoke_abi_time_times_efault() -> TestResult {
+    with_setup(|| {
+        // A non-NULL but faulting tbuf → -EFAULT (copy_to_user of struct tms),
+        // matching Linux SYSCALL_DEFINE1(times).
+        if call(Syscall::Times.raw(), a0(u64::MAX)) != Some(EFAULT) {
+            return Err("times(faulting buf) should return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_times_efault);
 
 // ── getrusage(who, rusage) ────────────────────────────────────────────
 // out!=0 → ok(0); out==0 → ok(-1).
@@ -132,12 +143,19 @@ kernel_test_in!("syscall_abi", smoke_abi_time_getrusage_pos);
 
 fn smoke_abi_time_getrusage_neg() -> TestResult {
     with_setup(|| {
-        // NULL out → the -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT here, NARF returns the -1 sentinel.
-        match call(Syscall::Getrusage.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("getrusage(_, NULL) should return the -1 sentinel"),
+        // An unknown `who` (not SELF/CHILDREN/THREAD) → -EINVAL, checked
+        // before `ru` is touched, so it beats even a NULL ru.
+        if call(Syscall::Getrusage.raw(), a1(99, 0)) != Some(EINVAL) {
+            return Err("getrusage(bad who, _) should return -EINVAL");
         }
+        // A valid `who` but a NULL/faulting ru → -EFAULT.
+        if call(Syscall::Getrusage.raw(), a1(0, 0)) != Some(EFAULT) {
+            return Err("getrusage(RUSAGE_SELF, NULL) should return -EFAULT");
+        }
+        if call(Syscall::Getrusage.raw(), a1(0, u64::MAX)) != Some(EFAULT) {
+            return Err("getrusage(RUSAGE_SELF, faulting) should return -EFAULT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_getrusage_neg);
@@ -323,12 +341,29 @@ kernel_test_in!("syscall_abi", smoke_abi_time_clock_settime_pos);
 
 fn smoke_abi_time_clock_settime_neg() -> TestResult {
     with_setup(|| {
-        // NULL timespec → the -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
-        match call(Syscall::ClockSetTime.raw(), a1(CLOCK_REALTIME, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("clock_settime(_, NULL) should return the -1 sentinel"),
+        // A non-settable clock is -EINVAL, and it is checked BEFORE the
+        // timespec, so a bad clock beats even a NULL ptr (Linux
+        // clockid_to_kclock/clock_set precede get_timespec64).
+        if call(Syscall::ClockSetTime.raw(), a1(CLOCK_MONOTONIC, 0)) != Some(EINVAL) {
+            return Err("clock_settime(CLOCK_MONOTONIC, _) should return -EINVAL");
         }
+        // Settable clock but a NULL/faulting timespec → -EFAULT.
+        if call(Syscall::ClockSetTime.raw(), a1(CLOCK_REALTIME, 0)) != Some(EFAULT) {
+            return Err("clock_settime(REALTIME, NULL) should return -EFAULT");
+        }
+        if call(Syscall::ClockSetTime.raw(), a1(CLOCK_REALTIME, u64::MAX)) != Some(EFAULT) {
+            return Err("clock_settime(REALTIME, faulting ts) should return -EFAULT");
+        }
+        // Out-of-range tv_nsec → -EINVAL.
+        let bad: [i64; 2] = [1, 1_000_000_000];
+        if call(
+            Syscall::ClockSetTime.raw(),
+            a1(CLOCK_REALTIME, bad.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clock_settime with tv_nsec >= 1e9 should return -EINVAL");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_clock_settime_neg);
@@ -758,6 +793,18 @@ fn smoke_abi_time_gettimeofday_null() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_gettimeofday_null);
 
+fn smoke_abi_time_gettimeofday_efault() -> TestResult {
+    with_setup(|| {
+        // A non-NULL but faulting tv → -EFAULT (put_user), matching Linux.
+        // (NULL is the allowed no-op above; only a bad non-NULL ptr faults.)
+        if call(Syscall::Gettimeofday.raw(), a1(u64::MAX, 0)) != Some(EFAULT) {
+            return Err("gettimeofday(faulting tv) should return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_gettimeofday_efault);
+
 // ── settimeofday(timeval, timezone) ───────────────────────────────────
 // Valid timeval* → ok(0). NULL timeval* → ok(0) (no-op).
 
@@ -790,6 +837,27 @@ fn smoke_abi_time_settimeofday_null() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_settimeofday_null);
+
+fn smoke_abi_time_settimeofday_neg() -> TestResult {
+    with_setup(|| {
+        // A non-NULL but faulting tv → -EFAULT (copy_from_user).
+        if call(Syscall::Settimeofday.raw(), a1(u64::MAX, 0)) != Some(EFAULT) {
+            return Err("settimeofday(faulting tv) should return -EFAULT");
+        }
+        // tv_usec out of range ([0, 1e6)) → -EINVAL (timeval_valid).
+        let bad: [i64; 2] = [1, 1_000_000];
+        if call(Syscall::Settimeofday.raw(), a1(bad.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("settimeofday with tv_usec >= 1e6 should return -EINVAL");
+        }
+        // tv_sec < 0 → -EINVAL.
+        let neg: [i64; 2] = [-1, 0];
+        if call(Syscall::Settimeofday.raw(), a1(neg.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("settimeofday with tv_sec < 0 should return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_settimeofday_neg);
 
 // ── time(time_t*) ────────────────────────────────────────────────────────
 // Returns seconds; if arg0 non-null, also stores there.

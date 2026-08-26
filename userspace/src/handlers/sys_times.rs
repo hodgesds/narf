@@ -1,9 +1,11 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `times(struct tms*)` — Linux `SYSCALL_DEFINE1(times)`. A faulting `tbuf`
+/// is -EFAULT; otherwise the elapsed-uptime tick count is returned via
+/// `force_successful_syscall_return`, so the value path never reports an error.
 pub(crate) fn sys_times(ctx: &mut dyn TrapContext) {
     let out_ptr = ctx.args().arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     // times() RETURNS elapsed wall-clock in ticks (uptime since an
     // arbitrary epoch) — that part was always right. The `tms` FIELDS,
     // however, must carry this task's real CPU time, not uptime.
@@ -28,13 +30,12 @@ pub(crate) fn sys_times(ctx: &mut dyn TrapContext) {
                                                                    // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
                                                                    // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     }
-    if uptime_ticks < 0 {
-        ctx.set_return(fail);
-        return;
-    }
+    // Linux returns the tick count through force_successful_syscall_return, so
+    // the value is never reinterpreted as an errno (even were it to wrap into
+    // the errno range in the far future). Return it verbatim.
     ctx.set_return(SyscallReturn::ok(uptime_ticks as u64));
 }
