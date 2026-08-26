@@ -1294,6 +1294,51 @@ kernel_test_in!(
     smoke_abi_ipc_sem_exit_undo_is_set_atomic
 );
 
+fn smoke_abi_ipc_sem_exit_undo_retains_other_owners() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut increment = [0u8; 6];
+        increment[2..4].copy_from_slice(&1i16.to_le_bytes());
+        increment[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+
+        const OWNER_A: u64 = FAKE_TASK + 27;
+        set_task(OWNER_A);
+        let owner_a_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, increment.as_ptr() as u64, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: first owner's SEM_UNDO increment failed");
+        }
+
+        const OWNER_B: u64 = FAKE_TASK + 28;
+        set_task(OWNER_B);
+        let owner_b_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, increment.as_ptr() as u64, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: second owner's SEM_UNDO increment failed");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(2) {
+            return Err("setup: both SEM_UNDO increments were not applied");
+        }
+
+        crate::sysvipc::sem_undo_process_exit(owner_a_pid, OWNER_A);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("first owner exit did not apply exactly its SEM_UNDO entry");
+        }
+
+        crate::sysvipc::sem_undo_process_exit(owner_b_pid, OWNER_B);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("first owner exit discarded the second owner's SEM_UNDO entry");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_exit_undo_retains_other_owners
+);
+
 fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
     with_setup(|| {
         // Linux's SETVAL wrapper rejects the value before looking up semid.

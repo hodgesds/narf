@@ -1582,21 +1582,26 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
             continue;
         }
         let mut changed = false;
-        while let Some(index) = set
-            .undos
-            .iter()
-            .position(|((owner, _, _, _), _)| *owner == undo_owner)
-        {
-            let ((_, _, _, semnum), adjustment) = set.undos.remove(index);
-            if adjustment == 0 {
-                continue;
+        let SemSet {
+            undos, sems, pids, ..
+        } = &mut *set;
+        // Linux owns one semadj vector per process and semaphore array, then
+        // applies the whole vector under the array lock at final process exit.
+        // Remove this owner's entries in one pass so cleanup is O(n), while
+        // retaining every other process's undo vector unchanged.
+        undos.retain(|((owner, _, _, semnum), adjustment)| {
+            if *owner != undo_owner {
+                return true;
             }
-            if let Some(sem) = set.sems.get_mut(semnum) {
-                *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
-                set.pids[semnum] = pid;
-                changed = true;
+            if *adjustment != 0 {
+                if let Some(sem) = sems.get_mut(*semnum) {
+                    *sem = sem.saturating_add(*adjustment).clamp(0, SEMVMX);
+                    pids[*semnum] = pid;
+                    changed = true;
+                }
             }
-        }
+            false
+        });
         if changed && !set.pending.is_empty() {
             with_sem_state(|state| scan_sem_waiters(&mut set, state, object));
         }
