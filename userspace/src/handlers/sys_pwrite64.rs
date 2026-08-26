@@ -45,33 +45,68 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // SAFETY: the source range was validated above; the guarded copy still
-    // catches a protection change racing that validation.
-    let kbuf = match unsafe { copy_from_user_vec(ptr, count) } {
-        Ok(bytes) => bytes,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
-            return;
-        }
-    };
-    let outcome = poll_blocking(endpoint.ops.write(offset, &kbuf))
-        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
-    match outcome {
-        Ok(n) if n <= kbuf.len() => {
-            #[cfg(feature = "linux-compat")]
-            if n != 0 {
-                crate::mqueue::notify_modify_fd(task, fd);
+    // Bounded chunks, as in `sys_write` — see the note in `sys_pread64` for
+    // why a single copy the size of the request is not an option.
+    const CHUNK: usize = 64 * 1024;
+    let mut total = 0usize;
+    let mut offset = offset;
+    while total < count {
+        let want = core::cmp::min(CHUNK, count - total);
+        // SAFETY: the complete source range passed validate_rw_user_range;
+        // each bounded guarded copy still catches a racing unmap.
+        let payload = match unsafe { copy_from_user_vec(ptr + total as u64, want) } {
+            Ok(bytes) => bytes,
+            Err(errno) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                break;
             }
-            ctx.set_return(SyscallReturn::ok(n as u64));
+        };
+        let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
+            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        let written = match outcome {
+            Ok(0) => break,
+            Ok(n) if n <= payload.len() => n,
+            Ok(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    return;
+                }
+                break;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                return;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) => break,
+            Err(narf_filesystem::FsError::BrokenPipe) => {
+                raise_signal_pending(task, 13); // SIGPIPE even after a prefix
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                    return;
+                }
+                break;
+            }
+            Err(error) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    return;
+                }
+                break;
+            }
+        };
+        total += written;
+        offset = offset.saturating_add(written as u64);
+        if written < payload.len() {
+            break;
         }
-        Ok(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
-        Err(narf_filesystem::FsError::WouldBlock) => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
-        }
-        Err(narf_filesystem::FsError::BrokenPipe) => {
-            raise_signal_pending(task, 13); // SIGPIPE
-            ctx.set_return(SyscallReturn::ok((-32i64) as u64));
-        }
-        Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
     }
+
+    #[cfg(feature = "linux-compat")]
+    if total != 0 {
+        crate::mqueue::notify_modify_fd(task, fd);
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
 }

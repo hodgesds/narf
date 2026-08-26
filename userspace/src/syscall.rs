@@ -827,8 +827,18 @@ pub enum Syscall {
     Pselect6,
 
     /// `epoll_create1(flags)` — create an epoll instance fd.
-    /// arg0 = flags (only EPOLL_CLOEXEC = 0x80000 honoured).
+    /// arg0 = flags (only EPOLL_CLOEXEC = 0x80000 honoured; any other
+    /// bit is -EINVAL, per `fs/eventpoll.c::do_epoll_create`).
     EpollCreate,
+
+    /// `epoll_create(size)` — the pre-2.6.27 entry point, x86_64 number
+    /// 213 only (aarch64 never had it). `size` has been ignored since the
+    /// interest list stopped being a hash table, but
+    /// `SYSCALL_DEFINE1(epoll_create)` still rejects `size <= 0` with
+    /// -EINVAL before calling `do_epoll_create(0)` — so it is NOT the same
+    /// syscall as `epoll_create1` and cannot share its handler: one reads
+    /// arg0 as a count, the other as a flag word.
+    EpollCreateLegacy,
 
     /// `epoll_ctl(epfd, op, fd, &event)`. arg0 = epfd,
     /// arg1 = op (EPOLL_CTL_ADD = 1, MOD, DEL = 2),
@@ -853,8 +863,15 @@ pub enum Syscall {
     EpollPwait2,
 
     /// `eventfd2(initval, flags)` — semaphore-shaped fd.
-    /// arg0 = initial counter value, arg1 = flags.
+    /// arg0 = initial counter value, arg1 = flags (EFD_SEMAPHORE |
+    /// EFD_CLOEXEC | EFD_NONBLOCK; anything else is -EINVAL).
     Eventfd,
+
+    /// `eventfd(initval)` — the one-argument original, x86_64 number 284
+    /// only. `SYSCALL_DEFINE1(eventfd)` calls `do_eventfd(count, 0)`: the
+    /// syscall takes no flag word, so arg1 holds whatever the caller
+    /// happened to leave in `rsi` and must never be read as flags.
+    EventfdLegacy,
 
     /// `timerfd_create(clockid, flags)` — timer-backed fd.
     /// arg0 = clockid (0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC),
@@ -2630,7 +2647,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Futex, 202),
     (Syscall::SchedSetaffinity, 203),
     (Syscall::SchedGetaffinity, 204),
-    (Syscall::EpollCreate, 213),
+    (Syscall::EpollCreateLegacy, 213),
     (Syscall::Getdents64, 217),
     (Syscall::Getdents, 78), // legacy 32-bit-offset getdents (x86_64-only)
     (Syscall::ClockSetTime, 227),
@@ -2667,10 +2684,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setns, 308),
     (Syscall::Signalfd, 282), // signalfd / signalfd4 share name
     (Syscall::TimerfdCreate, 283),
-    (Syscall::Eventfd, 284), // eventfd (legacy 1-arg form)
+    (Syscall::EventfdLegacy, 284), // eventfd (legacy 1-arg form)
     // eventfd2(initval, flags) is a DIFFERENT x86_64 number (290) from
-    // the legacy eventfd (284). glibc/musl's `eventfd()` wrapper always
-    // issues eventfd2, so map 290 to the same (eventfd2-shaped) handler.
+    // the legacy eventfd (284), and they are not interchangeable: only
+    // eventfd2 has a flag word. glibc/musl's `eventfd()` wrapper always
+    // issues eventfd2, which is why this is the variant every other
+    // architecture (and `Syscall::Eventfd::raw()`) resolves to.
     (Syscall::Eventfd, 290),
     (Syscall::PerfEventOpen, 298),
     (Syscall::Bpf, 321),

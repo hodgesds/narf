@@ -4666,15 +4666,14 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     let iovcnt = a.arg2 as usize;
     let pos = a.arg3;
 
-    if v2 && pos == u64::MAX {
-        if is_write {
-            handler_sys_writev::sys_writev(ctx);
-        } else {
-            handler_sys_readv::sys_readv(ctx);
-        }
-        return;
-    }
-    if (pos as i64) < 0 {
+    // `pos == -1` is the preadv2/pwritev2 escape hatch that
+    // `SYSCALL_DEFINE6(preadv2)` routes to plain `do_readv`/`do_writev`: it
+    // uses and advances the shared file position instead of an explicit
+    // offset. `preadv`/`pwritev` have no such case, so a negative offset is
+    // simply -EINVAL there.
+    let use_current_pos = v2 && pos == u64::MAX;
+
+    if !use_current_pos && (pos as i64) < 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
@@ -4686,8 +4685,9 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     };
     // Positioned I/O on a pipe/FIFO/socket is -ESPIPE: streams never carry
     // FMODE_PREAD/FMODE_PWRITE, so consuming their bytes "at an offset" (the
-    // old behaviour) silently corrupted the stream position.
-    {
+    // old behaviour) silently corrupted the stream position. The `pos == -1`
+    // form is exempt — it IS readv/writev, which pipes support.
+    if !use_current_pos {
         use narf_filesystem::FileType;
         let ty = endpoint.ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
@@ -4720,12 +4720,122 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         return;
     }
 
+    // Only now does the flag word matter. `vfs_readv`/`vfs_writev` reach
+    // `kiocb_set_rw_flags` (via do_iter_readv_writev) AFTER the FMODE check,
+    // after `import_iovec`, and after the `if (!tot_len) goto out;`
+    // short-circuit — so a bad descriptor outranks a bad flag, and an empty
+    // vector returns 0 without the flags ever being looked at. Validating the
+    // word first, as this handler briefly did, reported -EOPNOTSUPP where
+    // Linux reports -EBADF or success.
+    if v2 {
+        const RWF_HIPRI: u64 = 0x01;
+        const RWF_DSYNC: u64 = 0x02;
+        const RWF_SYNC: u64 = 0x04;
+        const RWF_NOWAIT: u64 = 0x08;
+        const RWF_APPEND: u64 = 0x10;
+        const RWF_NOAPPEND: u64 = 0x20;
+        const RWF_ATOMIC: u64 = 0x40;
+        const RWF_DONTCACHE: u64 = 0x80;
+        const RWF_NOSIGNAL: u64 = 0x100;
+        const RWF_SUPPORTED: u64 = RWF_HIPRI
+            | RWF_DSYNC
+            | RWF_SYNC
+            | RWF_NOWAIT
+            | RWF_APPEND
+            | RWF_NOAPPEND
+            | RWF_ATOMIC
+            | RWF_DONTCACHE
+            | RWF_NOSIGNAL;
+        // arg4 is pos_h, arg5 the rwf_t flag word (`int`, so 32 bits).
+        let flags = a.arg5 & 0xffff_ffff;
+        if flags != 0 {
+            if flags & !RWF_SUPPORTED != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+            // NARF has no FMODE_NOWAIT, no atomic-write support and no
+            // per-I/O cache-drop, and the kernel answers each of those with
+            // -EOPNOTSUPP on a file that cannot provide them. RWF_NOWAIT is
+            // not even a gap: tmpfs does not set FMODE_NOWAIT either, so
+            // Linux gives -EOPNOTSUPP for the same call on the same kind of
+            // memory-backed file.
+            if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            // LINUX-GAP, and deliberately loud. These three change where the
+            // bytes land or whether a signal is raised, and NARF cannot
+            // express any of them on this path:
+            //
+            //   RWF_APPEND   `generic_write_checks_count` does
+            //                `iocb->ki_pos = i_size_read(inode)`, so the flag
+            //                OVERRIDES the explicit offset and writes at EOF.
+            //                Accepting it and writing at `pos` anyway puts the
+            //                caller's bytes somewhere else entirely.
+            //   RWF_NOAPPEND negates the description's O_APPEND for this one
+            //                I/O; the `pos == -1` path below delegates to
+            //                writev, which honours O_APPEND and cannot be
+            //                told not to.
+            //   RWF_NOSIGNAL sets IOCB_NOSIGNAL, which is what suppresses the
+            //                `send_sig(SIGPIPE, ...)` in `pipe_write` and
+            //                `sock_sendmsg`. Ignoring it delivers a signal the
+            //                caller explicitly asked to be spared — and the
+            //                default action for SIGPIPE kills the process.
+            //
+            // Silently ignoring any of them is a data-placement or
+            // signal-delivery divergence that surfaces far from its cause.
+            // -EOPNOTSUPP is a documented answer for a file that cannot honour
+            // an RWF_ bit, and callers already branch on it.
+            if flags & (RWF_APPEND | RWF_NOAPPEND | RWF_NOSIGNAL) != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            // What remains is honourable as-is: RWF_DSYNC / RWF_SYNC promise
+            // the write reaches stable storage before returning, which an
+            // in-memory coherent filesystem already satisfies, and RWF_HIPRI
+            // is a scheduling hint.
+        }
+    }
+
+    if use_current_pos {
+        // Hand the whole call to readv/writev, which own the position lock,
+        // the blocking/EAGAIN rules and partial-progress reporting. They
+        // repeat the descriptor and iovec checks above; that is cheap next to
+        // the I/O and keeps one implementation of those rules.
+        if is_write {
+            handler_sys_writev::sys_writev(ctx);
+        } else {
+            handler_sys_readv::sys_readv(ctx);
+        }
+        return;
+    }
+
+    // Bounded staging, as in readv/writev: `import_rw_iovecs` caps the whole
+    // vector at MAX_RW_COUNT, but a SINGLE iovec may still be far larger than
+    // NARF's 16-MiB copy limit, so each one is transferred a chunk at a time.
+    const CHUNK: usize = 64 * 1024;
     let mut off = pos;
     let mut total = 0usize;
+    let mut pending: alloc::vec::Vec<ImportedRwIovec> = alloc::vec::Vec::new();
     for iovec in &iovecs {
-        if iovec.len == 0 {
-            continue;
+        let mut remaining = *iovec;
+        while remaining.len != 0 {
+            let step = core::cmp::min(CHUNK, remaining.len);
+            pending.push(ImportedRwIovec {
+                base: remaining.base,
+                len: step,
+            });
+            remaining.base += step as u64;
+            remaining.len -= step;
         }
+    }
+    // Every entry is now at most CHUNK bytes, so each staging buffer and each
+    // guarded copy stays inside the 16-MiB limit.
+    for iovec in &pending {
         let outcome = if is_write {
             // SAFETY: import_rw_iovecs validated this source range; the
             // guarded copy still catches a protection change racing it.

@@ -723,12 +723,9 @@ fn exclusive_release(fd: i32, owner: u64) {
 
 // ── sys_epoll_create / wait / ctl handlers ───────────────────────────
 
-pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
-    let args = *ctx.args();
-    let flags = args.arg0 as u32;
-    let cloexec = (flags & crate::fd::O_CLOEXEC) != 0;
+/// Shared body for both epoll-creating entry points.
+fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
     let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-    let fail = SyscallReturn::ok((-1i64) as u64);
 
     // The fd entry's ops Arc is the ONLY owner handle: every later
     // epoll_ctl/epoll_wait recovers the instance from the fd table
@@ -741,35 +738,65 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: install_flags,
-            status_flags: 0,
+            // `do_epoll_create` opens the anon inode with
+            // `O_RDWR | (flags & O_CLOEXEC)`. The access mode is observable:
+            // a caller that probes `fcntl(epfd, F_GETFL)` — glibc's stdio
+            // does this on any fd handed to fdopen — saw O_RDONLY here and
+            // concluded the descriptor was not writable.
+            status_flags: crate::fd::O_RDWR,
         })
     });
 
     match new_fd {
         Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
-        None => ctx.set_return(fail),
+        // LINUX-GAP: `ep_alloc` failing is -ENOMEM and a full descriptor
+        // table is -EMFILE. NARF's fd table grows without bound, so this arm
+        // is unreachable; RLIMIT_NOFILE enforcement is its own change.
+        None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
     }
 }
 
-/// `epoll_ctl(epfd, op, fd, event)` — `fs/eventpoll.c::do_epoll_ctl` errno
-/// order:
+/// `epoll_create1(flags)` — x86_64 291, aarch64 20.
+///
+/// `fs/eventpoll.c::do_epoll_create` opens with
+/// `if (flags & ~EPOLL_CLOEXEC) return -EINVAL;`. Ignoring the unknown bits
+/// (which this handler did while it also served `epoll_create`) hands back a
+/// descriptor without the property the caller asked for — most consequentially
+/// a non-CLOEXEC epoll fd leaking through every exec in the process tree.
+pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
+    let flags = ctx.args().arg0 as u32;
+    if flags & !crate::fd::O_CLOEXEC != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    create_epoll(ctx, flags & crate::fd::O_CLOEXEC != 0);
+}
+
+/// `epoll_create(size)` — the pre-2.6.27 entry point, x86_64 213 only.
 ///
 /// ```text
-///   if (ep_op_has_event(op) && copy_from_user(...)) return -EFAULT;
-///   f = fdget(epfd);  if (!f)  return -EBADF;
-///   tf = fdget(fd);   if (!tf) return -EBADF;
-///   if (f.file == tf.file || !is_file_epoll(f.file)) return -EINVAL;
-///   ADD on a registered fd     -> -EEXIST
-///   MOD / DEL on an unknown fd -> -ENOENT
-///   a cycle or too-deep nest   -> -ELOOP
-///   any other op               -> -EINVAL
+/// SYSCALL_DEFINE1(epoll_create, int, size)
+/// {
+///         if (size <= 0)
+///                 return -EINVAL;
+///         return do_epoll_create(0);
+/// }
 /// ```
 ///
-/// Every one of those used to be the same `-1`, i.e. EPERM. That single value
-/// is load-bearing for event loops: libevent/libuv keep a shadow interest set
-/// and reconcile it against EEXIST (already added) and ENOENT (already gone),
-/// and glibc's `epoll_ctl` hands the errno straight through. A blanket EPERM
-/// turns a benign duplicate ADD into a fatal "Operation not permitted".
+/// `size` stopped meaning anything when the interest list stopped being a
+/// hash table, but the check outlived it and callers still rely on it. arg0
+/// is a COUNT here, not a flag word — sharing an implementation with
+/// `epoll_create1` made `epoll_create(0)` succeed and, in the other
+/// direction, would have read a size of 524288 as EPOLL_CLOEXEC.
+pub fn sys_epoll_create(ctx: &mut dyn TrapContext) {
+    let size = ctx.args().arg0 as i32;
+    if size <= 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    create_epoll(ctx, false);
+}
+
 pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
@@ -825,6 +852,14 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // LINUX-GAP: `do_epoll_ctl` rejects a target with no `.poll` operation —
+    // `if (!file_can_poll(fd_file(tf))) return -EPERM;` — which on Linux
+    // covers regular files and directories. NARF has no equivalent marker on
+    // `FileOps`, and file type is NOT a usable proxy for one: inotify
+    // descriptors and the pollable procfs files (`/proc/self/mountinfo`,
+    // whose whole point is change notification) are `FileType::File` here and
+    // must stay addable. Expressing this faithfully needs a `can_poll` on the
+    // trait, audited per implementation.
     // Both "epfd names itself" and "epfd is not an epoll" are -EINVAL, and
     // Linux checks them only after both descriptors resolve. The comparison
     // is on the open file description (`fd_file(f) == fd_file(tf)`), not the

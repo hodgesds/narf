@@ -8028,9 +8028,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_sock_send_zc),
     );
     table.install_raw(Syscall::Poll, "poll", RawFnHandler(sys_poll));
+    // Shadowed below by the `crate::epoll` implementations; kept so the
+    // legacy `io_mux::EpollFile` path stays wired while it still exists.
     table.install_raw(
         Syscall::EpollCreate,
-        "epoll_create",
+        "epoll_create1",
         RawFnHandler(sys_epoll_create),
     );
     table.install_raw(Syscall::EpollCtl, "epoll_ctl", RawFnHandler(sys_epoll_ctl));
@@ -8039,7 +8041,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "epoll_wait",
         RawFnHandler(sys_epoll_wait),
     );
-    table.install_raw(Syscall::Eventfd, "eventfd", RawFnHandler(sys_eventfd));
+    table.install_raw(Syscall::Eventfd, "eventfd2", RawFnHandler(sys_eventfd2));
     table.install_raw(Syscall::Bpf, "bpf", RawFnHandler(sys_bpf));
     table.install_raw(
         Syscall::PidfdOpen,
@@ -8901,6 +8903,19 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::EpollCreate,
         "epoll_create1",
         RawFnHandler(crate::epoll::sys_epoll_create1),
+    );
+    // x86_64 213. A separate syscall from epoll_create1, not an alias:
+    // arg0 is a size the kernel validates, not a flag word.
+    table.install_raw(
+        Syscall::EpollCreateLegacy,
+        "epoll_create",
+        RawFnHandler(crate::epoll::sys_epoll_create),
+    );
+    // x86_64 284. Likewise separate from eventfd2: it has no flag word.
+    table.install_raw(
+        Syscall::EventfdLegacy,
+        "eventfd",
+        RawFnHandler(sys_eventfd),
     );
     table.install_raw(
         Syscall::EpollCtl,
@@ -10212,6 +10227,7 @@ pub(crate) use {
     handler_sys_epoll_ctl::sys_epoll_ctl,
     handler_sys_epoll_wait::sys_epoll_wait,
     handler_sys_eventfd::sys_eventfd,
+    handler_sys_eventfd::sys_eventfd2,
     handler_sys_execve::sys_execve,
     handler_sys_execveat::sys_execveat,
     handler_sys_exit_group::sys_exit_group,

@@ -57,25 +57,61 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let mut kbuf = alloc::vec![0u8; count];
-    let outcome = poll_blocking(endpoint.ops.read(offset, &mut kbuf))
-        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
-    match outcome {
-        Ok(n) if n <= kbuf.len() => {
-            // SAFETY: the destination passed validate_rw_user_range above; the
-            // guarded copy still catches a protection change racing it.
-            if let Err(errno) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
-            } else {
-                ctx.set_return(SyscallReturn::ok(n as u64));
+    // Stage the transfer in bounded chunks, exactly as `sys_read` does.
+    // `validate_rw_user_range` deliberately skips NARF's generic 16-MiB
+    // single-copy cap so that a large request is not rejected outright — but
+    // that only works if the handler then honours the cap by chunking. A
+    // single `vec![0u8; count]` for a MAX_RW_COUNT-sized pread would ask the
+    // kernel heap for 2 GiB and then fail the copy on the 16-MiB limit,
+    // where Linux transfers the whole thing.
+    const CHUNK: usize = 64 * 1024;
+    let mut total = 0usize;
+    let mut offset = offset;
+    let mut staging = alloc::vec![0u8; core::cmp::min(CHUNK, count)];
+    while total < count {
+        let want = core::cmp::min(CHUNK, count - total);
+        let outcome = poll_blocking(endpoint.ops.read(offset, &mut staging[..want]))
+            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        let read = match outcome {
+            Ok(0) => break,
+            Ok(n) if n <= want => n,
+            // A FileOps that claims more bytes than the buffer holds is a
+            // driver bug, not a user error; Linux's iterators cap at the
+            // iov length.
+            Ok(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    return;
+                }
+                break;
             }
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                return;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) => break,
+            Err(error) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    return;
+                }
+                break;
+            }
+        };
+        // SAFETY: the destination passed validate_rw_user_range above; the
+        // guarded copy still catches a protection change racing it.
+        if let Err(errno) = unsafe { copy_to_user(ptr + total as u64, &staging[..read]) } {
+            if total == 0 {
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                return;
+            }
+            break;
         }
-        // A FileOps that claims more bytes than the buffer holds is a driver
-        // bug, not a user error; Linux's iterators cap at the iov length.
-        Ok(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
-        Err(narf_filesystem::FsError::WouldBlock) => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        total += read;
+        offset = offset.saturating_add(read as u64);
+        if read < want {
+            break; // short read / EOF
         }
-        Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
     }
+    ctx.set_return(SyscallReturn::ok(total as u64));
 }

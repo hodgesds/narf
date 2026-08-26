@@ -40,7 +40,32 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "linux-compat")]
     {
         if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+            // `do_fcntl` receives an already-resolved `struct file *`, so a
+            // closed descriptor is -EBADF from the entry's fdget_raw before
+            // any per-command argument check runs.
+            if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                return;
+            }
+            // `f_dupfd`: `if (from >= nofile) return -EINVAL;` — the floor is
+            // rejected before any allocation is attempted, and separately from
+            // the -EMFILE that a full table would produce. A caller doing
+            // `fcntl(fd, F_DUPFD, 1024)` to park a descriptor above the
+            // limit needs EINVAL to learn the floor is the problem.
+            //
+            // The floor is `int argi = (int)arg` widened back to `unsigned
+            // int` by f_dupfd's parameter, i.e. the low 32 bits — NOT the
+            // full register. `fcntl(fd, F_DUPFD, 1 << 32)` is a floor of 0 on
+            // Linux and duplicates; comparing the untruncated value rejected
+            // it with EINVAL instead.
             let min_fd = arg as u32;
+            let nofile = read_rlimit(task, 7)
+                .map(|limit| limit.cur)
+                .unwrap_or_else(|| default_rlimits()[7].cur);
+            if u64::from(min_fd) >= nofile {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            }
             let cloexec = cmd == F_DUPFD_CLOEXEC;
             let outcome = fd::with_table(task, |t| {
                 t.duplicate(fd, min_fd, if cloexec { crate::fd::FD_CLOEXEC } else { 0 })
@@ -302,24 +327,53 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // concrete MemFdFile rather than as a per-fd flag.
     #[cfg(feature = "linux-compat")]
     {
-        if cmd == F_ADD_SEALS {
-            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
-                let r = match mfd.add_seals(arg as u32) {
-                    Ok(()) => SyscallReturn::ok(0),
-                    Err(()) => SyscallReturn::ok((-1i64) as u64),
-                };
-                ctx.set_return(r);
+        // `fs/fcntl.c` routes both seal commands into `mm/memfd.c::
+        // memfd_fcntl`, which reaches `memfd_file_seals_ptr(file)`:
+        // a file that is not a sealable memfd yields NULL and the command
+        // fails -EINVAL. Answering -EPERM instead (the old `-1` sentinel)
+        // reads as "you are not allowed to seal this", which sends a caller
+        // looking for a privilege it does not need — the file simply has no
+        // seal word. A closed descriptor is still -EBADF, from the fdget in
+        // the syscall entry, ahead of any of this.
+        if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
+            let open = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+            if !open {
+                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
                 return;
             }
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-        if cmd == F_GET_SEALS {
-            if let Some(mfd) = memfd_arc_from_fd(task, fd) {
+            let Some(mfd) = memfd_arc_from_fd(task, fd) else {
+                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                return;
+            };
+            if cmd == F_GET_SEALS {
                 ctx.set_return(SyscallReturn::ok(mfd.seals() as u64));
                 return;
             }
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            // `memfd_add_seals` opens with
+            // `if (!(file->f_mode & FMODE_WRITE)) return -EPERM;`: sealing
+            // mutates shared state, so a read-only handle may not do it.
+            let writable = fd::with_table(task, |t| {
+                t.status_flags(fd).map(|flags| {
+                    flags & crate::fd::O_ACCMODE != crate::fd::O_RDONLY
+                        && flags & crate::fd::O_PATH == 0
+                })
+            })
+            .flatten()
+            .unwrap_or(false);
+            if !writable {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                return;
+            }
+            let r = match mfd.add_seals(arg as u32) {
+                Ok(()) => SyscallReturn::ok(0),
+                Err(crate::linux_compat::SealError::Invalid) => {
+                    SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)
+                }
+                Err(crate::linux_compat::SealError::Denied) => {
+                    SyscallReturn::ok((-1i64) as u64) // -EPERM
+                }
+            };
+            ctx.set_return(r);
             return;
         }
     }
