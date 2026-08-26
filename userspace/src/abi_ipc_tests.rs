@@ -523,6 +523,31 @@ fn smoke_abi_ipc_semget_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semget_neg);
 
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_ipc_distinct_sem_sets_do_not_share_mutation_lock() -> TestResult {
+    with_setup(|| {
+        let locked = make_semset(1)?;
+        let active = make_semset(1)?;
+        if crate::sysvipc::__test_sem_sets_lock_independently(locked, active) != Some(true) {
+            return Err("distinct semaphore sets did not own independent mutation locks");
+        }
+        if call(Syscall::Semctl.raw(), a3(active, 0, SETVAL, 3)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(active, 0, GETVAL, 0)) != Some(3)
+        {
+            return Err("operation on independently locked semaphore set failed");
+        }
+        if call(Syscall::Semctl.raw(), a3(locked, 0, GETVAL, 0)) != Some(0) {
+            return Err("unrelated semaphore set was modified");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_distinct_sem_sets_do_not_share_mutation_lock
+);
+
 // ── Semop ───────────────────────────────────────────────────────────
 //
 // semop(semid, sops, nsops). struct sembuf { u16 sem_num; i16 sem_op;

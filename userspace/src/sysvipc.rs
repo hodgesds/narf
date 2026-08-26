@@ -242,6 +242,10 @@ fn encode_perm(out: &mut [u8], key: u32, uid: u32, gid: u32, cuid: u32, cgid: u3
 // ════════════════════════════════════════════════════════════════════
 
 struct SemSet {
+    /// Set once IPC_RMID has detached this object from the namespace registry.
+    /// References obtained before removal remain valid long enough to observe
+    /// Linux's EIDRM result under the per-set lock.
+    removed: bool,
     key: u32,
     sems: Vec<i32>,
     /// Outer process id of the last successful operator for each semaphore.
@@ -261,7 +265,12 @@ struct SemSet {
     pending: VecDeque<u64>,
     ncnt: Vec<usize>,
     zcnt: Vec<usize>,
+    /// SEM_UNDO adjustments are owned by the semaphore array in Linux.  Keep
+    /// them under the same per-set lock so unrelated arrays never contend.
+    undos: SemUndoTable,
 }
+
+type SemSetRef = Arc<IrqSafeSpinLock<SemSet>>;
 
 type SemUndoKey = (u64, u64, u64, usize);
 type SemUndoTable = Vec<(SemUndoKey, i32)>;
@@ -272,6 +281,9 @@ type SemStagedSnapshot = (usize, Option<(i64, i64)>, bool); // (nsops, timeout, 
 
 struct SemWait {
     task: u64,
+    /// Production waiters retain their set across IPC_RMID.  Synthetic ABI
+    /// race tests may intentionally stage a waiter for an already-missing id.
+    set: Option<SemSetRef>,
     ipc_ns: u64,
     id: u64,
     sops: Vec<u8>,
@@ -294,7 +306,9 @@ struct SemUsage {
 
 #[derive(Default)]
 struct SemState {
-    sets: BTreeMap<IpcObjectKey, SemSet>,
+    /// Namespace registry only.  Semaphore values and metadata live behind
+    /// each set's own lock, matching Linux's `sem_array` locking boundary.
+    sets: BTreeMap<IpcObjectKey, SemSetRef>,
     ids: BTreeMap<u64, IpcIdTable>,
     /// Linux keeps a per-namespace key index rather than walking every set.
     /// IPC_PRIVATE is deliberately absent because it never names an object.
@@ -305,7 +319,6 @@ struct SemState {
     /// Sorted by task id: O(log N) park registration/lookup with fallible
     /// capacity reservation before an O(N) queued-path insertion.
     waits: Vec<SemWait>,
-    undos: SemUndoTable,
 }
 
 static SEMS: IrqSafeSpinLock<Option<SemState>> = IrqSafeSpinLock::new(None);
@@ -340,8 +353,20 @@ fn with_sem_state<R>(f: impl FnOnce(&mut SemState) -> R) -> R {
     f(g.get_or_insert_with(SemState::default))
 }
 
-fn with_sems<R>(f: impl FnOnce(&mut BTreeMap<IpcObjectKey, SemSet>) -> R) -> R {
-    with_sem_state(|state| f(&mut state.sets))
+fn lookup_sem_set(object: IpcObjectKey) -> Option<SemSetRef> {
+    with_sem_state(|state| state.sets.get(&object).cloned())
+}
+
+fn with_sem_set<R>(
+    object: IpcObjectKey,
+    f: impl FnOnce(&mut SemSet) -> Result<R, i64>,
+) -> Result<R, i64> {
+    let set_ref = lookup_sem_set(object).ok_or(EINVAL)?;
+    let mut set = set_ref.lock();
+    if set.removed {
+        return Err(EIDRM);
+    }
+    f(&mut set)
 }
 
 fn sem_wait_index(waits: &[SemWait], task: u64) -> Result<usize, usize> {
@@ -352,10 +377,10 @@ fn sem_undo_index(undos: &SemUndoTable, key: SemUndoKey) -> Result<usize, usize>
     undos.binary_search_by_key(&key, |(entry_key, _)| *entry_key)
 }
 
-fn ensure_sem_undo_set(state: &mut SemState, object: IpcObjectKey, owner: u64) -> Result<(), i64> {
-    let nsems = state.sets.get(&object).ok_or(EINVAL)?.sems.len();
+fn ensure_sem_undo_set(set: &mut SemSet, object: IpcObjectKey, owner: u64) -> Result<(), i64> {
+    let nsems = set.sems.len();
     let missing = (0..nsems)
-        .filter(|num| sem_undo_index(&state.undos, (owner, object.0, object.1, *num)).is_err())
+        .filter(|num| sem_undo_index(&set.undos, (owner, object.0, object.1, *num)).is_err())
         .count();
     if missing == 0 {
         return Ok(());
@@ -363,14 +388,14 @@ fn ensure_sem_undo_set(state: &mut SemState, object: IpcObjectKey, owner: u64) -
     if FAIL_NEXT_SEM_UNDO_RESERVE.swap(false, Ordering::AcqRel) {
         return Err(ENOMEM);
     }
-    state.undos.try_reserve(missing).map_err(|_| ENOMEM)?;
+    set.undos.try_reserve(missing).map_err(|_| ENOMEM)?;
     for semnum in 0..nsems {
         let key = (owner, object.0, object.1, semnum);
-        if sem_undo_index(&state.undos, key).is_err() {
-            state.undos.push((key, 0));
+        if sem_undo_index(&set.undos, key).is_err() {
+            set.undos.push((key, 0));
         }
     }
-    state.undos.sort_unstable_by_key(|(key, _)| *key);
+    set.undos.sort_unstable_by_key(|(key, _)| *key);
     Ok(())
 }
 
@@ -395,6 +420,22 @@ pub(crate) fn __test_sem_set_count() -> usize {
             .unwrap_or_default()
             .set_count
     })
+}
+
+/// Prove distinct semaphore arrays have independently acquirable mutation
+/// locks after both references have been resolved from the namespace index.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_sem_sets_lock_independently(first: u64, second: u64) -> Option<bool> {
+    let ipc_ns = current_ipc_namespace_id();
+    let (first, second) = with_sem_state(|state| {
+        Some((
+            Arc::clone(state.sets.get(&(ipc_ns, first))?),
+            Arc::clone(state.sets.get(&(ipc_ns, second))?),
+        ))
+    })?;
+    let _first_guard = first.lock();
+    let independent = second.try_lock().is_some();
+    Some(independent)
 }
 
 fn now_seconds() -> i64 {
@@ -1331,6 +1372,7 @@ pub(crate) fn __test_begin_removed_wait(kind: u8, id: u64) {
                     index,
                     SemWait {
                         task,
+                        set: None,
                         ipc_ns,
                         id,
                         sops: Vec::new(),
@@ -1353,6 +1395,8 @@ pub(crate) fn __test_begin_removed_wait(kind: u8, id: u64) {
 #[doc(hidden)]
 pub(crate) fn __test_stage_sem_wait(id: u64, sops: &[u8]) {
     let task = crate::handlers::current_task_id();
+    let ipc_ns = current_ipc_namespace_id();
+    let set_ref = lookup_sem_set((ipc_ns, id));
     with_sem_state(|state| {
         if state.waits.try_reserve(1).is_ok() {
             let index = sem_wait_index(&state.waits, task).unwrap_or_else(|index| index);
@@ -1360,7 +1404,8 @@ pub(crate) fn __test_stage_sem_wait(id: u64, sops: &[u8]) {
                 index,
                 SemWait {
                     task,
-                    ipc_ns: current_ipc_namespace_id(),
+                    set: set_ref,
+                    ipc_ns,
                     id,
                     sops: sops.to_vec(),
                     nsops: sops.len() / 6,
@@ -1432,7 +1477,7 @@ fn ipc_thread_exit(_pid: u64, tid: u64) {
         drop(q);
         drop(removed);
     }
-    with_sem_state(|state| unlink_sem_wait(state, tid));
+    drop(unlink_sem_wait(tid));
 }
 
 pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
@@ -1449,40 +1494,51 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
         }
         owner
     };
-    with_sem_state(|state| {
-        while let Some(index) = state
+    let mut after = None;
+    loop {
+        let next = with_sem_state(|state| match after {
+            Some(object) => state
+                .sets
+                .range((
+                    core::ops::Bound::Excluded(object),
+                    core::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(&object, set)| (object, Arc::clone(set))),
+            None => state
+                .sets
+                .iter()
+                .next()
+                .map(|(&object, set)| (object, Arc::clone(set))),
+        });
+        let Some((object, set_ref)) = next else {
+            break;
+        };
+        after = Some(object);
+        let mut set = set_ref.lock();
+        if set.removed {
+            continue;
+        }
+        let mut changed = false;
+        while let Some(index) = set
             .undos
             .iter()
             .position(|((owner, _, _, _), _)| *owner == undo_owner)
         {
-            let (_, ipc_ns, semid, _) = state.undos[index].0;
-            let object = (ipc_ns, semid);
-            let mut changed = false;
-            // One Linux sem_undo contains the adjustment vector for a whole
-            // set. Apply every member while holding this transaction, then
-            // expose the final state to queued operations exactly once.
-            while index < state.undos.len() {
-                let ((owner, namespace, id, semnum), adjustment) = state.undos[index];
-                if owner != undo_owner || (namespace, id) != object {
-                    break;
-                }
-                state.undos.remove(index);
-                if adjustment == 0 {
-                    continue;
-                }
-                if let Some(set) = state.sets.get_mut(&object) {
-                    if let Some(sem) = set.sems.get_mut(semnum) {
-                        *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
-                        set.pids[semnum] = pid;
-                        changed = true;
-                    }
-                }
+            let ((_, _, _, semnum), adjustment) = set.undos.remove(index);
+            if adjustment == 0 {
+                continue;
             }
-            if changed {
-                scan_sem_waiters(state, object);
+            if let Some(sem) = set.sems.get_mut(semnum) {
+                *sem = sem.saturating_add(adjustment).clamp(0, SEMVMX);
+                set.pids[semnum] = pid;
+                changed = true;
             }
         }
-    });
+        if changed && !set.pending.is_empty() {
+            with_sem_state(|state| scan_sem_waiters(&mut set, &mut state.waits, object));
+        }
+    }
     drain_sem_wakes();
 }
 
@@ -1532,7 +1588,6 @@ fn parse_sem_op(sops: &[u8], i: usize) -> (usize, i16, i16) {
 #[allow(clippy::too_many_arguments)]
 fn perform_sem_ops(
     set: &mut SemSet,
-    undos: &mut SemUndoTable,
     ipc_ns: u64,
     semid: u64,
     sops: &[u8],
@@ -1560,14 +1615,14 @@ fn perform_sem_ops(
         }
         if flg & SEM_UNDO != 0 && op != 0 {
             let owner = undo_owner.expect("SEM_UNDO owner");
-            let index = sem_undo_index(undos, (owner, ipc_ns, semid, num))
+            let index = sem_undo_index(&set.undos, (owner, ipc_ns, semid, num))
                 .expect("SEM_UNDO key preallocated");
-            let next_undo = undos[index].1 - i32::from(op);
+            let next_undo = set.undos[index].1 - i32::from(op);
             if !((-SEMVMX - 1)..=SEMVMX).contains(&next_undo) {
                 fail = Some((ERANGE, true, None));
                 break;
             }
-            undos[index].1 = next_undo;
+            set.undos[index].1 = next_undo;
         }
         if op != 0 {
             set.sems[num] = next;
@@ -1581,9 +1636,9 @@ fn perform_sem_ops(
                 set.sems[num] -= i32::from(op);
                 if flg & SEM_UNDO != 0 {
                     let owner = undo_owner.expect("SEM_UNDO owner");
-                    let index = sem_undo_index(undos, (owner, ipc_ns, semid, num))
+                    let index = sem_undo_index(&set.undos, (owner, ipc_ns, semid, num))
                         .expect("SEM_UNDO key preallocated");
-                    undos[index].1 += i32::from(op);
+                    set.undos[index].1 += i32::from(op);
                 }
             }
         }
@@ -1595,6 +1650,48 @@ fn perform_sem_ops(
     }
     set.otime = now_seconds();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_semop_locked(
+    set: &mut SemSet,
+    object: IpcObjectKey,
+    sops: &[u8],
+    nsops: usize,
+    pid: u64,
+    undo_owner: Option<u64>,
+    caller_uid: u32,
+    caller_gid: u32,
+    caller_groups: &[u32],
+) -> Result<(), SemOpFailure> {
+    let needs_write = (0..nsops).any(|i| parse_sem_op(sops, i).1 != 0);
+    let request = if needs_write { 0o2 } else { 0o4 };
+    // Linux reports EFBIG for an imported sem_num outside this set, and
+    // performs this check before ipcperms.
+    for i in 0..nsops {
+        let (num, _, _) = parse_sem_op(sops, i);
+        if num >= set.sems.len() {
+            return Err((EFBIG, true, None));
+        }
+    }
+    if !ipc_allowed(
+        caller_uid,
+        caller_gid,
+        caller_groups,
+        set.uid,
+        set.gid,
+        set.cuid,
+        set.cgid,
+        set.mode,
+        request,
+    ) {
+        return Err((EACCES, true, None));
+    }
+    let result = perform_sem_ops(set, object.0, object.1, sops, nsops, pid, undo_owner);
+    if result.is_ok() && !set.pending.is_empty() {
+        with_sem_state(|state| scan_sem_waiters(set, &mut state.waits, object));
+    }
+    result
 }
 
 fn adjust_wait_count(set: &mut SemSet, blocker: SemWaitBlocker, add: bool) {
@@ -1630,13 +1727,7 @@ fn drain_sem_wakes() {
 /// Complete every currently eligible waiter before exposing the mutation.
 /// The queue is scanned in insertion order, but an unsatisfied entry is
 /// skipped, matching Linux rather than imposing head-of-line blocking.
-fn scan_sem_waiters(state: &mut SemState, object: IpcObjectKey) {
-    let SemState {
-        sets, waits, undos, ..
-    } = state;
-    let Some(set) = sets.get_mut(&object) else {
-        return;
-    };
+fn scan_sem_waiters(set: &mut SemSet, waits: &mut [SemWait], object: IpcObjectKey) {
     let mut pending = core::mem::take(&mut set.pending);
     loop {
         let pass_len = pending.len();
@@ -1657,9 +1748,8 @@ fn scan_sem_waiters(state: &mut SemState, object: IpcObjectKey) {
             let undo_owner = wait.undo_owner;
             let old_blocker = wait.blocking;
             let changes_value = (0..nsops).any(|i| parse_sem_op(&wait.sops, i).1 != 0);
-            let result = perform_sem_ops(
-                set, undos, object.0, object.1, &wait.sops, nsops, pid, undo_owner,
-            );
+            let result =
+                perform_sem_ops(set, object.0, object.1, &wait.sops, nsops, pid, undo_owner);
             match result {
                 Ok(()) => {
                     if let Some(blocker) = old_blocker {
@@ -1713,26 +1803,57 @@ fn scan_sem_waiters(state: &mut SemState, object: IpcObjectKey) {
     set.pending = pending;
 }
 
-fn unlink_sem_wait(state: &mut SemState, task: u64) -> Option<SemWait> {
-    let Ok(index) = sem_wait_index(&state.waits, task) else {
-        return None;
+fn unlink_sem_wait(task: u64) -> Option<SemWait> {
+    let set_ref = with_sem_state(|state| {
+        sem_wait_index(&state.waits, task)
+            .ok()
+            .and_then(|index| state.waits[index].set.as_ref().map(Arc::clone))
+    });
+    let Some(set_ref) = set_ref else {
+        return with_sem_state(|state| {
+            let index = sem_wait_index(&state.waits, task).ok()?;
+            Some(state.waits.remove(index))
+        });
     };
-    let wait = state.waits.remove(index);
+    let mut set = set_ref.lock();
+    let wait = with_sem_state(|state| {
+        let index = sem_wait_index(&state.waits, task).ok()?;
+        Some(state.waits.remove(index))
+    })?;
     if wait.result.is_some() {
         return Some(wait);
     }
-    if let Some(set) = state.sets.get_mut(&(wait.ipc_ns, wait.id)) {
-        if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
-            set.pending.remove(pos);
-        }
-        if let Some(blocker) = wait.blocking {
-            adjust_wait_count(set, blocker, false);
-        }
+    if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
+        set.pending.remove(pos);
+    }
+    if let Some(blocker) = wait.blocking {
+        adjust_wait_count(&mut set, blocker, false);
     }
     Some(wait)
 }
 
 fn finish_pending_sem_wait(task: u64, errno: i64) -> i64 {
+    let set_ref = with_sem_state(|state| {
+        sem_wait_index(&state.waits, task)
+            .ok()
+            .and_then(|index| state.waits[index].set.as_ref().map(Arc::clone))
+    });
+    let Some(set_ref) = set_ref else {
+        let (result, waker) = with_sem_state(|state| {
+            let Ok(index) = sem_wait_index(&state.waits, task) else {
+                return (errno, None);
+            };
+            let wait = &mut state.waits[index];
+            let result = wait.result.unwrap_or(errno);
+            wait.result = Some(result);
+            (result, wait.waker.take())
+        });
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        return result;
+    };
+    let mut set = set_ref.lock();
     let (result, waker) = with_sem_state(|state| {
         let Ok(index) = sem_wait_index(&state.waits, task) else {
             return (errno, None);
@@ -1743,13 +1864,11 @@ fn finish_pending_sem_wait(task: u64, errno: i64) -> i64 {
             state.waits.insert(index, wait);
             return (result, None);
         }
-        if let Some(set) = state.sets.get_mut(&(wait.ipc_ns, wait.id)) {
-            if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
-                set.pending.remove(pos);
-            }
-            if let Some(blocker) = wait.blocking {
-                adjust_wait_count(set, blocker, false);
-            }
+        if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
+            set.pending.remove(pos);
+        }
+        if let Some(blocker) = wait.blocking {
+            adjust_wait_count(&mut set, blocker, false);
         }
         wait.result = Some(errno);
         let waker = wait.waker.take();
@@ -1774,7 +1893,7 @@ fn take_sem_wait_result(task: u64, ipc_ns: u64, id: u64) -> Option<i64> {
         Some((result, state.waits.remove(index)))
     })?;
     // SemWait owns a retained operation and possibly the final task-waker Arc.
-    // Drop both only after the IRQ-safe global semaphore lock is released.
+    // Drop both only after the IRQ-safe waiter-registry lock is released.
     drop(wait);
     Some(result)
 }
@@ -1961,18 +2080,27 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
     let flg = a.arg2;
     let ipc_ns = current_ipc_namespace_id();
     let (_, uid, gid, groups) = current_identity();
-    let id = with_sem_state(|state| {
+    let id = loop {
         if key as u64 != IPC_PRIVATE {
-            if let Some(&id) = state.key_ids.get(&(ipc_ns, key)) {
-                let set = state
-                    .sets
-                    .get(&(ipc_ns, id))
-                    .expect("indexed SysV semaphore set missing");
+            let existing = with_sem_state(|state| {
+                state.key_ids.get(&(ipc_ns, key)).map(|&id| {
+                    let set = state
+                        .sets
+                        .get(&(ipc_ns, id))
+                        .expect("indexed SysV semaphore set missing");
+                    (id, Arc::clone(set))
+                })
+            });
+            if let Some((id, set_ref)) = existing {
+                let set = set_ref.lock();
+                if set.removed {
+                    continue;
+                }
                 if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
-                    return Err(EEXIST);
+                    break Err(EEXIST);
                 }
                 if nsems > set.sems.len() {
-                    return Err(EINVAL);
+                    break Err(EINVAL);
                 }
                 let requested_bits = (flg as u32) & IPC_PERM_MASK;
                 let requested =
@@ -1983,40 +2111,44 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                         requested,
                     )
                 {
-                    return Err(EACCES);
+                    break Err(EACCES);
                 }
-                return Ok(id);
+                break Ok(id);
             }
             if flg & IPC_CREAT == 0 {
-                return Err(ENOENT);
+                break Err(ENOENT);
             }
         }
         if nsems == 0 {
-            return Err(EINVAL);
+            break Err(EINVAL);
         }
-        let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
-        if usage.sem_count.saturating_add(nsems) > SEMMNS || usage.set_count >= semmni() {
-            return Err(ENOSPC);
-        }
-        let mut sems = Vec::new();
-        let mut pids = Vec::new();
-        let mut ncnt = Vec::new();
-        let mut zcnt = Vec::new();
-        if sems.try_reserve_exact(nsems).is_err()
-            || pids.try_reserve_exact(nsems).is_err()
-            || ncnt.try_reserve_exact(nsems).is_err()
-            || zcnt.try_reserve_exact(nsems).is_err()
-        {
-            return Err(ENOMEM);
-        }
-        sems.resize(nsems, 0);
-        pids.resize(nsems, 0);
-        ncnt.resize(nsems, 0);
-        zcnt.resize(nsems, 0);
-        let id = state.ids.entry(ipc_ns).or_default().allocate(semmni())?;
-        state.sets.insert(
-            (ipc_ns, id),
-            SemSet {
+        let created = with_sem_state(|state| {
+            // Another creator may have published this key while we inspected
+            // the old object. Retry so its permissions and size are checked.
+            if key as u64 != IPC_PRIVATE && state.key_ids.contains_key(&(ipc_ns, key)) {
+                return Ok(None);
+            }
+            let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+            if usage.sem_count.saturating_add(nsems) > SEMMNS || usage.set_count >= semmni() {
+                return Err(ENOSPC);
+            }
+            let mut sems = Vec::new();
+            let mut pids = Vec::new();
+            let mut ncnt = Vec::new();
+            let mut zcnt = Vec::new();
+            if sems.try_reserve_exact(nsems).is_err()
+                || pids.try_reserve_exact(nsems).is_err()
+                || ncnt.try_reserve_exact(nsems).is_err()
+                || zcnt.try_reserve_exact(nsems).is_err()
+            {
+                return Err(ENOMEM);
+            }
+            sems.resize(nsems, 0);
+            pids.resize(nsems, 0);
+            ncnt.resize(nsems, 0);
+            zcnt.resize(nsems, 0);
+            let set = Arc::try_new(IrqSafeSpinLock::new(SemSet {
+                removed: false,
                 key,
                 sems,
                 pids,
@@ -2030,19 +2162,28 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 pending: VecDeque::new(),
                 ncnt,
                 zcnt,
-            },
-        );
-        if key as u64 != IPC_PRIVATE {
-            assert!(
-                state.key_ids.insert((ipc_ns, key), id).is_none(),
-                "duplicate SysV semaphore key index"
-            );
+                undos: Vec::new(),
+            }))
+            .map_err(|_| ENOMEM)?;
+            let id = state.ids.entry(ipc_ns).or_default().allocate(semmni())?;
+            state.sets.insert((ipc_ns, id), set);
+            if key as u64 != IPC_PRIVATE {
+                assert!(
+                    state.key_ids.insert((ipc_ns, key), id).is_none(),
+                    "duplicate SysV semaphore key index"
+                );
+            }
+            let usage = state.usage.entry(ipc_ns).or_default();
+            usage.set_count += 1;
+            usage.sem_count += nsems;
+            Ok(Some(id))
+        });
+        match created {
+            Ok(Some(id)) => break Ok(id),
+            Ok(None) => continue,
+            Err(errno) => break Err(errno),
         }
-        let usage = state.usage.entry(ipc_ns).or_default();
-        usage.set_count += 1;
-        usage.sem_count += nsems;
-        Ok(id)
-    });
+    };
     match id {
         Ok(id) => ctx.set_return(SyscallReturn::ok(id)),
         Err(e) => ctx.set_return(err(e)),
@@ -2099,7 +2240,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
         // SAFETY: copy_from_user validates the complete __kernel_timespec.
         if unsafe { crate::handlers::copy_from_user(&mut raw, a.arg3) }.is_err() {
             finish_semtimedop_wait(timed);
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             ctx.set_return(err(EFAULT));
             return;
         }
@@ -2113,13 +2254,13 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
 
     if nsops > MAX_SOPS {
         finish_semtimedop_wait(timed);
-        with_sem_state(|state| unlink_sem_wait(state, task));
+        drop(unlink_sem_wait(task));
         ctx.set_return(err(E2BIG));
         return;
     }
     if nsops == 0 {
         finish_semtimedop_wait(timed);
-        with_sem_state(|state| unlink_sem_wait(state, task));
+        drop(unlink_sem_wait(task));
         ctx.set_return(err(EINVAL));
         return;
     }
@@ -2134,7 +2275,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
         // and snapshots the complete operation array before any possible park.
         if unsafe { crate::handlers::copy_from_user(&mut buf[..nbytes], sops_ptr) }.is_err() {
             finish_semtimedop_wait(timed);
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             ctx.set_return(err(EFAULT));
             return;
         }
@@ -2143,7 +2284,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     // the signed id.  The id check then precedes timespec field validation.
     if semid_raw < 0 {
         finish_semtimedop_wait(timed);
-        with_sem_state(|state| unlink_sem_wait(state, task));
+        drop(unlink_sem_wait(task));
         ctx.set_return(err(EINVAL));
         return;
     }
@@ -2152,7 +2293,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     if let Some((sec, nsec)) = timeout {
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             finish_semtimedop_wait(timed);
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             ctx.set_return(err(EINVAL));
             return;
         }
@@ -2191,67 +2332,58 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
 
     let has_undo = (0..nsops).any(|i| parse_sem_op(&buf[..nbytes], i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
-    let result = with_sem_state(|state| {
-        // Linux find_alloc_undo() creates one dense per-set adjustment array
-        // before EFBIG and permission validation.  Do the same, including for
-        // a zero operation carrying SEM_UNDO, so ENOMEM has Linux precedence.
-        if let Some(owner) = undo_owner {
-            if let Err(errno) = ensure_sem_undo_set(state, object, owner) {
-                return Err((errno, true, None));
+    let set_ref = lookup_sem_set(object);
+    let result = match set_ref.as_ref() {
+        None => Err((EINVAL, true, None)),
+        Some(set_ref) => {
+            let mut set = set_ref.lock();
+            if set.removed {
+                Err((EIDRM, true, None))
+            } else {
+                // Linux find_alloc_undo() creates one dense per-set adjustment array
+                // before EFBIG and permission validation.  Do the same, including for
+                // a zero operation carrying SEM_UNDO, so ENOMEM has Linux precedence.
+                if let Some(owner) = undo_owner {
+                    if let Err(errno) = ensure_sem_undo_set(&mut set, object, owner) {
+                        Err((errno, true, None))
+                    } else {
+                        perform_semop_locked(
+                            &mut set,
+                            object,
+                            &buf[..nbytes],
+                            nsops,
+                            pid,
+                            undo_owner,
+                            caller_uid,
+                            caller_gid,
+                            &caller_groups,
+                        )
+                    }
+                } else {
+                    perform_semop_locked(
+                        &mut set,
+                        object,
+                        &buf[..nbytes],
+                        nsops,
+                        pid,
+                        undo_owner,
+                        caller_uid,
+                        caller_gid,
+                        &caller_groups,
+                    )
+                }
             }
         }
-        let SemState { sets, undos, .. } = state;
-        let set = match sets.get_mut(&object) {
-            Some(set) => set,
-            None => return Err((EINVAL, true, None)),
-        };
-        let needs_write = (0..nsops).any(|i| parse_sem_op(&buf[..nbytes], i).1 != 0);
-        let request = if needs_write { 0o2 } else { 0o4 };
-        // Linux reports EFBIG for an imported sem_num outside this set, and
-        // performs this check before ipcperms.
-        for i in 0..nsops {
-            let (num, _, _) = parse_sem_op(&buf[..nbytes], i);
-            if num >= set.sems.len() {
-                return Err((EFBIG, true, None));
-            }
-        }
-        if !ipc_allowed(
-            caller_uid,
-            caller_gid,
-            &caller_groups,
-            set.uid,
-            set.gid,
-            set.cuid,
-            set.cgid,
-            set.mode,
-            request,
-        ) {
-            return Err((EACCES, true, None));
-        }
-        let result = perform_sem_ops(
-            set,
-            undos,
-            ipc_ns,
-            semid,
-            &buf[..nbytes],
-            nsops,
-            pid,
-            undo_owner,
-        );
-        if result.is_ok() {
-            scan_sem_waiters(state, object);
-        }
-        result
-    });
+    };
     drain_sem_wakes();
     match result {
         Ok(()) => {
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             finish_semtimedop_wait(timed);
             ctx.set_return(SyscallReturn::ok(0));
         }
         Err((e, true, _)) => {
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             finish_semtimedop_wait(timed);
             ctx.set_return(err(e));
         }
@@ -2263,58 +2395,64 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 return;
             }
             retained.extend_from_slice(&buf[..nbytes]);
-            let enqueue_result = with_sem_state(|state| {
-                let result = {
-                    let SemState {
-                        sets, waits, undos, ..
-                    } = state;
-                    let Some(set) = sets.get_mut(&object) else {
-                        return Err(EIDRM);
-                    };
-                    let retry = perform_sem_ops(
-                        set, undos, ipc_ns, semid, &retained, nsops, pid, undo_owner,
-                    );
-                    match retry {
-                        Ok(()) => Ok(Some(())),
-                        Err((errno, true, _)) => Err(errno),
-                        Err((EAGAIN, false, retry_blocking)) => {
-                            if set.pending.try_reserve(1).is_err() || waits.try_reserve(1).is_err()
-                            {
-                                return Err(ENOMEM);
+            let enqueue_result = if let Some(set_ref) = set_ref {
+                let mut set = set_ref.lock();
+                if set.removed {
+                    Err(EIDRM)
+                } else {
+                    let retry =
+                        perform_sem_ops(&mut set, ipc_ns, semid, &retained, nsops, pid, undo_owner);
+                    let retry_result = (|| -> Result<Option<()>, i64> {
+                        match retry {
+                            Ok(()) => Ok(Some(())),
+                            Err((errno, true, _)) => Err(errno),
+                            Err((EAGAIN, false, retry_blocking)) => {
+                                if set.pending.try_reserve(1).is_err() {
+                                    return Err(ENOMEM);
+                                }
+                                let blocker = retry_blocking.or(blocking);
+                                with_sem_state(|state| {
+                                    state.waits.try_reserve(1).map_err(|_| ENOMEM)?;
+                                    if let Some(blocker) = blocker {
+                                        adjust_wait_count(&mut set, blocker, true);
+                                    }
+                                    set.pending.push_back(task);
+                                    let wait_index = sem_wait_index(&state.waits, task)
+                                        .unwrap_or_else(|index| index);
+                                    state.waits.insert(
+                                        wait_index,
+                                        SemWait {
+                                            task,
+                                            set: Some(Arc::clone(&set_ref)),
+                                            ipc_ns,
+                                            id: semid,
+                                            sops: retained,
+                                            nsops,
+                                            timeout,
+                                            blocking: blocker,
+                                            pid,
+                                            undo_owner,
+                                            result: None,
+                                            waker: None,
+                                        },
+                                    );
+                                    Ok::<(), i64>(())
+                                })?;
+                                Ok(None)
                             }
-                            let blocker = retry_blocking.or(blocking);
-                            if let Some(blocker) = blocker {
-                                adjust_wait_count(set, blocker, true);
-                            }
-                            set.pending.push_back(task);
-                            let wait_index =
-                                sem_wait_index(waits, task).unwrap_or_else(|index| index);
-                            waits.insert(
-                                wait_index,
-                                SemWait {
-                                    task,
-                                    ipc_ns,
-                                    id: semid,
-                                    sops: retained,
-                                    nsops,
-                                    timeout,
-                                    blocking: blocker,
-                                    pid,
-                                    undo_owner,
-                                    result: None,
-                                    waker: None,
-                                },
-                            );
-                            Ok(None)
+                            Err((errno, _, _)) => Err(errno),
                         }
-                        Err((errno, _, _)) => Err(errno),
+                    })();
+                    if matches!(retry_result, Ok(Some(()))) && !set.pending.is_empty() {
+                        with_sem_state(|state| {
+                            scan_sem_waiters(&mut set, &mut state.waits, object)
+                        });
                     }
-                };
-                if matches!(result, Ok(Some(()))) {
-                    scan_sem_waiters(state, object);
+                    retry_result
                 }
-                result
-            });
+            } else {
+                Err(EIDRM)
+            };
             match enqueue_result {
                 Ok(Some(())) => {
                     drain_sem_wakes();
@@ -2356,7 +2494,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             }
         }
         Err((e, _, _)) => {
-            with_sem_state(|state| unlink_sem_wait(state, task));
+            drop(unlink_sem_wait(task));
             finish_semtimedop_wait(timed);
             ctx.set_return(err(e));
         }
@@ -2413,52 +2551,71 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_RMID => {
-            let removed = with_sem_state(|state| {
-                let set = state.sets.get(&object).ok_or(EINVAL)?;
-                if !ipc_owner(caller_uid, set.uid, set.cuid) {
-                    return Err(EPERM);
-                }
-                let set = state.sets.remove(&object).ok_or(EINVAL)?;
-                state
-                    .ids
-                    .get_mut(&ipc_ns)
-                    .expect("SysV semaphore id table missing")
-                    .release(semid);
-                if set.key as u64 != IPC_PRIVATE {
-                    assert_eq!(
-                        state.key_ids.remove(&(ipc_ns, set.key)),
-                        Some(semid),
-                        "SysV semaphore key index diverged"
-                    );
-                }
-                let remove_usage = {
-                    let usage = state
-                        .usage
-                        .get_mut(&ipc_ns)
-                        .expect("SysV semaphore usage missing");
-                    usage.set_count = usage
-                        .set_count
-                        .checked_sub(1)
-                        .expect("SysV semaphore set count underflow");
-                    usage.sem_count = usage
-                        .sem_count
-                        .checked_sub(set.sems.len())
-                        .expect("SysV semaphore member count underflow");
-                    usage.set_count == 0
-                };
-                if remove_usage {
-                    state.usage.remove(&ipc_ns);
-                }
-                state
-                    .undos
-                    .retain(|((_, namespace, id, _), _)| *namespace != ipc_ns || *id != semid);
-                for wait in &mut state.waits {
-                    if wait.ipc_ns == ipc_ns && wait.id == semid && wait.result.is_none() {
-                        wait.result = Some(EIDRM);
+            let removed = match lookup_sem_set(object) {
+                None => Err(EINVAL),
+                Some(set_ref) => {
+                    let mut set = set_ref.lock();
+                    if set.removed {
+                        Err(EIDRM)
+                    } else if !ipc_owner(caller_uid, set.uid, set.cuid) {
+                        Err(EPERM)
+                    } else {
+                        with_sem_state(|state| {
+                            let Some(current) = state.sets.get(&object) else {
+                                return Err(EIDRM);
+                            };
+                            if !Arc::ptr_eq(current, &set_ref) {
+                                return Err(EIDRM);
+                            }
+                            state.sets.remove(&object);
+                            state
+                                .ids
+                                .get_mut(&ipc_ns)
+                                .expect("SysV semaphore id table missing")
+                                .release(semid);
+                            if set.key as u64 != IPC_PRIVATE {
+                                assert_eq!(
+                                    state.key_ids.remove(&(ipc_ns, set.key)),
+                                    Some(semid),
+                                    "SysV semaphore key index diverged"
+                                );
+                            }
+                            let remove_usage = {
+                                let usage = state
+                                    .usage
+                                    .get_mut(&ipc_ns)
+                                    .expect("SysV semaphore usage missing");
+                                usage.set_count = usage
+                                    .set_count
+                                    .checked_sub(1)
+                                    .expect("SysV semaphore set count underflow");
+                                usage.sem_count = usage
+                                    .sem_count
+                                    .checked_sub(set.sems.len())
+                                    .expect("SysV semaphore member count underflow");
+                                usage.set_count == 0
+                            };
+                            if remove_usage {
+                                state.usage.remove(&ipc_ns);
+                            }
+                            for wait in &mut state.waits {
+                                if wait.ipc_ns == ipc_ns
+                                    && wait.id == semid
+                                    && wait.result.is_none()
+                                {
+                                    wait.result = Some(EIDRM);
+                                }
+                            }
+                            set.removed = true;
+                            set.pending.clear();
+                            set.ncnt.fill(0);
+                            set.zcnt.fill(0);
+                            set.undos.clear();
+                            Ok(())
+                        })
                     }
                 }
-                Ok(())
-            });
+            };
             match removed {
                 Ok(()) => {
                     drain_sem_wakes();
@@ -2468,17 +2625,25 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
-            let snapshot = with_sem_state(|state| {
+            let resolved = with_sem_state(|state| {
                 let returned_id = if cmd == IPC_STAT {
                     semid
                 } else {
                     state
                         .ids
                         .get(&ipc_ns)
-                        .and_then(|ids| ids.full_id_at(semid))
-                        .ok_or(EINVAL)?
+                        .and_then(|ids| ids.full_id_at(semid))?
                 };
-                let set = state.sets.get(&(ipc_ns, returned_id)).ok_or(EINVAL)?;
+                state
+                    .sets
+                    .get(&(ipc_ns, returned_id))
+                    .map(|set| (returned_id, Arc::clone(set)))
+            });
+            let snapshot = resolved.ok_or(EINVAL).and_then(|(returned_id, set_ref)| {
+                let set = set_ref.lock();
+                if set.removed {
+                    return Err(EIDRM);
+                }
                 if cmd != SEM_STAT_ANY
                     && !ipc_allowed(
                         caller_uid,
@@ -2494,7 +2659,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 {
                     return Err(EACCES);
                 }
-                Ok((returned_id, sem_stat_snapshot(set)))
+                Ok((returned_id, sem_stat_snapshot(&set)))
             });
             let (returned_id, snapshot) = match snapshot {
                 Ok(snapshot) => snapshot,
@@ -2529,8 +2694,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             let new_uid = get_u32(&input, 4);
             let new_gid = get_u32(&input, 8);
             let new_mode = get_u32(&input, 20) & IPC_PERM_MASK;
-            let authorized = with_sems(|m| {
-                let set = m.get(&object).ok_or(EINVAL)?;
+            let authorized = with_sem_set(object, |set| {
                 if !ipc_owner(caller_uid, set.uid, set.cuid) {
                     return Err(EPERM);
                 }
@@ -2547,8 +2711,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let result = with_sems(|m| {
-                let set = m.get_mut(&object).ok_or(EINVAL)?;
+            let result = with_sem_set(object, |set| {
                 if !ipc_owner(caller_uid, set.uid, set.cuid) {
                     return Err(EPERM);
                 }
@@ -2572,8 +2735,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 return;
             }
             let pid = current_identity().0;
-            let r = with_sem_state(|state| {
-                let set = state.sets.get_mut(&object).ok_or(EINVAL)?;
+            let r = with_sem_set(object, |set| {
                 if semnum_raw < 0 || semnum >= set.sems.len() {
                     return Err(EINVAL);
                 }
@@ -2593,12 +2755,14 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 set.sems[semnum] = value;
                 set.pids[semnum] = pid;
                 set.ctime = now_seconds();
-                for ((_, namespace, id, num), adjustment) in &mut state.undos {
+                for ((_, namespace, id, num), adjustment) in &mut set.undos {
                     if *namespace == ipc_ns && *id == semid && *num == semnum {
                         *adjustment = 0;
                     }
                 }
-                scan_sem_waiters(state, object);
+                if !set.pending.is_empty() {
+                    with_sem_state(|state| scan_sem_waiters(set, &mut state.waits, object));
+                }
                 Ok(())
             });
             ctx.set_return(match r {
@@ -2610,8 +2774,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             });
         }
         GETVAL | GETPID | GETNCNT | GETZCNT => {
-            let r = with_sems(|m| {
-                let set = m.get(&object).ok_or(EINVAL)?;
+            let r = with_sem_set(object, |set| {
                 // semctl_main performs read permission before validating the
                 // semaphore number for all four per-semaphore read commands.
                 if !ipc_allowed(
@@ -2655,9 +2818,18 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             });
         }
         SETALL => {
-            let n = match with_sems(|m| {
-                let set = m.get(&object).ok_or(EINVAL)?;
-                if !ipc_allowed(
+            let set_ref = match lookup_sem_set(object) {
+                Some(set_ref) => set_ref,
+                None => {
+                    ctx.set_return(err(EINVAL));
+                    return;
+                }
+            };
+            let set_size = {
+                let set = set_ref.lock();
+                if set.removed {
+                    Err(EIDRM)
+                } else if !ipc_allowed(
                     caller_uid,
                     caller_gid,
                     &caller_groups,
@@ -2668,10 +2840,12 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                     set.mode,
                     0o2,
                 ) {
-                    return Err(EACCES);
+                    Err(EACCES)
+                } else {
+                    Ok(set.sems.len())
                 }
-                Ok(set.sems.len())
-            }) {
+            };
+            let n = match set_size {
                 Ok(n) => n,
                 Err(e) => {
                     ctx.set_return(err(e));
@@ -2697,22 +2871,27 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 values.push(i32::from(value));
             }
             let pid = current_identity().0;
-            let r = with_sem_state(|state| {
-                let set = state.sets.get_mut(&object).ok_or(EIDRM)?;
-                if set.sems.len() != values.len() {
-                    return Err(EIDRM);
-                }
-                set.sems.copy_from_slice(&values);
-                set.pids.fill(pid);
-                set.ctime = now_seconds();
-                for ((_, namespace, id, _), adjustment) in &mut state.undos {
-                    if *namespace == ipc_ns && *id == semid {
-                        *adjustment = 0;
+            let r = {
+                let mut set = set_ref.lock();
+                if set.removed || set.sems.len() != values.len() {
+                    Err(EIDRM)
+                } else {
+                    set.sems.copy_from_slice(&values);
+                    set.pids.fill(pid);
+                    set.ctime = now_seconds();
+                    for ((_, namespace, id, _), adjustment) in &mut set.undos {
+                        if *namespace == ipc_ns && *id == semid {
+                            *adjustment = 0;
+                        }
                     }
+                    if !set.pending.is_empty() {
+                        with_sem_state(|state| {
+                            scan_sem_waiters(&mut set, &mut state.waits, object)
+                        });
+                    }
+                    Ok(())
                 }
-                scan_sem_waiters(state, object);
-                Ok(())
-            });
+            };
             ctx.set_return(match r {
                 Ok(()) => {
                     drain_sem_wakes();
@@ -2722,8 +2901,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             });
         }
         GETALL => {
-            let r = with_sems(|m| {
-                let set = m.get(&object).ok_or(EINVAL)?;
+            let r = with_sem_set(object, |set| {
                 if !ipc_allowed(
                     caller_uid,
                     caller_gid,
@@ -3726,21 +3904,43 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
 /// with EIDRM, matching Linux free_ipcs().
 #[cfg(feature = "container")]
 pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
+    // Detach and retire one set at a time.  Namespace-registry code never
+    // waits for an object lock; all paths use object -> registry ordering.
+    while let Some((object, set_ref)) = with_sem_state(|state| {
+        let object = state
+            .sets
+            .keys()
+            .find(|(namespace, _)| *namespace == ipc_ns)
+            .copied()?;
+        Some((object, Arc::clone(state.sets.get(&object)?)))
+    }) {
+        let mut set = set_ref.lock();
+        with_sem_state(|state| {
+            if state
+                .sets
+                .get(&object)
+                .is_some_and(|current| Arc::ptr_eq(current, &set_ref))
+            {
+                state.sets.remove(&object);
+            }
+            for wait in &mut state.waits {
+                if wait.ipc_ns == ipc_ns && wait.id == object.1 && wait.result.is_none() {
+                    wait.result = Some(EIDRM);
+                }
+            }
+        });
+        set.removed = true;
+        set.pending.clear();
+        set.ncnt.fill(0);
+        set.zcnt.fill(0);
+        set.undos.clear();
+    }
     with_sem_state(|state| {
-        state.sets.retain(|(namespace, _), _| *namespace != ipc_ns);
         state.ids.remove(&ipc_ns);
         state
             .key_ids
             .retain(|(namespace, _), _| *namespace != ipc_ns);
         state.usage.remove(&ipc_ns);
-        state
-            .undos
-            .retain(|((_, namespace, _, _), _)| *namespace != ipc_ns);
-        for wait in &mut state.waits {
-            if wait.ipc_ns == ipc_ns && wait.result.is_none() {
-                wait.result = Some(EIDRM);
-            }
-        }
     });
     drain_sem_wakes();
     // Retire one queue at a time so dropping queued payloads and firing wakers
