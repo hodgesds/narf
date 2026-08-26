@@ -1075,6 +1075,207 @@ kernel_test_in!(
     smoke_abi_ipc_sem_queue_handoff_order_and_waker_dedupe
 );
 
+/// A single value transition can complete several semaphore operations.  The
+/// allocation-free wake queue must preserve the set's handoff order rather
+/// than the task-id order used by the global registration index.
+fn smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    struct OrderedWake {
+        marker: u64,
+        order: Arc<AtomicU64>,
+    }
+
+    impl OrderedWake {
+        fn record(&self) {
+            self.order
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old * 10 + self.marker)
+                })
+                .expect("infallible wake-order update");
+        }
+    }
+
+    impl Wake for OrderedWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        // Deliberately reverse task-id order so a scan of the global sorted
+        // waiter index would produce 21 instead of the required FIFO 12.
+        const FIRST: u64 = FAKE_TASK + 32;
+        const SECOND: u64 = FAKE_TASK + 31;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        set_task(FIRST);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("first batch waiter did not queue");
+        }
+        set_task(SECOND);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("second batch waiter did not queue");
+        }
+
+        let order = Arc::new(AtomicU64::new(0));
+        let first_waker = core::task::Waker::from(Arc::new(OrderedWake {
+            marker: 1,
+            order: Arc::clone(&order),
+        }));
+        let second_waker = core::task::Waker::from(Arc::new(OrderedWake {
+            marker: 2,
+            order: Arc::clone(&order),
+        }));
+        if crate::sysvipc::register_sem_wait_waker(FIRST, first_waker)
+            != crate::sysvipc::SemParkState::Pending
+            || crate::sysvipc::register_sem_wait_waker(SECOND, second_waker)
+                != crate::sysvipc::SemParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("batch waiters rejected durable waker registration");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 2)) != Some(0) {
+            return Err("SETVAL failed to complete the waiter batch");
+        }
+        if order.load(Ordering::Relaxed) != 12 {
+            return Err("batched semaphore wakes did not preserve handoff order");
+        }
+
+        for task in [FIRST, SECOND] {
+            set_task(task);
+            if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+                set_task(FAKE_TASK);
+                return Err("batched waiter did not consume cached success");
+            }
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("batched semaphore operations were not committed atomically");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order
+);
+
+/// Linux unlinks an interrupted `sem_queue` directly from its intrusive list.
+/// Removing a middle waiter must leave both FIFO neighbours linked and must
+/// not change their handoff order.
+fn smoke_abi_ipc_sem_middle_cancel_preserves_pending_fifo() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    struct OrderedWake {
+        marker: u64,
+        order: Arc<AtomicU64>,
+    }
+
+    impl OrderedWake {
+        fn record(&self) {
+            self.order
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old * 10 + self.marker)
+                })
+                .expect("infallible wake-order update");
+        }
+    }
+
+    impl Wake for OrderedWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        // Deliberately avoid task-id order so the global waiter index cannot
+        // accidentally satisfy this FIFO assertion.
+        const FIRST: u64 = FAKE_TASK + 35;
+        const MIDDLE: u64 = FAKE_TASK + 33;
+        const LAST: u64 = FAKE_TASK + 34;
+        for task in [FIRST, MIDDLE, LAST] {
+            set_task(task);
+            if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD
+            {
+                set_task(FAKE_TASK);
+                return Err("semaphore waiter did not enter the pending FIFO");
+            }
+        }
+
+        let order = Arc::new(AtomicU64::new(0));
+        for (task, marker) in [(FIRST, 1), (LAST, 3)] {
+            let waker = core::task::Waker::from(Arc::new(OrderedWake {
+                marker,
+                order: Arc::clone(&order),
+            }));
+            if crate::sysvipc::register_sem_wait_waker(task, waker)
+                != crate::sysvipc::SemParkState::Pending
+            {
+                set_task(FAKE_TASK);
+                return Err("pending FIFO waiter rejected durable waker registration");
+            }
+        }
+
+        set_task(MIDDLE);
+        crate::handlers::raise_signal_pending(MIDDLE, 10);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(EINTR) {
+            crate::handlers::clear_signal_pending(MIDDLE, 10);
+            set_task(FAKE_TASK);
+            return Err("middle semaphore waiter did not cancel with EINTR");
+        }
+        crate::handlers::clear_signal_pending(MIDDLE, 10);
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(2) {
+            return Err("middle cancellation corrupted the pending wait count");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 2)) != Some(0) {
+            return Err("SETVAL failed to complete pending FIFO neighbours");
+        }
+        if order.load(Ordering::Relaxed) != 13 {
+            return Err("middle cancellation changed neighbour handoff order");
+        }
+        for task in [FIRST, LAST] {
+            set_task(task);
+            if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+                set_task(FAKE_TASK);
+                return Err("pending FIFO neighbour did not consume cached success");
+            }
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(0)
+        {
+            return Err("pending FIFO retained stale state after completion");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_middle_cancel_preserves_pending_fifo
+);
+
 fn smoke_abi_ipc_sem_queue_timeout_and_undo_handoff() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
@@ -1195,6 +1396,51 @@ fn smoke_abi_ipc_sem_exit_undo_is_set_atomic() -> TestResult {
 kernel_test_in!(
     "syscall_abi/sysvipc_correctness",
     smoke_abi_ipc_sem_exit_undo_is_set_atomic
+);
+
+fn smoke_abi_ipc_sem_exit_undo_retains_other_owners() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut increment = [0u8; 6];
+        increment[2..4].copy_from_slice(&1i16.to_le_bytes());
+        increment[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+
+        const OWNER_A: u64 = FAKE_TASK + 27;
+        set_task(OWNER_A);
+        let owner_a_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, increment.as_ptr() as u64, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: first owner's SEM_UNDO increment failed");
+        }
+
+        const OWNER_B: u64 = FAKE_TASK + 28;
+        set_task(OWNER_B);
+        let owner_b_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, increment.as_ptr() as u64, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("setup: second owner's SEM_UNDO increment failed");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(2) {
+            return Err("setup: both SEM_UNDO increments were not applied");
+        }
+
+        crate::sysvipc::sem_undo_process_exit(owner_a_pid, OWNER_A);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("first owner exit did not apply exactly its SEM_UNDO entry");
+        }
+
+        crate::sysvipc::sem_undo_process_exit(owner_b_pid, OWNER_B);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0) {
+            return Err("first owner exit discarded the second owner's SEM_UNDO entry");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_exit_undo_retains_other_owners
 );
 
 fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
@@ -1520,6 +1766,70 @@ fn smoke_abi_ipc_sem_undo_and_rmid_wake() -> TestResult {
 kernel_test_in!(
     "syscall_abi/sysvipc_correctness",
     smoke_abi_ipc_sem_undo_and_rmid_wake
+);
+
+fn smoke_abi_ipc_sem_rmid_only_retires_target_set_waiters() -> TestResult {
+    with_setup(|| {
+        let removed_id = make_semset(1)?;
+        let live_id = make_semset(1)?;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        const REMOVED_WAITER: u64 = FAKE_TASK + 36;
+        set_task(REMOVED_WAITER);
+        if call_raw(
+            Syscall::Semop.raw(),
+            a2(removed_id, decrement.as_ptr() as u64, 1),
+        )
+        .value
+            != 0xDEAD
+        {
+            set_task(FAKE_TASK);
+            return Err("removed-set waiter did not block");
+        }
+
+        const LIVE_WAITER: u64 = FAKE_TASK + 37;
+        set_task(LIVE_WAITER);
+        if call_raw(
+            Syscall::Semop.raw(),
+            a2(live_id, decrement.as_ptr() as u64, 1),
+        )
+        .value
+            != 0xDEAD
+        {
+            set_task(FAKE_TASK);
+            return Err("live-set waiter did not block");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(removed_id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("IPC_RMID failed for target semaphore set");
+        }
+        set_task(REMOVED_WAITER);
+        if call(Syscall::Semop.raw(), a2(removed_id, BAD_PTR, 1)) != Some(EIDRM) {
+            set_task(FAKE_TASK);
+            return Err("target-set waiter did not consume EIDRM");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(live_id, 0, GETNCNT, 0)) != Some(1) {
+            return Err("IPC_RMID disturbed another set's pending waiter");
+        }
+        if call(Syscall::Semctl.raw(), a3(live_id, 0, SETVAL, 1)) != Some(0) {
+            return Err("SETVAL failed on unaffected semaphore set");
+        }
+        set_task(LIVE_WAITER);
+        if call(Syscall::Semop.raw(), a2(live_id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("unaffected set waiter did not consume cached success");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_rmid_only_retires_target_set_waiters
 );
 
 fn smoke_abi_ipc_retained_semop_and_shared_undo() -> TestResult {
