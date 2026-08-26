@@ -12,9 +12,11 @@ use super::*;
 ///   - a NULL/faulting `tp` (`get_timespec64`) → -EFAULT,
 ///   - `timespec64_valid_settod` (`tv_sec < 0` or `tv_nsec` outside
 ///     `[0, NSEC_PER_SEC)`) → -EINVAL.
+///
 /// NARF only implements CLOCK_REALTIME as settable; every other clockid
 /// (valid-but-unsettable like CLOCK_MONOTONIC, or entirely unknown) is the
 /// same -EINVAL Linux returns.
+///
 /// LINUX-GAP: `security_settime64` rejects a caller without CAP_SYS_TIME with
 /// -EPERM; NARF does not model that capability here.
 pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {

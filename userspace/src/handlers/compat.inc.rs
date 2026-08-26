@@ -7047,27 +7047,10 @@ fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::S
     arc_shard_get(&SOCKET_ARCS, raw as usize)
 }
 
-fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
-    if ptr == 0 || !(2..=110).contains(&len) {
-        return None;
-    }
-    // Copy the whole sockaddr struct into a kernel buffer under SMAP bracket,
-    // then parse it — no raw volatile access after this point.
-    let total = len as usize;
-    let mut buf = alloc::vec![0u8; total];
-    // SAFETY: ptr validated (non-null, reasonable length) above.
-    unsafe { copy_from_user(&mut buf, ptr) }.ok()?;
-    // Family is the first u16 (little-endian on x86_64).
-    let family = u16::from_le_bytes([buf[0], buf[1]]);
-    let body = buf[2..].to_vec();
-    Some(crate::socket::SockAddr { family, body })
-}
-
-/// Import a MANDATORY user sockaddr for bind/connect without collapsing
-/// Linux's two `move_addr_to_kernel` errors: an `addrlen` outside
+/// Import a MANDATORY user sockaddr for bind/connect, distinguishing Linux's
+/// two `move_addr_to_kernel` errors: an `addrlen` outside
 /// `[0, sizeof(sockaddr_storage)]` (or too short to hold `sa_family_t`) is
-/// -EINVAL, and a faulting copy is -EFAULT. `copy_user_addr` predates exact
-/// errno reporting and folds both to `None`.
+/// -EINVAL, and a faulting copy is -EFAULT.
 fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAddr, i64> {
     let len = raw_len as i32;
     // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.
@@ -7111,11 +7094,37 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     let fd = args.arg0 as u32;
     let _addr_out = args.arg1;
     let _addr_len_out = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux accept4 error ORDER (net/socket.c): __sys_accept4 does
+    // `fd_empty → -EBADF` FIRST, then __sys_accept4_file checks
+    // `flags & ~(SOCK_CLOEXEC|SOCK_NONBLOCK) → -EINVAL` BEFORE
+    // `sock_from_file → -ENOTSOCK`. So: EBADF, then EINVAL, then ENOTSOCK. A
+    // full descriptor table on the new fd → -EMFILE; the accept op → -EAGAIN/…
+    // (plain accept passes flags=0, so the flag check is a no-op there.)
+    let flags_bad = flags & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK) != 0;
+    let sock = match current_socket_result(fd) {
+        Ok(s) => {
+            if flags_bad {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+                return;
+            }
+            s
+        }
+        // EBADF (absent fd) is reported regardless of the flags.
+        Err(9) => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+        // A present non-socket fd: the flag check precedes -ENOTSOCK in Linux.
+        Err(88) => {
+            if flags_bad {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL (flags)
+            } else {
+                ctx.set_return(SyscallReturn::ok((-88i64) as u64)); // -ENOTSOCK
+            }
+            return;
+        }
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -7167,7 +7176,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 }) {
                 Some(n) => n,
                 None => {
-                    ctx.set_return(fail);
+                    ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                     return;
                 }
             };
@@ -7238,7 +7247,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }
 

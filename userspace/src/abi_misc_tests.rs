@@ -48,12 +48,10 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_tcgetattr_pos);
 
 fn smoke_abi_misc_tcgetattr_neg() -> TestResult {
     with_setup(|| {
-        // Null out-pointer → -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT (-14) for a bad buffer; NARF
-        // returns the -1 sentinel.
+        // Null out-pointer → -EFAULT (get_termios's copy_to_user faults).
         match call(Syscall::Tcgetattr.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("tcgetattr with a null buffer should return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("tcgetattr with a null buffer should return -EFAULT"),
         }
     })
 }
@@ -73,11 +71,10 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_tcsetattr_pos);
 
 fn smoke_abi_misc_tcsetattr_neg() -> TestResult {
     with_setup(|| {
-        // Null in-pointer (arg2 == 0) → -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT (-14) for a bad buffer.
+        // Null in-pointer (arg2 == 0) → -EFAULT (set_termios's copy faults).
         match call(Syscall::Tcsetattr.raw(), a2(0, 0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("tcsetattr with a null buffer should return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("tcsetattr with a null buffer should return -EFAULT"),
         }
     })
 }

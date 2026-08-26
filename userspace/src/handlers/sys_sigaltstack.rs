@@ -19,6 +19,7 @@ use super::*;
 ///   3. `copy_to_user(uoss, &old)` — -EFAULT, and ONLY when the install did
 ///      not error (`if (!err && uoss)`): a rejected install never writes the
 ///      old-stack out-param, and the snapshot is the PRE-install state.
+///
 /// LINUX-GAP: `on_sig_stack(sp)` → -EPERM (changing the altstack while
 /// executing on it) is not enforced — NARF does not track the faulting user
 /// sp relative to the active altstack here.

@@ -62,16 +62,16 @@ fn smoke_abi_sched_getcpu_bad_cpu_ptr_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_getcpu_bad_cpu_ptr_neg);
 
 // ── getpriority(which, who) ─────────────────────────────────────────
-// PRIO_PROCESS(0) only; returns nice+20 (default nice 0 ⇒ 20).
+// PRIO_PROCESS(0) only; returns 20 - nice (default nice 0 ⇒ 20).
 
 fn smoke_abi_sched_getpriority_pos() -> TestResult {
     with_setup(|| {
-        // PRIO_PROCESS, self. Default nice 0 ⇒ wire value 20 (nice+20).
+        // PRIO_PROCESS, self. Default nice 0 ⇒ wire value 20 - nice == 20.
         match call(Syscall::Getpriority.raw(), a1(0, 0)) {
             Some(20) => Ok(()),
             other => {
                 let _ = other;
-                Err("getpriority(PRIO_PROCESS) should return nice+20 == 20")
+                Err("getpriority(PRIO_PROCESS) should return 20 - nice == 20")
             }
         }
     })
@@ -80,12 +80,13 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getpriority_pos);
 
 fn smoke_abi_sched_getpriority_bad_which_neg() -> TestResult {
     with_setup(|| {
-        // PRIO_PGRP(1) / PRIO_USER(2) are unsupported ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux supports PRIO_PGRP/PRIO_USER; bad 'which' is EINVAL.
-        match call(Syscall::Getpriority.raw(), a1(1, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("getpriority with non-PRIO_PROCESS should return -1"),
+        // `which` outside [PRIO_PROCESS, PRIO_USER] → -EINVAL (kernel/sys.c).
+        // LINUX-GAP: PRIO_PGRP(1)/PRIO_USER(2) are unimplemented and also
+        // reported as -EINVAL here.
+        if call(Syscall::Getpriority.raw(), a1(1, 0)) != Some(EINVAL) {
+            return Err("getpriority with non-PRIO_PROCESS should return -EINVAL");
         }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getpriority_bad_which_neg);
@@ -94,14 +95,14 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getpriority_bad_which_neg);
 
 fn smoke_abi_sched_setpriority_pos() -> TestResult {
     with_setup(|| {
-        // Set nice 10 then read it back: getpriority returns 10+20 == 30.
+        // Set nice 10 then read it back: getpriority returns 20 - 10 == 10.
         match call(Syscall::Setpriority.raw(), a2(0, 0, 10)) {
             Some(0) => {}
             _ => return Err("smoke_abi_sched_setpriority_pos: unexpected syscall return"),
         }
         match call(Syscall::Getpriority.raw(), a1(0, 0)) {
-            Some(30) => Ok(()),
-            _ => Ok(()),
+            Some(10) => Ok(()),
+            _ => Err("getpriority after setpriority(nice 10) should be 20 - 10 == 10"),
         }
     })
 }
@@ -109,12 +110,27 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setpriority_pos);
 
 fn smoke_abi_sched_setpriority_out_of_range_neg() -> TestResult {
     with_setup(|| {
-        // prio 100 is outside the valid -20..=19 nice range ⇒ wire -1.
-        // LINUX-GAP: Linux clamps and may EACCES; bad args here yield -1.
-        match call(Syscall::Setpriority.raw(), a2(0, 0, 100)) {
-            Some(-1) => Ok(()),
-            _ => Err("setpriority with out-of-range nice should return -1"),
+        // Linux CLAMPS niceval to [MIN_NICE(-20), MAX_NICE(19)] instead of
+        // rejecting it, so an out-of-range value succeeds (returns 0) rather
+        // than the old -1. Both ends clamp; getpriority then reads back the
+        // clamped nice (via NARF's own nice→priority mapping), which must
+        // differ between the two clamps to prove the clamp actually applied.
+        if call(Syscall::Setpriority.raw(), a2(0, 0, 100)) != Some(0) {
+            return Err("setpriority with an out-of-range nice should clamp and return 0");
         }
+        let high = call(Syscall::Getpriority.raw(), a1(0, 0));
+        if call(Syscall::Setpriority.raw(), a2(0, 0, (-100i64) as u64)) != Some(0) {
+            return Err("setpriority(-100) should clamp and return 0");
+        }
+        let low = call(Syscall::Getpriority.raw(), a1(0, 0));
+        if high == low {
+            return Err("out-of-range setpriority did not clamp to distinct nice bounds");
+        }
+        // An unsupported `which` (PRIO_USER=2, or out of [0,2]) → -EINVAL.
+        if call(Syscall::Setpriority.raw(), a2(2, 0, 0)) != Some(EINVAL) {
+            return Err("setpriority with an unsupported which should return -EINVAL");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setpriority_out_of_range_neg);
@@ -491,12 +507,15 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_pos);
 
 fn smoke_abi_sched_setparam_null_buf_neg() -> TestResult {
     with_setup(|| {
-        // Null param pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL/-EFAULT for a bad param pointer.
-        match call(Syscall::SchedSetparam.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_setparam with null buffer should return -1"),
+        // do_sched_setscheduler: `!param` → -EINVAL (before the copy).
+        if call(Syscall::SchedSetparam.raw(), a1(0, 0)) != Some(EINVAL) {
+            return Err("sched_setparam with a null param should return -EINVAL");
         }
+        // A non-NULL but faulting param → -EFAULT (copy_from_user).
+        if call(Syscall::SchedSetparam.raw(), a1(0, BAD_PTR)) != Some(EFAULT) {
+            return Err("sched_setparam with a faulting param should return -EFAULT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_null_buf_neg);
@@ -581,11 +600,11 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_rr_get_interval_pos);
 
 fn smoke_abi_sched_rr_get_interval_bad_ptr_neg() -> TestResult {
     with_setup(|| {
-        // Non-canonical timespec pointer ⇒ copy_to_user EFAULT ⇒ wire -1.
-        // LINUX-GAP: Linux returns -EFAULT for a bad timespec pointer.
+        // Non-canonical timespec pointer ⇒ put_timespec64's copy_to_user
+        // faults ⇒ -EFAULT.
         match call(Syscall::SchedRrGetInterval.raw(), a1(0, BAD_PTR)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_rr_get_interval with bad pointer should return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("sched_rr_get_interval with a bad pointer should return -EFAULT"),
         }
     })
 }

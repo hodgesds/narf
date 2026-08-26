@@ -285,10 +285,9 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_neg);
 fn smoke_abi_socket_accept_neg() -> TestResult {
     with_setup(|| {
         let n = Syscall::SocketAccept.raw();
-        let r = call(n, a0(BAD_FD)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns the -1 sentinel.
-        if r != -1 {
-            return Err("accept() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if call(n, a0(BAD_FD)) != Some(EBADF) {
+            return Err("accept() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -412,10 +411,17 @@ kernel_test_in!(
 fn smoke_abi_socket_accept4_neg() -> TestResult {
     with_setup(|| {
         let n = Syscall::SocketAccept4.raw();
-        let r = call(n, a3(BAD_FD, 0, 0, 0)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns the -1 sentinel.
-        if r != -1 {
-            return Err("accept4() on a bad fd did not return -1");
+        // Linux order (net/socket.c): fd_empty → -EBADF (before the flag
+        // check), then __sys_accept4_file `flags & ~(SOCK_CLOEXEC|SOCK_NONBLOCK)
+        // → -EINVAL` before sock_from_file → -ENOTSOCK.
+        // An absent fd → -EBADF regardless of flags.
+        if call(n, a3(BAD_FD, 0, 0, 0)) != Some(EBADF) {
+            return Err("accept4() on a bad fd did not return -EBADF");
+        }
+        // A valid socket with an unknown flag bit → -EINVAL.
+        let srv = open_unix_stream()?;
+        if call(n, a3(srv, 0, 0, 0x1)) != Some(EINVAL) {
+            return Err("accept4() with an unknown flag did not return -EINVAL");
         }
         Ok(())
     })
@@ -1560,10 +1566,9 @@ fn smoke_abi_socket_getsockopt_neg() -> TestResult {
             arg4: optlen.as_mut_ptr() as u64,
             ..Default::default()
         };
-        let r = call(n, args).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("getsockopt() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if call(n, args) != Some(EBADF) {
+            return Err("getsockopt() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -1884,10 +1889,10 @@ fn smoke_abi_socket_setsockopt_neg() -> TestResult {
             arg4: 0,
             ..Default::default()
         };
-        let r = call(n, args).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EINVAL (-22); NARF returns -1.
-        if r != -1 {
-            return Err("setsockopt() with zero optlen did not return -1");
+        // optlen == 0 < sizeof(int): sock_setsockopt's per-option length check
+        // → -EINVAL.
+        if call(n, args) != Some(EINVAL) {
+            return Err("setsockopt() with zero optlen did not return -EINVAL");
         }
         Ok(())
     })
@@ -2194,11 +2199,10 @@ fn smoke_abi_socket_recvmsg_neg() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
         let n = Syscall::SocketRecvMsg.raw();
-        // msg_ptr == 0 → -1 sentinel.
-        let r = call(n, a2(fd, 0, 0)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EFAULT (-14); NARF returns -1.
-        if r != -1 {
-            return Err("recvmsg() with NULL msghdr did not return -1");
+        // ___sys_recvmsg's copy_msghdr_from_user faults on a NULL msghdr →
+        // -EFAULT.
+        if call(n, a2(fd, 0, 0)) != Some(EFAULT) {
+            return Err("recvmsg() with NULL msghdr did not return -EFAULT");
         }
         Ok(())
     })

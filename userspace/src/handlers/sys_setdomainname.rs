@@ -5,6 +5,7 @@ use super::*;
 /// of sethostname:
 ///   - `len < 0 || len > __NEW_UTS_LEN(64)` → -EINVAL (`len == 0` sets empty),
 ///   - a faulting `name` → -EFAULT.
+///
 /// LINUX-GAP: a caller without CAP_SYS_ADMIN is -EPERM first; not modelled here.
 pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
