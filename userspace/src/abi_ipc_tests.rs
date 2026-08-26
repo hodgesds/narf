@@ -1287,11 +1287,25 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         #[cfg(target_arch = "aarch64")]
         const STAT_SIZE: usize = 88;
 
-        let id = make_semset(2)?;
         let read_i32 = |bytes: &[u8], offset: usize| {
             i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
         let mut info = [0u8; 40];
+        let _ = call_raw(
+            Syscall::Semctl.raw(),
+            a3(0, 0, SEM_INFO, info.as_mut_ptr() as u64),
+        );
+        let usage_before = (read_i32(&info, 28), read_i32(&info, 36));
+        let id = make_semset(2)?;
+        info.fill(0);
+        let _ = call_raw(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_INFO, info.as_mut_ptr() as u64),
+        );
+        if (read_i32(&info, 28), read_i32(&info, 36)) != (usage_before.0 + 1, usage_before.1 + 2) {
+            return Err("semget did not update exact namespace usage");
+        }
+        info.fill(0);
         let ipc_info = call_raw(
             Syscall::Semctl.raw(),
             a3(id, 0, IPC_INFO, info.as_mut_ptr() as u64),
@@ -1361,6 +1375,14 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         crate::handlers::__test_set_fsids(task, 0, 0);
         if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
             return Err("semctl info test cleanup failed");
+        }
+        info.fill(0);
+        let _ = call_raw(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_INFO, info.as_mut_ptr() as u64),
+        );
+        if (read_i32(&info, 28), read_i32(&info, 36)) != usage_before {
+            return Err("semctl IPC_RMID did not restore exact namespace usage");
         }
         Ok(())
     })
@@ -2241,6 +2263,15 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_capacity_stat_and_rmid);
 
 fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
+        let read_i32 = |bytes: &[u8], offset: usize| {
+            i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let mut info = [0u8; 32];
+        let _ = call_raw(
+            Syscall::Msgctl.raw(),
+            a2(0, MSG_INFO, info.as_mut_ptr() as u64),
+        );
+        let usage_before = (read_i32(&info, 0), read_i32(&info, 4), read_i32(&info, 24));
         let id = make_msgq()?;
         let mut msg = [0u8; 9];
         msg[..8].copy_from_slice(&1i64.to_ne_bytes());
@@ -2248,11 +2279,17 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         if call(Syscall::Msgsnd.raw(), a3(id, msg.as_ptr() as u64, 1, 0)) != Some(0) {
             return Err("setup: msgctl info message send failed");
         }
-
-        let read_i32 = |bytes: &[u8], offset: usize| {
-            i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
-        };
-        let mut info = [0u8; 32];
+        info.fill(0);
+        let _ = call_raw(
+            Syscall::Msgctl.raw(),
+            a2(id, MSG_INFO, info.as_mut_ptr() as u64),
+        );
+        if (read_i32(&info, 0), read_i32(&info, 4), read_i32(&info, 24))
+            != (usage_before.0 + 1, usage_before.1 + 1, usage_before.2 + 1)
+        {
+            return Err("msgsnd did not update exact namespace usage");
+        }
+        info.fill(0);
         let ipc_info = call_raw(
             Syscall::Msgctl.raw(),
             a2(id, IPC_INFO, info.as_mut_ptr() as u64),
@@ -2316,6 +2353,14 @@ fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
         }
         if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
             return Err("msgctl info test cleanup failed");
+        }
+        info.fill(0);
+        let _ = call_raw(
+            Syscall::Msgctl.raw(),
+            a2(id, MSG_INFO, info.as_mut_ptr() as u64),
+        );
+        if (read_i32(&info, 0), read_i32(&info, 4), read_i32(&info, 24)) != usage_before {
+            return Err("msgctl IPC_RMID did not restore exact namespace usage");
         }
         Ok(())
     })

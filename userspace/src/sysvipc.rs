@@ -46,6 +46,7 @@ fn err(e: i64) -> SyscallReturn {
 }
 
 type IpcObjectKey = (u64, u64); // (IPC namespace id, namespace-local object id)
+type IpcLookupKey = (u64, u32); // (IPC namespace id, user-supplied key)
 
 #[cfg(feature = "container")]
 fn current_ipc_namespace_id() -> u64 {
@@ -230,9 +231,21 @@ struct SemWait {
     waker: Option<Waker>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct SemUsage {
+    set_count: usize,
+    sem_count: usize,
+}
+
 #[derive(Default)]
 struct SemState {
     sets: BTreeMap<IpcObjectKey, SemSet>,
+    /// Linux keeps a per-namespace key index rather than walking every set.
+    /// IPC_PRIVATE is deliberately absent because it never names an object.
+    key_ids: BTreeMap<IpcLookupKey, u64>,
+    /// Exact per-namespace limit/SEM_INFO counters, updated in the same
+    /// critical section as `sets`.
+    usage: BTreeMap<u64, SemUsage>,
     /// Sorted by task id: O(log N) park registration/lookup with fallible
     /// capacity reservation before an O(N) queued-path insertion.
     waits: Vec<SemWait>,
@@ -318,10 +331,13 @@ pub(crate) fn __test_set_semmni(limit: usize) {
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_sem_set_count() -> usize {
     let ipc_ns = current_ipc_namespace_id();
-    with_sems(|sets| {
-        sets.keys()
-            .filter(|(namespace, _)| *namespace == ipc_ns)
-            .count()
+    with_sem_state(|state| {
+        state
+            .usage
+            .get(&ipc_ns)
+            .copied()
+            .unwrap_or_default()
+            .set_count
     })
 }
 
@@ -1342,13 +1358,13 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
     let flg = a.arg2;
     let ipc_ns = current_ipc_namespace_id();
     let (_, uid, gid, groups) = current_identity();
-    let id = with_sems(|m| {
+    let id = with_sem_state(|state| {
         if key as u64 != IPC_PRIVATE {
-            if let Some(((_, id), set)) = m
-                .iter()
-                .find(|((namespace, _), s)| *namespace == ipc_ns && s.key == key)
-            {
-                let id = *id;
+            if let Some(&id) = state.key_ids.get(&(ipc_ns, key)) {
+                let set = state
+                    .sets
+                    .get(&(ipc_ns, id))
+                    .expect("indexed SysV semaphore set missing");
                 if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
                     return Err(EEXIST);
                 }
@@ -1375,13 +1391,8 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
         if nsems == 0 {
             return Err(EINVAL);
         }
-        let (set_count, used_sems) = m
-            .iter()
-            .filter(|((namespace, _), _)| *namespace == ipc_ns)
-            .fold((0usize, 0usize), |(count, used), (_, set)| {
-                (count.saturating_add(1), used.saturating_add(set.sems.len()))
-            });
-        if used_sems.saturating_add(nsems) > SEMMNS || set_count >= semmni() {
+        let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+        if usage.sem_count.saturating_add(nsems) > SEMMNS || usage.set_count >= semmni() {
             return Err(ENOSPC);
         }
         let mut sems = Vec::new();
@@ -1400,7 +1411,7 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
         ncnt.resize(nsems, 0);
         zcnt.resize(nsems, 0);
         let id = alloc_sem_id();
-        m.insert(
+        state.sets.insert(
             (ipc_ns, id),
             SemSet {
                 key,
@@ -1418,6 +1429,15 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 zcnt,
             },
         );
+        if key as u64 != IPC_PRIVATE {
+            assert!(
+                state.key_ids.insert((ipc_ns, key), id).is_none(),
+                "duplicate SysV semaphore key index"
+            );
+        }
+        let usage = state.usage.entry(ipc_ns).or_default();
+        usage.set_count += 1;
+        usage.sem_count += nsems;
         Ok(id)
     });
     match id {
@@ -1759,19 +1779,14 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
         IPC_INFO | SEM_INFO => {
-            let (set_count, used_sems, max_index) = with_sems(|sets| {
-                sets.iter()
-                    .filter(|((namespace, _), _)| *namespace == ipc_ns)
-                    .fold(
-                        (0usize, 0usize, 0u64),
-                        |(count, used, max_id), ((_, id), set)| {
-                            (
-                                count.saturating_add(1),
-                                used.saturating_add(set.sems.len()),
-                                core::cmp::max(max_id, *id),
-                            )
-                        },
-                    )
+            let (usage, max_index) = with_sem_state(|state| {
+                let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+                let max_index = state
+                    .sets
+                    .range((ipc_ns, 0)..=(ipc_ns, u64::MAX))
+                    .next_back()
+                    .map_or(0, |((_, id), _)| *id);
+                (usage, max_index)
             });
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
             let mut out = [0u8; SEMINFO_SIZE];
@@ -1783,8 +1798,8 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             put_i32(&mut out, 20, SEMOPM as i32);
             put_i32(&mut out, 24, SEMUME);
             if cmd == SEM_INFO {
-                put_i32(&mut out, 28, clamp_i32(set_count));
-                put_i32(&mut out, 36, clamp_i32(used_sems));
+                put_i32(&mut out, 28, clamp_i32(usage.set_count));
+                put_i32(&mut out, 36, clamp_i32(usage.sem_count));
             } else {
                 put_i32(&mut out, 28, SEMUSZ);
                 put_i32(&mut out, 36, SEMVMX);
@@ -1804,7 +1819,32 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 if !ipc_owner(caller_uid, set.uid, set.cuid) {
                     return Err(EPERM);
                 }
-                state.sets.remove(&object);
+                let set = state.sets.remove(&object).ok_or(EINVAL)?;
+                if set.key as u64 != IPC_PRIVATE {
+                    assert_eq!(
+                        state.key_ids.remove(&(ipc_ns, set.key)),
+                        Some(semid),
+                        "SysV semaphore key index diverged"
+                    );
+                }
+                let remove_usage = {
+                    let usage = state
+                        .usage
+                        .get_mut(&ipc_ns)
+                        .expect("SysV semaphore usage missing");
+                    usage.set_count = usage
+                        .set_count
+                        .checked_sub(1)
+                        .expect("SysV semaphore set count underflow");
+                    usage.sem_count = usage
+                        .sem_count
+                        .checked_sub(set.sems.len())
+                        .expect("SysV semaphore member count underflow");
+                    usage.set_count == 0
+                };
+                if remove_usage {
+                    state.usage.remove(&ipc_ns);
+                }
                 state
                     .undos
                     .retain(|((_, namespace, id, _), _)| *namespace != ipc_ns || *id != semid);
@@ -2130,9 +2170,20 @@ struct QueuedMessage {
     payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct MsgUsage {
+    queue_count: usize,
+    message_count: usize,
+    byte_count: usize,
+}
+
 #[derive(Default)]
 struct MsgState {
     queues: BTreeMap<IpcObjectKey, MsgQueue>,
+    /// Per-namespace key lookup; IPC_PRIVATE queues are intentionally absent.
+    key_ids: BTreeMap<IpcLookupKey, u64>,
+    /// Exact per-namespace limit/MSG_INFO counters.
+    usage: BTreeMap<u64, MsgUsage>,
     waits: BTreeMap<u64, IpcWait>,
 }
 
@@ -2182,11 +2233,13 @@ pub(crate) fn __test_set_msg_max_queues(limit: usize) {
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_msg_queue_count() -> usize {
     let ipc_ns = current_ipc_namespace_id();
-    with_msgs(|queues| {
-        queues
-            .keys()
-            .filter(|(namespace, _)| *namespace == ipc_ns)
-            .count()
+    with_msg_state(|state| {
+        state
+            .usage
+            .get(&ipc_ns)
+            .copied()
+            .unwrap_or_default()
+            .queue_count
     })
 }
 
@@ -2198,13 +2251,13 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
     let flg = a.arg1;
     let ipc_ns = current_ipc_namespace_id();
     let (_, uid, gid, groups) = current_identity();
-    let id = with_msgs(|m| {
+    let id = with_msg_state(|state| {
         if key as u64 != IPC_PRIVATE {
-            if let Some(((_, id), q)) = m
-                .iter()
-                .find(|((namespace, _), q)| *namespace == ipc_ns && q.key == key)
-            {
-                let id = *id;
+            if let Some(&id) = state.key_ids.get(&(ipc_ns, key)) {
+                let q = state
+                    .queues
+                    .get(&(ipc_ns, id))
+                    .expect("indexed SysV message queue missing");
                 if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
                     return Err(EEXIST);
                 }
@@ -2224,15 +2277,12 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
                 return Err(ENOENT);
             }
         }
-        if m.keys()
-            .filter(|(namespace, _)| *namespace == ipc_ns)
-            .count()
-            >= msg_max_queues()
-        {
+        let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+        if usage.queue_count >= msg_max_queues() {
             return Err(ENOSPC);
         }
         let id = alloc_msg_id();
-        m.insert(
+        state.queues.insert(
             (ipc_ns, id),
             MsgQueue {
                 key,
@@ -2251,6 +2301,13 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
                 last_recv_pid: 0,
             },
         );
+        if key as u64 != IPC_PRIVATE {
+            assert!(
+                state.key_ids.insert((ipc_ns, key), id).is_none(),
+                "duplicate SysV message key index"
+            );
+        }
+        state.usage.entry(ipc_ns).or_default().queue_count += 1;
         Ok(id)
     });
     match id {
@@ -2382,6 +2439,12 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         q.current_bytes += msgsz;
         q.stime = now_seconds();
         q.last_send_pid = pid;
+        let usage = state
+            .usage
+            .get_mut(&ipc_ns)
+            .expect("SysV message usage missing");
+        usage.message_count += 1;
+        usage.byte_count += msgsz;
         notify_msg_waiters(state, WaitKind::MsgRecv, object);
         Ok(true)
     });
@@ -2520,6 +2583,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                     }
             })
         };
+        let mut removed_bytes = None;
         let selected: Option<(i64, Vec<u8>)> = match idx {
             Some(i) => {
                 let msg = &q.msgs[i];
@@ -2541,10 +2605,25 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                 q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
                 q.rtime = now_seconds();
                 q.last_recv_pid = pid;
+                removed_bytes = Some(msg.payload.len());
                 Some((msg.mtype, msg.payload))
             }
             None => None,
         };
+        if let Some(bytes) = removed_bytes {
+            let usage = state
+                .usage
+                .get_mut(&ipc_ns)
+                .expect("SysV message usage missing");
+            usage.message_count = usage
+                .message_count
+                .checked_sub(1)
+                .expect("SysV message count underflow");
+            usage.byte_count = usage
+                .byte_count
+                .checked_sub(bytes)
+                .expect("SysV message byte count underflow");
+        }
         if selected.is_some() {
             if flg & MSG_COPY == 0 {
                 notify_msg_waiters(state, WaitKind::MsgSend, object);
@@ -2648,28 +2727,21 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
         IPC_INFO | MSG_INFO => {
-            let (queue_count, message_count, byte_count, max_index) = with_msgs(|queues| {
-                let mut queue_count = 0usize;
-                let mut message_count = 0usize;
-                let mut byte_count = 0usize;
-                let mut max_index = 0u64;
-                for ((namespace, id), queue) in queues.iter() {
-                    if *namespace != ipc_ns {
-                        continue;
-                    }
-                    queue_count = queue_count.saturating_add(1);
-                    message_count = message_count.saturating_add(queue.msgs.len());
-                    byte_count = byte_count.saturating_add(queue.current_bytes);
-                    max_index = core::cmp::max(max_index, *id);
-                }
-                (queue_count, message_count, byte_count, max_index)
+            let (usage, max_index) = with_msg_state(|state| {
+                let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+                let max_index = state
+                    .queues
+                    .range((ipc_ns, 0)..=(ipc_ns, u64::MAX))
+                    .next_back()
+                    .map_or(0, |((_, id), _)| *id);
+                (usage, max_index)
             });
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
             let mut out = [0u8; MSGINFO_SIZE];
             if cmd == MSG_INFO {
-                put_i32(&mut out, 0, clamp_i32(queue_count));
-                put_i32(&mut out, 4, clamp_i32(message_count));
-                put_i32(&mut out, 24, clamp_i32(byte_count));
+                put_i32(&mut out, 0, clamp_i32(usage.queue_count));
+                put_i32(&mut out, 4, clamp_i32(usage.message_count));
+                put_i32(&mut out, 24, clamp_i32(usage.byte_count));
             } else {
                 put_i32(&mut out, 0, MSG_POOL_KIB);
                 put_i32(&mut out, 4, MSG_MAP);
@@ -2695,6 +2767,35 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     return Err(EPERM);
                 }
                 let queue = state.queues.remove(&object).ok_or(EINVAL)?;
+                if queue.key as u64 != IPC_PRIVATE {
+                    assert_eq!(
+                        state.key_ids.remove(&(ipc_ns, queue.key)),
+                        Some(msqid),
+                        "SysV message key index diverged"
+                    );
+                }
+                let remove_usage = {
+                    let usage = state
+                        .usage
+                        .get_mut(&ipc_ns)
+                        .expect("SysV message usage missing");
+                    usage.queue_count = usage
+                        .queue_count
+                        .checked_sub(1)
+                        .expect("SysV message queue count underflow");
+                    usage.message_count = usage
+                        .message_count
+                        .checked_sub(queue.msgs.len())
+                        .expect("SysV message count underflow");
+                    usage.byte_count = usage
+                        .byte_count
+                        .checked_sub(queue.current_bytes)
+                        .expect("SysV message byte count underflow");
+                    usage.queue_count == 0
+                };
+                if remove_usage {
+                    state.usage.remove(&ipc_ns);
+                }
                 for wait in state.waits.values_mut() {
                     if wait.kind != WaitKind::Sem && (wait.ipc_ns, wait.id) == object {
                         wait.errno = EIDRM;
@@ -2883,6 +2984,10 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
     with_sem_state(|state| {
         state.sets.retain(|(namespace, _), _| *namespace != ipc_ns);
         state
+            .key_ids
+            .retain(|(namespace, _), _| *namespace != ipc_ns);
+        state.usage.remove(&ipc_ns);
+        state
             .undos
             .retain(|((_, namespace, _, _), _)| *namespace != ipc_ns);
         for wait in &mut state.waits {
@@ -2896,6 +3001,10 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
         state
             .queues
             .retain(|(namespace, _), _| *namespace != ipc_ns);
+        state
+            .key_ids
+            .retain(|(namespace, _), _| *namespace != ipc_ns);
+        state.usage.remove(&ipc_ns);
         for wait in state.waits.values_mut() {
             if wait.ipc_ns == ipc_ns {
                 wait.errno = EIDRM;
