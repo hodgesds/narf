@@ -2080,6 +2080,38 @@ pub mod cow {
         }
     }
 
+    /// Undo speculative retains previously added by [`inc_ref_batch`].
+    ///
+    /// Fork uses this only for the suffix of private frames whose child VMAs
+    /// were never published.  The original owner is therefore still live: a
+    /// count that falls from two to one is removed from the table, restoring
+    /// the implicit sole-owner representation, and no frame is released.
+    /// Duplicate inputs remain distinct retains and are rolled back in full.
+    /// This path allocates nothing and takes each touched shard at most once.
+    pub(crate) fn rollback_inc_ref_batch(frames: &[PhysAddr]) {
+        for (shard, refcounts) in REFCOUNTS.iter().enumerate() {
+            let mut guard = None;
+            for &phys in frames {
+                let key = phys.raw();
+                if key == 0 || ref_shard(key) != shard {
+                    continue;
+                }
+                let g = guard.get_or_insert_with(|| refcounts.map.lock());
+                let map = g
+                    .as_mut()
+                    .expect("speculative COW retain must have a refcount table");
+                let entry = map
+                    .get(&key)
+                    .expect("speculative COW retain must remain registered");
+                let previous = entry.fetch_sub(1, Ordering::AcqRel);
+                assert!(previous > 1, "cannot roll back the original COW owner");
+                if previous == 2 {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
     /// Decrement the refcount on `phys`. Returns the new count
     /// (post-decrement). If `phys` was never `inc_ref`'d, returns
     /// 0 — `free_frame` then returns the frame to the bin

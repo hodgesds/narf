@@ -59,7 +59,7 @@ pub(crate) struct RegionIndex<V> {
     free_len: usize,
     len: usize,
     #[cfg(any(test, feature = "kernel-test"))]
-    fail_next_reserve: bool,
+    fail_reserve_after: usize,
 }
 
 impl<V> Default for RegionIndex<V> {
@@ -77,7 +77,7 @@ impl<V> RegionIndex<V> {
             free_len: 0,
             len: 0,
             #[cfg(any(test, feature = "kernel-test"))]
-            fail_next_reserve: false,
+            fail_reserve_after: 0,
         }
     }
 
@@ -92,8 +92,11 @@ impl<V> RegionIndex<V> {
     /// corresponding `insert_reserved` calls makes the guarantee stable.
     pub(crate) fn try_reserve_nodes(&mut self, additional: usize) -> Result<(), ReserveError> {
         #[cfg(any(test, feature = "kernel-test"))]
-        if additional != 0 && core::mem::take(&mut self.fail_next_reserve) {
-            return Err(ReserveError);
+        if additional != 0 && self.fail_reserve_after != 0 {
+            self.fail_reserve_after -= 1;
+            if self.fail_reserve_after == 0 {
+                return Err(ReserveError);
+            }
         }
 
         let new_slots = additional.saturating_sub(self.free_len);
@@ -105,7 +108,14 @@ impl<V> RegionIndex<V> {
     #[cfg(any(test, feature = "kernel-test"))]
     #[allow(dead_code)]
     pub(crate) fn fail_next_reserve_for_test(&mut self) {
-        self.fail_next_reserve = true;
+        self.fail_reserve_after = 1;
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    #[allow(dead_code)]
+    pub(crate) fn fail_reserve_after_for_test(&mut self, calls: usize) {
+        assert!(calls != 0);
+        self.fail_reserve_after = calls;
     }
 
     #[inline]

@@ -836,8 +836,14 @@ x86_64 is rejected at runtime.
   while the parent region transaction is held. The batch groups frames by
   refcount shard, locks each touched shard once, and increments once per input
   occurrence; unbacked zero sentinels and externally owned SHARED mappings are
-  excluded. Multi-page materialization and parent permission rewriting snapshot
-  COW counts by shard while holding the relevant address-space region lock. A
+  excluded. Child VMA publication transfers those retains in prefix order. If
+  a later child index reservation fails, partial-child teardown releases the
+  published prefix and an allocation-free rollback removes only the unpublished
+  suffix, including restoration of the implicit sole-owner representation.
+  The shared-owner transaction is released after regular child publication and
+  before private huge-page allocation or copying. Multi-page materialization
+  and parent permission rewriting snapshot COW counts by shard while holding
+  the relevant address-space region lock. A
   concurrent last-owner decrement may conservatively leave a leaf read-only;
   a sole-owner frame cannot become newly shared without that same region
   transaction, so the snapshot cannot incorrectly grant WRITE to shared

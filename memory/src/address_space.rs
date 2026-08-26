@@ -63,6 +63,9 @@ static FAIL_SHARED_RELOCATION_AFTER_INSTALL: core::sync::atomic::AtomicBool =
 static FAIL_FIXED_RELOCATION_AFTER_SHRINK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "kernel-test")]
+static FAIL_FORK_CHILD_REGION_RESERVE_AFTER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "kernel-test")]
 pub(crate) fn __test_fail_next_shared_alias_after_install() {
     FAIL_SHARED_ALIAS_AFTER_INSTALL.store(true, core::sync::atomic::Ordering::Release);
 }
@@ -73,6 +76,11 @@ pub(crate) fn __test_fail_next_shared_relocation_after_install() {
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_fail_next_fixed_relocation_after_shrink() {
     FAIL_FIXED_RELOCATION_AFTER_SHRINK.store(true, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_fail_fork_child_region_reserve_after(calls: usize) {
+    assert!(calls != 0);
+    FAIL_FORK_CHILD_REGION_RESERVE_AFTER.store(calls, core::sync::atomic::Ordering::Release);
 }
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_unmap_path_counts() -> (usize, usize) {
@@ -8785,6 +8793,18 @@ impl AddressSpace {
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         // SAFETY: caller's contract — paging is live.
         let child = unsafe { Self::new_for_user() }?;
+        #[cfg(feature = "kernel-test")]
+        {
+            let fail_after =
+                FAIL_FORK_CHILD_REGION_RESERVE_AFTER.swap(0, core::sync::atomic::Ordering::AcqRel);
+            if fail_after != 0 {
+                child
+                    .regions
+                    .lock()
+                    .by_base
+                    .fail_reserve_after_for_test(fail_after);
+            }
+        }
         // Linearize the parent topology snapshot before taking the shared-
         // owner transaction. The child is not scheduler-visible during
         // construction. Release the VMA transaction once both regular and
@@ -8796,8 +8816,24 @@ impl AddressSpace {
         // Mark every private region as potentially COW-shared. Keep its POSIX
         // WRITE permission authoritative; the PTE derivation consults this
         // marker plus each frame's refcount to force only shared pages RO.
-        // Snapshot the resulting region list to clone into the child.
-        let parent_regions: Vec<Region> = {
+        // Complete the huge metadata snapshot before publishing any base-page
+        // COW retain. Huge backing itself remains parent-owned and is copied
+        // eagerly below.
+        let parent_huge: Vec<HugeRegion> = self
+            .huge_regions
+            .lock()
+            .iter()
+            .map(|region| HugeRegion {
+                base: region.base,
+                len: region.len,
+                perms: region.perms,
+                size: region.size,
+                frames: region.frames.clone(),
+            })
+            .collect();
+        // Snapshot the resulting region list and retain exactly the private
+        // resident backing that the child will own.
+        let (parent_regions, cow_frames): (Vec<Region>, Vec<PhysAddr>) = {
             let mut g = self.regions.lock();
             if !g.swap_pages.is_empty() {
                 // Swap slots are single-owner today. Cloning phys=0 would
@@ -8842,32 +8878,40 @@ impl AddressSpace {
                 .flat_map(|region| region.phys.iter().copied())
                 .filter(|phys| phys.raw() != 0)
                 .collect();
+            let parent_regions = g.snapshot();
             crate::frame::cow::inc_ref_batch(&cow_frames);
-            g.snapshot()
+            (parent_regions, cow_frames)
         };
-        let parent_huge: Vec<HugeRegion> = self
-            .huge_regions
-            .lock()
-            .iter()
-            .map(|region| HugeRegion {
-                base: region.base,
-                len: region.len,
-                perms: region.perms,
-                size: region.size,
-                frames: region.frames.clone(),
-            })
-            .collect();
         drop(vma_guard);
 
         // The child's regions are a deep clone of the parent's
         // (post-mark) — same vaddr base, phys list, and logical permissions.
+        let mut published_cow_frames = 0usize;
         for mut r in parent_regions.into_iter() {
+            let region_cow_frames = if r.perms.contains(RegionPerms::SHARED) {
+                0
+            } else {
+                r.phys.iter().filter(|phys| phys.raw() != 0).count()
+            };
             // Linux fork clears VM_LOCKED_MASK in the child. The parent keeps
             // both its current locks and its future default; a CLONE_VM thread
             // shares this same AddressSpace instead of taking this path.
             r.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
-            child.map_region_inner(r, None, None)?;
+            if let Err(error) = child.map_region_inner(r, None, None) {
+                // Child Drop owns and balances the published prefix. Restore
+                // only the suffix which never acquired a child VMA; rolling
+                // back the prefix here would double-decrement live backing.
+                crate::frame::cow::rollback_inc_ref_batch(&cow_frames[published_cow_frames..]);
+                return Err(error);
+            }
+            published_cow_frames += region_cow_frames;
         }
+        debug_assert_eq!(published_cow_frames, cow_frames.len());
+        // All externally-owned regular aliases are now retained by the child.
+        // Huge allocations and multi-megabyte copies below neither consult nor
+        // publish shared-owner state and must not run with this global IRQ-safe
+        // transaction held.
+        drop(_shared_guard);
 
         // Private hugetlb mappings are copied eagerly. The hugepage pool has
         // no sub-page COW metadata, so sharing a writable hardware block leaf

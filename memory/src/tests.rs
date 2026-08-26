@@ -3922,6 +3922,128 @@ fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_cow_refcount_batch_retains_each_owner);
 
+/// A failed fork owns only the child VMAs it actually published. If a later
+/// child index insertion runs out of metadata, speculative COW retains for the
+/// unpublished suffix must be undone while the partial child's Drop balances
+/// the published prefix. Existing siblings must keep their exact ownership.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
+    use crate::address_space::__test_fail_fork_child_region_reserve_after;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+
+    cow::__test_clear();
+    // SAFETY: paging is live in the kernel-test harness and this test owns the
+    // fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("fork rollback parent root unavailable"),
+    };
+    let first = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("fork rollback first frame unavailable"),
+    };
+    let second = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            frame::free_frame(first);
+            return TestResult::Skip("fork rollback second frame unavailable");
+        }
+    };
+    let first_phys = first.start_address();
+    let second_phys = second.start_address();
+    let first_base = VirtAddr::new(0x0000_0080_3a00_0000);
+    let second_base = VirtAddr::new(0x0000_0080_3a00_2000);
+    if parent
+        .map_region(Region {
+            base: first_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![first_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(first);
+        frame::free_frame(second);
+        return TestResult::Fail("fork rollback first VMA setup failed");
+    }
+    if parent
+        .map_region(Region {
+            base: second_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![second_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(second);
+        return TestResult::Fail("fork rollback second VMA setup failed");
+    }
+
+    __test_fail_fork_child_region_reserve_after(2);
+    // SAFETY: the inactive parent is exclusively owned; the injected failure
+    // occurs during child metadata publication before scheduler visibility.
+    let first_failure = unsafe { parent.clone_for_fork() };
+    if !matches!(first_failure, Err(AddressSpaceError::AllocationFailed)) {
+        return TestResult::Fail("fork index failure did not surface AllocationFailed");
+    }
+    let parent_intact = parent.lookup(first_base).is_some_and(|region| {
+        region.phys == alloc::vec![first_phys]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    }) && parent.lookup(second_base).is_some_and(|region| {
+        region.phys == alloc::vec![second_phys]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !parent_intact || cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("failed fork leaked a child COW owner or changed the parent");
+    }
+
+    // Establish one real sibling, then repeat the same partial failure. Both
+    // backing counts must return exactly to the two live owners; this catches
+    // both a leaked suffix and an accidental rollback of the published prefix.
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let sibling = match unsafe { parent.clone_for_fork() } {
+        Ok(sibling) => sibling,
+        Err(_) => return TestResult::Fail("fork rollback sibling setup failed"),
+    };
+    if cow::count(first_phys) != 2 || cow::count(second_phys) != 2 {
+        return TestResult::Fail("successful sibling did not own both COW frames");
+    }
+    __test_fail_fork_child_region_reserve_after(2);
+    // SAFETY: same injected, unpublished-child contract as the first failure.
+    let second_failure = unsafe { parent.clone_for_fork() };
+    if !matches!(second_failure, Err(AddressSpaceError::AllocationFailed))
+        || cow::count(first_phys) != 2
+        || cow::count(second_phys) != 2
+    {
+        return TestResult::Fail("failed fork changed pre-existing sibling ownership");
+    }
+
+    drop(sibling);
+    if cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("sibling teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(first_phys) == 0 && cow::count(second_phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left failed-fork COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_failed_fork_rolls_back_unpublished_cow_refs
+);
+
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same
@@ -12858,6 +12980,10 @@ kernel_test_in!(
 fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
     use crate::{AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, VirtAddr};
 
+    // This test asserts exact global reverse-map owner counts. Isolate those
+    // counts from deliberately retained mappings in earlier memory smokes.
+    crate::rmap::__reset_for_test();
+
     #[cfg(target_arch = "x86_64")]
     unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
         // SAFETY: caller supplies this test's live, exclusively-owned root.
@@ -12929,15 +13055,20 @@ fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
             unsafe { translated(&address_space, VirtAddr::new(source.as_u64() + 0x1000)) };
         // SAFETY: same live-root proof after rollback.
         let rolled_back = unsafe { translated(&address_space, rollback_destination) };
-        if injected != Err(crate::AddressSpaceError::AllocationFailed)
-            || source_first != Some(first)
-            || source_second != Some(second)
-            || rolled_back.is_some()
-            || crate::rmap::owner_count(first) != 1
-            || crate::rmap::owner_count(second) != 1
-            || address_space.lookup(rollback_destination).is_some()
-        {
-            return TestResult::Fail("shared relocation post-install rollback leaked state");
+        if injected != Err(crate::AddressSpaceError::AllocationFailed) {
+            return TestResult::Fail("shared relocation injection returned the wrong error");
+        }
+        if source_first != Some(first) || source_second != Some(second) {
+            return TestResult::Fail("shared relocation rollback changed source translations");
+        }
+        if rolled_back.is_some() {
+            return TestResult::Fail("shared relocation rollback left a destination translation");
+        }
+        if crate::rmap::owner_count(first) != 1 || crate::rmap::owner_count(second) != 1 {
+            return TestResult::Fail("shared relocation rollback changed reverse-map ownership");
+        }
+        if address_space.lookup(rollback_destination).is_some() {
+            return TestResult::Fail("shared relocation rollback left destination metadata");
         }
     }
 
