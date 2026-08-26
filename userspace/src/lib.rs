@@ -31,6 +31,7 @@
 //! above. The shapes here will drive those implementations.
 
 #![no_std]
+#![feature(allocator_api)]
 #![feature(generic_const_exprs)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]

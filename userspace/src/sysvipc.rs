@@ -14,10 +14,11 @@
 //! line in `lib.rs`.
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 #[cfg(feature = "kernel-test")]
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -528,18 +529,53 @@ struct IpcWait {
     /// registration without a polling deadline.
     ready: bool,
     /// The task's current scheduler waker. Replaced on repeated polls and
-    /// always fired after dropping the message-state lock.
+    /// always fired after dropping the owning queue's lock.
     waker: Option<Waker>,
     data: WaitData,
 }
 
-fn with_waits<R>(f: impl FnOnce(&mut BTreeMap<u64, IpcWait>) -> R) -> R {
-    with_msg_state(|state| f(&mut state.waits))
+fn with_msg_wait_queues<R>(task: u64, f: impl FnOnce(&mut BTreeMap<u64, MsgQueueRef>) -> R) -> R {
+    let mut queues = MSG_WAIT_QUEUES[task as usize % MSG_WAIT_SHARDS].lock();
+    f(queues.get_or_insert_with(BTreeMap::new))
+}
+
+fn msg_wait_queue(task: u64) -> Option<MsgQueueRef> {
+    with_msg_wait_queues(task, |queues| queues.get(&task).cloned())
+}
+
+fn index_msg_wait(task: u64, queue: &MsgQueueRef) {
+    with_msg_wait_queues(task, |queues| match queues.entry(task) {
+        alloc::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(queue));
+        }
+        alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+            assert!(
+                Arc::ptr_eq(entry.get(), queue),
+                "SysV message wait changed queues while linked"
+            );
+            entry.insert(Arc::clone(queue));
+        }
+    });
+}
+
+fn unindex_msg_wait(task: u64, queue: &MsgQueueRef) {
+    with_msg_wait_queues(task, |queues| {
+        if queues
+            .get(&task)
+            .is_some_and(|indexed| Arc::ptr_eq(indexed, queue))
+        {
+            queues.remove(&task);
+        }
+    });
 }
 
 fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
-    with_waits(|waits| {
-        waits.entry(task).or_insert_with(|| IpcWait {
+    let Some(queue) = lookup_msg_queue((ipc_ns, id)) else {
+        return;
+    };
+    {
+        let mut q = queue.lock();
+        q.waits.entry(task).or_insert_with(|| IpcWait {
             kind,
             ipc_ns,
             id,
@@ -548,12 +584,17 @@ fn begin_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
             waker: None,
             data: WaitData::None,
         });
-    });
+        index_msg_wait(task, &queue);
+    }
 }
 
 fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec<u8>, msgflg: u64) {
-    with_waits(|waits| {
-        waits.entry(task).or_insert_with(|| IpcWait {
+    let Some(queue) = lookup_msg_queue((ipc_ns, id)) else {
+        return;
+    };
+    {
+        let mut q = queue.lock();
+        q.waits.entry(task).or_insert_with(|| IpcWait {
             kind: WaitKind::MsgSend,
             ipc_ns,
             id,
@@ -566,7 +607,8 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
                 msgflg,
             },
         });
-    });
+        index_msg_wait(task, &queue);
+    }
 }
 
 fn copy_staged_sem_wait(
@@ -592,38 +634,45 @@ enum MsgSendResume {
 }
 
 fn take_msg_send_resume(task: u64, ipc_ns: u64, id: u64) -> MsgSendResume {
-    let (resume, removed) = with_waits(|waits| {
-        let Some(wait) = waits.get(&task) else {
-            return (MsgSendResume::Fresh, None);
+    let Some(queue) = msg_wait_queue(task) else {
+        return MsgSendResume::Fresh;
+    };
+    let (resume, removed) = {
+        let mut q = queue.lock();
+        let Some(wait) = q.waits.get(&task) else {
+            return MsgSendResume::Fresh;
         };
         if wait.kind != WaitKind::MsgSend || wait.ipc_ns != ipc_ns || wait.id != id {
-            return (MsgSendResume::Fresh, waits.remove(&task));
-        }
-        if wait.errno != 0 {
+            (MsgSendResume::Fresh, q.waits.remove(&task))
+        } else if wait.errno != 0 {
             let errno = wait.errno;
-            return (MsgSendResume::Error(errno), waits.remove(&task));
+            (MsgSendResume::Error(errno), q.waits.remove(&task))
+        } else {
+            let wait = q.waits.get_mut(&task).expect("checked SysV sender missing");
+            wait.ready = false;
+            let WaitData::MsgSend {
+                mtype,
+                payload,
+                msgflg,
+            } = &mut wait.data
+            else {
+                panic!("staged SysV sender lost its payload state");
+            };
+            (
+                MsgSendResume::Staged(
+                    *mtype,
+                    payload
+                        .take()
+                        .expect("staged SysV sender payload already taken"),
+                    *msgflg,
+                ),
+                None,
+            )
         }
-        let wait = waits.get_mut(&task).expect("checked SysV sender missing");
-        wait.ready = false;
-        let WaitData::MsgSend {
-            mtype,
-            payload,
-            msgflg,
-        } = &mut wait.data
-        else {
-            panic!("staged SysV sender lost its payload state");
-        };
-        (
-            MsgSendResume::Staged(
-                *mtype,
-                payload
-                    .take()
-                    .expect("staged SysV sender payload already taken"),
-                *msgflg,
-            ),
-            None,
-        )
-    });
+    };
+    if removed.is_some() {
+        unindex_msg_wait(task, &queue);
+    }
     // A stale or terminal wait can own a waker/payload whose drop reaches
     // scheduler or allocator state; release it after restoring IRQ state.
     drop(removed);
@@ -632,7 +681,8 @@ fn take_msg_send_resume(task: u64, ipc_ns: u64, id: u64) -> MsgSendResume {
 
 #[allow(clippy::too_many_arguments)] // One complete retained msgsnd operation.
 fn restore_msg_send_wait(
-    state: &mut MsgState,
+    queue_ref: &MsgQueueRef,
+    queue: &mut MsgQueue,
     task: u64,
     ipc_ns: u64,
     id: u64,
@@ -640,7 +690,7 @@ fn restore_msg_send_wait(
     payload: Vec<u8>,
     msgflg: u64,
 ) {
-    match state.waits.entry(task) {
+    match queue.waits.entry(task) {
         alloc::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(IpcWait {
                 kind: WaitKind::MsgSend,
@@ -682,6 +732,7 @@ fn restore_msg_send_wait(
             );
         }
     }
+    index_msg_wait(task, queue_ref);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -695,35 +746,40 @@ pub(crate) enum MsgParkState {
 /// queue transition or terminal error that won before registration is returned
 /// as `Ready`, so the caller re-executes instead of sleeping for a timer poll.
 pub(crate) fn register_msg_wait_waker(task: u64, waker: Waker) -> MsgParkState {
+    let Some(queue) = msg_wait_queue(task) else {
+        return MsgParkState::NotWaiting;
+    };
     let mut incoming = Some(waker);
-    let (state, replaced) = with_waits(|waits| match waits.get_mut(&task) {
-        Some(wait) if wait.errno != 0 || wait.ready => (MsgParkState::Ready, None),
-        Some(wait) => {
-            if wait
-                .waker
-                .as_ref()
-                .is_some_and(|old| old.will_wake(incoming.as_ref().expect("incoming waker")))
-            {
-                (MsgParkState::Pending, None)
-            } else {
-                (
-                    MsgParkState::Pending,
-                    core::mem::replace(&mut wait.waker, incoming.take()),
-                )
+    let (state, replaced) =
+        {
+            let mut q = queue.lock();
+            match q.waits.get_mut(&task) {
+                Some(wait) if wait.errno != 0 || wait.ready => (MsgParkState::Ready, None),
+                Some(wait) => {
+                    if wait.waker.as_ref().is_some_and(|old| {
+                        old.will_wake(incoming.as_ref().expect("incoming waker"))
+                    }) {
+                        (MsgParkState::Pending, None)
+                    } else {
+                        (
+                            MsgParkState::Pending,
+                            core::mem::replace(&mut wait.waker, incoming.take()),
+                        )
+                    }
+                }
+                None => (MsgParkState::NotWaiting, None),
             }
-        }
-        None => (MsgParkState::NotWaiting, None),
-    });
+        };
     // Waker drops may release the final scheduler Arc; never do so under the
-    // IRQ-safe message-state lock.
+    // IRQ-safe per-queue lock.
     drop(replaced);
     drop(incoming);
     state
 }
 
-fn notify_msg_waiters(state: &mut MsgState, kind: WaitKind, object: IpcObjectKey) {
-    for wait in state.waits.values_mut() {
-        if wait.kind == kind && (wait.ipc_ns, wait.id) == object && wait.errno == 0 {
+fn notify_msg_waiters(queue: &mut MsgQueue, kind: WaitKind) {
+    for wait in queue.waits.values_mut() {
+        if wait.kind == kind && wait.errno == 0 {
             wait.ready = true;
         }
     }
@@ -733,13 +789,16 @@ fn notify_msg_waiters(state: &mut MsgState, kind: WaitKind, object: IpcObjectKey
 /// race against IPC_RMID.  The queue and terminal wait record live under the
 /// same lock, so checking both in one transaction preserves EIDRM even when
 /// removal occurs after the syscall's initial fast-path error check.
-fn missing_msg_queue_errno(
-    state: &MsgState,
-    task: u64,
-    kind: WaitKind,
-    object: IpcObjectKey,
-) -> i64 {
-    state
+fn missing_msg_queue_errno(task: u64, kind: WaitKind, object: IpcObjectKey) -> i64 {
+    let Some(queue) = msg_wait_queue(task) else {
+        return EINVAL;
+    };
+    let q = queue.lock();
+    msg_queue_errno(&q, task, kind, object)
+}
+
+fn msg_queue_errno(queue: &MsgQueue, task: u64, kind: WaitKind, object: IpcObjectKey) -> i64 {
+    queue
         .waits
         .get(&task)
         .filter(|wait| wait.kind == kind && (wait.ipc_ns, wait.id) == object && wait.errno != 0)
@@ -748,53 +807,87 @@ fn missing_msg_queue_errno(
 
 /// Fire all message wakers whose condition changed. Taking one waker per lock
 /// acquisition keeps wake/drop paths outside the IRQ-disabled critical section
-/// without allocating a temporary wake vector.
-fn drain_msg_wakes() {
+/// without allocating a temporary wake vector. The monotonic task-id cursor
+/// also avoids rescanning the map prefix for every waker.
+fn drain_msg_wakes(queue: &MsgQueueRef) {
+    let mut after = None;
     loop {
-        let waker = with_waits(|waits| {
-            waits
-                .values_mut()
-                .find(|wait| {
-                    wait.kind != WaitKind::Sem
-                        && (wait.errno != 0 || wait.ready)
-                        && wait.waker.is_some()
-                })
-                .and_then(|wait| wait.waker.take())
-        });
-        match waker {
-            Some(waker) => waker.wake(),
+        let next = {
+            let mut q = queue.lock();
+            let ready = |(_, wait): &(&u64, &mut IpcWait)| {
+                (wait.errno != 0 || wait.ready) && wait.waker.is_some()
+            };
+            match after {
+                Some(task) => q
+                    .waits
+                    .range_mut((
+                        core::ops::Bound::Excluded(task),
+                        core::ops::Bound::Unbounded,
+                    ))
+                    .find(ready),
+                None => q.waits.iter_mut().find(ready),
+            }
+            .map(|(&task, wait)| {
+                (
+                    task,
+                    wait.waker.take().expect("selected SysV message waker"),
+                )
+            })
+        };
+        match next {
+            Some((task, waker)) => {
+                after = Some(task);
+                waker.wake();
+            }
             None => break,
         }
     }
 }
 
 fn clear_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
-    let removed = with_waits(|waits| {
-        if waits
+    let Some(queue) = msg_wait_queue(task) else {
+        return;
+    };
+    let removed = {
+        let mut q = queue.lock();
+        if q.waits
             .get(&task)
             .is_some_and(|wait| wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id)
         {
-            waits.remove(&task)
+            q.waits.remove(&task)
         } else {
             None
         }
-    });
+    };
+    if removed.is_some() {
+        unindex_msg_wait(task, &queue);
+    }
     drop(removed);
 }
 
 fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i64> {
-    let (errno, removed) = with_waits(|waits| match waits.get(&task) {
-        Some(wait)
-            if wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id && wait.errno != 0 =>
-        {
-            let errno = wait.errno;
-            (Some(errno), waits.remove(&task))
+    let queue = msg_wait_queue(task)?;
+    let (errno, removed) = {
+        let mut q = queue.lock();
+        match q.waits.get(&task) {
+            Some(wait)
+                if wait.kind == kind
+                    && wait.ipc_ns == ipc_ns
+                    && wait.id == id
+                    && wait.errno != 0 =>
+            {
+                let errno = wait.errno;
+                (Some(errno), q.waits.remove(&task))
+            }
+            Some(wait) if wait.kind != kind || wait.ipc_ns != ipc_ns || wait.id != id => {
+                (None, q.waits.remove(&task))
+            }
+            _ => (None, None),
         }
-        Some(wait) if wait.kind != kind || wait.ipc_ns != ipc_ns || wait.id != id => {
-            (None, waits.remove(&task))
-        }
-        _ => (None, None),
-    });
+    };
+    if removed.is_some() {
+        unindex_msg_wait(task, &queue);
+    }
     drop(removed);
     errno
 }
@@ -804,15 +897,19 @@ fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i6
 /// signal after wakeup; whichever state mutation acquires this lock first is
 /// therefore the observable winner (`EIDRM` or `EINTR`).
 fn finish_interrupted_msg_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i64> {
-    let (result, removed) = with_waits(|waits| {
-        let wait = waits.get(&task)?;
+    let queue = msg_wait_queue(task)?;
+    let (result, removed) = {
+        let mut q = queue.lock();
+        let wait = q.waits.get(&task)?;
         if wait.kind != kind || wait.ipc_ns != ipc_ns || wait.id != id {
             return None;
         }
         let result = if wait.errno != 0 { wait.errno } else { EINTR };
-        Some((result, waits.remove(&task)))
-    })
-    .map_or((None, None), |(result, removed)| (Some(result), removed));
+        (Some(result), q.waits.remove(&task))
+    };
+    if removed.is_some() {
+        unindex_msg_wait(task, &queue);
+    }
     drop(removed);
     result
 }
@@ -899,9 +996,13 @@ pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
     else {
         return false;
     };
-    with_msg_state(|state| {
-        restore_msg_send_wait(state, task, ipc_ns, id, mtype, payload, msgflg);
-    });
+    let Some(queue) = msg_wait_queue(task) else {
+        return false;
+    };
+    {
+        let mut q = queue.lock();
+        restore_msg_send_wait(&queue, &mut q, task, ipc_ns, id, mtype, payload, msgflg);
+    }
     true
 }
 
@@ -916,8 +1017,11 @@ fn ensure_sem_undo_observer() {
 }
 
 fn ipc_thread_exit(_pid: u64, tid: u64) {
-    let removed = with_waits(|waits| waits.remove(&tid));
-    drop(removed);
+    if let Some(queue) = msg_wait_queue(tid) {
+        let removed = queue.lock().waits.remove(&tid);
+        unindex_msg_wait(tid, &queue);
+        drop(removed);
+    }
     with_sem_state(|state| unlink_sem_wait(state, tid));
 }
 
@@ -2250,6 +2354,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
 // ════════════════════════════════════════════════════════════════════
 
 struct MsgQueue {
+    removed: bool,
     key: u32,
     msgs: VecDeque<QueuedMessage>,
     uid: u32,
@@ -2266,32 +2371,97 @@ struct MsgQueue {
     last_send_pid: u64,
     /// Outer PID retained for translation into each observer's PID namespace.
     last_recv_pid: u64,
+    /// Blocked operations belong to the queue whose condition they observe.
+    /// Keeping them under the same per-queue lock closes check-to-park and
+    /// IPC_RMID races without serializing unrelated queues.
+    waits: BTreeMap<u64, IpcWait>,
+    counters: Arc<MsgNamespaceCounters>,
 }
+
+type MsgQueueRef = Arc<IrqSafeSpinLock<MsgQueue>>;
 
 struct QueuedMessage {
     mtype: i64,
     payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct MsgCounterCell {
+    message_count: AtomicIsize,
+    byte_count: AtomicIsize,
+}
+
+struct MsgNamespaceCounters {
+    cells: [MsgCounterCell; narf_lib::percpu::MAX_CPUS],
+}
+
+impl MsgNamespaceCounters {
+    fn new() -> Self {
+        Self {
+            cells: core::array::from_fn(|_| MsgCounterCell {
+                message_count: AtomicIsize::new(0),
+                byte_count: AtomicIsize::new(0),
+            }),
+        }
+    }
+
+    fn add_message(&self, bytes: usize) {
+        let cpu = narf_lib::percpu::current_cpu();
+        self.cells[cpu]
+            .message_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.cells[cpu]
+            .byte_count
+            .fetch_add(bytes as isize, Ordering::Relaxed);
+    }
+
+    fn remove_messages(&self, messages: usize, bytes: usize) {
+        let cpu = narf_lib::percpu::current_cpu();
+        self.cells[cpu]
+            .message_count
+            .fetch_sub(messages as isize, Ordering::Relaxed);
+        self.cells[cpu]
+            .byte_count
+            .fetch_sub(bytes as isize, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        (
+            self.cells
+                .iter()
+                .map(|cell| cell.message_count.load(Ordering::Relaxed))
+                .sum::<isize>()
+                .max(0) as usize,
+            self.cells
+                .iter()
+                .map(|cell| cell.byte_count.load(Ordering::Relaxed))
+                .sum::<isize>()
+                .max(0) as usize,
+        )
+    }
+}
+
 struct MsgUsage {
     queue_count: usize,
-    message_count: usize,
-    byte_count: usize,
+    counters: Arc<MsgNamespaceCounters>,
 }
 
 #[derive(Default)]
 struct MsgState {
-    queues: BTreeMap<IpcObjectKey, MsgQueue>,
+    queues: BTreeMap<IpcObjectKey, MsgQueueRef>,
     ids: BTreeMap<u64, IpcIdTable>,
     /// Per-namespace key lookup; IPC_PRIVATE queues are intentionally absent.
     key_ids: BTreeMap<IpcLookupKey, u64>,
     /// Exact per-namespace limit/MSG_INFO counters.
     usage: BTreeMap<u64, MsgUsage>,
-    waits: BTreeMap<u64, IpcWait>,
 }
 
 static MSG_STATE: IrqSafeSpinLock<Option<MsgState>> = IrqSafeSpinLock::new(None);
+/// Task-to-queue index for the scheduler's waker registration path. Only
+/// blocked operations touch this lock; successful queue traffic does not.
+const MSG_WAIT_SHARDS: usize = 64;
+static MSG_WAIT_QUEUES: [IrqSafeSpinLock<Option<BTreeMap<u64, MsgQueueRef>>>; MSG_WAIT_SHARDS] =
+    [const { IrqSafeSpinLock::new(None) }; MSG_WAIT_SHARDS];
 const MSG_MAX_BYTES: usize = 8192;
 const MSG_DEFAULT_QUEUE_BYTES: usize = 16384;
 const MSG_MAX_QUEUES: usize = 32_000;
@@ -2323,8 +2493,8 @@ fn with_msg_state<R>(f: impl FnOnce(&mut MsgState) -> R) -> R {
     f(state.get_or_insert_with(MsgState::default))
 }
 
-fn with_msgs<R>(f: impl FnOnce(&mut BTreeMap<IpcObjectKey, MsgQueue>) -> R) -> R {
-    with_msg_state(|state| f(&mut state.queues))
+fn lookup_msg_queue(object: IpcObjectKey) -> Option<MsgQueueRef> {
+    with_msg_state(|state| state.queues.get(&object).cloned())
 }
 
 #[cfg(feature = "kernel-test")]
@@ -2339,10 +2509,25 @@ pub(crate) fn __test_msg_queue_count() -> usize {
         state
             .usage
             .get(&ipc_ns)
-            .copied()
-            .unwrap_or_default()
-            .queue_count
+            .map_or(0, |usage| usage.queue_count)
     })
+}
+
+/// Prove two registry entries own distinct, independently acquirable object
+/// locks. Both references are resolved before either object lock is taken, so
+/// the test follows the production registry-before-object lock hierarchy.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_msg_queues_lock_independently(first: u64, second: u64) -> Option<bool> {
+    let ipc_ns = current_ipc_namespace_id();
+    let (first, second) = with_msg_state(|state| {
+        Some((
+            state.queues.get(&(ipc_ns, first))?.clone(),
+            state.queues.get(&(ipc_ns, second))?.clone(),
+        ))
+    })?;
+    let _first_guard = first.lock();
+    let independent = second.try_lock().is_some();
+    Some(independent)
 }
 
 /// `msgget(key, msgflg)`.
@@ -2356,10 +2541,11 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
     let id = with_msg_state(|state| {
         if key as u64 != IPC_PRIVATE {
             if let Some(&id) = state.key_ids.get(&(ipc_ns, key)) {
-                let q = state
+                let queue = state
                     .queues
                     .get(&(ipc_ns, id))
                     .expect("indexed SysV message queue missing");
+                let q = queue.lock();
                 if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
                     return Err(EEXIST);
                 }
@@ -2379,41 +2565,64 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
                 return Err(ENOENT);
             }
         }
-        let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
-        if usage.queue_count >= msg_max_queues() {
+        if state
+            .usage
+            .get(&ipc_ns)
+            .is_some_and(|usage| usage.queue_count >= msg_max_queues())
+        {
             return Err(ENOSPC);
         }
+        // Allocate the comparatively large per-CPU counter block and queue
+        // object before reserving an ID or publishing any registry indexes.
+        // Linux likewise allocates the queue before ipc_addid(); allocation
+        // failure must return ENOMEM without leaving a half-created object.
+        let counters = match state.usage.get(&ipc_ns) {
+            Some(usage) => Arc::clone(&usage.counters),
+            None => Arc::try_new(MsgNamespaceCounters::new()).map_err(|_| ENOMEM)?,
+        };
+        let queue = Arc::try_new(IrqSafeSpinLock::new(MsgQueue {
+            removed: false,
+            key,
+            msgs: VecDeque::new(),
+            uid,
+            gid,
+            cuid: uid,
+            cgid: gid,
+            mode: (flg as u32) & IPC_PERM_MASK,
+            stime: 0,
+            rtime: 0,
+            ctime: now_seconds(),
+            current_bytes: 0,
+            max_bytes: MSG_DEFAULT_QUEUE_BYTES,
+            last_send_pid: 0,
+            last_recv_pid: 0,
+            waits: BTreeMap::new(),
+            counters: Arc::clone(&counters),
+        }))
+        .map_err(|_| ENOMEM)?;
         let id = state
             .ids
             .entry(ipc_ns)
             .or_default()
             .allocate(msg_max_queues())?;
-        state.queues.insert(
-            (ipc_ns, id),
-            MsgQueue {
-                key,
-                msgs: VecDeque::new(),
-                uid,
-                gid,
-                cuid: uid,
-                cgid: gid,
-                mode: (flg as u32) & IPC_PERM_MASK,
-                stime: 0,
-                rtime: 0,
-                ctime: now_seconds(),
-                current_bytes: 0,
-                max_bytes: MSG_DEFAULT_QUEUE_BYTES,
-                last_send_pid: 0,
-                last_recv_pid: 0,
-            },
-        );
+        state.queues.insert((ipc_ns, id), queue);
         if key as u64 != IPC_PRIVATE {
             assert!(
                 state.key_ids.insert((ipc_ns, key), id).is_none(),
                 "duplicate SysV message key index"
             );
         }
-        state.usage.entry(ipc_ns).or_default().queue_count += 1;
+        match state.usage.entry(ipc_ns) {
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(MsgUsage {
+                    queue_count: 1,
+                    counters,
+                });
+            }
+            alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().queue_count += 1;
+            }
+        }
         Ok(id)
     });
     match id {
@@ -2491,75 +2700,70 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
     };
     let msgsz = payload.len();
     let mut pending_payload = Some(payload);
-    let r: Result<bool, i64> = with_msg_state(|state| {
-        let fits = {
-            let Some(q) = state.queues.get_mut(&object) else {
-                return Err(missing_msg_queue_errno(
-                    state,
-                    task,
-                    WaitKind::MsgSend,
-                    object,
-                ));
-            };
-            if !ipc_allowed(
-                caller_uid,
-                caller_gid,
-                &caller_groups,
-                q.uid,
-                q.gid,
-                q.cuid,
-                q.cgid,
-                q.mode,
-                0o2,
-            ) {
-                return Err(EACCES);
-            }
-            msgsz.saturating_add(q.current_bytes) <= q.max_bytes
-                && q.msgs.len().saturating_add(1) <= q.max_bytes
-        };
-        if !fits {
-            if msgflg & IPC_NOWAIT as u64 == 0 {
-                restore_msg_send_wait(
-                    state,
-                    task,
-                    ipc_ns,
-                    msqid,
+    let Some(queue) = lookup_msg_queue(object) else {
+        ctx.set_return(err(missing_msg_queue_errno(
+            task,
+            WaitKind::MsgSend,
+            object,
+        )));
+        return;
+    };
+    let r: Result<bool, i64> = {
+        let mut q = queue.lock();
+        if !ipc_allowed(
+            caller_uid,
+            caller_gid,
+            &caller_groups,
+            q.uid,
+            q.gid,
+            q.cuid,
+            q.cgid,
+            q.mode,
+            0o2,
+        ) {
+            Err(EACCES)
+        } else if q.removed {
+            // Linux checks ipcperms() before ipc_valid_object() after taking
+            // the queue lock. Initial lookup failure remains EINVAL, while a
+            // removal race after a successful lookup is EIDRM.
+            Err(EIDRM)
+        } else {
+            let fits = msgsz.saturating_add(q.current_bytes) <= q.max_bytes
+                && q.msgs.len().saturating_add(1) <= q.max_bytes;
+            if !fits {
+                if msgflg & IPC_NOWAIT as u64 == 0 {
+                    restore_msg_send_wait(
+                        &queue,
+                        &mut q,
+                        task,
+                        ipc_ns,
+                        msqid,
+                        mtype,
+                        pending_payload.take().expect("blocked SysV message"),
+                        msgflg,
+                    );
+                }
+                Ok(false)
+            } else if q.msgs.try_reserve(1).is_err() {
+                Err(ENOMEM)
+            } else {
+                q.msgs.push_back(QueuedMessage {
                     mtype,
-                    pending_payload.take().expect("blocked SysV message"),
-                    msgflg,
-                );
+                    payload: pending_payload.take().expect("pending SysV message"),
+                });
+                q.current_bytes += msgsz;
+                q.stime = now_seconds();
+                q.last_send_pid = pid;
+                q.counters.add_message(msgsz);
+                notify_msg_waiters(&mut q, WaitKind::MsgRecv);
+                Ok(true)
             }
-            return Ok(false);
         }
-        let Some(q) = state.queues.get_mut(&object) else {
-            return Err(missing_msg_queue_errno(
-                state,
-                task,
-                WaitKind::MsgSend,
-                object,
-            ));
-        };
-        q.msgs.try_reserve(1).map_err(|_| ENOMEM)?;
-        q.msgs.push_back(QueuedMessage {
-            mtype,
-            payload: pending_payload.take().expect("pending SysV message"),
-        });
-        q.current_bytes += msgsz;
-        q.stime = now_seconds();
-        q.last_send_pid = pid;
-        let usage = state
-            .usage
-            .get_mut(&ipc_ns)
-            .expect("SysV message usage missing");
-        usage.message_count += 1;
-        usage.byte_count += msgsz;
-        notify_msg_waiters(state, WaitKind::MsgRecv, object);
-        Ok(true)
-    });
+    };
     match r {
         Ok(true) => {
             clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
-            drain_msg_wakes();
+            drain_msg_wakes(&queue);
             narf_net::readiness::notify(0);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -2644,15 +2848,16 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
     // ownership of the payload here so ordinary receives need no heap copy.
     // MSG_COPY is deliberately non-destructive and therefore retains one
     // fallibly allocated snapshot outside the queue lock.
-    let picked = with_msg_state(|state| {
-        let Some(q) = state.queues.get_mut(&object) else {
-            return Err(missing_msg_queue_errno(
-                state,
-                task,
-                WaitKind::MsgRecv,
-                object,
-            ));
-        };
+    let Some(queue) = lookup_msg_queue(object) else {
+        ctx.set_return(err(missing_msg_queue_errno(
+            task,
+            WaitKind::MsgRecv,
+            object,
+        )));
+        return;
+    };
+    let picked = {
+        let mut q = queue.lock();
         if !ipc_allowed(
             caller_uid,
             caller_gid,
@@ -2664,106 +2869,104 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             q.mode,
             0o4,
         ) {
-            return Err(EACCES);
-        }
-        let idx = if flg & MSG_COPY != 0 {
-            usize::try_from(msgtyp)
-                .ok()
-                .and_then(|ordinal| q.msgs.iter().enumerate().nth(ordinal).map(|(idx, _)| idx))
-        } else if msgtyp < 0 {
-            let limit = if msgtyp == i64::MIN {
-                i64::MAX
-            } else {
-                -msgtyp
-            };
-            q.msgs
-                .iter()
-                .enumerate()
-                .filter(|(_, msg)| msg.mtype <= limit)
-                .min_by_key(|(_, msg)| msg.mtype)
-                .map(|(idx, _)| idx)
+            Err(EACCES)
+        } else if q.removed {
+            Err(EIDRM)
         } else {
-            q.msgs.iter().position(|msg| {
-                msgtyp == 0
-                    || if flg & MSG_EXCEPT != 0 {
-                        msg.mtype != msgtyp
+            'select: {
+                let idx = if flg & MSG_COPY != 0 {
+                    usize::try_from(msgtyp).ok().and_then(|ordinal| {
+                        q.msgs.iter().enumerate().nth(ordinal).map(|(idx, _)| idx)
+                    })
+                } else if msgtyp < 0 {
+                    let limit = if msgtyp == i64::MIN {
+                        i64::MAX
                     } else {
-                        msg.mtype == msgtyp
+                        -msgtyp
+                    };
+                    q.msgs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, msg)| msg.mtype <= limit)
+                        .min_by_key(|(_, msg)| msg.mtype)
+                        .map(|(idx, _)| idx)
+                } else {
+                    q.msgs.iter().position(|msg| {
+                        msgtyp == 0
+                            || if flg & MSG_EXCEPT != 0 {
+                                msg.mtype != msgtyp
+                            } else {
+                                msg.mtype == msgtyp
+                            }
+                    })
+                };
+                let mut removed_bytes = None;
+                let selected: Option<(i64, Vec<u8>)> = match idx {
+                    Some(i) => {
+                        let msg = &q.msgs[i];
+                        if msg.payload.len() > msgsz && flg & MSG_NOERROR == 0 {
+                            break 'select Err(E2BIG);
+                        }
+                        if flg & MSG_COPY != 0 && msg.payload.len() > msgsz {
+                            // copy_msg() rejects a source larger than its prepared
+                            // destination even when MSG_NOERROR bypassed E2BIG.
+                            break 'select Err(EINVAL);
+                        }
+                        let copied_len = core::cmp::min(msg.payload.len(), msgsz);
+                        if flg & MSG_COPY != 0 {
+                            copy_payload[..copied_len].copy_from_slice(&msg.payload[..copied_len]);
+                            copy_payload.truncate(copied_len);
+                            break 'select Ok(Some((
+                                msg.mtype,
+                                core::mem::take(&mut copy_payload),
+                            )));
+                        }
+                        let msg = q.msgs.remove(i).expect("selected SysV message");
+                        q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
+                        q.rtime = now_seconds();
+                        q.last_recv_pid = pid;
+                        removed_bytes = Some(msg.payload.len());
+                        Some((msg.mtype, msg.payload))
                     }
-            })
-        };
-        let mut removed_bytes = None;
-        let selected: Option<(i64, Vec<u8>)> = match idx {
-            Some(i) => {
-                let msg = &q.msgs[i];
-                if msg.payload.len() > msgsz && flg & MSG_NOERROR == 0 {
-                    return Err(E2BIG);
+                    None => None,
+                };
+                if let Some(bytes) = removed_bytes {
+                    q.counters.remove_messages(1, bytes);
                 }
-                if flg & MSG_COPY != 0 && msg.payload.len() > msgsz {
-                    // copy_msg() rejects a source larger than its prepared
-                    // destination even when MSG_NOERROR bypassed E2BIG.
-                    return Err(EINVAL);
-                }
-                let copied_len = core::cmp::min(msg.payload.len(), msgsz);
-                if flg & MSG_COPY != 0 {
-                    copy_payload[..copied_len].copy_from_slice(&msg.payload[..copied_len]);
-                    copy_payload.truncate(copied_len);
-                    return Ok(Some((msg.mtype, core::mem::take(&mut copy_payload))));
-                }
-                let msg = q.msgs.remove(i).expect("selected SysV message");
-                q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
-                q.rtime = now_seconds();
-                q.last_recv_pid = pid;
-                removed_bytes = Some(msg.payload.len());
-                Some((msg.mtype, msg.payload))
-            }
-            None => None,
-        };
-        if let Some(bytes) = removed_bytes {
-            let usage = state
-                .usage
-                .get_mut(&ipc_ns)
-                .expect("SysV message usage missing");
-            usage.message_count = usage
-                .message_count
-                .checked_sub(1)
-                .expect("SysV message count underflow");
-            usage.byte_count = usage
-                .byte_count
-                .checked_sub(bytes)
-                .expect("SysV message byte count underflow");
-        }
-        if selected.is_some() {
-            if flg & MSG_COPY == 0 {
-                notify_msg_waiters(state, WaitKind::MsgSend, object);
-            }
-        } else if flg & IPC_NOWAIT as i64 == 0 {
-            match state.waits.entry(task) {
-                alloc::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(IpcWait {
-                        kind: WaitKind::MsgRecv,
-                        ipc_ns,
-                        id: msqid,
-                        errno: 0,
-                        ready: false,
-                        waker: None,
-                        data: WaitData::None,
-                    });
-                }
-                alloc::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let wait = entry.get_mut();
-                    if wait.kind == WaitKind::MsgRecv
-                        && wait.ipc_ns == ipc_ns
-                        && wait.id == msqid
-                        && wait.errno == 0
-                    {
-                        wait.ready = false;
+                if selected.is_some() {
+                    if flg & MSG_COPY == 0 {
+                        notify_msg_waiters(&mut q, WaitKind::MsgSend);
                     }
+                } else if flg & IPC_NOWAIT as i64 == 0 {
+                    match q.waits.entry(task) {
+                        alloc::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(IpcWait {
+                                kind: WaitKind::MsgRecv,
+                                ipc_ns,
+                                id: msqid,
+                                errno: 0,
+                                ready: false,
+                                waker: None,
+                                data: WaitData::None,
+                            });
+                        }
+                        alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let wait = entry.get_mut();
+                            if wait.kind == WaitKind::MsgRecv
+                                && wait.ipc_ns == ipc_ns
+                                && wait.id == msqid
+                                && wait.errno == 0
+                            {
+                                wait.ready = false;
+                            }
+                        }
+                    }
+                    index_msg_wait(task, &queue);
                 }
+                Ok(selected)
             }
         }
-        Ok(selected)
-    });
+    };
     let (mtype, payload) = match picked {
         Ok(Some(msg)) => msg,
         Ok(None) => {
@@ -2793,7 +2996,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
     if flg & MSG_COPY == 0 {
         // As in Linux, publish freed queue capacity after unlocking and before
         // the potentially faulting userspace copy.
-        drain_msg_wakes();
+        drain_msg_wakes(&queue);
         narf_net::readiness::notify(0);
     }
     let copied_len = core::cmp::min(payload.len(), msgsz);
@@ -2837,17 +3040,20 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
         IPC_INFO | MSG_INFO => {
-            let (usage, max_index) = with_msg_state(|state| {
-                let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
+            let (queue_count, counters, max_index) = with_msg_state(|state| {
+                let (queue_count, counters) = state.usage.get(&ipc_ns).map_or((0, None), |usage| {
+                    (usage.queue_count, Some(Arc::clone(&usage.counters)))
+                });
                 let max_index = state.ids.get(&ipc_ns).map_or(0, IpcIdTable::max_index);
-                (usage, max_index)
+                (queue_count, counters, max_index)
             });
+            let (message_count, byte_count) = counters.map_or((0, 0), |c| c.snapshot());
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
             let mut out = [0u8; MSGINFO_SIZE];
             if cmd == MSG_INFO {
-                put_i32(&mut out, 0, clamp_i32(usage.queue_count));
-                put_i32(&mut out, 4, clamp_i32(usage.message_count));
-                put_i32(&mut out, 24, clamp_i32(usage.byte_count));
+                put_i32(&mut out, 0, clamp_i32(queue_count));
+                put_i32(&mut out, 4, clamp_i32(message_count));
+                put_i32(&mut out, 24, clamp_i32(byte_count));
             } else {
                 put_i32(&mut out, 0, MSG_POOL_KIB);
                 put_i32(&mut out, 4, MSG_MAP);
@@ -2868,19 +3074,25 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
         }
         IPC_RMID => {
             let removed = with_msg_state(|state| {
-                let q = state.queues.get(&object).ok_or(EINVAL)?;
+                let queue = state.queues.get(&object).cloned().ok_or(EINVAL)?;
+                let mut q = queue.lock();
+                if q.removed {
+                    return Err(EINVAL);
+                }
                 if !ipc_owner(caller_uid, q.uid, q.cuid) {
                     return Err(EPERM);
                 }
-                let queue = state.queues.remove(&object).ok_or(EINVAL)?;
+                let removed_queue = state.queues.remove(&object).ok_or(EINVAL)?;
+                assert!(Arc::ptr_eq(&removed_queue, &queue));
+                q.removed = true;
                 state
                     .ids
                     .get_mut(&ipc_ns)
                     .expect("SysV message id table missing")
                     .release(msqid);
-                if queue.key as u64 != IPC_PRIVATE {
+                if q.key as u64 != IPC_PRIVATE {
                     assert_eq!(
-                        state.key_ids.remove(&(ipc_ns, queue.key)),
+                        state.key_ids.remove(&(ipc_ns, q.key)),
                         Some(msqid),
                         "SysV message key index diverged"
                     );
@@ -2894,32 +3106,28 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                         .queue_count
                         .checked_sub(1)
                         .expect("SysV message queue count underflow");
-                    usage.message_count = usage
-                        .message_count
-                        .checked_sub(queue.msgs.len())
-                        .expect("SysV message count underflow");
-                    usage.byte_count = usage
-                        .byte_count
-                        .checked_sub(queue.current_bytes)
-                        .expect("SysV message byte count underflow");
                     usage.queue_count == 0
                 };
                 if remove_usage {
                     state.usage.remove(&ipc_ns);
                 }
-                for wait in state.waits.values_mut() {
-                    if wait.kind != WaitKind::Sem && (wait.ipc_ns, wait.id) == object {
+                for wait in q.waits.values_mut() {
+                    if (wait.ipc_ns, wait.id) == object {
                         wait.errno = EIDRM;
                     }
                 }
-                Ok(queue)
+                q.counters.remove_messages(q.msgs.len(), q.current_bytes);
+                let messages = core::mem::take(&mut q.msgs);
+                q.current_bytes = 0;
+                drop(q);
+                Ok((queue, messages))
             });
             match removed {
-                Ok(queue) => {
+                Ok((queue, messages)) => {
                     // Queue payload destruction and task wakeups can release
                     // allocator/scheduler state; perform both after unlocking.
-                    drop(queue);
-                    drain_msg_wakes();
+                    drop(messages);
+                    drain_msg_wakes(&queue);
                     narf_net::readiness::notify(0);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
@@ -2927,7 +3135,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             }
         }
         IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
-            let snapshot = with_msg_state(|state| {
+            let target = with_msg_state(|state| {
                 let returned_id = if cmd == IPC_STAT {
                     msqid
                 } else {
@@ -2937,7 +3145,15 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                         .and_then(|ids| ids.full_id_at(msqid))
                         .ok_or(EINVAL)?
                 };
-                let q = state.queues.get(&(ipc_ns, returned_id)).ok_or(EINVAL)?;
+                let queue = state
+                    .queues
+                    .get(&(ipc_ns, returned_id))
+                    .cloned()
+                    .ok_or(EINVAL)?;
+                Ok((returned_id, queue))
+            });
+            let snapshot = target.and_then(|(returned_id, queue)| {
+                let q = queue.lock();
                 if cmd != MSG_STAT_ANY
                     && !ipc_allowed(
                         caller_uid,
@@ -2952,6 +3168,9 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     )
                 {
                     return Err(EACCES);
+                }
+                if q.removed {
+                    return Err(EIDRM);
                 }
                 Ok((
                     returned_id,
@@ -3037,16 +3256,25 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             let new_gid = get_u32(&input, 8);
             let new_mode = get_u32(&input, 20) & IPC_PERM_MASK;
             let new_max = get_u64(&input, 88);
-            let authorized = with_msgs(|m| {
-                let q = m.get(&object).ok_or(EINVAL)?;
-                if !ipc_owner(caller_uid, q.uid, q.cuid) {
-                    return Err(EPERM);
+            let queue = match lookup_msg_queue(object) {
+                Some(queue) => queue,
+                None => {
+                    ctx.set_return(err(EINVAL));
+                    return;
                 }
-                if new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0 {
-                    return Err(EPERM);
+            };
+            let authorized = {
+                let q = queue.lock();
+                if q.removed {
+                    Err(EINVAL)
+                } else if !ipc_owner(caller_uid, q.uid, q.cuid)
+                    || new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0
+                {
+                    Err(EPERM)
+                } else {
+                    Ok(())
                 }
-                Ok(())
-            });
+            };
             if let Err(e) = authorized {
                 ctx.set_return(err(e));
                 return;
@@ -3058,25 +3286,32 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let result = with_msg_state(|state| {
+            let max_bytes = match usize::try_from(new_max) {
+                Ok(max_bytes) => max_bytes,
+                Err(_) => {
+                    ctx.set_return(err(EINVAL));
+                    return;
+                }
+            };
+            let result = {
+                let mut q = queue.lock();
+                if q.removed {
+                    Err(EINVAL)
+                } else if !ipc_owner(caller_uid, q.uid, q.cuid)
+                    || new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0
                 {
-                    let q = state.queues.get_mut(&object).ok_or(EINVAL)?;
-                    if !ipc_owner(caller_uid, q.uid, q.cuid) {
-                        return Err(EPERM);
-                    }
-                    if new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0 {
-                        return Err(EPERM);
-                    }
+                    Err(EPERM)
+                } else {
                     q.uid = new_uid;
                     q.gid = new_gid;
                     q.mode = new_mode;
-                    q.max_bytes = usize::try_from(new_max).map_err(|_| EINVAL)?;
+                    q.max_bytes = max_bytes;
                     q.ctime = now_seconds();
+                    notify_msg_waiters(&mut q, WaitKind::MsgRecv);
+                    notify_msg_waiters(&mut q, WaitKind::MsgSend);
+                    Ok(())
                 }
-                notify_msg_waiters(state, WaitKind::MsgRecv, object);
-                notify_msg_waiters(state, WaitKind::MsgSend, object);
-                Ok(())
-            });
+            };
             match result {
                 Ok(()) => {
                     // Linux uses its internal -EAGAIN receiver sentinel to
@@ -3084,7 +3319,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                     // sentinel to userspace. A readiness bump retries both
                     // receivers (including stricter permissions) and senders
                     // that may now fit under a larger qbytes.
-                    drain_msg_wakes();
+                    drain_msg_wakes(&queue);
                     narf_net::readiness::notify(0);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
@@ -3118,21 +3353,59 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
         }
     });
     drain_sem_wakes();
-    with_msg_state(|state| {
-        state
+    // Retire one queue at a time so dropping queued payloads and firing wakers
+    // happens outside all IRQ-safe locks without requiring a fallible staging
+    // allocation during namespace teardown.
+    while let Some((queue, messages)) = with_msg_state(|state| {
+        let object = state
             .queues
-            .retain(|(namespace, _), _| *namespace != ipc_ns);
+            .keys()
+            .find(|(namespace, _)| *namespace == ipc_ns)
+            .copied()?;
+        let queue = state
+            .queues
+            .remove(&object)
+            .expect("indexed SysV message queue missing during namespace drop");
+        let mut q = queue.lock();
+        q.removed = true;
+        for wait in q.waits.values_mut() {
+            wait.errno = EIDRM;
+        }
+        q.counters.remove_messages(q.msgs.len(), q.current_bytes);
+        let messages = core::mem::take(&mut q.msgs);
+        q.current_bytes = 0;
+        state
+            .ids
+            .get_mut(&ipc_ns)
+            .expect("SysV message id table missing during namespace drop")
+            .release(object.1);
+        if q.key as u64 != IPC_PRIVATE {
+            assert_eq!(
+                state.key_ids.remove(&(ipc_ns, q.key)),
+                Some(object.1),
+                "SysV message key index diverged during namespace drop"
+            );
+        }
+        let usage = state
+            .usage
+            .get_mut(&ipc_ns)
+            .expect("SysV message usage missing during namespace drop");
+        usage.queue_count = usage
+            .queue_count
+            .checked_sub(1)
+            .expect("SysV message queue count underflow during namespace drop");
+        drop(q);
+        Some((queue, messages))
+    }) {
+        drop(messages);
+        drain_msg_wakes(&queue);
+    }
+    with_msg_state(|state| {
         state.ids.remove(&ipc_ns);
         state
             .key_ids
             .retain(|(namespace, _), _| *namespace != ipc_ns);
         state.usage.remove(&ipc_ns);
-        for wait in state.waits.values_mut() {
-            if wait.ipc_ns == ipc_ns {
-                wait.errno = EIDRM;
-            }
-        }
     });
-    drain_msg_wakes();
     narf_net::readiness::notify(0);
 }
