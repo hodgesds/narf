@@ -2112,6 +2112,256 @@ kernel_test_in!(
     smoke_abi_ipc_msg_wait_waker_handoff_and_rmid
 );
 
+/// Full-queue senders use the same queue-local publication protocol as
+/// receivers: one retained waker, EIDRM on removal, and a reusable task slot
+/// after the terminal result is consumed.
+fn smoke_abi_ipc_msg_sender_waker_rmid_and_slot_reuse() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountWake(AtomicU32);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    with_setup(|| {
+        const BLOCKED: u64 = FAKE_TASK + 41;
+        let id = make_msgq()?;
+        let mut update = [0u8; 120];
+        update[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+        update[88..96].copy_from_slice(&1u64.to_ne_bytes());
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_SET, update.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setup: failed to set one-byte message capacity");
+        }
+
+        let mut msg = [0u8; 9];
+        msg[..8].copy_from_slice(&7i64.to_ne_bytes());
+        msg[8] = b's';
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, msg.as_ptr() as u64, 1, IPC_NOWAIT),
+        ) != Some(0)
+        {
+            return Err("setup: failed to fill one-byte message queue");
+        }
+
+        set_task(BLOCKED);
+        let send_args = a3(id, msg.as_ptr() as u64, 1, 0);
+        // The direct ABI harness has no schedulable UserTaskCtx, so a real
+        // blocking msgsnd deliberately falls back to EAGAIN there. Publish
+        // and recheck the exact retained record through the kernel-test hook;
+        // the ordinary syscall below still consumes its terminal result.
+        crate::sysvipc::__test_stage_msg_send(id, 7, b"s", 0);
+        if !crate::sysvipc::__test_reblock_staged_msg_send(id) {
+            set_task(FAKE_TASK);
+            return Err("full-queue sender wait did not survive a recheck");
+        }
+        let wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        let waker = core::task::Waker::from(Arc::clone(&wakes));
+        if crate::sysvipc::register_msg_wait_waker(BLOCKED, waker.clone())
+            != crate::sysvipc::MsgParkState::Pending
+            || crate::sysvipc::register_msg_wait_waker(BLOCKED, waker)
+                != crate::sysvipc::MsgParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("blocked sender rejected deduplicated waker registration");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("sender-wait queue removal failed");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 1 {
+            return Err("RMID produced a lost or duplicate sender wake");
+        }
+        let late = core::task::Waker::from(Arc::new(CountWake(AtomicU32::new(0))));
+        if crate::sysvipc::register_msg_wait_waker(BLOCKED, late)
+            != crate::sysvipc::MsgParkState::Ready
+        {
+            return Err("sender RMID state was lost before late registration");
+        }
+        set_task(BLOCKED);
+        if call_raw(Syscall::Msgsnd.raw(), send_args).value as i64 != EIDRM {
+            set_task(FAKE_TASK);
+            return Err("removed blocked sender observed an errno other than EIDRM");
+        }
+        if crate::sysvipc::register_msg_wait_waker(
+            BLOCKED,
+            core::task::Waker::from(Arc::new(CountWake(AtomicU32::new(0)))),
+        ) != crate::sysvipc::MsgParkState::NotWaiting
+        {
+            set_task(FAKE_TASK);
+            return Err("terminal sender wait remained linked after EIDRM consumption");
+        }
+
+        // Reuse the same task for a receiver on another queue. Recycled wait
+        // slots must not hide the new wait or retain the removed queue.
+        set_task(FAKE_TASK);
+        let replacement = make_msgq()?;
+        let mut out = [0u8; 9];
+        let recv_args = SyscallArgs {
+            arg0: replacement,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        set_task(BLOCKED);
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("reused task slot did not publish a receiver wait");
+        }
+        let reused_wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        if crate::sysvipc::register_msg_wait_waker(
+            BLOCKED,
+            core::task::Waker::from(Arc::clone(&reused_wakes)),
+        ) != crate::sysvipc::MsgParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("reused task slot rejected its receiver waker");
+        }
+        set_task(FAKE_TASK);
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(replacement, msg.as_ptr() as u64, 1, 0),
+        ) != Some(0)
+            || reused_wakes.0.load(Ordering::Relaxed) != 1
+        {
+            return Err("reused task slot was not woken by its new queue");
+        }
+        set_task(BLOCKED);
+        if call_raw(Syscall::Msgrcv.raw(), recv_args).value as i64 != 1 || out != msg {
+            set_task(FAKE_TASK);
+            return Err("reused task slot received the wrong queue publication");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msg_sender_waker_rmid_and_slot_reuse
+);
+
+fn smoke_abi_ipc_msg_sender_wakes_only_for_sufficient_capacity() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountWake(AtomicU32);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    with_setup(|| {
+        const BLOCKED: u64 = FAKE_TASK + 42;
+        let id = make_msgq()?;
+        let mut update = [0u8; 120];
+        update[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+        update[88..96].copy_from_slice(&3u64.to_ne_bytes());
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_SET, update.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setup: failed to set three-byte message capacity");
+        }
+
+        for byte in b"abc" {
+            let mut msg = [0u8; 9];
+            msg[..8].copy_from_slice(&1i64.to_ne_bytes());
+            msg[8] = *byte;
+            if call(
+                Syscall::Msgsnd.raw(),
+                a3(id, msg.as_ptr() as u64, 1, IPC_NOWAIT),
+            ) != Some(0)
+            {
+                return Err("setup: failed to fill three-byte message queue");
+            }
+        }
+
+        set_task(BLOCKED);
+        crate::sysvipc::__test_stage_msg_send(id, 9, b"zz", 0);
+        let wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        if crate::sysvipc::register_msg_wait_waker(
+            BLOCKED,
+            core::task::Waker::from(Arc::clone(&wakes)),
+        ) != crate::sysvipc::MsgParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("capacity waiter rejected its sender waker");
+        }
+
+        let mut out = [0u8; 10];
+        let recv = SyscallArgs {
+            arg0: id,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 2,
+            arg3: 0,
+            arg4: IPC_NOWAIT,
+            ..Default::default()
+        };
+        set_task(FAKE_TASK);
+        if call_raw(Syscall::Msgrcv.raw(), recv).value as i64 != 1 {
+            return Err("setup: first capacity receive failed");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 0 {
+            return Err("sender woke before enough byte capacity was available");
+        }
+        if call_raw(Syscall::Msgrcv.raw(), recv).value as i64 != 1 {
+            return Err("setup: second capacity receive failed");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 1 {
+            return Err("sender was not woken exactly once when its message fit");
+        }
+
+        let mut ignored_user_msg = [0u8; 10];
+        ignored_user_msg[..8].copy_from_slice(&77i64.to_ne_bytes());
+        ignored_user_msg[8..].copy_from_slice(b"xx");
+        set_task(BLOCKED);
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(id, ignored_user_msg.as_ptr() as u64, 2, 0),
+        ) != Some(0)
+        {
+            set_task(FAKE_TASK);
+            return Err("capacity wake did not let the staged sender commit");
+        }
+        set_task(FAKE_TASK);
+        if call_raw(Syscall::Msgrcv.raw(), recv).value as i64 != 1
+            || call_raw(Syscall::Msgrcv.raw(), recv).value as i64 != 2
+            || i64::from_ne_bytes(out[..8].try_into().unwrap()) != 9
+            || &out[8..] != b"zz"
+        {
+            return Err("capacity wake lost or replaced the staged sender payload");
+        }
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("capacity wake queue cleanup failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msg_sender_wakes_only_for_sufficient_capacity
+);
+
 fn smoke_abi_ipc_msgrcv_negative_selects_lowest_type() -> TestResult {
     with_setup(|| {
         let id = make_msgq()?;
