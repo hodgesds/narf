@@ -992,29 +992,34 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
         return TestResult::Fail("setpriority(5) did not return OK");
     }
 
-    // Re-read: wire value = 25 (5 + 20).
+    // Re-read: Linux nice_to_rlimit wire value = 20 - nice = 15.
     let r = call(Syscall::Getpriority, 0, 0, 0)
         .map(|r| r.value)
         .unwrap_or(!0);
-    if r != 25 {
+    if r != 15 {
         return TestResult::Fail("setpriority did not stick");
     }
 
-    // Out-of-range nice rejected.
+    // Linux clamps an out-of-range niceval to MAX_NICE(19) rather than
+    // rejecting it, so the call succeeds and the readback reflects the clamp
+    // (wire = 20 - 19 = 1).
     let r = call(Syscall::Setpriority, 0, 0, 100);
-    let bad_rejected = matches!(
-        r,
-        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
-    );
-    if !bad_rejected {
-        return TestResult::Fail("setpriority(100) was not rejected");
+    if !matches!(r, Some(rr) if rr.status == SyscallReturn::OK && rr.value == 0) {
+        return TestResult::Fail("setpriority(100) did not clamp and return OK");
+    }
+    let r = call(Syscall::Getpriority, 0, 0, 0)
+        .map(|r| r.value)
+        .unwrap_or(!0);
+    if r != 1 {
+        return TestResult::Fail("setpriority(100) did not clamp to MAX_NICE(19)");
     }
 
-    // Bad which (1 = PRIO_PGRP) rejected.
+    // Bad which (1 = PRIO_PGRP) is -EINVAL, matching Linux
+    // SYSCALL_DEFINE2(getpriority)'s `which > PRIO_USER` rejection.
     let r = call(Syscall::Getpriority, 1, 0, 0);
     let bad_which = matches!(
         r,
-        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-22i64) as u64,
     );
     if !bad_which {
         return TestResult::Fail("getpriority(PRIO_PGRP) was not rejected");

@@ -12611,6 +12611,7 @@ fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
         unsafe { crate::aarch64::paging::translate(address_space.root, va) }
     }
 
@@ -12763,6 +12764,11 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
         Ok(frame) => frame.start_address(),
         Err(_) => return TestResult::Skip("shared Duplicate backing allocation failed"),
     };
+    // The reverse map is process-global and owners are only retired on explicit
+    // unmap; a prior test that dropped its address space without unmapping can
+    // leave stale owners on a since-freed frame we just re-allocated. Clear it
+    // so `owner_count(frame)` reflects only the mappings this test installs.
+    crate::rmap::__reset_for_test();
     let source = VirtAddr::new(0x0000_4096_0000_0000);
     let destination = VirtAddr::new(0x0000_4097_0000_0000);
     let mapped = address_space.with_vma_transaction(|| {
@@ -12797,6 +12803,8 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
     let source_translation = unsafe { translated(&address_space, source) };
     // SAFETY: same live-root proof as the source translation.
     let destination_translation = unsafe { translated(&address_space, destination) };
+    // Duplicate clones residency: the source stays mapped, the destination is
+    // installed to the same frame, and the frame gains a second rmap owner.
     let correct = duplicated.is_ok()
         && source_translation == Some(frame)
         && destination_translation == Some(frame)

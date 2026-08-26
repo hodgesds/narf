@@ -68,8 +68,8 @@ pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
 /// `include/uapi/linux/ptrace.h`:
 ///
 /// ```text
-/// #define PTRACE_O_MASK		(\
-///	0x000000ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP)
+/// #define PTRACE_O_MASK        (\
+///    0x000000ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP)
 /// ```
 ///
 /// with PTRACE_O_EXITKILL = 1<<20 and PTRACE_O_SUSPEND_SECCOMP = 1<<21.
@@ -83,14 +83,14 @@ pub const PTRACE_O_MASK: u64 = 0x0000_00ff | (1 << 20) | (1 << 21);
 /// ```text
 /// static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
 /// {
-///	int ret = -ESRCH;
-///	...
-///	if (child->ptrace && child->parent == current) {
-///		if (ignore_state || ptrace_freeze_traced(child))
-///			ret = 0;
-///	}
-///	...
-///	return ret;
+///    int ret = -ESRCH;
+///    ...
+///    if (child->ptrace && child->parent == current) {
+///        if (ignore_state || ptrace_freeze_traced(child))
+///            ret = 0;
+///    }
+///    ...
+///    return ret;
 /// }
 /// ```
 ///

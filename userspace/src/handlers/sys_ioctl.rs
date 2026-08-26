@@ -388,7 +388,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
+            None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
         }
         return;
     }
@@ -424,7 +424,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
                     ctx.set_return(SyscallReturn::ok(0));
                 }
-                None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
+                None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
             }
             return;
         }
@@ -494,7 +494,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     });
                 match new_fd {
                     Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-                    None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
+                    None => ctx.set_return(SyscallReturn::ok((-EMFILE) as u64)),
                 }
                 return;
             }
