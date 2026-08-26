@@ -1063,6 +1063,10 @@ impl FileOps for PtyMaster {
         true
     }
 
+    // The controlling-tty transaction and its CTTY hook are `linux-compat`
+    // machinery; without the feature this override drops to the trait default
+    // (`Ok(false)` — TIOCSCTTY is a no-op on non-Linux-ABI builds).
+    #[cfg(feature = "linux-compat")]
     fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
         self.pty.acquire_controlling_tty(arg, readable)?;
         Ok(true)
@@ -1469,6 +1473,9 @@ impl FileOps for PtySlave {
         true
     }
 
+    // See the master-side override above: gated to match the `linux-compat`
+    // CTTY machinery, falling back to the trait default when the feature is off.
+    #[cfg(feature = "linux-compat")]
     fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
         self.pty.acquire_controlling_tty(arg, readable)?;
         Ok(true)
