@@ -217,9 +217,12 @@ fn smoke_abi_fdio_pwritev_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pwritev_pos);
 
 fn smoke_abi_fdio_pwritev_neg() -> TestResult {
-    with_setup(|| {
-        // iovcnt > IOV_MAX → -EINVAL.
-        match call(Syscall::Pwritev.raw(), a3(3, 0x1000, 2000, 0)) {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        // iovcnt > IOV_MAX → -EINVAL. The fd must be OPEN for that to be the
+        // failure under test: `do_pwritev` resolves the descriptor first, so
+        // a closed one reports -EBADF before import_iovec ever runs.
+        let fd = open_fd(b"/abi/f\0")?;
+        match call(Syscall::Pwritev.raw(), a3(fd as u64, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("pwritev over IOV_MAX was not -EINVAL"),
         }
@@ -247,12 +250,15 @@ fn smoke_abi_fdio_preadv_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_preadv_pos);
 
 fn smoke_abi_fdio_preadv_neg() -> TestResult {
-    with_setup(
-        || match call(Syscall::Preadv.raw(), a3(3, 0x1000, 2000, 0)) {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        // As in the pwritev case: an open fd, so -EINVAL from IOV_MAX is what
+        // is being asserted rather than -EBADF from the fd lookup.
+        let fd = open_fd(b"/abi/f\0")?;
+        match call(Syscall::Preadv.raw(), a3(fd as u64, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("preadv over IOV_MAX was not -EINVAL"),
-        },
-    )
+        }
+    })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_preadv_neg);
 
@@ -574,11 +580,10 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_ftruncate_pos);
 
 fn smoke_abi_fdio_ftruncate_neg() -> TestResult {
     with_setup(|| {
-        // bad fd → -1 sentinel.
-        // LINUX-GAP: Linux ftruncate(2) returns -EBADF.
+        // `fs/open.c::do_sys_ftruncate`: `if (fd_empty(f)) return -EBADF;`.
         match call(Syscall::Ftruncate.raw(), a1(4949, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("ftruncate on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("ftruncate on bad fd was not -EBADF"),
         }
     })
 }
@@ -1621,11 +1626,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_pos);
 
 fn smoke_abi_fdio_flock_neg() -> TestResult {
     with_setup(|| {
-        // bad fd → -1 sentinel.
-        // LINUX-GAP: Linux flock(2) returns -EBADF.
+        // `fs/locks.c::SYSCALL_DEFINE2(flock)`: the operation translates
+        // (LOCK_EX is valid), then `if (fd_empty(f)) return -EBADF;`.
         match call(Syscall::Flock.raw(), a1(4444, 2 | 4)) {
-            Some(-1) => Ok(()),
-            _ => Err("flock on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("flock on bad fd was not -EBADF"),
         }
     })
 }
@@ -2556,21 +2561,21 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_copy_file_range_neg);
 
 // ── tee ────────────────────────────────────────────────────────────
 //
-// tee(fd_in, fd_out, len, flags). fd_in must be a pipe read end
-// (peekable). An empty pipe peeks to an empty slice → tee returns 0
-// without consuming — the reachable success. A non-pipe fd_in → EINVAL.
+// tee(fd_in, fd_out, len, flags). Both ends must be distinct pipes; a
+// non-pipe is -EINVAL. `fs/splice.c::ipipe_prep` returns 0 only once the
+// source pipe has no writers left — a transient empty pipe waits, or
+// -EAGAINs under SPLICE_F_NONBLOCK.
 
 fn smoke_abi_fdio_tee_pos() -> TestResult {
     with_setup(|| {
         let (rd1, _wr1) = make_pipe()?;
         let (_rd2, wr2) = make_pipe()?;
-        // Empty source pipe → peek yields no bytes → tee returns 0.
-        // LINUX-GAP: with the writer still open, Linux `fs/splice.c::do_tee`
-        // BLOCKS here (or -EAGAINs under SPLICE_F_NONBLOCK); NARF's tee has
-        // no blocking path yet and reports the transient 0.
-        match call(Syscall::Tee.raw(), a3(rd1 as u64, wr2 as u64, 16, 0)) {
-            Some(0) => Ok(()),
-            _ => Err("tee on an empty pipe did not return 0"),
+        // The source is empty but its write end is still open, so this is not
+        // end-of-stream. SPLICE_F_NONBLOCK (0x2) turns the wait into -EAGAIN;
+        // reporting 0 (the old behaviour) told the caller the stream ended.
+        match call(Syscall::Tee.raw(), a3(rd1 as u64, wr2 as u64, 16, 0x2)) {
+            Some(v) if v == EAGAIN => Ok(()),
+            _ => Err("tee on a live-but-empty pipe was not -EAGAIN"),
         }
     })
 }
@@ -2580,6 +2585,7 @@ fn smoke_abi_fdio_tee_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let fd = open_fd(b"/abi/f\0")?;
         // fd_in is a regular file, not a pipe read end → -EINVAL.
+        // (`do_tee`: `if (!ipipe || !opipe || ipipe == opipe) -EINVAL`.)
         match call(Syscall::Tee.raw(), a3(fd as u64, fd as u64, 16, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("tee on a non-pipe fd was not -EINVAL"),

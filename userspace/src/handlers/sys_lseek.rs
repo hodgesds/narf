@@ -46,19 +46,46 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     }
     const SEEK_DATA: u64 = 3;
     const SEEK_HOLE: u64 = 4;
-    if offset >= 0 && (whence == SEEK_DATA || whence == SEEK_HOLE) {
+    if whence == SEEK_DATA || whence == SEEK_HOLE {
+        // `fs/read_write.c::must_set_pos`:
+        //
+        //   case SEEK_DATA: if ((u64)offset >= eof) return -ENXIO; break;
+        //   case SEEK_HOLE: if ((u64)offset >= eof) return -ENXIO;
+        //                   offset = eof; break;
+        //
+        // Note the UNSIGNED compare, so a negative offset is -ENXIO as well.
+        // Every extent-mapping filesystem reports the same past-EOF answer.
+        // Folding these into the -EINVAL of the SEEK_SET/CUR/END match below
+        // (which has no arm for them) destroyed the distinction userspace
+        // relies on: -EINVAL means "this kernel has no SEEK_DATA at all, use
+        // a whole-file copy", while -ENXIO means "supported, and there is no
+        // more data" — the loop-termination condition of a sparse copy.
+        let eof = ops.stat().size;
+        if (offset as u64) >= eof {
+            ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+            return;
+        }
         match poll_blocking(ops.seek(offset as u64, whence as u32)) {
             Some(Ok(new_off)) => {
                 description.set_offset(new_off);
                 ctx.set_return(SyscallReturn::ok(new_off));
                 return;
             }
+            // No extent map: fall through to the generic answer below.
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            _ => {
-                ctx.set_return(einval);
+            // A filesystem that DOES map extents and found no such
+            // data/hole at or after `offset` is reporting end-of-data.
+            Some(Err(_)) => {
+                ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
                 return;
             }
         }
+        // Generic model: the whole file is data and the only hole is the
+        // virtual one at EOF.
+        let new_off = if whence == SEEK_HOLE { eof } else { offset as u64 };
+        description.set_offset(new_off);
+        ctx.set_return(SyscallReturn::ok(new_off));
+        return;
     }
     let outcome = {
         let base = match whence {

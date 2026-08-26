@@ -22,6 +22,16 @@ fn open_abi_fd(path: &[u8]) -> Result<u32, &'static str> {
     }
 }
 
+/// As [`open_abi_fd`], but O_RDWR. `vfs_write` rejects a write through an
+/// O_RDONLY description with -EBADF, so every write-side test needs this
+/// rather than the read-only default above.
+fn open_abi_fd_rw(path: &[u8]) -> Result<u32, &'static str> {
+    match call_open(path.as_ptr() as u64, crate::fd::O_RDWR as u64) {
+        Some(fd) if fd >= 0 => Ok(fd as u32),
+        _ => Err("open of seeded MemFs file failed"),
+    }
+}
+
 // ── Tcgetattr / Tcsetattr — task-global termios, -1 on a null buffer ──
 
 fn smoke_abi_misc_tcgetattr_pos() -> TestResult {
@@ -202,7 +212,7 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_pread64_neg);
 
 fn smoke_abi_misc_pwrite64_pos() -> TestResult {
     with_memfs("/m", "m", &[("f", b"abcdefghij")], || {
-        let fd = open_abi_fd(b"/m/f\0")?;
+        let fd = open_abi_fd_rw(b"/m/f\0")?;
         let payload = b"ZZ";
         // pwrite(fd, "ZZ", 2, offset=8) → 2 bytes written.
         let args = a3(fd as u64, payload.as_ptr() as u64, payload.len() as u64, 8);
@@ -247,9 +257,11 @@ fn smoke_abi_misc_preadv2_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_misc_preadv2_pos);
 
 fn smoke_abi_misc_preadv2_neg() -> TestResult {
-    with_setup(|| {
-        // iovcnt > IOV_MAX (1024) → -EINVAL, before any fd lookup.
-        let args = a3(99, 0x1000, 4096, 0);
+    with_memfs("/m", "m", &[("f", b"abcdefghij")], || {
+        // iovcnt > IOV_MAX (1024) → -EINVAL. `do_preadv` resolves the fd
+        // first, so this needs an OPEN one or -EBADF wins.
+        let fd = open_abi_fd(b"/m/f\0")?;
+        let args = a3(fd as u64, 0x1000, 4096, 0);
         match call(Syscall::Preadv2.raw(), args) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("preadv2 with iovcnt > 1024 should return -EINVAL"),
@@ -260,7 +272,7 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_preadv2_neg);
 
 fn smoke_abi_misc_pwritev2_pos() -> TestResult {
     with_memfs("/m", "m", &[("f", b"abcdefghij")], || {
-        let fd = open_abi_fd(b"/m/f\0")?;
+        let fd = open_abi_fd_rw(b"/m/f\0")?;
         let payload = b"QQ";
         let iov = [payload.as_ptr() as u64, payload.len() as u64];
         // pwritev2(fd, iov, 1, pos=0, 0, flags=0) → 2 bytes written.
@@ -274,9 +286,11 @@ fn smoke_abi_misc_pwritev2_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_misc_pwritev2_pos);
 
 fn smoke_abi_misc_pwritev2_neg() -> TestResult {
-    with_setup(|| {
-        // iovcnt > IOV_MAX → -EINVAL.
-        let args = a3(99, 0x1000, 4096, 0);
+    with_memfs("/m", "m", &[("f", b"abcdefghij")], || {
+        // iovcnt > IOV_MAX → -EINVAL, on an OPEN and writable fd so the
+        // -EBADF paths ahead of import_iovec are not what is asserted.
+        let fd = open_abi_fd_rw(b"/m/f\0")?;
+        let args = a3(fd as u64, 0x1000, 4096, 0);
         match call(Syscall::Pwritev2.raw(), args) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("pwritev2 with iovcnt > 1024 should return -EINVAL"),

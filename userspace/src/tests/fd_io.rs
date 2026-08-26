@@ -1554,12 +1554,15 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
 
     // Open the file via SYS_OPEN.
     // Linux open(2) ABI: arg0 = NUL-terminated absolute path, arg1 = flags.
+    // O_RDWR, not the O_RDONLY default: this smoke pwrites through the fd,
+    // and `vfs_write` rejects that with -EBADF on a read-only description.
     let path = b"/pio/f\0";
+    let flags = crate::fd::O_RDWR as u64;
     let mut ctx = FakeCtx {
         #[cfg(target_arch = "x86_64")]
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: 0, // flags
+            arg1: flags,
             arg2: 0,
             arg3: 0,
             arg4: 0,
@@ -1569,7 +1572,7 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
         args: SyscallArgs {
             arg0: 0xffffffffffffff9c, // AT_FDCWD
             arg1: path.as_ptr() as u64,
-            arg2: 0, // flags
+            arg2: flags,
             ..Default::default()
         },
         ret: None,

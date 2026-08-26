@@ -268,10 +268,16 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
                 let secs = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
                 let nsec =
                     u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+                // poll_select_set_timeout(): a negative field or tv_nsec
+                // outside [0, 1e9) is -EINVAL, not a clamped timeout.
+                if (secs as i64) < 0 || nsec >= 1_000_000_000 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                    return;
+                }
                 secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64
             }
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
                 return;
             }
         }
@@ -286,7 +292,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
             let task = current_task_id();
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
     }
@@ -743,11 +749,16 @@ pub(crate) fn poll_wait_kernel(
 
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
     use core::sync::atomic::Ordering;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // `fs/select.c::do_sys_poll` answers an over-large nfds with -EINVAL and a
+    // faulting `struct pollfd[]` with -EFAULT. The old `-1` sentinel reached
+    // userspace as EPERM, an errno poll(2) never returns, so a caller could
+    // neither retry nor degrade on it.
+    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
+    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
 
     // Upper bound on nfds to prevent OOM from hostile input.
     if nfds > 1_048_576 {
-        ctx.set_return(fail);
+        ctx.set_return(EINVAL);
         return;
     }
 
@@ -784,11 +795,11 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // multiply cannot wrap, and `validate_user_range` rejects the kernel half,
     // the canonical hole, a null base, and an end-overflow.
     let Some(bytes) = nfds.checked_mul(8) else {
-        ctx.set_return(fail);
+        ctx.set_return(EINVAL);
         return;
     };
     if crate::handlers::validate_user_range(ptr as u64, bytes).is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        ctx.set_return(EFAULT);
         return;
     }
 
@@ -797,7 +808,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     let mut fds = match unsafe { parse_pollfds(ptr, nfds) } {
         Some(v) => v,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(EFAULT);
             return;
         }
     };
