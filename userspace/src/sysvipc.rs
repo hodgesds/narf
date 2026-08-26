@@ -435,17 +435,18 @@ enum WaitKind {
     MsgRecv,
 }
 
-#[derive(Clone)]
 enum WaitData {
     None,
     MsgSend {
         mtype: i64,
-        payload: Vec<u8>,
+        /// Owned by the wait record while parked and temporarily taken by the
+        /// re-executing syscall.  A still-full queue restores the same buffer
+        /// without allocating or copying under the IRQ-safe state lock.
+        payload: Option<Vec<u8>>,
         msgflg: u64,
     },
 }
 
-#[derive(Clone)]
 struct IpcWait {
     kind: WaitKind,
     ipc_ns: u64,
@@ -490,7 +491,7 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
             waker: None,
             data: WaitData::MsgSend {
                 mtype,
-                payload,
+                payload: Some(payload),
                 msgflg,
             },
         });
@@ -513,7 +514,7 @@ fn copy_staged_sem_wait(
     })
 }
 
-fn staged_msg_send_wait(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>, u64)> {
+fn take_staged_msg_send(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>, u64)> {
     with_waits(|waits| {
         let wait = waits.get_mut(&task)?;
         if wait.kind != WaitKind::MsgSend
@@ -524,15 +525,69 @@ fn staged_msg_send_wait(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>
             return None;
         }
         wait.ready = false;
-        match &wait.data {
+        match &mut wait.data {
             WaitData::MsgSend {
                 mtype,
                 payload,
                 msgflg,
-            } => Some((*mtype, payload.clone(), *msgflg)),
+            } => Some((*mtype, payload.take()?, *msgflg)),
             _ => None,
         }
     })
+}
+
+#[allow(clippy::too_many_arguments)] // One complete retained msgsnd operation.
+fn restore_msg_send_wait(
+    state: &mut MsgState,
+    task: u64,
+    ipc_ns: u64,
+    id: u64,
+    mtype: i64,
+    payload: Vec<u8>,
+    msgflg: u64,
+) {
+    match state.waits.entry(task) {
+        alloc::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(IpcWait {
+                kind: WaitKind::MsgSend,
+                ipc_ns,
+                id,
+                errno: 0,
+                ready: false,
+                waker: None,
+                data: WaitData::MsgSend {
+                    mtype,
+                    payload: Some(payload),
+                    msgflg,
+                },
+            });
+        }
+        alloc::collections::btree_map::Entry::Occupied(mut entry) => {
+            let wait = entry.get_mut();
+            assert!(
+                wait.kind == WaitKind::MsgSend
+                    && wait.ipc_ns == ipc_ns
+                    && wait.id == id
+                    && wait.errno == 0,
+                "staged SysV sender changed while rechecking"
+            );
+            wait.ready = false;
+            let WaitData::MsgSend {
+                mtype: retained_type,
+                payload: retained_payload,
+                msgflg: retained_flags,
+            } = &mut wait.data
+            else {
+                panic!("staged SysV sender lost its payload state");
+            };
+            debug_assert_eq!(*retained_type, mtype);
+            debug_assert_eq!(*retained_flags, msgflg);
+            assert!(
+                retained_payload.replace(payload).is_none(),
+                "staged SysV sender payload restored twice"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -730,6 +785,19 @@ pub(crate) fn __test_stage_msg_send(id: u64, mtype: i64, payload: &[u8], msgflg:
         payload.to_vec(),
         msgflg,
     );
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
+    let task = crate::handlers::current_task_id();
+    let ipc_ns = current_ipc_namespace_id();
+    let Some((mtype, payload, msgflg)) = take_staged_msg_send(task, ipc_ns, id) else {
+        return false;
+    };
+    with_msg_state(|state| {
+        restore_msg_send_wait(state, task, ipc_ns, id, mtype, payload, msgflg);
+    });
+    true
 }
 
 fn ensure_sem_undo_observer() {
@@ -2213,7 +2281,7 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(EINTR));
         return;
     }
-    let staged = staged_msg_send_wait(task, ipc_ns, msqid);
+    let staged = take_staged_msg_send(task, ipc_ns, msqid);
     let (mtype, payload, msgflg) = if let Some(staged) = staged {
         staged
     } else {
@@ -2286,19 +2354,15 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         };
         if !fits {
             if msgflg & IPC_NOWAIT as u64 == 0 {
-                state.waits.entry(task).or_insert_with(|| IpcWait {
-                    kind: WaitKind::MsgSend,
+                restore_msg_send_wait(
+                    state,
+                    task,
                     ipc_ns,
-                    id: msqid,
-                    errno: 0,
-                    ready: false,
-                    waker: None,
-                    data: WaitData::MsgSend {
-                        mtype,
-                        payload: pending_payload.take().expect("blocked SysV message"),
-                        msgflg,
-                    },
-                });
+                    msqid,
+                    mtype,
+                    pending_payload.take().expect("blocked SysV message"),
+                    msgflg,
+                );
             }
             return Ok(false);
         }

@@ -1603,6 +1603,11 @@ fn smoke_abi_ipc_msgsnd_retains_kernel_snapshot() -> TestResult {
         user_msg[..8].copy_from_slice(&9i64.to_ne_bytes());
         user_msg[8..].copy_from_slice(b"new");
         crate::sysvipc::__test_stage_msg_send(id, 7, b"old", 0);
+        if !crate::sysvipc::__test_reblock_staged_msg_send(id)
+            || !crate::sysvipc::__test_reblock_staged_msg_send(id)
+        {
+            return Err("staged msgsnd lost its owned payload across repeated rechecks");
+        }
         if call(
             Syscall::Msgsnd.raw(),
             a3(id, user_msg.as_ptr() as u64, 3, 0),
