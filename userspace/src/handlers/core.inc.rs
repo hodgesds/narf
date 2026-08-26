@@ -4710,16 +4710,47 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                 ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                 return;
             }
-            // NARF has no FMODE_NOWAIT, no atomic-write support, and no
-            // per-I/O cache-drop; the kernel answers each of those with
-            // -EOPNOTSUPP on a file that cannot provide them.
+            // NARF has no FMODE_NOWAIT, no atomic-write support and no
+            // per-I/O cache-drop, and the kernel answers each of those with
+            // -EOPNOTSUPP on a file that cannot provide them. RWF_NOWAIT is
+            // not even a gap: tmpfs does not set FMODE_NOWAIT either, so
+            // Linux gives -EOPNOTSUPP for the same call on the same kind of
+            // memory-backed file.
             if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
                 ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
                 return;
             }
-            // RWF_DSYNC / RWF_SYNC promise this write reaches stable storage
-            // before returning. NARF's filesystems are in-memory and coherent,
-            // so the promise already holds; HIPRI and NOSIGNAL are advisory.
+            // LINUX-GAP, and deliberately loud. These three change where the
+            // bytes land or whether a signal is raised, and NARF cannot
+            // express any of them on this path:
+            //
+            //   RWF_APPEND   `generic_write_checks_count` does
+            //                `iocb->ki_pos = i_size_read(inode)`, so the flag
+            //                OVERRIDES the explicit offset and writes at EOF.
+            //                Accepting it and writing at `pos` anyway puts the
+            //                caller's bytes somewhere else entirely.
+            //   RWF_NOAPPEND negates the description's O_APPEND for this one
+            //                I/O; the `pos == -1` path below delegates to
+            //                writev, which honours O_APPEND and cannot be
+            //                told not to.
+            //   RWF_NOSIGNAL sets IOCB_NOSIGNAL, which is what suppresses the
+            //                `send_sig(SIGPIPE, ...)` in `pipe_write` and
+            //                `sock_sendmsg`. Ignoring it delivers a signal the
+            //                caller explicitly asked to be spared — and the
+            //                default action for SIGPIPE kills the process.
+            //
+            // Silently ignoring any of them is a data-placement or
+            // signal-delivery divergence that surfaces far from its cause.
+            // -EOPNOTSUPP is a documented answer for a file that cannot honour
+            // an RWF_ bit, and callers already branch on it.
+            if flags & (RWF_APPEND | RWF_NOAPPEND | RWF_NOSIGNAL) != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            // What remains is honourable as-is: RWF_DSYNC / RWF_SYNC promise
+            // the write reaches stable storage before returning, which an
+            // in-memory coherent filesystem already satisfies, and RWF_HIPRI
+            // is a scheduling hint.
         }
     }
 

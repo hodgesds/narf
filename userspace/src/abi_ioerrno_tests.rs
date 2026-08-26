@@ -1202,6 +1202,107 @@ fn smoke_abi_ioerrno_preadv2_sync_flags_accepted() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_preadv2_sync_flags_accepted);
 
+fn smoke_abi_ioerrno_pwritev2_append_is_rejected() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let payload = *b"ZZ";
+        let iov = iovec(payload.as_ptr() as u64, 2);
+        // `generic_write_checks_count` does
+        // `if (iocb->ki_flags & IOCB_APPEND) iocb->ki_pos = i_size_read(inode);`
+        // — RWF_APPEND OVERRIDES the explicit offset and writes at EOF.
+        // Accepting the flag and honouring `pos` would put these two bytes at
+        // offset 0 instead of offset 6, which no error would ever reveal.
+        let r = call_raw(
+            Syscall::Pwritev2.raw(),
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0x10, // RWF_APPEND
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EOPNOTSUPP,
+            "pwritev2 RWF_APPEND must be -EOPNOTSUPP, never silently ignored",
+        )?;
+        // And nothing may have been written at the offset it was told to use.
+        let mut buf = [0u8; 6];
+        match call(
+            Syscall::Pread64.raw(),
+            a3(fd as u64, buf.as_mut_ptr() as u64, 6, 0),
+        ) {
+            Some(6) if &buf == b"abcdef" => Ok(()),
+            _ => Err("a rejected RWF_APPEND write must not have moved any bytes"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_pwritev2_append_is_rejected);
+
+fn smoke_abi_ioerrno_pwritev2_nosignal_is_rejected() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let payload = *b"Z";
+        let iov = iovec(payload.as_ptr() as u64, 1);
+        // RWF_NOSIGNAL sets IOCB_NOSIGNAL, which is what suppresses the
+        // `send_sig(SIGPIPE, current, 0)` in pipe_write. Ignoring it delivers
+        // a signal whose default action kills the caller.
+        let r = call_raw(
+            Syscall::Pwritev2.raw(),
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0x100, // RWF_NOSIGNAL
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EOPNOTSUPP,
+            "pwritev2 RWF_NOSIGNAL must be -EOPNOTSUPP, never silently ignored",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pwritev2_nosignal_is_rejected
+);
+
+fn smoke_abi_ioerrno_pwritev2_noappend_is_rejected() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let payload = *b"Z";
+        let iov = iovec(payload.as_ptr() as u64, 1);
+        // RWF_NOAPPEND negates the description's O_APPEND for one I/O. The
+        // `pos == -1` form delegates to writev, which honours O_APPEND and
+        // cannot be told not to, so the flag cannot be expressed here.
+        let r = call_raw(
+            Syscall::Pwritev2.raw(),
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0x20, // RWF_NOAPPEND
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EOPNOTSUPP,
+            "pwritev2 RWF_NOAPPEND must be -EOPNOTSUPP, never silently ignored",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pwritev2_noappend_is_rejected
+);
+
 // ── fadvise64 / readahead / sync_file_range ────────────────────────
 
 fn smoke_abi_ioerrno_fadvise_bad_advice() -> TestResult {
