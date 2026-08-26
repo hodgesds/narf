@@ -7065,6 +7065,27 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
     Some(crate::socket::SockAddr { family, body })
 }
 
+/// Import a MANDATORY user sockaddr for bind/connect without collapsing
+/// Linux's two `move_addr_to_kernel` errors: an `addrlen` outside
+/// `[0, sizeof(sockaddr_storage)]` (or too short to hold `sa_family_t`) is
+/// -EINVAL, and a faulting copy is -EFAULT. `copy_user_addr` predates exact
+/// errno reporting and folds both to `None`.
+fn copy_user_addr_result(ptr: u64, raw_len: u64) -> Result<crate::socket::SockAddr, i64> {
+    let len = raw_len as i32;
+    // move_addr_to_kernel: ulen < 0 || ulen > sizeof(sockaddr_storage) → EINVAL.
+    if !(0..=128).contains(&len) || len < 2 {
+        return Err(22); // -EINVAL (no room for a complete sa_family_t)
+    }
+    let mut buf = alloc::vec![0u8; len as usize];
+    // SAFETY: copy_from_user range-validates the whole address (catching a NULL
+    // or faulting ptr) and SMAP-brackets the read.
+    unsafe { copy_from_user(&mut buf, ptr) }.map_err(|_| 14i64)?; // -EFAULT
+    Ok(crate::socket::SockAddr {
+        family: u16::from_le_bytes([buf[0], buf[1]]),
+        body: buf[2..].to_vec(),
+    })
+}
+
 /// Return the listener's shared open-file-description `O_NONBLOCK` state.
 ///
 /// `SocketFile` is shared across dup, exec remapping, and SCM_RIGHTS while an

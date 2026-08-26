@@ -15,7 +15,8 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     let sock_nonblock = (raw_kind & SOCK_NONBLOCK) != 0;
     let kind = raw_kind & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let proto = args.arg2 as u32;
-    // Reject unknown families up front (EAFNOSUPPORT shape).
+    // Reject unknown families up front. Linux `__sock_create` returns
+    // -EAFNOSUPPORT when no registered net_proto_family matches the domain.
     if !matches!(
         domain,
         crate::socket::AF_UNIX
@@ -24,7 +25,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             | crate::socket::AF_BYPASS
             | crate::socket::AF_NETLINK
     ) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-97i64) as u64)); // -EAFNOSUPPORT
         return;
     }
     let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
@@ -82,7 +83,9 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     }) {
         Some(n) => n,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            // Linux socket() → sock_map_fd → get_unused_fd_flags: a full
+            // per-process descriptor table is -EMFILE.
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };

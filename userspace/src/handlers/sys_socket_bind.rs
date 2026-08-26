@@ -6,18 +6,19 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     let fd = args.arg0 as u32;
     let addr_ptr = args.arg1;
     let addr_len = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux __sys_bind: sockfd_lookup_light gives -EBADF / -ENOTSOCK, then
+    // move_addr_to_kernel gives -EINVAL / -EFAULT, then the family's bind op.
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
-    let addr = match copy_user_addr(addr_ptr, addr_len) {
-        Some(a) => a,
-        None => {
-            ctx.set_return(fail);
+    let addr = match copy_user_addr_result(addr_ptr, addr_len) {
+        Ok(a) => a,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -40,6 +41,11 @@ pub(crate) fn sys_socket_bind(ctx: &mut dyn TrapContext) {
     }
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
+        // EADDRINUSE / EADDRNOTAVAIL / EINVAL / EACCES / EAFNOSUPPORT from the
+        // family's bind op, rather than a bare -1/EPERM.
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }

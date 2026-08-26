@@ -26,8 +26,9 @@ use super::*;
 ///     handler runs via the return-to-user hook),
 ///   - -EAGAIN, when the (finite) timeout expired — persisted across
 ///     re-executions in `blocking_deadline_ns`, same as poll/epoll,
-///   - -EINVAL for a malformed timespec, -1 for the legacy bad-input
-///     shape (sigsetsize != 8 / NULL set) the ABI tests pin.
+///   - -EINVAL for a malformed timespec or `sigsetsize != 8`, -EFAULT for a
+///     NULL/faulting `set` (matching Linux's size-check-then-copy_from_user
+///     order).
 ///
 /// arg0 = set ptr (in), arg1 = info ptr (out, may be 0),
 /// arg2 = timeout timespec ptr (may be 0 = block indefinitely),
@@ -38,8 +39,15 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     let info_out = args.arg1;
     let timeout_in = args.arg2;
     let sigsetsize = args.arg3;
-    if sigsetsize != 8 || set_in == 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    // `SYSCALL_DEFINE4(rt_sigtimedwait)` (kernel/signal.c) validates the size
+    // (`!= sizeof(sigset_t)` → -EINVAL) BEFORE it reads the set, then the set
+    // copy-in reports -EFAULT (which also covers a NULL `set_in`).
+    if sigsetsize != 8 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    if set_in == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     // Read the user sigset through the SMAP-bracketed helper (a raw
@@ -51,7 +59,7 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // SAFETY: set_in != 0 + sigsetsize == 8 checked above; copy_from_user
     // range-validates and SMAP-brackets the 8-byte read.
     if unsafe { copy_from_user(&mut set_buf, set_in) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     let set = u64::from_ne_bytes(set_buf);

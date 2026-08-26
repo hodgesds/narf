@@ -69,10 +69,9 @@ fn smoke_abi_socket_socket_open_neg() -> TestResult {
         let n = Syscall::SocketOpen.raw();
         // Family 9999 is not AF_UNIX/INET/INET6/BYPASS/NETLINK → rejected.
         let r = call(n, a2(9999, SOCK_STREAM, 0)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EAFNOSUPPORT (-97); NARF returns the bare
-        // -1 sentinel for an unknown family.
-        if r != -1 {
-            return Err("unknown family did not return -1");
+        // Linux __sock_create returns -EAFNOSUPPORT for an unregistered family.
+        if r != EAFNOSUPPORT {
+            return Err("unknown family did not return -EAFNOSUPPORT");
         }
         Ok(())
     })
@@ -99,11 +98,10 @@ fn smoke_abi_socket_bind_neg() -> TestResult {
     with_setup(|| {
         let (addr, alen) = unix_sockaddr(b"/abi-bind-neg");
         let n = Syscall::SocketBind.raw();
-        // No such fd → current_socket() fails → -1.
+        // No such fd → sockfd_lookup_light → -EBADF.
         let r = call(n, a2(BAD_FD, addr.as_ptr() as u64, alen)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns the -1 sentinel.
-        if r != -1 {
-            return Err("bind() on a bad fd did not return -1");
+        if r != EBADF {
+            return Err("bind() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -133,12 +131,13 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_listen_pos);
 fn smoke_abi_socket_listen_neg() -> TestResult {
     with_setup(|| {
         // listen() on a fresh (unbound) socket: state is Fresh, not
-        // UnixListener → dispatch returns InvalidArg → -1.
+        // UnixListener → dispatch returns InvalidArg. Linux unix_listen returns
+        // -EINVAL for an unbound socket (`!u->addr`).
         let fd = open_unix_stream()?;
         let n = Syscall::SocketListen.raw();
         let r = call(n, a1(fd, 16)).ok_or("status not Ok")?;
-        if r != -1 {
-            return Err("listen() on an unbound socket did not return -1");
+        if r != EINVAL {
+            return Err("listen() on an unbound socket did not return -EINVAL");
         }
         Ok(())
     })
@@ -523,9 +522,9 @@ fn smoke_abi_socket_pair_neg() -> TestResult {
         // AF_INET is not implemented for socketpair → -1.
         let r =
             call(n, a3(AF_INET, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EOPNOTSUPP (-95); NARF returns -1.
-        if r != -1 {
-            return Err("socketpair(AF_INET, ...) did not return -1");
+        // A known family with no ->socketpair op (AF_INET) → -EOPNOTSUPP.
+        if r != EOPNOTSUPP {
+            return Err("socketpair(AF_INET, ...) did not return -EOPNOTSUPP");
         }
         Ok(())
     })
@@ -605,6 +604,64 @@ fn smoke_abi_socket_send_errno_order() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_errno_order);
 
+/// Linux errno parity for the socket connection-lifecycle syscalls: an
+/// unregistered family is -EAFNOSUPPORT, an absent fd is -EBADF, a live
+/// non-socket fd is -ENOTSOCK, a bad addr is -EINVAL/-EFAULT, and
+/// socketpair distinguishes -EAFNOSUPPORT from -EOPNOTSUPP.
+fn smoke_abi_socket_errno_parity() -> TestResult {
+    with_setup(|| {
+        // socket() with an unregistered family → -EAFNOSUPPORT.
+        if call(Syscall::SocketOpen.raw(), a2(9999, SOCK_STREAM, 0)) != Some(EAFNOSUPPORT) {
+            return Err("socket(bad family) should return -EAFNOSUPPORT");
+        }
+        // An absent descriptor → -EBADF for every fd-first socket call.
+        let (addr, _alen) = unix_sockaddr(b"/tmp/narf-errno-probe");
+        let ap = addr.as_ptr() as u64;
+        if call(Syscall::SocketBind.raw(), a2(BAD_FD, ap, 16)) != Some(EBADF) {
+            return Err("bind(bad fd) should return -EBADF");
+        }
+        if call(Syscall::SocketConnect.raw(), a2(BAD_FD, ap, 16)) != Some(EBADF) {
+            return Err("connect(bad fd) should return -EBADF");
+        }
+        if call(Syscall::SocketListen.raw(), a1(BAD_FD, 16)) != Some(EBADF) {
+            return Err("listen(bad fd) should return -EBADF");
+        }
+        if call(Syscall::SocketShutdown.raw(), a1(BAD_FD, SHUT_RDWR)) != Some(EBADF) {
+            return Err("shutdown(bad fd) should return -EBADF");
+        }
+        // A live non-socket fd → -ENOTSOCK (sockfd_lookup_light's 2nd error).
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        if call(Syscall::SocketListen.raw(), a1(non_socket, 16)) != Some(ENOTSOCK) {
+            return Err("listen(non-socket fd) should return -ENOTSOCK");
+        }
+        // bind addr validation on a real socket: addrlen < 2 → -EINVAL;
+        // a faulting addr of valid length → -EFAULT (move_addr_to_kernel).
+        let sock = open_unix_stream()?;
+        if call(Syscall::SocketBind.raw(), a2(sock, ap, 1)) != Some(EINVAL) {
+            return Err("bind with addrlen < 2 should return -EINVAL");
+        }
+        if call(Syscall::SocketBind.raw(), a2(sock, BAD_USER_PTR, 16)) != Some(EFAULT) {
+            return Err("bind with a faulting addr should return -EFAULT");
+        }
+        // socketpair: a known family with no ->socketpair op → -EOPNOTSUPP;
+        // an unregistered family → -EAFNOSUPPORT.
+        let mut sv = [0u8; 8];
+        let svp = sv.as_mut_ptr() as u64;
+        if call(Syscall::SocketPair.raw(), a3(AF_INET, SOCK_STREAM, 0, svp)) != Some(EOPNOTSUPP) {
+            return Err("socketpair(AF_INET) should return -EOPNOTSUPP");
+        }
+        if call(Syscall::SocketPair.raw(), a3(9999, SOCK_STREAM, 0, svp)) != Some(EAFNOSUPPORT) {
+            return Err("socketpair(bad family) should return -EAFNOSUPPORT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_errno_parity);
+
 // ───────────────────────────── SocketRecv ─────────────────────────────
 
 fn smoke_abi_socket_recv_pos() -> TestResult {
@@ -655,9 +712,9 @@ fn smoke_abi_socket_recv_neg() -> TestResult {
             a3(BAD_FD, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
         )
         .ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("recv() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if r != EBADF {
+            return Err("recv() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -1447,9 +1504,9 @@ fn smoke_abi_socket_shutdown_neg() -> TestResult {
     with_setup(|| {
         let n = Syscall::SocketShutdown.raw();
         let r = call(n, a1(BAD_FD, SHUT_RDWR)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("shutdown() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if r != EBADF {
+            return Err("shutdown() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -1887,9 +1944,9 @@ fn smoke_abi_socket_getsockname_neg() -> TestResult {
             a2(BAD_FD, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
         )
         .ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("getsockname() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if r != EBADF {
+            return Err("getsockname() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -1947,9 +2004,9 @@ fn smoke_abi_socket_getpeername_neg_badfd() -> TestResult {
             a2(BAD_FD, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
         )
         .ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("getpeername() on a bad fd did not return -1");
+        // sockfd_lookup_light on an absent fd → -EBADF.
+        if r != EBADF {
+            return Err("getpeername() on a bad fd did not return -EBADF");
         }
         Ok(())
     })
@@ -1969,9 +2026,9 @@ fn smoke_abi_socket_getpeername_neg_unconnected() -> TestResult {
             a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
         )
         .ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -ENOTCONN (-107); NARF returns -1.
-        if r != -1 {
-            return Err("getpeername() on an unconnected socket did not return -1");
+        // getpeername on a socket with no peer → -ENOTCONN.
+        if r != ENOTCONN {
+            return Err("getpeername() on an unconnected socket did not return -ENOTCONN");
         }
         Ok(())
     })
@@ -3140,7 +3197,7 @@ fn smoke_abi_socket_pathname_bind_mount_aliases_same_inode() -> TestResult {
         if call(
             Syscall::SocketBind.raw(),
             a2(duplicate, alias_addr.as_ptr() as u64, alias_len),
-        ) != Some(-1)
+        ) != Some(EADDRINUSE)
         {
             return Err("bind through alias did not see source-path socket inode as occupied");
         }
@@ -3287,8 +3344,8 @@ kernel_test_in!(
 );
 
 /// A second bind to a live abstract name is EADDRINUSE (-98 via the
-/// dispatcher's AddrInUse → the handler's -1 sentinel is NOT used here
-/// because bind maps the SockError through; assert the address is taken).
+/// dispatcher's AddrInUse → bind maps the SockError through to the Linux
+/// errno; assert the address is reported taken as -EADDRINUSE).
 fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
     with_setup(|| {
         let a = open_unix(SOCK_STREAM)?;
@@ -3299,12 +3356,12 @@ fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
         {
             return Err("first bind() to an abstract stream name failed");
         }
-        // Second socket binding the SAME abstract name must fail.
+        // Second socket binding the SAME abstract name must fail with
+        // -EADDRINUSE (Linux unix_bind → the address is in use).
         let b = open_unix(SOCK_STREAM)?;
         let r = call(Syscall::SocketBind.raw(), a2(b, addr.as_ptr() as u64, alen));
-        // bind()'s handler maps a non-Ok dispatcher result to the -1 sentinel.
-        if r != Some(-1) {
-            return Err("second bind() to a live abstract name did not fail");
+        if r != Some(EADDRINUSE) {
+            return Err("second bind() to a live abstract name did not return -EADDRINUSE");
         }
         Ok(())
     })

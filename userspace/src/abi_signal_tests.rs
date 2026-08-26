@@ -181,6 +181,19 @@ fn smoke_abi_signal_rt_sigaction_neg() -> TestResult {
         if r != Some(-22) {
             return Err("rt_sigaction(SIGSTOP, act, ...) should return -EINVAL");
         }
+        // signal 0 is invalid (Linux `do_sigaction` `sig < 1`) → -EINVAL.
+        if call(Syscall::RtSigaction.raw(), a3(0, 0, 0, 8)) != Some(EINVAL) {
+            return Err("rt_sigaction(0, ...) should return -EINVAL");
+        }
+        // A faulting `act` → -EFAULT (the new action is read before the old is
+        // written, so this wins even with a valid oact).
+        if call(Syscall::RtSigaction.raw(), a3(10, u64::MAX, 0, 8)) != Some(EFAULT) {
+            return Err("rt_sigaction with a faulting act should return -EFAULT");
+        }
+        // A faulting `oact` (act absent) → -EFAULT (written last).
+        if call(Syscall::RtSigaction.raw(), a3(10, 0, u64::MAX, 8)) != Some(EFAULT) {
+            return Err("rt_sigaction with a faulting oact should return -EFAULT");
+        }
         Ok(())
     })
 }
@@ -239,12 +252,16 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigpending_pos);
 
 fn smoke_abi_signal_rt_sigpending_neg() -> TestResult {
     with_setup(|| {
-        // sigsetsize != 8 → ok(-1) (and set_out==0 is also rejected,
-        // which short-circuits before the unchecked write).
-        // LINUX-GAP: Linux returns -EINVAL.
-        let r = call(Syscall::RtSigpending.raw(), a1(0, 8));
-        if r != Some(-1) {
-            return Err("rt_sigpending(NULL, 8) should return -1");
+        // sigsetsize > sizeof(sigset_t) → -EINVAL (SYSCALL_DEFINE2 checks the
+        // size before it touches the user pointer, so this wins over the
+        // faulting NULL below).
+        if call(Syscall::RtSigpending.raw(), a1(0, 16)) != Some(EINVAL) {
+            return Err("rt_sigpending(_, 16) should return -EINVAL");
+        }
+        // Valid size but a NULL (faulting) set_out → copy_to_user faults →
+        // -EFAULT.
+        if call(Syscall::RtSigpending.raw(), a1(0, 8)) != Some(EFAULT) {
+            return Err("rt_sigpending(NULL, 8) should return -EFAULT");
         }
         Ok(())
     })
@@ -425,11 +442,15 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigtimedwait_pos);
 
 fn smoke_abi_signal_rt_sigtimedwait_neg() -> TestResult {
     with_setup(|| {
-        // sigsetsize != 8 → ok(-1) before any pointer deref.
-        // LINUX-GAP: Linux returns -EINVAL.
-        let r = call(Syscall::RtSigtimedwait.raw(), a3(0, 0, 0, 16));
-        if r != Some(-1) {
-            return Err("rt_sigtimedwait with sigsetsize!=8 should return -1");
+        // sigsetsize != 8 → -EINVAL before any pointer deref (the size check
+        // precedes copy_from_user in SYSCALL_DEFINE4).
+        if call(Syscall::RtSigtimedwait.raw(), a3(0, 0, 0, 16)) != Some(EINVAL) {
+            return Err("rt_sigtimedwait with sigsetsize!=8 should return -EINVAL");
+        }
+        // Valid size but a NULL (faulting) set → copy_from_user faults →
+        // -EFAULT.
+        if call(Syscall::RtSigtimedwait.raw(), a3(0, 0, 0, 8)) != Some(EFAULT) {
+            return Err("rt_sigtimedwait(NULL set, 8) should return -EFAULT");
         }
         Ok(())
     })
@@ -455,21 +476,36 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigaltstack_pos);
 
 fn smoke_abi_signal_sigaltstack_neg() -> TestResult {
     with_setup(|| {
-        // Build a stack_t in local memory with an invalid flag bit set
-        // (0x4, outside {SS_ONSTACK=1, SS_DISABLE=2}) → ok(-1).
-        // LINUX-GAP: Linux returns -EINVAL.
+        // (a) An invalid flag bit (0x4, outside {SS_ONSTACK=1, SS_DISABLE=2})
+        // → -EINVAL (do_sigaltstack `ss_mode != ...`).
         let mut ss = [0u8; 24];
-        ss[0..8].copy_from_slice(&0u64.to_ne_bytes()); // sp
         ss[8..12].copy_from_slice(&0x4u32.to_ne_bytes()); // bad flags
-        ss[16..24].copy_from_slice(&0u64.to_ne_bytes()); // size
-        let p = ss.as_ptr() as u64;
-        let r = call(Syscall::Sigaltstack.raw(), a1(p, 0));
-        if r != Some(-1) {
-            return Err("sigaltstack with invalid flags should return -1");
+        ss[16..24].copy_from_slice(&(MIN_SIGSTKSZ_TEST).to_ne_bytes()); // ample size
+        if call(Syscall::Sigaltstack.raw(), a1(ss.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("sigaltstack with invalid flags should return -EINVAL");
+        }
+
+        // (b) A non-SS_DISABLE stack with ss_size < MINSIGSTKSZ → -ENOMEM
+        // (do_sigaltstack size check). flags = SS_ONSTACK, size = 0.
+        let mut small = [0u8; 24];
+        small[8..12].copy_from_slice(&1u32.to_ne_bytes()); // SS_ONSTACK
+        small[16..24].copy_from_slice(&0u64.to_ne_bytes()); // size 0 < 2048
+        if call(Syscall::Sigaltstack.raw(), a1(small.as_ptr() as u64, 0)) != Some(ENOMEM) {
+            return Err("sigaltstack with undersized stack should return -ENOMEM");
+        }
+
+        // (c) A faulting (non-user) ss_in → -EFAULT (copy_from_user reads the
+        // input first, before any out-param write). ss_in==0 means query-only,
+        // so use u64::MAX — the file's established faulting-pointer sentinel.
+        if call(Syscall::Sigaltstack.raw(), a1(u64::MAX, 0)) != Some(EFAULT) {
+            return Err("sigaltstack with a faulting ss_in should return -EFAULT");
         }
         Ok(())
     })
 }
+// MINSIGSTKSZ on x86_64 (see MIN_SIGSTKSZ in the handler). Used as an "ample"
+// altstack size so the flag-validation path is reached before the size check.
+const MIN_SIGSTKSZ_TEST: u64 = 8192;
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigaltstack_neg);
 
 // ── Signalfd ────────────────────────────────────────────────────────
@@ -809,11 +845,38 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigprocmask_pos);
 
 fn smoke_abi_signal_sigprocmask_neg() -> TestResult {
     with_setup(|| {
-        // sigsetsize != 8 → ok(-1).
-        // LINUX-GAP: Linux returns -EINVAL.
-        let r = call(Syscall::Sigprocmask.raw(), a3(2, 0, 0, 16));
-        if r != Some(-1) {
-            return Err("sigprocmask with sigsetsize!=8 should return -1");
+        // sigsetsize != 8 → -EINVAL (checked before any pointer deref).
+        if call(Syscall::Sigprocmask.raw(), a3(2, 0, 0, 16)) != Some(EINVAL) {
+            return Err("sigprocmask with sigsetsize!=8 should return -EINVAL");
+        }
+        // A faulting `nset` → -EFAULT (read before the mask op).
+        if call(Syscall::Sigprocmask.raw(), a3(2, u64::MAX, 0, 8)) != Some(EFAULT) {
+            return Err("sigprocmask with a faulting nset should return -EFAULT");
+        }
+        // An unknown `how` with a real `nset` → -EINVAL (Linux `sigprocmask`
+        // default arm). Provide a readable set word.
+        let set: u64 = 0;
+        if call(
+            Syscall::Sigprocmask.raw(),
+            a3(99, &set as *const u64 as u64, 0, 8),
+        ) != Some(EINVAL)
+        {
+            return Err("sigprocmask with unknown how should return -EINVAL");
+        }
+        // A faulting `oset` (valid/absent nset) → -EFAULT (written last).
+        if call(Syscall::Sigprocmask.raw(), a3(2, 0, u64::MAX, 8)) != Some(EFAULT) {
+            return Err("sigprocmask with a faulting oset should return -EFAULT");
+        }
+        // An unknown `how` is IGNORED when `nset` is NULL — a pure query
+        // returns 0 (Linux only inspects `how` when nset != NULL). Give a
+        // real writable oset so the copy-out succeeds.
+        let mut oset: u64 = 0;
+        if call(
+            Syscall::Sigprocmask.raw(),
+            a3(99, 0, &mut oset as *mut u64 as u64, 8),
+        ) != Some(0)
+        {
+            return Err("sigprocmask(garbage_how, NULL, oset, 8) should return 0");
         }
         Ok(())
     })

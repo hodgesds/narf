@@ -6,11 +6,13 @@ pub(crate) fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
     let fd = args.arg0 as u32;
     let addr_ptr = args.arg1;
     let len_ptr = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux __sys_getsockname/getpeername: sockfd_lookup_light gives
+    // -EBADF / -ENOTSOCK, then the family op (-ENOTCONN for getpeername on an
+    // unconnected socket).
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -48,6 +50,9 @@ pub(crate) fn sys_socket_get_addr(ctx: &mut dyn TrapContext, peer: bool) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(fail),
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }

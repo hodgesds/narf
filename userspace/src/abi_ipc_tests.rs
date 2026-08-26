@@ -3277,17 +3277,22 @@ fn smoke_abi_sysvipc_namespace_share_and_isolation() -> TestResult {
                 .ok_or("setup: initial private IPC namespace missing")?;
 
             set_task(FAKE_TASK);
+            // A successful *get returns the id (>= 0); an error is a negative
+            // errno. The FIRST object created in a fresh IPC namespace lands in
+            // slot 0 with sequence 0, whose Linux-style public id is exactly 0
+            // (see IpcIdTable::allocate) — the same value Linux's ipc_buildid
+            // yields — so accept 0 as a valid id, not just > 0.
             let sem_a = call(Syscall::Semget.raw(), a2(SEM_KEY, 1, IPC_CREAT | 0o600))
-                .filter(|id| *id > 0)
+                .filter(|id| *id >= 0)
                 .ok_or("setup: namespace-A semget failed")? as u64;
             if call(Syscall::Semctl.raw(), a3(sem_a, 0, SETVAL, 7)) != Some(0) {
                 return Err("setup: namespace-A SETVAL failed");
             }
             let msg_a = call(Syscall::Msgget.raw(), a1(MSG_KEY, IPC_CREAT | 0o600))
-                .filter(|id| *id > 0)
+                .filter(|id| *id >= 0)
                 .ok_or("setup: namespace-A msgget failed")? as u64;
             let shm_a = call(Syscall::Shmget.raw(), a2(SHM_KEY, 4096, IPC_CREAT | 0o600))
-                .filter(|id| *id > 0)
+                .filter(|id| *id >= 0)
                 .ok_or("setup: namespace-A shmget failed")? as u64;
 
             crate::namespaces::setns_ipc(SHARED_TASK, shared_ns);

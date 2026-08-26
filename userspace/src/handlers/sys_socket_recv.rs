@@ -7,17 +7,19 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
     let buf_ptr = args.arg1;
     let buf_len = args.arg2 as usize;
     let flags = args.arg3 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // Linux __sys_recvfrom: sockfd_lookup_light gives -EBADF / -ENOTSOCK; a
+    // faulting destination buffer is -EFAULT; the family recv op surfaces
+    // -EAGAIN / -ENOTCONN / -ECONNREFUSED / …
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
     // Validate destination range before issuing the Recv op.
     if buf_len > 0 && validate_user_range(buf_ptr, buf_len).is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     // A recv is non-blocking if the fd is O_NONBLOCK or the call carries
@@ -62,7 +64,7 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             // datagram-length probe. Do not validate/copy a zero-byte range:
             // a null pointer is valid when no payload bytes are requested.
             if n > 0 && unsafe { copy_to_user(buf_ptr, &buf[..n]) }.is_err() {
-                ctx.set_return(fail);
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                 return;
             }
             // recvfrom source-address output: arg4 points to sockaddr storage,
@@ -78,7 +80,7 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                     // writable sockaddr range through `copy_to_user`.
                     if copied > 0 && unsafe { copy_to_user(args.arg4, &encoded[..copied]) }.is_err()
                     {
-                        ctx.set_return(fail);
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
                         return;
                     }
                     write_user_u32(args.arg5, encoded.len() as u32);
@@ -138,6 +140,9 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             }
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(fail),
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (unreachable)
     }
 }
